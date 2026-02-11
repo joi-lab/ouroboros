@@ -1,0 +1,4 @@
+
+openai>=1.0.0
+requests
+playwright>=1.40.0
