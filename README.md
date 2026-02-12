@@ -18,6 +18,10 @@
 - (опционально) `GITHUB_USER` (по умолчанию `razzant`)
 - (опционально) `GITHUB_REPO` (по умолчанию `ouroboros`)
 - (опционально) `OUROBOROS_MODEL` (по умолчанию `openai/gpt-5.2`)
+- (опционально) `OUROBOROS_IDLE_ENABLED` (`1`/`0`, по умолчанию `1`)
+- (опционально) `OUROBOROS_IDLE_COOLDOWN_SEC` (по умолчанию `900`)
+- (опционально) `OUROBOROS_IDLE_BUDGET_PCT_CAP` (по умолчанию `35`)
+- (опционально) `OUROBOROS_IDLE_MAX_PER_DAY` (по умолчанию `8`)
 
 2) Запусти единственную boot-ячейку в Colab.
 3) Напиши своему Telegram-боту. Первый написавший становится владельцем.
@@ -36,7 +40,10 @@
 
 - `state/state.json` — состояние, владелец, бюджет, approvals
 - `logs/` — raw JSONL логи (chat, events, tools, supervisor)
-- `memory/` — долговременная память
+- `memory/` — долговременная и рабочая память
+  - `memory/scratchpad.md` — рабочий контекст между задачами/рестартами
+  - `memory/scratchpad_journal.jsonl` — журнал обновлений scratchpad
+  - `memory/identity.md` — self-model на основе наблюдаемых данных
 - `index/` — summaries.json и другие индексы
 - `NOTES.md` — заметки «что работает / что не работает»
 
@@ -100,8 +107,24 @@ Telegram по умолчанию рендерит разметку только 
 ## Контекст и устойчивость
 
 - Воркеры подмешивают в контекст хвосты `logs/chat.jsonl`, `logs/tools.jsonl`, `logs/events.jsonl`, `logs/supervisor.jsonl`, `logs/narration.jsonl`, чтобы лучше помнить фактические результаты прошлых шагов.
+- Воркеры также подмешивают `memory/scratchpad.md` и `memory/identity.md`, чтобы сохранять рабочий фокус и self-model между задачами и после рестартов.
+- После каждой задачи агент обновляет `scratchpad` через отдельный промпт `prompts/SCRATCHPAD_SUMMARY.md` (компактно, без воды, с краткими evidence-цитатами команд/ошибок).
 - При direct-send форматированного ответа в Telegram полный текст всё равно логируется в `chat.jsonl` для следующих задач.
 - Long polling Telegram и отправка сообщений обрабатываются с ретраями; кратковременные сетевые таймауты не должны валить супервизор.
+
+## Idle режим (саморазвитие в простое)
+
+Когда нет входящих задач владельца и бюджет позволяет, супервизор может ставить внутренние idle-задачи:
+- консолидация памяти,
+- анализ производительности,
+- идеи улучшения кода,
+- исследование через web_search,
+- подготовка проактивной идеи владельцу.
+
+Guardrails:
+- cooldown между idle-задачами (`OUROBOROS_IDLE_COOLDOWN_SEC`),
+- лимит доли бюджета (`OUROBOROS_IDLE_BUDGET_PCT_CAP`),
+- дневной лимит задач (`OUROBOROS_IDLE_MAX_PER_DAY`).
 
 ## Модели
 

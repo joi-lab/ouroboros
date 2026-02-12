@@ -7,6 +7,7 @@ This module is intentionally self-contained (minimal dependencies) so that Ourob
 from __future__ import annotations
 
 import datetime as _dt
+from collections import Counter
 import hashlib
 import html
 import json
@@ -128,6 +129,559 @@ class OuroborosAgent:
         self._pending_events: List[Dict[str, Any]] = []
         self._event_queue: Any = event_queue  # multiprocessing.Queue for real-time progress
         self._current_chat_id: Optional[int] = None
+
+    SCRATCHPAD_SECTIONS: Tuple[str, ...] = (
+        "CurrentProjects",
+        "OpenThreads",
+        "InvestigateLater",
+        "RecentEvidence",
+    )
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, str(default)))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _norm_item(value: str) -> str:
+        return re.sub(r"\s+", " ", str(value or "").strip()).lower()
+
+    @staticmethod
+    def _dedupe_keep_order(items: List[str], max_items: int) -> List[str]:
+        out: List[str] = []
+        seen: set[str] = set()
+        for raw in items:
+            item = re.sub(r"\s+", " ", str(raw or "").strip())
+            if not item:
+                continue
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= max_items:
+                break
+        return out
+
+    @staticmethod
+    def _parse_jsonl_lines(raw_text: str) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for line in (raw_text or "").splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                rows.append(obj)
+        return rows
+
+    @staticmethod
+    def _parse_iso_to_unix(iso_ts: str) -> Optional[float]:
+        txt = str(iso_ts or "").strip()
+        if not txt:
+            return None
+        try:
+            txt = txt.replace("Z", "+00:00")
+            return _dt.datetime.fromisoformat(txt).timestamp()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _clip_text(text: str, max_chars: int) -> str:
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        half = max(200, max_chars // 2)
+        return text[:half] + "\n...(truncated)...\n" + text[-half:]
+
+    def _memory_path(self, rel: str) -> pathlib.Path:
+        return self.env.drive_path(f"memory/{safe_relpath(rel)}")
+
+    def _scratchpad_path(self) -> pathlib.Path:
+        return self._memory_path("scratchpad.md")
+
+    def _scratchpad_journal_path(self) -> pathlib.Path:
+        return self._memory_path("scratchpad_journal.jsonl")
+
+    def _identity_path(self) -> pathlib.Path:
+        return self._memory_path("identity.md")
+
+    def _identity_meta_path(self) -> pathlib.Path:
+        return self._memory_path("identity_meta.json")
+
+    def _default_scratchpad(self) -> str:
+        lines = [
+            "# Scratchpad",
+            "",
+            f"UpdatedAt: {utc_now_iso()}",
+            "",
+        ]
+        for section in self.SCRATCHPAD_SECTIONS:
+            lines.extend([f"## {section}", "- (empty)", ""])
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _default_identity(self) -> str:
+        return (
+            "# Identity\n\n"
+            f"UpdatedAt: {utc_now_iso()}\n\n"
+            "## Strengths\n"
+            "- (collecting data)\n\n"
+            "## Weaknesses\n"
+            "- (collecting data)\n\n"
+            "## FrequentMistakes\n"
+            "- (collecting data)\n\n"
+            "## PreferredApproaches\n"
+            "- (collecting data)\n\n"
+            "## CurrentGrowthFocus\n"
+            "- Build a stronger evidence base from real tasks.\n"
+        )
+
+    def _ensure_memory_files(self) -> None:
+        scratchpad = self._scratchpad_path()
+        identity = self._identity_path()
+        journal = self._scratchpad_journal_path()
+        identity_meta = self._identity_meta_path()
+
+        if not scratchpad.exists():
+            write_text(scratchpad, self._default_scratchpad())
+        if not identity.exists():
+            write_text(identity, self._default_identity())
+        if not journal.exists():
+            write_text(journal, "")
+        if not identity_meta.exists():
+            write_text(
+                identity_meta,
+                json.dumps(
+                    {"tasks_since_update": 0, "last_updated_at": "", "last_reason": "init"},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+            )
+
+    def _parse_scratchpad(self, content: str) -> Dict[str, List[str]]:
+        sections: Dict[str, List[str]] = {name: [] for name in self.SCRATCHPAD_SECTIONS}
+        current: Optional[str] = None
+        for raw_line in (content or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith("## "):
+                name = line[3:].strip()
+                current = name if name in sections else None
+                continue
+            if current and line.startswith("- "):
+                item = line[2:].strip()
+                if item and item != "(empty)":
+                    sections[current].append(item)
+        return sections
+
+    def _render_scratchpad(self, sections: Dict[str, List[str]]) -> str:
+        lines = ["# Scratchpad", "", f"UpdatedAt: {utc_now_iso()}", ""]
+        for section in self.SCRATCHPAD_SECTIONS:
+            lines.append(f"## {section}")
+            items = sections.get(section) or []
+            if items:
+                for item in items:
+                    lines.append(f"- {item}")
+            else:
+                lines.append("- (empty)")
+            lines.append("")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _extract_json_object(self, text: str) -> Optional[Dict[str, Any]]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+        try:
+            obj = json.loads(raw)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            chunk = raw[start : end + 1]
+            try:
+                obj = json.loads(chunk)
+                if isinstance(obj, dict):
+                    return obj
+            except Exception:
+                return None
+        return None
+
+    def _normalize_delta_obj(self, obj: Dict[str, Any]) -> Dict[str, List[str]]:
+        def _clean_list(field: str, max_items: int, max_len: int = 220) -> List[str]:
+            raw = obj.get(field, [])
+            if isinstance(raw, str):
+                raw = [raw]
+            if not isinstance(raw, list):
+                return []
+            out: List[str] = []
+            for v in raw:
+                item = re.sub(r"\s+", " ", str(v or "").strip())
+                if not item:
+                    continue
+                if len(item) > max_len:
+                    item = item[: max_len - 3].rstrip() + "..."
+                out.append(item)
+            return self._dedupe_keep_order(out, max_items=max_items)
+
+        return {
+            "project_updates": _clean_list("project_updates", max_items=8),
+            "open_threads": _clean_list("open_threads", max_items=10),
+            "investigate_later": _clean_list("investigate_later", max_items=12),
+            "evidence_quotes": _clean_list("evidence_quotes", max_items=12),
+            "drop_items": _clean_list("drop_items", max_items=20),
+        }
+
+    def _deterministic_scratchpad_delta(
+        self, task: Dict[str, Any], final_text: str, llm_trace: Dict[str, Any]
+    ) -> Dict[str, List[str]]:
+        task_text = re.sub(r"\s+", " ", str(task.get("text") or "").strip())
+        answer = re.sub(r"\s+", " ", str(final_text or "").strip())
+
+        project_updates: List[str] = []
+        if task_text:
+            project_updates.append(f"Task focus: {task_text[:160]}")
+        if answer:
+            project_updates.append(f"Latest result: {answer[:160]}")
+
+        open_threads: List[str] = []
+        investigate_later: List[str] = []
+        evidence_quotes: List[str] = []
+
+        for call in (llm_trace.get("tool_calls") or [])[:16]:
+            tool_name = str(call.get("tool") or "?")
+            args = call.get("args") or {}
+            result = str(call.get("result") or "")
+            is_error = bool(call.get("is_error"))
+
+            if tool_name == "run_shell":
+                cmd = args.get("cmd") if isinstance(args, dict) else None
+                if isinstance(cmd, list):
+                    cmd_str = " ".join([str(x) for x in cmd]).strip()
+                    if cmd_str:
+                        evidence_quotes.append(f"`run_shell {cmd_str}`")
+
+            first_line = result.splitlines()[0].strip() if result else ""
+            if first_line:
+                if len(first_line) > 180:
+                    first_line = first_line[:177] + "..."
+                if is_error or first_line.startswith("⚠️"):
+                    evidence_quotes.append(f"`{tool_name}` -> {first_line}")
+                    open_threads.append(f"Resolve {tool_name} issue: {first_line[:120]}")
+                else:
+                    evidence_quotes.append(f"`{tool_name}` -> {first_line}")
+
+        if not investigate_later and open_threads:
+            investigate_later.append("Investigate recurring tool failure patterns and preventive checks.")
+
+        return self._normalize_delta_obj(
+            {
+                "project_updates": project_updates,
+                "open_threads": open_threads,
+                "investigate_later": investigate_later,
+                "evidence_quotes": evidence_quotes,
+                "drop_items": [],
+            }
+        )
+
+    def _summarize_scratchpad_delta(
+        self, task: Dict[str, Any], final_text: str, llm_trace: Dict[str, Any]
+    ) -> Tuple[Dict[str, List[str]], Dict[str, Any], str]:
+        fallback = self._deterministic_scratchpad_delta(task, final_text, llm_trace)
+        prompt_text = self._safe_read(self.env.repo_path("prompts/SCRATCHPAD_SUMMARY.md"), fallback="")
+        if not prompt_text.strip():
+            return fallback, {}, "fallback:no_prompt"
+
+        payload = {
+            "task": {
+                "id": task.get("id"),
+                "type": task.get("type"),
+                "text": str(task.get("text") or "")[:1600],
+            },
+            "assistant_final_answer": str(final_text or "")[:2500],
+            "assistant_notes": [str(x)[:300] for x in (llm_trace.get("assistant_notes") or [])[:10]],
+            "tool_calls": (llm_trace.get("tool_calls") or [])[:20],
+        }
+
+        model = os.environ.get("OUROBOROS_MEMORY_MODEL", os.environ.get("OUROBOROS_MODEL", "openai/gpt-5.2"))
+        max_tokens = max(250, min(self._env_int("OUROBOROS_SCRATCHPAD_SUMMARY_MAX_TOKENS", 700), 2000))
+        usage: Dict[str, Any] = {}
+
+        try:
+            client = self._openrouter_client()
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": prompt_text},
+                    {
+                        "role": "user",
+                        "content": json.dumps(payload, ensure_ascii=False, indent=2),
+                    },
+                ],
+                max_tokens=max_tokens,
+            )
+            resp_dict = resp.model_dump()
+            usage = resp_dict.get("usage", {}) or {}
+            content = str((((resp_dict.get("choices") or [{}])[0].get("message") or {}).get("content")) or "")
+            parsed = self._extract_json_object(content)
+            if not parsed:
+                return fallback, usage, "fallback:unparseable"
+            return self._normalize_delta_obj(parsed), usage, "llm"
+        except Exception as e:
+            append_jsonl(
+                self.env.drive_path("logs") / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "scratchpad_summary_error",
+                    "task_id": task.get("id"),
+                    "error": repr(e),
+                },
+            )
+            return fallback, usage, "fallback:error"
+
+    def _apply_scratchpad_delta(
+        self, current_scratchpad: str, delta: Dict[str, List[str]]
+    ) -> Tuple[str, Dict[str, List[str]]]:
+        merged = self._parse_scratchpad(current_scratchpad or self._default_scratchpad())
+
+        drop_keys = {self._norm_item(x) for x in (delta.get("drop_items") or []) if str(x).strip()}
+        if drop_keys:
+            for section in self.SCRATCHPAD_SECTIONS:
+                merged[section] = [x for x in merged.get(section, []) if self._norm_item(x) not in drop_keys]
+
+        field_map = {
+            "CurrentProjects": "project_updates",
+            "OpenThreads": "open_threads",
+            "InvestigateLater": "investigate_later",
+            "RecentEvidence": "evidence_quotes",
+        }
+        limits = {
+            "CurrentProjects": 12,
+            "OpenThreads": 18,
+            "InvestigateLater": 24,
+            "RecentEvidence": 20,
+        }
+
+        for section, field in field_map.items():
+            merged[section] = self._dedupe_keep_order(
+                merged.get(section, []) + list(delta.get(field) or []),
+                max_items=limits[section],
+            )
+
+        return self._render_scratchpad(merged), merged
+
+    def _load_identity_meta(self) -> Dict[str, Any]:
+        path = self._identity_meta_path()
+        raw = self._safe_read(path, fallback="")
+        if raw.strip():
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return {
+                        "tasks_since_update": int(obj.get("tasks_since_update") or 0),
+                        "last_updated_at": str(obj.get("last_updated_at") or ""),
+                        "last_reason": str(obj.get("last_reason") or ""),
+                    }
+            except Exception:
+                pass
+        return {"tasks_since_update": 0, "last_updated_at": "", "last_reason": ""}
+
+    def _save_identity_meta(self, meta: Dict[str, Any]) -> None:
+        write_text(self._identity_meta_path(), json.dumps(meta, ensure_ascii=False, indent=2))
+
+    def _should_update_identity(self, meta: Dict[str, Any]) -> bool:
+        task_cadence = max(1, min(self._env_int("OUROBOROS_IDENTITY_UPDATE_EVERY_TASKS", 5), 200))
+        hour_cadence = max(1, min(self._env_int("OUROBOROS_IDENTITY_UPDATE_EVERY_HOURS", 12), 24 * 30))
+
+        if int(meta.get("tasks_since_update") or 0) >= task_cadence:
+            return True
+
+        last_ts = self._parse_iso_to_unix(str(meta.get("last_updated_at") or ""))
+        if last_ts is None:
+            return True
+
+        age_sec = time.time() - last_ts
+        return age_sec >= (hour_cadence * 3600)
+
+    def _build_identity_from_data(self, scratchpad_sections: Dict[str, List[str]]) -> str:
+        tools_tail = self._safe_tail(
+            self.env.drive_path("logs/tools.jsonl"),
+            max_lines=max(100, min(self._env_int("OUROBOROS_IDENTITY_TOOLS_LINES", 450), 2000)),
+            max_chars=max(15000, min(self._env_int("OUROBOROS_IDENTITY_TOOLS_CHARS", 120000), 300000)),
+        )
+        journal_tail = self._safe_tail(
+            self._scratchpad_journal_path(),
+            max_lines=max(60, min(self._env_int("OUROBOROS_IDENTITY_JOURNAL_LINES", 240), 2000)),
+            max_chars=max(10000, min(self._env_int("OUROBOROS_IDENTITY_JOURNAL_CHARS", 90000), 250000)),
+        )
+
+        tool_success: Counter[str] = Counter()
+        tool_errors: Counter[str] = Counter()
+        error_signatures: Counter[str] = Counter()
+        investigate_counter: Counter[str] = Counter()
+
+        for row in self._parse_jsonl_lines(tools_tail):
+            tool = str(row.get("tool") or "unknown")
+            preview = str(row.get("result_preview") or "").strip()
+            is_error = preview.startswith("⚠️")
+            if is_error:
+                tool_errors[tool] += 1
+                first = preview.splitlines()[0].strip() if preview else ""
+                if first:
+                    error_signatures[first[:160]] += 1
+            else:
+                tool_success[tool] += 1
+
+        for row in self._parse_jsonl_lines(journal_tail):
+            delta = row.get("delta")
+            if not isinstance(delta, dict):
+                continue
+            items = delta.get("investigate_later") or []
+            if isinstance(items, list):
+                for item in items:
+                    txt = re.sub(r"\s+", " ", str(item or "").strip())
+                    if txt:
+                        investigate_counter[txt[:160]] += 1
+
+        strengths = [f"{tool}: {count} successful runs" for tool, count in tool_success.most_common(4)]
+        if not strengths:
+            strengths = ["Collecting stable success patterns from recent tasks."]
+
+        weaknesses = [f"{tool}: {count} recent errors" for tool, count in tool_errors.most_common(4)]
+        if not weaknesses:
+            weaknesses = ["No recurring tool failures detected in the latest window."]
+
+        mistakes = [f"{msg} (x{count})" for msg, count in error_signatures.most_common(4)]
+        if not mistakes:
+            mistakes = ["No repeated error signature detected yet."]
+
+        preferred: List[str] = []
+        for tool, _count in tool_success.most_common(4):
+            if tool == "repo_list":
+                preferred.append("Map directories first with `repo_list`, then do targeted reads.")
+            elif tool == "repo_read":
+                preferred.append("Inspect exact files with `repo_read` before proposing edits.")
+            elif tool == "run_shell":
+                preferred.append("Use shell checks to verify runtime state before assumptions.")
+            elif tool == "git_status":
+                preferred.append("Check git cleanliness before and after repository operations.")
+            elif tool == "web_search":
+                preferred.append("Use web search only for truly fresh external facts.")
+        if not preferred:
+            preferred = ["Use small verifiable steps and log outcomes before next action."]
+
+        growth_focus = []
+        growth_focus.extend([x for x in (scratchpad_sections.get("OpenThreads") or [])[:2]])
+        growth_focus.extend([x for x, _ in investigate_counter.most_common(2)])
+        if not growth_focus:
+            growth_focus = ["Improve robustness of multi-step tasks with less context bloat."]
+        growth_focus = self._dedupe_keep_order(growth_focus, max_items=4)
+
+        lines = [
+            "# Identity",
+            "",
+            f"UpdatedAt: {utc_now_iso()}",
+            "",
+            "## Strengths",
+        ]
+        lines.extend([f"- {x}" for x in strengths])
+        lines.extend(["", "## Weaknesses"])
+        lines.extend([f"- {x}" for x in weaknesses])
+        lines.extend(["", "## FrequentMistakes"])
+        lines.extend([f"- {x}" for x in mistakes])
+        lines.extend(["", "## PreferredApproaches"])
+        lines.extend([f"- {x}" for x in self._dedupe_keep_order(preferred, max_items=4)])
+        lines.extend(["", "## CurrentGrowthFocus"])
+        lines.extend([f"- {x}" for x in growth_focus])
+        lines.append("")
+        return "\n".join(lines)
+
+    def _maybe_update_identity(self, scratchpad_sections: Dict[str, List[str]], reason: str = "task_complete") -> None:
+        meta = self._load_identity_meta()
+        meta["tasks_since_update"] = int(meta.get("tasks_since_update") or 0) + 1
+
+        if not self._should_update_identity(meta):
+            self._save_identity_meta(meta)
+            return
+
+        identity_md = self._build_identity_from_data(scratchpad_sections)
+        write_text(self._identity_path(), identity_md)
+        meta["tasks_since_update"] = 0
+        meta["last_updated_at"] = utc_now_iso()
+        meta["last_reason"] = reason
+        self._save_identity_meta(meta)
+
+        append_jsonl(
+            self.env.drive_path("logs") / "events.jsonl",
+            {
+                "ts": utc_now_iso(),
+                "type": "identity_updated",
+                "reason": reason,
+            },
+        )
+
+    def _update_memory_after_task(self, task: Dict[str, Any], final_text: str, llm_trace: Dict[str, Any]) -> None:
+        drive_logs = self.env.drive_path("logs")
+        try:
+            self._ensure_memory_files()
+            delta, summary_usage, summary_source = self._summarize_scratchpad_delta(task, final_text, llm_trace)
+            if summary_usage:
+                self._pending_events.append(
+                    {
+                        "type": "llm_usage",
+                        "task_id": task.get("id"),
+                        "provider": "openrouter",
+                        "usage": summary_usage,
+                        "source": "scratchpad_summary",
+                        "ts": utc_now_iso(),
+                    }
+                )
+
+            current_scratchpad = self._safe_read(self._scratchpad_path(), fallback=self._default_scratchpad())
+            merged_text, merged_sections = self._apply_scratchpad_delta(current_scratchpad, delta)
+            write_text(self._scratchpad_path(), merged_text)
+
+            journal_entry = {
+                "ts": utc_now_iso(),
+                "task_id": task.get("id"),
+                "task_type": task.get("type"),
+                "summary_source": summary_source,
+                "task_text_preview": truncate_for_log(str(task.get("text") or ""), 600),
+                "final_answer_preview": truncate_for_log(str(final_text or ""), 600),
+                "delta": delta,
+            }
+            append_jsonl(self._scratchpad_journal_path(), journal_entry)
+
+            append_jsonl(
+                drive_logs / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "scratchpad_updated",
+                    "task_id": task.get("id"),
+                    "summary_source": summary_source,
+                    "projects": len(merged_sections.get("CurrentProjects") or []),
+                    "open_threads": len(merged_sections.get("OpenThreads") or []),
+                },
+            )
+
+            self._maybe_update_identity(merged_sections, reason="task_complete")
+        except Exception as e:
+            append_jsonl(
+                drive_logs / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "memory_update_error",
+                    "task_id": task.get("id"),
+                    "error": repr(e),
+                    "traceback": truncate_for_log(traceback.format_exc(), 2000),
+                },
+            )
 
     def _emit_progress(self, text: str) -> None:
         """Push a progress message to the supervisor queue (best-effort, non-blocking)."""
@@ -335,17 +889,19 @@ class OuroborosAgent:
             notes_md = self._safe_read(self.env.drive_path("NOTES.md"))
             state_json = self._safe_read(self.env.drive_path("state/state.json"), fallback="{}")
             index_summaries = self._safe_read(self.env.drive_path("index/summaries.json"))
+            self._ensure_memory_files()
+            scratchpad_raw = self._safe_read(self._scratchpad_path(), fallback=self._default_scratchpad())
+            identity_raw = self._safe_read(self._identity_path(), fallback=self._default_identity())
 
-            def _env_int(name: str, default: int) -> int:
-                try:
-                    return int(os.environ.get(name, str(default)))
-                except Exception:
-                    return default
+            chat_lines = max(40, min(self._env_int("OUROBOROS_CONTEXT_CHAT_LINES", 220), 2000))
+            artifact_lines = max(20, min(self._env_int("OUROBOROS_CONTEXT_ARTIFACT_LINES", 160), 2000))
+            chat_chars = max(5000, min(self._env_int("OUROBOROS_CONTEXT_CHAT_CHARS", 60000), 300000))
+            artifact_chars = max(3000, min(self._env_int("OUROBOROS_CONTEXT_ARTIFACT_CHARS", 35000), 200000))
+            scratchpad_chars = max(1500, min(self._env_int("OUROBOROS_CONTEXT_SCRATCHPAD_CHARS", 12000), 120000))
+            identity_chars = max(1200, min(self._env_int("OUROBOROS_CONTEXT_IDENTITY_CHARS", 9000), 120000))
 
-            chat_lines = max(40, min(_env_int("OUROBOROS_CONTEXT_CHAT_LINES", 220), 2000))
-            artifact_lines = max(20, min(_env_int("OUROBOROS_CONTEXT_ARTIFACT_LINES", 160), 2000))
-            chat_chars = max(5000, min(_env_int("OUROBOROS_CONTEXT_CHAT_CHARS", 60000), 300000))
-            artifact_chars = max(3000, min(_env_int("OUROBOROS_CONTEXT_ARTIFACT_CHARS", 35000), 200000))
+            scratchpad_ctx = self._clip_text(scratchpad_raw, max_chars=scratchpad_chars)
+            identity_ctx = self._clip_text(identity_raw, max_chars=identity_chars)
 
             chat_log_recent = self._safe_tail(
                 self.env.drive_path("logs/chat.jsonl"), max_lines=chat_lines, max_chars=chat_chars
@@ -393,6 +949,8 @@ class OuroborosAgent:
                 {"role": "system", "content": "## README.md\n\n" + readme_md},
                 {"role": "system", "content": "## Drive state (state/state.json)\n\n" + state_json},
                 {"role": "system", "content": "## NOTES.md (Drive)\n\n" + notes_md},
+                {"role": "system", "content": "## Working scratchpad (Drive: memory/scratchpad.md)\n\n" + scratchpad_ctx},
+                {"role": "system", "content": "## Self-model identity (Drive: memory/identity.md)\n\n" + identity_ctx},
                 {"role": "system", "content": "## Index summaries (Drive: index/summaries.json)\n\n" + index_summaries},
                 {"role": "system", "content": "## Runtime context (JSON)\n\n" + json.dumps(runtime_ctx, ensure_ascii=False, indent=2)},
             ]
@@ -413,8 +971,9 @@ class OuroborosAgent:
             tools = self._tools_schema()
 
             usage: Dict[str, Any] = {}
+            llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
             try:
-                text, usage = self._llm_with_tools(messages=messages, tools=tools)
+                text, usage, llm_trace = self._llm_with_tools(messages=messages, tools=tools)
             except Exception as e:
                 tb = traceback.format_exc()
                 append_jsonl(
@@ -442,6 +1001,9 @@ class OuroborosAgent:
                     "ts": utc_now_iso(),
                 }
             )
+
+            # Memory updates are best-effort and must never block the main answer.
+            self._update_memory_after_task(task=task, final_text=text or "", llm_trace=llm_trace)
 
             # Telegram formatting: render Markdown -> Telegram HTML directly from the worker (best-effort).
             # Rationale: supervisor currently sends plain text; parse_mode is not guaranteed there.
@@ -789,7 +1351,9 @@ class OuroborosAgent:
             default_headers=headers,
         )
 
-    def _llm_with_tools(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
+    def _llm_with_tools(
+        self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]
+    ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
         model = os.environ.get("OUROBOROS_MODEL", "openai/gpt-5.2")
         client = self._openrouter_client()
         drive_logs = self.env.drive_path("logs")
@@ -818,6 +1382,13 @@ class OuroborosAgent:
         max_tool_rounds = int(os.environ.get("OUROBOROS_MAX_TOOL_ROUNDS", "20"))
         llm_max_retries = int(os.environ.get("OUROBOROS_LLM_MAX_RETRIES", "3"))
         last_usage: Dict[str, Any] = {}
+        llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
+
+        def _safe_args(v: Any) -> Any:
+            try:
+                return json.loads(json.dumps(v, ensure_ascii=False, default=str))
+            except Exception:
+                return {"_repr": repr(v)}
 
         for round_idx in range(max_tool_rounds):
             # ---- LLM call with retry on transient errors ----
@@ -860,7 +1431,7 @@ class OuroborosAgent:
                     f"⚠️ Не удалось получить ответ от модели после {llm_max_retries} попыток.\n"
                     f"Ошибка: {type(last_llm_error).__name__}: {last_llm_error}\n"
                     f"Попробуй повторить запрос через минуту."
-                ), last_usage
+                ), last_usage, llm_trace
 
             last_usage = resp_dict.get("usage", {}) or {}
 
@@ -875,6 +1446,10 @@ class OuroborosAgent:
                 # Emit the LLM's reasoning/plan as a progress message (human-readable narration)
                 if content and content.strip():
                     self._emit_progress(content.strip())
+                    llm_trace["assistant_notes"] = self._dedupe_keep_order(
+                        list(llm_trace.get("assistant_notes") or []) + [content.strip()[:320]],
+                        max_items=20,
+                    )
 
                 round_narrations: List[str] = []
 
@@ -895,6 +1470,14 @@ class OuroborosAgent:
                             {"ts": utc_now_iso(), "tool": fn_name, "error": "json_parse", "detail": repr(e)},
                         )
                         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                        llm_trace["tool_calls"].append(
+                            {
+                                "tool": fn_name,
+                                "args": {},
+                                "result": truncate_for_log(result, 600),
+                                "is_error": True,
+                            }
+                        )
                         round_narrations.append(self._narrate_tool(fn_name, {}, result, False))
                         continue
 
@@ -909,6 +1492,14 @@ class OuroborosAgent:
                             {"ts": utc_now_iso(), "tool": fn_name, "error": "unknown_tool"},
                         )
                         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                        llm_trace["tool_calls"].append(
+                            {
+                                "tool": fn_name,
+                                "args": _safe_args(args),
+                                "result": truncate_for_log(result, 600),
+                                "is_error": True,
+                            }
+                        )
                         round_narrations.append(self._narrate_tool(fn_name, args, result, False))
                         continue
 
@@ -946,6 +1537,14 @@ class OuroborosAgent:
                         },
                     )
                     messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                    llm_trace["tool_calls"].append(
+                        {
+                            "tool": fn_name,
+                            "args": _safe_args(args),
+                            "result": truncate_for_log(result, 700),
+                            "is_error": (not tool_ok) or str(result).startswith("⚠️"),
+                        }
+                    )
                     round_narrations.append(self._narrate_tool(fn_name, args, result, tool_ok))
 
                 # ---- Batch-send narration for this tool round ----
@@ -959,9 +1558,14 @@ class OuroborosAgent:
 
                 continue
 
-            return (content or ""), last_usage
+            if content and content.strip():
+                llm_trace["assistant_notes"] = self._dedupe_keep_order(
+                    list(llm_trace.get("assistant_notes") or []) + [content.strip()[:320]],
+                    max_items=20,
+                )
+            return (content or ""), last_usage, llm_trace
 
-        return "⚠️ Превышен лимит tool rounds. Остановился.", last_usage
+        return "⚠️ Превышен лимит tool rounds. Остановился.", last_usage, llm_trace
 
     def _tools_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -1499,5 +2103,5 @@ def make_agent(repo_dir: str, drive_root: str, event_queue: Any = None) -> Ourob
 
 
 def smoke_test() -> str:
-    required = ["prompts/BASE.md", "README.md", "WORLD.md"]
+    required = ["prompts/BASE.md", "prompts/SCRATCHPAD_SUMMARY.md", "README.md", "WORLD.md"]
     return "OK: " + ", ".join(required)

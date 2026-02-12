@@ -181,6 +181,21 @@ GITHUB_REPO = get_secret("GITHUB_REPO", default="ouroboros")
 MAX_WORKERS = int(get_secret("OUROBOROS_MAX_WORKERS", default="5") or "5")
 MODEL_MAIN = get_secret("OUROBOROS_MODEL", default="openai/gpt-5.2")
 
+def as_bool(v: Any, default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off", ""):
+        return False
+    return default
+
+IDLE_ENABLED = as_bool(get_secret("OUROBOROS_IDLE_ENABLED", default="1"), default=True)
+IDLE_COOLDOWN_SEC = max(60, int(get_secret("OUROBOROS_IDLE_COOLDOWN_SEC", default="900") or "900"))
+IDLE_BUDGET_PCT_CAP = max(1.0, min(float(get_secret("OUROBOROS_IDLE_BUDGET_PCT_CAP", default="35") or "35"), 100.0))
+IDLE_MAX_PER_DAY = max(1, int(get_secret("OUROBOROS_IDLE_MAX_PER_DAY", default="8") or "8"))
+
 # expose needed env to workers (do not print)
 os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
@@ -207,9 +222,30 @@ REPO_DIR.mkdir(parents=True, exist_ok=True)
 
 STATE_PATH = DRIVE_ROOT / "state" / "state.json"
 
+def ensure_state_defaults(st: Dict[str, Any]) -> Dict[str, Any]:
+    st.setdefault("created_at", datetime.datetime.now(datetime.timezone.utc).isoformat())
+    st.setdefault("owner_id", None)
+    st.setdefault("owner_chat_id", None)
+    st.setdefault("tg_offset", 0)
+    st.setdefault("spent_usd", 0.0)
+    st.setdefault("spent_calls", 0)
+    st.setdefault("spent_tokens_prompt", 0)
+    st.setdefault("spent_tokens_completion", 0)
+    st.setdefault("approvals", {})
+    st.setdefault("session_id", uuid.uuid4().hex)
+    st.setdefault("current_branch", None)
+    st.setdefault("current_sha", None)
+    st.setdefault("last_owner_message_at", "")
+    st.setdefault("last_idle_task_at", "")
+    st.setdefault("idle_cursor", 0)
+    if not isinstance(st.get("idle_stats"), dict):
+        st["idle_stats"] = {}
+    return st
+
 def load_state() -> Dict[str, Any]:
     if STATE_PATH.exists():
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        st = ensure_state_defaults(json.loads(STATE_PATH.read_text(encoding="utf-8")))
+        return st
     st = {
         "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "owner_id": None,
@@ -223,11 +259,16 @@ def load_state() -> Dict[str, Any]:
         "session_id": uuid.uuid4().hex,
         "current_branch": None,
         "current_sha": None,
+        "last_owner_message_at": "",
+        "last_idle_task_at": "",
+        "idle_cursor": 0,
+        "idle_stats": {},
     }
     STATE_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
     return st
 
 def save_state(st: Dict[str, Any]) -> None:
+    st = ensure_state_defaults(st)
     STATE_PATH.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
 
 def append_jsonl(path: pathlib.Path, obj: Dict[str, Any]) -> None:
@@ -605,6 +646,110 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
     st["spent_tokens_completion"] = int(st.get("spent_tokens_completion") or 0) + int(usage.get("completion_tokens") or 0)
     save_state(st)
 
+def parse_iso_to_ts(iso_ts: str) -> Optional[float]:
+    txt = str(iso_ts or "").strip()
+    if not txt:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(txt.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return None
+
+def budget_pct(st: Dict[str, Any]) -> float:
+    spent = float(st.get("spent_usd") or 0.0)
+    total = float(get_secret("TOTAL_BUDGET", default=str(TOTAL_BUDGET_DEFAULT)) or TOTAL_BUDGET_DEFAULT)
+    if total <= 0:
+        return 0.0
+    return (spent / total) * 100.0
+
+def idle_task_catalog() -> List[Tuple[str, str]]:
+    return [
+        (
+            "memory_consolidation",
+            "Idle internal task: consolidate working memory. Update memory/scratchpad.md from recent logs and add compact evidence quotes.",
+        ),
+        (
+            "performance_analysis",
+            "Idle internal task: analyze recent tools/events logs and report key bottlenecks, recurring failures, and optimization opportunities.",
+        ),
+        (
+            "code_improvement_idea",
+            "Idle internal task: inspect your own codebase and propose one safe high-impact improvement with rationale and validation plan.",
+        ),
+        (
+            "web_learning",
+            "Idle internal task: use web_search for one focused topic that can improve reliability/efficiency of this system, then summarize practical takeaways.",
+        ),
+        (
+            "owner_idea_proposal",
+            "Idle internal task: prepare one concise proactive idea for the owner based on current priorities and unresolved threads.",
+        ),
+    ]
+
+def enqueue_idle_task_if_needed() -> None:
+    if not IDLE_ENABLED:
+        return
+    if PENDING or RUNNING:
+        return
+
+    st = load_state()
+    owner_chat_id = st.get("owner_chat_id")
+    if not owner_chat_id:
+        return
+
+    now = time.time()
+    last_owner_ts = parse_iso_to_ts(str(st.get("last_owner_message_at") or ""))
+    if last_owner_ts is not None and (now - last_owner_ts) < IDLE_COOLDOWN_SEC:
+        return
+
+    last_idle_ts = parse_iso_to_ts(str(st.get("last_idle_task_at") or ""))
+    if last_idle_ts is not None and (now - last_idle_ts) < IDLE_COOLDOWN_SEC:
+        return
+
+    if budget_pct(st) >= IDLE_BUDGET_PCT_CAP:
+        return
+
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    idle_stats = st.get("idle_stats") if isinstance(st.get("idle_stats"), dict) else {}
+    day_stat = idle_stats.get(today) if isinstance(idle_stats.get(today), dict) else {}
+    day_count = int(day_stat.get("count") or 0)
+    if day_count >= IDLE_MAX_PER_DAY:
+        return
+
+    catalog = idle_task_catalog()
+    cursor = int(st.get("idle_cursor") or 0)
+    kind, text = catalog[cursor % len(catalog)]
+    tid = uuid.uuid4().hex[:8]
+    PENDING.append({"id": tid, "type": "idle", "chat_id": int(owner_chat_id), "text": text})
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    st["idle_cursor"] = cursor + 1
+    st["last_idle_task_at"] = now_iso
+    idle_stats[today] = {
+        "count": day_count + 1,
+        "last_task_id": tid,
+        "last_kind": kind,
+        "last_at": now_iso,
+    }
+    # Keep recent days only.
+    if len(idle_stats) > 14:
+        for d in sorted(idle_stats.keys())[:-14]:
+            idle_stats.pop(d, None)
+    st["idle_stats"] = idle_stats
+    save_state(st)
+
+    append_jsonl(
+        DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
+            "ts": now_iso,
+            "type": "idle_task_enqueued",
+            "task_id": tid,
+            "kind": kind,
+            "budget_pct": budget_pct(st),
+        },
+    )
+    send_with_budget(int(owner_chat_id), f"🧠 Idle task queued: {tid} ({kind})")
+
 def respawn_worker(wid: int) -> None:
     in_q = CTX.Queue()
     proc = CTX.Process(target=worker_main, args=(wid, in_q, EVENT_Q, str(REPO_DIR), str(DRIVE_ROOT)))
@@ -660,6 +805,13 @@ def status_text() -> str:
     lines.append(f"spent_usd: {st.get('spent_usd')}")
     lines.append(f"spent_calls: {st.get('spent_calls')}")
     lines.append(f"prompt_tokens: {st.get('spent_tokens_prompt')}, completion_tokens: {st.get('spent_tokens_completion')}")
+    lines.append(
+        "idle: "
+        + f"enabled={int(IDLE_ENABLED)}, cooldown_sec={IDLE_COOLDOWN_SEC}, "
+        + f"budget_cap_pct={IDLE_BUDGET_PCT_CAP:.1f}, max_per_day={IDLE_MAX_PER_DAY}"
+    )
+    lines.append(f"last_owner_message_at: {st.get('last_owner_message_at') or '-'}")
+    lines.append(f"last_idle_task_at: {st.get('last_idle_task_at') or '-'}")
     return "\n".join(lines)
 
 def cancel_task_by_id(task_id: str) -> bool:
@@ -704,6 +856,23 @@ def handle_approval(chat_id: int, text: str) -> bool:
         except Exception as e:
             send_with_budget(chat_id, f"❌ Ошибка промоута в stable: {e}")
 
+    if cmd == "/approve" and approvals[approval_id].get("type") == "reindex":
+        reason = str(approvals[approval_id].get("reason") or "").strip()
+        tid = uuid.uuid4().hex[:8]
+        PENDING.append(
+            {
+                "id": tid,
+                "type": "task",
+                "chat_id": chat_id,
+                "text": (
+                    "Approved internal task: run full reindex of drive/index/summaries.json. "
+                    "Rebuild summaries carefully, report what changed, and include validation checks. "
+                    f"Reason: {reason}"
+                ).strip(),
+            }
+        )
+        send_with_budget(chat_id, f"✅ Reindex approval accepted. Queued task {tid}.")
+
     return True
 
 # start
@@ -716,6 +885,10 @@ append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
     "branch": load_state().get("current_branch"),
     "sha": load_state().get("current_sha"),
     "max_workers": MAX_WORKERS,
+    "idle_enabled": IDLE_ENABLED,
+    "idle_cooldown_sec": IDLE_COOLDOWN_SEC,
+    "idle_budget_pct_cap": IDLE_BUDGET_PCT_CAP,
+    "idle_max_per_day": IDLE_MAX_PER_DAY,
 })
 
 offset = int(load_state().get("tg_offset") or 0)
@@ -794,6 +967,71 @@ while True:
                 )
             continue
 
+        if et == "schedule_task":
+            st = load_state()
+            owner_chat_id = st.get("owner_chat_id")
+            desc = str(evt.get("description") or "").strip()
+            if owner_chat_id and desc:
+                tid = uuid.uuid4().hex[:8]
+                PENDING.append(
+                    {
+                        "id": tid,
+                        "type": "task",
+                        "chat_id": int(owner_chat_id),
+                        "text": desc,
+                    }
+                )
+                send_with_budget(int(owner_chat_id), f"🗓️ Запланировал задачу {tid}: {desc}")
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "type": "schedule_task_event",
+                    "description": desc,
+                },
+            )
+            continue
+
+        if et == "cancel_task":
+            task_id = str(evt.get("task_id") or "").strip()
+            st = load_state()
+            owner_chat_id = st.get("owner_chat_id")
+            ok = cancel_task_by_id(task_id) if task_id else False
+            if owner_chat_id:
+                send_with_budget(int(owner_chat_id), f"{'✅' if ok else '❌'} cancel {task_id or '?'} (event)")
+            append_jsonl(
+                DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {
+                    "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "type": "cancel_task_event",
+                    "task_id": task_id,
+                    "ok": ok,
+                },
+            )
+            continue
+
+        if et == "reindex_request":
+            approval_id = uuid.uuid4().hex[:8]
+            st = load_state()
+            approvals = st.get("approvals") or {}
+            approvals[approval_id] = {
+                "type": "reindex",
+                "reason": evt.get("reason", ""),
+                "status": "pending",
+                "requested_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }
+            st["approvals"] = approvals
+            save_state(st)
+            if st.get("owner_chat_id"):
+                send_with_budget(
+                    int(st["owner_chat_id"]),
+                    f"🗂️ Запрос на полную реиндексацию:\n{evt.get('reason', '')}\n\n"
+                    f"Подтвердить: /approve {approval_id}\n"
+                    f"Отклонить: /deny {approval_id}",
+                )
+            continue
+
+    enqueue_idle_task_if_needed()
     assign_tasks()
 
     # Poll Telegram
@@ -821,11 +1059,13 @@ while True:
         from_user = msg.get("from") or {}
         user_id = int(from_user.get("id") or 0)
         text = str(msg.get("text") or "")
+        now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         st = load_state()
         if st.get("owner_id") is None:
             st["owner_id"] = user_id
             st["owner_chat_id"] = chat_id
+            st["last_owner_message_at"] = now_iso
             save_state(st)
             log_chat("in", chat_id, user_id, text)
             send_with_budget(chat_id, "✅ Owner registered. Ouroboros online.")
@@ -835,6 +1075,8 @@ while True:
             continue
 
         log_chat("in", chat_id, user_id, text)
+        st["last_owner_message_at"] = now_iso
+        save_state(st)
 
         # immutable supervisor commands
         if text.strip().lower().startswith("/panic"):
