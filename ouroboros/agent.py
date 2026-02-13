@@ -1728,20 +1728,44 @@ class OuroborosAgent:
                 )
 
             # Detect empty model response (successful call but no text)
-            if not isinstance(text, str) or not text.strip():
+            # Also detect "visually empty" responses (Markdown-only / formatting-only)
+            visible = self._strip_markdown(text) if isinstance(text, str) else ""
+            is_truly_empty = not isinstance(text, str) or not text.strip()
+            is_visually_empty = not visible.strip()
+
+            if is_truly_empty or is_visually_empty:
                 had_tools = len(llm_trace.get("tool_calls", [])) > 0
                 tool_calls_count = len(llm_trace.get("tool_calls", []))
-                append_jsonl(
-                    drive_logs / "events.jsonl",
-                    {
-                        "ts": utc_now_iso(),
-                        "type": "empty_model_response",
-                        "task_id": task.get("id"),
-                        "task_type": task.get("type"),
-                        "had_tools": had_tools,
-                        "tool_calls": tool_calls_count,
-                    },
-                )
+
+                if is_truly_empty:
+                    # Original empty response case
+                    append_jsonl(
+                        drive_logs / "events.jsonl",
+                        {
+                            "ts": utc_now_iso(),
+                            "type": "empty_model_response",
+                            "task_id": task.get("id"),
+                            "task_type": task.get("type"),
+                            "had_tools": had_tools,
+                            "tool_calls": tool_calls_count,
+                        },
+                    )
+                else:
+                    # Markdown-only response case (visible content is empty)
+                    append_jsonl(
+                        drive_logs / "events.jsonl",
+                        {
+                            "ts": utc_now_iso(),
+                            "type": "empty_model_visible_text",
+                            "task_id": task.get("id"),
+                            "task_type": task.get("type"),
+                            "had_tools": had_tools,
+                            "tool_calls": tool_calls_count,
+                            "text_len": len(text),
+                            "visible_len": len(visible),
+                        },
+                    )
+
                 text = "⚠️ Модель вернула пустой ответ. Попробуй переформулировать запрос или повторить."
 
             self._pending_events.append(
