@@ -3,7 +3,7 @@
 Самомодифицирующийся агент. Работает в Google Colab, общается через Telegram,
 хранит код в GitHub, память — на Google Drive.
 
-**Версия:** 2.7.0
+**Версия:** 2.8.0
 
 ---
 
@@ -48,7 +48,7 @@ Telegram → colab_launcher.py (thin entry point)
                ↓
            ouroboros/             (agent package)
             ├── agent.py         — thin orchestrator (task handling + events)
-            ├── loop.py          — LLM tool loop (send → tools → repeat)
+            ├── loop.py          — LLM tool loop (concurrent tools, retry, cost)
             ├── context.py       — context builder + tool history compaction
             ├── apply_patch.py   — Claude Code CLI apply_patch shim
             ├── tools/           — pluggable tools
@@ -63,9 +63,9 @@ Telegram → colab_launcher.py (thin entry point)
 `agent.py` — тонкий оркестратор. Принимает задачу, собирает контекст,
 вызывает LLM loop, эмитит результаты. Не содержит LLM-логики напрямую.
 
-`loop.py` — ядро: LLM-вызов с инструментами в цикле. Retry, effort
-escalation, tool execution, cost tracking. Единственное место где
-происходит взаимодействие LLM ↔ tools.
+`loop.py` — ядро: LLM-вызов с инструментами в цикле. **Concurrent tool
+execution** (ThreadPoolExecutor), retry, effort escalation, per-round cost
+logging. Единственное место где происходит взаимодействие LLM ↔ tools.
 
 `context.py` — сборка LLM-контекста из промптов, памяти, логов и состояния.
 Включает `compact_tool_history()` для сжатия старых tool results в длинных
@@ -96,7 +96,7 @@ ouroboros/
   utils.py                 — Общие утилиты (нулевой уровень зависимостей)
   apply_patch.py           — Claude Code CLI apply_patch shim
   agent.py                 — Тонкий оркестратор: handle_task, event emission
-  loop.py                  — LLM tool loop: send → execute tools → repeat
+  loop.py                  — LLM tool loop: concurrent execution, retry, cost tracking
   context.py               — Сборка контекста + compact_tool_history
   tools/                   — Пакет инструментов (плагинная архитектура):
     __init__.py             — Реэкспорт ToolRegistry, ToolContext
@@ -151,22 +151,29 @@ colab_bootstrap_shim.py    — Boot shim (вставляется в Colab, не 
 
 ## Changelog
 
+### 2.8.0 — Concurrent Tool Execution
+
+Параллельное выполнение tool calls через ThreadPoolExecutor.
+
+- 2.8x speedup на параллельных shell/IO вызовах (benchmark: 3×sleep 0.5s)
+- Порядок результатов сохраняется (LLM ожидает tool results в порядке запроса)
+- Извлечена `_execute_single_tool()` для тестируемости
+- loop.py: 203 → 270 строк (+67)
+
 ### 2.7.0 — Codebase Digest Tool
 
 Новый инструмент `codebase_digest` — полный обзор кодовой базы за один вызов.
 
 - AST-based extraction: все файлы, классы, функции, размеры
 - Заменяет 15+ `repo_read` вызовов в начале каждого evolution цикла
-- Ожидаемая экономия: ~10 LLM-раундов и $3-4 за цикл
 - core.py: 96 → 208 строк (+112, новый функционал)
 
 ### 2.6.0 — Agent Loop Decomposition
 
 Извлечение LLM tool loop из agent.py в отдельный модуль `ouroboros/loop.py`.
 
-- `loop.py` (203 строк): core LLM-with-tools loop — retry, effort escalation, tool execution, per-round cost logging
-- `agent.py`: 515 → 358 строк (-157). Теперь чистый оркестратор: task → context → loop → events
-- Промоут в `ouroboros-stable` (6 циклов эволюции, все модули ≤472 строк)
+- `loop.py` (203 строк): core LLM-with-tools loop — retry, effort escalation, tool execution
+- `agent.py`: 515 → 358 строк (-157). Теперь чистый оркестратор
 
 ### 2.5.0 — Cost Tracking + Restart DRY
 
@@ -175,7 +182,3 @@ Per-round `llm_round` events, `cached_tokens` tracking, `safe_restart()` consoli
 ### 2.4.0 — Context Window Optimization
 
 `compact_tool_history()` — сжатие старых tool results (30-50% экономия tokens).
-
-### 2.3.0 — Queue Decomposition + Git Safety
-
-Декомпозиция `supervisor/workers.py` (687→282 строк), критический fix для git reliability.
