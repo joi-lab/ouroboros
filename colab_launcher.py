@@ -360,6 +360,16 @@ while True:
                 RUNNING[task_id] = meta
             continue
 
+        if et == "typing_start":
+            try:
+                _chat_id = int(evt.get("chat_id") or 0)
+                if _chat_id:
+                    # Send typing action — supervisor handles it directly
+                    TG.send_chat_action(_chat_id, "typing")
+            except Exception:
+                pass
+            continue
+
         if et == "send_message":
             try:
                 _log_text = evt.get("log_text")

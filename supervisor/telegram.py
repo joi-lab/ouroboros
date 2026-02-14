@@ -89,6 +89,18 @@ class TelegramClient:
                 time.sleep(0.8 * (attempt + 1))
         return False, last_err
 
+    def send_chat_action(self, chat_id: int, action: str = "typing") -> bool:
+        """Send chat action (typing indicator). Best-effort, no retries."""
+        try:
+            r = requests.post(
+                f"{self.base}/sendChatAction",
+                data={"chat_id": chat_id, "action": action},
+                timeout=5,
+            )
+            return r.status_code == 200
+        except Exception:
+            return False
+
 
 # ---------------------------------------------------------------------------
 # Message splitting + formatting
