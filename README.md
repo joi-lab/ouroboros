@@ -3,7 +3,7 @@
 Самомодифицирующийся агент. Работает в Google Colab, общается через Telegram,
 хранит код в GitHub, память — на Google Drive.
 
-**Версия:** 2.21.0
+**Версия:** 2.22.0
 
 ---
 
@@ -156,6 +156,15 @@ colab_bootstrap_shim.py    — Boot shim (вставляется в Colab, не 
 
 ## Changelog
 
+### 2.22.0 — Budget Guard: Round & Cost Limits
+
+Prevents runaway tasks from burning the budget. Tasks that hit limits get a clean forced-finish instead of infinite loops.
+
+- `ouroboros/loop.py`: `max_rounds` (default=50) + `budget_remaining_usd` (40% threshold) parameters
+- When limit hit: LLM gets one final call WITHOUT tools to produce a summary
+- `ouroboros/agent.py`: Reads budget from state.json, passes to loop
+- Critical for budget conservation: previous tasks ran up to 125+ rounds unchecked
+
 ### 2.21.0 — True Process Restart via os.execv
 
 Fixed the fundamental restart problem: `safe_restart` only updated code on disk but the supervisor kept old modules in memory. Workers spawned after restart still used stale code.
@@ -183,12 +192,3 @@ Added budget remaining info to LLM runtime context so agent can make cost-aware 
 - `ouroboros/context.py`: Budget injection (total/spent/remaining USD) into runtime context
 - Restart to activate spawn workers (v2.19.0), prompt caching, tool argument compaction (v2.19.1)
 - All improvements from v2.14.0-v2.19.1 now live in production
-
-### 2.19.0 — Fork→Spawn Process Model
-
-Switched worker process model from `fork` to `spawn` to eliminate stale code inheritance.
-
-- `supervisor/workers.py`: `mp.get_context("spawn")` ensures fresh Python interpreter for each worker
-- Workers now start from clean slate, no inherited modules/state from supervisor
-- Combined with `safe_restart`, this should fix the persistent stale code issue
-- Prompt caching support added to context builder (cache_control on static content)

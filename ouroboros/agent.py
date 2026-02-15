@@ -173,6 +173,18 @@ class OuroborosAgent:
                     "task_id": task.get("id"), **cap_info,
                 })
 
+            # Read budget remaining for cost guard
+            budget_remaining = None
+            try:
+                state_path = self.env.drive_path("state") / "state.json"
+                state_data = json.loads(read_text(state_path))
+                total_budget = float(os.environ.get("TOTAL_BUDGET", 0))
+                spent = float(state_data.get("spent_usd", 0))
+                if total_budget > 0:
+                    budget_remaining = max(0, total_budget - spent)
+            except Exception:
+                pass
+
             # --- LLM loop (delegated to loop.py) ---
             usage: Dict[str, Any] = {}
             llm_trace: Dict[str, Any] = {"assistant_notes": [], "tool_calls": []}
@@ -185,6 +197,7 @@ class OuroborosAgent:
                     emit_progress=self._emit_progress,
                     incoming_messages=self._incoming_messages,
                     task_type=str(task.get("type") or ""),
+                    budget_remaining_usd=budget_remaining,
                 )
             except Exception as e:
                 tb = traceback.format_exc()

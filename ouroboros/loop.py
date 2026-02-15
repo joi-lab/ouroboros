@@ -100,12 +100,18 @@ def run_llm_loop(
     emit_progress: Callable[[str], None],
     incoming_messages: queue.Queue,
     task_type: str = "",
+    max_rounds: int = 50,
+    budget_remaining_usd: Optional[float] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """
     Core LLM-with-tools loop.
 
     Sends messages to LLM, executes tool calls, retries on errors,
     escalates reasoning effort for long tasks.
+
+    Args:
+        max_rounds: Maximum number of LLM rounds before forcing completion (default: 50)
+        budget_remaining_usd: If set, forces completion when task cost exceeds 40% of this budget
 
     Returns: (final_text, accumulated_usage, llm_trace)
     """
@@ -281,6 +287,31 @@ def run_llm_loop(
             _maybe_raise_effort("high")
         if error_count >= 4:
             _maybe_raise_effort("xhigh")
+
+        # --- Budget / round guards ---
+        should_finish = False
+        finish_reason = ""
+
+        if round_idx >= max_rounds:
+            should_finish = True
+            finish_reason = f"Достигнут лимит раундов ({max_rounds}). Заверши работу."
+        elif budget_remaining_usd is not None:
+            task_cost = accumulated_usage.get("cost", 0)
+            if task_cost > budget_remaining_usd * 0.4:
+                should_finish = True
+                finish_reason = f"Задача потратила ${task_cost:.3f} (40% от оставшегося бюджета ${budget_remaining_usd:.2f}). Заверши работу."
+
+        if should_finish:
+            messages.append({"role": "system", "content": f"[LIMIT] {finish_reason} Дай финальный ответ сейчас."})
+            try:
+                resp_msg, usage = llm.chat(
+                    messages=messages, model=active_model, tools=None,
+                    reasoning_effort=active_effort,
+                )
+                add_usage(accumulated_usage, usage)
+                return (resp_msg.get("content") or finish_reason), accumulated_usage, llm_trace
+            except Exception:
+                return finish_reason, accumulated_usage, llm_trace
 
     # Unreachable but keeps type checkers happy
     return "", accumulated_usage, llm_trace
