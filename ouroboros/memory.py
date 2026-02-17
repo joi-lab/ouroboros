@@ -110,7 +110,11 @@ class Memory:
                 dir_raw = str(e.get("direction", "")).lower()
                 direction = "→" if dir_raw in ("out", "outgoing") else "←"
                 ts = str(e.get("ts", ""))[:16]
-                text = short(str(e.get("text", "")), 300)
+                raw_text = str(e.get("text", ""))
+                if dir_raw in ("out", "outgoing"):
+                    text = short(raw_text, 800)
+                else:
+                    text = raw_text  # never truncate creator's messages
                 lines.append(f"{direction} [{ts}] {text}")
 
             return f"Показано {len(entries)} сообщений:\n\n" + "\n".join(lines)
@@ -153,9 +157,13 @@ class Memory:
             direction = "→" if dir_raw in ("out", "outgoing") else "←"
             ts_full = e.get("ts", "")
             ts_hhmm = ts_full[11:16] if len(ts_full) >= 16 else ""
-            # Truncate outgoing messages to 500 chars, incoming to 300 chars
-            truncate_len = 500 if dir_raw in ("out", "outgoing") else 300
-            text = short(str(e.get("text", "")), truncate_len)
+            # Creator messages: no truncation (most valuable context)
+            # Outgoing messages: truncate to 800 chars
+            raw_text = str(e.get("text", ""))
+            if dir_raw in ("out", "outgoing"):
+                text = short(raw_text, 800)
+            else:
+                text = raw_text  # never truncate creator's messages
             lines.append(f"{direction} {ts_hhmm} {text}")
         return "\n".join(lines)
 
