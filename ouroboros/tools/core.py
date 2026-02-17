@@ -10,7 +10,7 @@ import pathlib
 from typing import Any, Dict, List, Tuple
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import read_text, safe_relpath
+from ouroboros.utils import read_text, safe_relpath, utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -268,6 +268,27 @@ Now write a comprehensive summary:"""
             model=model,
             max_tokens=4096,
         )
+
+        # Track cost in budget system
+        if usage:
+            usage_event = {
+                "type": "llm_usage",
+                "ts": utc_now_iso(),
+                "task_id": ctx.task_id if ctx.task_id else "",
+                "usage": {
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "cost": usage.get("cost", 0),
+                },
+            }
+            if ctx.event_queue is not None:
+                try:
+                    ctx.event_queue.put_nowait(usage_event)
+                except Exception:
+                    if hasattr(ctx, "pending_events"):
+                        ctx.pending_events.append(usage_event)
+            elif hasattr(ctx, "pending_events"):
+                ctx.pending_events.append(usage_event)
 
         summary = response.get("content", "")
         if not summary:
