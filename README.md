@@ -3,7 +3,7 @@
 Самосоздающийся агент. Работает в Google Colab, общается через Telegram,
 хранит код в GitHub, память — на Google Drive.
 
-**Версия:** 4.22.0
+**Версия:** 4.23.0
 
 ---
 
@@ -140,6 +140,11 @@ Bible check → коммит. Подробности в `prompts/SYSTEM.md`.
 ---
 
 ## Changelog
+
+### v4.23.0 — Empty Response Fallback
+- Automatic fallback to gemini-2.5-pro when primary model returns empty responses 3x
+- Raw empty response logging for debugging (llm_empty_response events)
+- Configurable fallback model via OUROBOROS_MODEL_FALLBACK env var
 
 ### 4.22.0 — Empty Response Resilience + Budget Category Fix
 - **Fix**: Empty LLM responses now properly retry with exponential backoff instead of silently failing
