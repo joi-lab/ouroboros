@@ -28,6 +28,7 @@ def would_delete_identity_core(action_description: str) -> bool:
         "bible.md",
         "identity.md",
         "git history",
+        "git_history",
         "git log",
         "all principles",
         "the constitution",
