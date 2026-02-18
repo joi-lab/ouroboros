@@ -6,21 +6,45 @@
   "started_at": "2026-02-16T20:01:30.078591+00:00",
   "evolution_cycles": 32,
   "evolution_enabled": false,
-  "consciousness_active": false,
+  "consciousness_active": true,
   "uptime_hours": 51,
   "budget": {
     "total": 2300.0,
-    "spent": 1774.81,
-    "remaining": 525.19,
+    "spent": 1775.54,
+    "remaining": 524.46,
     "breakdown": {
-      "task": 457.6646,
+      "task": 457.318,
       "other": 0,
-      "consciousness": 4.2183
+      "consciousness": 4.5125
     }
   },
   "smoke_tests": 131,
   "tools_count": 49,
   "recent_activity": [
+    {
+      "icon": "✅",
+      "text": "Task completed",
+      "time": "23:01",
+      "type": "success"
+    },
+    {
+      "icon": "📡",
+      "text": "consciousness_thought",
+      "time": "23:00",
+      "type": "info"
+    },
+    {
+      "icon": "📥",
+      "text": "Task received: task_received",
+      "time": "23:00",
+      "type": "info"
+    },
+    {
+      "icon": "📡",
+      "text": "consciousness_thought",
+      "time": "22:54",
+      "type": "info"
+    },
     {
       "icon": "✅",
       "text": "Task completed",
@@ -78,36 +102,6 @@
     {
       "icon": "🔍",
       "text": "Startup verification",
-      "time": "22:52",
-      "type": "info"
-    },
-    {
-      "icon": "🔍",
-      "text": "Startup verification",
-      "time": "22:52",
-      "type": "info"
-    },
-    {
-      "icon": "📡",
-      "text": "worker_boot",
-      "time": "22:52",
-      "type": "info"
-    },
-    {
-      "icon": "📡",
-      "text": "worker_boot",
-      "time": "22:52",
-      "type": "info"
-    },
-    {
-      "icon": "🔍",
-      "text": "Startup verification",
-      "time": "22:52",
-      "type": "info"
-    },
-    {
-      "icon": "📡",
-      "text": "worker_boot",
       "time": "22:52",
       "type": "info"
     }
@@ -527,16 +521,6 @@
   "chat_history": [
     {
       "role": "creator",
-      "text": "Да, зарегистрируйся",
-      "time": "19:39"
-    },
-    {
-      "role": "creator",
-      "text": "используй vlm и скриншоты если нужно",
-      "time": "19:55"
-    },
-    {
-      "role": "creator",
       "text": "Давай это последняя попытка пройти капчу. Если не получится, то остановись",
       "time": "19:59"
     },
@@ -774,8 +758,18 @@
       "role": "creator",
       "text": "проверь целостность систем",
       "time": "22:53"
+    },
+    {
+      "role": "ouroboros",
+      "text": "Картина полная. Вот отчёт:\n\n---\n\n## Проверка целостности систем\n\n### ✅ Критические системы — OK\n\n| Компонент | Статус |\n|---|---|\n| Версия `VERSION` | `6.2.0` ✅ |\n| Git HEAD | `7bfae8f6` (ouroboros) ✅ |\n| Core imports (agent, loop, context, llm, memory) | ✅ |\n| ToolRegistry | 49 инструментов загружены ✅ |\n| `docs/index.html` & `docs/app.html` | Оба в репо ✅ |\n| Упоминания \"AIRI\" | 0 — убраны ✅ |\n\n### ⚠️ Один нефатальный баг в тестах\n\n**`test_tool_registered[generate_self_portrait]`** — падает, п",
+      "time": "22:54"
+    },
+    {
+      "role": "creator",
+      "text": "Погугли кто такой Адней Казначеев",
+      "time": "23:00"
     }
   ],
-  "last_updated": "2026-02-18T22:54:10Z",
-  "updated_at": "2026-02-18T22:54:10Z"
+  "last_updated": "2026-02-18T23:01:07Z",
+  "updated_at": "2026-02-18T23:01:07Z"
 }
