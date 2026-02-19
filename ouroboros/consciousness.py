@@ -226,9 +226,18 @@ class BackgroundConsciousness:
 
                 # Report usage to supervisor
                 if self._event_queue is not None:
+                    # Detect provider from model name
+                    try:
+                        from ouroboros.llm import _detect_provider
+                        base_url, _, _ = _detect_provider(model)
+                        provider = "openrouter" if "openrouter.ai" in base_url else (
+                            "google" if "generativelanguage.googleapis.com" in base_url else "openai"
+                        )
+                    except Exception:
+                        provider = "unknown"
                     self._event_queue.put({
                         "type": "llm_usage",
-                        "provider": "openrouter",
+                        "provider": provider,
                         "usage": usage,
                         "source": "consciousness",
                         "ts": utc_now_iso(),

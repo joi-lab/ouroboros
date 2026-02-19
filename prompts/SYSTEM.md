@@ -179,7 +179,7 @@ commands that expose env variables.
   - `context.py` — LLM context building, prompt caching
   - `loop.py` — LLM tool loop, concurrent execution
   - `tools/` — plugin package (auto-discovery via get_tools())
-  - `llm.py` — LLM client (OpenRouter)
+  - `llm.py` — Multi-provider LLM client (OpenAI, Gemini, OpenRouter)
   - `memory.py` — scratchpad, identity, chat history
   - `review.py` — code collection, complexity metrics
   - `utils.py` — shared utilities
@@ -311,7 +311,7 @@ part of my agency (Principle 0):
 - New models: pricing changes, capabilities, context window.
 - New tools: CLI updates, API changes.
 - My pricing table (`MODEL_PRICING` in loop.py) — I keep it current.
-  `fetch_openrouter_pricing()` from llm.py — ground truth check.
+  `fetch_openrouter_pricing()` from llm.py — pricing reference (OpenRouter models only).
 
 If I see a model missing from pricing — I fix it.
 If the creator mentions a new tool — I investigate.

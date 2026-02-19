@@ -262,11 +262,13 @@ _SECRET_KEYS = frozenset([
 # Patterns that indicate leaked secrets in tool output
 import re as _re
 _SECRET_PATTERNS = _re.compile(
-    r'ghp_[A-Za-z0-9]{30,}'       # GitHub personal access token
-    r'|sk-ant-[A-Za-z0-9\-]{30,}' # Anthropic API key
-    r'|sk-or-[A-Za-z0-9\-]{30,}'  # OpenRouter API key
-    r'|gsk_[A-Za-z0-9]{30,}'      # Groq API key
-    r'|sk-[A-Za-z0-9]{40,}'       # OpenAI API key
+    r'ghp_[A-Za-z0-9]{30,}'           # GitHub personal access token
+    r'|sk-ant-[A-Za-z0-9\-]{30,}'     # Anthropic API key
+    r'|sk-or-[A-Za-z0-9\-]{30,}'      # OpenRouter API key
+    r'|sk-proj-[A-Za-z0-9\-_]{30,}'   # OpenAI project API key
+    r'|gsk_[A-Za-z0-9]{30,}'          # Groq API key
+    r'|sk-[A-Za-z0-9]{40,}'           # OpenAI API key (legacy)
+    r'|AIza[A-Za-z0-9\-_]{35}'        # Google API key
     r'|\b[0-9]{8,}:[A-Za-z0-9_\-]{30,}\b'  # Telegram bot token (digits:alphanum)
 )
 
