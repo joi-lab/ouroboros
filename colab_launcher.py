@@ -201,7 +201,7 @@ if not CHAT_LOG_PATH.exists():
 # ----------------------------
 # 3) Git constants
 # ----------------------------
-BRANCH_DEV = "ouroboros"
+BRANCH_DEV = os.environ.get("OUROBOROS_BOOT_BRANCH", "ouroboros")
 BRANCH_STABLE = "ouroboros-stable"
 REMOTE_URL = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
 
