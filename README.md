@@ -199,6 +199,38 @@ Full text: [BIBLE.md](BIBLE.md)
 | `OUROBOROS_MAX_ROUNDS` | `200` | Maximum LLM rounds per task |
 | `OUROBOROS_MODEL_FALLBACK_LIST` | `gpt-4.1,gemini-2.5-flash,anthropic/claude-sonnet-4.6` | Fallback model chain for empty responses |
 
+### Multi-Provider Routing
+
+Ouroboros routes LLM calls to different providers based on the model name. Each provider requires its own API key.
+
+| Model prefix | Provider | API Key | Example models |
+|-------------|----------|---------|----------------|
+| `gpt-*`, `o3*`, `o4*` (or no prefix) | OpenAI (direct) | `OPENAI_API_KEY` | `gpt-4.1`, `o3`, `gpt-5` |
+| `openai/` | OpenAI (direct) | `OPENAI_API_KEY` | `openai/gpt-4.1` |
+| `gemini*` or `google/` | Google Gemini (direct) | `GOOGLE_API_KEY` | `gemini-2.5-flash`, `google/gemini-2.5-pro` |
+| `anthropic/` | OpenRouter | `OPENROUTER_API_KEY` | `anthropic/claude-sonnet-4.6` |
+| `x-ai/`, `meta-llama/`, `qwen/` | OpenRouter | `OPENROUTER_API_KEY` | `x-ai/grok-3` |
+
+**How it works:**
+
+- The `_detect_provider()` function in `ouroboros/llm.py` inspects the model name and selects the correct `base_url` and API key automatically.
+- All providers use the OpenAI Python SDK (`openai` package) with different `base_url` values.
+- OpenAI and Gemini are called directly (lower latency, no middleman markup). Anthropic models are routed through OpenRouter since Anthropic does not expose an OpenAI-compatible API.
+- If you only set `OPENAI_API_KEY`, you can use OpenAI models. Add `GOOGLE_API_KEY` for Gemini, and `OPENROUTER_API_KEY` for Anthropic/other models.
+
+**Recommended minimal setup (Azure VM):**
+
+```bash
+# .env file
+OPENAI_API_KEY=sk-...          # Required: primary LLM + web search
+GOOGLE_API_KEY=AIza...         # Optional: enables Gemini models (cheap for background tasks)
+TELEGRAM_BOT_TOKEN=123:ABC...  # Required: Telegram bot
+GITHUB_TOKEN=ghp_...           # Required: git operations
+TOTAL_BUDGET=50                # Required: spending limit in USD
+```
+
+**Budget tracking:** Costs are tracked locally in `state.json`. Unlike the previous OpenRouter-only setup, there is no external spend verification endpoint (OpenAI and Gemini do not expose one). The budget limit (`TOTAL_BUDGET`) is enforced locally and remains the primary safety guardrail.
+
 ---
 
 ## Evolution Time-Lapse
