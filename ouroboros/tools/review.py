@@ -1,7 +1,8 @@
-"""Multi-model review tool — sends code/text to multiple LLMs for consensus review.
+"""Multi-model review tool -- sends code/text to multiple LLMs for consensus review.
 
-Models are NOT hardcoded — the LLM chooses which models to use based on
-prompt guidance. Budget is tracked via llm_usage events.
+Models are NOT hardcoded -- the LLM chooses which models to use based on
+prompt guidance. Routes each model to its correct provider (OpenAI, Gemini, OpenRouter).
+Budget is tracked via llm_usage events.
 """
 
 import os
@@ -10,6 +11,7 @@ import asyncio
 import logging
 import httpx
 
+from ouroboros.llm import _detect_provider
 from ouroboros.utils import utc_now_iso
 from ouroboros.tools.registry import ToolEntry, ToolContext
 
@@ -20,8 +22,6 @@ log = logging.getLogger(__name__)
 MAX_MODELS = 10
 # Concurrency limit for parallel requests
 CONCURRENCY_LIMIT = 5
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def get_tools():
@@ -46,7 +46,7 @@ def get_tools():
                         "prompt": {
                             "type": "string",
                             "description": (
-                                "Review instructions — what to check for. "
+                                "Review instructions -- what to check for. "
                                 "Fully specified by the LLM at call time."
                             ),
                         },
@@ -54,8 +54,8 @@ def get_tools():
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "OpenRouter model identifiers to query "
-                                "(e.g. 3 diverse models for good coverage)"
+                                "Model identifiers to query "
+                                "(e.g. ['gpt-4.1', 'gemini-2.5-pro', 'anthropic/claude-sonnet-4.6'])"
                             ),
                         },
                     },
@@ -74,12 +74,12 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
     try:
         try:
             asyncio.get_running_loop()
-            # Already in async context — run in a separate thread
+            # Already in async context -- run in a separate thread
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 result = pool.submit(asyncio.run, _multi_model_review_async(content, prompt, models, ctx)).result()
         except RuntimeError:
-            # No running loop — safe to use asyncio.run directly
+            # No running loop -- safe to use asyncio.run directly
             result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx))
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
@@ -87,18 +87,21 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
 
 
-async def _query_model(client, model, messages, api_key, semaphore):
-    """Query a single model with semaphore-based concurrency control. Returns (model, response_dict, headers_dict) or (model, error_str, None)."""
+async def _query_model(client, model, messages, semaphore):
+    """Query a single model via its provider. Returns (model, response_dict, headers_dict) or (model, error_str, None)."""
+    base_url, api_key, clean_model = _detect_provider(model)
+    url = f"{base_url.rstrip('/')}/chat/completions"
+
     async with semaphore:
         try:
             resp = await client.post(
-                OPENROUTER_URL,
+                url,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": model,
+                    "model": clean_model,
                     "messages": messages,
                     "temperature": 0.2,
                 },
@@ -128,14 +131,14 @@ async def _query_model(client, model, messages, api_key, semaphore):
 
 
 async def _multi_model_review_async(content: str, prompt: str, models: list, ctx: ToolContext):
-    """Async orchestration: validate → query → parse → emit → return."""
+    """Async orchestration: validate -> query -> parse -> emit -> return."""
     # Validation
     if not content:
         return {"error": "content is required"}
     if not prompt:
         return {"error": "prompt is required"}
     if not models:
-        return {"error": "models list is required (e.g. ['openai/o3', 'google/gemini-2.5-pro'])"}
+        return {"error": "models list is required (e.g. ['gpt-4.1', 'gemini-2.5-pro'])"}
 
     if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
         return {"error": "models must be a list of strings"}
@@ -146,9 +149,14 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     if len(models) == 0:
         return {"error": "At least one model is required"}
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return {"error": "OPENROUTER_API_KEY not set"}
+    # Verify at least one provider key is available
+    has_any_key = any([
+        os.environ.get("OPENAI_API_KEY", ""),
+        os.environ.get("GOOGLE_API_KEY", ""),
+        os.environ.get("OPENROUTER_API_KEY", ""),
+    ])
+    if not has_any_key:
+        return {"error": "No API keys configured (need OPENAI_API_KEY, GOOGLE_API_KEY, or OPENROUTER_API_KEY)"}
 
     messages = [
         {"role": "system", "content": prompt},
@@ -158,7 +166,7 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     # Query all models with bounded concurrency
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     async with httpx.AsyncClient() as client:
-        tasks = [_query_model(client, m, messages, api_key, semaphore) for m in models]
+        tasks = [_query_model(client, m, messages, semaphore) for m in models]
         results = await asyncio.gather(*tasks)
 
     # Parse and process results
@@ -187,7 +195,7 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
             "cost_estimate": 0.0,
         }
 
-    # Success case — extract response text and verdict
+    # Success case -- extract response text and verdict
     try:
         choices = result.get("choices", [])
         if not choices:
@@ -227,9 +235,8 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
         # Fallback to total_cost field
         elif "usage" in result and "total_cost" in result["usage"]:
             cost = float(result["usage"]["total_cost"])
-        # Finally check headers
+        # Finally check headers (OpenRouter-specific)
         elif headers_dict:
-            # Case-insensitive search for cost header
             for key, value in headers_dict.items():
                 if key.lower() == "x-openrouter-cost":
                     cost = float(value)
@@ -272,5 +279,5 @@ def _emit_usage_event(review_result: dict, ctx: ToolContext) -> None:
             if hasattr(ctx, "pending_events"):
                 ctx.pending_events.append(usage_event)
     elif hasattr(ctx, "pending_events"):
-        # No event_queue — use pending_events
+        # No event_queue -- use pending_events
         ctx.pending_events.append(usage_event)

@@ -20,7 +20,7 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_VLM_MODEL = "anthropic/claude-sonnet-4.6"
+_DEFAULT_VLM_MODEL = "gpt-4.1"
 
 
 def _get_vlm_model() -> str:

@@ -1,7 +1,8 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+Multi-provider routing: OpenAI (primary), Google Gemini, Anthropic (via OpenRouter).
+All providers use the openai Python SDK with different base_url and api_key.
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
@@ -14,7 +15,62 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_LIGHT_MODEL = "gemini-2.5-flash"
+
+
+def _detect_provider(model: str) -> Tuple[str, str, str]:
+    """Detect provider from model name. Returns (base_url, api_key, clean_model_name).
+
+    Routing rules:
+      - "openai/" prefix or known OpenAI models (gpt-*, o3*, o4*) -> OpenAI direct
+      - "google/" prefix or "gemini*" -> Google Gemini (OpenAI-compatible endpoint)
+      - "anthropic/" prefix -> OpenRouter (Anthropic has no OpenAI-compatible API)
+      - No prefix -> default to OpenAI
+    """
+    if model.startswith("openai/"):
+        return (
+            "https://api.openai.com/v1",
+            os.environ.get("OPENAI_API_KEY", ""),
+            model[7:],  # strip "openai/" prefix for direct API
+        )
+    elif model.startswith("google/") or model.startswith("gemini"):
+        clean = model.replace("google/", "")
+        return (
+            "https://generativelanguage.googleapis.com/v1beta/openai/",
+            os.environ.get("GOOGLE_API_KEY", ""),
+            clean,
+        )
+    elif model.startswith("anthropic/"):
+        # Anthropic models go through OpenRouter (no native OpenAI-compatible API)
+        return (
+            "https://openrouter.ai/api/v1",
+            os.environ.get("OPENROUTER_API_KEY", ""),
+            model,  # keep full name for OpenRouter
+        )
+    elif model.startswith(("x-ai/", "meta-llama/", "qwen/")):
+        # Other providers route through OpenRouter
+        return (
+            "https://openrouter.ai/api/v1",
+            os.environ.get("OPENROUTER_API_KEY", ""),
+            model,
+        )
+    else:
+        # Default: treat as OpenAI model (gpt-4.1, o3, etc.)
+        return (
+            "https://api.openai.com/v1",
+            os.environ.get("OPENAI_API_KEY", ""),
+            model,
+        )
+
+
+def _is_openrouter(base_url: str) -> bool:
+    """Check if a base_url points to OpenRouter."""
+    return "openrouter.ai" in base_url
+
+
+def _is_anthropic_model(model: str) -> bool:
+    """Check if a model is an Anthropic model (routed via OpenRouter)."""
+    return model.startswith("anthropic/")
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -39,12 +95,14 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
 def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
     """
     Fetch current pricing from OpenRouter API.
+    Only runs if OPENROUTER_API_KEY is set.
 
     Returns dict of {model_id: (input_per_1m, cached_per_1m, output_per_1m)}.
-    Returns empty dict on failure.
+    Returns empty dict on failure or if key is not configured.
     """
-    import logging
-    log = logging.getLogger("ouroboros.llm")
+    if not os.environ.get("OPENROUTER_API_KEY", ""):
+        log.debug("OPENROUTER_API_KEY not set, skipping pricing fetch")
+        return {}
 
     try:
         import requests
@@ -97,50 +155,52 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         log.info(f"Fetched pricing for {len(pricing_dict)} models from OpenRouter")
         return pricing_dict
 
-    except (requests.RequestException, ValueError, KeyError) as e:
+    except Exception as e:
         log.warning(f"Failed to fetch OpenRouter pricing: {e}")
         return {}
 
 
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """Multi-provider LLM client. Routes to OpenAI, Gemini, or OpenRouter based on model name."""
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
-    ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
-        self._client = None
+    def __init__(self, **kwargs):
+        # Accept (and ignore) legacy kwargs for backward compatibility
+        # Old code passed api_key= and base_url= which are no longer needed
+        # since provider detection is automatic.
+        # Per-provider client cache: base_url -> OpenAI client
+        self._clients: Dict[str, Any] = {}
 
-    def _get_client(self):
-        if self._client is None:
+    def _get_client(self, base_url: str, api_key: str):
+        """Get or create an OpenAI client for the given provider."""
+        cache_key = base_url
+        if cache_key not in self._clients:
             from openai import OpenAI
-            self._client = OpenAI(
-                base_url=self._base_url,
-                api_key=self._api_key,
-                default_headers={
-                    "HTTP-Referer": "https://colab.research.google.com/",
-                    "X-Title": "Ouroboros",
-                },
+            headers = {"X-Title": "Ouroboros"}
+            if _is_openrouter(base_url):
+                headers["HTTP-Referer"] = "https://github.com/razzant/ouroboros"
+            self._clients[cache_key] = OpenAI(
+                base_url=base_url,
+                api_key=api_key,
+                default_headers=headers,
             )
-        return self._client
+        return self._clients[cache_key]
 
-    def _fetch_generation_cost(self, generation_id: str) -> Optional[float]:
-        """Fetch cost from OpenRouter Generation API as fallback."""
+    def _fetch_generation_cost(self, generation_id: str, base_url: str, api_key: str) -> Optional[float]:
+        """Fetch cost from OpenRouter Generation API. Only works for OpenRouter."""
+        if not _is_openrouter(base_url):
+            return None
         try:
             import requests
-            url = f"{self._base_url.rstrip('/')}/generation?id={generation_id}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
+            url = f"{base_url.rstrip('/')}/generation?id={generation_id}"
+            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")
                 if cost is not None:
                     return float(cost)
-            # Generation might not be ready yet — retry once after short delay
+            # Generation might not be ready yet -- retry once after short delay
             time.sleep(0.5)
-            resp = requests.get(url, headers={"Authorization": f"Bearer {self._api_key}"}, timeout=5)
+            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5)
             if resp.status_code == 200:
                 data = resp.json().get("data") or {}
                 cost = data.get("total_cost") or data.get("usage", {}).get("cost")
@@ -148,7 +208,6 @@ class LLMClient:
                     return float(cost)
         except Exception:
             log.debug("Failed to fetch generation cost from OpenRouter", exc_info=True)
-            pass
         return None
 
     def chat(
@@ -160,16 +219,19 @@ class LLMClient:
         max_tokens: int = 16384,
         tool_choice: str = "auto",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Single LLM call. Returns: (response_message_dict, usage_dict with cost)."""
-        client = self._get_client()
+        """Single LLM call. Routes to correct provider based on model name.
+        Returns: (response_message_dict, usage_dict with cost)."""
+        base_url, api_key, clean_model = _detect_provider(model)
+        client = self._get_client(base_url, api_key)
         effort = normalize_reasoning_effort(reasoning_effort)
+        is_openrouter = _is_openrouter(base_url)
 
         extra_body: Dict[str, Any] = {
             "reasoning": {"effort": effort, "exclude": True},
         }
 
-        # Pin Anthropic models to Anthropic provider for prompt caching
-        if model.startswith("anthropic/"):
+        # OpenRouter-specific: pin Anthropic models to Anthropic provider for prompt caching
+        if is_openrouter and _is_anthropic_model(model):
             extra_body["provider"] = {
                 "order": ["Anthropic"],
                 "allow_fallbacks": False,
@@ -177,20 +239,22 @@ class LLMClient:
             }
 
         kwargs: Dict[str, Any] = {
-            "model": model,
+            "model": clean_model,
             "messages": messages,
             "max_tokens": max_tokens,
             "extra_body": extra_body,
         }
         if tools:
-            # Add cache_control to last tool for Anthropic prompt caching
-            # This caches all tool schemas (they never change between calls)
-            tools_with_cache = [t for t in tools]  # shallow copy
-            if tools_with_cache:
-                last_tool = {**tools_with_cache[-1]}  # copy last tool
-                last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
-                tools_with_cache[-1] = last_tool
-            kwargs["tools"] = tools_with_cache
+            if is_openrouter and _is_anthropic_model(model):
+                # Add cache_control to last tool for Anthropic prompt caching (via OpenRouter)
+                tools_with_cache = [t for t in tools]  # shallow copy
+                if tools_with_cache:
+                    last_tool = {**tools_with_cache[-1]}  # copy last tool
+                    last_tool["cache_control"] = {"type": "ephemeral", "ttl": "1h"}
+                    tools_with_cache[-1] = last_tool
+                kwargs["tools"] = tools_with_cache
+            else:
+                kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
         resp = client.chat.completions.create(**kwargs)
@@ -206,8 +270,6 @@ class LLMClient:
                 usage["cached_tokens"] = int(prompt_details["cached_tokens"])
 
         # Extract cache_write_tokens from prompt_tokens_details if available
-        # OpenRouter: "cache_write_tokens"
-        # Native Anthropic: "cache_creation_tokens" or "cache_creation_input_tokens"
         if not usage.get("cache_write_tokens"):
             prompt_details_for_write = usage.get("prompt_tokens_details") or {}
             if isinstance(prompt_details_for_write, dict):
@@ -217,11 +279,11 @@ class LLMClient:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        # Ensure cost is present in usage (OpenRouter includes it, but fallback if missing)
-        if not usage.get("cost"):
+        # Fetch cost from OpenRouter Generation API if not in usage (OpenRouter-only)
+        if not usage.get("cost") and is_openrouter:
             gen_id = resp_dict.get("id") or ""
             if gen_id:
-                cost = self._fetch_generation_cost(gen_id)
+                cost = self._fetch_generation_cost(gen_id, base_url, api_key)
                 if cost is not None:
                     usage["cost"] = cost
 
@@ -231,18 +293,18 @@ class LLMClient:
         self,
         prompt: str,
         images: List[Dict[str, Any]],
-        model: str = "anthropic/claude-sonnet-4.6",
+        model: str = "gpt-4.1",
         max_tokens: int = 1024,
         reasoning_effort: str = "low",
     ) -> Tuple[str, Dict[str, Any]]:
         """
-        Send a vision query to an LLM. Lightweight — no tools, no loop.
+        Send a vision query to an LLM. Lightweight -- no tools, no loop.
 
         Args:
             prompt: Text instruction for the model
             images: List of image dicts. Each dict must have either:
-                - {"url": "https://..."} — for URL images
-                - {"base64": "<b64>", "mime": "image/png"} — for base64 images
+                - {"url": "https://..."} -- for URL images
+                - {"base64": "<b64>", "mime": "image/png"} -- for base64 images
             model: VLM-capable model ID
             max_tokens: Max response tokens
             reasoning_effort: Effort level
@@ -280,11 +342,11 @@ class LLMClient:
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        return os.environ.get("OUROBOROS_MODEL", "gpt-4.1")
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        main = os.environ.get("OUROBOROS_MODEL", "gpt-4.1")
         code = os.environ.get("OUROBOROS_MODEL_CODE", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]
