@@ -226,9 +226,17 @@ class LLMClient:
         effort = normalize_reasoning_effort(reasoning_effort)
         is_openrouter = _is_openrouter(base_url)
 
-        extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
-        }
+        extra_body: Dict[str, Any] = {}
+
+        # Only include "reasoning" for OpenAI reasoning models (o3, o4-mini, etc.).
+        # Gemini and other providers don't support this field and return 400.
+        _is_openai_reasoning = (
+            not is_openrouter
+            and not base_url.startswith("https://generativelanguage.googleapis.com")
+            and any(clean_model.startswith(p) for p in ("o3", "o4"))
+        )
+        if _is_openai_reasoning:
+            extra_body["reasoning"] = {"effort": effort, "exclude": True}
 
         # OpenRouter-specific: pin Anthropic models to Anthropic provider for prompt caching
         if is_openrouter and _is_anthropic_model(model):
