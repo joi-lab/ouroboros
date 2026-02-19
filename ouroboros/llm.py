@@ -160,6 +160,15 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         return {}
 
 
+def _clean_nones(obj):
+    """Recursively remove None values from dicts/lists (Gemini rejects them)."""
+    if isinstance(obj, dict):
+        return {k: _clean_nones(v) for k, v in obj.items() if v is not None}
+    elif isinstance(obj, list):
+        return [_clean_nones(i) for i in obj if i is not None]
+    return obj
+
+
 class LLMClient:
     """Multi-provider LLM client. Routes to OpenAI, Gemini, or OpenRouter based on model name."""
 
@@ -249,7 +258,7 @@ class LLMClient:
         kwargs: Dict[str, Any] = {
             "model": clean_model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_completion_tokens": max_tokens,
             "extra_body": extra_body,
         }
         if tools:
@@ -262,7 +271,11 @@ class LLMClient:
                     tools_with_cache[-1] = last_tool
                 kwargs["tools"] = tools_with_cache
             else:
-                kwargs["tools"] = tools
+                # Clean None values from tool schemas (Gemini rejects them)
+                if base_url.startswith("https://generativelanguage.googleapis.com"):
+                    kwargs["tools"] = _clean_nones(tools)
+                else:
+                    kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
 
         resp = client.chat.completions.create(**kwargs)
