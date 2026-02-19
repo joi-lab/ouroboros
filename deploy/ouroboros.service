@@ -1,0 +1,32 @@
+[Unit]
+Description=Ouroboros — Self-modifying AI agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ouroboros
+Group=ouroboros
+WorkingDirectory=/opt/ouroboros/repo
+EnvironmentFile=/opt/ouroboros/.env
+ExecStart=/opt/ouroboros/venv/bin/python /opt/ouroboros/repo/standalone_launcher.py
+Restart=on-failure
+RestartSec=30
+
+# Logging — journalctl -u ouroboros -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ouroboros
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/ouroboros
+PrivateTmp=true
+
+# Resource limits
+LimitNOFILE=65536
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
