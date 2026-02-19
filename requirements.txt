@@ -3,3 +3,4 @@ openai>=1.0.0
 requests
 playwright
 playwright-stealth
+python-dotenv>=1.0.0

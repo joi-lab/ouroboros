@@ -11,7 +11,17 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 log = logging.getLogger(__name__)
 
 # ----------------------------
-# 0) Install launcher deps
+# 0) Detect environment
+# ----------------------------
+_ON_COLAB = False
+try:
+    import google.colab  # type: ignore
+    _ON_COLAB = True
+except ImportError:
+    pass
+
+# ----------------------------
+# 0) Install launcher deps (Colab only — standalone uses requirements.txt)
 # ----------------------------
 def install_launcher_deps() -> None:
     subprocess.run(
@@ -19,7 +29,8 @@ def install_launcher_deps() -> None:
         check=True,
     )
 
-install_launcher_deps()
+if _ON_COLAB:
+    install_launcher_deps()
 
 def ensure_claude_code_cli() -> bool:
     """Best-effort install of Claude Code CLI for Anthropic-powered code edits."""
@@ -50,12 +61,15 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+if _ON_COLAB:
+    from google.colab import userdata  # type: ignore
+    from google.colab import drive  # type: ignore
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
+    if not _ON_COLAB:
+        return None
     try:
         return userdata.get(name)
     except Exception:
@@ -148,13 +162,16 @@ if str(ANTHROPIC_API_KEY or "").strip():
     ensure_claude_code_cli()
 
 # ----------------------------
-# 2) Mount Drive
+# 2) Mount Drive / resolve local data path
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
-
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+if _ON_COLAB:
+    if not pathlib.Path("/content/drive/MyDrive").exists():
+        drive.mount("/content/drive")
+    DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
+    REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+else:
+    DRIVE_ROOT = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR", "/opt/ouroboros/data")).resolve()
+    REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", "/opt/ouroboros/repo")).resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)

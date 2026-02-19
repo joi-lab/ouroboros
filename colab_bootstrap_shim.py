@@ -2,6 +2,9 @@
 
 Paste this file contents into the only immutable Colab cell.
 The shim stays tiny and only starts the runtime launcher from repository.
+
+Also works outside Colab: reads secrets from environment variables (e.g.
+loaded via python-dotenv in standalone_launcher.py).
 """
 
 import os
@@ -10,16 +13,25 @@ import subprocess
 import sys
 from typing import Optional
 
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+_ON_COLAB = False
+try:
+    import google.colab  # type: ignore
+    _ON_COLAB = True
+except ImportError:
+    pass
+
+if _ON_COLAB:
+    from google.colab import userdata  # type: ignore
+    from google.colab import drive  # type: ignore
 
 
 def get_secret(name: str, required: bool = False) -> Optional[str]:
     v = None
-    try:
-        v = userdata.get(name)
-    except Exception:
-        v = None
+    if _ON_COLAB:
+        try:
+            v = userdata.get(name)
+        except Exception:
+            v = None
     if v is None or str(v).strip() == "":
         v = os.environ.get(name)
     if required:
@@ -42,7 +54,7 @@ for _name in ("OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHU
 for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
     export_secret_to_env(_name, required=False)
 
-# Colab diagnostics defaults (override in config cell if needed).
+# Diagnostics defaults (override in config cell/env if needed).
 os.environ.setdefault("OUROBOROS_WORKER_START_METHOD", "fork")
 os.environ.setdefault("OUROBOROS_DIAG_HEARTBEAT_SEC", "30")
 os.environ.setdefault("OUROBOROS_DIAG_SLOW_CYCLE_SEC", "20")
@@ -53,7 +65,11 @@ GITHUB_USER = str(os.environ.get("GITHUB_USER", "razzant"))
 GITHUB_REPO = str(os.environ.get("GITHUB_REPO", "ouroboros"))
 BOOT_BRANCH = str(os.environ.get("OUROBOROS_BOOT_BRANCH", "ouroboros"))
 
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+if _ON_COLAB:
+    REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+else:
+    REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", "/opt/ouroboros/repo")).resolve()
+
 REMOTE_URL = f"https://{GITHUB_TOKEN}:x-oauth-basic@github.com/{GITHUB_USER}/{GITHUB_REPO}.git"
 
 if not (REPO_DIR / ".git").exists():
@@ -75,11 +91,15 @@ print(
         os.environ.get("OUROBOROS_DIAG_HEARTBEAT_SEC", ""),
     )
 )
-print("[boot] logs: /content/drive/MyDrive/Ouroboros/logs/supervisor.jsonl")
 
-# Mount Drive in notebook process first (interactive auth works here).
-if not pathlib.Path("/content/drive/MyDrive").exists():
-    drive.mount("/content/drive")
+if _ON_COLAB:
+    print("[boot] logs: /content/drive/MyDrive/Ouroboros/logs/supervisor.jsonl")
+    # Mount Drive in notebook process first (interactive auth works here).
+    if not pathlib.Path("/content/drive/MyDrive").exists():
+        drive.mount("/content/drive")
+else:
+    _data_dir = os.environ.get("OUROBOROS_DATA_DIR", "/opt/ouroboros/data")
+    print(f"[boot] logs: {_data_dir}/logs/supervisor.jsonl")
 
 launcher_path = REPO_DIR / "colab_launcher.py"
 assert launcher_path.exists(), f"Missing launcher: {launcher_path}"
