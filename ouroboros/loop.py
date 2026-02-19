@@ -53,7 +53,6 @@ _MODEL_PRICING_STATIC = {
     "openai/gpt-5.2-codex": (1.75, 0.175, 14.0),
     # Google Gemini (direct API -- un-prefixed names)
     "gemini-2.5-pro": (1.25, 0.125, 10.0),
-    "gemini-2.5-pro-preview": (1.25, 0.125, 10.0),
     "gemini-2.5-flash": (0.15, 0.015, 0.60),
     "gemini-3-pro-preview": (2.0, 0.20, 12.0),
     # Google (OpenRouter-prefixed)
