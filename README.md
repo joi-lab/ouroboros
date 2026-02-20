@@ -9,9 +9,10 @@ A self-modifying AI agent that writes its own code, rewrites its own mind, and e
 
 Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
 
-**Version:** 6.2.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+**Version:** 6.2.1 | [Landing Page](https://joi-lab.github.io/ouroboros/)
 
 ---
+
 
 ## What Makes This Different
 
@@ -26,6 +27,7 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 - **30+ Evolution Cycles** -- From v4.1 to v4.25 in 24 hours, autonomously.
 
 ---
+
 
 ## Architecture
 
@@ -134,6 +136,7 @@ Open your Telegram bot and send any message. The first person to write becomes t
 
 ---
 
+
 ## Telegram Bot Commands
 
 | Command | Description |
@@ -169,6 +172,7 @@ All other messages are sent directly to the LLM (Principle 3: LLM-First).
 Full text: [BIBLE.md](BIBLE.md)
 
 ---
+
 
 ## Configuration
 
@@ -222,6 +226,10 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.2.1 -- Identity.md Corruption Fix + Version Sync
+- Fix identity.md corruption detection by validating content instead of timestamp (Principle 1)
+- Synchronized VERSION with README.md
 
 ### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
 - **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
