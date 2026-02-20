@@ -50,12 +50,20 @@ install_apply_patch()
 # ----------------------------
 # 1) Secrets + runtime config
 # ----------------------------
-from google.colab import userdata  # type: ignore
-from google.colab import drive  # type: ignore
+try:
+    from google.colab import userdata  # type: ignore
+    from google.colab import drive  # type: ignore
+    IN_COLAB = True
+except Exception:
+    userdata = None  # type: ignore
+    drive = None  # type: ignore
+    IN_COLAB = False
 
 _LEGACY_CFG_WARNED: Set[str] = set()
 
 def _userdata_get(name: str) -> Optional[str]:
+    if userdata is None:
+        return None
     try:
         return userdata.get(name)
     except Exception:
@@ -90,7 +98,10 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
         val = default
     return max(minimum, val)
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
+OPENROUTER_API_KEY = str(get_secret("OPENROUTER_API_KEY", default="") or "")
+MISTRAL_API_KEY = str(get_secret("MISTRAL_API_KEY", default="") or "")
+LLM_API_KEY = OPENROUTER_API_KEY or MISTRAL_API_KEY
+assert LLM_API_KEY.strip(), "Missing required secret: set OPENROUTER_API_KEY or MISTRAL_API_KEY"
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
@@ -133,7 +144,16 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
     minimum=0,
 )
 
+LLM_BASE_URL = get_cfg(
+    "OUROBOROS_LLM_BASE_URL",
+    default="https://openrouter.ai/api/v1" if OPENROUTER_API_KEY.strip() else "https://api.mistral.ai/v1",
+    allow_legacy_secret=True,
+)
+
 os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
+os.environ["MISTRAL_API_KEY"] = str(MISTRAL_API_KEY)
+os.environ["OUROBOROS_LLM_API_KEY"] = str(LLM_API_KEY)
+os.environ["OUROBOROS_LLM_BASE_URL"] = str(LLM_BASE_URL or "")
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
@@ -152,11 +172,13 @@ if str(ANTHROPIC_API_KEY or "").strip():
 # ----------------------------
 # 2) Mount Drive
 # ----------------------------
-if not pathlib.Path("/content/drive/MyDrive").exists():
+default_drive_root = "/content/drive/MyDrive/Ouroboros" if IN_COLAB else str((pathlib.Path.cwd() / ".ouroboros_data").resolve())
+default_repo_dir = "/content/ouroboros_repo" if IN_COLAB else str(pathlib.Path(__file__).resolve().parent)
+if IN_COLAB and drive is not None and not pathlib.Path("/content/drive/MyDrive").exists():
     drive.mount("/content/drive")
 
-DRIVE_ROOT = pathlib.Path("/content/drive/MyDrive/Ouroboros").resolve()
-REPO_DIR = pathlib.Path("/content/ouroboros_repo").resolve()
+DRIVE_ROOT = pathlib.Path(str(get_cfg("OUROBOROS_DRIVE_ROOT", default=default_drive_root, allow_legacy_secret=True) or default_drive_root)).resolve()
+REPO_DIR = pathlib.Path(str(get_cfg("OUROBOROS_REPO_DIR", default=default_repo_dir, allow_legacy_secret=True) or default_repo_dir)).resolve()
 
 for sub in ["state", "logs", "memory", "index", "locks", "archive"]:
     (DRIVE_ROOT / sub).mkdir(parents=True, exist_ok=True)
