@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 # Ouroboros — Memory.
 
 Scratchpad, identity, chat history.
 Contract: load scratchpad/identity, chat_history().
-
-from __future__ import annotations
 
 import json
 import logging
@@ -164,7 +164,7 @@ class Memory:
             # Creator messages: no truncation (most valuable context)
             # Outgoing messages: truncate to 800 chars
             raw_text = str(e.get("text", ""))
-            if dir_raw in ("out", "outgoing"):
+            if dir_raw in ("out", "outgoing")):
                 text = short(raw_text, 800)
             else:
                 text = raw_text  # never truncate creator's messages
