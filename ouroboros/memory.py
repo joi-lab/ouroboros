@@ -164,7 +164,7 @@ class Memory:
             # Creator messages: no truncation (most valuable context)
             # Outgoing messages: truncate to 800 chars
             raw_text = str(e.get("text", ""))
-            if dir_raw in ("out", "outgoing")):
+            if dir_raw in ("out", "outgoing"):
                 text = short(raw_text, 800)
             else:
                 text = raw_text  # never truncate creator's messages
@@ -197,7 +197,7 @@ class Memory:
             if "cmd" in args:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
-            status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
+            status = "✔" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
             lines.append(f"{status} {tool} {hint_str}".strip())
         return "\n".join(lines)
 
