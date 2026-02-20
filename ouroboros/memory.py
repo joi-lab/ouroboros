@@ -1,9 +1,10 @@
-from __future__ import annotations
-
-# Ouroboros — Memory.
+"""Ouroboros — Memory.
 
 Scratchpad, identity, chat history.
 Contract: load scratchpad/identity, chat_history().
+"""
+
+from __future__ import annotations
 
 import json
 import logging
@@ -103,6 +104,7 @@ class Memory:
             if offset > 0:
                 entries = entries[:-offset] if offset < len(entries) else []
 
+
             entries = entries[-count:] if count < len(entries) else entries
 
             if not entries:
@@ -197,7 +199,7 @@ class Memory:
             if "cmd" in args:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
-            status = "✔" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
+            status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
             lines.append(f"{status} {tool} {hint_str}".strip())
         return "\n".join(lines)
 
