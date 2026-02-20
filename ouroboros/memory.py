@@ -1,9 +1,7 @@
-"""
-Ouroboros — Memory.
+# Ouroboros — Memory.
 
 Scratchpad, identity, chat history.
 Contract: load scratchpad/identity, chat_history().
-"""
 
 from __future__ import annotations
 
@@ -57,9 +55,14 @@ class Memory:
 
     def load_identity(self) -> str:
         p = self.identity_path()
-        if p.exists():
-            return read_text(p)
         default = self._default_identity()
+        if p.exists():
+            content = read_text(p)
+            if not content.strip() or content.strip() == default.strip():
+                log.warning("Identity file is empty or default; regenerating.")
+                write_text(p, default)
+                return default
+            return content
         write_text(p, default)
         return default
 
@@ -104,6 +107,7 @@ class Memory:
 
             if not entries:
                 return "(no messages matching query)"
+
 
             lines = []
             for e in entries:
