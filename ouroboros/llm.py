@@ -108,10 +108,21 @@ class LLMClient:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: Optional[str] = None,
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
+        env_key = (
+            os.environ.get("OUROBOROS_LLM_API_KEY", "")
+            or os.environ.get("OPENROUTER_API_KEY", "")
+            or os.environ.get("MISTRAL_API_KEY", "")
+        )
+        self._api_key = api_key or env_key
+        if base_url:
+            self._base_url = base_url
+        else:
+            self._base_url = (
+                os.environ.get("OUROBOROS_LLM_BASE_URL", "")
+                or ("https://openrouter.ai/api/v1" if os.environ.get("OPENROUTER_API_KEY", "").strip() else "https://api.mistral.ai/v1")
+            )
         self._client = None
 
     def _get_client(self):
