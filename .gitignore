@@ -26,3 +26,10 @@ Thumbs.db
 # Release artifacts (not tracked)
 .create_release.py
 .release_notes.md
+
+# Viktor-Friday runtime artifacts
+data/vfriday/
+reports/generated/
+.vfriday/base/
+.vfriday/backup/
+.vfriday/state.yaml

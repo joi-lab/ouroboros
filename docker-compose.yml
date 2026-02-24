@@ -1,0 +1,44 @@
+services:
+  vfriday-api:
+    build: .
+    command: ["python", "-m", "vfriday.app"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      VFRIDAY_API_HOST: 0.0.0.0
+      VFRIDAY_API_PORT: 8080
+      VFRIDAY_ORCHESTRATOR_URL: http://vfriday-api:8080
+      VFRIDAY_DATA_DIR: /data/vfriday
+    volumes:
+      - ouroboros-data:/data
+    ports:
+      - "8080:8080"
+
+  vfriday-tutor-bot:
+    build: .
+    command: ["python", "-m", "vfriday.integrations.telegram_tutor_bot"]
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      - vfriday-api
+    environment:
+      VFRIDAY_ORCHESTRATOR_URL: http://vfriday-api:8080
+      VFRIDAY_DATA_DIR: /data/vfriday
+    volumes:
+      - ouroboros-data:/data
+
+  ouroboros-engineer:
+    build: .
+    command: ["python", "launcher.py"]
+    restart: on-failure
+    env_file: .env
+    profiles: ["engineer"]
+    environment:
+      DRIVE_ROOT: /data/ouroboros
+      OUROBOROS_REPO_DIR: /app
+    volumes:
+      - ouroboros-data:/data
+
+volumes:
+  ouroboros-data:
+

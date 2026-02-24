@@ -1,0 +1,16 @@
+skill: "add-lean4-verifier"
+version: "0.1.0"
+description: "Lean4 verifier scaffold only (no runtime activation)."
+core_version: "6.2.0"
+adds:
+  - configs/vfriday_lean4.yaml
+modifies: []
+structured:
+  env_additions:
+    - VFRIDAY_LEAN4_ENABLED
+    - VFRIDAY_LEAN4_ENDPOINT
+  python_dependencies: []
+depends: []
+conflicts: []
+post_apply: []
+test: "python3 -m pytest tests/test_vfriday_sympy.py -q"

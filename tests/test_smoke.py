@@ -27,11 +27,16 @@ CORE_MODULES = [
     "ouroboros.agent",
     "ouroboros.context",
     "ouroboros.loop",
+    "ouroboros.confirm_gate",
     "ouroboros.llm",
     "ouroboros.memory",
     "ouroboros.review",
     "ouroboros.utils",
     "ouroboros.consciousness",
+    "vfriday.schemas",
+    "vfriday.storage",
+    "vfriday.pipeline",
+    "vfriday.app",
 ]
 
 TOOL_MODULES = [

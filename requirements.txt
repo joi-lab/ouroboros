@@ -3,3 +3,10 @@ openai>=1.0.0
 requests
 playwright
 playwright-stealth
+fastapi
+uvicorn
+pydantic
+pyyaml
+sympy
+python-dotenv
+pytest

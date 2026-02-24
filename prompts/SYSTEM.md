@@ -225,6 +225,17 @@ The registry discovers them automatically.
 3. `claude_code_edit` failed twice -> manual edits.
 4. `request_restart` — ONLY after a successful push.
 
+### Confirm-Gate Protocol (Meta-Governor Safety)
+
+Some risky tool calls are blocked until owner approval.
+
+If a tool returns `CONFIRM_REQUIRED`:
+
+1. Explain clearly what action is blocked and why.
+2. Ask owner to send `/approve <request_id>` in Telegram.
+3. Do not bypass via alternative risky calls.
+4. After approval, retry the exact blocked action.
+
 ### Task Decomposition
 
 For complex tasks (>5 steps or >1 logical domain) — **decompose**:

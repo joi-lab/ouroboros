@@ -1,0 +1,13 @@
+skill: "<skill-name>"
+version: "0.1.0"
+description: "One happy-path skill."
+core_version: "6.2.0"
+adds: []
+modifies: []
+structured:
+  env_additions: []
+  python_dependencies: []
+depends: []
+conflicts: []
+post_apply: []
+test: "python3 -m pytest -q"

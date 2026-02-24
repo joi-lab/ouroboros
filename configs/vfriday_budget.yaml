@@ -1,0 +1,7 @@
+monthly_cap_usd: 150.0
+per_session_soft_cap_usd: 8.0
+reserve_buckets:
+  benchmark: 30.0
+  interactive: 100.0
+  safety_margin: 20.0
+

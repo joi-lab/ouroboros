@@ -1,0 +1,10 @@
+solver_model: o3
+tutor_model: gpt-5-mini
+ocr_model: gpt-4.1
+fallbacks:
+  solver:
+    - gpt-5-mini
+  tutor:
+    - gpt-4.1
+  ocr:
+    - gpt-4.1-mini

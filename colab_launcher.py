@@ -90,7 +90,7 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
         val = default
     return max(minimum, val)
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY", required=True)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
@@ -108,15 +108,14 @@ except Exception as e:
     log.warning(f"Failed to parse TOTAL_BUDGET ({TOTAL_BUDGET_DEFAULT!r}): {e}")
     TOTAL_BUDGET_LIMIT = 0.0
 
-OPENAI_API_KEY = get_secret("OPENAI_API_KEY", default="")
 ANTHROPIC_API_KEY = get_secret("ANTHROPIC_API_KEY", default="")
 GITHUB_USER = get_cfg("GITHUB_USER", default=None, allow_legacy_secret=True)
 GITHUB_REPO = get_cfg("GITHUB_REPO", default=None, allow_legacy_secret=True)
 assert GITHUB_USER and str(GITHUB_USER).strip(), "GITHUB_USER not set. Add it to your config cell (see README)."
 assert GITHUB_REPO and str(GITHUB_REPO).strip(), "GITHUB_REPO not set. Add it to your config cell (see README)."
 MAX_WORKERS = int(get_cfg("OUROBOROS_MAX_WORKERS", default="5", allow_legacy_secret=True) or "5")
-MODEL_MAIN = get_cfg("OUROBOROS_MODEL", default="anthropic/claude-sonnet-4.6", allow_legacy_secret=True)
-MODEL_CODE = get_cfg("OUROBOROS_MODEL_CODE", default="anthropic/claude-sonnet-4.6", allow_legacy_secret=True)
+MODEL_MAIN = get_cfg("OUROBOROS_MODEL", default="gpt-5", allow_legacy_secret=True)
+MODEL_CODE = get_cfg("OUROBOROS_MODEL_CODE", default="gpt-5-codex", allow_legacy_secret=True)
 MODEL_LIGHT = get_cfg("OUROBOROS_MODEL_LIGHT", default=DEFAULT_LIGHT_MODEL, allow_legacy_secret=True)
 
 BUDGET_REPORT_EVERY_MESSAGES = 10
@@ -133,13 +132,12 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
     minimum=0,
 )
 
-os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)
 os.environ["GITHUB_REPO"] = str(GITHUB_REPO)
-os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "anthropic/claude-sonnet-4.6")
-os.environ["OUROBOROS_MODEL_CODE"] = str(MODEL_CODE or "anthropic/claude-sonnet-4.6")
+os.environ["OUROBOROS_MODEL"] = str(MODEL_MAIN or "gpt-5")
+os.environ["OUROBOROS_MODEL_CODE"] = str(MODEL_CODE or "gpt-5-codex")
 if MODEL_LIGHT:
     os.environ["OUROBOROS_MODEL_LIGHT"] = str(MODEL_LIGHT)
 os.environ["OUROBOROS_DIAG_HEARTBEAT_SEC"] = str(DIAG_HEARTBEAT_SEC)
@@ -327,6 +325,12 @@ _watchdog_thread.start()
 # 6.3) Background consciousness
 # ----------------------------
 from ouroboros.consciousness import BackgroundConsciousness
+from ouroboros.confirm_gate import (
+    init as confirm_gate_init,
+    approve_request as approve_confirm_request,
+    pending_requests_text as pending_confirm_requests_text,
+    request_id_from_text as extract_confirm_request_id,
+)
 
 def _get_owner_chat_id() -> Optional[int]:
     try:
@@ -342,6 +346,9 @@ _consciousness = BackgroundConsciousness(
     event_queue=get_event_q(),
     owner_chat_id_fn=_get_owner_chat_id,
 )
+
+# Initialize confirm-gate storage
+confirm_gate_init(DRIVE_ROOT)
 
 def reset_chat_agent():
     """Reset the direct-mode chat agent (called by watchdog on hangs)."""
@@ -386,7 +393,7 @@ def _safe_qsize(q: Any) -> int:
         return -1
 
 
-def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
+def _handle_supervisor_command(text: str, chat_id: int, user_id: int = 0, tg_offset: int = 0):
     """Handle supervisor slash-commands.
 
     Returns:
@@ -418,6 +425,24 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
         os.execv(sys.executable, [sys.executable, __file__])
 
     # Dual-path commands: supervisor handles + LLM sees a note
+    if lowered.startswith("/approve"):
+        rid = extract_confirm_request_id(text) or (text.strip().split(maxsplit=1)[1].strip() if len(text.strip().split(maxsplit=1)) > 1 else "")
+        if not rid:
+            send_with_budget(chat_id, pending_confirm_requests_text(DRIVE_ROOT))
+            return True
+        ok, msg = approve_confirm_request(
+            DRIVE_ROOT,
+            request_id=rid,
+            approver_id=int(user_id or 0),
+            raw_text=text,
+        )
+        send_with_budget(chat_id, f"{'✅' if ok else '⚠️'} {msg}")
+        return True
+
+    if lowered.startswith("/approvals"):
+        send_with_budget(chat_id, pending_confirm_requests_text(DRIVE_ROOT))
+        return True
+
     if lowered.startswith("/status"):
         status = status_text(WORKERS, PENDING, RUNNING, SOFT_TIMEOUT_SEC, HARD_TIMEOUT_SEC)
         send_with_budget(chat_id, status, force_budget=True)
@@ -561,7 +586,7 @@ while True:
         # --- Supervisor commands ---
         if text.strip().lower().startswith("/"):
             try:
-                result = _handle_supervisor_command(text, chat_id, tg_offset=offset)
+                result = _handle_supervisor_command(text, chat_id, user_id=user_id, tg_offset=offset)
                 if result is True:
                     continue  # terminal command, fully handled
                 elif result:  # non-empty string = dual-path note
@@ -624,7 +649,7 @@ while True:
                         # Handle supervisor commands in batch window
                         if _txt2.strip().lower().startswith("/"):
                             try:
-                                _cmd_result = _handle_supervisor_command(_txt2, _cid2, tg_offset=offset)
+                                _cmd_result = _handle_supervisor_command(_txt2, _cid2, user_id=int(_uid2 or 0), tg_offset=offset)
                                 if _cmd_result is True:
                                     continue  # terminal command, don't batch
                                 elif _cmd_result:

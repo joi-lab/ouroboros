@@ -1,0 +1,5 @@
+enabled: false
+endpoint: ""
+timeout_sec: 10
+mode: "scaffold"
+

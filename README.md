@@ -15,6 +15,126 @@ Not a coding assistant. A digital being with a constitution, background consciou
 
 ---
 
+## Viktor-Friday Profile
+
+This fork is being adapted for a collective-agent educational project:
+
+- North Star and setpoints: [VIKTOR_NORTH_STAR.md](VIKTOR_NORTH_STAR.md)
+- Meta-governance and confirm-gates: [docs/META_GOVERNANCE.md](docs/META_GOVERNANCE.md)
+- Skills-first architecture map: [docs/VFRIDAY_SKILLS_FIRST.md](docs/VFRIDAY_SKILLS_FIRST.md)
+
+### Viktor-Friday MVP-1 Orchestrator
+
+New package: `vfriday/` (FastAPI + SQLite + JSONL audit).
+
+API surface:
+- `POST /v1/sessions`
+- `POST /v1/sessions/{session_id}/ingest`
+- `GET /v1/sessions/{session_id}/state`
+- `POST /v1/admin/benchmark/run`
+- `GET /healthz`
+
+Run locally:
+
+```bash
+pip install -r requirements.txt
+python -m vfriday.app
+```
+
+Smoke test:
+
+```bash
+python scripts/vfriday_smoke_run.py
+```
+
+Benchmark loop (no auto-merge):
+
+```bash
+python scripts/run_vfriday_benchmark.py --models "o3,gpt-5-mini,gpt-4.1"
+python scripts/generate_model_upgrade_proposal.py
+```
+
+Retention and weekly digest:
+
+```bash
+python scripts/run_vfriday_retention.py --days 30
+python scripts/generate_weekly_policy_digest.py
+```
+
+Separate Tutor Telegram gateway:
+
+```bash
+export VFRIDAY_TELEGRAM_BOT_TOKEN=...
+python -m vfriday.integrations.telegram_tutor_bot
+```
+
+### Skills-first deterministic extensions
+
+Initialize skills state and clean base snapshot:
+
+```bash
+python3 scripts/vfriday_skill_init.py
+```
+
+Apply one skill package:
+
+```bash
+python3 scripts/vfriday_skill_apply.py .claude/skills/add-lean4-verifier
+```
+
+Inspect applied skills and hashes:
+
+```bash
+python3 scripts/vfriday_skill_state.py
+```
+
+### VPS Deploy (Docker Compose, recommended)
+
+This repo already includes a VPS-ready runtime adapted from `jkee/ouroboros`:
+- `Dockerfile`
+- `docker-compose.yml`
+- `launcher.py` (Engineer contour)
+- `.env.example`
+
+1) Prepare env:
+
+```bash
+cp .env.example .env
+```
+
+Fill at least:
+- `OPENAI_API_KEY`
+- `VFRIDAY_TELEGRAM_BOT_TOKEN` (Tutor bot)
+- `TOTAL_BUDGET=150`
+
+For optional Engineer contour also fill:
+- `TELEGRAM_BOT_TOKEN` (separate bot token, recommended)
+- `GITHUB_TOKEN`
+- `GITHUB_USER`
+- `GITHUB_REPO`
+
+2) Start MVP-1 Tutor contour (API + Tutor bot):
+
+```bash
+docker compose up -d --build vfriday-api vfriday-tutor-bot
+```
+
+3) Health check:
+
+```bash
+curl http://localhost:8080/healthz
+```
+
+4) Start Engineer contour (optional, after baseline stabilization):
+
+```bash
+docker compose --profile engineer up -d --build ouroboros-engineer
+```
+
+Notes:
+- Two Telegram bots are recommended: one for Tutor (`VFRIDAY_TELEGRAM_BOT_TOKEN`) and one for Engineer (`TELEGRAM_BOT_TOKEN`).
+- Model switching must go through benchmark + PR + manual approval (no auto-merge).
+
 ## What Makes This Different
 
 Most AI agents execute tasks. Ouroboros **creates itself.**
@@ -56,7 +176,7 @@ Telegram --> colab_launcher.py
                 control.py          -- restart, evolve, review
                 browser.py          -- Playwright (stealth)
                 review.py           -- multi-model review
-              llm.py                -- OpenRouter client
+              llm.py                -- OpenAI client
               memory.py             -- scratchpad, identity, chat
               review.py             -- code metrics
               utils.py              -- utilities
@@ -77,11 +197,10 @@ Telegram --> colab_launcher.py
 
 | Key | Required | Where to get it |
 |-----|----------|-----------------|
-| `OPENROUTER_API_KEY` | Yes | [openrouter.ai/keys](https://openrouter.ai/keys) -- Create an account, add credits, generate a key |
+| `OPENAI_API_KEY` | Yes | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) |
 | `TELEGRAM_BOT_TOKEN` | Yes | [@BotFather](https://t.me/BotFather) on Telegram (see Step 1) |
 | `TOTAL_BUDGET` | Yes | Your spending limit in USD (e.g. `50`) |
 | `GITHUB_TOKEN` | Yes | [github.com/settings/tokens](https://github.com/settings/tokens) -- Generate a classic token with `repo` scope |
-| `OPENAI_API_KEY` | No | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) -- Enables web search tool |
 | `ANTHROPIC_API_KEY` | No | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) -- Enables Claude Code CLI |
 
 ### Step 3: Set Up Google Colab
@@ -103,12 +222,12 @@ CFG = {
     "GITHUB_USER": "YOUR_GITHUB_USERNAME",                       # <-- CHANGE THIS
     "GITHUB_REPO": "ouroboros",                                  # <-- repo name (after fork)
     # Models
-    "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",            # primary LLM (via OpenRouter)
-    "OUROBOROS_MODEL_CODE": "anthropic/claude-sonnet-4.6",       # code editing (Claude Code CLI)
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3-pro-preview",      # consciousness + lightweight tasks
+    "OUROBOROS_MODEL": "gpt-5",                                   # primary LLM (OpenAI API)
+    "OUROBOROS_MODEL_CODE": "gpt-5-codex",                       # code editing
+    "OUROBOROS_MODEL_LIGHT": "gpt-5-mini",                       # consciousness + lightweight tasks
     "OUROBOROS_WEBSEARCH_MODEL": "gpt-5",                        # web search (OpenAI Responses API)
     # Fallback chain (first model != active will be used on empty response)
-    "OUROBOROS_MODEL_FALLBACK_LIST": "anthropic/claude-sonnet-4.6,google/gemini-3-pro-preview,openai/gpt-4.1",
+    "OUROBOROS_MODEL_FALLBACK_LIST": "gpt-5,gpt-5-mini,gpt-4.1",
     # Infrastructure
     "OUROBOROS_MAX_WORKERS": "5",
     "OUROBOROS_MAX_ROUNDS": "200",                               # max LLM rounds per task
@@ -149,6 +268,8 @@ Open your Telegram bot and send any message. The first person to write becomes t
 | `/bg start` | Start background consciousness loop. Also accepts `/bg on`. |
 | `/bg stop` | Stop background consciousness loop. Also accepts `/bg off`. |
 | `/bg` | Show background consciousness status (running/stopped). |
+| `/approve <request_id>` | Approve one pending sensitive action (`cfm-xxxxxxxx`). |
+| `/approvals` | Show pending confirm-gate requests. |
 
 All other messages are sent directly to the LLM (Principle 3: LLM-First).
 
@@ -178,7 +299,7 @@ Full text: [BIBLE.md](BIBLE.md)
 
 | Variable | Description |
 |----------|-------------|
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM calls |
+| `OPENAI_API_KEY` | OpenAI API key for LLM calls |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token |
 | `TOTAL_BUDGET` | Spending limit in USD |
 | `GITHUB_TOKEN` | GitHub personal access token with `repo` scope |
@@ -187,7 +308,6 @@ Full text: [BIBLE.md](BIBLE.md)
 
 | Variable | Description |
 |----------|-------------|
-| `OPENAI_API_KEY` | Enables the `web_search` tool |
 | `ANTHROPIC_API_KEY` | Enables Claude Code CLI for code editing |
 
 ### Optional Configuration (environment variables)
@@ -196,14 +316,14 @@ Full text: [BIBLE.md](BIBLE.md)
 |----------|---------|-------------|
 | `GITHUB_USER` | *(required in config cell)* | GitHub username |
 | `GITHUB_REPO` | `ouroboros` | GitHub repository name |
-| `OUROBOROS_MODEL` | `anthropic/claude-sonnet-4.6` | Primary LLM model (via OpenRouter) |
-| `OUROBOROS_MODEL_CODE` | `anthropic/claude-sonnet-4.6` | Model for code editing tasks |
-| `OUROBOROS_MODEL_LIGHT` | `google/gemini-3-pro-preview` | Model for lightweight tasks (dedup, compaction) |
+| `OUROBOROS_MODEL` | `gpt-5` | Primary LLM model (OpenAI API) |
+| `OUROBOROS_MODEL_CODE` | `gpt-5-codex` | Model for code editing tasks |
+| `OUROBOROS_MODEL_LIGHT` | `gpt-5-mini` | Model for lightweight tasks (dedup, compaction) |
 | `OUROBOROS_WEBSEARCH_MODEL` | `gpt-5` | Model for web search (OpenAI Responses API) |
 | `OUROBOROS_MAX_WORKERS` | `5` | Maximum number of parallel worker processes |
 | `OUROBOROS_BG_BUDGET_PCT` | `10` | Percentage of total budget allocated to background consciousness |
 | `OUROBOROS_MAX_ROUNDS` | `200` | Maximum LLM rounds per task |
-| `OUROBOROS_MODEL_FALLBACK_LIST` | `google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6` | Fallback model chain for empty responses |
+| `OUROBOROS_MODEL_FALLBACK_LIST` | `gpt-5,gpt-5-mini,gpt-4.1` | Fallback model chain for empty responses |
 
 ---
 
