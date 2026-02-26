@@ -7,7 +7,7 @@ Supports: *** Update File, *** Add File, *** Delete File, *** End of File.
 import pathlib
 
 
-APPLY_PATCH_PATH = pathlib.Path("/usr/local/bin/apply_patch")
+APPLY_PATCH_PATH = pathlib.Path("/home/alexroll/.local/bin/apply_patch")
 APPLY_PATCH_CODE = r"""#!/usr/bin/env python3
 import os
 import sys
