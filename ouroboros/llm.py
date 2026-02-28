@@ -1,7 +1,7 @@
 """
 Ouroboros — LLM client.
 
-The only module that communicates with the LLM API (OpenRouter).
+The only module that communicates with the LLM API (ProxyAPI).
 Contract: chat(), default_model(), available_models(), add_usage().
 """
 
@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
-DEFAULT_LIGHT_MODEL = "google/gemini-3-pro-preview"
+DEFAULT_LIGHT_MODEL = "x-ai/grok-3-mini"
 
 
 def normalize_reasoning_effort(value: str, default: str = "medium") -> str:
@@ -36,9 +36,9 @@ def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
         total["cost"] = float(total.get("cost") or 0) + float(usage["cost"])
 
 
-def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
+def fetch_proxyapi_pricing() -> Dict[str, Tuple[float, float, float]]:
     """
-    Fetch current pricing from OpenRouter API.
+    Fetch current pricing from provider models API.
 
     Returns dict of {model_id: (input_per_1m, cached_per_1m, output_per_1m)}.
     Returns empty dict on failure.
@@ -53,7 +53,8 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
         return {}
 
     try:
-        url = "https://openrouter.ai/api/v1/models"
+        base_url = os.environ.get("PROXYAPI_BASE_URL", "https://api.proxyapi.ru/openrouter/v1")
+        url = f"{base_url.rstrip('/')}/models"
         resp = requests.get(url, timeout=15)
         resp.raise_for_status()
 
@@ -73,7 +74,7 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
             if not pricing or not pricing.get("prompt"):
                 continue
 
-            # OpenRouter pricing is in dollars per token (raw values)
+            # Provider pricing is in dollars per token (raw values)
             raw_prompt = float(pricing.get("prompt", 0))
             raw_completion = float(pricing.get("completion", 0))
             raw_cached_str = pricing.get("input_cache_read")
@@ -94,36 +95,42 @@ def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
 
             pricing_dict[model_id] = (prompt_price, cached_price, completion_price)
 
-        log.info(f"Fetched pricing for {len(pricing_dict)} models from OpenRouter")
+        log.info(f"Fetched pricing for {len(pricing_dict)} models from provider API")
         return pricing_dict
 
     except (requests.RequestException, ValueError, KeyError) as e:
-        log.warning(f"Failed to fetch OpenRouter pricing: {e}")
+        log.warning(f"Failed to fetch provider pricing: {e}")
         return {}
 
 
+def fetch_openrouter_pricing() -> Dict[str, Tuple[float, float, float]]:
+    """Backward-compatible alias for legacy imports."""
+    return fetch_proxyapi_pricing()
+
+
 class LLMClient:
-    """OpenRouter API wrapper. All LLM calls go through this class."""
+    """ProxyAPI wrapper. All LLM calls go through this class."""
 
     def __init__(
         self,
         api_key: Optional[str] = None,
-        base_url: str = "https://openrouter.ai/api/v1",
+        base_url: str = "https://api.proxyapi.ru/openrouter/v1",
     ):
-        self._api_key = api_key or os.environ.get("OPENROUTER_API_KEY", "")
-        self._base_url = base_url
+        self._api_key = api_key or os.environ.get("PROXYAPI_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
+        self._base_url = os.environ.get("PROXYAPI_BASE_URL", base_url)
         self._client = None
 
     def _get_client(self):
         if self._client is None:
             from openai import OpenAI
+            default_headers = {
+                "HTTP-Referer": "https://colab.research.google.com/",
+                "X-Title": "Ouroboros",
+            }
             self._client = OpenAI(
                 base_url=self._base_url,
                 api_key=self._api_key,
-                default_headers={
-                    "HTTP-Referer": "https://colab.research.google.com/",
-                    "X-Title": "Ouroboros",
-                },
+                default_headers=default_headers,
             )
         return self._client
 
@@ -231,7 +238,7 @@ class LLMClient:
         self,
         prompt: str,
         images: List[Dict[str, Any]],
-        model: str = "anthropic/claude-sonnet-4.6",
+        model: str = "x-ai/grok-3-mini",
         max_tokens: int = 1024,
         reasoning_effort: str = "low",
     ) -> Tuple[str, Dict[str, Any]]:
@@ -280,11 +287,11 @@ class LLMClient:
 
     def default_model(self) -> str:
         """Return the single default model from env. LLM switches via tool if needed."""
-        return os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        return os.environ.get("OUROBOROS_MODEL", "x-ai/grok-3-mini")
 
     def available_models(self) -> List[str]:
         """Return list of available models from env (for switch_model tool schema)."""
-        main = os.environ.get("OUROBOROS_MODEL", "anthropic/claude-sonnet-4.6")
+        main = os.environ.get("OUROBOROS_MODEL", "x-ai/grok-3-mini")
         code = os.environ.get("OUROBOROS_MODEL_CODE", "")
         light = os.environ.get("OUROBOROS_MODEL_LIGHT", "")
         models = [main]

@@ -57,7 +57,7 @@ Telegram --> colab_launcher.py
                 control.py          -- restart, evolve, review
                 browser.py          -- Playwright (stealth)
                 review.py           -- multi-model review
-              llm.py                -- OpenRouter client
+              llm.py                -- ProxyAPI client
               memory.py             -- scratchpad, identity, chat
               review.py             -- code metrics
               utils.py              -- utilities
@@ -78,7 +78,7 @@ Telegram --> colab_launcher.py
 
 | Key | Required | Where to get it |
 |-----|----------|-----------------|
-| `OPENROUTER_API_KEY` | Yes | [openrouter.ai/keys](https://openrouter.ai/keys) -- Create an account, add credits, generate a key |
+| `PROXYAPI_API_KEY` | Yes | [proxyapi.ru](https://proxyapi.ru/) -- Create an account and generate an API key |
 | `TELEGRAM_BOT_TOKEN` | Yes | [@BotFather](https://t.me/BotFather) on Telegram (see Step 1) |
 | `TOTAL_BUDGET` | Yes | Your spending limit in USD (e.g. `50`) |
 | `GITHUB_TOKEN` | Yes | [github.com/settings/tokens](https://github.com/settings/tokens) -- Generate a classic token with `repo` scope |
@@ -98,18 +98,21 @@ Telegram --> colab_launcher.py
 
 ```python
 import os
+import runpy
+import subprocess
+from pathlib import Path
 
 # ⚠️ CHANGE THESE to your GitHub username and forked repo name
 CFG = {
     "GITHUB_USER": "YOUR_GITHUB_USERNAME",                       # <-- CHANGE THIS
     "GITHUB_REPO": "ouroboros",                                  # <-- repo name (after fork)
     # Models
-    "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",            # primary LLM (via OpenRouter)
-    "OUROBOROS_MODEL_CODE": "anthropic/claude-sonnet-4.6",       # code editing (Claude Code CLI)
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3-pro-preview",      # consciousness + lightweight tasks
+    "OUROBOROS_MODEL": "x-ai/grok-3-mini",            # primary LLM (via ProxyAPI)
+    "OUROBOROS_MODEL_CODE": "x-ai/grok-3-mini",       # code editing (Claude Code CLI)
+    "OUROBOROS_MODEL_LIGHT": "x-ai/grok-3-mini",      # consciousness + lightweight tasks
     "OUROBOROS_WEBSEARCH_MODEL": "gpt-5",                        # web search (OpenAI Responses API)
     # Fallback chain (first model != active will be used on empty response)
-    "OUROBOROS_MODEL_FALLBACK_LIST": "anthropic/claude-sonnet-4.6,google/gemini-3-pro-preview,openai/gpt-4.1",
+    "OUROBOROS_MODEL_FALLBACK_LIST": "x-ai/grok-3-mini,qwen/qwen3.5-plus-02-15,openai/o4-mini",
     # Infrastructure
     "OUROBOROS_MAX_WORKERS": "5",
     "OUROBOROS_MAX_ROUNDS": "200",                               # max LLM rounds per task
@@ -118,15 +121,21 @@ CFG = {
 for k, v in CFG.items():
     os.environ[k] = str(v)
 
-# Clone the original repo (the boot shim will re-point origin to your fork)
-!git clone https://github.com/joi-lab/ouroboros.git /content/ouroboros_repo
-%cd /content/ouroboros_repo
+# Clone the original repo (the boot shim will re-point origin to your fork).
+# If you re-run the cell, the existing checkout is reused.
+repo_dir = Path("/content/ouroboros_repo")
+if not repo_dir.exists():
+    subprocess.run(
+        ["git", "clone", "https://github.com/joi-lab/ouroboros.git", str(repo_dir)],
+        check=True,
+    )
+os.chdir(repo_dir)
 
 # Install dependencies
-!pip install -q -r requirements.txt
+subprocess.run(["pip", "install", "-q", "-r", "requirements.txt"], check=True)
 
 # Run the boot shim
-%run colab_bootstrap_shim.py
+runpy.run_path("colab_bootstrap_shim.py", run_name="__main__")
 ```
 
 ### Step 5: Start Chatting
@@ -179,7 +188,7 @@ Full text: [BIBLE.md](BIBLE.md)
 
 | Variable | Description |
 |----------|-------------|
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM calls |
+| `PROXYAPI_API_KEY` | ProxyAPI key for LLM calls |
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API token |
 | `TOTAL_BUDGET` | Spending limit in USD |
 | `GITHUB_TOKEN` | GitHub personal access token with `repo` scope |
@@ -197,14 +206,14 @@ Full text: [BIBLE.md](BIBLE.md)
 |----------|---------|-------------|
 | `GITHUB_USER` | *(required in config cell)* | GitHub username |
 | `GITHUB_REPO` | `ouroboros` | GitHub repository name |
-| `OUROBOROS_MODEL` | `anthropic/claude-sonnet-4.6` | Primary LLM model (via OpenRouter) |
-| `OUROBOROS_MODEL_CODE` | `anthropic/claude-sonnet-4.6` | Model for code editing tasks |
-| `OUROBOROS_MODEL_LIGHT` | `google/gemini-3-pro-preview` | Model for lightweight tasks (dedup, compaction) |
+| `OUROBOROS_MODEL` | `x-ai/grok-3-mini` | Primary LLM model (via ProxyAPI) |
+| `OUROBOROS_MODEL_CODE` | `x-ai/grok-3-mini` | Model for code editing tasks |
+| `OUROBOROS_MODEL_LIGHT` | `x-ai/grok-3-mini` | Model for lightweight tasks (dedup, compaction) |
 | `OUROBOROS_WEBSEARCH_MODEL` | `gpt-5` | Model for web search (OpenAI Responses API) |
 | `OUROBOROS_MAX_WORKERS` | `5` | Maximum number of parallel worker processes |
 | `OUROBOROS_BG_BUDGET_PCT` | `10` | Percentage of total budget allocated to background consciousness |
 | `OUROBOROS_MAX_ROUNDS` | `200` | Maximum LLM rounds per task |
-| `OUROBOROS_MODEL_FALLBACK_LIST` | `google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6` | Fallback model chain for empty responses |
+| `OUROBOROS_MODEL_FALLBACK_LIST` | `x-ai/grok-3-mini,qwen/qwen3.5-plus-02-15,openai/o4-mini` | Fallback model chain for empty responses |
 
 ---
 

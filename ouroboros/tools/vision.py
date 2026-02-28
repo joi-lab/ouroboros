@@ -20,7 +20,7 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_VLM_MODEL = "anthropic/claude-sonnet-4.6"
+_DEFAULT_VLM_MODEL = "x-ai/grok-3-mini"
 
 
 def _get_vlm_model() -> str:

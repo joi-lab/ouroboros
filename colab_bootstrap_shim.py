@@ -35,8 +35,15 @@ def export_secret_to_env(name: str, required: bool = False) -> Optional[str]:
 
 
 # Export required runtime secrets so subprocess launcher can always read env fallback.
-for _name in ("OPENROUTER_API_KEY", "TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
+for _name in ("TELEGRAM_BOT_TOKEN", "TOTAL_BUDGET", "GITHUB_TOKEN"):
     export_secret_to_env(_name, required=True)
+
+_proxy_key = export_secret_to_env("PROXYAPI_API_KEY", required=False)
+if not _proxy_key:
+    export_secret_to_env("OPENROUTER_API_KEY", required=True)
+    os.environ["PROXYAPI_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
+else:
+    os.environ["OPENROUTER_API_KEY"] = os.environ["PROXYAPI_API_KEY"]
 
 # Optional secrets (keep empty if missing).
 for _name in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
@@ -47,6 +54,7 @@ os.environ.setdefault("OUROBOROS_WORKER_START_METHOD", "fork")
 os.environ.setdefault("OUROBOROS_DIAG_HEARTBEAT_SEC", "30")
 os.environ.setdefault("OUROBOROS_DIAG_SLOW_CYCLE_SEC", "20")
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
+os.environ.setdefault("PROXYAPI_BASE_URL", "https://api.proxyapi.ru/openrouter/v1")
 
 GITHUB_TOKEN = str(os.environ["GITHUB_TOKEN"])
 GITHUB_USER = os.environ.get("GITHUB_USER", "").strip()
