@@ -98,6 +98,9 @@ Telegram --> colab_launcher.py
 
 ```python
 import os
+import runpy
+import subprocess
+from pathlib import Path
 
 # ⚠️ CHANGE THESE to your GitHub username and forked repo name
 CFG = {
@@ -118,15 +121,21 @@ CFG = {
 for k, v in CFG.items():
     os.environ[k] = str(v)
 
-# Clone the original repo (the boot shim will re-point origin to your fork)
-!git clone https://github.com/joi-lab/ouroboros.git /content/ouroboros_repo
-%cd /content/ouroboros_repo
+# Clone the original repo (the boot shim will re-point origin to your fork).
+# If you re-run the cell, the existing checkout is reused.
+repo_dir = Path("/content/ouroboros_repo")
+if not repo_dir.exists():
+    subprocess.run(
+        ["git", "clone", "https://github.com/joi-lab/ouroboros.git", str(repo_dir)],
+        check=True,
+    )
+os.chdir(repo_dir)
 
 # Install dependencies
-!pip install -q -r requirements.txt
+subprocess.run(["pip", "install", "-q", "-r", "requirements.txt"], check=True)
 
 # Run the boot shim
-%run colab_bootstrap_shim.py
+runpy.run_path("colab_bootstrap_shim.py", run_name="__main__")
 ```
 
 ### Step 5: Start Chatting
