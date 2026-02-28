@@ -90,7 +90,9 @@ def _parse_int_cfg(raw: Optional[str], default: int, minimum: int = 0) -> int:
         val = default
     return max(minimum, val)
 
-OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
+PROXYAPI_API_KEY = get_secret("PROXYAPI_API_KEY", default="")
+if not str(PROXYAPI_API_KEY or "").strip():
+    PROXYAPI_API_KEY = get_secret("OPENROUTER_API_KEY", required=True)
 TELEGRAM_BOT_TOKEN = get_secret("TELEGRAM_BOT_TOKEN", required=True)
 TOTAL_BUDGET_DEFAULT = get_secret("TOTAL_BUDGET", required=True)
 GITHUB_TOKEN = get_secret("GITHUB_TOKEN", required=True)
@@ -133,7 +135,9 @@ DIAG_SLOW_CYCLE_SEC = _parse_int_cfg(
     minimum=0,
 )
 
-os.environ["OPENROUTER_API_KEY"] = str(OPENROUTER_API_KEY)
+os.environ["PROXYAPI_API_KEY"] = str(PROXYAPI_API_KEY)
+os.environ["OPENROUTER_API_KEY"] = str(PROXYAPI_API_KEY)
+os.environ.setdefault("PROXYAPI_BASE_URL", "https://api.proxyapi.ru/openrouter/v1")
 os.environ["OPENAI_API_KEY"] = str(OPENAI_API_KEY or "")
 os.environ["ANTHROPIC_API_KEY"] = str(ANTHROPIC_API_KEY or "")
 os.environ["GITHUB_USER"] = str(GITHUB_USER)

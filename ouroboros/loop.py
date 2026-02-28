@@ -25,7 +25,7 @@ from ouroboros.utils import utc_now_iso, append_jsonl, truncate_for_log, sanitiz
 
 log = logging.getLogger(__name__)
 
-# Pricing from OpenRouter API (2026-02-17). Update periodically via /api/v1/models.
+# Pricing from provider API (2026-02-17). Update periodically via /models.
 _MODEL_PRICING_STATIC = {
     "anthropic/claude-opus-4.6": (5.0, 0.5, 25.0),
     "anthropic/claude-opus-4": (15.0, 1.5, 75.0),
@@ -50,7 +50,7 @@ _pricing_lock = threading.Lock()
 
 def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
     """
-    Lazy-load pricing. On first call, attempts to fetch from OpenRouter API.
+    Lazy-load pricing. On first call, attempts to fetch from provider API.
     Falls back to static pricing if fetch fails.
     Thread-safe via module-level lock.
     """
@@ -70,13 +70,13 @@ def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
         _cached_pricing = dict(_MODEL_PRICING_STATIC)
 
         try:
-            from ouroboros.llm import fetch_openrouter_pricing
-            _live = fetch_openrouter_pricing()
+            from ouroboros.llm import fetch_proxyapi_pricing
+            _live = fetch_proxyapi_pricing()
             if _live and len(_live) > 5:
                 _cached_pricing.update(_live)
         except Exception as e:
             import logging as _log
-            _log.getLogger(__name__).warning("Failed to sync pricing from OpenRouter: %s", e)
+            _log.getLogger(__name__).warning("Failed to sync pricing from provider API: %s", e)
             # Reset flag so we retry next time
             _pricing_fetched = False
 
