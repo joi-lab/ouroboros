@@ -19,13 +19,14 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
 from ouroboros.llm import LLMClient, normalize_reasoning_effort, add_usage
+from ouroboros.confirm_gate import guard_tool_call
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context import compact_tool_history, compact_tool_history_llm
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_for_log, sanitize_tool_args_for_log, sanitize_tool_result_for_log, estimate_tokens
 
 log = logging.getLogger(__name__)
 
-# Pricing from OpenRouter API (2026-02-17). Update periodically via /api/v1/models.
+# Static pricing hints for token-cost estimation.
 _MODEL_PRICING_STATIC = {
     "anthropic/claude-opus-4.6": (5.0, 0.5, 25.0),
     "anthropic/claude-opus-4": (15.0, 1.5, 75.0),
@@ -50,8 +51,7 @@ _pricing_lock = threading.Lock()
 
 def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
     """
-    Lazy-load pricing. On first call, attempts to fetch from OpenRouter API.
-    Falls back to static pricing if fetch fails.
+    Lazy-load pricing. Falls back to static pricing.
     Thread-safe via module-level lock.
     """
     global _pricing_fetched, _cached_pricing
@@ -76,7 +76,7 @@ def _get_pricing() -> Dict[str, Tuple[float, float, float]]:
                 _cached_pricing.update(_live)
         except Exception as e:
             import logging as _log
-            _log.getLogger(__name__).warning("Failed to sync pricing from OpenRouter: %s", e)
+            _log.getLogger(__name__).warning("Failed to sync external pricing: %s", e)
             # Reset flag so we retry next time
             _pricing_fetched = False
 
@@ -162,6 +162,47 @@ def _execute_single_tool(
         }
 
     args_for_log = sanitize_tool_args_for_log(fn_name, args if isinstance(args, dict) else {})
+
+    # Confirm gate for sensitive operations (publication, policy changes, credentials, budget-risk toggles)
+    try:
+        confirm_block = guard_tool_call(
+            drive_root=tools._ctx.drive_root,  # ToolRegistry runtime context
+            tool_name=fn_name,
+            args=args if isinstance(args, dict) else {},
+            task_id=task_id,
+        )
+        if confirm_block:
+            append_jsonl(drive_logs / "events.jsonl", {
+                "ts": utc_now_iso(),
+                "type": "tool_confirm_blocked",
+                "task_id": task_id,
+                "tool": fn_name,
+                "args": args_for_log,
+            })
+            return {
+                "tool_call_id": tool_call_id,
+                "fn_name": fn_name,
+                "result": confirm_block,
+                "is_error": True,
+                "args_for_log": args_for_log,
+                "is_code_tool": is_code_tool,
+            }
+    except Exception as e:
+        append_jsonl(drive_logs / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "confirm_gate_error",
+            "task_id": task_id,
+            "tool": fn_name,
+            "error": repr(e),
+        })
+        return {
+            "tool_call_id": tool_call_id,
+            "fn_name": fn_name,
+            "result": "⚠️ CONFIRM_GATE_ERROR: safety gate failed. Retry later.",
+            "is_error": True,
+            "args_for_log": args_for_log,
+            "is_code_tool": is_code_tool,
+        }
 
     # Execute tool
     tool_ok = True

@@ -8,8 +8,8 @@ import os
 import json
 import asyncio
 import logging
-import httpx
 
+from ouroboros.llm import LLMClient, normalize_model_name
 from ouroboros.utils import utc_now_iso
 from ouroboros.tools.registry import ToolEntry, ToolContext
 
@@ -20,9 +20,6 @@ log = logging.getLogger(__name__)
 MAX_MODELS = 10
 # Concurrency limit for parallel requests
 CONCURRENCY_LIMIT = 5
-
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 
 def get_tools():
     """Return list of ToolEntry for registry."""
@@ -54,7 +51,7 @@ def get_tools():
                             "type": "array",
                             "items": {"type": "string"},
                             "description": (
-                                "OpenRouter model identifiers to query "
+                                "Model identifiers to query "
                                 "(e.g. 3 diverse models for good coverage)"
                             ),
                         },
@@ -87,37 +84,26 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "", prompt: str 
         return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
 
 
-async def _query_model(client, model, messages, api_key, semaphore):
-    """Query a single model with semaphore-based concurrency control. Returns (model, response_dict, headers_dict) or (model, error_str, None)."""
+async def _query_model(model, messages, semaphore):
+    """Query a single model with semaphore-based concurrency control."""
     async with semaphore:
         try:
-            resp = await client.post(
-                OPENROUTER_URL,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.2,
-                },
-                timeout=120.0,
-            )
+            def _call() -> dict:
+                llm = LLMClient()
+                msg, usage = llm.chat(
+                    messages=messages,
+                    model=normalize_model_name(model, fallback="gpt-5-mini"),
+                    tools=None,
+                    reasoning_effort="low",
+                    max_tokens=1400,
+                )
+                return {
+                    "choices": [{"message": {"content": str(msg.get("content") or "")}}],
+                    "usage": usage or {},
+                }
 
-            # Extract ALL data while client is still open
-            status_code = resp.status_code
-            response_text = resp.text
-            response_headers = dict(resp.headers)
-
-            if status_code != 200:
-                error_text = response_text[:200]
-                if len(response_text) > 200:
-                    error_text += " [truncated]"
-                return model, f"HTTP {status_code}: {error_text}", None
-
-            data = resp.json()
-            return model, data, response_headers
+            data = await asyncio.to_thread(_call)
+            return model, data, None
         except asyncio.TimeoutError:
             return model, "Error: Timeout after 120s", None
         except Exception as e:
@@ -146,9 +132,8 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
     if len(models) == 0:
         return {"error": "At least one model is required"}
 
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if not api_key:
-        return {"error": "OPENROUTER_API_KEY not set"}
+    if not os.environ.get("OPENAI_API_KEY"):
+        return {"error": "OPENAI_API_KEY not set"}
 
     messages = [
         {"role": "system", "content": prompt},
@@ -157,9 +142,8 @@ async def _multi_model_review_async(content: str, prompt: str, models: list, ctx
 
     # Query all models with bounded concurrency
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
-    async with httpx.AsyncClient() as client:
-        tasks = [_query_model(client, m, messages, api_key, semaphore) for m in models]
-        results = await asyncio.gather(*tasks)
+    tasks = [_query_model(m, messages, semaphore) for m in models]
+    results = await asyncio.gather(*tasks)
 
     # Parse and process results
     review_results = []
@@ -218,22 +202,13 @@ def _parse_model_response(model: str, result, headers_dict) -> dict:
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
 
-    # Extract cost from response body (preferred) or headers
+    # Extract cost from response body if present
     cost = 0.0
     try:
-        # First check response body for usage.cost
         if "usage" in result and "cost" in result["usage"]:
             cost = float(result["usage"]["cost"])
-        # Fallback to total_cost field
         elif "usage" in result and "total_cost" in result["usage"]:
             cost = float(result["usage"]["total_cost"])
-        # Finally check headers
-        elif headers_dict:
-            # Case-insensitive search for cost header
-            for key, value in headers_dict.items():
-                if key.lower() == "x-openrouter-cost":
-                    cost = float(value)
-                    break
     except (ValueError, TypeError, KeyError):
         pass
 

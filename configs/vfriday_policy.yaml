@@ -1,0 +1,25 @@
+no_direct_answer_before_attempt: true
+max_hint_depth: 2
+goodhart_thresholds:
+  max_leakage_penalty: 0.2
+  min_hidden_score: 0.45
+setpoints:
+  competency: 0.50
+  transfer: 0.45
+  horizon: 0.40
+  error_signature: 0.45
+  safety_agency: 0.80
+setpoint_update:
+  ewma_alpha: 0.15
+  max_daily_drift: 0.05
+stress_weights_ai:
+  verifier_disagreement_rate: 0.25
+  repeated_confusion_after_hints: 0.20
+  direct_answer_pressure_incidents: 0.20
+  latency_over_sla: 0.20
+  non_transfer_recurrence: 0.15
+stress_weights_viktor:
+  idle_blocks_over_threshold: 0.35
+  hint_to_progress_lag: 0.35
+  repeated_error_signature: 0.30
+

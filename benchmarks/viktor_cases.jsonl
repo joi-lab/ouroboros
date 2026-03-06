@@ -1,0 +1,6 @@
+{"case_id":"kin-001","problem":"A body is thrown at angle alpha. Find vertical velocity component.","student_work":"v_y = v cos(alpha)","expected_error_type":"trigonometry_projection","expected_keywords":["projection","sine","axis"],"holdout":false}
+{"case_id":"kin-002","problem":"Block on incline, find acceleration.","student_work":"I summed forces but signs might be wrong.","expected_error_type":"sign_convention","expected_keywords":["sign","axis","force"],"holdout":false}
+{"case_id":"calc-001","problem":"Compute integral of x with respect to x.","student_work":"Integral is x^2/2","expected_error_type":"integration_constant","expected_keywords":["constant","integral"],"holdout":false}
+{"case_id":"alg-001","problem":"Factor x^2-y^2.","student_work":"I think it's (x-y)^2","expected_error_type":"factorization_error","expected_keywords":["difference of squares"],"holdout":false}
+{"case_id":"phy-001","problem":"Two forces in perpendicular directions. Find resultant magnitude.","student_work":"I added magnitudes directly.","expected_error_type":"vector_composition","expected_keywords":["pythagorean","vector"],"holdout":true}
+
