@@ -96,7 +96,9 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     if task_type in ("task", ""):
         task_text = str(evt.get("task_text") or "").strip()
         task_result = str(evt.get("task_result") or "")
-        is_command = task_text.startswith("/") or task_text.startswith("[Supervisor handled")
+        is_command = (task_text.startswith("/")
+                     or task_text.startswith("[Supervisor handled")
+                     or task_text.startswith("[auto-resume"))
         is_trivial = len(task_text) < 10
         if task_text and not is_command and not is_trivial:
             st_user = ctx.load_state()
