@@ -4,10 +4,14 @@ Writes apply_patch script to /usr/local/bin/ on import.
 
 Supports: *** Update File, *** Add File, *** Delete File, *** End of File.
 """
+import os
 import pathlib
 
 
-APPLY_PATCH_PATH = pathlib.Path("/usr/local/bin/apply_patch")
+APPLY_PATCH_PATH = pathlib.Path(
+    os.environ.get("OUROBOROS_APPLY_PATCH_PATH")
+    or str(pathlib.Path.home() / ".local" / "bin" / "apply_patch")
+)
 APPLY_PATCH_CODE = r"""#!/usr/bin/env python3
 import os
 import sys
