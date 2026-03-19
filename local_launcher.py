@@ -36,29 +36,36 @@ def _patch_telegram_client_with_curl():
     from supervisor.telegram import TelegramClient as _TC
 
     def _curl_get_updates(self, offset: int, timeout: int = 10):
-        import shlex
         url = f"{self.base}/getUpdates?offset={offset}&timeout={timeout}&allowed_updates=message&allowed_updates=edited_message"
-        cmd = ["curl", "-s", "--max-time", str(timeout + 5), url]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        max_time = max(timeout + 5, 15)
+        cmd = ["curl", "-s", "-f", "--max-time", str(max_time), url]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 10)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("curl getUpdates subprocess timed out")
         if r.returncode != 0:
-            raise RuntimeError(f"curl getUpdates failed: {r.stderr}")
+            raise RuntimeError(f"curl getUpdates failed (rc={r.returncode}): stderr={r.stderr!r}, stdout={r.stdout[:200]!r}")
+        if not r.stdout.strip():
+            raise RuntimeError("curl getUpdates returned empty response")
         data = json.loads(r.stdout)
         if data.get("ok") is not True:
             raise RuntimeError(f"Telegram getUpdates failed: {data}")
         return data.get("result") or []
 
     def _curl_send_message(self, chat_id: int, text: str, parse_mode: str = ""):
-        import urllib.parse
-        payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": "true"}
+        cmd = ["curl", "-s", "-f", "--max-time", "30", "-X", "POST",
+               "--data-urlencode", f"chat_id={chat_id}",
+               "--data-urlencode", f"text={text}",
+               "--data-urlencode", "disable_web_page_preview=true"]
         if parse_mode:
-            payload["parse_mode"] = parse_mode
-        cmd = ["curl", "-s", "--max-time", "30", "-X", "POST"]
-        for k, v in payload.items():
-            cmd += ["-d", f"{k}={v}"]
+            cmd += ["--data-urlencode", f"parse_mode={parse_mode}"]
         cmd.append(f"{self.base}/sendMessage")
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        except subprocess.TimeoutExpired:
+            return False, "curl sendMessage timed out"
         if r.returncode != 0:
-            return False, f"curl failed: {r.stderr}"
+            return False, f"curl failed (rc={r.returncode}): {r.stderr!r}"
         data = json.loads(r.stdout)
         if data.get("ok") is True:
             return True, "ok"
