@@ -347,8 +347,28 @@ def enforce_task_timeouts() -> None:
 # ---------------------------------------------------------------------------
 
 def build_evolution_task_text(cycle: int) -> str:
-    """Build evolution task text. Minimal trigger — SYSTEM.md has the full instructions."""
-    return f"EVOLUTION #{cycle}"
+    """Build evolution task text based on the last user task.
+
+    Reads last_user_task_text and last_user_task_result from state
+    so the evolution cycle develops and improves the user's work.
+    """
+    st = load_state()
+    last_text = str(st.get("last_user_task_text") or "").strip()
+    last_result = str(st.get("last_user_task_result") or "").strip()
+
+    if not last_text:
+        return f"EVOLUTION #{cycle}"
+
+    parts = [f"EVOLUTION #{cycle}"]
+    parts.append(f"\nПоследняя задача пользователя:\n{last_text}")
+    if last_result:
+        parts.append(f"\nРезультат:\n{last_result}")
+    parts.append(
+        "\nРазвей и улучши результат этой задачи: углуби анализ, "
+        "добавь практические примеры, исправь недостатки, "
+        "предложи следующие шаги. Сохрани результат в память."
+    )
+    return "\n".join(parts)
 
 
 def build_review_task_text(reason: str) -> str:

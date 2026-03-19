@@ -91,6 +91,16 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_type = str(evt.get("task_type") or "")
     wid = evt.get("worker_id")
 
+    # Save last user task text and result for evolution context
+    if task_type in ("task", ""):
+        task_text = str(evt.get("task_text") or "")
+        task_result = str(evt.get("task_result") or "")
+        if task_text:
+            st_user = ctx.load_state()
+            st_user["last_user_task_text"] = task_text[:500]
+            st_user["last_user_task_result"] = task_result[:1000]
+            ctx.save_state(st_user)
+
     # Track evolution task success/failure for circuit breaker
     if task_type == "evolution":
         st = ctx.load_state()

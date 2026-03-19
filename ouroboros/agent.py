@@ -533,6 +533,8 @@ class OuroborosAgent:
             "type": "task_done",
             "task_id": task.get("id"),
             "task_type": task.get("type"),
+            "task_text": str(task.get("text") or "")[:500],
+            "task_result": str(text or "")[:1000],
             "cost_usd": round(float(usage.get("cost") or 0), 6),
             "total_rounds": int(usage.get("rounds") or 0),
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
