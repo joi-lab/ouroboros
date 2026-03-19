@@ -327,18 +327,26 @@ cat local_data/memory/llm-agent-maturity-methodology.md
 | **Budget guard** | Остаток < $50 → эволюция отключается |
 | **Busy check** | Эволюция не стартует, пока агент занят задачей пользователя |
 
-### Проверить что эволюция работает
+### Быстрая проверка: идёт ли эволюция?
 
 ```bash
-# 1. Есть ли последняя задача для эволюции?
 cat local_data/state/state.json | python3 -c "
 import sys, json; s = json.load(sys.stdin)
 print('Evolution:', 'ON' if s.get('evolution_mode_enabled') else 'OFF')
 print('Cycle:', s.get('evolution_cycle', 0))
+print('Failures:', s.get('evolution_consecutive_failures', 0))
 print('Task:', (s.get('last_user_task_text') or 'нет')[:100])
 "
+```
 
-# 2. Reasoning эволюции (агент думает о задаче пользователя?)
+- **Cycle растёт** → эволюция идёт
+- **Failures: 0** → циклы завершаются успешно
+- **Task** → по какой задаче эволюционирует (должна быть настоящая задача, не `/status` или `[auto-resume]`)
+
+### Подробная проверка
+
+```bash
+# 1. Reasoning эволюции — о чём думает агент?
 tail -20 local_data/logs/reasoning.jsonl | python3 -c "
 import sys, json
 for line in sys.stdin:
@@ -347,8 +355,14 @@ for line in sys.stdin:
     print()
 "
 
-# 3. Результат эволюции
+# 2. Результаты задач (последние 5)
 ls -lt local_data/task_results/ | head -5
+
+# 3. Что делал агент в эволюции (вызовы инструментов)
+grep 'evolution' local_data/logs/events.jsonl | tail -10 | python3 -m json.tool
+
+# 4. Что агент записал в память
+ls -lt local_data/memory/
 ```
 
 ---
