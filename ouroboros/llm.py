@@ -165,7 +165,7 @@ class LLMClient:
         effort = normalize_reasoning_effort(reasoning_effort)
 
         extra_body: Dict[str, Any] = {
-            "reasoning": {"effort": effort, "exclude": True},
+            "reasoning": {"effort": effort, "exclude": False},
         }
 
         # Pin Anthropic models to Anthropic provider for prompt caching

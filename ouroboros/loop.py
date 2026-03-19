@@ -794,12 +794,30 @@ def run_llm_loop(
 
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
+            reasoning = msg.get("reasoning_content") or ""
             # No tool calls — final response
             if not tool_calls:
+                if reasoning:
+                    llm_trace["last_reasoning"] = reasoning
+                    append_jsonl(drive_logs / "reasoning.jsonl", {
+                        "ts": utc_now_iso(), "task_id": task_id,
+                        "round": round_idx, "reasoning_content": reasoning,
+                        "is_final": True,
+                    })
                 return _handle_text_response(content, llm_trace, accumulated_usage)
 
             # Process tool calls
-            messages.append({"role": "assistant", "content": content or "", "tool_calls": tool_calls})
+            assistant_msg: Dict[str, Any] = {"role": "assistant", "content": content or "", "tool_calls": tool_calls}
+            if reasoning:
+                assistant_msg["reasoning_content"] = reasoning
+            messages.append(assistant_msg)
+
+            # Log reasoning chain to dedicated file for analysis
+            if reasoning:
+                append_jsonl(drive_logs / "reasoning.jsonl", {
+                    "ts": utc_now_iso(), "task_id": task_id,
+                    "round": round_idx, "reasoning_content": reasoning,
+                })
 
             if content and content.strip():
                 emit_progress(content.strip())
@@ -951,6 +969,7 @@ def _call_llm_with_retry(
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
 
             # Log per-round metrics
+            reasoning_content = resp_msg.get("reasoning_content") or ""
             _round_event = {
                 "ts": utc_now_iso(), "type": "llm_round",
                 "task_id": task_id,
@@ -962,6 +981,8 @@ def _call_llm_with_retry(
                 "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
                 "cost_usd": cost,
             }
+            if reasoning_content:
+                _round_event["reasoning_content"] = reasoning_content[:2000]
             append_jsonl(drive_logs / "events.jsonl", _round_event)
             return msg, cost
 

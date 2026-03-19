@@ -227,6 +227,8 @@ def _patched_chat(self, messages, model, tools=None, reasoning_effort="medium",
     for m in messages:
         m_copy = dict(m)
         if is_reasoner and m_copy.get("role") == "assistant":
+            # Preserve actual reasoning_content from previous rounds if present;
+            # otherwise insert empty string for API compatibility
             if "reasoning_content" not in m_copy:
                 m_copy["reasoning_content"] = ""
         clean_messages.append(m_copy)
