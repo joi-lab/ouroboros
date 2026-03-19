@@ -28,16 +28,55 @@ import queue as _queue_mod
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 # ---------------------------------------------------------------------------
-# Force IPv4 — Python may try IPv6 first which times out on some networks
+# Conda's OpenSSL can't connect to Telegram (SSL handshake timeout).
+# System curl works fine. Monkey-patch TelegramClient to use curl.
 # ---------------------------------------------------------------------------
-_original_getaddrinfo = socket.getaddrinfo
+def _patch_telegram_client_with_curl():
+    """Replace requests-based TelegramClient methods with curl-based ones."""
+    from supervisor.telegram import TelegramClient as _TC
 
-def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
-    if family == 0:
-        family = socket.AF_INET
-    return _original_getaddrinfo(host, port, family, type, proto, flags)
+    def _curl_get_updates(self, offset: int, timeout: int = 10):
+        import shlex
+        url = f"{self.base}/getUpdates?offset={offset}&timeout={timeout}&allowed_updates=message&allowed_updates=edited_message"
+        cmd = ["curl", "-s", "--max-time", str(timeout + 5), url]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 10)
+        if r.returncode != 0:
+            raise RuntimeError(f"curl getUpdates failed: {r.stderr}")
+        data = json.loads(r.stdout)
+        if data.get("ok") is not True:
+            raise RuntimeError(f"Telegram getUpdates failed: {data}")
+        return data.get("result") or []
 
-socket.getaddrinfo = _ipv4_getaddrinfo
+    def _curl_send_message(self, chat_id: int, text: str, parse_mode: str = ""):
+        import urllib.parse
+        payload = {"chat_id": str(chat_id), "text": text, "disable_web_page_preview": "true"}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        cmd = ["curl", "-s", "--max-time", "30", "-X", "POST"]
+        for k, v in payload.items():
+            cmd += ["-d", f"{k}={v}"]
+        cmd.append(f"{self.base}/sendMessage")
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
+        if r.returncode != 0:
+            return False, f"curl failed: {r.stderr}"
+        data = json.loads(r.stdout)
+        if data.get("ok") is True:
+            return True, "ok"
+        return False, f"telegram_api_error: {data}"
+
+    def _curl_send_chat_action(self, chat_id: int, action: str = "typing"):
+        cmd = ["curl", "-s", "--max-time", "5", "-X", "POST",
+               "-d", f"chat_id={chat_id}", "-d", f"action={action}",
+               f"{self.base}/sendChatAction"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    _TC.get_updates = _curl_get_updates
+    _TC.send_message = _curl_send_message
+    _TC.send_chat_action = _curl_send_chat_action
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -374,6 +413,8 @@ init_state()
 from supervisor.telegram import (
     init as telegram_init, TelegramClient, send_with_budget, log_chat,
 )
+_patch_telegram_client_with_curl()
+log.info("TelegramClient patched to use curl (workaround for conda SSL)")
 TG = TelegramClient(str(TELEGRAM_BOT_TOKEN))
 telegram_init(
     drive_root=DRIVE_ROOT,
