@@ -404,7 +404,7 @@ print('Budget spent:', s.get('spent_usd'))
 ```
 - `Enabled: False` → отправь `/evolve` в Telegram
 - `Failures: 3` → circuit breaker. `/evolve` для сброса
-- `Last task: False` → отправь хотя бы одну задачу
+- `Last task: False` → отправь хотя бы одну настоящую задачу (команды `/status`, `/evolve` и короткие сообщения не считаются)
 - Бюджет исчерпан → увеличь `TOTAL_BUDGET` в `.env`
 
 ### Сбросить всё состояние
