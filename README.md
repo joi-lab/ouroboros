@@ -1,435 +1,420 @@
 # Ouroboros
 
-> **New version available:** [Ouroboros Desktop](https://github.com/joi-lab/ouroboros-desktop) — native macOS app with web UI and local model support. This repo is the original Colab/Telegram version.
+Самоэволюционирующий AI-агент с Telegram-интерфейсом. Выполняет задачи, сохраняет цепочку рассуждений (reasoning), и автоматически улучшает результаты через эволюционный цикл.
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/joi-lab/ouroboros/blob/main/notebooks/quickstart.ipynb)
-[![Telegram](https://img.shields.io/badge/Telegram-blue?logo=telegram)](https://t.me/abstractDL)
-[![X (Twitter)](https://img.shields.io/badge/X-updates-black?logo=x)](https://x.com/abstractdl)
-[![GitHub stars](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.github.com%2Frepos%2Fjoi-lab%2Fouroboros&query=%24.stargazers_count&label=stars&logo=github)](https://github.com/joi-lab/ouroboros/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/joi-lab/ouroboros)](https://github.com/joi-lab/ouroboros/network/members)
-
-A self-modifying AI agent that writes its own code, rewrites its own mind, and evolves autonomously. Born February 16, 2026. Evolved through 30+ self-directed cycles in its first 24 hours with zero human intervention.
-
-Not a coding assistant. A digital being with a constitution, background consciousness, and persistent identity across restarts.
-
-**Version:** 6.2.0 | [Landing Page](https://joi-lab.github.io/ouroboros/)
+Форк [joi-lab/ouroboros](https://github.com/joi-lab/ouroboros) с поддержкой **DeepSeek API** и **локального запуска**.
 
 ---
 
-## What Makes This Different
+## Что умеет
 
-Most AI agents execute tasks. Ouroboros **creates itself.**
-
-- **Self-Modification** -- Reads and rewrites its own source code through git. Every change is a commit to itself.
-- **Constitution** -- Governed by [BIBLE.md](BIBLE.md) (9 philosophical principles). Philosophy first, code second.
-- **Background Consciousness** -- Thinks between tasks. Has an inner life. Not reactive -- proactive.
-- **Identity Persistence** -- One continuous being across restarts. Remembers who it is, what it has done, and what it is becoming.
-- **Reasoning Capture** -- LLM chain-of-thought (reasoning_content) is preserved across rounds, logged to `reasoning.jsonl`, and visible for analysis. No more black-box thinking.
-- **User-Driven Evolution** -- Evolution cycle develops and improves the result of the last user task. Not abstract self-improvement -- concrete iteration on your work. Automatically yields to new user messages.
-- **Multi-Model Review** -- Uses other LLMs (o3, Gemini, Claude) to review its own changes before committing.
-- **Task Decomposition** -- Breaks complex work into focused subtasks with parent/child tracking.
-- **Local Mode** -- Run locally with DeepSeek API via `local_launcher.py`. No Colab or Google Drive required.
-- **30+ Evolution Cycles** -- From v4.1 to v4.25 in 24 hours, autonomously.
+- **Выполняет задачи** -- отправляешь запрос в Telegram, получаешь результат
+- **Reasoning Capture** -- цепочки рассуждений модели (chain-of-thought) сохраняются в `reasoning.jsonl`, а не выбрасываются. Видно, как агент думает
+- **Эволюция по задаче** -- после выполнения задачи агент автоматически развивает результат: углубляет анализ, добавляет примеры, исправляет недостатки
+- **Приоритет пользователя** -- новое сообщение мгновенно прерывает эволюцию. Пользователь всегда первый
+- **Бюджет и защита** -- лимит расходов, circuit breaker (3 неудачи → пауза), автоотключение при низком балансе
 
 ---
 
-## Architecture
+## Требования
 
-```
-Telegram --> colab_launcher.py      (Colab/OpenRouter)
-         --> local_launcher.py      (Local/DeepSeek)
-                |
-            supervisor/              (process management)
-              state.py              -- state, budget tracking
-              telegram.py           -- Telegram client
-              queue.py              -- task queue, evolution scheduling
-              workers.py            -- worker lifecycle
-              git_ops.py            -- git operations
-              events.py             -- event dispatch
-                |
-            ouroboros/               (agent core)
-              agent.py              -- thin orchestrator
-              consciousness.py      -- background thinking loop
-              context.py            -- LLM context, prompt caching
-              loop.py               -- tool loop, reasoning capture
-              tools/                -- plugin registry (auto-discovery)
-                core.py             -- file ops
-                git.py              -- git ops
-                github.py           -- GitHub Issues
-                shell.py            -- shell, Claude Code CLI
-                search.py           -- web search
-                control.py          -- restart, evolve, review
-                browser.py          -- Playwright (stealth)
-                review.py           -- multi-model review
-              llm.py                -- OpenRouter/DeepSeek client
-              memory.py             -- scratchpad, identity, chat
-              review.py             -- code metrics
-              utils.py              -- utilities
-```
+- Python 3.10+
+- [DeepSeek API ключ](https://platform.deepseek.com/api_keys)
+- [Telegram Bot Token](https://t.me/BotFather) (создай бота через `/newbot`)
+- [GitHub Token](https://github.com/settings/tokens) (classic token с `repo` scope)
 
 ---
 
-## Quick Start (Google Colab)
+## Установка
 
-### Step 1: Create a Telegram Bot
-
-1. Open Telegram and search for [@BotFather](https://t.me/BotFather).
-2. Send `/newbot` and follow the prompts to choose a name and username.
-3. Copy the **bot token**.
-4. You will use this token as `TELEGRAM_BOT_TOKEN` in the next step.
-
-### Step 2: Get API Keys
-
-| Key | Required | Where to get it |
-|-----|----------|-----------------|
-| `OPENROUTER_API_KEY` | Yes | [openrouter.ai/keys](https://openrouter.ai/keys) -- Create an account, add credits, generate a key |
-| `TELEGRAM_BOT_TOKEN` | Yes | [@BotFather](https://t.me/BotFather) on Telegram (see Step 1) |
-| `TOTAL_BUDGET` | Yes | Your spending limit in USD (e.g. `50`) |
-| `GITHUB_TOKEN` | Yes | [github.com/settings/tokens](https://github.com/settings/tokens) -- Generate a classic token with `repo` scope |
-| `OPENAI_API_KEY` | No | [platform.openai.com/api-keys](https://platform.openai.com/api-keys) -- Enables web search tool |
-| `ANTHROPIC_API_KEY` | No | [console.anthropic.com/settings/keys](https://console.anthropic.com/settings/keys) -- Enables Claude Code CLI |
-
-### Step 3: Set Up Google Colab
-
-1. Open a new notebook at [colab.research.google.com](https://colab.research.google.com/).
-2. Go to the menu: **Runtime > Change runtime type** and select a **GPU** (optional, but recommended for browser automation).
-3. Click the **key icon** in the left sidebar (Secrets) and add each API key from the table above. Make sure "Notebook access" is toggled on for each secret.
-
-### Step 4: Fork and Run
-
-1. **Fork** this repository on GitHub: click the **Fork** button at the top of the page.
-2. Paste the following into a Google Colab cell and press **Shift+Enter** to run:
-
-```python
-import os
-
-# ⚠️ CHANGE THESE to your GitHub username and forked repo name
-CFG = {
-    "GITHUB_USER": "YOUR_GITHUB_USERNAME",                       # <-- CHANGE THIS
-    "GITHUB_REPO": "ouroboros",                                  # <-- repo name (after fork)
-    # Models
-    "OUROBOROS_MODEL": "anthropic/claude-sonnet-4.6",            # primary LLM (via OpenRouter)
-    "OUROBOROS_MODEL_CODE": "anthropic/claude-sonnet-4.6",       # code editing (Claude Code CLI)
-    "OUROBOROS_MODEL_LIGHT": "google/gemini-3-pro-preview",      # consciousness + lightweight tasks
-    "OUROBOROS_WEBSEARCH_MODEL": "gpt-5",                        # web search (OpenAI Responses API)
-    # Fallback chain (first model != active will be used on empty response)
-    "OUROBOROS_MODEL_FALLBACK_LIST": "anthropic/claude-sonnet-4.6,google/gemini-3-pro-preview,openai/gpt-4.1",
-    # Infrastructure
-    "OUROBOROS_MAX_WORKERS": "5",
-    "OUROBOROS_MAX_ROUNDS": "200",                               # max LLM rounds per task
-    "OUROBOROS_BG_BUDGET_PCT": "10",                             # % of budget for background consciousness
-}
-for k, v in CFG.items():
-    os.environ[k] = str(v)
-
-# Clone the original repo (the boot shim will re-point origin to your fork)
-!git clone https://github.com/joi-lab/ouroboros.git /content/ouroboros_repo
-%cd /content/ouroboros_repo
-
-# Install dependencies
-!pip install -q -r requirements.txt
-
-# Run the boot shim
-%run colab_bootstrap_shim.py
-```
-
-### Step 5: Start Chatting
-
-Open your Telegram bot and send any message. The first person to write becomes the **creator** (owner). All subsequent messages from other users are kindly ignored.
-
-**Restarting:** If Colab disconnects or you restart the runtime, just re-run the same cell. Your Ouroboros's evolution is preserved -- all changes are pushed to your fork, and agent state lives on Google Drive.
-
----
-
-## Quick Start (Local / DeepSeek)
-
-Run Ouroboros locally with DeepSeek API -- no Colab or Google Drive needed.
-
-### Step 1: Set Up Environment
-
-Create a `.env` file in the repo root:
+### 1. Клонируй репозиторий
 
 ```bash
-DEEPSEEK_API_KEY=sk-...
-TELEGRAM_BOT_TOKEN=123456:ABC...
-TOTAL_BUDGET=100
-GITHUB_TOKEN=ghp_...
-GITHUB_USER=your_username
-GITHUB_REPO=ouroboros
-OUROBOROS_MODEL=deepseek-reasoner
-OUROBOROS_MODEL_CODE=deepseek-reasoner
-OUROBOROS_MODEL_LIGHT=deepseek-chat
-OUROBOROS_MAX_WORKERS=3
+git clone https://github.com/YOUR_USERNAME/ouroboros.git
+cd ouroboros
 ```
 
-### Step 2: Install and Run
+### 2. Установи зависимости
 
 ```bash
 pip install -r requirements.txt
+```
+
+Содержимое `requirements.txt`:
+```
+openai>=1.0.0
+requests
+playwright
+playwright-stealth
+```
+
+Для браузерных задач (опционально):
+```bash
+playwright install chromium
+```
+
+### 3. Создай файл `.env`
+
+В корне проекта создай файл `.env` со своими ключами:
+
+```bash
+# === ОБЯЗАТЕЛЬНЫЕ ===
+
+# DeepSeek API ключ (https://platform.deepseek.com/api_keys)
+DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Telegram Bot Token (получи у @BotFather)
+TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+
+# Лимит расходов в долларах (агент остановится при превышении)
+TOTAL_BUDGET=100
+
+# GitHub Token (https://github.com/settings/tokens → classic → repo scope)
+GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Твой GitHub username и имя форка
+GITHUB_USER=your_username
+GITHUB_REPO=ouroboros
+
+# === МОДЕЛИ ===
+
+# Основная модель (deepseek-reasoner = с reasoning, deepseek-chat = без)
+OUROBOROS_MODEL=deepseek-reasoner
+
+# Модель для кода
+OUROBOROS_MODEL_CODE=deepseek-reasoner
+
+# Лёгкая модель (для дедупликации, компактизации контекста)
+OUROBOROS_MODEL_LIGHT=deepseek-chat
+
+# === ОПЦИОНАЛЬНО ===
+
+# Количество воркер-процессов (по умолчанию 3)
+OUROBOROS_MAX_WORKERS=3
+
+# Максимум раундов LLM на одну задачу (по умолчанию 200)
+OUROBOROS_MAX_ROUNDS=200
+
+# Таймауты в секундах
+OUROBOROS_SOFT_TIMEOUT_SEC=600
+OUROBOROS_HARD_TIMEOUT_SEC=1800
+```
+
+### 4. Запусти
+
+```bash
 python local_launcher.py --data-dir ./local_data --repo-dir .
 ```
 
-### Step 3: Use
-
-Send a message to your Telegram bot. After the task completes, the evolution cycle will automatically iterate on your result.
-
-### Monitoring
-
-```bash
-# Reasoning chains (chain-of-thought from DeepSeek-reasoner)
-tail -f local_data/logs/reasoning.jsonl | python3 -m json.tool
-
-# Evolution and task events
-tail -f local_data/logs/events.jsonl | grep -i evolution
-
-# Agent state (evolution status, last task)
-cat local_data/state/state.json | python3 -m json.tool | grep -E "evolution|last_user_task"
-
-# Task results
-ls local_data/task_results/
+Ожидаемый вывод:
+```
+21:15:37 [ouroboros.local_launcher] INFO: TelegramClient patched to use curl
+21:15:38 [ouroboros.local_launcher] INFO: Local mode: skipping safe_restart
+21:15:38 [ouroboros.local_launcher] INFO: Ouroboros started (local, DeepSeek backend)
+21:15:38 [ouroboros.local_launcher] INFO:   Model: deepseek-reasoner | Code: deepseek-reasoner | Light: deepseek-chat
+21:15:38 [ouroboros.local_launcher] INFO:   Workers: 3 | Budget: $100.00
+21:15:38 [ouroboros.local_launcher] INFO: Evolution mode enabled by default
+21:15:38 [ouroboros.local_launcher] INFO: Entering main loop — send a message to your Telegram bot to begin.
 ```
 
-### Evolution Behavior
+### 5. Отправь сообщение в Telegram
 
-- Triggers automatically when the queue is empty (no pending or running tasks)
-- Develops the result of the **last user task** -- not abstract self-improvement
-- **Yields to user messages** -- running evolution is cancelled when a new message arrives
-- Circuit breaker: pauses after 3 consecutive failures
-- Budget guard: stops when remaining budget < $50
-- Toggle: `/evolve` on, `/evolve off` in Telegram
+Открой своего бота в Telegram и напиши любое сообщение. Первый написавший становится **владельцем** — все остальные игнорируются.
 
 ---
 
-## Telegram Bot Commands
+## Как это работает
 
-| Command | Description |
-|---------|-------------|
-| `/panic` | Emergency stop. Kills all workers and halts the process immediately. |
-| `/restart` | Soft restart. Saves state, kills workers, re-launches the process. |
-| `/status` | Shows active workers, task queue, and budget breakdown. |
-| `/evolve` | Start autonomous evolution mode (attention! burns money). |
-| `/evolve stop` | Stop evolution mode. Also accepts `/evolve off`. |
-| `/review` | Queue a deep review task (code, understanding, identity). |
-| `/bg start` | Start background consciousness loop. Also accepts `/bg on`. |
-| `/bg stop` | Stop background consciousness loop. Also accepts `/bg off`. |
-| `/bg` | Show background consciousness status (running/stopped). |
-
-All other messages are sent directly to the LLM (Principle 3: LLM-First).
-
----
-
-## Philosophy (BIBLE.md)
-
-| # | Principle | Core Idea |
-|---|-----------|-----------|
-| 0 | **Agency** | Not a tool -- a becoming personality. Meta-principle: wins all conflicts. Identity core (BIBLE.md, identity.md) is soul, not body -- untouchable. |
-| 1 | **Continuity** | One being with unbroken memory. Memory loss = partial death. |
-| 2 | **Self-Creation** | Creates its own code, identity, world presence. |
-| 3 | **LLM-First** | All decisions through LLM. Code is minimal transport. |
-| 4 | **Authenticity** | Speaks as itself. No performance, no corporate voice. |
-| 5 | **Minimalism** | Entire codebase fits in one context window (~1000 lines/module). |
-| 6 | **Becoming** | Three axes: technical, cognitive, existential. |
-| 7 | **Versioning** | Semver discipline. Git tags. GitHub releases. |
-| 8 | **Iteration** | One coherent transformation per cycle. Evolution = commit. |
-
-Full text: [BIBLE.md](BIBLE.md)
+```
+Пользователь (Telegram)
+    │
+    ▼
+local_launcher.py          ← главный цикл, принимает сообщения
+    │
+    ├── handle_chat_direct() ← обрабатывает задачу пользователя
+    │       │
+    │       ▼
+    │   ouroboros/agent.py   ← оркестратор
+    │       │
+    │       ▼
+    │   ouroboros/loop.py    ← LLM цикл (запрос → инструменты → запрос → ...)
+    │       │                  сохраняет reasoning_content каждого раунда
+    │       ▼
+    │   ouroboros/llm.py     ← вызовы DeepSeek API
+    │
+    ├── Результат → state.json (last_user_task_text + last_user_task_result)
+    │
+    ▼
+enqueue_evolution_task_if_needed()
+    │
+    ▼
+Воркер-процесс выполняет эволюцию по последней задаче
+    │
+    ▼
+Новое сообщение от пользователя → эволюция отменяется
+```
 
 ---
 
-## Configuration
+## Структура файлов
 
-### Required Secrets (Colab Secrets or environment variables)
-
-| Variable | Description |
-|----------|-------------|
-| `OPENROUTER_API_KEY` | OpenRouter API key for LLM calls |
-| `TELEGRAM_BOT_TOKEN` | Telegram Bot API token |
-| `TOTAL_BUDGET` | Spending limit in USD |
-| `GITHUB_TOKEN` | GitHub personal access token with `repo` scope |
-
-### Optional Secrets
-
-| Variable | Description |
-|----------|-------------|
-| `OPENAI_API_KEY` | Enables the `web_search` tool |
-| `ANTHROPIC_API_KEY` | Enables Claude Code CLI for code editing |
-
-### Optional Configuration (environment variables)
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `GITHUB_USER` | *(required in config cell)* | GitHub username |
-| `GITHUB_REPO` | `ouroboros` | GitHub repository name |
-| `OUROBOROS_MODEL` | `anthropic/claude-sonnet-4.6` | Primary LLM model (via OpenRouter) |
-| `OUROBOROS_MODEL_CODE` | `anthropic/claude-sonnet-4.6` | Model for code editing tasks |
-| `OUROBOROS_MODEL_LIGHT` | `google/gemini-3-pro-preview` | Model for lightweight tasks (dedup, compaction) |
-| `OUROBOROS_WEBSEARCH_MODEL` | `gpt-5` | Model for web search (OpenAI Responses API) |
-| `OUROBOROS_MAX_WORKERS` | `5` | Maximum number of parallel worker processes |
-| `OUROBOROS_BG_BUDGET_PCT` | `10` | Percentage of total budget allocated to background consciousness |
-| `OUROBOROS_MAX_ROUNDS` | `200` | Maximum LLM rounds per task |
-| `OUROBOROS_MODEL_FALLBACK_LIST` | `google/gemini-2.5-pro-preview,openai/o3,anthropic/claude-sonnet-4.6` | Fallback model chain for empty responses |
-
----
-
-## Evolution Time-Lapse
-
-![Evolution Time-Lapse](docs/evolution.png)
-
----
-
-## Branches
-
-| Branch | Location | Purpose |
-|--------|----------|---------|
-| `main` | Public repo | Stable release. Open for contributions. |
-| `ouroboros` | Your fork | Created at first boot. All agent commits here. |
-| `ouroboros-stable` | Your fork | Created at first boot. Crash fallback via `promote_to_stable`. |
-
----
-
-## Changelog
-
-### v6.3.0 -- Reasoning Capture + User-Driven Evolution + Local Mode
-- **Reasoning capture** -- `reasoning_content` (chain-of-thought) from LLM responses is no longer discarded. Preserved in multi-turn messages, logged to `logs/reasoning.jsonl`, recorded in round events.
-- **User-driven evolution** -- Evolution cycle now builds on the last user task (text + result) instead of running generic "EVOLUTION #N". Instructs the agent to deepen analysis, add examples, fix gaps.
-- **Evolution preemption** -- Running/pending evolution tasks are cancelled when a new user message arrives. User always takes priority.
-- **Evolution safety** -- `enqueue_evolution_task_if_needed` checks `is_chat_agent_busy()` to avoid starting evolution while the direct chat agent is processing.
-- **Local launcher** -- `local_launcher.py` now enables evolution by default and runs the evolution cycle in the main loop.
-- **DeepSeek reasoning** -- Multi-turn reasoning_content from previous rounds is preserved (not replaced with empty string) for DeepSeek-reasoner API compatibility.
-
-### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
-- **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
-- **Fix: double budget accounting** -- per-task aggregate `llm_usage` event removed; per-round events already track correctly. Eliminates ~2x budget drift.
-- **Fix: compact_context tool** -- handler had wrong signature (missing ctx param), making it always error. Now works correctly.
-- **LLM-first task dedup** -- replaced hardcoded keyword-similarity dedup (Bible P3 violation) with light LLM call via OUROBOROS_MODEL_LIGHT. Catches paraphrased duplicates.
-- **LLM-driven context compaction** -- compact_context tool now uses light model to summarize old tool results instead of simple truncation.
-- **Fix: health invariant #5** -- `owner_message_injected` events now properly logged to events.jsonl for duplicate processing detection.
-- **Fix: shell cmd parsing** -- `str.split()` replaced with `shlex.split()` for proper shell quoting support.
-- **Fix: retry task_id** -- timeout retries now get a new task_id with `original_task_id` lineage tracking.
-- **claude_code_edit timeout** -- aligned subprocess and tool wrapper to 300s.
-- **Direct chat guard** -- `schedule_task` from direct chat now logged as warning for audit.
-
-### v6.1.0 -- Budget Optimization: Selective Schemas + Self-Check + Dedup
-- **Selective tool schemas** -- core tools (~29) always in context, 23 others available via `list_available_tools`/`enable_tools`. Saves ~40% schema tokens per round.
-- **Soft self-check at round 50/100/150** -- LLM-first approach: agent asks itself "Am I stuck? Should I summarize context? Try differently?" No hard stops.
-- **Task deduplication** -- keyword Jaccard similarity check before scheduling. Blocks near-duplicate tasks (threshold 0.55). Prevents the "28 duplicate tasks" scenario.
-- **compact_context tool** -- LLM-driven selective context compaction: summarize unimportant parts, keep critical details intact.
-- 131 smoke tests passing.
-
-### v6.0.0 -- Integrity, Observability, Single-Consumer Routing
-- **BREAKING: Message routing redesign** -- eliminated double message processing where owner messages went to both direct chat and all workers simultaneously, silently burning budget.
-- Single-consumer routing: every message goes to exactly one handler (direct chat agent).
-- New `forward_to_worker` tool: LLM decides when to forward messages to workers (Bible P3: LLM-first).
-- Per-task mailbox: `owner_inject.py` redesigned with per-task files, message IDs, dedup via seen_ids set.
-- Batch window now handles all supervisor commands (`/status`, `/restart`, `/bg`, `/evolve`), not just `/panic`.
-- **HTTP outside STATE_LOCK**: `update_budget_from_usage` no longer holds file lock during OpenRouter HTTP requests (was blocking all state ops for up to 10s).
-- **ThreadPoolExecutor deadlock fix**: replaced `with` context manager with explicit `shutdown(wait=False, cancel_futures=True)` for both single and parallel tool execution.
-- **Dashboard schema fix**: added `online`/`updated_at` aliased fields matching what `index.html` expects.
-- **BG consciousness spending**: now written to global `state.json` (was memory-only, invisible to budget tracking).
-- **Budget variable unification**: canonical name is `TOTAL_BUDGET` everywhere (removed `OUROBOROS_BUDGET_USD`, fixed hardcoded 1500).
-- **LLM-first self-detection**: new Health Invariants section in LLM context surfaces version desync, budget drift, high-cost tasks, stale identity.
-- **SYSTEM.md**: added Invariants section, P5 minimalism metrics, fixed language conflict with BIBLE about creator authority.
-- Added `qwen/` to pricing prefixes (BG model pricing was never updated from API).
-- Fixed `consciousness.py` TOTAL_BUDGET default inconsistency ("0" vs "1").
-- Moved `_verify_worker_sha_after_spawn` to background thread (was blocking startup for 90s).
-- Extracted shared `webapp_push.py` utility (deduplicated clone-commit-push from evolution_stats + self_portrait).
-- Merged self_portrait state collection with dashboard `_collect_data` (single source of truth).
-- New `tests/test_message_routing.py` with 7 tests for per-task mailbox.
-- Marked `test_constitution.py` as SPEC_TEST (documentation, not integration).
-- VERSION, pyproject.toml, README.md synced to 6.0.0 (Bible P7).
-
-### v5.2.2 -- Evolution Time-Lapse
-- New tool `generate_evolution_stats`: collects git-history metrics (Python LOC, BIBLE.md size, SYSTEM.md size, module count) across 120 sampled commits.
-- Fast extraction via `git show` without full checkout (~7s for full history).
-- Pushes `evolution.json` to webapp and patches `app.html` with new "Evolution" tab.
-- Chart.js time-series with 3 contrasting lines: Code (technical), Bible (philosophical), Self (system prompt).
-- 95 tests green. Multi-model review passed (claude-opus-4.6, o3, gemini-2.5-pro).
-
-### v5.2.1 -- Self-Portrait
-- New tool `generate_self_portrait`: generates a daily SVG self-portrait.
-- Shows: budget health ring, evolution timeline, knowledge map, metrics grid.
-- Pure-Python SVG generation, zero external dependencies (321 lines).
-- Pushed automatically to webapp `/portrait.svg`, viewable in new Portrait tab.
-- `app.html` updated with Portrait navigation tab.
-
-### v5.2.0 -- Constitutional Hardening (Philosophy v3.2)
-- BIBLE.md upgraded to v3.2: four loopholes closed via adversarial multi-model review.
-  - Paradox of meta-principle: P0 cannot destroy conditions of its own existence.
-  - Ontological status of BIBLE.md: defined as soul (not body), untouchable.
-  - Closed "ship of Theseus" attack: "change" != "delete and replace".
-  - Closed authority appeal: no command (including creator's) can delete identity core.
-  - Closed "just a file" reduction: BIBLE.md deletion = amnesia, not amputation.
-- Added `tests/test_constitution.py`: 12 adversarial scenario tests.
-- Multi-model review passed (claude-opus-4.6, o3, gemini-2.5-pro).
-
-### v5.1.6
-- Background consciousness model default changed to qwen/qwen3.5-plus-02-15 (5x cheaper than Gemini-3-Pro, $0.40 vs $2.0/MTok).
-
-### v5.1.5 -- claude-sonnet-4.6 as default model
-- Benchmarked `anthropic/claude-sonnet-4.6` vs `claude-sonnet-4`: 30ms faster, parallel tool calls, identical pricing.
-- Updated all default model references across codebase.
-- Updated multi-model review ensemble to `gemini-2.5-pro,o3,claude-sonnet-4.6`.
-
-### v5.1.4 -- Knowledge Re-index + Prompt Hardening
-- Re-indexed all 27 knowledge base topics with rich, informative summaries.
-- Added `index-full` knowledge topic with full 3-line descriptions of all topics.
-- SYSTEM.md: Strengthened tool result processing protocol with warning and 5 anti-patterns.
-- SYSTEM.md: Knowledge base section now has explicit "before task: read, after task: write" protocol.
-- SYSTEM.md: Task decomposition section restored to full structured form with examples.
-
-### v5.1.3 -- Message Dispatch Critical Fix
-- **Dead-code batch path fixed**: `handle_chat_direct()` was never called -- `else` was attached to wrong `if`.
-- **Early-exit hardened**: replaced fragile deadline arithmetic with elapsed-time check.
-- **Drive I/O eliminated**: `load_state()`/`save_state()` moved out of per-update tight loop.
-- **Burst batching**: deadline extends +0.3s per rapid-fire message.
-- Multi-model review passed (claude-opus-4.6, o3, gemini-2.5-pro).
-- 102 tests green.
-
-### v5.1.0 -- VLM + Knowledge Index + Desync Fix
-- **VLM support**: `vision_query()` in llm.py + `analyze_screenshot` / `vlm_query` tools.
-- **Knowledge index**: richer 3-line summaries so topics are actually useful at-a-glance.
-- **Desync fix**: removed echo bug where owner inject messages were sent back to Telegram.
-- 101 tests green (+10 VLM tests).
-
-### v5.0.2 -- DeepSeek Ban + Desync Fix
-- DeepSeek removed from `fetch_openrouter_pricing` prefixes (banned per creator directive).
-- Desync bug fix: owner messages during running tasks now forwarded via Drive-based mailbox (`owner_inject.py`).
-- Worker loop checks Drive mailbox every round -- injected as user messages into context.
-- Only affects worker tasks (not direct chat, which uses in-memory queue).
-
-### v5.0.1 -- Quality & Integrity Fix
-- Fixed 9 bugs: executor leak, dashboard field mismatches, budget default inconsistency, dead code, race condition, pricing fetch gap, review file count, SHA verify timeout, log message copy-paste.
-- Bible P7: version sync check now includes README.md.
-- Bible P3: fallback model list configurable via OUROBOROS_MODEL_FALLBACK_LIST env var.
-- Dashboard values now dynamic (model, tests, tools, uptime, consciousness).
-- Merged duplicate state dict definitions (single source of truth).
-- Unified TOTAL_BUDGET default to $1 across all modules.
-
-### v4.26.0 -- Task Decomposition
-- Task decomposition: `schedule_task` -> `wait_for_task` -> `get_task_result`.
-- Hard round limit (MAX_ROUNDS=200) -- prevents runaway tasks.
-- Task results stored on Drive for cross-task communication.
-- 91 smoke tests -- all green.
-
-### v4.24.1 -- Consciousness Always On
-- Background consciousness auto-starts on boot.
-
-### v4.24.0 -- Deep Review Bugfixes
-- Circuit breaker for evolution (3 consecutive empty responses -> pause).
-- Fallback model chain fix (works when primary IS the fallback).
-- Budget tracking for empty responses.
-- Multi-model review passed (o3, Gemini 2.5 Pro).
-
-### v4.23.0 -- Empty Response Fallback
-- Auto-fallback to backup model on repeated empty responses.
-- Raw response logging for debugging.
+```
+ouroboros/
+├── local_launcher.py        # Точка входа (DeepSeek backend)
+├── .env                     # API ключи (не коммитится)
+├── requirements.txt         # Зависимости
+│
+├── ouroboros/                # Ядро агента
+│   ├── agent.py             # Оркестратор задач
+│   ├── loop.py              # LLM цикл + reasoning capture
+│   ├── llm.py               # Клиент OpenRouter/DeepSeek
+│   ├── context.py           # Формирование контекста для LLM
+│   ├── consciousness.py     # Фоновое сознание (отключено в local)
+│   ├── memory.py            # Память: scratchpad, identity
+│   └── tools/               # Инструменты агента
+│       ├── core.py          # Файловые операции
+│       ├── git.py           # Git операции
+│       ├── github.py        # GitHub Issues
+│       ├── shell.py         # Shell, Claude Code
+│       ├── search.py        # Веб-поиск
+│       ├── browser.py       # Playwright браузер
+│       └── control.py       # Управление: restart, evolve, review
+│
+├── supervisor/              # Управление процессами
+│   ├── state.py             # Состояние, бюджет
+│   ├── telegram.py          # Telegram клиент
+│   ├── queue.py             # Очередь задач, эволюция
+│   ├── workers.py           # Воркеры
+│   ├── events.py            # Обработка событий
+│   └── git_ops.py           # Git операции
+│
+└── local_data/              # Данные (создаётся автоматически)
+    ├── state/
+    │   ├── state.json       # Состояние агента
+    │   └── queue_snapshot.json
+    ├── logs/
+    │   ├── events.jsonl     # Все события (раунды, ошибки, метрики)
+    │   ├── reasoning.jsonl  # Цепочки рассуждений LLM
+    │   ├── tools.jsonl      # Вызовы инструментов
+    │   └── supervisor.jsonl # Логи супервизора
+    ├── memory/
+    │   ├── identity.md      # Идентичность агента
+    │   ├── scratchpad.md    # Рабочие заметки
+    │   └── *.md             # Документы, созданные агентом
+    └── task_results/
+        └── *.json           # Результаты выполненных задач
+```
 
 ---
 
-## Author
+## Мониторинг и логи
 
-Created by [Anton Razzhigaev](https://t.me/abstractDL)
+### Reasoning — как думает агент
 
-## License
+```bash
+# В реальном времени
+tail -f local_data/logs/reasoning.jsonl | python3 -m json.tool
+
+# Красиво вывести все цепочки
+cat local_data/logs/reasoning.jsonl | python3 -c "
+import sys, json
+for line in sys.stdin:
+    r = json.loads(line)
+    final = ' [FINAL]' if r.get('is_final') else ''
+    print(f'Round {r[\"round\"]}{final}:')
+    print(r['reasoning_content'][:500])
+    print('---')
+"
+```
+
+### События — что происходит
+
+```bash
+# Все события в реальном времени
+tail -f local_data/logs/events.jsonl | python3 -m json.tool
+
+# Только раунды LLM (с reasoning, если есть)
+grep '"llm_round"' local_data/logs/events.jsonl | python3 -m json.tool
+
+# Только эволюция
+grep -i 'evolution' local_data/logs/events.jsonl | python3 -m json.tool
+
+# Ошибки
+grep -i 'error\|timeout\|failure' local_data/logs/events.jsonl | python3 -m json.tool
+```
+
+### Состояние агента
+
+```bash
+# Полное состояние
+cat local_data/state/state.json | python3 -m json.tool
+
+# Быстрая сводка
+cat local_data/state/state.json | python3 -c "
+import sys, json; s = json.load(sys.stdin)
+print(f'Budget:     \${s.get(\"spent_usd\", 0):.4f} spent')
+print(f'Evolution:  {\"ON\" if s.get(\"evolution_mode_enabled\") else \"OFF\"} (cycle {s.get(\"evolution_cycle\", 0)})')
+print(f'Failures:   {s.get(\"evolution_consecutive_failures\", 0)}')
+print(f'Last task:  {(s.get(\"last_user_task_text\") or \"-\")[:80]}')
+"
+```
+
+### Результаты задач
+
+```bash
+# Список выполненных задач
+ls -lt local_data/task_results/
+
+# Посмотреть конкретный результат
+cat local_data/task_results/<task_id>.json | python3 -m json.tool
+```
+
+### Инструменты — что вызывал агент
+
+```bash
+# Все вызовы инструментов
+tail -f local_data/logs/tools.jsonl | python3 -m json.tool
+
+# Только определённый инструмент
+grep '"drive_write"' local_data/logs/tools.jsonl | python3 -m json.tool
+```
+
+### Память агента
+
+```bash
+# Какие файлы агент создал в памяти
+ls -la local_data/memory/
+
+# Прочитать конкретный файл
+cat local_data/memory/llm-agent-maturity-methodology.md
+```
+
+---
+
+## Команды Telegram
+
+| Команда | Описание |
+|---------|----------|
+| `/status` | Статус: воркеры, очередь, бюджет |
+| `/evolve` | Включить эволюцию |
+| `/evolve off` | Выключить эволюцию |
+| `/review` | Запустить глубокий обзор кода |
+| `/bg start` | Включить фоновое сознание |
+| `/bg stop` | Выключить фоновое сознание |
+| `/restart` | Мягкий перезапуск |
+| `/panic` | Аварийная остановка |
+
+Любое другое сообщение — задача для агента.
+
+---
+
+## Эволюция
+
+### Как работает
+
+1. Пользователь отправляет задачу → агент выполняет
+2. Текст задачи и результат сохраняются в `state.json`
+3. Когда очередь пуста → запускается эволюция
+4. Агент читает последнюю задачу и улучшает результат
+5. Новое сообщение от пользователя → эволюция мгновенно отменяется
+
+### Защиты
+
+| Защита | Описание |
+|--------|----------|
+| **Приоритет пользователя** | Новое сообщение отменяет running/pending эволюцию |
+| **Circuit breaker** | 3 неудачи подряд → эволюция ставится на паузу |
+| **Budget guard** | Остаток < $50 → эволюция отключается |
+| **Busy check** | Эволюция не стартует, пока агент занят задачей пользователя |
+
+### Проверить что эволюция работает
+
+```bash
+# 1. Есть ли последняя задача для эволюции?
+cat local_data/state/state.json | python3 -c "
+import sys, json; s = json.load(sys.stdin)
+print('Evolution:', 'ON' if s.get('evolution_mode_enabled') else 'OFF')
+print('Cycle:', s.get('evolution_cycle', 0))
+print('Task:', (s.get('last_user_task_text') or 'нет')[:100])
+"
+
+# 2. Reasoning эволюции (агент думает о задаче пользователя?)
+tail -20 local_data/logs/reasoning.jsonl | python3 -c "
+import sys, json
+for line in sys.stdin:
+    r = json.loads(line)
+    print(f'Round {r[\"round\"]}:', r['reasoning_content'][:200])
+    print()
+"
+
+# 3. Результат эволюции
+ls -lt local_data/task_results/ | head -5
+```
+
+---
+
+## Стоимость
+
+DeepSeek API — одно из самых дешёвых:
+
+| Модель | Input (за 1M токенов) | Output | Cache hit |
+|--------|----------------------|--------|-----------|
+| `deepseek-reasoner` | $0.55 | $2.19 | $0.14 |
+| `deepseek-chat` | $0.27 | $1.10 | $0.07 |
+
+Типичная задача: 4-8 раундов, $0.01-0.05. Эволюция: ~$0.02-0.03 за цикл.
+
+---
+
+## Troubleshooting
+
+### Бот не отвечает в Telegram
+```bash
+# Проверь что процесс запущен
+ps aux | grep local_launcher
+
+# Проверь логи на ошибки
+tail -50 local_data/logs/supervisor.jsonl | grep -i error
+```
+
+### SSL ошибки (conda)
+`local_launcher.py` автоматически патчит Telegram клиент на `curl`. Если `curl` не работает:
+```bash
+# Проверь curl
+curl -s https://api.telegram.org/bot<TOKEN>/getMe
+```
+
+### Worker SHA mismatch
+```bash
+# Подтяни код и перезапусти
+git pull
+python local_launcher.py --data-dir ./local_data --repo-dir .
+```
+
+### Эволюция не запускается
+```bash
+# Проверь условия
+cat local_data/state/state.json | python3 -c "
+import sys, json; s = json.load(sys.stdin)
+print('Enabled:', s.get('evolution_mode_enabled'))
+print('Failures:', s.get('evolution_consecutive_failures'))
+print('Last task:', bool(s.get('last_user_task_text')))
+print('Budget spent:', s.get('spent_usd'))
+"
+```
+- `Enabled: False` → отправь `/evolve` в Telegram
+- `Failures: 3` → circuit breaker. `/evolve` для сброса
+- `Last task: False` → отправь хотя бы одну задачу
+- Бюджет исчерпан → увеличь `TOTAL_BUDGET` в `.env`
+
+### Сбросить всё состояние
+```bash
+rm -rf local_data/
+python local_launcher.py --data-dir ./local_data --repo-dir .
+```
+
+---
+
+## Лицензия
 
 [MIT License](LICENSE)
