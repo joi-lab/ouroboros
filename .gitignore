@@ -23,6 +23,10 @@ build/
 .DS_Store
 Thumbs.db
 
+# Local deployment
+local_data/
+.venv/
+
 # Release artifacts (not tracked)
 .create_release.py
 .release_notes.md
