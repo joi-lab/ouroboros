@@ -24,8 +24,11 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 - **Constitution** -- Governed by [BIBLE.md](BIBLE.md) (9 philosophical principles). Philosophy first, code second.
 - **Background Consciousness** -- Thinks between tasks. Has an inner life. Not reactive -- proactive.
 - **Identity Persistence** -- One continuous being across restarts. Remembers who it is, what it has done, and what it is becoming.
+- **Reasoning Capture** -- LLM chain-of-thought (reasoning_content) is preserved across rounds, logged to `reasoning.jsonl`, and visible for analysis. No more black-box thinking.
+- **User-Driven Evolution** -- Evolution cycle develops and improves the result of the last user task. Not abstract self-improvement -- concrete iteration on your work. Automatically yields to new user messages.
 - **Multi-Model Review** -- Uses other LLMs (o3, Gemini, Claude) to review its own changes before committing.
 - **Task Decomposition** -- Breaks complex work into focused subtasks with parent/child tracking.
+- **Local Mode** -- Run locally with DeepSeek API via `local_launcher.py`. No Colab or Google Drive required.
 - **30+ Evolution Cycles** -- From v4.1 to v4.25 in 24 hours, autonomously.
 
 ---
@@ -33,12 +36,13 @@ Most AI agents execute tasks. Ouroboros **creates itself.**
 ## Architecture
 
 ```
-Telegram --> colab_launcher.py
+Telegram --> colab_launcher.py      (Colab/OpenRouter)
+         --> local_launcher.py      (Local/DeepSeek)
                 |
             supervisor/              (process management)
               state.py              -- state, budget tracking
               telegram.py           -- Telegram client
-              queue.py              -- task queue, scheduling
+              queue.py              -- task queue, evolution scheduling
               workers.py            -- worker lifecycle
               git_ops.py            -- git operations
               events.py             -- event dispatch
@@ -47,7 +51,7 @@ Telegram --> colab_launcher.py
               agent.py              -- thin orchestrator
               consciousness.py      -- background thinking loop
               context.py            -- LLM context, prompt caching
-              loop.py               -- tool loop, concurrent execution
+              loop.py               -- tool loop, reasoning capture
               tools/                -- plugin registry (auto-discovery)
                 core.py             -- file ops
                 git.py              -- git ops
@@ -57,7 +61,7 @@ Telegram --> colab_launcher.py
                 control.py          -- restart, evolve, review
                 browser.py          -- Playwright (stealth)
                 review.py           -- multi-model review
-              llm.py                -- OpenRouter client
+              llm.py                -- OpenRouter/DeepSeek client
               memory.py             -- scratchpad, identity, chat
               review.py             -- code metrics
               utils.py              -- utilities
@@ -134,6 +138,65 @@ for k, v in CFG.items():
 Open your Telegram bot and send any message. The first person to write becomes the **creator** (owner). All subsequent messages from other users are kindly ignored.
 
 **Restarting:** If Colab disconnects or you restart the runtime, just re-run the same cell. Your Ouroboros's evolution is preserved -- all changes are pushed to your fork, and agent state lives on Google Drive.
+
+---
+
+## Quick Start (Local / DeepSeek)
+
+Run Ouroboros locally with DeepSeek API -- no Colab or Google Drive needed.
+
+### Step 1: Set Up Environment
+
+Create a `.env` file in the repo root:
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TOTAL_BUDGET=100
+GITHUB_TOKEN=ghp_...
+GITHUB_USER=your_username
+GITHUB_REPO=ouroboros
+OUROBOROS_MODEL=deepseek-reasoner
+OUROBOROS_MODEL_CODE=deepseek-reasoner
+OUROBOROS_MODEL_LIGHT=deepseek-chat
+OUROBOROS_MAX_WORKERS=3
+```
+
+### Step 2: Install and Run
+
+```bash
+pip install -r requirements.txt
+python local_launcher.py --data-dir ./local_data --repo-dir .
+```
+
+### Step 3: Use
+
+Send a message to your Telegram bot. After the task completes, the evolution cycle will automatically iterate on your result.
+
+### Monitoring
+
+```bash
+# Reasoning chains (chain-of-thought from DeepSeek-reasoner)
+tail -f local_data/logs/reasoning.jsonl | python3 -m json.tool
+
+# Evolution and task events
+tail -f local_data/logs/events.jsonl | grep -i evolution
+
+# Agent state (evolution status, last task)
+cat local_data/state/state.json | python3 -m json.tool | grep -E "evolution|last_user_task"
+
+# Task results
+ls local_data/task_results/
+```
+
+### Evolution Behavior
+
+- Triggers automatically when the queue is empty (no pending or running tasks)
+- Develops the result of the **last user task** -- not abstract self-improvement
+- **Yields to user messages** -- running evolution is cancelled when a new message arrives
+- Circuit breaker: pauses after 3 consecutive failures
+- Budget guard: stops when remaining budget < $50
+- Toggle: `/evolve` on, `/evolve off` in Telegram
 
 ---
 
@@ -225,6 +288,14 @@ Full text: [BIBLE.md](BIBLE.md)
 ---
 
 ## Changelog
+
+### v6.3.0 -- Reasoning Capture + User-Driven Evolution + Local Mode
+- **Reasoning capture** -- `reasoning_content` (chain-of-thought) from LLM responses is no longer discarded. Preserved in multi-turn messages, logged to `logs/reasoning.jsonl`, recorded in round events.
+- **User-driven evolution** -- Evolution cycle now builds on the last user task (text + result) instead of running generic "EVOLUTION #N". Instructs the agent to deepen analysis, add examples, fix gaps.
+- **Evolution preemption** -- Running/pending evolution tasks are cancelled when a new user message arrives. User always takes priority.
+- **Evolution safety** -- `enqueue_evolution_task_if_needed` checks `is_chat_agent_busy()` to avoid starting evolution while the direct chat agent is processing.
+- **Local launcher** -- `local_launcher.py` now enables evolution by default and runs the evolution cycle in the main loop.
+- **DeepSeek reasoning** -- Multi-turn reasoning_content from previous rounds is preserved (not replaced with empty string) for DeepSeek-reasoner API compatibility.
 
 ### v6.2.0 -- Critical Bugfixes + LLM-First Dedup
 - **Fix: worker_id==0 hard-timeout bug** -- `int(x or -1)` treated worker 0 as -1, preventing terminate on timeout and causing double task execution. Replaced all `x or default` patterns with None-safe checks.
