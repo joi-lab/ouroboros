@@ -812,6 +812,16 @@ while True:
 
         _consciousness.inject_observation(f"Owner message: {text[:100]}")
 
+        # Save real user message as last task for evolution context
+        _clean_text = text.strip()
+        if (_clean_text
+            and len(_clean_text) >= 10
+            and not _clean_text.startswith("/")
+            and not _clean_text.startswith("[")):
+            _st_task = load_state()
+            _st_task["last_user_task_text"] = _clean_text[:500]
+            save_state(_st_task)
+
         # Cancel running evolution tasks — user's message takes priority
         _evo_cancelled = []
         for _rtid, _rinfo in list(RUNNING.items()):
