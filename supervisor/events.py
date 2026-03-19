@@ -92,10 +92,13 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     wid = evt.get("worker_id")
 
     # Save last user task text and result for evolution context
+    # Skip supervisor commands and trivial messages
     if task_type in ("task", ""):
-        task_text = str(evt.get("task_text") or "")
+        task_text = str(evt.get("task_text") or "").strip()
         task_result = str(evt.get("task_result") or "")
-        if task_text:
+        is_command = task_text.startswith("/") or task_text.startswith("[Supervisor handled")
+        is_trivial = len(task_text) < 10
+        if task_text and not is_command and not is_trivial:
             st_user = ctx.load_state()
             st_user["last_user_task_text"] = task_text[:500]
             st_user["last_user_task_result"] = task_result[:1000]
