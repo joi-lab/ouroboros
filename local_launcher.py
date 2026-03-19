@@ -399,11 +399,13 @@ workers_init(
 from supervisor.events import dispatch_event
 
 # ---------------------------------------------------------------------------
-# 5) Bootstrap repo
+# 5) Bootstrap repo (local mode — skip safe_restart to avoid branch reset)
 # ---------------------------------------------------------------------------
 ensure_repo_present()
-ok, msg = safe_restart(reason="bootstrap", unsynced_policy="rescue_and_reset")
-assert ok, f"Bootstrap failed: {msg}"
+# safe_restart disabled for local mode: it resets to main even with BRANCH_DEV set
+# because import_test() may fail in non-Colab environments.
+# Instead, just stay on the current branch.
+log.info("Local mode: skipping safe_restart, staying on current branch")
 
 # ---------------------------------------------------------------------------
 # 6) Start workers
@@ -566,10 +568,13 @@ def _handle_supervisor_command(text: str, chat_id: int, tg_offset: int = 0):
         st2["tg_offset"] = tg_offset
         save_state(st2)
         send_with_budget(chat_id, "♻️ Restarting (soft).")
-        ok_r, msg_r = safe_restart(reason="owner_restart", unsynced_policy="rescue_and_reset")
-        if not ok_r:
-            send_with_budget(chat_id, f"⚠️ Restart cancelled: {msg_r}")
-            return True
+        # safe_restart disabled for local mode
+        send_with_budget(chat_id, "♻️ Restart skipped in local mode (no branch reset).")
+        return True
+        # ok_r, msg_r = safe_restart(reason="owner_restart", unsynced_policy="rescue_and_reset")
+        # if not ok_r:
+        #     send_with_budget(chat_id, f"⚠️ Restart cancelled: {msg_r}")
+        #     return True
         kill_workers()
         os.execv(sys.executable, [sys.executable, __file__,
                                   "--data-dir", str(DRIVE_ROOT),
