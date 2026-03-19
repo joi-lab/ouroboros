@@ -64,7 +64,7 @@ playwright install chromium
 DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 
 # Telegram Bot Token (получи у @BotFather)
-TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
+# TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrSTUvwxYZ
 
 # Лимит расходов в долларах (агент остановится при превышении)
 TOTAL_BUDGET=100
