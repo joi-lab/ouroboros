@@ -812,6 +812,19 @@ while True:
 
         _consciousness.inject_observation(f"Owner message: {text[:100]}")
 
+        # Cancel running evolution tasks — user's message takes priority
+        _evo_cancelled = []
+        for _rtid, _rinfo in list(RUNNING.items()):
+            if str(_rinfo.get("task", {}).get("type") or "") == "evolution":
+                if cancel_task_by_id(_rtid):
+                    _evo_cancelled.append(_rtid)
+        # Also drop pending evolution tasks
+        _evo_pending_before = len(PENDING)
+        PENDING[:] = [t for t in PENDING if str(t.get("type") or "") != "evolution"]
+        if _evo_cancelled or len(PENDING) < _evo_pending_before:
+            persist_queue_snapshot(reason="evolution_preempted_by_user")
+            log.info("Evolution preempted by user message: cancelled=%s", _evo_cancelled)
+
         agent = _get_chat_agent()
 
         if agent._busy:

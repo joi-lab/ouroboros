@@ -403,6 +403,13 @@ def enqueue_evolution_task_if_needed() -> None:
     """
     if PENDING or RUNNING:
         return
+    # Don't start evolution while the direct chat agent is busy with a user task
+    try:
+        from supervisor.workers import is_chat_agent_busy
+        if is_chat_agent_busy():
+            return
+    except ImportError:
+        pass
     st = load_state()
     if not bool(st.get("evolution_mode_enabled")):
         return

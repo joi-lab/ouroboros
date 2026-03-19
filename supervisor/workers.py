@@ -139,6 +139,11 @@ def _get_chat_agent():
     return _chat_agent
 
 
+def is_chat_agent_busy() -> bool:
+    """Check if the direct chat agent is currently processing a task."""
+    return _chat_agent is not None and getattr(_chat_agent, "_busy", False)
+
+
 def handle_chat_direct(chat_id: int, text: str, image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None) -> None:
     try:
         agent = _get_chat_agent()
