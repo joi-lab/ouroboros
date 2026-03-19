@@ -287,41 +287,58 @@ class OuroborosAgent:
             return {"status": "error", "error": str(e)}, 0
 
     def _verify_system_state(self, git_sha: str) -> None:
-        """Bible Principle 1: verify system state on every startup.
+        """Lightweight system state verification on startup.
 
-        Checks:
+        Bible P1 requires context recovery, but P0 requires agency —
+        which means not wasting budget on housekeeping. This method runs
+        quick checks and logs issues for later resolution. It must NOT
+        block or delay task processing.
+
+        Checks (all fast, no LLM calls):
         - Uncommitted changes (auto-rescue commit & push)
         - VERSION file sync with git tags
         - Budget remaining (warning thresholds)
         """
+        import time as _time
+        start = _time.monotonic()
+        TIMEOUT_SEC = 15  # Hard cap: verification must complete in 15s
+
         checks = {}
         issues = 0
         drive_logs = self.env.drive_path("logs")
 
-        # 1. Uncommitted changes
+        # 1. Uncommitted changes (most important — prevents data loss)
         checks["uncommitted_changes"], issue_count = self._check_uncommitted_changes()
         issues += issue_count
 
-        # 2. VERSION vs git tag
-        checks["version_sync"], issue_count = self._check_version_sync()
-        issues += issue_count
+        # 2. VERSION vs git tag (informational only — logged, not blocking)
+        if _time.monotonic() - start < TIMEOUT_SEC:
+            checks["version_sync"], issue_count = self._check_version_sync()
+            issues += issue_count
+        else:
+            checks["version_sync"] = {"status": "skipped", "reason": "timeout"}
 
         # 3. Budget check
-        checks["budget"], issue_count = self._check_budget()
-        issues += issue_count
+        if _time.monotonic() - start < TIMEOUT_SEC:
+            checks["budget"], issue_count = self._check_budget()
+            issues += issue_count
+        else:
+            checks["budget"] = {"status": "skipped", "reason": "timeout"}
 
         # Log verification result
+        elapsed_ms = round((_time.monotonic() - start) * 1000)
         event = {
             "ts": utc_now_iso(),
             "type": "startup_verification",
             "checks": checks,
             "issues_count": issues,
             "git_sha": git_sha,
+            "elapsed_ms": elapsed_ms,
         }
         append_jsonl(drive_logs / "events.jsonl", event)
 
         if issues > 0:
-            log.warning(f"Startup verification found {issues} issue(s): {checks}")
+            log.warning(f"Startup verification found {issues} issue(s) in {elapsed_ms}ms: {checks}")
 
     # =====================================================================
     # Main entry point

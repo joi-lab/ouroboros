@@ -445,6 +445,60 @@ def _check_budget_limits(
     return None
 
 
+def _maybe_inject_housekeeping_guard(
+    round_idx: int,
+    messages: List[Dict[str, Any]],
+    llm_trace: Dict[str, Any],
+) -> None:
+    """Detect and interrupt self-absorbed housekeeping in early rounds.
+
+    If the agent has spent its first 4+ rounds exclusively on housekeeping
+    tools (git_status, repo_read on identity/scratchpad/VERSION, etc.)
+    without any task-relevant tool calls, inject a hard nudge.
+    """
+    if round_idx < 4 or round_idx > 8:
+        return  # Only check in the critical early window
+
+    HOUSEKEEPING_TOOLS = frozenset({
+        "git_status", "git_diff", "drive_read", "drive_list",
+        "update_scratchpad", "update_identity",
+    })
+    HOUSEKEEPING_PATHS = frozenset({
+        "VERSION", "identity.md", "scratchpad.md", "state.json",
+        "BIBLE.md", "README.md",
+    })
+
+    tool_calls = llm_trace.get("tool_calls", [])
+    if not tool_calls:
+        return
+
+    housekeeping_count = 0
+    for tc in tool_calls:
+        tool_name = tc.get("tool", "")
+        args = tc.get("args", {})
+        path = str(args.get("path", ""))
+
+        is_housekeeping = (
+            tool_name in HOUSEKEEPING_TOOLS
+            or any(hp in path for hp in HOUSEKEEPING_PATHS)
+        )
+        if is_housekeeping:
+            housekeeping_count += 1
+
+    # If >75% of tool calls so far are housekeeping, nudge the agent
+    if len(tool_calls) >= 3 and housekeeping_count / len(tool_calls) > 0.75:
+        messages.append({
+            "role": "system",
+            "content": (
+                "[HOUSEKEEPING GUARD] You have spent your first rounds on "
+                "self-maintenance (version checks, identity reads, git status) "
+                "instead of the creator's request. STOP housekeeping NOW and "
+                "start working on what was actually asked. Health issues can "
+                "wait — the creator's request cannot."
+            ),
+        })
+
+
 def _maybe_inject_self_check(
     round_idx: int,
     max_rounds: int,
@@ -661,6 +715,9 @@ def run_llm_loop(
                 except Exception:
                     log.warning("Failed to get final response after round limit", exc_info=True)
                     return finish_reason, accumulated_usage, llm_trace
+
+            # Housekeeping guard: detect and interrupt self-absorbed behavior in early rounds
+            _maybe_inject_housekeeping_guard(round_idx, messages, llm_trace)
 
             # Soft self-check reminder every 50 rounds (LLM-first: agent decides, not code)
             _maybe_inject_self_check(round_idx, MAX_ROUNDS, messages, accumulated_usage, emit_progress)

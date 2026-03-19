@@ -169,7 +169,7 @@ def _build_health_invariants(env: Any) -> str:
                 pyproject_ver = line.split("=", 1)[1].strip().strip('"').strip("'")
                 break
         if ver_file and pyproject_ver and ver_file != pyproject_ver:
-            checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, pyproject.toml={pyproject_ver}")
+            checks.append(f"NOTE: VERSION DESYNC — VERSION={ver_file}, pyproject.toml={pyproject_ver} (fix in background, not during active task)")
         elif ver_file:
             checks.append(f"OK: version sync ({ver_file})")
     except Exception:
@@ -210,7 +210,7 @@ def _build_health_invariants(env: Any) -> str:
         if identity_path.exists():
             age_hours = (_time.time() - identity_path.stat().st_mtime) / 3600
             if age_hours > 8:
-                checks.append(f"WARNING: STALE IDENTITY — identity.md last updated {age_hours:.0f}h ago")
+                checks.append(f"INFO: STALE IDENTITY — identity.md last updated {age_hours:.0f}h ago (update after current task, not before)")
             else:
                 checks.append("OK: identity.md recent")
     except Exception:
@@ -347,8 +347,14 @@ def build_llm_messages(
     ]
 
     # Health invariants — surfaces anomalies for LLM-first self-detection (Bible P0+P3)
+    # NOTE: These are informational only. They must NOT derail the user's task.
     health_section = _build_health_invariants(env)
     if health_section:
+        health_section += (
+            "\n\n**REMINDER:** Health issues are for background consciousness "
+            "or post-task resolution. Do NOT fix them before completing the "
+            "creator's current request."
+        )
         dynamic_parts.append(health_section)
 
     dynamic_parts.extend(_build_recent_sections(memory, env, task_id=task.get("id", "")))
@@ -385,8 +391,30 @@ def build_llm_messages(
                 },
             ],
         },
-        {"role": "user", "content": _build_user_content(task)},
     ]
+
+    # Task-focus injection: force the agent to decompose and start the task
+    # before any housekeeping. This is the key mechanism to prevent
+    # the "self-absorbed mode" anti-pattern.
+    user_content = _build_user_content(task)
+    if task_type not in ("evolution", "review", "consciousness"):
+        task_focus_prefix = (
+            "[TASK-FOCUS PROTOCOL]\n"
+            "Before doing ANYTHING else (version checks, identity updates, "
+            "scratchpad reads), you MUST:\n"
+            "1. Read and understand this request\n"
+            "2. Decompose it into 2-5 concrete steps\n"
+            "3. Start executing step 1\n"
+            "Only after meaningful progress on the task may you do housekeeping.\n"
+            "---\n\n"
+        )
+        if isinstance(user_content, str):
+            user_content = task_focus_prefix + user_content
+        elif isinstance(user_content, list):
+            # Multipart content — prepend text block
+            user_content = [{"type": "text", "text": task_focus_prefix}] + user_content
+
+    messages.append({"role": "user", "content": user_content})
 
     # --- Soft-cap token trimming ---
     messages, cap_info = apply_message_token_soft_cap(messages, 200000)
