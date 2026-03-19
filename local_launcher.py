@@ -419,6 +419,13 @@ from supervisor.state import (
 state_init(DRIVE_ROOT, TOTAL_BUDGET_LIMIT)
 init_state()
 
+# Enable evolution mode by default for local launcher
+_st = load_state()
+if not _st.get("evolution_mode_enabled"):
+    _st["evolution_mode_enabled"] = True
+    save_state(_st)
+    log.info("Evolution mode enabled by default")
+
 from supervisor.telegram import (
     init as telegram_init, TelegramClient, send_with_budget, log_chat,
 )
@@ -717,7 +724,7 @@ while True:
         dispatch_event(evt, _event_ctx)
 
     enforce_task_timeouts()
-    # enqueue_evolution_task_if_needed()  # Disabled: focus on user tasks
+    enqueue_evolution_task_if_needed()
     assign_tasks()
     persist_queue_snapshot(reason="main_loop")
 
