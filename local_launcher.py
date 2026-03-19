@@ -17,6 +17,7 @@ import logging
 import os
 import pathlib
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -25,6 +26,18 @@ import types
 import uuid
 import queue as _queue_mod
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+# ---------------------------------------------------------------------------
+# Force IPv4 — Python may try IPv6 first which times out on some networks
+# ---------------------------------------------------------------------------
+_original_getaddrinfo = socket.getaddrinfo
+
+def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    if family == 0:
+        family = socket.AF_INET
+    return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 # ---------------------------------------------------------------------------
 # Logging
