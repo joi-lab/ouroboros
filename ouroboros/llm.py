@@ -197,7 +197,13 @@ class LLMClient:
         resp_dict = resp.model_dump()
         usage = resp_dict.get("usage") or {}
         choices = resp_dict.get("choices") or [{}]
-        msg = (choices[0] if choices else {}).get("message") or {}
+        first_choice = choices[0] if choices else {}
+        msg = first_choice.get("message") or {}
+
+        # Pass finish_reason through so the loop can detect truncation
+        finish_reason = first_choice.get("finish_reason")
+        if finish_reason:
+            msg["finish_reason"] = finish_reason
 
         # Extract cached_tokens from prompt_tokens_details if available
         if not usage.get("cached_tokens"):

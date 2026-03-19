@@ -795,6 +795,31 @@ def run_llm_loop(
             tool_calls = msg.get("tool_calls") or []
             content = msg.get("content")
             reasoning = msg.get("reasoning_content") or ""
+            finish_reason = msg.get("finish_reason") or ""
+
+            # Handle truncated response (hit max_tokens limit)
+            if finish_reason == "length":
+                log.warning("LLM response truncated (finish_reason=length) at round %d, injecting continuation prompt", round_idx)
+                append_jsonl(drive_logs / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "llm_truncated",
+                    "task_id": task_id, "round": round_idx, "model": active_model,
+                    "content_len": len(content or ""),
+                    "tool_calls_count": len(tool_calls),
+                })
+                # Save whatever partial content was generated, then ask LLM to continue concisely
+                partial = (content or "").strip()
+                if partial:
+                    messages.append({"role": "assistant", "content": partial})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "[SYSTEM] Your previous response was truncated because it exceeded the maximum token limit. "
+                        "Do NOT repeat what you already wrote. Continue from where you stopped, but be much more concise. "
+                        "Use tool calls (save_artifact, memory_write) to store long content instead of generating it inline."
+                    ),
+                })
+                continue  # next round with continuation prompt
+
             # No tool calls — final response
             if not tool_calls:
                 if reasoning:

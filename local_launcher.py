@@ -217,8 +217,9 @@ def _patched_chat(self, messages, model, tools=None, reasoning_effort="medium",
     from ouroboros.llm import normalize_reasoning_effort
     client = self._get_client()
 
-    # DeepSeek max_tokens limit is 8192
-    max_tokens = min(max_tokens, 8192)
+    # DeepSeek max_tokens limit: 8K for reasoning tokens, 16K for output
+    # The 8192 cap was too aggressive — deepseek-reasoner supports 16384 output tokens
+    max_tokens = min(max_tokens, 16384)
 
     # For deepseek-reasoner: assistant messages MUST have reasoning_content field
     # See https://api-docs.deepseek.com/guides/thinking_mode#tool-calls
@@ -258,7 +259,13 @@ def _patched_chat(self, messages, model, tools=None, reasoning_effort="medium",
     resp_dict = resp.model_dump()
     usage = resp_dict.get("usage") or {}
     choices = resp_dict.get("choices") or [{}]
-    msg = (choices[0] if choices else {}).get("message") or {}
+    first_choice = choices[0] if choices else {}
+    msg = first_choice.get("message") or {}
+
+    # Pass finish_reason through so the loop can detect truncation
+    finish_reason = first_choice.get("finish_reason")
+    if finish_reason:
+        msg["finish_reason"] = finish_reason
 
     # DeepSeek pricing (per 1M tokens, cache-miss / cache-hit):
     # deepseek-chat:     $0.27 input / $1.10 output  (cached: $0.07)
