@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> This repository is an active mirror of the official Ouroboros repository:
+> **https://github.com/razzant/ouroboros**
+>
+> Please open issues, discussions, and release questions in `razzant/ouroboros`.
+> Open pull requests against its lowercase `ouroboros` branch and follow `CONTRIBUTING.md` there.
+
 # Ouroboros
 
 [![GitHub stars](https://img.shields.io/github/stars/razzant/ouroboros?style=flat&logo=github)](https://github.com/razzant/ouroboros/stargazers)
