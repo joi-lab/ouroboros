@@ -1,9 +1,9 @@
 > [!IMPORTANT]
-> This repository is an active mirror of the official Ouroboros repository:
+> This repository is an archived mirror of the official Ouroboros repository:
 > **https://github.com/razzant/ouroboros**
 >
-> Please open issues, discussions, and release questions in `razzant/ouroboros`.
-> Open pull requests against its lowercase `ouroboros` branch and follow `CONTRIBUTING.md` there.
+> Current development, releases, issues, discussions, and pull requests live in `razzant/ouroboros`.
+> The code and history remain available here for existing links and forks.
 
 # Ouroboros
 
