@@ -49,7 +49,7 @@ Use `e1v2/run_pro.py` / `e1v2/auto_run.py` for evolutionary runs and
 at `/opt/miniconda3/envs/oboros`; that volume supplies the Python interpreter and
 Ouroboros's third-party dependencies (the agent SOURCE is seeded separately into
 `/obo-repo` and imported via `PYTHONPATH`, so the volume holds DEPENDENCIES ONLY).
-`build_env_volume.sh` builds it self-contained from this repo's `requirements.txt`:
+`build_env_volume.sh` builds it self-contained from this repo's `requirements-runtime.lock`:
 
 ```bash
 devtools/benchmarks/swe_bench_pro/build_env_volume.sh            # idempotent; no-op if ready
@@ -68,7 +68,7 @@ host-mounted directory (e.g. `/Users/...`), not `/tmp`.
   `oboros-env` volume. For musl images (`oboros-env-musl` is unreliable — musllinux wheels
   for tree-sitter et al. are often missing), `run_pro.py` instead sets `OBO_INSTALL_IN_IMAGE=1`
   and `entrypoint_pro.sh` installs Ouroboros into the task image at container start (venv from
-  the mounted clean source, `pip install -r requirements.txt` with a graceful tree-sitter
+  the mounted clean source, `pip install -r requirements-runtime.lock` with a graceful tree-sitter
   fallback — code-intel degrades to string search, the solve still runs). This mirrors the
   Terminal-Bench installed-agent transport and removes the musl-skip class.
 - **Crash/teardown resilience.** `run_pro.py` captures `patch.diff` and writes the

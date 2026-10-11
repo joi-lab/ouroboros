@@ -94,6 +94,101 @@ def test_project_name_limit_is_enforced_before_gateway_side_effects(tmp_path):
     assert get_project(tmp_path, "too-long") is None
 
 
+def test_create_project_reports_creation_fact_without_persisting_it(tmp_path):
+    """B1 contract: the returned dict carries the additive `created` key —
+    True only for the call that registered the row, False on the idempotent
+    replay — and the key never lands in the persisted registry entry."""
+    from ouroboros.projects_registry import create_project, get_project, list_projects
+
+    first = create_project(tmp_path, "alpha", name="Alpha")
+    assert first["created"] is True
+    replay = create_project(tmp_path, "alpha")
+    assert replay["created"] is False
+    assert replay["id"] == "alpha"
+    assert replay["chat_id"] == first["chat_id"]
+    assert all("created" not in row for row in list_projects(tmp_path))
+    assert "created" not in (get_project(tmp_path, "alpha") or {})
+
+
+def test_project_started_row_rides_outbox_pins_main_and_dedupes_durably(tmp_path, monkeypatch):
+    """B1: the agent-initiated `project_started` row mirrors the completion
+    mechanics — same terminal-delivery outbox, `project-start:<pid>` as the ONE
+    restart-surviving dedupe, and the send handler pins chat 1 (Main) even
+    though the task is already project-bound (lineage routing would otherwise
+    pull the row into the Project thread)."""
+    from ouroboros.project_dialogue import announce_project_started
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from supervisor import events, workers
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    bind_task_to_project(
+        tmp_path, "root-project", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    queued = []
+    monkeypatch.setattr(
+        workers, "get_event_q", lambda: SimpleNamespace(put=queued.append),
+    )
+    events._DELIVERED_MESSAGE_IDS.clear()
+    task = {"id": "root-project", "project_id": "launch", "title": "Ship release"}
+
+    assert announce_project_started(tmp_path, project, "root-project", task=task) is True
+    assert announce_project_started(tmp_path, project, "root-project", task=task) is True
+    assert len(queued) == 2  # duplicate live copies share one durable delivery id
+    assert queued[0]["delivery_id"] == "project-start:launch"
+    assert queued[0]["system_type"] == "project_started"
+    assert queued[0]["role"] == "system"
+    assert queued[0]["chat_id"] == 1
+    assert queued[0]["text"] == "Launch 🚀 › Ship release · Started"
+    assert queued[0]["progress_meta"] == {
+        "project_id": "launch",
+        "project_name": "Launch 🚀",
+        "target_label": "Launch 🚀 › Ship release",
+    }
+
+    sent = []
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={},
+        send_with_budget=lambda *a, **k: sent.append((a, k)),
+        append_jsonl=lambda *_a, **_k: None,
+    )
+    events._handle_send_message(queued[0], ctx)
+    events._handle_send_message(queued[1], ctx)
+
+    assert len(sent) == 1  # second copy suppressed by the durable delivery id
+    assert sent[0][0][0] == 1  # pinned to Main despite the project binding
+    assert sent[0][1]["system_type"] == "project_started"
+    assert sent[0][1]["role"] == "system"
+    assert sent[0][1]["progress_meta"]["target_label"] == "Launch 🚀 › Ship release"
+
+
+def test_owner_api_create_does_not_announce_project_started(tmp_path, monkeypatch):
+    """Owner decision 2=A: manual/HTTP project creation stays silent — no
+    `project_started` row rides the terminal-delivery outbox from the owner
+    API seam (only the agent-initiated workers seams announce)."""
+    from ouroboros.gateway.projects import api_projects_create
+
+    delivered = []
+    monkeypatch.setattr(
+        "supervisor.terminal_delivery.enqueue_terminal_delivery",
+        lambda *_a, **_k: delivered.append(1) or True,
+    )
+
+    async def _json():
+        return {"id": "manual-room", "name": "Manual Room"}
+
+    request = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(drive_root=tmp_path)),
+        json=_json,
+    )
+    response = asyncio.run(api_projects_create(request))
+    assert response.status_code == 200
+    from ouroboros.projects_registry import get_project
+
+    assert get_project(tmp_path, "manual-room") is not None
+    assert delivered == []
+
+
 def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
     from ouroboros.project_dialogue import append_chat_annotation, latest_chat_annotations
 
@@ -121,6 +216,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         action="routed",
         target="project:alpha",
         status="delivered",
+        detail="- missing: rejected (reason=source_missing, ordinal=0)",
+        attachment_manifest=[{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     )
     path = tmp_path / "logs" / "chat_annotations.jsonl"
     with path.open("ab") as handle:
@@ -130,6 +232,7 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
     assert latest["owner-1"]["status"] == "delivered"
     assert set(latest["owner-1"]) == {
         "ts", "type", "client_message_id", "action", "target", "status",
+        "detail", "attachment_manifest",
     }
 
     from ouroboros.gateway.history import make_chat_history_endpoint
@@ -142,6 +245,13 @@ def test_chat_annotations_are_compact_and_torn_tail_tolerant(tmp_path):
         "action": "routed",
         "target": "project:alpha",
         "status": "delivered",
+        "detail": "- missing: rejected (reason=source_missing, ordinal=0)",
+        "attachment_manifest": [{
+            "ordinal": 0,
+            "status": "rejected",
+            "reason": "source_missing",
+            "label": "missing",
+        }],
     }
 
 
@@ -170,6 +280,115 @@ def test_chat_annotation_compaction_drops_rows_after_chat_retention(tmp_path):
     assert (logs / "chat_annotations.jsonl").read_text(encoding="utf-8") == ""
 
 
+def test_chat_annotation_compaction_keeps_receipts_that_address_no_message(tmp_path):
+    """A steer the agent authored itself is answered by a receipt keyed on its
+    routing token, and its only reader is the tool waiting on `routing_wait`.
+    Chat-row membership cannot retire it: the append that crosses the threshold
+    used to delete the very row it had just written, so a landed delivery came
+    back as unconfirmed. Stale owner rows still go."""
+    from ouroboros.project_dialogue import (
+        AGENT_RECEIPT_ID_PREFIX, _COMPACT_AT_BYTES, append_chat_annotation,
+        latest_chat_annotations,
+    )
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "direction": "in", "chat_id": 1,
+            "client_message_id": "msg-1789388120127-2", "text": "publish the skills",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    annotations = logs / "chat_annotations.jsonl"
+    live = {
+        "ts": "2026-09-14T12:37:49Z", "type": "chat_annotation",
+        "client_message_id": "msg-1789388120127-2", "action": "promote_chat_to_task",
+        "target": "a3e646fc62a44015", "status": "scheduled", "detail": "x" * 400,
+    }
+    stale = {**live, "client_message_id": "msg-expired-1"}
+    with annotations.open("w", encoding="utf-8") as stream:
+        while annotations.stat().st_size < _COMPACT_AT_BYTES:
+            stream.write(json.dumps(live) + "\n")
+            stream.write(json.dumps(stale) + "\n")
+            stream.flush()
+    assert annotations.stat().st_size >= _COMPACT_AT_BYTES  # the next append compacts
+
+    receipt_id = f"{AGENT_RECEIPT_ID_PREFIX}f00dtoken"
+    assert append_chat_annotation(
+        tmp_path, receipt_id, action="steer_task", target="a3e646fc62a44015",
+        status="delivered", routing_token="f00dtoken",
+    )
+
+    latest = latest_chat_annotations(tmp_path)
+    assert annotations.stat().st_size < _COMPACT_AT_BYTES  # it really did compact
+    assert latest[receipt_id]["status"] == "delivered"  # survives its own append
+    assert latest[receipt_id]["routing_token"] == "f00dtoken"
+    assert "msg-1789388120127-2" in latest  # the owner's message keeps its receipt
+    assert "msg-expired-1" not in latest  # chat retention still drops the rest
+
+    # Per-id dedupe bounds the synthetic rows exactly like the addressed ones.
+    assert append_chat_annotation(
+        tmp_path, receipt_id, action="steer_task", target="a3e646fc62a44015",
+        status="needs_manual_target", routing_token="f00dtoken",
+    )
+    rows = [
+        json.loads(line) for line in annotations.read_text(encoding="utf-8").splitlines() if line
+    ]
+    assert [row["status"] for row in rows if row["client_message_id"] == receipt_id] == [
+        "delivered", "needs_manual_target",
+    ]
+    assert latest_chat_annotations(tmp_path)[receipt_id]["status"] == "needs_manual_target"
+
+
+def test_synthetic_receipt_retention_is_bounded_by_the_newest_cap(tmp_path):
+    """Every steer mints a fresh token, so per-id dedupe bounds nothing: without a
+    cap the synthetic rows accumulate forever, the file stays permanently above the
+    compaction threshold and every append rewrites the whole of it. The newest cap
+    survives, which is all any live `routing_wait` (15 s of polling) can need."""
+    from ouroboros.project_dialogue import (
+        AGENT_RECEIPT_ID_PREFIX, _COMPACT_AT_BYTES, _RETAINED_AGENT_RECEIPTS,
+        append_chat_annotation, latest_chat_annotations,
+    )
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    annotations = logs / "chat_annotations.jsonl"
+    seeded = 70
+    with annotations.open("w", encoding="utf-8") as stream:
+        for index in range(seeded):
+            stream.write(json.dumps({
+                "ts": f"2026-09-14T12:{index // 60:02d}:{index % 60:02d}Z",
+                "type": "chat_annotation",
+                "client_message_id": f"{AGENT_RECEIPT_ID_PREFIX}token{index:04d}",
+                "action": "steer_task", "target": "t-target", "status": "delivered",
+                "routing_token": f"token{index:04d}", "detail": "x" * 200,
+            }) + "\n")
+    assert annotations.stat().st_size < _COMPACT_AT_BYTES  # no compaction yet
+    assert len(latest_chat_annotations(tmp_path)) == seeded
+
+    # Cross the threshold with one oversized stale row, then append the newest receipt.
+    with annotations.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({
+            "ts": "2026-07-13T00:00:00Z", "type": "chat_annotation",
+            "client_message_id": "expired", "action": "routed",
+            "target": "x" * _COMPACT_AT_BYTES, "status": "delivered",
+        }) + "\n")
+    newest = f"{AGENT_RECEIPT_ID_PREFIX}tokennewest"
+    assert append_chat_annotation(
+        tmp_path, newest, action="steer_task", target="t-target",
+        status="delivered", routing_token="tokennewest",
+    )
+
+    latest = latest_chat_annotations(tmp_path)
+    assert annotations.stat().st_size < _COMPACT_AT_BYTES  # it really did compact
+    synthetic = [mid for mid in latest if mid.startswith(AGENT_RECEIPT_ID_PREFIX)]
+    assert len(synthetic) <= _RETAINED_AGENT_RECEIPTS
+    assert newest in synthetic          # the row its own append had to keep
+    assert "expired" not in latest      # chat retention still drops addressed rows
+
+
 def test_project_sidebar_and_menu_static_contracts():
     from pathlib import Path
 
@@ -177,6 +396,7 @@ def test_project_sidebar_and_menu_static_contracts():
     html = (root / "web" / "index.html").read_text(encoding="utf-8")
     app = (root / "web" / "app.js").read_text(encoding="utf-8")
     menu = (root / "web" / "modules" / "project_create.js").read_text(encoding="utf-8")
+    menu_behavior = (root / "web" / "modules" / "ui_interactions.js").read_text(encoding="utf-8")
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
     css = (root / "web" / "style.css").read_text(encoding="utf-8")
 
@@ -191,7 +411,7 @@ def test_project_sidebar_and_menu_static_contracts():
     assert "project_seen_revision" in app
     assert "acknowledgeProjectAfterPaint" in app
     assert "inst.refreshHistory?.({ revision })" in app
-    assert "paint?.painted" in app
+    assert "paint?.read" in app  # painted AND at the newest messages (DESIGN "Project unread dot")
     assert "await markProjectViewed(project.id, revision)" in app
     assert "async function markProjectViewed" in app
     assert "await fetchJson('/api/ui/preferences'" in app
@@ -202,26 +422,27 @@ def test_project_sidebar_and_menu_static_contracts():
 
     assert "chatAnnotation: msg.chat_annotation || null" in chat
     annotation_handler = chat[
-        chat.index("ws.on('message_annotation'"):
-        chat.index("ws.on('log'")
+        chat.index("onWs('message_annotation'"):
+        chat.index("onWs('log'")
     ]
     assert "updateMessageAnnotation" in annotation_handler
     assert "addMessage(" not in annotation_handler
-    assert "clearTransientRoutingAnnotations();" in chat
+    assert "clearTransientRoutingAnnotations(messagesDiv);" in chat
 
     assert "menu.setAttribute('role', 'menu')" in menu
     assert 'role="menuitem" data-prm="rename"' in menu
     assert 'role="menuitem" class="danger" data-prm="delete"' in menu
     assert 'data-prm="hide"' not in menu
+    assert "binding = bindMenu(menu," in menu
     for key in ("Escape", "ArrowDown", "ArrowUp", "Home", "End"):
-        assert key in menu
-    assert "window.innerWidth" in menu and "window.innerHeight" in menu
+        assert key in menu_behavior
+    assert "win.innerWidth" in menu_behavior and "win.innerHeight" in menu_behavior
     assert "const PROJECT_NAME_MAX = 80" in menu
     assert "newName.length > maxNameLength" in menu
     assert 'maxlength="${maxNameLength}"' in menu
 
 
-def test_project_main_mirror_never_creates_second_unread_static_contract():
+def test_project_activity_stays_out_of_main_static_contract():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
@@ -229,36 +450,141 @@ def test_project_main_mirror_never_creates_second_unread_static_contract():
 
     unread_fn = chat[
         chat.index("function incrementUnreadIfNeeded"):
-        chat.index("ws.on('typing'")
+        chat.index("onWs('typing'")
     ]
     project_guard = unread_fn.index("if (isKnownProjectFrame(msg)) return;")
     increment = unread_fn.index("state.unreadCount++;")
     assert project_guard < increment
     assert "Project visible_revision is the sole unread authority" in unread_fn
 
-    # The useful Main штаб/live-card mirror remains, but every unread call keeps
-    # the original frame so the Project-origin guard can classify it.
+    # Main has its own compact host-stamped completion row. Project progress,
+    # logs and ordinary summaries never enter its live fan-out.
     fanout = chat[
-        chat.index("const isProjectMirrorFrame"):
-        chat.index("ws.on('message_annotation'")
+        chat.index("const isMyThread"):
+        chat.index("onWs('message_annotation'")
     ]
-    assert "mirrorProject && isProjectMirrorFrame(msg)" in fanout
+    assert "mirrorProject" not in fanout
+    # Every Chat instance enters through the shared thread gate. Its Main arm
+    # still excludes both server-stamped and already-known Project frames.
+    assert "return chatThreadAccepts(msg, isMain, chatId, state.projectChatIds);" in fanout
+    activity = (root / "web" / "modules" / "chat_activity.js").read_text(encoding="utf-8")
+    main_gate = activity[
+        activity.index("export function mainThreadAccepts"):
+        activity.index("/** Main routing for the legacy LocalChatBridge")
+    ]
+    shared_gate = activity[
+        activity.index("export function chatThreadAccepts"):
+        activity.index("/**\n * Route one LocalChatBridge log envelope")
+    ]
+    assert "if (msg && msg.project_thread) return false;" in main_gate
+    assert "projectChatIds.has(cid)" in main_gate
+    assert "if (isMain) return mainThreadAccepts(msg, projectChatIds);" in shared_gate
+    assert "return Number(msg?.chat_id ?? 1) === chatId;" in shared_gate
+    assert "PROJECT_ROW_TYPES.has(msg.system_type)" in fanout
     assert "appendTaskSummaryToLiveCard(msg);" in fanout
-    assert "updateLiveCardFromProgressMessage(msg);" in fanout
+    assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true });" in fanout
     assert "incrementUnreadIfNeeded(msg);" in fanout
     assert "incrementUnreadIfNeeded();" not in chat
 
-    # History replay reconstructs the mirror but is not a new-delivery signal;
-    # only live frames may advance Main's global unread counter.
+    # History replay renders the durable compact completion independently of
+    # task-card reconstruction.
     history = chat[
-        chat.index("async function syncHistory"):
-        chat.index("function cancelHistoryPaint")
+        chat.index("function applyHistoryMessages"):
+        chat.index("async function syncHistory")
     ]
     assert "appendTaskSummaryToLiveCard(msg" in history
+    assert "PROJECT_ROW_TYPES.has(msg.system_type)" in history
     assert "incrementUnreadIfNeeded" not in history
+    # The lifecycle row points at its Project through the door, which alone decides the
+    # fallback word: a missing or never-given name reads `Project`, never the raw id.
+    project_answer = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
+    door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
+    assert "projectReference({ id: projectId, name: projectName })" in project_answer
+    assert "MINTED_ID.test(name)) ? name : tr('project.reference.generic', 'Project')" in door
+    assert "name: projectName || projectId" not in chat + project_answer
 
 
-def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
+def test_project_lifecycle_rows_render_design_system_action_static_contract():
+    """B2 static guard (sol item 4 UI / fable 4.3): BOTH host-stamped Project
+    lifecycle rows render their action through the shared design-system helper
+    inside a `.system-message-actions` container; the custom pill class and its
+    bare `<br>` spacing are structurally gone from chat.js AND style.css."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
+    style = (root / "web" / "style.css").read_text(encoding="utf-8")
+    helpers = (root / "web" / "modules" / "ui_helpers.js").read_text(encoding="utf-8")
+    app = (root / "web" / "app.js").read_text(encoding="utf-8")
+
+    # One shared set drives render, history replay, and live fan-out.
+    assert (
+        "const PROJECT_ROW_TYPES = new Set(['project_started', 'project_handoff', 'project_completion_summary']);"
+        in chat
+    )
+    # chat.js only delegates; the lifecycle-row module puts the one Project reference
+    # (web/modules/project_reference.js) into the shared action composition.
+    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName," in chat
+    assert "terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary'" in chat
+    render = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
+    assert "createSystemMessageActions(projectReference(" in render
+    assert "row.className = 'system-message-actions'" in helpers
+    # The Main mirror of a Project question carries no system action: its Project chip is the way there.
+    assert "createSystemMessageActions(" in (root / "web/modules/chat_activity.js").read_text(encoding="utf-8")
+    assert "document.createElement('br')" not in render
+
+    # The custom pill is gone everywhere; the conversion-flow buttons moved to
+    # the shared design-system role beside their `btn btn-xs btn-danger` sibling.
+    assert "chat-live-project-btn" not in chat
+    assert "chat-live-project-btn" not in style
+    # The conversion button is now built by the chrome sync from the record's
+    # facts (an HTML template could not be re-derived when a turn is direct),
+    # so the design-system role and the marker app.js queries are set on the
+    # node itself.
+    chrome = chat[chat.index("function syncBlockChrome(record) {"):chat.index("function syncCancelRunButton(record) {")]
+    assert "btn.className = 'btn btn-xs btn-default';" in chrome
+    assert "btn.dataset.turnIntoProject = '1';" in chrome
+    assert "btn.textContent = liveCardLabel.turnIntoProject();" in chrome
+    # The words sit with the other live-card labels and are read through the interface-language seam.
+    chip = (root / "web" / "modules" / "task_phase_chip.js").read_text(encoding="utf-8")
+    assert "turnIntoProject: () => tr('task.card.turn_into_project', 'Turn into project')," in chip
+    # One owner intent, one control: the converted card (chat.js), the bound-task
+    # footer (app.js) and every row that points at a Project get it from the door,
+    # which alone knows its classes and words.
+    door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
+    assert "chat-live-project-card-btn" in door and "chat-live-project-card-btn" not in helpers
+    handoff = (root / "web" / "modules" / "project_handoff.js").read_text(encoding="utf-8")
+    # Main alone owns a handoff controller; the converted card mounts through it.
+    assert "handoffs?.mount(record.root" in chat and "isMain ? createProjectHandoffs(" in chat
+    assert "projectReference({ id: projectId, name: projectName }, { layout: 'inline', taskId })" in handoff
+    assert "state: 'background'" not in handoff
+    assert "projectReference(project, { layout: 'footer' })" in app
+    # The project pointer is a Main-root affordance: applyTaskBindings walks
+    # only Main root cards, never the Project panel's copy or nested subagents
+    # (D15; the browser flow is pinned by the marker-gated continuity smoke).
+    assert "'#page-chat .chat-live-card[data-task-id]:not(.subagent)'" in app
+
+    # Layout-only container CSS; the page-local `Open Project` button and its rule are gone.
+    assert ".system-message-actions {" in style
+    assert ".system-message-action {" not in style
+    assert "export function createSystemMessageAction(" not in helpers
+
+
+def test_chat_ws_subscriptions_flow_through_disposer_helper():
+    """P3 lifecycle: every WS subscription in chat.js must go through the
+    onWs helper so destroy() can release it. A bare ws.on() call would leak
+    a listener past the instance lifetime; the helper's own definition is
+    the single allowed occurrence of `ws.on(`."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
+
+    assert "const onWs = (event, fn) => wsDisposers.push(ws.on(event, fn));" in chat
+    assert chat.count("ws.on(") == 1
+
+
+def test_legacy_decision_progress_remains_readable_in_history(tmp_path):
     from ouroboros.gateway.history import make_chat_history_endpoint
 
     logs = tmp_path / "logs"
@@ -282,12 +608,13 @@ def test_ephemeral_decision_progress_marker_survives_history_replay(tmp_path):
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"})))
     messages = json.loads(response.body.decode("utf-8"))["messages"]
     progress = next(message for message in messages if message.get("task_id") == "decision-1")
-    assert progress["ephemeral_decision"] is True
+    assert progress.get("is_progress") is True
+    assert progress.get("text") or progress.get("content")
 
 
-def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_path, monkeypatch):
+def test_direct_routing_keeps_annotation_and_final_in_history_projection(tmp_path, monkeypatch):
     """Finalization→supervisor→chat-log keeps one durable answer beside the
-    routing annotation; progress remains marked for Web card suppression."""
+    routing annotation and ordinary readable progress."""
     from ouroboros import agent_task_pipeline as pipeline
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.project_dialogue import append_chat_annotation
@@ -304,8 +631,6 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
     )
     monkeypatch.setattr(message_bus, "_send_markdown", lambda *args, **kwargs: (True, ""))
     for name in (
-        "_store_task_result",
-        "_run_chat_consolidation",
         "_run_scratchpad_consolidation",
         "_run_post_task_processing_async",
     ):
@@ -328,7 +653,7 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
 
     pending_events = []
     pipeline.emit_task_results(
-        env=SimpleNamespace(drive_root=tmp_path),
+        env=SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path),
         memory=object(),
         llm=object(),
         pending_events=pending_events,
@@ -338,7 +663,7 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
             "chat_id": 1,
             "text": "Start the robot task",
             "_is_direct_chat": True,
-            "_ephemeral_turn": True,
+            "_skip_post_task_synthesis": True,
         },
         text="The robot task was submitted as robot01.",
         usage={"rounds": 2, "cost": 0.01},
@@ -364,7 +689,6 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
         "log_text": "Submitting the robot task",
         "format": "markdown",
         "is_progress": True,
-        "progress_meta": {"ephemeral_decision": True},
     }, event_ctx)
     final_event = next(event for event in pending_events if event["type"] == "send_message")
     _handle_send_message(final_event, event_ctx)
@@ -385,47 +709,38 @@ def test_ephemeral_routing_keeps_annotation_and_final_in_history_projection(tmp_
     ]
     assert len(finals) == 1
     progress = next(message for message in messages if message.get("is_progress"))
-    assert progress["ephemeral_decision"] is True
+    assert progress.get("is_progress") is True
+    assert progress.get("text") or progress.get("content")
 
 
-def test_ephemeral_decision_web_frames_never_create_task_card_or_second_receipt():
+def test_web_frames_keep_reference_order_and_one_authored_reply():
+    """Real references precede activity rendering; task controls stay host-attested."""
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[1]
     chat = (root / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-
-    assert "const ephemeralDecisionTaskIds = new Set();" in chat
-    register = chat[
-        chat.index("function registerEphemeralDecisionFrame"):
-        chat.index("function buildMessageKey")
-    ]
-    assert "ephemeralDecisionTaskIds.add(taskId);" in register
-    assert "record.root?.remove();" in register
-
-    card_factory = chat[
-        chat.index("function createLiveCardRecord"):
-        chat.index("function getLiveCardRecord")
-    ]
-    assert "!ephemeralDecisionTaskIds.has(normalizedGroupId)" in card_factory
-
-    progress = chat[
-        chat.index("function updateLiveCardFromProgressMessage"):
-        chat.index("function updateSubagentCardFromEvent")
-    ]
-    logs = chat[
-        chat.index("function updateLiveCardFromLogEvent"):
-        chat.index("function addMessage")
-    ]
-    assert "if (registerEphemeralDecisionFrame(msg)) return;" in progress
-    assert "if (registerEphemeralDecisionFrame(evt)) return;" in logs
-    assert logs.index("showContextFitToast(evt);") < logs.index("registerEphemeralDecisionFrame(evt)")
-
-    fanout = chat[
-        chat.index("ws.on('chat'"):
-        chat.index("ws.on('message_annotation'")
-    ]
-    # Inline ephemeral answers are not blanket-suppressed. Typed routing turns
-    # retain any non-empty final answer while their progress/card stays hidden.
-    assert fanout.count("if (ephemeralDecision) return;") == 1  # progress/card path only
-    assert fanout.index("showTaskIncidentToast(msg);") < fanout.index("if (ephemeralDecision) return;")
-    assert "addMessage(msg.content" in fanout
+    reference = chat[chat.index("function admitCardMetadata"):chat.index("function createLiveCardRecord")]
+    assert reference.index("noteToolMetrics(row.task_id, row,") < reference.index("isModelWaitReference(row)")
+    assert reference.index("isModelWaitReference(row)") < reference.index("reviewReferenceFromRow(row)")
+    logs = chat[chat.index("function updateLiveCardFromLogEvent"):chat.index("function addMessage")]
+    assert logs.index("admitCardMetadata(evt)") < logs.index("const taskId = getLogTaskGroupId(evt)")
+    # Ordinary telemetry accounting follows metadata admission; reference-carried
+    # evidence is admitted inside that seam before any presentation-only return.
+    assert logs.index("admitCardMetadata(evt)") < logs.index("noteToolMetrics(taskId, evt, rawTs)")
+    history = chat[chat.index("function applyHistoryMessages"):chat.index("async function syncHistory")]
+    assert history.index("admitCardMetadata(msg)") < history.index("updateLiveCardFromProgressMessage(msg,")
+    fanout = chat[chat.index("onWs('chat'"):chat.index("onWs('message_annotation'")]
+    assert fanout.index("admitCardMetadata(msg)") < fanout.index("updateLiveCardFromProgressMessage(msg,")
+    assert "showTaskIncidentToast(msg);" in fanout
+    assistant_fanout = fanout[fanout.index("const explicitTaskId"):]
+    assert assistant_fanout.count("addMessage(msg.content, msg.role") == 1
+    # Stop authority stays host-attested: the fanout hands the progress row to
+    # the card updater, and only the host's `cancelable` flag grants it there
+    # (typing frames are receipts and never register liveness or controls).
+    assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true })" in fanout
+    updater = chat[chat.index("function updateLiveCardFromProgressMessage"):chat.index("function updateLiveCardFromLogEvent")]
+    assert "const taskId = msg?.task_id || '';" in updater
+    guard = updater.index("if (!taskId) return false;")
+    grant = updater.index("if (grantCancelAuthority && msg.cancelable === true) {")
+    # The grant keeps the earlier replayed tool-evidence change instead of overwriting it.
+    assert guard < grant < updater.index("changed = markTaskCancelable(String(taskId)) || changed;")

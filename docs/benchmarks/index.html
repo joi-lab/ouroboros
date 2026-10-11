@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Ouroboros benchmark scores, publication status, public runs, traces, submissions, and methodology for Terminal-Bench 2.1, OSWorld-Verified, CL-Bench, SWE-bench Pro, and GAIA.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://ouroboros-agent.ai/benchmarks/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ouroboros">
+  <meta property="og:title" content="Ouroboros benchmark evidence">
+  <meta property="og:description" content="Self-reported benchmark results with evidence status, public runs, traces, methodology, and upstream submission status.">
+  <meta property="og:url" content="https://ouroboros-agent.ai/benchmarks/">
+  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta property="og:image:alt" content="Ouroboros benchmark evidence with public runs and traces">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta name="twitter:image:alt" content="Ouroboros benchmark evidence with public runs and traces">
+  <title>Ouroboros benchmark evidence</title>
+  <link rel="icon" href="/assets/icon_1024.png" type="image/png">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "CollectionPage",
+      "name": "Ouroboros benchmark evidence",
+      "description": "Self-reported benchmark results with evidence status, public runs, traces, methodology, and upstream submission status.",
+      "url": "https://ouroboros-agent.ai/benchmarks/",
+      "isPartOf": {"@type": "WebSite", "name": "Ouroboros", "url": "https://ouroboros-agent.ai/"}
+    }
+  </script>
+  <link rel="stylesheet" crossorigin href="/assets/ouroboros-CMTHrJbp.css">
+</head>
+<body class="text-page">
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="text-nav"><a class="brand" href="/" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a><nav aria-label="Text pages"><a href="/paper/">Paper</a><a href="/about/">About</a><a href="/install/">Install</a><a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">Harness code</a></nav></header>
+  <main class="text-document text-document-wide">
+    <p class="chapter-index">BENCHMARKS / PUBLIC EVIDENCE</p>
+    <h1>Scores, status, and evidence.</h1>
+    <p class="text-lede">These results are self-reported, and each row states what evidence is public. The GAIA row is marked while its scrubbed trace capsule is pending. Publication does not wait for a leaderboard maintainer to merge submissions. Terminal-Bench 2.1 closed community submissions on September 19, 2026.</p>
+
+    <div class="table-scroll" tabindex="0" role="region" aria-label="Ouroboros benchmark results"><table>
+      <thead><tr><th>Benchmark</th><th>Model</th><th>Ouroboros</th><th>Comparison</th><th>Status and evidence</th></tr></thead>
+      <tbody>
+        <tr><td>Terminal-Bench 2.1</td><td>Claude Opus-5 high</td><td><strong>86.74%</strong> after zeroing one disclosed reward-hack trial (raw: 86.97%)</td><td>Claude Code + Fable 5: 83.8%</td><td>Self-reported with a <a href="https://github.com/harbor-framework/terminal-bench-2-1/pull/175">submission</a> and a <a href="https://hub.harborframework.com/jobs/2b145543-edeb-4a3b-b46f-4800310f1182">public run</a>; community submissions closed.</td></tr>
+        <tr><td>Terminal-Bench 2.1</td><td>Claude Opus-4.8 high</td><td><strong>80.22%</strong></td><td>Claude Code: 78.9%</td><td>Self-reported with a <a href="https://hub.harborframework.com/jobs/4b8e244f-8ab0-4d28-8218-7cf346282faa">public run</a>.</td></tr>
+        <tr><td>Terminal-Bench 2.1</td><td>GPT-5.5</td><td><strong>84.3%</strong></td><td>Codex CLI: 83.1%</td><td>Self-reported with a <a href="https://hub.harborframework.com/jobs/f02fd019-23e1-495f-af0a-ebd9a65f3079">public run</a>.</td></tr>
+        <tr><td>Terminal-Bench 2.1</td><td>Grok-4.5</td><td><strong>84.94%</strong></td><td>Cursor CLI: 79.3%. Hermes: 77.53%.</td><td>Self-reported after a reward-hack audit, with a <a href="https://github.com/harbor-framework/terminal-bench-2-1/pull/146">submission</a>; community submissions closed.</td></tr>
+        <tr><td>OSWorld-Verified</td><td>Claude Opus-5</td><td><strong>90.69%</strong></td><td>Previous best on the public board: 90.19%</td><td>Self-reported with <a href="https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-opus5">public task evidence</a>.</td></tr>
+        <tr><td>OSWorld-Verified</td><td>Claude Sonnet-4.6</td><td><strong>83.27%</strong></td><td>Pointer: 81.45%</td><td>Self-reported with <a href="https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-sonnet46">public task evidence</a>.</td></tr>
+        <tr><td>CL-Bench</td><td>Claude Sonnet-4.6</td><td><strong>0.2301, rank 1</strong></td><td>Previous top: 0.1960</td><td>Self-reported with an <a href="https://github.com/pgasawa/continual-learning-bench/pull/10">open submission</a> and <a href="https://huggingface.co/datasets/razzant/ouroboros-clbench-traces">full traces</a>.</td></tr>
+        <tr><td>SWE-bench Pro</td><td>GPT-5.6-luna</td><td>58.2%</td><td>Codex CLI scored 59.4%, with no significant difference.</td><td>Self-reported with <a href="https://huggingface.co/datasets/razzant/swepro-luna-matched-pair">matched-pair traces</a>.</td></tr>
+        <tr><td>GAIA</td><td>Claude Sonnet-5</td><td>129/165, 78.2%</td><td>Claude Code scored 131/165, 79.4%, while strict pass@1 was 128/165 for both.</td><td>Self-reported with public <a href="https://github.com/razzant/ouroboros/blob/ouroboros/devtools/benchmarks/gaia/METHODOLOGY.md">methodology</a>; the scrubbed trace capsule is pending.</td></tr>
+      </tbody>
+    </table></div>
+
+    <h2>How to read the table</h2>
+    <p>Each comparison binds a model to a harness. A model score from one harness does not describe the same system as the score from another harness. The repository keeps adapters and methods under <a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">devtools/benchmarks</a>.</p>
+  </main>
+  <footer class="text-footer"><a href="/">Home</a><a href="/paper/">Paper</a><a href="/about/">About</a><a href="/install/">Install</a><a href="https://habr.com/ru/companies/airi/articles/1065428/">Launch write-up</a></footer>
+</body>
+</html>

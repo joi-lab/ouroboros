@@ -9,7 +9,14 @@ import shutil
 import subprocess
 from typing import Any, Dict, Iterable, List, Tuple
 
-from ouroboros.platform_layer import IS_LINUX, IS_MACOS, IS_WINDOWS, bootstrap_process_path
+from ouroboros.platform_layer import (
+    IS_LINUX,
+    IS_MACOS,
+    IS_WINDOWS,
+    bootstrap_process_path,
+    node_runtime_health,
+    resolve_bundled_node,
+)
 from ouroboros.utils import utc_now_iso
 
 
@@ -42,12 +49,22 @@ _LINUX_PACKAGE_TOOLS = (
 _WINDOWS_PACKAGE_TOOLS = (
     "winget",
 )
+# The exec probe covers ONLY node (the incident class: `which` succeeds but the
+# kernel SIGKILLs the binary on launch). npm/npx/pnpm/yarn follow node — they
+# get no exec probes of their own; python/git/other tools are out of class.
+# The probe timeout is SHORT so the bounded admission path (8s wall-clock cap in
+# workspace_admission.bounded_workspace_preflight) stays safe; verdicts are
+# memoized in the platform layer.
+_NODE_PROBE_TIMEOUT_SEC = 3.0
+_NODE_DEPENDENT_TOOLS = ("npm", "npx", "pnpm", "yarn")
 _MANIFEST_NAMES = (
     "package.json",
     "pyproject.toml",
     "setup.py",
     "setup.cfg",
     "requirements.txt",
+    "requirements-runtime.lock",
+    "uv.lock",
     "tox.ini",
     "go.mod",
     "Cargo.toml",
@@ -85,7 +102,23 @@ def summarize_workspace_preflight(preflight: Dict[str, Any]) -> Dict[str, Any]:
     manifests = preflight.get("manifests") if isinstance(preflight.get("manifests"), list) else []
     tools = preflight.get("tools") if isinstance(preflight.get("tools"), dict) else {}
     available = sorted(k for k, v in tools.items() if isinstance(v, dict) and v.get("available"))
-    missing = sorted(k for k, v in tools.items() if isinstance(v, dict) and not v.get("available"))
+    broken_names = sorted(
+        k for k, v in tools.items()
+        if isinstance(v, dict)
+        and not v.get("available")
+        and v.get("status") in ("found_but_broken", "interpreter_broken")
+    )
+    missing = sorted(
+        k for k, v in tools.items()
+        if isinstance(v, dict) and not v.get("available") and k not in set(broken_names)
+    )
+    broken: List[Dict[str, str]] = []
+    for name in broken_names:
+        entry = tools[name]
+        reason = str(entry.get("probe_reason") or entry.get("reason") or entry.get("status") or "broken")
+        if entry.get("bundled_fallback"):
+            reason += "; bundled fallback available"
+        broken.append({"tool": name, "reason": reason})
     manifest_summary = []
     for item in manifests[:20]:
         if not isinstance(item, dict):
@@ -108,6 +141,10 @@ def summarize_workspace_preflight(preflight: Dict[str, Any]) -> Dict[str, Any]:
         "tools": {
             "available": available,
             "missing": missing,
+            # Present only when a which-found tool failed its exec probe (or
+            # follows a broken interpreter) — the healthy-path summary stays
+            # byte-identical.
+            **({"broken": broken} if broken else {}),
         },
     }
 
@@ -125,9 +162,25 @@ def render_workspace_preflight_summary(summary: Dict[str, Any]) -> str:
         f"- git_dirty: {bool(git.get('dirty'))} ({int(git.get('status_count') or 0)} status entries)",
         "- manifests: "
         + (", ".join(str(item.get("path") or "") for item in manifests if isinstance(item, dict)) or "<none detected>"),
-        "- available_tools: " + (", ".join(tools.get("available") or []) or "<none detected>"),
-        "- missing_tools: " + (", ".join(tools.get("missing") or []) or "<none detected>"),
+        # "on PATH" is what shutil.which actually measured; "available" over-
+        # claimed executability (a broken binary on PATH counted as available).
+        # The structured summary keys stay unchanged — they ride durable
+        # task metadata and old rows must keep replaying.
+        "- tools_on_path: " + (", ".join(tools.get("available") or []) or "<none detected>"),
+        "- tools_missing_from_path: " + (", ".join(tools.get("missing") or []) or "<none detected>"),
     ]
+    broken = [item for item in (tools.get("broken") or []) if isinstance(item, dict)]
+    if broken:
+        # Which-found but execution-probe-dead tools: NOT available, and the
+        # reason (plus a bundled-node fallback fact, when one exists) is what
+        # keeps the agent from treating the miss as a syntax/config problem.
+        lines.append(
+            "- broken_tools: "
+            + ", ".join(
+                f"{item.get('tool') or '<tool>'} ({item.get('reason') or 'broken'})"
+                for item in broken
+            )
+        )
     if summary.get("error"):
         lines.append(f"- preflight_error: {summary.get('error')}")
     return "\n".join(lines)
@@ -274,7 +327,47 @@ def _probe_tools(names: Iterable[str]) -> Dict[str, Dict[str, Any]]:
             continue
         path = shutil.which(clean)
         out[clean] = {"available": bool(path), "path": path or ""}
+    _apply_node_exec_probe(out)
     return out
+
+
+def _apply_node_exec_probe(tools: Dict[str, Dict[str, Any]]) -> None:
+    """Exec-probe node in place; a dead node also downgrades its dependents.
+
+    ``shutil.which`` proves existence, not runnability. Statuses on the node
+    entry: ``available`` / ``found_but_broken`` / ``missing``. When node is
+    execution-probed broken OR absent entirely, npm/npx/pnpm/yarn that
+    ``which`` found are marked unavailable with reason ``interpreter_broken``
+    (no exec probes on them — their `#!/usr/bin/env node` launchers cannot run
+    without node), and a healthy bundled node is disclosed as a fallback fact
+    for the agent-facing summary.
+    """
+    node = tools.get("node")
+    if not isinstance(node, dict):
+        return
+    if node.get("path"):
+        health = node_runtime_health(str(node["path"]), timeout_sec=_NODE_PROBE_TIMEOUT_SEC)
+        if health.healthy:
+            node["status"] = "available"
+            node["version"] = health.version
+            return
+        node["available"] = False
+        # A which-hit that stat/access-fails mid-probe is missing, not broken.
+        node["status"] = "found_but_broken" if health.status == "broken" else "missing"
+        node["probe_reason"] = health.reason or health.status
+    else:
+        node["status"] = "missing"
+    bundled = resolve_bundled_node()
+    if bundled and node_runtime_health(bundled, timeout_sec=_NODE_PROBE_TIMEOUT_SEC).healthy:
+        node["bundled_fallback"] = bundled
+    # npm/npx/pnpm/yarn start through `#!/usr/bin/env node`: with node broken OR
+    # absent they are equally dead, however present their own files are.
+    for name in _NODE_DEPENDENT_TOOLS:
+        entry = tools.get(name)
+        if isinstance(entry, dict) and entry.get("path"):
+            entry["available"] = False
+            entry["status"] = "interpreter_broken"
+            entry["reason"] = "interpreter_broken"
 
 
 def _git_stdout(root: pathlib.Path, cmd: List[str], *, timeout: int) -> str:

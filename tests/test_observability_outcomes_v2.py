@@ -1,12 +1,14 @@
 import gzip
 import json
 import os
+import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 from ouroboros.observability import (
     persist_call,
     posix_private_modes_supported,
+    read_blob_ref,
     redact_projection,
     write_blob,
 )
@@ -33,6 +35,8 @@ def _read_gzip_json(path):
 
 
 def test_redactor_records_key_and_value_rules_without_secret_leak():
+    query_secret = "query-secret-value-123456"
+    basic_secret = "dXNlcjpiYXNpYy1zZWNyZXQtdmFsdWU="
     payload = {
         "OPENAI_API_KEY": "sk-testsecretvalue000000000000",
         "log": "MY_API_KEY=thisisaverylongsecretvalue123456 github_pat_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890",
@@ -59,6 +63,10 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
             "bearer_token": "verylongbearertokenvalueabcdef",
             "anthropic_secret": "sk-ant-verylongsecretvalue123456",
             "url": "https://user:pass@example.com/path",
+            "request": (
+                f"GET https://example.com/path?api_key={query_secret}&model=test "
+                f"Authorization: Basic {basic_secret}"
+            ),
         },
     }
 
@@ -79,6 +87,8 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
     assert "stripescretvalue" not in rendered
     assert "verylongsecretvalue" not in rendered
     assert "user:pass" not in rendered
+    assert query_secret not in rendered
+    assert basic_secret not in rendered
     assert redacted.value["prompt_tokens"] == 123
     assert redacted.value["completion_tokens"] == 45
     assert redacted.value["cached_tokens"] == 6
@@ -89,9 +99,12 @@ def test_redactor_records_key_and_value_rules_without_secret_leak():
     assert redacted.value["path"] == "/workspace/reports/summary-long-name.json"
     assert redacted.value["service"] == "background-analysis-service"
     assert redacted.value["public_url"] == "https://example.com/public/long-resource-name"
+    assert "model=test" in redacted.value["nested"]["request"]
     assert redacted.manifest()["redacted"] is True
     rules = {item["rule"] for item in redacted.manifest()["rules"]}
-    assert {"secret_key_name", "url_credentials"} <= rules
+    assert {
+        "basic_auth", "secret_key_name", "secret_query_parameter", "url_credentials",
+    } <= rules
 
 
 def test_redactor_masks_compound_secret_names_without_generic_key_false_positives():
@@ -115,7 +128,7 @@ def test_redactor_masks_compound_secret_names_without_generic_key_false_positive
 
     redacted = redact_projection(payload)
 
-    assert redacted.value["authtoken"] == "***REDACTED***"
+    assert redacted.value["authtoken"].startswith("***REDACTED[")  # G11 fingerprint
     assert structured_secret not in json.dumps(redacted.value)
     assert text_secret not in redacted.value["log"]
     for key, value in benign_fields.items():
@@ -148,8 +161,8 @@ def test_redactor_masks_segmented_secret_markers_with_trailing_qualifiers():
 
     redacted = redact_projection(payload)
 
-    assert redacted.value["client_secret_v2"] == "***REDACTED***"
-    assert redacted.value["api_key_prod"] == "***REDACTED***"
+    assert redacted.value["client_secret_v2"].startswith("***REDACTED[")
+    assert redacted.value["api_key_prod"].startswith("***REDACTED[")
     rendered = json.dumps(redacted.value)
     assert "ClientSecretValue1234" not in rendered
     assert "ApiKeyValue12345678" not in rendered
@@ -166,7 +179,8 @@ def test_redactor_masks_segmented_secret_markers_with_trailing_qualifiers():
     assert "prompt_tokens: 123" in redacted.value["log"]
 
 
-def test_persist_call_writes_private_full_and_redacted_refs(tmp_path):
+def test_persist_call_writes_private_full_and_redacted_refs(tmp_path, monkeypatch):
+    monkeypatch.delenv("OUROBOROS_OBSERVABILITY_KEEP_RAW", raising=False)
     # Built by concatenation so the staged source never contains a literal PAT pattern.
     payload = {"tool": "run_command", "args": {"token": "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"}}
 
@@ -192,7 +206,7 @@ def test_persist_call_writes_private_full_and_redacted_refs(tmp_path):
         assert os.stat(redacted_path).st_mode & 0o777 == 0o600
     assert "full_payload_ref" not in refs
     assert "redacted_projection" not in refs
-    assert _read_gzip_json(redacted_path)["args"]["token"] == "***REDACTED***"
+    assert _read_gzip_json(redacted_path)["args"]["token"].startswith("***REDACTED[")
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     # Default: the authoritative blob is REDACTED so no raw secret lands on disk;
@@ -202,11 +216,45 @@ def test_persist_call_writes_private_full_and_redacted_refs(tmp_path):
     full_path = manifest["full_payload_ref"]["path"]
     if posix_private_modes_supported():
         assert os.stat(full_path).st_mode & 0o777 == 0o600
-    assert _read_gzip_json(full_path)["args"]["token"] == "***REDACTED***"
+    assert _read_gzip_json(full_path)["args"]["token"].startswith("***REDACTED[")
     assert manifest["call_type"] == "tool_call"
     assert manifest["redaction"]["redacted"] is True
     assert manifest["full_payload_ref"]["sha256"]
     assert refs["manifest_ref"]["sha256"] == __import__("hashlib").sha256(manifest_path.read_bytes()).hexdigest()
+
+
+def test_persist_call_keep_raw_override_preserves_exact_authoritative_payload(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.delenv("OUROBOROS_OBSERVABILITY_KEEP_RAW", raising=False)
+    payload = {
+        "messages": [
+            {
+                "role": "tool",
+                "content": {"token": "actor-visible-token-shaped-evidence"},
+            },
+        ],
+    }
+
+    refs = persist_call(
+        tmp_path,
+        task_id="task-checkpoint",
+        call_id="checkpoint-1",
+        call_type="context_compaction_checkpoint",
+        payload=payload,
+        keep_raw=True,
+    )
+
+    manifest = json.loads(
+        (tmp_path / "observability" / "calls" / "task-checkpoint" / "checkpoint-1.json")
+        .read_text(encoding="utf-8")
+    )
+    assert manifest["full_payload_redacted"] is False
+    assert refs["full_payload_redacted"] is False
+    assert read_blob_ref(tmp_path, manifest["full_payload_ref"]) == payload
+    projection = read_blob_ref(tmp_path, refs["redacted_projection_ref"])
+    assert projection["messages"][0]["content"]["token"].startswith("***REDACTED[")
+    assert manifest["full_payload_ref"]["sha256"] != refs["redacted_projection_ref"]["sha256"]
 
 
 def test_persist_call_keep_raw_env_persists_unredacted(tmp_path, monkeypatch):
@@ -222,7 +270,7 @@ def test_persist_call_keep_raw_env_persists_unredacted(tmp_path, monkeypatch):
     assert manifest["full_payload_redacted"] is False
     assert refs["full_payload_redacted"] is False
     assert _read_gzip_json(manifest["full_payload_ref"]["path"])["args"]["token"].startswith("ghp_")
-    assert _read_gzip_json(refs["redacted_projection_ref"]["path"])["args"]["token"] == "***REDACTED***"
+    assert _read_gzip_json(refs["redacted_projection_ref"]["path"])["args"]["token"].startswith("***REDACTED[")
     assert manifest["full_payload_ref"]["path"] != refs["redacted_projection_ref"]["path"]
 
 
@@ -256,11 +304,12 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
 
     runtime_error = derive_loop_outcome(
         "⚠️ Error during processing: RuntimeError: boom",
-        {"rounds": 1},
+        {"rounds": 1, "execution_status": "infra_failed", "reason_code": "task_exception"},
         {"tool_calls": []},
     )
     assert runtime_error["outcome_axes"]["execution"]["status"] == EXECUTION_INFRA_FAILED
     assert runtime_error["reason_code"] == "task_exception"
+    assert runtime_error["failure"]["kind"] == "runtime"
 
     deep_unavailable = derive_loop_outcome(
         "❌ Deep self-review unavailable: no key",
@@ -277,13 +326,14 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "tool": "run_command",
             "is_error": True,
             "status": "artifact_output_error",
-            "result": "⚠️ ARTIFACT_OUTPUT_ERROR: undeclared output",
+            "result": "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.",
         }]},
     )
-    assert tool_failure["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert tool_failure["reason_code"] == "tool_failure"
-    assert tool_failure["failure"]["kind"] == "tool"
-    assert tool_failure["failure"]["tool_errors"][0]["status"] == "artifact_output_error"
+    assert tool_failure["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert tool_failure["reason_code"] == "final_message"
+    assert tool_failure["failure"] is None
+    assert tool_failure["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "artifact_output_error"
+    assert tool_failure["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     answer_with_tool_error = derive_loop_outcome(
         "FINAL ANSWER: 42",
@@ -295,8 +345,8 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "result": "bad probe",
         }]},
     )
-    assert answer_with_tool_error["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert answer_with_tool_error["outcome_axes"]["execution"]["reason_code"] == "tool_failure"
+    assert answer_with_tool_error["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert answer_with_tool_error["outcome_axes"]["execution"]["reason_code"] == "final_message"
     assert answer_with_tool_error["reason_code"] == "final_message"
     assert answer_with_tool_error["failure"] is None
     assert answer_with_tool_error["final_answer"] == "42"
@@ -316,7 +366,7 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
         },
     )
     assert stale_latch["final_answer"] == ""
-    assert stale_latch["reason_code"] == "tool_failure"
+    assert stale_latch["reason_code"] == "final_message"
 
     # A2 (v6.50.2): an access-policy block on a READ-ONLY exploratory tool is honest
     # telemetry, not a degraded execution — the agent simply could not look there. It is
@@ -363,8 +413,8 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
     assert policy_write_block["failure"] is None
     assert execution["policy_denials"][0]["status"] == "resource_policy_blocked"
 
-    # Boundary: a GENUINE tool/exec error (not a policy refusal) on a write/shell tool
-    # STILL degrades — the policy_denials demotion is scoped to `*_blocked` refusals.
+    # A real tool error remains unresolved evidence; the delivered answer's
+    # execution status is not inferred from the number of unsuccessful calls.
     real_error = derive_loop_outcome(
         "Done.",
         {"rounds": 1},
@@ -375,8 +425,56 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "result": "⚠️ unexpected error",
         }]},
     )
-    assert real_error["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert real_error["reason_code"] == "tool_failure"
+    assert real_error["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert real_error["reason_code"] == "final_message"
+    assert real_error["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "error"
+
+
+def test_a_listing_miss_then_a_success_elsewhere_leaves_execution_ok(tmp_path):
+    """Owner item I27: a read-only discovery miss does not colour the outcome.
+
+    The live case listed a folder whose name carried a non-breaking space, got a
+    first-class LIST_FILES_ERROR, found the right spelling on the very next call
+    and STILL finished as tool_failure / "Done with warnings": the recovery scan
+    credits a later success only for the SAME target signature, and a differently
+    spelled path can never match it. The producer names the miss instead, so no
+    failure is recorded to recover from and the scan stays untouched.
+
+    Run through the real registry, so this pins the producer and the outcome
+    together rather than a hand-written trace row."""
+    from ouroboros.loop_tool_execution import _typed_execution_failure
+    from ouroboros.project_dialogue import completion_status_label
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    (repo / "ML Conf 2").mkdir(parents=True)
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    tools = ToolRegistry(repo_dir=repo, drive_root=drive)
+
+    # The exact live shape: a NON-BREAKING space instead of a space.
+    nbsp_spelling = "ML\u00a0Conf 2"
+    miss = tools.execute_result("list_files", {"path": nbsp_spelling})
+    assert miss.text.startswith("⚠️ LIST_FILES_NOT_FOUND:")
+    assert (miss.status, miss.code) == ("ok", "LEGACY_WARNING")
+    assert _typed_execution_failure(True, miss) is False
+    found = tools.execute_result("list_files", {"path": "ML Conf 2"})
+    assert found.status == "ok" and not found.text.startswith("⚠️")
+
+    outcome = derive_loop_outcome(
+        "FINAL ANSWER: the deck folder is empty",
+        {"rounds": 2},
+        {"tool_calls": [
+            {"tool": "list_files", "args": {"path": nbsp_spelling}, "result": miss.text,
+             "status": miss.status, "is_error": _typed_execution_failure(True, miss)},
+            {"tool": "list_files", "args": {"path": "ML Conf 2"}, "result": found.text,
+             "status": found.status, "is_error": _typed_execution_failure(True, found)},
+        ]},
+    )
+    assert outcome["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert outcome["outcome_axes"]["execution"]["reason_code"] != "tool_failure"
+    assert outcome["failure"] is None
+    assert completion_status_label({"status": "completed", **outcome}, {}) == "Done"
 
 
 def test_forced_finalization_with_answer_is_best_effort():
@@ -693,7 +791,7 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
 
 
 def test_t4_cosmetic_partition_guards():
-    # A GENUINE tool error STILL degrades (partition is structural).
+    # A genuine error keeps its unresolved classification and unreviewed warning.
     blocking = derive_loop_outcome(
         "Done",
         {"rounds": 2},
@@ -705,7 +803,9 @@ def test_t4_cosmetic_partition_guards():
             "result": "⚠️ unexpected write error",
         }]},
     )
-    assert blocking["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+    assert blocking["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert blocking["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "error"
+    assert blocking["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     # v6.57.0 (1.3): a POLICY refusal (`write_file_blocked`) is NOT degrading — it lands in
     # policy_denials telemetry (the runtime declined the write; the deliverable, if any, is
@@ -757,6 +857,112 @@ def test_t4_cosmetic_partition_guards():
     assert reviewed["outcome_axes"]["execution"]["status"] == EXECUTION_OK
     assert reviewed["outcome_axes"]["execution"]["cosmetic_tool_errors"]
     assert "warning" not in reviewed["outcome_axes"]["objective"]
+
+
+def test_signal_death_is_not_cosmetic_but_plain_exit_still_is():
+    """A killed child remains unresolved, never cosmetic or silently clean.
+
+    SIGKILL/OOM is an actual tool error even when a later answer is delivered.
+    It stays visible in execution evidence and warns when no acceptance review
+    judged the result. A plain non-zero exit remains cosmetic.
+    """
+    killed = derive_loop_outcome(
+        "Done.",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "args": {"cmd": ["node", "--version"]},
+            "is_error": True,
+            "status": "non_zero_exit",
+            "exit_code": -9,
+            "signal": "SIGKILL",
+            "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=-9 (signal=SIGKILL, cwd=/x).",
+        }]},
+    )
+    execution = killed["outcome_axes"]["execution"]
+    assert execution["status"] == EXECUTION_OK
+    assert execution["reason_code"] == "final_message"
+    assert execution["failure"] is None
+    assert execution["unresolved_tool_errors"][0]["signal"] == "SIGKILL"
+    assert not execution["cosmetic_tool_errors"]
+    assert killed["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
+
+    plain = derive_loop_outcome(
+        "Done.",
+        {"rounds": 2},
+        {"tool_calls": [{
+            "tool": "run_command",
+            "args": {"cmd": ["find", "/nope"]},
+            "is_error": True,
+            "status": "non_zero_exit",
+            "exit_code": 1,
+            "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=1.",
+        }]},
+    )
+    assert plain["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert plain["outcome_axes"]["execution"]["cosmetic_tool_errors"]
+
+
+def test_cancel_panic_kill_never_reaches_user_verdict_as_tool_failure(tmp_path):
+    """Q2-2=A MANDATORY pin: our OWN cancel/panic SIGKILL of a run_command child
+    must never surface to the owner as a red `tool_failure` verdict.
+
+    Why no leak exists (read from supervisor/task_lifecycle.cancel_task_custody
+    + task_results._is_status_regression): cancellation custody claims the
+    durable cancel intent, kills and JOINS the worker's whole process TREE (the
+    run_command child dies WITH the worker, so the loop never observes the -9
+    and cannot finalize over it), and only then writes the terminal `cancelled`
+    result — which carries NO trace-derived axes. The panic sweep
+    (shell.kill_all_tracked_subprocesses) rides server-wide teardown where the
+    workers die too. The one remaining lane — a late worker write landing AFTER
+    custody's terminal write — is closed by the sticky-terminal monotonic
+    status guard. Both halves are pinned here at the outcomes level, and the
+    kill path itself is EXECUTED (not argued from code reading) by the serial
+    twin ``test_e2e_cancel_of_inflight_run_command_child_never_reads_as_tool_failure``
+    in tests/test_cancel_intents_phase_a.py — custody kills a real worker tree
+    with a live run_command stand-in child and the stored axis is cancelled.
+    Because no false red leaks, the narrow active-cancel-intent classifier
+    filter of Q2-2=A is deliberately NOT implemented (it is specified only IF
+    a leak exists), and no new public status is introduced."""
+    from ouroboros.task_results import load_task_result, write_task_result
+
+    sigkill_trace = {"tool_calls": [{
+        "tool": "run_command",
+        "args": {"cmd": ["python3", "train.py"]},
+        "is_error": True,
+        "status": "non_zero_exit",
+        "exit_code": -9,
+        "signal": "SIGKILL",
+        "result": "⚠️ SHELL_EXIT_ERROR: command exited with exit_code=-9 (signal=SIGKILL, cwd=/x).",
+    }]}
+
+    # 1) Custody's terminal write (shape mirrored from cancel_task_custody):
+    #    status=cancelled, plain result text, no trace-derived axes.
+    write_task_result(
+        tmp_path, "t-cancel", "cancelled",
+        result="Running task cancelled and worker terminated.",
+    )
+    stored = load_task_result(tmp_path, "t-cancel")
+    axes = normalize_outcome_axes(stored)
+    assert axes["execution"]["status"] == "cancelled"
+    assert axes["execution"]["reason_code"] == "cancelled"
+    assert "tool_failure" not in json.dumps(axes)
+
+    # 2) A natural completion retains the signal death as unresolved evidence
+    #    and discloses the unreviewed result without deriving execution failure.
+    late = derive_loop_outcome("done", {}, sigkill_trace)
+    assert late["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert late["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["signal"] == "SIGKILL"
+
+    # 3) A LATE worker write carrying that completed outcome cannot clobber the
+    #    cancelled verdict: terminal statuses are sticky (monotonic guard).
+    write_task_result(
+        tmp_path, "t-cancel", "completed",
+        outcome_axes=late["outcome_axes"], result="late worker settle",
+    )
+    stored_after = load_task_result(tmp_path, "t-cancel")
+    assert stored_after["status"] == "cancelled"
+    assert "tool_failure" not in json.dumps(stored_after)
 
 
 def test_tool_arg_sanitizer_uses_value_pattern_redactor():
@@ -827,6 +1033,52 @@ def test_latest_llm_response_text_salvages_newest_assistant_text(tmp_path):
     )
 
     assert latest_llm_response_text(tmp_path, "t-salvage") == "newest real progress"
+
+
+def test_latest_llm_response_text_strips_trailing_protocol_object(tmp_path):
+    """Salvage lockstep with the loop's trailing-object parse: a body of prose
+    plus a trailing delivery-control object salvages the PROSE only; a body
+    that is entirely the protocol object stays suppressed (skipped); an object
+    quoted mid-prose passes through untouched."""
+    import time as _time
+
+    from ouroboros.observability import latest_llm_response_text, persist_call
+
+    persist_call(
+        tmp_path, task_id="t-strip", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": "older real text"}, "usage": {}},
+    )
+    _time.sleep(0.02)
+    persist_call(
+        tmp_path, task_id="t-strip", call_id="llm_b_response", call_type="llm_response",
+        payload={
+            "message": {
+                "content": 'Final summary for the owner.\n\n{"delivery_control": "keep"}',
+            },
+            "usage": {},
+        },
+    )
+    assert latest_llm_response_text(tmp_path, "t-strip") == "Final summary for the owner."
+
+    # Entirely-protocol body: suppressed, salvage reaches the older real text.
+    persist_call(
+        tmp_path, task_id="t-whole", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": "older real text"}, "usage": {}},
+    )
+    _time.sleep(0.02)
+    persist_call(
+        tmp_path, task_id="t-whole", call_id="llm_b_response", call_type="llm_response",
+        payload={"message": {"content": '{"delivery_control": "keep"}'}, "usage": {}},
+    )
+    assert latest_llm_response_text(tmp_path, "t-whole") == "older real text"
+
+    # Object with prose AFTER it is quoted material, not a directive.
+    quoted = 'the contract wants {"delivery_control": "keep"} as the reply'
+    persist_call(
+        tmp_path, task_id="t-quoted", call_id="llm_a_response", call_type="llm_response",
+        payload={"message": {"content": quoted}, "usage": {}},
+    )
+    assert latest_llm_response_text(tmp_path, "t-quoted") == quoted
 
 
 def test_latest_llm_response_text_scans_past_many_empty_tool_rounds(tmp_path):
@@ -1039,3 +1291,151 @@ def test_has_failures_true_for_failed_receipt():
         {"status": "ready", "artifacts": [], "errors": []},
     )
     assert refreshed["summary"]["has_failures"] is True
+
+
+def test_omitted_ledger_stub_keeps_the_real_summary_across_artifact_finalization(tmp_path):
+    """A ledger above the inline threshold rides as a stub with no entries.
+
+    Artifact finalization rebuilt the ledger FROM that stub, so a task whose
+    real ledger held nine entries and a failing verification receipt was
+    rewritten to "0 entries / no failures / execution ok" on the record the
+    owner and the parent read — the stub is a projection of the artifact file,
+    never a source. The stub's summary is now re-projected from the refreshed
+    file, and the recomputed bundle describes the bytes actually on disk.
+    """
+    from hashlib import sha256
+
+    from tests._headless_cli_shared import _init_repo_with_file
+
+    from ouroboros import headless
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    parent = tmp_path / "data"
+    parent.mkdir()
+    repo = tmp_path / "repo"
+    _init_repo_with_file(repo)
+    task_id = "stubledger"
+    ledger = {
+        "schema_version": 2, "created_at": "now", "task_id": task_id,
+        "entries": [{"kind": "verification_receipt", "status": "fail", "detail": "x" * 1600}]
+        + [{"kind": "objective_outcome", "status": "not_evaluated", "detail": "y" * 1600} for _ in range(8)],
+        "summary": {"entry_count": 9, "has_failures": True},
+    }
+    refs = maybe_write_verification_artifact(parent, task_id, ledger)
+    assert refs["artifact"] is not None, "the fixture must exceed the inline threshold"
+    assert refs["inline"]["omitted_to_artifact"] is True
+    assert "entries" not in refs["inline"]
+
+    write_task_result(
+        parent, task_id, STATUS_COMPLETED, result="done",
+        verification_ledger=refs["inline"], artifacts=[refs["artifact"]],
+        artifact_status="ready",
+        outcome_axes={"lifecycle": {"status": STATUS_COMPLETED}, "execution": {"status": EXECUTION_OK}},
+    )
+
+    for run in ("first", "second"):
+        headless.finalize_task_artifacts(parent, {"id": task_id, "workspace_root": str(repo)})
+        stored = load_task_result(parent, task_id)
+        stub = stored["verification_ledger"]
+        assert stub["omitted_to_artifact"] is True, run
+        assert "entries" not in stub, run
+        assert "outcome_axes" not in stub, run
+        assert stub["summary"]["entry_count"] == 9, run
+        assert stub["summary"]["has_failures"] is True, run
+
+        ledger_item = next(
+            item for item in stored["artifact_bundle"]["artifacts"]
+            if item.get("kind") == "verification_ledger"
+        )
+        data = pathlib.Path(ledger_item["path"]).read_bytes()
+        assert ledger_item["size"] == len(data), run
+        assert ledger_item["sha256"] == sha256(data).hexdigest(), run
+        on_disk = json.loads(data.decode("utf-8"))
+        assert on_disk["summary"]["entry_count"] == 9, run
+        assert on_disk["summary"]["has_failures"] is True, run
+
+
+def test_refreshing_an_omitted_ledger_stub_is_an_identity():
+    stub = {
+        "schema_version": 1, "created_at": "now", "task_id": "t",
+        "summary": {"entry_count": 9, "has_failures": True}, "omitted_to_artifact": True,
+    }
+    for status in ("ready", "ready_with_changes", "failed", "pending", "missing"):
+        assert refresh_verification_ledger_artifacts(
+            dict(stub), {"status": status, "artifacts": [], "errors": []},
+        ) == stub
+
+
+def test_task_exception_publishes_the_loop_s_accumulated_evidence(monkeypatch, tmp_path):
+    """The outer agent catch owns the terminal projection, not the evidence.
+
+    A lifecycle failure after real rounds must publish the loop's accumulated
+    trace and usage — never a ``0 calls`` projection built from the untouched
+    pre-loop defaults — and must not call an internal error a provider failure.
+    """
+    from ouroboros import agent as agent_module
+    from ouroboros import agent_task_pipeline
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr(agent_module, "build_llm_messages", lambda **_kwargs: ([], {}))
+    # The durable result is written before post-task cognition starts; the
+    # reflection thread is not this seam's subject.
+    monkeypatch.setattr(
+        agent_task_pipeline, "_run_post_task_processing_async", lambda *_a, **_kw: None)
+
+    def die_after_real_work(**_kwargs):
+        # Exactly what ``run_llm_loop`` attaches on an unexpected exit: the SAME
+        # in-memory accumulators the loop was filling.
+        exc = RuntimeError("owner wait refused a terminal continuation")
+        exc._ouroboros_loop_usage = {
+            "rounds": 7, "prompt_tokens": 4321, "completion_tokens": 210,
+            "execution_id": "exec_lifecycle_failure",
+        }
+        exc._ouroboros_loop_trace = {
+            "reasoning_notes": ["planned the edit"],
+            "tool_calls": [{
+                "tool": "write_file", "tool_call_id": "call-1", "result": "ok",
+                "trace_ref": {"call_id": "tool_write_file_1"},
+            }],
+        }
+        raise exc
+
+    monkeypatch.setattr(agent_module, "run_llm_loop", die_after_real_work)
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    events = agent._handle_task_scoped({
+        "id": "lifecycle-fail", "type": "task", "chat_id": 1, "text": "do it",
+        "drive_root": str(drive), "budget_drive_root": str(drive),
+    })
+
+    stored = load_task_result(drive, "lifecycle-fail")
+    assert stored["status"] == STATUS_FAILED
+    assert stored["reason_code"] == "task_exception"
+    # The published trace counts the call that really happened.
+    assert stored["trace_summary"].startswith("## Tool trace (1 calls")
+    assert stored["trace_refs"]["execution_id"] == "exec_lifecycle_failure"
+    assert [ref["call_id"] for ref in stored["trace_refs"]["tool_call_refs"]] == [
+        "tool_write_file_1"]
+    # The loop's own tally rides the honest loop plane; an internal lifecycle
+    # error is a runtime failure, not a provider one.
+    assert stored["loop_outcome"]["usage"]["total_rounds"] == 7
+    assert stored["loop_outcome"]["usage"]["prompt_tokens"] == 4321
+    assert stored["loop_outcome"]["usage"]["completion_tokens"] == 210
+    execution = stored["outcome_axes"]["execution"]
+    assert execution["status"] == EXECUTION_INFRA_FAILED
+    assert execution["failure"] == {"kind": "runtime", "reason_code": "task_exception"}
+    # The original exception stays the evidence of what failed.
+    assert "RuntimeError: owner wait refused a terminal continuation" in stored["result"]
+    error_events = [
+        json.loads(line)
+        for line in (drive / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    task_error = next(row for row in error_events if row.get("type") == "task_error")
+    assert "owner wait refused a terminal continuation" in task_error["error"]
+    assert "die_after_real_work" in task_error["traceback"]
+    assert any(event.get("type") == "task_done" for event in events)

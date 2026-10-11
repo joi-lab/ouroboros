@@ -1,9 +1,10 @@
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { apiFetch, jsonPost } from './api_client.js';
+import { fetchJson, jsonPost } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { downloadViaHostBridge } from './ui_helpers.js';
+import { downloadViaHostBridge, setInlineStatus } from './ui_helpers.js';
+import { bindMenu } from './ui_interactions.js';
 
 function formatFileSize(size) {
     const num = Number(size);
@@ -38,7 +39,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         <div class="files-layout">
             <section class="files-sidebar">
                 <div class="files-toolbar">
-                    <input id="files-search" type="text" placeholder="Filter current folder...">
+                    <input id="files-search" class="ui-control" name="files-filter" type="text" aria-label="Filter current folder" placeholder="Filter current folder...">
                 </div>
                 <div class="files-browser-header">
                     <div id="files-breadcrumb" class="files-breadcrumb"></div>
@@ -48,7 +49,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
                         <button class="btn btn-default" id="files-new-dir" title="Create directory">+ Dir</button>
                     </div>
                 </div>
-                <div id="files-list" class="files-list scroll-fade-y"></div>
+                <div id="files-list" class="files-list scroll-fade-y" tabindex="0" aria-label="Files in current folder"></div>
             </section>
             <section class="files-preview">
                 <div class="files-preview-header">
@@ -62,17 +63,18 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
                         <button class="btn btn-primary" id="files-save" hidden disabled>Save</button>
                     </div>
                 </div>
+                <div id="files-preview-status" class="ui-status files-preview-status" role="status" aria-live="polite" hidden></div>
                 <div id="files-preview-content" class="files-preview-content scroll-fade-y">${defaultDirectoryContent()}</div>
             </section>
             <div class="files-drop-overlay" aria-hidden="true">
                 <div class="files-drop-card">Drop files to upload into the current folder</div>
             </div>
-            <div id="files-context-menu" class="files-context-menu" hidden>
-                <button type="button" class="files-context-item" data-action="download">Download</button>
-                <button type="button" class="files-context-item" data-action="copy">Copy</button>
-                <button type="button" class="files-context-item" data-action="move">Move</button>
-                <button type="button" class="files-context-item" data-action="paste">Paste Here</button>
-                <button type="button" class="files-context-item files-context-item-danger" data-action="delete">Delete</button>
+            <div id="files-context-menu" class="files-context-menu ui-popup" role="menu" aria-label="File actions" hidden>
+                <button type="button" role="menuitem" class="files-context-item" data-action="download">Download</button>
+                <button type="button" role="menuitem" class="files-context-item" data-action="copy">Copy</button>
+                <button type="button" role="menuitem" class="files-context-item" data-action="move">Move</button>
+                <button type="button" role="menuitem" class="files-context-item" data-action="paste">Paste Here</button>
+                <button type="button" role="menuitem" class="files-context-item files-context-item-danger" data-action="delete">Delete</button>
             </div>
         </div>
     `;
@@ -84,10 +86,10 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     const previewPathEl = page.querySelector('#files-preview-path');
     const previewMetaEl = page.querySelector('#files-preview-meta');
     const previewContentEl = page.querySelector('#files-preview-content');
+    const previewStatusEl = page.querySelector('#files-preview-status');
     const contextMenuEl = page.querySelector('#files-context-menu');
-    const contextMenuPositionStyle = document.createElement('style');
-    contextMenuPositionStyle.id = 'files-context-menu-position-style';
-    page.appendChild(contextMenuPositionStyle);
+    let contextMenuBinding = null;
+    let contextAnchor = null;
     const saveBtn = page.querySelector('#files-save');
     const downloadBtn = page.querySelector('#files-download');
     const openExternalBtn = page.querySelector('#files-open-external');
@@ -115,10 +117,13 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         editorWritable: false,
         editorIsNew: false,
         editorFilename: '',
+        editorSaving: false,
         clipboard: null,
         contextEntryType: '',
         contextDestinationPath: '.',
     };
+    let viewRequest = 0;
+    let draftRevision = 0;
 
     function updateEditorActions() {
         const visible = state.editorWritable && state.selectedType === 'file';
@@ -128,7 +133,8 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
                 : state.selectedPath === state.editorPath
         ) && (state.editorDirty || state.editorIsNew);
         saveBtn.hidden = !visible;
-        saveBtn.disabled = !canSave;
+        saveBtn.disabled = !canSave || state.editorSaving;
+        saveBtn.textContent = state.editorSaving ? 'Saving…' : 'Save';
         const fileSelected = state.selectedType === 'file' && Boolean(state.selectedPath);
         downloadBtn.hidden = !fileSelected;
         openExternalBtn.hidden = !fileSelected;
@@ -155,6 +161,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     }
 
     function setPreview({ path, meta, content, html, node }) {
+        showStatus('');
         previewPathEl.textContent = path || 'Select a file';
         previewMetaEl.textContent = meta || '';
         if (node) {
@@ -174,35 +181,38 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
 
         if (options.isNew) {
             const nameInput = document.createElement('input');
-            nameInput.className = 'files-editor-name';
+            nameInput.className = 'files-editor-name ui-control';
             nameInput.type = 'text';
+            nameInput.name = 'filename';
+            nameInput.setAttribute('aria-label', 'File name');
             nameInput.placeholder = 'new-file.txt';
             nameInput.value = state.editorFilename || '';
             nameInput.autocomplete = 'off';
             nameInput.spellcheck = false;
             nameInput.addEventListener('input', () => {
+                draftRevision += 1;
                 state.editorFilename = nameInput.value;
                 state.editorDirty = state.editorValue !== state.editorOriginal || state.editorFilename !== state.editorOriginalFilename;
+                showStatus('');
                 updateEditorActions();
             });
             wrapper.appendChild(nameInput);
         }
 
         const textarea = document.createElement('textarea');
-        textarea.className = 'files-editor';
+        textarea.className = 'files-editor ui-control ui-control-code';
+        textarea.name = 'file-content';
+        textarea.setAttribute('aria-label', 'File contents');
+        textarea.setAttribute('aria-describedby', 'files-preview-path files-preview-meta');
         textarea.value = content || '';
         textarea.spellcheck = false;
         textarea.placeholder = options.isNew ? 'Start typing file contents...' : '';
         textarea.addEventListener('input', () => {
+            draftRevision += 1;
             state.editorValue = textarea.value;
             state.editorDirty = state.editorValue !== state.editorOriginal || state.editorFilename !== state.editorOriginalFilename;
+            showStatus('');
             updateEditorActions();
-        });
-        textarea.addEventListener('keydown', (event) => {
-            if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
-                event.preventDefault();
-                saveCurrentFile().catch(showError);
-            }
         });
         wrapper.appendChild(textarea);
         return wrapper;
@@ -232,7 +242,8 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         return Boolean(result?.confirmed);
     }
 
-    function showContextMenu(x, y, path, type, destinationPath = '.') {
+    function showContextMenu(x, y, path, type, destinationPath = '.', anchor = listEl) {
+        hideContextMenu();
         state.contextPath = path || '';
         state.contextEntryType = type || '';
         state.contextDestinationPath = destinationPath || '.';
@@ -248,22 +259,34 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         if (deleteItem) {
             deleteItem.hidden = !path;
         }
+        contextMenuEl.querySelectorAll('[data-action="copy"], [data-action="move"]').forEach((item) => {
+            item.hidden = !path;
+        });
+        contextAnchor = anchor;
+        contextAnchor.setAttribute('aria-expanded', 'true');
+        contextAnchor.setAttribute('aria-haspopup', 'menu');
+        document.body.appendChild(contextMenuEl);
         contextMenuEl.hidden = false;
-        const margin = 8;
-        const rect = contextMenuEl.getBoundingClientRect();
-        const left = Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - rect.width - margin));
-        const top = Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - rect.height - margin));
-        contextMenuPositionStyle.textContent = `#files-context-menu[data-open="1"]{left:${Math.round(left)}px;top:${Math.round(top)}px;}`;
-        contextMenuEl.dataset.open = '1';
+        contextMenuBinding = bindMenu(contextMenuEl, {
+            anchor,
+            point: Number.isFinite(x) && Number.isFinite(y) ? { x, y } : undefined,
+            onClose: resetContextMenu,
+        });
     }
 
-    function hideContextMenu() {
+    function resetContextMenu() {
         state.contextPath = '';
         state.contextEntryType = '';
         state.contextDestinationPath = '.';
-        delete contextMenuEl.dataset.open;
-        contextMenuPositionStyle.textContent = '';
+        contextAnchor?.setAttribute('aria-expanded', 'false');
+        contextAnchor = null;
+        contextMenuBinding = null;
         contextMenuEl.hidden = true;
+        layoutEl.appendChild(contextMenuEl);
+    }
+
+    function hideContextMenu(options) {
+        contextMenuBinding?.close(options);
     }
 
     function filteredEntries() {
@@ -317,6 +340,10 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
             const button = document.createElement('button');
             const selected = state.selectedPath === entry.path;
             button.type = 'button';
+            if (!entry.isParentLink) {
+                button.setAttribute('aria-haspopup', 'menu');
+                button.setAttribute('aria-expanded', 'false');
+            }
             button.className = `files-entry ${entry.isParentLink ? 'parent-link' : ''} ${selected ? 'selected' : ''}`;
             button.innerHTML = `
                 <span class="files-entry-icon">${iconForEntry(entry)}</span>
@@ -326,71 +353,74 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
             button.addEventListener('contextmenu', (event) => {
                 if (entry.isParentLink) return;
                 event.preventDefault();
-                state.selectedPath = entry.path;
-                state.selectedType = entry.type;
-                renderList();
                 showContextMenu(
                     event.clientX,
                     event.clientY,
                     entry.path,
                     entry.type,
                     entry.type === 'dir' ? entry.path : state.path || '.',
+                    button,
                 );
             });
-            button.addEventListener('click', async () => {
+            button.addEventListener('keydown', (event) => {
+                if (entry.isParentLink || (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10'))) return;
+                event.preventDefault();
+                showContextMenu(undefined, undefined, entry.path, entry.type, entry.type === 'dir' ? entry.path : state.path, button);
+            });
+            button.addEventListener('click', () => {
                 hideContextMenu();
                 if (entry.type === 'dir') {
-                    state.selectedPath = entry.isParentLink ? '' : entry.path;
-                    state.selectedType = 'dir';
-                    renderList();
                     loadDirectory(entry.path).catch(showError);
                 } else {
-                    if (!(await canLeaveEditor())) return;
-                    state.selectedPath = entry.path;
-                    state.selectedType = entry.type;
-                    renderList();
-                    loadFile(entry.path, { skipLeaveCheck: true }).catch(showError);
+                    loadFile(entry.path).catch(showError);
                 }
             });
             listEl.appendChild(button);
         });
     }
 
+    function showStatus(text, tone = 'muted') {
+        setInlineStatus(previewStatusEl, text, tone);
+        previewStatusEl.hidden = !text;
+    }
+
     function showError(err) {
-        setPreview({
-            path: 'Files',
-            meta: 'Request failed',
-            content: err instanceof Error ? err.message : String(err),
-        });
+        showStatus(`Request failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
     }
 
     async function loadDirectory(path = '.', options = {}) {
-        if (!options.skipEditorReset) {
-            if (!options.skipLeaveCheck && !(await canLeaveEditor())) return;
-            resetEditorState();
-        }
+        const request = ++viewRequest;
+        const preserveEditor = options.skipEditorReset || (!options.useBackendDefault && path === state.path);
+        if (!preserveEditor && !options.skipLeaveCheck && !(await canLeaveEditor())) return;
+        if (request !== viewRequest) return;
+        const revision = draftRevision;
         hideContextMenu();
         const params = new URLSearchParams();
         if (options.useBackendDefault !== true) {
             params.set('path', path);
         }
         const query = params.toString();
-        const resp = await apiFetch(`/api/files/list${query ? `?${query}` : ''}`);
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await fetchJson(`/api/files/list${query ? `?${query}` : ''}`);
+        if (request !== viewRequest) return;
+        if (!preserveEditor && revision !== draftRevision) {
+            showStatus('New edits kept. Choose the folder again when ready to leave.');
+            return;
+        }
 
+        if (!options.keepStatus) showStatus('');
+        if (!preserveEditor) {
+            state.selectedPath = '';
+            state.selectedType = 'dir';
+            resetEditorState();
+        }
         state.rootPath = data.root_path || state.rootPath;
         state.path = data.path || '.';
         state.parentPath = data.parent_path || '.';
         state.entries = Array.isArray(data.entries) ? data.entries : [];
-        if (state.selectedPath && !state.entries.some((entry) => entry.path === state.selectedPath)) {
-            state.selectedPath = '';
-            state.selectedType = '';
-        }
         renderBreadcrumb(Array.isArray(data.breadcrumb) ? data.breadcrumb : []);
         renderList();
 
-        if (!state.selectedPath || state.selectedType === 'dir') {
+        if (!preserveEditor || (!state.selectedPath && !state.editorWritable)) {
             setPreview({
                 path: data.display_path || state.rootPath || 'Files',
                 meta: data.truncated ? 'Directory listing truncated.' : defaultDirectoryMeta(),
@@ -399,14 +429,23 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         }
     }
 
-    async function loadFile(path, options = {}) {
-        if (!options.skipLeaveCheck && state.selectedPath !== path && !(await canLeaveEditor())) return;
+    async function loadFile(path) {
+        if (state.selectedPath === path && state.editorPath === path) return;
+        const request = ++viewRequest;
+        if (!(await canLeaveEditor()) || request !== viewRequest) return;
+        const revision = draftRevision;
         hideContextMenu();
         const params = new URLSearchParams({ path });
-        const resp = await apiFetch(`/api/files/read?${params.toString()}`);
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await fetchJson(`/api/files/read?${params.toString()}`);
+        if (request !== viewRequest) return;
+        if (revision !== draftRevision) {
+            showStatus('New edits kept. Choose the file again when ready to leave.');
+            return;
+        }
 
+        state.selectedPath = data.path || path;
+        state.selectedType = 'file';
+        renderList();
         if (data.is_image && data.content_url) {
             resetEditorState();
             setPreview({
@@ -439,7 +478,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         }
 
         const editable = !data.truncated;
-        state.editorPath = path;
+        state.editorPath = state.selectedPath;
         state.editorOriginalFilename = data.name || '';
         state.editorOriginal = data.content || '';
         state.editorValue = data.content || '';
@@ -468,17 +507,12 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         const filename = filenameFromPath(path);
         const result = await downloadViaHostBridge(url, filename, { openExternal });
         if (result.native) {
-            setPreview({
-                path,
-                meta: openExternal ? 'Opened externally' : 'Downloaded',
-                content: `${filename} saved to ${result.path || 'Downloads'}.`,
-            });
+            showStatus(openExternal ? `Opened ${filename} externally.` : `${filename} saved to ${result.path || 'Downloads'}.`, 'success');
             return;
         }
     }
 
     async function createDirectory() {
-        if (!(await canLeaveEditor())) return;
         const result = await showModal({
             title: 'Create Directory',
             message: 'Enter a name for the new directory in the current folder.',
@@ -488,39 +522,56 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         });
         const name = (result?.value || '').trim();
         if (!result?.confirmed || !name) return;
-        const data = await jsonPost('/api/files/mkdir', { path: state.path || '.', name });
-        state.selectedPath = '';
-        state.selectedType = 'dir';
-        await loadDirectory(state.path || '.', { skipLeaveCheck: true });
+        await jsonPost('/api/files/mkdir', { path: state.path || '.', name });
+        await loadDirectory(state.path || '.');
+        showStatus(`Directory ${name} created.`, 'success');
+    }
+
+    async function finishFileOperation(view, { directory, path = '', type = 'dir', message }) {
+        const currentView = view.request === viewRequest;
+        const replacePreview = currentView && view.revision === draftRevision;
+        if (replacePreview) {
+            resetEditorState();
+            state.selectedPath = path;
+            state.selectedType = type;
+            updateEditorActions();
+            setPreview({ path: path || state.rootPath, meta: message, content: '' });
+        }
+        showStatus(message, 'success');
+        // A completed write remains real, but it cannot take over newer work.
+        // Refreshing the original folder must not cancel a newer navigation.
+        if (!currentView || (!replacePreview && directory !== state.path)) return;
+        try {
+            await loadDirectory(directory, { skipLeaveCheck: true, skipEditorReset: true, keepStatus: true });
+            showStatus(message, 'success');
+        } catch (err) {
+            showStatus(`${message} Folder refresh failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+        }
     }
 
     async function pasteClipboard(destinationPath = state.path || '.') {
-        if (!state.clipboard) return;
+        const clipboard = state.clipboard;
+        if (!clipboard) return;
         if (!(await canLeaveEditor())) return;
+        const view = { request: viewRequest, revision: draftRevision };
 
         const data = await jsonPost('/api/files/transfer', {
-            source_path: state.clipboard.path,
+            source_path: clipboard.path,
             destination_dir: destinationPath || '.',
-            mode: state.clipboard.mode,
+            mode: clipboard.mode,
         });
 
-        const pastedMode = state.clipboard.mode;
-        state.clipboard = null;
+        if (state.clipboard === clipboard) state.clipboard = null;
         updateClipboardActions();
-        const refreshPath = destinationPath || state.path || '.';
-        state.selectedPath = data.path || '';
-        state.selectedType = data.type || '';
-        await loadDirectory(refreshPath, { skipLeaveCheck: true });
-        setPreview({
-            path: data.display_path || state.rootPath || 'Files',
-            meta: `${pastedMode === 'move' ? 'Moved' : 'Copied'} ${data.type || 'item'}`,
-            content: '',
+        await finishFileOperation(view, {
+            directory: destinationPath || '.', path: data.path || '', type: data.type || '',
+            message: `${clipboard.mode === 'move' ? 'Moved' : 'Copied'} ${data.display_path || data.path || clipboard.name}.`,
         });
     }
 
-    async function deleteSelectedEntry() {
-        if (!state.selectedPath) return;
-        const entry = state.entries.find((item) => item.path === state.selectedPath);
+    async function deleteSelectedEntry(path = state.selectedPath) {
+        if (!path) return;
+        const entry = state.entries.find((item) => item.path === path);
         if (!entry) return;
         if (!(await canLeaveEditor())) return;
 
@@ -533,90 +584,96 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
             cancelLabel: 'Cancel',
         });
         if (!result?.confirmed) return;
+        const view = { request: viewRequest, revision: draftRevision };
+        const directory = state.path || '.';
 
-        await jsonPost('/api/files/delete', { path: state.selectedPath });
+        await jsonPost('/api/files/delete', { path });
 
-        resetEditorState();
-        state.selectedPath = '';
-        state.selectedType = 'dir';
-        await loadDirectory(state.path || '.', { skipLeaveCheck: true, skipEditorReset: true });
-        setPreview({
-            path: state.rootPath || 'Files',
-            meta: `${entry.type === 'dir' ? 'Directory' : 'File'} deleted`,
-            content: '',
+        await finishFileOperation(view, {
+            directory, message: `${entry.type === 'dir' ? 'Directory' : 'File'} deleted: ${entry.name}.`,
         });
     }
 
     async function uploadFiles(fileList) {
         const files = Array.from(fileList || []);
         if (!files.length) return;
+        if (!(await canLeaveEditor())) return;
+        const uploadPath = state.path || '.';
+        const view = { request: viewRequest, revision: draftRevision };
+        let uploaded;
 
         for (const file of files) {
             const form = new FormData();
-            form.set('path', state.path || '.');
+            form.set('path', uploadPath);
             form.set('file', file);
 
-            setPreview({
-                path: state.rootPath || 'Files',
-                meta: `Uploading into ${state.path || '.'}`,
-                content: `Uploading ${file.name}...`,
-            });
+            showStatus(`Uploading ${file.name} into ${uploadPath}…`);
 
-            const resp = await apiFetch('/api/files/upload', {
+            uploaded = await fetchJson('/api/files/upload', {
                 method: 'POST',
                 body: form,
             });
-            const data = await resp.json();
-            if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-
-            state.selectedPath = data.path || '';
-            state.selectedType = 'file';
         }
 
-        await loadDirectory(state.path || '.');
-        if (state.selectedPath) {
-            const selected = state.entries.find((entry) => entry.path === state.selectedPath);
-            setPreview({
-                path: selected ? `${state.rootPath || 'Files'}/${selected.name}` : (state.rootPath || 'Files'),
-                meta: selected ? `${formatFileSize(selected.size)} • uploaded` : 'Upload complete',
-                content: '',
-            });
-        }
+        await finishFileOperation(view, {
+            directory: uploadPath, path: uploaded.path || '', type: 'file',
+            message: `Upload complete: ${files.map(file => file.name).join(', ')} in ${uploadPath}.`,
+        });
     }
 
     async function saveCurrentFile() {
-        if (!state.editorWritable) return;
+        if (!state.editorWritable || state.editorSaving || (!state.editorDirty && !state.editorIsNew)) return;
         const relName = state.editorFilename.trim();
+        if (state.editorIsNew && !relName) return;
         const savePath = state.editorIsNew
             ? (state.path && state.path !== '.' ? `${state.path}/${relName}` : relName)
             : state.editorPath;
         if (!savePath) return;
-        const data = await jsonPost('/api/files/write', {
-            path: savePath,
-            content: state.editorValue,
-            create: state.editorIsNew,
-        });
-
-        state.selectedPath = data.path || savePath;
-        state.selectedType = 'file';
-        state.editorPath = data.path || savePath;
-        state.editorFilename = data.name || relName;
-        state.editorOriginalFilename = state.editorFilename;
-        state.editorIsNew = false;
-        state.editorOriginal = state.editorValue;
-        state.editorDirty = false;
+        const editor = previewContentEl.querySelector('.files-editor');
+        const nameInput = previewContentEl.querySelector('.files-editor-name');
+        const content = state.editorValue;
+        state.editorSaving = true;
+        if (nameInput) nameInput.disabled = true;
         updateEditorActions();
-        setPreview({
-            path: data.display_path || state.rootPath || 'Files',
-            meta: `${formatFileSize(data.size)} • saved`,
-            node: renderEditor(state.editorValue, { isNew: false }),
-        });
-        await loadDirectory(state.path || '.', { skipEditorReset: true, skipLeaveCheck: true });
+        showStatus('Saving…');
+        try {
+            const data = await jsonPost('/api/files/write', {
+                path: savePath,
+                content,
+                create: state.editorIsNew,
+            });
+            if (editor !== previewContentEl.querySelector('.files-editor')) return;
+            state.selectedPath = data.path || savePath;
+            state.selectedType = 'file';
+            state.editorPath = state.selectedPath;
+            state.editorFilename = data.name || relName;
+            state.editorOriginalFilename = state.editorFilename;
+            state.editorIsNew = false;
+            state.editorOriginal = content;
+            state.editorDirty = state.editorValue !== content;
+            if (nameInput === document.activeElement) editor?.focus();
+            nameInput?.remove();
+            previewPathEl.textContent = data.display_path || state.editorPath;
+            previewMetaEl.textContent = `${formatFileSize(data.size)} • editable`;
+            showStatus(state.editorDirty ? 'Saved. Newer edits are still unsaved.' : 'Saved.', 'success');
+        } finally {
+            state.editorSaving = false;
+            if (nameInput) nameInput.disabled = false;
+            updateEditorActions();
+        }
+        try {
+            await loadDirectory(state.path || '.', { skipEditorReset: true, keepStatus: true });
+        } catch (err) {
+            if (editor === previewContentEl.querySelector('.files-editor')) {
+                showStatus(`Saved. Folder refresh failed: ${err instanceof Error ? err.message : String(err)}`, 'error');
+            }
+        }
     }
 
     function createNewFile(options = {}) {
         if (state.editorDirty && !options.force) return;
         hideContextMenu();
+        viewRequest += 1;
         state.selectedPath = '';
         state.selectedType = 'file';
         state.editorPath = '';
@@ -700,11 +757,15 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     });
 
     contextMenuEl.addEventListener('click', (event) => {
-        const action = event.target instanceof HTMLElement ? event.target.dataset.action : '';
+        const action = event.target.closest('[data-action]')?.dataset.action;
+        if (!action) return;
+        const path = state.contextPath;
+        const destinationPath = state.contextDestinationPath;
+        hideContextMenu({ restoreFocus: true });
         if (action === 'download') {
-            downloadFile(state.contextPath).catch(showError);
+            downloadFile(path).catch(showError);
         } else if (action === 'copy' || action === 'move') {
-            const entry = state.entries.find((item) => item.path === state.contextPath);
+            const entry = state.entries.find((item) => item.path === path);
             if (entry) {
                 state.clipboard = {
                     mode: action,
@@ -713,22 +774,13 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
                     type: entry.type,
                 };
                 updateClipboardActions();
-                setPreview({
-                    path: state.rootPath || 'Files',
-                    meta: `${action === 'move' ? 'Move' : 'Copy'} ready`,
-                    content: `${entry.name} will be ${action === 'move' ? 'moved' : 'copied'} into the next folder where you press Paste.`,
-                });
+                showStatus(`${action === 'move' ? 'Move' : 'Copy'} ready: ${entry.name} will be ${action === 'move' ? 'moved' : 'copied'} into the next folder where you press Paste.`);
             }
         } else if (action === 'paste') {
-            pasteClipboard(state.contextDestinationPath).catch(showError);
+            pasteClipboard(destinationPath).catch(showError);
         } else if (action === 'delete') {
-            deleteSelectedEntry().catch(showError);
+            deleteSelectedEntry(path).catch(showError);
         }
-        hideContextMenu();
-    });
-
-    document.addEventListener('click', () => {
-        hideContextMenu();
     });
 
     listEl.addEventListener('contextmenu', (event) => {
@@ -738,8 +790,10 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         }
     });
 
-    window.addEventListener('blur', () => {
-        hideContextMenu();
+    listEl.addEventListener('keydown', (event) => {
+        if (event.target !== listEl || !state.clipboard || (event.key !== 'ContextMenu' && !(event.shiftKey && event.key === 'F10'))) return;
+        event.preventDefault();
+        showContextMenu(undefined, undefined, '', 'dir', state.path || '.');
     });
 
     refreshBtn.addEventListener('click', () => {
@@ -756,20 +810,19 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
         const active = document.activeElement;
         const inEditor = active && (
             active.classList?.contains('files-editor') ||
-            active.classList?.contains('files-editor-name') ||
-            active.id === 'files-search' ||
-            active.matches?.('[data-confirm-input]')
+            active.classList?.contains('files-editor-name')
         );
-        const dialogOpen = Boolean(document.querySelector('.confirm-dialog-backdrop'));
+        const dialogOpen = Boolean(document.querySelector('[aria-modal="true"]'));
         if (!page.classList.contains('active')) return;
         if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
-            if (!inEditor) return;
+            if (!inEditor || dialogOpen) return;
             event.preventDefault();
+            if (event.repeat) return;
             saveCurrentFile().catch(showError);
             return;
         }
         if (event.key === 'Delete') {
-            if (inEditor || dialogOpen) return;
+            if (inEditor || active === searchEl || dialogOpen || contextMenuBinding) return;
             event.preventDefault();
             deleteSelectedEntry().catch(showError);
         }
@@ -778,6 +831,7 @@ export function initFiles({ state: appState, setBeforePageLeave } = {}) {
     if (typeof setBeforePageLeave === 'function') {
         setBeforePageLeave(async ({ from }) => {
             if (from !== 'files') return true;
+            hideContextMenu();
             return canLeaveEditor();
         });
     }

@@ -5,15 +5,119 @@ deep_self_review.py)."""
 
 from __future__ import annotations
 
-import os
+
+from typing import Any, Mapping
+
+from ouroboros.model_slots import ResolvedModelTarget, parse_fallback_chain
+from ouroboros.settings_defaults import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS  # noqa: F401
+from ouroboros.settings_integrity import runtime_setting
+
+# MiniMax exposes the same OpenAI-compatible API on two regional hosts. Keep the
+# mapping centralized so transport, capability evidence, and settings diagnostics
+# fingerprint the exact endpoint selected by the owner.
+MINIMAX_REGION_ENDPOINTS: dict[str, str] = {
+    "global_en": "https://api.minimax.io/v1",
+    "cn_zh": "https://api.minimaxi.com/v1",
+}
+MINIMAX_DEFAULT_REGION = "global_en"
+
+
+def resolve_minimax_base_url(region: str = "") -> str:
+    """Return the configured MiniMax OpenAI-compatible endpoint."""
+    selected = str(region or "").strip().lower() or MINIMAX_DEFAULT_REGION
+    return MINIMAX_REGION_ENDPOINTS.get(selected, MINIMAX_REGION_ENDPOINTS[MINIMAX_DEFAULT_REGION])
+
+
+# DeepSeek serves one official OpenAI-compatible endpoint (no regions, no
+# owner-configurable base URL — a proxy/mirror setup belongs to the generic
+# openai-compatible slot). Kept as a module constant so transport and the
+# provider test resolve the same host; the reviewer-window/base-url fingerprint
+# maps deliberately have NO deepseek branch (both default to "" consistently —
+# the fingerprint is already unique per provider+model).
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+# Z.ai (Zhipu / GLM) serves one OpenAI-compatible API surface on two plans that
+# share the same key: pay-as-you-go and the subscription Coding Plan. The plan
+# selects the endpoint (analogous to MiniMax regions); the PAYG endpoint is the
+# default because the Coding Plan endpoint is officially intended for supported
+# coding tools only.
+ZAI_PLAN_ENDPOINTS: dict[str, str] = {
+    "payg": "https://api.z.ai/api/paas/v4",
+    "coding": "https://api.z.ai/api/coding/paas/v4",
+}
+ZAI_DEFAULT_PLAN = "payg"
+
+
+def resolve_zai_base_url(plan: str = "") -> str:
+    """Return the configured Z.ai OpenAI-compatible endpoint for the plan."""
+    selected = str(plan or "").strip().lower() or ZAI_DEFAULT_PLAN
+    return ZAI_PLAN_ENDPOINTS.get(selected, ZAI_PLAN_ENDPOINTS[ZAI_DEFAULT_PLAN])
+
+
+# DeepSeek's Chat Completions ``reasoning_effort`` enum is low/high/max
+# (medium/xhigh are documented aliases of high) and thinking is switched off by
+# ``thinking.type=disabled``, not by an effort value. This is the wire dialect
+# of one provider, projected at the physical-send boundary; the canonical
+# Ouroboros effort scale stays the SSOT everywhere else. Not a model or pricing
+# table and never an admission gate.
+DEEPSEEK_REASONING_EFFORT_ALIASES = {
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "high",
+    "ultra": "max",
+}
+
+
+def normalize_deepseek_reasoning_effort(value: str) -> str:
+    """Project one canonical effort tier onto DeepSeek's Chat wire enum."""
+    normalized = str(value or "").strip().lower()
+    return DEEPSEEK_REASONING_EFFORT_ALIASES.get(normalized, normalized)
+
+
+# Z.ai (GLM) serves the same Chat Completions ``reasoning_effort`` shape but a
+# DIFFERENT enum mapping than DeepSeek — do not reuse the DeepSeek table. The
+# provider has exactly three tiers (low | high | max); ``medium`` does not
+# exist, thinking cannot be disabled (``thinking={"type":"disabled"}`` answers
+# 400 code 1210 "please use low, high or max" on PAYG), and an ABSENT
+# parameter is served at MAX — so a silently dropped tier means every call
+# runs (and bills) at max. Projection of the canonical scale, measured live
+# 2026-09-21 on the Coding Plan endpoint: none/minimal/low -> low,
+# medium/high -> high, xhigh/ultra -> max.
+ZAI_REASONING_EFFORT_ALIASES = {
+    "none": "low",
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+    "ultra": "max",
+}
+
+
+def normalize_zai_reasoning_effort(value: str) -> str:
+    """Project one canonical effort tier onto Z.ai's Chat wire enum.
+
+    Every canonical tier maps to a concrete provider tier; unlike DeepSeek
+    there is no "off" arm — GLM reasoning cannot be disabled, so an unmapped
+    value still resolves to a tier rather than being dropped (a dropped tier
+    is served at max).
+    """
+    normalized = str(value or "").strip().lower()
+    return ZAI_REASONING_EFFORT_ALIASES.get(normalized, "low")
+
 
 # Direct-provider prefix → canonical provider name. Un-prefixed models route
 # through OpenRouter. Order matters only for readability; prefixes are disjoint.
 PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("claudexor::", "claudexor"),
     ("openai::", "openai"),
     ("anthropic::", "anthropic"),
+    ("minimax::", "minimax"),
     ("cloudru::", "cloudru"),
     ("gigachat::", "gigachat"),
+    ("deepseek::", "deepseek"),
+    ("zai::", "zai"),
     ("openai-compatible::", "openai-compatible"),
     ("openrouter::", "openrouter"),
 )
@@ -22,7 +126,10 @@ PROVIDER_PREFIXES: tuple[tuple[str, str], ...] = (
 PROVIDER_ENV_KEYS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "cloudru": "CLOUDRU_FOUNDATION_MODELS_API_KEY",
+    "deepseek": "DEEPSEEK_API_KEY",
+    "zai": "ZAI_API_KEY",
     "openrouter": "OPENROUTER_API_KEY",
 }
 
@@ -46,7 +153,10 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
     "openrouter": ("OPENROUTER_API_KEY",),
     "openai": ("OPENAI_API_KEY",),
     "anthropic": ("ANTHROPIC_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY", "MINIMAX_REGION"),
     "cloudru": ("CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL"),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "zai": ("ZAI_API_KEY", "ZAI_PLAN"),
     "gigachat": (
         "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD", "GIGACHAT_USER",
         "GIGACHAT_BASE_URL", "GIGACHAT_SCOPE", "GIGACHAT_VERIFY_SSL_CERTS",
@@ -56,27 +166,34 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
         "OPENAI_API_KEY", "OPENAI_BASE_URL",
     ),
     "local": (),
+    # The owned engine holds credentials; no control token reaches model settings/env.
+    "claudexor": (),
 }
 
-# Settings keys that hold a ROUTED model identity (prefix -> provider via provider_for_model).
+# Active settings keys that hold a ROUTED model identity (prefix -> provider via
+# provider_for_model). Heavy is a bounded migration/history input, not a live
+# route selector; keeping the split here prevents new consumers (including
+# Provider Test) from accidentally resurrecting it.
 # Superset of the live slots; a key absent from settings still declares whatever
 # ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
 # fills the defaults in rather than treating "unset" as "unused".
-MODEL_SETTING_KEYS: tuple[str, ...] = (
-    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT",
+ACTIVE_MODEL_SETTING_KEYS: tuple[str, ...] = (
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
     "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
 )
+LEGACY_MODEL_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_MODEL_HEAVY",)
+# Compatibility import name. Its meaning is now explicitly the active set.
+MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 
 # Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
 # NOT a routed model identity: they carry no provider prefix, so provider_for_model would
 # mis-route them to OpenRouter.  Their transport is the Anthropic SDK subprocess, which
-# authenticates with ANTHROPIC_API_KEY (tools/shell.py claude_code_edit,
+# authenticates with ANTHROPIC_API_KEY (the Claude runtime gateways:
 # tools/claude_advisory_review.py), so a non-empty value DECLARES the anthropic provider.
-CLAUDE_SDK_MODEL_SETTING_KEYS: tuple[str, ...] = ("CLAUDE_CODE_MODEL", "CLAUDE_AGENT_SDK_MODEL")
 
 
 def provider_for_model(model: str) -> str:
@@ -90,22 +207,121 @@ def provider_for_model(model: str) -> str:
     return "openrouter"
 
 
+# Physical per-request ceilings on tool schemas, by execution provider; a provider
+# absent here has no known ceiling. OpenAI's own API refuses a longer `tools` array
+# (400 array_above_max_length); the same models through OpenRouter accepted 129
+# (provider canary, CI run 37204372307, 2026-10-04).
+PROVIDER_TOOL_SCHEMA_LIMITS: dict[str, int] = {"openai": 128}
+
+
+def tool_schema_limit(model: str, *, use_local: bool = False) -> int | None:
+    """The route's ceiling on tool schemas in one request, or None when none is known."""
+    return None if use_local else PROVIDER_TOOL_SCHEMA_LIMITS.get(provider_for_model(model))
+
+
+def parse_claudexor_model(model: str) -> tuple[str, str]:
+    """Split the model transport's opaque source and model, never an account pin."""
+    if not str(model).startswith("claudexor::"):
+        raise ValueError("Not a Claudexor model identity")
+    source, separator, native_model = str(model)[len("claudexor::"):].partition("=")
+    if not separator or not source.strip() or not native_model.strip():
+        raise ValueError("Claudexor models use claudexor::<source>=<model>")
+    return source.strip(), native_model.strip()
+
+
+def resolve_model_target(
+    model: str,
+    *,
+    effort: str = "",
+    credential_ref: str = "",
+    context_window: int = 0,
+) -> ResolvedModelTarget:
+    """Construct the ABI-4 typed target at an EXISTING resolution seam.
+
+    Wraps what the resolution already computed (reuse-first): the transport
+    lane comes from ``provider_for_model``, and the optional facts keep their
+    typed sentinels unless the calling seam genuinely resolved them. No
+    parallel resolver, no pricing, no window probing — a context window is
+    Capability Evidence's fact (0 = unknown, fail-open).
+    """
+    model_id = str(model or "").strip()
+    return ResolvedModelTarget(
+        model_id=model_id,
+        provider_route=provider_for_model(model_id),
+        credential_ref=str(credential_ref or "").strip(),
+        effort=str(effort or "").strip(),
+        context_window=max(0, int(context_window or 0)),
+    )
+
+
+def fallback_candidate_targets(active_model: str = "", *, preserve_slots: bool = False) -> tuple[ResolvedModelTarget, ...]:
+    """The cross-model fallback candidate ladder as typed targets (ABI-4).
+
+    Same membership and order as ``model_slots.get_fallback_models`` — a typed
+    view over the ONE chain SSOT, not a second resolver. ``preserve_slots`` keeps
+    repeated model ids so callers can compare their distinct configured account bindings.
+    Effort stays the ""
+    sentinel: the ladder resolves destinations, the dispatching round owns the
+    active effort. ``provider_route`` stays the ``""`` sentinel DELIBERATELY:
+    the chain's local-vs-remote dispatch lane is the loop's single global
+    ``USE_LOCAL_FALLBACK`` flag (the pre-existing contract, byte-identical
+    through the ABI-4 sweep), so a per-candidate route here would be a
+    fabricated fact no dispatcher consumes.
+    """
+    from ouroboros.model_slots import get_fallback_models, parse_fallback_chain
+
+    return tuple(
+        ResolvedModelTarget(model_id=model, provider_route="")
+        for model in (parse_fallback_chain() if preserve_slots else get_fallback_models(active_model))
+    )
+
+
 def provider_has_credentials(provider: str) -> bool:
-    """Return True when the environment carries usable credentials for a provider."""
+    """Whether a route is configured; a managed engine's live readiness is separate."""
+    if provider == "claudexor":
+        return True  # A selected engine route needs no API key in Ouroboros.
     if provider == "local":
         return True
     if provider == "openai-compatible":
-        compat = str(os.environ.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-        legacy_key = str(os.environ.get("OPENAI_API_KEY", "") or "").strip()
-        legacy_base = str(os.environ.get("OPENAI_BASE_URL", "") or "").strip()
+        compat = str(runtime_setting("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
+        legacy_key = str(runtime_setting("OPENAI_API_KEY", "") or "").strip()
+        legacy_base = str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
         return bool(compat or (legacy_key and legacy_base))
     if provider == "gigachat":
-        creds = str(os.environ.get("GIGACHAT_CREDENTIALS", "") or "").strip()
-        user = str(os.environ.get("GIGACHAT_USER", "") or "").strip()
-        password = str(os.environ.get("GIGACHAT_PASSWORD", "") or "").strip()
+        creds = str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip()
+        user = str(runtime_setting("GIGACHAT_USER", "") or "").strip()
+        password = str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
         return bool(creds or (user and password))
     env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
-    return bool(str(os.environ.get(env_key, "") or "").strip())
+    return bool(str(runtime_setting(env_key, "") or "").strip())
+
+
+def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
+    """Mapping-based twin used by pure config/default compilers (no ambient env)."""
+    def get(key: str) -> str:
+        return str((settings or {}).get(key, "") or "").strip()
+
+    if provider == "claudexor":
+        return True  # Selection declares the route; never persist a synthetic healthy bit.
+
+    if provider == "local":
+        return bool(get("LOCAL_MODEL_SOURCE"))
+    if provider == "openai-compatible":
+        return bool(
+            get("OPENAI_COMPATIBLE_BASE_URL")
+            or (get("OPENAI_API_KEY") and get("OPENAI_BASE_URL"))
+        )
+    if provider == "gigachat":
+        return bool(
+            get("GIGACHAT_CREDENTIALS")
+            or (get("GIGACHAT_USER") and get("GIGACHAT_PASSWORD"))
+        )
+    env_key = PROVIDER_ENV_KEYS.get(provider, "OPENROUTER_API_KEY")
+    return bool(get(env_key))
+
+
+def model_has_credentials_in_settings(model: str, settings: dict) -> bool:
+    return provider_has_credentials_in_settings(provider_for_model(model), settings)
 
 
 def model_has_credentials(model: str) -> bool:
@@ -115,14 +331,14 @@ def model_has_credentials(model: str) -> bool:
 
 def local_only_review_route_env() -> bool:
     """Whether review slots must inherit the configured local Main route."""
-    local_main = str(os.environ.get("USE_LOCAL_MAIN", "") or "").strip().lower()
+    local_main = str(runtime_setting("USE_LOCAL_MAIN", "") or "").strip().lower()
     if local_main not in {"1", "true", "yes", "on"}:
         return False
     return not any(
         provider_has_credentials(provider)
         for provider in (
-            "openrouter", "openai", "anthropic", "cloudru", "gigachat",
-            "openai-compatible",
+            "openrouter", "openai", "anthropic", "minimax", "cloudru", "gigachat",
+            "deepseek", "zai", "openai-compatible",
         )
     )
 
@@ -135,23 +351,21 @@ def review_model_uses_local(model: str) -> bool:
 def resolve_credentialed_model(default_model: str) -> str:
     """Return ``default_model`` if its provider is credentialed, else the first
     configured model slot whose provider has credentials (light → fallback →
-    main → heavy). Falls back to ``default_model`` when nothing is credentialed
+    main). Falls back to ``default_model`` when nothing is credentialed
     so callers surface the original provider error rather than a silent swap."""
     if model_has_credentials(default_model):
         return default_model
-    # LIGHT/MAIN/HEAVY are single-model slots; FALLBACKS is a comma chain expanded via the
+    # LIGHT/MAIN are single-model slots; FALLBACKS is a comma chain expanded via the
     # shared SSOT parser (which also honors the legacy singular OUROBOROS_MODEL_FALLBACK)
-    # instead of testing the whole comma-string as one broken model id. Empty Heavy/Light
-    # (default -> Main) simply contribute nothing here. Lazy import: config imports this
-    # module, so importing config at module load would be circular.
-    from ouroboros.config import parse_fallback_chain
+    # instead of testing the whole comma-string as one broken model id. Empty Light
+    # (default -> Main) simply contributes nothing here.
     candidates: list[str] = []
-    light = str(os.environ.get("OUROBOROS_MODEL_LIGHT", "") or "").strip()
+    light = str(runtime_setting("OUROBOROS_MODEL_LIGHT", "") or "").strip()
     if light:
         candidates.append(light)
     candidates.extend(parse_fallback_chain())
-    for env_name in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY"):
-        raw = str(os.environ.get(env_name, "") or "").strip()
+    for env_name in ("OUROBOROS_MODEL",):
+        raw = str(runtime_setting(env_name, "") or "").strip()
         if raw:
             candidates.append(raw)
     for candidate in candidates:
@@ -160,16 +374,20 @@ def resolve_credentialed_model(default_model: str) -> str:
     return default_model
 
 
-def declared_model_settings(settings: dict) -> dict[str, str]:
+def declared_model_settings(
+    settings: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+) -> dict[str, str]:
     """Return the model slots a settings mapping DECLARES, with runtime defaults filled in.
 
     An absent or empty slot is not "unused": the server falls back to
     ``config.SETTINGS_DEFAULTS`` for it, so the default's provider is genuinely reachable and
-    must be declared.  Lazy config import (config imports this module)."""
-    from ouroboros.config import SETTINGS_DEFAULTS
-
+    must be declared.  ``include_claude_sdk_defaults`` is a RETIRED no-op kept for caller
+    compatibility: the Claude-SDK transport and its dedicated model slots are gone, so both
+    values declare the same set."""
     declared: dict[str, str] = {}
-    for key in (*MODEL_SETTING_KEYS, *CLAUDE_SDK_MODEL_SETTING_KEYS):
+    for key in MODEL_SETTING_KEYS:
         value = str((settings or {}).get(key) or "").strip()
         if not value:
             value = str(SETTINGS_DEFAULTS.get(key) or "").strip()
@@ -187,9 +405,6 @@ def providers_for_declared_models(declared: dict) -> dict[str, list[str]]:
     for key, raw in (declared or {}).items():
         text = str(raw or "").strip()
         if not text:
-            continue
-        if str(key) in CLAUDE_SDK_MODEL_SETTING_KEYS:
-            found.setdefault("anthropic", set()).add(text)
             continue
         for part in text.split(","):
             model = part.strip()
@@ -218,13 +433,19 @@ ALL_PROVIDER_CREDENTIAL_KEYS: frozenset[str] = frozenset(
 )
 
 
-def provider_credential_plan(settings: dict) -> dict:
+def provider_credential_plan(
+    settings: dict,
+    *,
+    include_claude_sdk_defaults: bool = True,
+) -> dict:
     """Derive WHICH provider credentials a settings mapping's declared models actually need.
 
     Returns ``{declared_model_slots, providers, planned_keys, fail_open}``.  ``fail_open`` is
     the disclosed escape hatch: when nothing resolves (a settings mapping with no model slot
     at all) the plan is the FULL credential universe, because a benchmark that dies on a
-    missing key at hour six is worse than one that carries a spare."""
+    missing key at hour six is worse than one that carries a spare.  The optional
+    ``include_claude_sdk_defaults`` switch is RETIRED (no-op): the Claude-SDK transport and
+    its dedicated model slots are gone, so both values produce the same plan."""
     declared = declared_model_settings(settings)
     providers = providers_for_declared_models(declared)
     planned = credential_keys_for_providers(providers)
@@ -241,9 +462,9 @@ def provider_credential_plan(settings: dict) -> dict:
 
 OPENAI_DIRECT_DEFAULTS = {
     "main": "openai::gpt-5.6-terra",
-    "heavy": "openai::gpt-5.6-sol",
+    "heavy": "",
     "light": "openai::gpt-5.6-luna",
-    "fallback": "openai::gpt-5.6-luna",
+    "fallback": "openai::gpt-5.6-sol",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0). Only providers whose
@@ -251,15 +472,13 @@ OPENAI_DIRECT_DEFAULTS = {
     # Cloud.ru and GigaChat are documented BELOW that floor, so filling their slot
     # would advertise a deep review that is doomed to overflow its real route.
     #
-    # DELIBERATELY plain Sol, NOT the OpenRouter default's `-pro`: that suffix is an
-    # OpenRouter slug, not an OpenAI model id. Live-probed 2026-07-29 against
-    # api.openai.com: `gpt-5.6-sol-pro` on /v1/chat/completions -> 404; the pro
+    # Plain Sol, the same model the OpenRouter default names. A `-pro` suffix is an
+    # OpenRouter routing slug, not an OpenAI model id: live-probed 2026-07-29 against
+    # api.openai.com, `gpt-5.6-sol-pro` on /v1/chat/completions -> 404; the pro
     # reasoning mode exists only on /v1/responses as `reasoning.mode="pro"` (200),
     # and passing `reasoning` to /v1/chat/completions -> 400 "Unknown parameter".
-    # Every LLM call in llm.py is a chat.completions call, so a direct-OpenAI
-    # install runs deep review on plain Sol — an owner-accepted capability
-    # difference from the OpenRouter default, disclosed in README/ARCHITECTURE
-    # rather than papered over with a slug that does not exist.
+    # Every LLM call in llm.py is a chat.completions call, so an owner's pinned
+    # `-pro` slug lands here too (deep_self_review.deep_review_route).
     "deep_self_review": "openai::gpt-5.6-sol",
 }
 
@@ -280,22 +499,86 @@ GIGACHAT_DIRECT_DEFAULTS = {
     "fallback": "gigachat::GigaChat-2-Max",
 }
 
+MINIMAX_DIRECT_DEFAULTS = {
+    "main": "minimax::MiniMax-M3",
+    "heavy": "minimax::MiniMax-M3",
+    "light": "minimax::MiniMax-M2.7",
+    "fallback": "minimax::MiniMax-M2.7",
+    # NO deep_self_review default: MiniMax documents M3 as "up to 1M tokens" with a
+    # GUARANTEED minimum of 512K (platform.minimax.io, 2026-08). Deep review sizes
+    # against a firm 1M window, so the guaranteed floor decides — the slot follows
+    # the Cloud.ru/GigaChat clear-instead-of-fill path; owners can opt in manually.
+}
+
+ZAI_DIRECT_DEFAULTS = {
+    "main": "zai::glm-5.3",
+    "heavy": "",
+    "light": "zai::glm-5.3-flash",
+    "vision": "",
+    "fallback": "zai::glm-5.3-flash",
+    # No deep_review default: the route publishes no window metadata and no live
+    # measurement exists, so the slot follows the MiniMax clear-instead-of-fill path.
+}
+
+DEEPSEEK_DIRECT_DEFAULTS = {
+    "main": "deepseek::deepseek-v4-pro",
+    "heavy": "",
+    "light": "deepseek::deepseek-v4-flash",
+    "fallback": "deepseek::deepseek-v4-flash",
+    # DeepSeek documents a FIRM 1M context on every v4 model (api-docs
+    # 2026-08: "1M context, 384K max output" with no guaranteed-minimum
+    # caveat), so the slot follows the OpenAI/Anthropic fill pattern rather
+    # than the MiniMax clear-instead-of-fill path (whose guaranteed floor was
+    # 512K). The route's /models endpoint publishes NO window metadata, so the
+    # sizing remains evidence-driven; a missing window measurement does not
+    # remove review authority (see ARCHITECTURE §7).
+    "deep_self_review": "deepseek::deepseek-v4-pro",
+    # No vision default: deepseek-v4-flash-vision-exp is experimental; it is
+    # recognized by supports_vision() for explicit owner selection only.
+}
+
 ANTHROPIC_DIRECT_DEFAULTS = {
-    "main": "anthropic::claude-sonnet-5",
-    "heavy": "anthropic::claude-opus-5",
+    "main": "anthropic::claude-opus-5",
+    "heavy": "",
     "light": "anthropic::claude-sonnet-5",
-    "fallback": "anthropic::claude-opus-4-6",
+    "fallback": "anthropic::claude-sonnet-5",
     # Deep self-review is a real slot with a SHIPPED default; without a
     # per-provider value a direct-only install keeps an unreachable
     # OpenRouter-form id it has no credential for (v6.82.0).
     "deep_self_review": "anthropic::claude-opus-5",
 }
 
-_DIRECT_PROVIDER_DEFAULTS = {
+DIRECT_PROVIDER_DEFAULTS = {
     "openai": OPENAI_DIRECT_DEFAULTS,
     "anthropic": ANTHROPIC_DIRECT_DEFAULTS,
     "cloudru": CLOUDRU_DIRECT_DEFAULTS,
     "gigachat": GIGACHAT_DIRECT_DEFAULTS,
+    "minimax": MINIMAX_DIRECT_DEFAULTS,
+    "deepseek": DEEPSEEK_DIRECT_DEFAULTS,
+    "zai": ZAI_DIRECT_DEFAULTS,
+}
+
+# Review panels are declared as provider ROLE sequences, then compiled against
+# the owner's current provider-prefixed Main/Light values. This keeps explicit
+# custom models useful while making the shipped single-provider policy obvious:
+# OpenAI and Anthropic run their strongest Main model three independent times.
+# The older MiniMax mixed panel is preserved because that profile was not part of
+# this policy change.
+DIRECT_PROVIDER_REVIEW_ROLES = {
+    "openai": ("main", "main", "main"),
+    "anthropic": ("main", "main", "main"),
+    "cloudru": ("main", "main", "main"),
+    "gigachat": ("main", "main", "main"),
+    "minimax": ("main", "light", "light"),
+    # Strongest-main ×3 policy (same as OpenAI/Anthropic): an exclusive
+    # DeepSeek install reviews with three independent thinking v4-pro calls.
+    "deepseek": ("main", "main", "main"),
+    "zai": ("main", "main", "main"),
+}
+
+DIRECT_PROVIDER_SCOPE_DEFAULTS = {
+    provider: defaults["main"]
+    for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
 }
 
 _ANTHROPIC_MODEL_ALIASES = {
@@ -329,7 +612,51 @@ def migrate_model_value(provider: str, value: str) -> str:
         if text.startswith("cloudru/"):
             return f"cloudru::{text[len('cloudru/'):]}"
         return text
+    if provider == "minimax":
+        if text.startswith("minimax::"):
+            return text
+        if text.startswith("minimax/"):
+            return f"minimax::{text[len('minimax/'):]}"
+        return text
+    if provider == "deepseek":
+        if text.startswith("deepseek::"):
+            return text
+        if text.startswith("deepseek/"):
+            return f"deepseek::{text[len('deepseek/'):]}"
+        return text
+    if provider == "zai":
+        if text.startswith("zai/"):
+            return f"zai::{text[len('zai/'):]}"
+        return text
     return text
+
+
+# Every credential that gives an install a remote route other than the
+# OpenAI-compatible endpoint (the direct providers, OpenRouter, the legacy base).
+_NON_COMPATIBLE_REMOTE_KEYS = (
+    "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY",
+    "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS",
+)
+
+
+def compatible_only_main_model(settings: Mapping[str, Any]) -> str:
+    """Main's exact ``openai-compatible::`` route when that endpoint is the install's
+    ONLY remote provider, else ''.
+
+    #1116: the shipped reviewer defaults are OpenRouter ids such an install cannot
+    reach, and the direct-provider remap deliberately excludes the compatible
+    endpoint. Review defaults then use the one model this install demonstrably
+    pays for — never a guessed id from another provider (less diversity, disclosed).
+    """
+    def text(key: str) -> str:
+        return str(settings.get(key) or "").strip()
+
+    if not text("OPENAI_COMPATIBLE_BASE_URL") or any(text(key) for key in _NON_COMPATIBLE_REMOTE_KEYS):
+        return ""
+    if text("GIGACHAT_USER") and text("GIGACHAT_PASSWORD"):
+        return ""
+    main = text("OUROBOROS_MODEL")
+    return main if main.startswith("openai-compatible::") else ""
 
 
 def compute_direct_review_models_fallback(
@@ -339,23 +666,21 @@ def compute_direct_review_models_fallback(
     *,
     review_runs: int = 3,
 ) -> list[str]:
-    """Return direct-provider review fallback preserving commit-triad shape.
-
-    The quorum-safe shape is ``[main, light, light]`` when main/light are
-    distinct provider-prefixed lanes; otherwise it degrades to ``[main] * N``.
-    """
-    if provider not in _DIRECT_PROVIDER_DEFAULTS:
+    """Compile a direct-provider review panel from declarative role names."""
+    if provider not in DIRECT_PROVIDER_DEFAULTS:
         return []
     provider_prefix = f"{provider}::"
     main = migrate_model_value(provider, main_model)
     if not main.startswith(provider_prefix):
         return []
     light = migrate_model_value(provider, light_model) if light_model else ""
-    default_light = migrate_model_value(provider, _DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
+    default_light = migrate_model_value(provider, DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
     light_slot = light if light.startswith(provider_prefix) else default_light
-    if light_slot and light_slot != main:
-        return [main, light_slot, light_slot]
-    return [main] * int(review_runs or 3)
+    role_models = {"main": main, "light": light_slot or main}
+    roles = DIRECT_PROVIDER_REVIEW_ROLES.get(provider, ("main", "light", "light"))
+    compiled = [role_models.get(role, main) for role in roles]
+    count = max(1, int(review_runs or 3))
+    return [compiled[index % len(compiled)] for index in range(count)]
 
 
 # Conservative static vision map by normalized id/prefix. The OpenRouter
@@ -368,6 +693,11 @@ _VISION_MODEL_PREFIXES: tuple[str, ...] = (
     "qwen/qwen-vl", "qwen/qwen2.5-vl", "qwen/qwen3-vl",
     "mistralai/pixtral", "meta-llama/llama-4", "meta-llama/llama-3.2-90b-vision",
     "openai/gpt-5.5",
+    # Narrow on purpose: only the dedicated vision variant. Plain deepseek
+    # chat/v4 ids stay non-vision (pinned by tests), and this slash-form
+    # normalized id also names a real OpenRouter vendor namespace — the
+    # OpenRouter /models overlay may refine exact ids either way.
+    "deepseek/deepseek-v4-flash-vision",
 )
 
 # Runtime overlay: model_id → bool, fed from OpenRouter /models
@@ -382,12 +712,41 @@ def update_vision_overlay(model_id: str, supports: bool) -> None:
         _VISION_OVERLAY[normalized] = bool(supports)
 
 
-def supports_vision(model_id: str) -> bool:
-    """True when the model accepts native image input blocks."""
+def supports_vision(model_id: str, *, model_role: str = "",
+                    model_account_override: str | None = None) -> bool | None:
+    """Image capability; None means unavailable subscription metadata, not blindness.
+
+    Subscription metadata belongs to this call's role/account, never the global
+    model-id overlay. Image senders preserve input when that fact is unknown;
+    the actual call can start the engine and return its normal typed refusal.
+    Metadata discovery itself must not start it or buy a model generation.
+    """
     # Local lanes have no vision regardless of family name; check the RAW id —
     # normalize_model_identity strips the " (local)" suffix.
     if str(model_id or "").strip().endswith(" (local)"):
         return False
+    if provider_for_model(model_id) == "claudexor":
+        from ouroboros.gateways.claudexor import ClaudexorUnavailable
+        from ouroboros.llm import LLMClient
+        from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
+        from ouroboros.model_wait import current_model_wait
+
+        source, native_model = parse_claudexor_model(model_id)
+        wait = current_model_wait()
+        if model_account_override is None and wait is not None:
+            model_account_override = wait.overrides.get(model_role, {}).get("model_account_override")
+        account = (model_account_override if model_account_override is not None
+                   else model_role_option(MODEL_ACCOUNTS_KEY, model_role))
+        try:
+            catalog = LLMClient.claudexor_model_catalog(
+                source, account or None, requested_model=native_model)
+        except ClaudexorUnavailable:
+            return None
+        if catalog.get("source") != source or (account and catalog.get("credentialProfileId") != account):
+            return None
+        item = next((row for row in catalog.get("models", []) if row.get("id") == native_model), {})
+        modalities = item.get("inputModalities")
+        return "image" in modalities if isinstance(modalities, list) and modalities else None
     normalized = normalize_model_identity(model_id)
     if not normalized:
         return False
@@ -416,6 +775,12 @@ def normalize_model_identity(model: str) -> str:
         return f"cloudru/{text[len('cloudru::'):]}"
     if text.startswith("gigachat::"):
         return f"gigachat/{text[len('gigachat::'):]}"
+    if text.startswith("minimax::"):
+        return f"minimax/{text[len('minimax::'):]}"
+    if text.startswith("deepseek::"):
+        return f"deepseek/{text[len('deepseek::'):]}"
+    if text.startswith("zai::"):
+        return f"zai/{text[len('zai::'):]}"
     if text.startswith("anthropic::"):
         return f"anthropic/{normalize_anthropic_model_id(text[len('anthropic::'):])}"
     if text.startswith("anthropic/"):

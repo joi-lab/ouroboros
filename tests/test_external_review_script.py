@@ -1,45 +1,102 @@
 from __future__ import annotations
 
+import json
+import hashlib
 import os
 import subprocess
+import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+from scripts.contributor_review_evidence import finalize_contributor_outcome
 from scripts.run_external_review import (
     _REVIEW_SUBSTRATE_PATHS,
     _apply_contributor_landing_obligations,
     _apply_contributor_review_env,
-    _assert_contributor_openrouter_config,
+    _assert_contributor_review_config,
     _classify_exit,
+    _configured_openrouter_models,
     _contributor_snapshot,
+    _contributor_execution_receipts,
+    _contributor_result,
     _create_isolated_checkout,
+    _run_on_trusted_base,
+    _freeze_contributor_slots,
     _openrouter_key_health,
     _openrouter_pool,
     _remove_isolated_checkout,
     _require_contributor_budget,
+    _prepare_review_configuration,
     _resolved_review_config,
     _review_evidence_and_cost,
     _select_healthy_openrouter_key,
-    _settings_defaults_at_ref,
     _write_contributor_packet,
 )
+
+
+@pytest.mark.parametrize('delivery,refused', [('native', False), ('packet', True), ('', True)])
+def test_contributor_config_roundtrip_keeps_direct_api_delivery(monkeypatch, delivery, refused):
+    from scripts.run_external_review import _diff_size_refusal, _slot_plan_payload
+    from ouroboros.reviewer_slot_config import parse_reviewer_slots, triad_delivery_slots
+
+    row = {'slot_id': 't', 'route': {'kind': 'api_chat', 'target_id': 'openai/test'}}
+    if delivery:
+        row['delivery'] = delivery
+    monkeypatch.setenv('OUROBOROS_REVIEWER_SLOTS', json.dumps({
+        'triad': [row], 'scope': [{'slot_id': 's', 'route': row['route']}]}))
+    resolved = _resolved_review_config()
+    assert resolved['triad_slots'][0].get('delivery', '') == delivery
+    stored = parse_reviewer_slots(json.dumps(_slot_plan_payload(resolved)))
+    assert triad_delivery_slots(config=stored)[0].retrieves is (not refused)
+    assert _diff_size_refusal(SimpleNamespace(contributor=True), resolved, 101, 100) is refused
+    assert _diff_size_refusal(SimpleNamespace(contributor=True), resolved, 100, 100) is False
+    assert _diff_size_refusal(SimpleNamespace(contributor=False), resolved, 101, 100) is True
+
+
+def test_contributor_mixed_panel_keeps_packet_limit():
+    from scripts.run_external_review import _diff_size_refusal
+
+    rows = [{'route': {'kind': 'api_chat'}, 'delivery': 'native'},
+            {'route': {'kind': 'agent_session'}},
+            {'route': {'kind': 'api_chat'}, 'subagent_id': 'reader'}]
+    args = SimpleNamespace(contributor=True)
+    assert not _diff_size_refusal(args, {'triad_slots': rows}, 101, 100)
+    assert _diff_size_refusal(args, {'triad_slots': rows + [{'route': {'kind': 'api_chat'}}]}, 101, 100)
 
 
 def test_contributor_trust_boundary_covers_functional_review_dependencies():
     from ouroboros.tools.scope_review import _CANONICAL_CONTEXT_DOCS
 
-    assert set(_CANONICAL_CONTEXT_DOCS).issubset(_REVIEW_SUBSTRATE_PATHS)
+    assert set(_CANONICAL_CONTEXT_DOCS) <= _REVIEW_SUBSTRATE_PATHS and "docs/DESIGN.md" in _CANONICAL_CONTEXT_DOCS
     assert {
         "docs/ARCHITECTURE.md",
         "ouroboros/capability_evidence.py",
         "ouroboros/code_intelligence.py",
+        "ouroboros/claudexor_daemon.py",
         "ouroboros/deadline_utils.py",
+        "ouroboros/delegate_custody.py",
+        "ouroboros/delegate_custody_usage.py",
+        "ouroboros/delegate_output.py",
+        "ouroboros/gateways/claudexor.py",
         "ouroboros/outcomes.py",
+        "ouroboros/openrouter_attribution.py",
         "ouroboros/platform_layer.py",
         "ouroboros/pricing.py",
+        # The v6.87.21 seam split moved route vocabulary, transport dispatch and
+        # api_chat prompt rendering BELOW the substrate into review_execution.py;
+        # a PR editing the route/executor seam there must still trip a trusted
+        # rerun, exactly as one editing review_substrate.py does (XG-5R4.1).
+        "ouroboros/review_execution.py",
+        "ouroboros/review_actor_aggregation.py",
+        "ouroboros/review_dispatch.py",
+        "ouroboros/review_slot_cancel.py",
+        "ouroboros/review_evidence.py",
+        "ouroboros/reviewer_slot_config.py",
+        "ouroboros/reviewer_window.py",
+        "ouroboros/review_substrate.py",
         "ouroboros/review_state.py",
         "ouroboros/runtime_mode_policy.py",
         "ouroboros/usage_accounting.py",
@@ -48,6 +105,14 @@ def test_contributor_trust_boundary_covers_functional_review_dependencies():
         "ouroboros/tools/registry.py",
         "ouroboros/tools/release_sync.py",
         "ouroboros/tools/review_synthesis.py",
+        "ouroboros/tools/review_binary_context.py",
+        "ouroboros/tools/scope_review_session.py",
+        "ouroboros/tools/scope_window.py",
+        "ouroboros/subagents.py",
+        "ouroboros/review_native_episode.py",
+        "ouroboros/review_verdict_extraction.py",
+        "ouroboros/review_execution_projection.py",
+        "scripts/contributor_review_evidence.py",
     }.issubset(_REVIEW_SUBSTRATE_PATHS)
 
 
@@ -61,7 +126,8 @@ def test_external_review_script_delegates_verdict_to_production_gate():
     # The default operator lane still runs the REAL advisory. Contributor mode
     # explicitly skips it while reusing the production triad+scope cycle.
     assert "operator_binding" not in source
-    assert "_handle_advisory_pre_review" in source
+    assert "_handle_advisory_pre_review" not in source
+    assert '"advisory.txt"' in source
     assert "skip_advisory_review=args.contributor" in source
     assert "_CONTRIBUTOR_PROFILE = \"external_pr_readiness\"" in source
 
@@ -69,6 +135,44 @@ def test_external_review_script_delegates_verdict_to_production_gate():
 def test_external_review_script_defaults_to_pro_mode():
     source = Path("scripts/run_external_review.py").read_text(encoding="utf-8")
     assert 'setdefault("OUROBOROS_RUNTIME_MODE", "pro")' in source
+
+
+def test_external_review_advisory_warning_uses_safe_canonical_reason(monkeypatch):
+    import scripts.run_external_review as module
+    from ouroboros.tools import claude_advisory_review as advisory
+
+    monkeypatch.setattr(
+        advisory,
+        "advisory_gate_unavailability_reason",
+        lambda: "agent_session_route_unavailable",
+    )
+    warning = module._advisory_unavailability_warning()
+    assert "agent_session_route_unavailable" in warning
+    assert advisory.ADVISORY_REVIEW_CHOICE_GUIDANCE in warning
+    assert "ANTHROPIC_API_KEY" not in warning
+
+    secret_error = "secret-setting-value-must-not-leak"
+
+    def _malformed():
+        raise ValueError(secret_error)
+
+    monkeypatch.setattr(advisory, "advisory_gate_unavailability_reason", _malformed)
+    warning = module._advisory_unavailability_warning()
+    assert "invalid_advisory_configuration" in warning
+    assert secret_error not in warning
+
+
+def test_external_review_checks_advisory_after_settings_load_without_key_heuristic():
+    import inspect
+    import scripts.run_external_review as module
+
+    main_source = inspect.getsource(module.main)
+    prepare_source = inspect.getsource(module._prepare_review_configuration)
+    assert main_source.index("_prepare_review_configuration(args)") < main_source.index(
+        "_advisory_unavailability_warning()"
+    )
+    assert "_load_settings_into_env()" in prepare_source
+    assert 'if not os.environ.get("ANTHROPIC_API_KEY"' not in main_source
 
 
 def test_external_review_script_resolves_models_and_efforts(monkeypatch):
@@ -85,12 +189,13 @@ def test_external_review_script_resolves_models_and_efforts(monkeypatch):
         "OUROBOROS_MODEL_LIGHT",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
     monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "anthropic/claude-opus-4.8,google/gemini-3.5-flash,openai/gpt-5.5")
     monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_MODELS", "openai/gpt-5.5")
     monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "high")
     monkeypatch.setenv("OUROBOROS_EFFORT_SCOPE_REVIEW", "high")
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
 
     config = _resolved_review_config()
 
@@ -99,9 +204,10 @@ def test_external_review_script_resolves_models_and_efforts(monkeypatch):
         "google/gemini-3.5-flash",
         "openai/gpt-5.5",
     ]
-    assert config["triad_effort"] == "high"
+    assert config["triad_efforts"] == ["high", "high", "high"]
     assert config["scope_models"] == ["openai/gpt-5.5"]
-    assert config["scope_effort"] == "high"
+    assert config["scope_efforts"] == ["high"]
+    assert all(row["route"]["kind"] == "api_chat" for row in config["triad_slots"])
     assert config["review_enforcement"] == "blocking"
     # v6.80.0: the scope-review floor key is gone; the operator line pins the context
     # mode instead, because that is now what decides scope-review applicability.
@@ -129,9 +235,21 @@ def _init_contributor_repo(tmp_path: Path, monkeypatch) -> Path:
     _git(repo, "config", "user.email", "test@example.com")
     _git(repo, "config", "user.name", "Test")
     _git(repo, "config", "core.autocrlf", "false")
+    # Same ignores as the real repository: importing from a checkout writes
+    # bytecode into it, which would otherwise read as an unclean worktree.
+    (repo / ".gitignore").write_text("__pycache__/\n*.pyc\n", encoding="utf-8")
     (repo / "scripts").mkdir()
-    (repo / "scripts" / "run_external_review.py").write_text("# base script\n", encoding="utf-8")
+    (repo / "scripts" / "run_external_review.py").write_text(
+        _BASE_SIDE_PROBE, encoding="utf-8"
+    )
     _write_target_config(repo)
+    # A real (not namespace) package, so a wrapper executed out of this repo
+    # imports its module-level dependency from here and not from whatever
+    # ouroboros the host interpreter happens to have installed.
+    (repo / "ouroboros" / "__init__.py").write_text("", encoding="utf-8")
+    (repo / "ouroboros" / "openrouter_attribution.py").write_text(
+        "OPENROUTER_APP_HEADERS: dict = {}\n", encoding="utf-8"
+    )
     (repo / "ouroboros" / "review_substrate.py").write_text(
         "# trusted review substrate\n", encoding="utf-8"
     )
@@ -146,6 +264,38 @@ def _init_contributor_repo(tmp_path: Path, monkeypatch) -> Path:
         '[project]\nname = "test-project"\nversion = "1.2.3"\n',
         encoding="utf-8",
     )
+    (repo / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "ouroboros"\nversion = "1.2.3"\n'
+        'source = { editable = "." }\n',
+        encoding="utf-8",
+    )
+    (repo / "web" / "modules").mkdir(parents=True)
+    (repo / "web" / "package.json").write_text(
+        '{"name":"ouroboros-ui","version":"1.2.3"}\n', encoding="utf-8"
+    )
+    (repo / "web" / "modules" / "api_types.js").write_text(
+        'export const GATEWAY_CONTRACT_VERSION = "1.2.3";\n', encoding="utf-8"
+    )
+    (repo / "README.md").write_text(
+        "[![Version 1.2.3](https://example.test/version.svg)](#)\n\n"
+        "[download-macos-arm64]: https://example.test/v1.2.3/Ouroboros-1.2.3.dmg\n\n"
+        "## Version History\n\n| 1.2.3 | Current |\n",
+        encoding="utf-8",
+    )
+    (repo / "docs").mkdir()
+    (repo / "docs" / "ARCHITECTURE.md").write_text(
+        "# Ouroboros v1.2.3\n", encoding="utf-8"
+    )
+    for root in (repo / "site" / "install", repo / "docs" / "install"):
+        root.mkdir(parents=True)
+        (root / "index.html").write_text(
+            '<a href="https://example.test/v1.2.3/Ouroboros-1.2.3.dmg" '
+            'data-release-download="macos-arm64">Download</a>\n'
+            '<a data-release-download="macos-arm64" '
+            'href="https://example.test/v1.2.3/Ouroboros-1.2.3.dmg">'
+            'Quick start</a>\n',
+            encoding="utf-8",
+        )
     (repo / "VERSION").write_text("1.2.3\n", encoding="utf-8")
     (repo / "a.txt").write_text("base\n", encoding="utf-8")
     _git(repo, "add", "-A")
@@ -161,52 +311,327 @@ def _init_contributor_repo(tmp_path: Path, monkeypatch) -> Path:
     return repo
 
 
-def test_target_base_defaults_override_local_review_settings(tmp_path, monkeypatch):
-    _init_contributor_repo(tmp_path, monkeypatch)
-    defaults = _settings_defaults_at_ref("base")
-    # _apply_contributor_review_env writes DIRECTLY to os.environ; register every
-    # key it mutates with monkeypatch FIRST (setenv registers an undo even for a
-    # previously ABSENT key, unlike delenv(raising=False)) so the teardown
-    # restores the pre-test environment. Without this the leaked
-    # OUROBOROS_REVIEW_ENFORCEMENT=blocking (etc.) changed the behavior of
-    # unrelated acceptance/marketplace tests later in the same serial
-    # (hermetic-preflight) process.
-    for _key in (
-        *defaults.keys(),
-        "OUROBOROS_REVIEW_ENFORCEMENT",
-        "OUROBOROS_CONTEXT_MODE",
-        "OUROBOROS_OBSERVABILITY_KEEP_RAW",
-        "OUROBOROS_PRE_PUSH_TESTS",
-        "OUROBOROS_PREFLIGHT_DIFF_AWARE",
-    ):
-        monkeypatch.setenv(_key, "")
-    monkeypatch.setenv("OUROBOROS_REVIEW_MODELS", "local/override")
-    monkeypatch.setenv("OUROBOROS_EFFORT_REVIEW", "low")
+# Stands in for the review script in the seeded repo's BASE commit, so the
+# base-side run is really executed and reports which tree it ran from.
+_BASE_SIDE_PROBE = """import json, os, pathlib, subprocess, sys
 
-    _apply_contributor_review_env(defaults)
+out = os.environ.get("REVIEW_PROBE_OUT", "")
+if out:
+    here = pathlib.Path(__file__).resolve().parents[1]
+    pathlib.Path(out).write_text(json.dumps({
+        "argv": sys.argv[1:],
+        "machinery_sha": subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=str(here),
+            capture_output=True, text=True,
+        ).stdout.strip(),
+        "machinery_root": str(here),
+        # resolve() while the directory still exists: on Windows the child is
+        # spawned with an 8.3 short-name temp cwd (C:\\Users\\RUNNER~1\\...) while
+        # __file__.resolve() reports the long form; both sides are recorded in
+        # the one canonical spelling so the equality below is about identity.
+        "cwd": str(pathlib.Path.cwd().resolve()),
+        "data_dir": os.environ.get("OUROBOROS_DATA_DIR", ""),
+    }), encoding="utf-8")
+raise SystemExit(1)
+"""
 
-    assert defaults["OUROBOROS_REVIEW_MODELS"] == (
-        "anthropic/fable,openai/sol,google/flash"
+
+def _probe_path(monkeypatch, tmp_path: Path) -> Path:
+    probe = tmp_path / "base-side-run.json"
+    monkeypatch.setenv("REVIEW_PROBE_OUT", str(probe))
+    return probe
+
+
+def _forwarded_options(argv: list[str]) -> dict[str, str]:
+    return dict(
+        item[2:].split("=", 1) for item in argv if item.startswith("--") and "=" in item
     )
-    assert os.environ["OUROBOROS_REVIEW_MODELS"] == defaults[
-        "OUROBOROS_REVIEW_MODELS"
-    ]
-    assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "high"
+
+
+@pytest.mark.parametrize(
+    "changed_path",
+    [
+        # A proposal that touches nothing review-related...
+        "a.txt",
+        # ...and proposals that rewrite the review machinery itself take the
+        # SAME path. That identity IS the contract: the lane never asks what a
+        # diff contains before deciding whose review code runs.
+        "ouroboros/review_substrate.py",
+        "scripts/run_external_review.py",
+        # A review-machinery module ABSENT from the evidence hand-list still
+        # executes from the base — the invariant needs no list membership
+        # (the class the retired-then-rotten classifier used to miss). Upstream
+        # later listed review_native_episode.py, so the probe moved to a review
+        # leaf the hand-list still omits.
+        "ouroboros/review_status_projection.py",
+    ],
+)
+def test_contributor_review_always_runs_on_the_trusted_base(
+    tmp_path, monkeypatch, changed_path
+):
+    """Owner decision (2026-08-19): review always runs on the old version.
+
+    The proposal is still the reviewed subject — the base-side run is handed the
+    same base/head commits — but the machinery executing the review is the
+    target base's own, whatever the proposal touches, and the base-side exit
+    code is the review's exit code. The base script really runs here: it reports
+    the tree it was loaded from.
+    """
+    if changed_path == "ouroboros/review_status_projection.py":
+        assert changed_path not in _REVIEW_SUBSTRATE_PATHS
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    path = repo / changed_path
+    path.write_text("# proposal\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", f"proposal touches {changed_path}")
+    base_sha = _git(repo, "rev-parse", "base").strip()
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+
+    exit_code = _run_on_trusted_base(SimpleNamespace(
+        base_ref="base", head_ref="HEAD", commit_message="PR title",
+        goal="goal", scope="scope", output="", drive_root="",
+    ))
+
+    assert exit_code == 1  # the base-side verdict is this review's verdict
+    ran = json.loads(probe.read_text(encoding="utf-8"))
+    assert ran["machinery_sha"] == base_sha != head_sha
+    assert Path(ran["machinery_root"]) != repo
+    assert ran["cwd"] == ran["machinery_root"]
+    assert ran["data_dir"]
+    assert "--contributor" in ran["argv"]
+    # Commits, not refs: a moving ref cannot re-point the trusted run.
+    options = _forwarded_options(ran["argv"])
+    assert options["base-ref"] == base_sha
+    assert options["head-ref"] == head_sha
+    assert ran["argv"][-2:] == ["--", "PR title"]
+    # The trusted worktree is temporary: it is removed once the review returns.
+    assert not Path(ran["machinery_root"]).exists()
+
+
+def test_the_handoff_forwards_artifact_paths_the_child_can_still_reach(
+    tmp_path, monkeypatch
+):
+    """Relative artifact paths must not resolve inside the temporary checkout.
+
+    The child runs with cwd set to the materialized base worktree, which is
+    deleted when the review returns; a verbatim relative --output/--drive-root
+    would put the operator's results there and lose them. They are absolutized
+    against the INVOKING cwd instead. Options travel in equals form so a value
+    starting with "-" reaches the child as a value, not as a broken flag.
+    """
+    _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    _run_on_trusted_base(SimpleNamespace(
+        base_ref="base", head_ref="HEAD", commit_message="-title-like-a-flag",
+        goal="--goal-like-a-flag", scope="-s", output="artifacts/run",
+        drive_root="~/drive",
+    ))
+
+    ran = json.loads(probe.read_text(encoding="utf-8"))
+    options = _forwarded_options(ran["argv"])
+    assert options["output"] == str(tmp_path / "artifacts" / "run")
+    # A quoted "~/..." keeps its home meaning: the parent expands it exactly
+    # the way the in-place lane's own resolution would have.
+    assert options["drive-root"] == os.path.abspath(os.path.expanduser("~/drive"))
+    for key in ("output", "drive-root"):
+        assert not Path(options[key]).is_relative_to(Path(ran["machinery_root"]))
+    # Values that look like flags survive as values.
+    assert options["goal"] == "--goal-like-a-flag"
+    assert options["scope"] == "-s"
+    assert ran["argv"][-2:] == ["--", "-title-like-a-flag"]
+
+
+def test_contributor_review_invoked_from_the_target_base_runs_in_place(
+    tmp_path, monkeypatch
+):
+    """No re-run when the executing tree already IS the target base."""
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    head_sha = _git(repo, "rev-parse", "HEAD").strip()
+    _git(repo, "checkout", "--detach", "base")
+
+    assert _run_on_trusted_base(SimpleNamespace(
+        base_ref="base", head_ref=head_sha, commit_message="",
+        goal="", scope="", output="", drive_root="",
+    )) is None
+    assert not probe.exists()
+
+
+def test_the_real_wrapper_hands_off_before_it_reviews_anything(tmp_path, monkeypatch):
+    """End-to-end pin of the main() wiring, not just the helper.
+
+    The REAL script is invoked as a process from a checkout that is not the
+    target base, exactly as a contributor runs it. Reaching any review work
+    without handing off first would leave the base-side probe unexecuted, so
+    deleting the main() hook fails here even while the helper stays perfect.
+    """
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    wrapper = Path(__file__).resolve().parent.parent / "scripts" / "run_external_review.py"
+    # The base commit keeps the probe; the proposal carries the real wrapper.
+    (repo / "scripts" / "run_external_review.py").write_text(
+        wrapper.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-m", "proposal adopts the real wrapper")
+    base_sha = _git(repo, "rev-parse", "base").strip()
+
+    proc = subprocess.run(
+        [
+            sys.executable, str(repo / "scripts" / "run_external_review.py"),
+            "--contributor", "--base-ref=base", "--head-ref=HEAD", "--", "PR title",
+        ],
+        cwd=str(repo), capture_output=True, text=True, timeout=300,
+        env={**os.environ, "REVIEW_PROBE_OUT": str(probe)},
+    )
+
+    assert probe.exists(), f"the base-side run never happened: {proc.stderr[-2000:]}"
+    ran = json.loads(probe.read_text(encoding="utf-8"))
+    assert ran["machinery_sha"] == base_sha
+    assert proc.returncode == 1  # the probe's exit code, passed through
+
+
+def test_contributor_review_refuses_a_dirty_authoring_worktree(tmp_path, monkeypatch):
+    """The uncommitted half of a proposal must not silently drop out.
+
+    The base-side run sees a freshly materialized (always clean) worktree, so
+    this is read in the authoring worktree before the re-run leaves it.
+    """
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    (repo / "uncommitted.txt").write_text("work in progress\n", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="not clean"):
+        _run_on_trusted_base(SimpleNamespace(
+            base_ref="base", head_ref="HEAD", commit_message="",
+            goal="", scope="", output="", drive_root="",
+        ))
+    assert not probe.exists()
+
+
+def test_a_base_without_the_wrapper_fails_closed_not_in_place(tmp_path, monkeypatch):
+    """The non-portable path keeps the fail-closed maintainer-rerun refusal.
+
+    A target base whose tree carries no review wrapper cannot execute this
+    review; falling back to the proposal's own machinery would be exactly the
+    self-review the handoff exists to prevent, so the lane refuses with the
+    INCOMPLETE_MAINTAINER_TRUSTED_BASE_RERUN_REQUIRED vocabulary instead.
+    """
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    probe = _probe_path(monkeypatch, tmp_path)
+    _git(repo, "rm", "-q", "scripts/run_external_review.py")
+    _git(repo, "commit", "-m", "strip the wrapper")
+    _git(repo, "branch", "-f", "base")
+    (repo / "a.txt").write_text("proposal on wrapperless base\n", encoding="utf-8")
+    _git(repo, "add", "a.txt")
+    _git(repo, "commit", "-m", "proposal")
+
+    import io, contextlib
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err):
+        exit_code = _run_on_trusted_base(SimpleNamespace(
+            base_ref="base", head_ref="HEAD", commit_message="",
+            goal="", scope="", output="", drive_root="",
+        ))
+
+    assert exit_code == 3
+    assert not probe.exists()
+    # F2 close-out conformance (item 7b): the maintainer-facing marker itself
+    # is the contract - exit 3 alone could mean anything.
+    assert "INCOMPLETE_MAINTAINER_TRUSTED_BASE_RERUN_REQUIRED" in err.getvalue()
+
+
+def test_contributor_result_is_decided_by_the_exit_code_alone():
+    """The retired D31 classifier is not a gate anywhere in the outcome path.
+
+    A proposal rewriting the review machinery gets the same result vocabulary as
+    any other, because nothing but the review's exit code reaches this decision.
+    """
+    assert _contributor_result(0) == "READY_FOR_INTEGRATION"
+    assert _contributor_result(1) == "BLOCKED"
+    assert _contributor_result(3) == "INCOMPLETE"
+
+
+def test_contributor_policy_preserves_configured_routes(monkeypatch):
+    payload = {
+        "triad": [
+            {"slot_id": "session", "route": {
+                "kind": "agent_session", "target_id": "codex=gpt-5.6-sol",
+                "profile_id": "account-a"}, "effort": "high"},
+            {"slot_id": "direct", "route": {
+                "kind": "api_chat", "target_id": "anthropic::claude-fable-5"},
+                "effort": "xhigh"},
+        ],
+        "scope": [{"slot_id": "scope", "route": {
+            "kind": "api_chat", "target_id": "openai/gpt-5.6-sol"},
+            "effort": "high"}],
+    }
+    raw = json.dumps(payload)
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", raw)
+    for key in ("OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_CONTEXT_MODE",
+                "OUROBOROS_OBSERVABILITY_KEEP_RAW", "OUROBOROS_PRE_PUSH_TESTS",
+                "OUROBOROS_PREFLIGHT_DIFF_AWARE"):
+        monkeypatch.setenv(key, "")
+
+    _apply_contributor_review_env()
+    config = _resolved_review_config(profile="external_pr_readiness")
+
+    assert os.environ["OUROBOROS_REVIEWER_SLOTS"] == raw
     assert os.environ["OUROBOROS_REVIEW_ENFORCEMENT"] == "blocking"
     assert os.environ["OUROBOROS_OBSERVABILITY_KEEP_RAW"] == "0"
     assert os.environ["OUROBOROS_PRE_PUSH_TESTS"] == "1"
     assert os.environ["OUROBOROS_PREFLIGHT_DIFF_AWARE"] == "false"
+    assert [row["route"]["kind"] for row in config["triad_slots"]] == [
+        "agent_session", "api_chat",
+    ]
+    assert config["triad_slots"][0]["route"]["profile_id"] == "account-a"
+    assert _configured_openrouter_models(config) == ["openai/gpt-5.6-sol"]
+    assert _configured_openrouter_models({
+        "triad_slots": [{"route": {
+            "kind": "api_chat", "target_id": "openrouter::openai/gpt-5.6-sol",
+        }}],
+    }) == ["openai/gpt-5.6-sol"]
+    _assert_contributor_review_config(config)
+    frozen = _freeze_contributor_slots(config)
+    assert frozen["execution_slot_config_source"] == "frozen_structured"
+    assert len(frozen["slot_plan_sha256"]) == 64
+    assert json.loads(os.environ["OUROBOROS_REVIEWER_SLOTS"])["triad"][0][
+        "slot_id"
+    ] == "session"
 
 
-def test_contributor_defaults_reject_explicit_direct_provider_route(monkeypatch):
-    defaults = {
-        "OUROBOROS_REVIEW_MODELS": "anthropic::claude-fable-5",
-        "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
-        "OUROBOROS_EFFORT_REVIEW": "high",
-        "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
+def test_agent_session_only_preflight_needs_no_api_budget_or_key(monkeypatch):
+    import scripts.run_external_review as module
+
+    config = {
+        "triad_slots": [{"slot_id": "t1", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol"},
+            "effort": "high"}],
+        "scope_slots": [{"slot_id": "s1", "route": {
+            "kind": "agent_session", "target_id": "cursor=claude-fable-5"},
+            "effort": "high"}],
+        "review_enforcement": "blocking", "context_mode": "max",
     }
-    with pytest.raises(RuntimeError, match="non-OpenRouter"):
-        _apply_contributor_review_env(defaults)
+    monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+    monkeypatch.setattr(module, "_load_settings_into_env", lambda: None)
+    monkeypatch.setattr(module, "_contributor_snapshot", lambda *_args: {"base_sha": "a" * 40})
+    monkeypatch.setattr(module, "_apply_contributor_review_env", lambda: None)
+    monkeypatch.setattr(module, "_resolved_review_config", lambda **_kwargs: config)
+    monkeypatch.setattr(module, "_freeze_contributor_slots", lambda value: value)
+    monkeypatch.setattr(
+        module, "_select_healthy_openrouter_key",
+        lambda **_kwargs: pytest.fail("agent-only review must not probe OpenRouter"),
+    )
+
+    snapshot, base, resolved = _prepare_review_configuration(SimpleNamespace(
+        contributor=True, base_ref="", head_ref="HEAD",
+    ))
+
+    assert snapshot and base == "a" * 40
+    assert resolved == config
 
 
 def test_contributor_budget_must_be_explicit_positive_and_finite(monkeypatch):
@@ -238,13 +663,58 @@ def test_contributor_snapshot_binds_clean_base_head_and_tree(tmp_path, monkeypat
         _contributor_snapshot("base", "HEAD")
 
 
-def test_contributor_snapshot_rejects_version_bump(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("relative_path", "before", "after", "carrier"),
+    [
+        ("VERSION", "1.2.3", "1.2.4", "VERSION"),
+        ("pyproject.toml", 'version = "1.2.3"', 'version = "1.2.4"',
+         "pyproject.project.version"),
+        ("uv.lock", 'version = "1.2.3"', 'version = "1.2.4"',
+         "uv.editable_root.version"),
+        ("web/package.json", '"version":"1.2.3"', '"version":"1.2.4"',
+         "web.package.version"),
+        ("web/modules/api_types.js", 'VERSION = "1.2.3"', 'VERSION = "1.2.4"',
+         "gateway.contract.version"),
+        ("README.md", "Version 1.2.3", "Version 1.2.4",
+         "readme.badge.version"),
+        ("README.md", "| 1.2.3 | Current |", "| 1.2.4 | Current |",
+         "readme.latest_history_row"),
+        ("README.md", "v1.2.3/Ouroboros-1.2.3.dmg",
+         "v1.2.4/Ouroboros-1.2.4.dmg", "readme.download.macos-arm64.0"),
+        ("site/install/index.html", "v1.2.3/Ouroboros-1.2.3.dmg",
+         "v1.2.4/Ouroboros-1.2.4.dmg", "site.install.download.macos-arm64.0"),
+        ("docs/install/index.html", "v1.2.3/Ouroboros-1.2.3.dmg",
+         "v1.2.4/Ouroboros-1.2.4.dmg", "docs.install.download.macos-arm64.0"),
+        ("docs/ARCHITECTURE.md", "Ouroboros v1.2.3", "Ouroboros v1.2.4",
+         "architecture.header.version"),
+    ],
+)
+def test_contributor_snapshot_rejects_every_version_carrier(
+    tmp_path, monkeypatch, relative_path, before, after, carrier
+):
     repo = _init_contributor_repo(tmp_path, monkeypatch)
-    (repo / "VERSION").write_text("1.2.4\n", encoding="utf-8")
-    _git(repo, "add", "VERSION")
+    path = repo / relative_path
+    path.write_text(path.read_text(encoding="utf-8").replace(before, after), encoding="utf-8")
+    _git(repo, "add", relative_path)
     _git(repo, "commit", "-m", "bad contributor bump")
 
-    with pytest.raises(RuntimeError, match="must not bump VERSION"):
+    with pytest.raises(RuntimeError, match=carrier):
+        _contributor_snapshot("base", "HEAD")
+
+
+def test_contributor_snapshot_checks_each_duplicate_installer_link(
+    tmp_path, monkeypatch
+):
+    repo = _init_contributor_repo(tmp_path, monkeypatch)
+    path = repo / "site" / "install" / "index.html"
+    current = "https://example.test/v1.2.3/Ouroboros-1.2.3.dmg"
+    stale = "https://example.test/v1.2.4/Ouroboros-1.2.4.dmg"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace(current, stale, 1), encoding="utf-8")
+    _git(repo, "add", str(path.relative_to(repo)))
+    _git(repo, "commit", "-m", "change one duplicate installer link")
+
+    with pytest.raises(RuntimeError, match="site.install.download.macos-arm64.0"):
         _contributor_snapshot("base", "HEAD")
 
 
@@ -252,6 +722,7 @@ def test_contributor_snapshot_rejects_version_bump(tmp_path, monkeypatch):
     "relative_path",
     [
         "ouroboros/review_substrate.py",
+        "ouroboros/review_execution.py",
         "ouroboros/utils.py",
         "ouroboros/tools/registry.py",
     ],
@@ -269,26 +740,6 @@ def test_contributor_snapshot_flags_transitive_review_substrate_changes(
 
     assert snapshot["review_substrate_changed"] == [relative_path]
     assert snapshot["review_substrate_matches_base"] is False
-
-
-def test_contributor_snapshot_flags_release_carrier_changes_without_version_file(
-    tmp_path, monkeypatch
-):
-    repo = _init_contributor_repo(tmp_path, monkeypatch)
-    path = repo / "pyproject.toml"
-    path.write_text(
-        '[project]\nname = "test-project"\nversion = "1.2.4"\n',
-        encoding="utf-8",
-    )
-    _git(repo, "add", "pyproject.toml")
-    _git(repo, "commit", "-m", "change package carrier only")
-
-    snapshot = _contributor_snapshot("base", "HEAD")
-
-    assert snapshot["release_metadata_or_machinery_changed"] is True
-    assert snapshot["release_sensitive_changes"]["carrier_fields"] == [
-        "pyproject.project.version"
-    ]
 
 
 def test_contributor_landing_obligations_are_exact_typed_items_only():
@@ -338,25 +789,44 @@ def test_contributor_packet_is_redacted_and_shareable(tmp_path):
             "review_substrate_changed": [],
         },
         resolved_config={"triad_models": ["anthropic/fable"]},
-        outcome={"status": "passed", "path": local_root, "api_key": "sk-secret-value"},
+        outcome={"status": "passed", "path": local_root, "api_key": "test-secret-value"},
         exit_code=0,
         evidence_refs=[],
         cost_report={"reported_actor_cost_usd": 1.0},
         elapsed_sec=1.5,
         triad_raw=[{"authorization": "Bearer secret-token-value", "path": local_root}],
         scope_raw={"status": "responded"},
+        execution_receipts=[{
+            "surface": "triad", "slot_id": "slot_1",
+            "observed": {"route_kind": "agent_session"},
+            "model_verification": "observed_display_label",
+        }],
+        execution_mismatches=[],
+        session_transcripts=[{
+            "surface": "triad", "slot_id": "slot_1", "sha256": "a" * 64,
+            "chars": 18, "transcript": "transcript EOF_MARK",
+        }],
         degraded_reasons=["reviewer-3=parse_failure (quorum still met)"],
         replacements=[(local_root, "$REPO")],
     )
 
     evidence_text = (output / "review-evidence.json").read_text(encoding="utf-8")
     full_text = (output / "full-output.txt").read_text(encoding="utf-8")
-    assert "sk-secret-value" not in evidence_text
+    public_evidence = json.loads(evidence_text)
+    assert "test-secret-value" not in evidence_text
     assert "secret-token-value" not in full_text
     assert local_root not in evidence_text + full_text
     assert "$REPO" in evidence_text + full_text
     assert "production_triad_quorum_plus_authoritative_scope" in evidence_text
+    assert '"execution_receipts_consistent": true' in evidence_text
+    assert "triad:slot_1:observed_model_is_display_label" in evidence_text
     assert "quorum still met" in evidence_text
+    assert "transcript EOF_MARK" in full_text
+    transcript_meta = public_evidence["review_execution"]["session_transcript_artifacts"][0]
+    assert transcript_meta["chars"] == len("transcript EOF_MARK")
+    assert transcript_meta["sha256"] == hashlib.sha256(
+        b"transcript EOF_MARK"
+    ).hexdigest()
     with zipfile.ZipFile(packet) as archive:
         assert set(archive.namelist()) == {
             "review-evidence.json",
@@ -423,6 +893,21 @@ def test_exit_classification_separates_infra_from_genuine_blocks():
         assert _classify_exit({"status": "blocked", "block_reason": infra_reason}) == 3, infra_reason
 
 
+def test_contributor_outcome_fails_closed_on_receipt_drift_only():
+    exit_code, outcome = finalize_contributor_outcome(
+        outcome={"status": "passed"}, exit_code=0,
+        mismatches=["provider_mismatch:triad:t1"],
+    )
+    assert exit_code == 3
+    assert outcome["block_reason"] == "execution_receipt_mismatch"
+
+    # Nothing about the proposal's contents downgrades a clean run any more: the
+    # machinery that produced it was the target base's either way.
+    assert finalize_contributor_outcome(
+        outcome={"status": "passed"}, exit_code=0, mismatches=[],
+    ) == (0, {"status": "passed"})
+
+
 def test_openrouter_pool_orders_hope_keys_last(monkeypatch, tmp_path):
     keys = tmp_path / "file1.txt"
     keys.write_text(
@@ -465,33 +950,278 @@ def test_contributor_openrouter_preflight_fails_closed(monkeypatch):
         _select_healthy_openrouter_key(required=True)
 
 
-def test_contributor_resolved_config_rejects_direct_provider_actors():
-    defaults = {
-        "OUROBOROS_REVIEW_MODELS": "anthropic/claude-fable-5,openai/gpt-5.6-sol",
-        "OUROBOROS_SCOPE_REVIEW_MODELS": "anthropic/claude-fable-5",
-        "OUROBOROS_EFFORT_REVIEW": "high",
-        "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
+def _persist_review_prompt(tmp_path, *, call_id: str, slot: dict):
+    from ouroboros.observability import persist_call
+
+    return persist_call(
+        tmp_path, task_id="review", call_id=call_id, call_type="prompt",
+        payload={"request": {"surface": "review"}, "slot": slot},
+    )
+
+
+def _persist_review_response(
+    tmp_path, *, call_id: str, usage: dict, transcript: str = "",
+):
+    from ouroboros.observability import persist_call
+
+    message = {"content": "[]"}
+    if transcript:
+        message["session_transcript"] = transcript
+        usage = {**usage, "verdict_provenance": {
+            "raw_transcript_chars": len(transcript),
+            "raw_transcript_sha256": hashlib.sha256(
+                transcript.encode("utf-8", "replace")
+            ).hexdigest(),
+        }}
+    return persist_call(
+        tmp_path, task_id="review", call_id=call_id, call_type="response",
+        payload={"message": message, "usage": usage},
+    )
+
+
+def test_contributor_receipts_bind_session_and_api_execution(tmp_path):
+    config = {
+        "triad_slots": [{"slot_id": "t1", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol",
+            "profile_id": "pinned"}, "effort": "high"}],
+        "scope_slots": [{"slot_id": "s1", "route": {
+            "kind": "api_chat", "target_id": "openai/gpt-5.6-sol"},
+            "effort": "xhigh"}],
+        "review_enforcement": "blocking",
+        "context_mode": "max",
     }
-    _assert_contributor_openrouter_config({
-        "triad_models": ["anthropic/claude-fable-5", "openai/gpt-5.6-sol"],
-        "scope_models": ["anthropic/claude-fable-5"],
-        "triad_effort": "high",
-        "scope_effort": "high",
-    }, defaults)
-    with pytest.raises(RuntimeError, match="exclusively through OpenRouter"):
-        _assert_contributor_openrouter_config({
-            "triad_models": ["anthropic::claude-fable-5"],
-            "scope_models": ["anthropic/claude-fable-5"],
-            "triad_effort": "high",
-            "scope_effort": "high",
-        }, defaults)
-    with pytest.raises(RuntimeError, match="drifted from target-base defaults"):
-        _assert_contributor_openrouter_config({
-            "triad_models": ["anthropic/claude-fable-5"],
-            "scope_models": ["anthropic/claude-fable-5"],
-            "triad_effort": "high",
-            "scope_effort": "high",
-        }, defaults)
+    _assert_contributor_review_config(config)
+    session_prompt = _persist_review_prompt(tmp_path, call_id="session_prompt", slot={
+        "slot_id": "t1", "model": "codex=gpt-5.6-sol", "effort": "high",
+        "route": "agent_session", "session_target": "codex=gpt-5.6-sol",
+        "session_profile": "pinned",
+    })
+    transcript = "full session transcript\nEOF_SENTINEL"
+    session_ref = _persist_review_response(
+        tmp_path, call_id="session", transcript=transcript, usage={
+            "provider": "claudexor", "delegated_route": "codex",
+            "resolved_model": "gpt-5.6-sol", "applied_profile": "pinned",
+            "applied_access": "readonly", "delegated_run_id": "run-1",
+            "custody_durable": True, "output_conformance": "passed",
+            "verdict_method": "schema", "settlement": {
+                "settled": True, "ledger_recorded": True,
+                "project_retired": True,
+            }},
+    )
+    api_prompt = _persist_review_prompt(tmp_path, call_id="api_prompt", slot={
+        "slot_id": "s1", "model": "openai/gpt-5.6-sol", "effort": "xhigh",
+        "route": "api_chat", "session_target": "", "session_profile": "",
+    })
+    api_ref = _persist_review_response(
+        tmp_path, call_id="api", usage={
+            "provider": "openrouter", "resolved_model": "openai/gpt-5.6-sol"},
+    )
+    ctx = SimpleNamespace(
+        _last_triad_raw_results=[{
+            "slot_id": "t1", "model_id": "gpt-5.6-sol", "status": "responded",
+            "prompt_ref": session_prompt, "response_ref": session_ref,
+        }],
+        _last_scope_raw_result={"raw_results": [{
+            "slot_id": "s1", "model_id": "openai/gpt-5.6-sol",
+            "status": "responded", "prompt_ref": api_prompt, "response_ref": api_ref,
+        }]},
+    )
+
+    unbound_receipts, unbound_mismatches, _ = _contributor_execution_receipts(
+        ctx, config, tmp_path
+    )
+    assert "session_custody_settlement_absent:triad:t1:run-1" in unbound_mismatches
+    assert unbound_receipts[0]["observed"]["settlement"] is None
+    assert unbound_receipts[1]["observed"]["route_kind"] == "api_chat"
+
+    from ouroboros import delegate_custody as custody
+
+    custody.record_started(tmp_path, custody.RunCustody(
+        run_id="run-1", task_id="review", project_id="review-project",
+        project_owned=True, ledger_root=str(tmp_path),
+    ))
+    custody.emit(tmp_path, custody.LEDGER_RECORDED, {"run_id": "run-1"})
+    custody.emit(tmp_path, custody.SETTLED, {"run_id": "run-1"})
+    custody.emit(tmp_path, custody.PROJECT_RETIRED, {"run_id": "run-1"})
+    custody._CUSTODY.clear()
+
+    receipts, mismatches, transcripts = _contributor_execution_receipts(
+        ctx, config, tmp_path
+    )
+
+    assert mismatches == []
+    assert receipts[0]["observed"] == {
+        "route_kind": "agent_session", "provider": "claudexor",
+        "harness": "codex", "model": "gpt-5.6-sol",
+        "profile_id": "pinned", "access": "readonly", "effort": None,
+        "delegated_run_id": "run-1", "custody_durable": True,
+        "settlement": {
+            "settled": True, "ledger_recorded": True,
+            "project_retired": True, "project_persistent": False,
+            "bound_at": "panel_complete_custody_replay",
+        },
+        "output_conformance": "passed", "verdict_method": "schema",
+    }
+    assert receipts[0]["dispatched"]["effort"] == "high"
+    assert receipts[0]["model_verification"] == "exact"
+    assert transcripts[0]["transcript"].endswith("EOF_SENTINEL")
+    drifted = json.loads(json.dumps(config))
+    drifted["triad_slots"][0]["route"]["target_id"] = "cursor=gpt-5.6-sol"
+    _, mismatches, _ = _contributor_execution_receipts(ctx, drifted, tmp_path)
+    assert any(item.startswith("harness_mismatch:triad:t1") for item in mismatches)
+
+
+def test_contributor_receipts_fail_closed_on_blob_provider_model_and_status_drift(tmp_path):
+    config = {
+        "triad_slots": [{"slot_id": "t1", "route": {
+            "kind": "api_chat", "target_id": "anthropic::claude-fable-5"},
+            "effort": "high"}],
+        "scope_slots": [{"slot_id": "s1", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol"},
+            "effort": "high"}],
+        "review_enforcement": "blocking", "context_mode": "max",
+    }
+    api_prompt = _persist_review_prompt(tmp_path, call_id="api_prompt_bad", slot={
+        "slot_id": "t1", "model": "anthropic::claude-fable-5", "effort": "high",
+        "route": "api_chat", "session_target": "", "session_profile": "",
+    })
+    api_response = _persist_review_response(
+        tmp_path, call_id="api_bad", usage={
+            "provider": "openrouter", "resolved_model": "openai/gpt-5.5"},
+    )
+    session_prompt = _persist_review_prompt(tmp_path, call_id="session_prompt_bad", slot={
+        "slot_id": "s1", "model": "codex=gpt-5.6-sol", "effort": "high",
+        "route": "agent_session", "session_target": "codex=gpt-5.6-sol",
+        "session_profile": "",
+    })
+    session_response = _persist_review_response(
+        tmp_path, call_id="session_bad", transcript="raw\nEOF", usage={
+            "provider": "claudexor", "delegated_route": "codex",
+            "resolved_model": "GPT-5.6 Terra 300K High",
+            "applied_profile": "auto-profile",
+            "applied_access": "readonly", "custody_durable": True,
+            "capability_delta": [{"reason": "session_ran_off_pinned_route"}],
+        },
+    )
+    ctx = SimpleNamespace(
+        _last_triad_raw_results=[{
+            "slot_id": "t1", "status": "parse_failure",
+            "prompt_ref": api_prompt, "response_ref": api_response,
+        }],
+        _last_scope_raw_result={"raw_results": [{
+            "slot_id": "s1", "status": "responded",
+            "prompt_ref": session_prompt, "response_ref": session_response,
+        }]},
+    )
+
+    _, mismatches, _ = _contributor_execution_receipts(ctx, config, tmp_path)
+
+    assert any(item.startswith("provider_mismatch:triad:t1") for item in mismatches)
+    assert any(item.startswith("model_mismatch:triad:t1") for item in mismatches)
+    assert any(item.startswith("model_identity_unverified:scope:s1")
+               for item in mismatches)
+    assert "delegated_run_id_absent:scope:s1" in mismatches
+    assert any(item.startswith("session_settlement_unproven:scope:s1")
+               for item in mismatches)
+    assert "capability_delta:scope:s1:session_ran_off_pinned_route" in mismatches
+
+    missing_response = json.loads(json.dumps(ctx._last_triad_raw_results[0]))
+    missing_response["response_ref"] = {}
+    missing_response_ctx = SimpleNamespace(
+        _last_triad_raw_results=[missing_response],
+        _last_scope_raw_result=ctx._last_scope_raw_result,
+    )
+    _, missing_response_mismatches, _ = _contributor_execution_receipts(
+        missing_response_ctx, config, tmp_path
+    )
+    assert "response_receipt_absent:triad:t1" in missing_response_mismatches
+
+    tampered = json.loads(json.dumps(ctx._last_triad_raw_results[0]))
+    tampered["response_ref"]["redacted_projection_ref"]["sha256"] = "0" * 64
+    tampered_ctx = SimpleNamespace(
+        _last_triad_raw_results=[tampered],
+        _last_scope_raw_result=ctx._last_scope_raw_result,
+    )
+    _, tampered_mismatches, _ = _contributor_execution_receipts(
+        tampered_ctx, config, tmp_path
+    )
+    assert any(item.startswith("unreadable_response_receipt:triad:t1")
+               for item in tampered_mismatches)
+
+
+def test_contributor_receipts_require_settlement_but_keep_advisory_delta(tmp_path):
+    config = {
+        "triad_slots": [{"slot_id": "t1", "route": {
+            "kind": "agent_session", "target_id": "codex=gpt-5.6-sol"},
+            "effort": "high"}],
+        "scope_slots": [], "review_enforcement": "blocking", "context_mode": "max",
+    }
+    prompt_ref = _persist_review_prompt(tmp_path, call_id="session_prompt_terminal", slot={
+        "slot_id": "t1", "model": "codex=gpt-5.6-sol", "effort": "high",
+        "route": "agent_session", "session_target": "codex=gpt-5.6-sol",
+        "session_profile": "",
+    })
+    response_ref = _persist_review_response(
+        tmp_path, call_id="session_terminal", transcript="raw\nEOF", usage={
+            "provider": "claudexor", "delegated_route": "codex",
+            "resolved_model": "gpt-5.6-sol", "applied_profile": "auto-profile",
+            "applied_access": "readonly", "custody_durable": True,
+            "delegated_run_id": "run-1", "settlement": {
+                "settled": True, "ledger_recorded": False,
+                "project_retired": True,
+            },
+            "capability_delta": [{"reason": "schema_unavailable_on_effective_route"}],
+        },
+    )
+    ctx = SimpleNamespace(
+        _last_triad_raw_results=[{
+            "slot_id": "t1", "status": "responded",
+            "prompt_ref": prompt_ref, "response_ref": response_ref,
+        }],
+        _last_scope_raw_result={},
+    )
+
+    from ouroboros import delegate_custody as custody
+
+    custody.record_started(tmp_path, custody.RunCustody(
+        run_id="run-1", task_id="review", project_id="review-project",
+        project_owned=True, ledger_root=str(tmp_path),
+    ))
+    custody.emit(tmp_path, custody.PROJECT_RETIRED, {"run_id": "run-1"})
+    custody._CUSTODY.clear()
+
+    _, mismatches, _ = _contributor_execution_receipts(ctx, config, tmp_path)
+
+    assert "session_settlement_unproven:triad:t1:settled,ledger_recorded" in mismatches
+    assert not any(item.startswith("capability_delta:") for item in mismatches)
+
+
+def test_contributor_receipts_accept_present_usage_less_error_payload(tmp_path):
+    from ouroboros.observability import persist_call
+    config = {
+        "triad_slots": [{"slot_id": "t1", "route": {
+            "kind": "api_chat", "target_id": "openai/gpt-5.6-sol"},
+            "effort": "high"}],
+        "scope_slots": [], "review_enforcement": "blocking", "context_mode": "max",
+    }
+    prompt_ref = _persist_review_prompt(tmp_path, call_id="error_prompt", slot={
+        "slot_id": "t1", "model": "openai/gpt-5.6-sol", "effort": "high",
+        "route": "api_chat", "session_target": "", "session_profile": "",
+    })
+    response_ref = persist_call(
+        tmp_path, task_id="review", call_id="error_response", call_type="response",
+        payload={"error": "Timeout after 300s"},
+    )
+    ctx = SimpleNamespace(
+        _last_triad_raw_results=[{
+            "slot_id": "t1", "status": "error",
+            "prompt_ref": prompt_ref, "response_ref": response_ref,
+        }],
+        _last_scope_raw_result={},
+    )
+    receipts, mismatches, _ = _contributor_execution_receipts(ctx, config, tmp_path)
+    assert mismatches == []
+    assert receipts[0]["observed"]["route_kind"] is None
 
 
 def test_normal_key_probe_stays_single_model_but_contributor_probes_all(monkeypatch):
@@ -523,10 +1253,11 @@ def test_normal_key_probe_stays_single_model_but_contributor_probes_all(monkeypa
 
 
 def _git(repo: Path, *args: str) -> str:
+    patch = args[:1] == ("diff",) and "--binary" in args
     proc = subprocess.run(
-        ["git", *args], cwd=str(repo), capture_output=True, text=True, check=True,
+        ["git", *args], cwd=str(repo), capture_output=True, text=not patch, check=True,
     )
-    return proc.stdout
+    return proc.stdout.decode("utf-8", errors="surrogateescape") if patch else proc.stdout
 
 
 def test_isolated_checkout_freezes_the_reviewed_tree(tmp_path, monkeypatch):

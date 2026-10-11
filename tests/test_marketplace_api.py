@@ -212,6 +212,46 @@ def test_marketplace_api_browse_keeps_official_and_cursor(monkeypatch):
     assert payload["next_cursor"] == "next"
 
 
+def test_marketplace_installed_collision_does_not_read_lifecycle_provenance(
+    monkeypatch, tmp_path
+):
+    from ouroboros.contracts.skill_manifest import SkillManifest
+    from ouroboros.skill_loader import LoadedSkill
+
+    skill_dir = tmp_path / "skills" / "clawhub" / "demo"
+    skill_dir.mkdir(parents=True)
+    collision = LoadedSkill(
+        name="demo",
+        skill_dir=skill_dir,
+        manifest=SkillManifest(
+            name="demo", description="", version="", type="instruction"
+        ),
+        content_hash="",
+        load_error="Skill name collision: clawhub and user_repo",
+        source="clawhub",
+        identity_collision=True,
+    )
+    monkeypatch.setattr(
+        "ouroboros.skill_loader.discover_skills",
+        lambda *_args, **_kwargs: [collision],
+    )
+    monkeypatch.setattr(
+        marketplace_api,
+        "read_provenance",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ambiguous identity must not read provenance")
+        ),
+    )
+
+    rows = marketplace_api._installed_skills_for_source(tmp_path, "clawhub")
+
+    assert len(rows) == 1
+    assert rows[0]["name"] == "demo"
+    assert rows[0]["load_error"] == collision.load_error
+    assert rows[0]["provenance"] == {}
+    assert not (tmp_path / "state").exists()
+
+
 def test_ouroboroshub_install_response_shape_after_review_and_deps(monkeypatch, tmp_path):
     _stub_marketplace_roots(monkeypatch, tmp_path)
     _run_lifecycle_inline(monkeypatch)
@@ -267,6 +307,37 @@ def test_ouroboroshub_install_response_shape_after_review_and_deps(monkeypatch, 
     }
 
 
+def test_ouroboroshub_api_rejects_foreign_identity_before_lifecycle_job(
+    monkeypatch, tmp_path
+):
+    _stub_marketplace_roots(monkeypatch, tmp_path)
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    async def _unexpected_job(**_kwargs):
+        raise AssertionError("lifecycle job must not start for ambiguous identity")
+
+    monkeypatch.setattr(marketplace_api, "run_lifecycle_job", _unexpected_job)
+    monkeypatch.setattr(
+        marketplace_api.ouroboroshub,
+        "install",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("installer must not run for ambiguous identity")
+        ),
+    )
+
+    response = asyncio.run(
+        marketplace_api.api_ouroboroshub_install(_BodyRequest({"slug": "demo"}))
+    )
+
+    assert response.status_code == 409
+    assert "collision" in _json_response_payload(response)["error"].lower()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
 def test_clawhub_uninstall_clears_deps_state(tmp_path):
     from ouroboros.marketplace.install import uninstall_skill
 
@@ -299,6 +370,92 @@ def test_clawhub_fresh_install_rolls_back_payload_on_dependency_failure(monkeypa
     assert not (tmp_path / "skills" / "clawhub" / "demo").exists()
     assert not (tmp_path / "state" / "skills" / "demo" / "deps.json").exists()
     assert not (tmp_path / "state" / "skills" / "demo" / "clawhub.json").exists()
+
+
+def test_clawhub_target_override_rejects_foreign_identity_before_landing(monkeypatch, tmp_path):
+    install_mod = _patch_clawhub_install_pipeline(monkeypatch, tmp_path, auto_specs=[])
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: User copy\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    result = install_mod.install_skill(
+        tmp_path,
+        tmp_path / "repo",
+        slug="demo",
+        auto_review=True,
+        overwrite=True,
+        target_name_override="demo",
+    )
+
+    assert result.ok is False
+    assert "collision" in result.error.lower()
+    assert not (tmp_path / "skills" / "clawhub" / "demo").exists()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
+def test_clawhub_fresh_install_purely_dedupes_foreign_user_repo(monkeypatch, tmp_path):
+    install_mod = _patch_clawhub_install_pipeline(monkeypatch, tmp_path, auto_specs=[])
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: User copy\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+
+    result = install_mod.install_skill(
+        tmp_path,
+        tmp_path / "repo",
+        slug="demo",
+        auto_review=False,
+    )
+
+    assert result.ok is True
+    assert result.sanitized_name == "demo-clawhub"
+    assert (tmp_path / "skills" / "clawhub" / "demo-clawhub" / "SKILL.md").is_file()
+    assert not (tmp_path / "state" / "skills" / "demo").exists()
+
+
+def test_clawhub_update_rejects_collision_before_provenance_or_unload(monkeypatch, tmp_path):
+    from ouroboros.marketplace import install as install_mod
+    from ouroboros.marketplace.provenance import write_provenance
+
+    target = tmp_path / "skills" / "clawhub" / "demo"
+    target.mkdir(parents=True)
+    original = "---\nname: demo\n---\nold payload\n"
+    (target / "SKILL.md").write_text(original, encoding="utf-8")
+    write_provenance(
+        tmp_path,
+        "demo",
+        {"schema_version": 1, "source": "clawhub", "slug": "demo"},
+    )
+    checkout = tmp_path / "checkout"
+    foreign = checkout / "demo"
+    foreign.mkdir(parents=True)
+    (foreign / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(checkout))
+    monkeypatch.setattr(
+        "ouroboros.extension_loader.is_extension_live",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collision must block before unload")
+        ),
+    )
+
+    result = install_mod.update_skill(
+        tmp_path,
+        tmp_path / "repo",
+        sanitized_name="demo",
+    )
+
+    assert result.ok is False
+    assert "collision" in result.error.lower()
+    assert (target / "SKILL.md").read_text(encoding="utf-8") == original
 
 
 def test_clawhub_landing_failure_restores_previous_payload(monkeypatch, tmp_path):
@@ -440,7 +597,7 @@ def test_marketplace_auto_repair_enqueues_once_per_payload_hash(monkeypatch, tmp
     assert first is True
     assert second is False
     assert len(calls) == 1
-    assert calls[0][1]["task_constraint"]["mode"] == "skill_repair"
+    assert calls[0][1]["task_constraint"]["mode"] == "normal"
     assert calls[0][1]["task_constraint"]["allow_review"] is True
     assert calls[0][1]["task_constraint"]["allow_enable"] is False
     assert broadcasts and broadcasts[0]["system_type"] == "skill_repair"
@@ -737,3 +894,71 @@ def test_ouroboroshub_update_review_blockers_restore_live_payload(monkeypatch, t
     assert calls == {"unload": 1, "reconcile": 1}
     assert (target_dir / "old.txt").read_text(encoding="utf-8") == "old-live-version"
     assert not (target_dir / "new.txt").exists()
+
+
+def test_uninstall_handler_waits_for_the_queue_lock_off_the_event_loop(monkeypatch, tmp_path):
+    """While the post-uninstall schedule resync waits for a held supervisor
+    queue lock, another request (GET /api/widgets) completes on the same loop;
+    the resync still runs, after the uninstall step, on a worker thread."""
+    import threading
+
+    import supervisor.queue as supervisor_queue
+    from ouroboros.gateway.widgets import api_widgets
+
+    _stub_marketplace_roots(monkeypatch, tmp_path)
+    _run_lifecycle_inline(monkeypatch)
+    order: list[str] = []
+    resync_threads: list[int] = []
+    entered = threading.Event()
+    held = threading.Event()
+    release = threading.Event()
+    holding = {"value": False}
+
+    def uninstall_skill(_drive_root, *, sanitized_name):
+        order.append("uninstall")
+        return SimpleNamespace(ok=True, sanitized_name=sanitized_name, error="")
+
+    def resync_skill_schedules(_drive_root=None):
+        resync_threads.append(threading.get_ident())
+        entered.set()
+        with supervisor_queue._queue_lock:  # the real mirror waits here too
+            order.append("resync")
+
+    monkeypatch.setattr(marketplace_api, "uninstall_skill", uninstall_skill)
+    monkeypatch.setattr(supervisor_queue, "resync_skill_schedules", resync_skill_schedules)
+
+    def hold_lock():
+        with supervisor_queue._queue_lock:
+            holding["value"] = True
+            held.set()
+            release.wait(timeout=10)
+            holding["value"] = False
+
+    async def scenario():
+        loop_thread = threading.get_ident()
+        uninstall = asyncio.create_task(
+            marketplace_api.api_marketplace_uninstall(_BodyRequest(path_params={"name": "demo"}))
+        )
+        await asyncio.get_running_loop().run_in_executor(None, entered.wait, 5)
+        assert entered.is_set(), "the handler never reached the schedule resync"
+        other = await asyncio.wait_for(api_widgets(None), 5)
+        still_held = holding["value"]
+        release.set()
+        response = await uninstall
+        return loop_thread, other, still_held, response
+
+    holder = threading.Thread(target=hold_lock, daemon=True)
+    holder.start()
+    assert held.wait(timeout=5)
+    try:
+        loop_thread, other, still_held, response = asyncio.run(scenario())
+    finally:
+        release.set()
+        holder.join(timeout=5)
+
+    assert other.status_code == 200
+    assert still_held, "the other request finished only after the lock was released: the loop was blocked"
+    assert response.status_code == 200
+    assert _json_response_payload(response)["ok"] is True
+    assert order == ["uninstall", "resync"]
+    assert resync_threads and resync_threads[0] != loop_thread

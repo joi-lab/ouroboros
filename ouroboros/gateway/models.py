@@ -12,7 +12,21 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from ouroboros.config import load_settings
+from ouroboros.net_transport import ExtraCaBundleError, extra_ca_bundle, verify_kwargs
 from ouroboros.gateway._helpers import json_error, json_exception
+from ouroboros.observability import redact_projection
+from ouroboros.provider_models import (
+    ALL_PROVIDER_CREDENTIAL_KEYS,
+    ACTIVE_MODEL_SETTING_KEYS,
+    DEEPSEEK_BASE_URL,
+    resolve_zai_base_url,
+    DIRECT_PROVIDER_DEFAULTS,
+    MINIMAX_REGION_ENDPOINTS,
+    ZAI_PLAN_ENDPOINTS,
+    OPENROUTER_DEFAULTS,
+    provider_for_model,
+    resolve_minimax_base_url,
+)
 
 log = logging.getLogger(__name__)
 
@@ -30,6 +44,7 @@ def _provider_label_from_model_id(model_id: str) -> str:
         "qwen": "Qwen",
         "mistralai": "Mistral",
         "deepseek": "DeepSeek",
+        "z-ai": "Z.ai (GLM)",
         "perplexity": "Perplexity",
     }.get(prefix, prefix.title() if prefix else "Other")
 
@@ -50,14 +65,15 @@ def _build_model_catalog_entry(
 ) -> dict[str, str]:
     raw_id = str(model_id or "").strip()
     name = str(display_name or "").strip() or raw_id
+    source_label = source or provider_label
     return {
         "provider_id": provider_id,
         "provider": provider_label,
-        "source": source or provider_label,
+        "source": source_label,
         "id": raw_id,
         "name": name,
         "value": _tagged_model_value(provider_id, raw_id),
-        "label": f"{provider_label} · {name}",
+        "label": f"{source_label} · {name}",
     }
 
 
@@ -175,6 +191,9 @@ async def _fetch_gigachat_model_catalog(
     from gigachat import GigaChatAsyncClient
 
     kwargs: dict = {"scope": scope or "GIGACHAT_API_PERS", "verify_ssl_certs": verify_ssl_certs}
+    bundle = extra_ca_bundle()
+    if bundle:
+        kwargs["ca_bundle_file"] = bundle
     if credentials:
         kwargs["credentials"] = credentials
     if user:
@@ -224,6 +243,54 @@ def _provider_specs(
     if anthropic_api_key:
         specs.append(("anthropic", lambda client: _fetch_anthropic_model_catalog(client, anthropic_api_key)))
 
+    minimax_api_key = str(settings.get("MINIMAX_API_KEY", "") or "").strip()
+    if minimax_api_key:
+        # MiniMax serves an OpenAI-compatible GET /v1/models on the region host
+        # (platform.minimax.io API reference), so the catalog is fetched live like
+        # every other remote provider instead of shipping a hardcoded list.
+        minimax_base_url = resolve_minimax_base_url(
+            str(settings.get("MINIMAX_REGION", "") or "")
+        )
+        specs.append((
+            "minimax",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client,
+                "minimax",
+                "MiniMax",
+                minimax_api_key,
+                minimax_base_url,
+            ),
+        ))
+
+    deepseek_api_key = str(settings.get("DEEPSEEK_API_KEY", "") or "").strip()
+    if deepseek_api_key:
+        # DeepSeek serves an OpenAI-compatible GET /models on its one official
+        # host, so the catalog is fetched live like the other remote providers.
+        specs.append((
+            "deepseek",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client,
+                "deepseek",
+                "DeepSeek",
+                deepseek_api_key,
+                DEEPSEEK_BASE_URL,
+            ),
+        ))
+    zai_api_key = str(settings.get("ZAI_API_KEY", "") or "").strip()
+    if zai_api_key:
+        # Z.ai serves an OpenAI-compatible GET /models on its plan-selected
+        # official host, so the catalog is fetched live like the other providers.
+        specs.append((
+            "zai",
+            lambda client: _fetch_openai_compatible_model_catalog(
+                client,
+                "zai",
+                "Z.ai (GLM)",
+                zai_api_key,
+                resolve_zai_base_url(str(settings.get("ZAI_PLAN", "") or "")),
+            ),
+        ))
+
     compatible_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
     compatible_base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
     legacy_base_url = str(settings.get("OPENAI_BASE_URL", "") or "").strip()
@@ -238,14 +305,14 @@ def _provider_specs(
                 compatible_base_url,
             ),
         ))
-    elif openai_api_key and legacy_base_url:
+    elif legacy_base_url:
         specs.append((
             "openai-compatible",
             lambda client: _fetch_openai_compatible_model_catalog(
                 client,
                 "openai-compatible",
                 "OpenAI Compatible",
-                openai_api_key,
+                compatible_api_key or openai_api_key,
                 legacy_base_url,
             ),
         ))
@@ -335,19 +402,144 @@ async def _load_provider(
         return provider_id, [], str(exc), stage, duration_ms
 
 
+def account_catalog_supported(operations: list[dict], path: str) -> bool:
+    """Opt in only when this exact operation declares the accounts query view."""
+    return any(
+        operation.get("method") == "GET" and operation.get("path") == path
+        and any(parameter.get("name") == "view" and parameter.get("location") == "query"
+                and "accounts" in (parameter.get("enum") or [])
+                for parameter in operation.get("parameters", []) if isinstance(parameter, dict))
+        for operation in operations if isinstance(operation, dict)
+    )
+
+
+def account_catalog_models(envelope: dict):
+    """Keep each model attached to the account and original catalog that reported it."""
+    for account in envelope.get("accounts", []):
+        catalog = account.get("catalog")
+        if isinstance(catalog, dict):
+            for model in catalog.get("models", []):
+                if isinstance(model, dict):
+                    yield account, catalog, model
+
+
+def _subscription_model_catalog(source_id: str = "", profile_id: str = "") -> dict:
+    """Read raw transport catalogs from the owned engine, never CLI model inventory.
+
+    Account-view engines enumerate every enabled account, retaining independent
+    capabilities and failures. Older engines keep selected-account discovery.
+    API-only installs do not provision a daemon while browsing model settings.
+    """
+    from ouroboros.claudexor_daemon import read_owned_gateway, owned_daemon_provisioned
+
+    result = {"items": [], "errors": [], "model_sources": []}
+    if not source_id and not owned_daemon_provisioned():
+        return result
+    try:
+        with read_owned_gateway() as gateway:
+            try:
+                operations = gateway.operations()
+            except Exception:
+                operations = []  # Discovery compatibility never invents new query support.
+            account_view = account_catalog_supported(operations, "/v2/model-sources/:id/models")
+            source_view = account_catalog_supported(operations, "/v2/model-sources")
+            sources = gateway.list_model_sources(**({"view": "accounts"} if source_view else {})).get("sources", [])
+            if account_view:
+                result.update(account_catalogs=[], partial=False)
+            result["model_sources"] = sources
+            for source in sources:
+                identifier = str(source.get("id") or "")
+                if source_id and identifier != source_id:
+                    continue
+                try:
+                    catalog = gateway.list_source_models(identifier, credential_profile_id=profile_id or None,
+                        **({"view": "accounts"} if account_view else {}))
+                except Exception as exc:
+                    result["errors"].append({"provider_id": "claudexor", "source_id": identifier,
+                        "code": str(getattr(exc, "code", "catalog_unavailable")), "error": str(exc)})
+                    if account_view:
+                        result["partial"] = True
+                    continue
+                if account_view:
+                    result["account_catalogs"].append(catalog)
+                    result["partial"] = result["partial"] or catalog.get("partial", False)
+                    for account in catalog.get("accounts", []):
+                        # A readable account carrying a problem (spent window, cooldown) is account state,
+                        # already on its items and account_catalogs; only a missing catalog is a read failure.
+                        if account.get("catalog") is None:
+                            problem = account.get("problem") or {}
+                            result["errors"].append({"provider_id": "claudexor", "source_id": identifier,
+                                "credential_profile_id": account.get("credentialProfileId"),
+                                "code": problem.get("code", "catalog_unavailable"),
+                                "error": problem.get("message", "This account catalog could not be read."),
+                                "availability": account.get("availability"), "problem": account.get("problem")})
+                    records = account_catalog_models(catalog)
+                else:
+                    records = ((None, catalog, model) for model in catalog.get("models", []))
+                for account, catalog, model in records:
+                    model_id = str(model.get("id") or "")
+                    if not model_id:
+                        continue
+                    entry = _build_model_catalog_entry("claudexor", str(source.get("label") or identifier),
+                        model_id, str(model.get("label") or model_id), source="Claudexor")
+                    entry.update({
+                        "source_id": identifier,
+                        "value": f"claudexor::{identifier}={model_id}",
+                        "credential_profile_id": catalog.get("credentialProfileId"),
+                        "account_fingerprint": catalog.get("accountFingerprint"),
+                        "context_window": model.get("contextWindow"),
+                        "max_context_window": model.get("maxContextWindow"),
+                        "max_output_tokens": model.get("maxOutputTokens"),
+                        "is_default": model.get("isDefault", False),
+                        "supported_options": model.get("supportedOptions", []),
+                        "reasoning_efforts": model.get("reasoningEfforts", []),
+                        "default_reasoning_effort": model.get("defaultReasoningEffort"),
+                        "input_modalities": model.get("inputModalities", []),
+                        "provenance": catalog.get("provenance"),
+                        "observed_at": catalog.get("observedAt"),
+                    })
+                    if account is not None:
+                        entry.update(availability=account.get("availability"), problem=account.get("problem"),
+                                     processing=model.get("processing"))
+                    result["items"].append(entry)
+            if source_id and not any(str(source.get("id") or "") == source_id for source in sources):
+                result["errors"].append({"provider_id": "claudexor", "source_id": source_id,
+                    "code": "model_source_unavailable", "error": "This engine does not provide the selected model transport."})
+    except Exception as exc:
+        result["errors"].append({"provider_id": "claudexor", "source_id": source_id,
+            "code": str(getattr(exc, "code", "catalog_unavailable")), "error": str(exc)})
+    return result
+
+
 async def api_model_catalog(_request: Request) -> JSONResponse:
+    query = _request.query_params if _request is not None else {}
+    source_id = str(query.get("source_id") or "").strip()
+    profile_id = str(query.get("credential_profile_id") or "").strip()
+    if profile_id and not source_id:
+        return json_error("credential_profile_id requires source_id", 400)
+    subscription = await asyncio.to_thread(_subscription_model_catalog, source_id, profile_id)
+    if source_id:
+        return JSONResponse(subscription)
     settings = load_settings()
-    items: list[dict[str, str]] = []
-    errors: list[dict[str, str]] = []
+    items = list(subscription["items"])
+    errors = list(subscription["errors"])
     seen_values: set[str] = set()
     specs = _provider_specs(settings)
 
     timeout = httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        results = await asyncio.gather(*[
-            _load_provider(client, provider_id, loader)
-            for provider_id, loader in specs
-        ])
+    try:
+        verify = verify_kwargs()
+    except ExtraCaBundleError as exc:
+        # A misconfigured trust bundle is a fact for the owner to read, not a bare 500:
+        # keep the engine catalog, name the setting, skip the API providers this turn.
+        errors.append({"provider_id": "extra_ca_bundle", "error": str(exc), "stage": "trust", "duration_ms": 0})
+        results = []
+    else:
+        async with httpx.AsyncClient(timeout=timeout, **verify) as client:
+            results = await asyncio.gather(*[
+                _load_provider(client, provider_id, loader)
+                for provider_id, loader in specs
+            ])
 
     for provider_id, provider_items, error, stage, duration_ms in results:
         if error:
@@ -365,8 +557,9 @@ async def api_model_catalog(_request: Request) -> JSONResponse:
             seen_values.add(value)
             items.append(item)
 
-    items.sort(key=lambda item: (item.get("provider", "").lower(), item.get("label", "").lower()))
+    items.sort(key=lambda item: (item.get("provider", "").lower(), item.get("name", "").lower()))
     return JSONResponse({
+        **subscription,
         "items": items,
         "errors": errors,
     })
@@ -412,7 +605,8 @@ async def api_local_model_start(request: Request) -> JSONResponse:
         # Download can be slow, run in thread to not block the async event loop
         model_path = await asyncio.to_thread(mgr.download_model, source, filename)
 
-        mgr.start_server(model_path, port=port, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx, chat_format=chat_format)
+        mgr.start_server(model_path, port=port, n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+                         chat_format=chat_format, source=source, filename=filename)
         return JSONResponse({"status": "starting", "model_path": model_path})
     except Exception as e:
         return json_exception(e)
@@ -436,7 +630,7 @@ async def api_local_model_status(request: Request) -> JSONResponse:
         # on the very first poll — before the user clicks Start.
         if mgr._runtime_status == "unknown" and mgr.get_status() == "offline":
             await asyncio.to_thread(mgr.check_runtime)
-        return JSONResponse(mgr.status_dict())
+        return JSONResponse({**mgr.status_dict(), "settings_application": mgr.settings_application(load_settings())})
     except Exception as e:
         return JSONResponse({"status": "error", "error": str(e)})
 
@@ -461,7 +655,7 @@ async def api_openai_compatible_models(request: Request) -> JSONResponse:
         api_key = str(body.get("apiKey", "") or "").strip()
         if not base_url:
             return json_error("baseUrl is required", 400)
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10.0, **verify_kwargs()) as client:
             models = await _fetch_openai_compatible_model_catalog(
                 client, "openai-compatible", "OpenAI-compatible", api_key, base_url
             )
@@ -471,6 +665,158 @@ async def api_openai_compatible_models(request: Request) -> JSONResponse:
         return JSONResponse({"error": f"HTTP {e.response.status_code}"}, status_code=502)
     except Exception as e:
         return json_exception(e)
+
+
+_PROVIDER_TEST_OVERRIDE_KEYS = ALL_PROVIDER_CREDENTIAL_KEYS
+_PROVIDER_TEST_KNOWN_IDS: frozenset[str] = frozenset({
+    "openrouter", "openai-compatible", *DIRECT_PROVIDER_DEFAULTS,
+})
+
+
+def _provider_test_model(provider_id: str, settings: dict) -> str:
+    """Resolve one deterministic runtime/default model without catalog I/O."""
+    for setting_key in ACTIVE_MODEL_SETTING_KEYS:
+        for raw_model in str(settings.get(setting_key, "") or "").split(","):
+            model = raw_model.strip()
+            if model and provider_for_model(model) == provider_id:
+                return model
+    if provider_id == "openrouter":
+        return str(OPENROUTER_DEFAULTS.get("main") or "").strip()
+    return str((DIRECT_PROVIDER_DEFAULTS.get(provider_id) or {}).get("main") or "").strip()
+
+
+def _discover_provider_test_model(provider_id: str, settings: dict) -> str:
+    """Catalog discovery for the sole route without a maintained default."""
+    if provider_id != "openai-compatible":
+        return ""
+
+    async def load_first() -> str:
+        loader = dict(_provider_specs(settings)).get(provider_id)
+        if loader is None:
+            return ""
+        async with httpx.AsyncClient(timeout=httpx.Timeout(_CATALOG_HTTP_TIMEOUT_SEC), **verify_kwargs()) as client:
+            items = await loader(client)
+        return str((items[0] if items else {}).get("value") or "").strip()
+
+    return asyncio.run(load_first())
+
+
+def _provider_test_log(provider_id: str, model: str, result: dict, duration_ms: int) -> None:
+    facts = redact_projection({
+        "provider_id": provider_id,
+        "model": model,
+        "ok": bool(result.get("ok")),
+        "error_category": str(result.get("error") or ""),
+        "status_code": result.get("status_code"),
+        "exception_type": str(result.get("exception_type") or ""),
+        "duration_ms": duration_ms,
+    }).value
+    logger = log.info if facts.get("ok") else log.warning
+    logger("provider_test result=%s", facts)
+
+
+def _run_provider_test_with_settings(provider_id: str, settings: dict) -> dict:
+    """Run selection, optional discovery, client construction and one send."""
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_probe import controlled_probe_error
+
+    started = time.perf_counter()
+    model = ""
+    try:
+        model = _provider_test_model(provider_id, settings)
+        if not model:
+            model = _discover_provider_test_model(provider_id, settings)
+        if not model:
+            result = {
+                "ok": False,
+                "error": "Provider is not configured",
+                "status_code": None,
+                "exception_type": "ProviderNotConfigured",
+            }
+        else:
+            result = LLMClient().probe_provider_readiness(model, settings=settings)
+    except Exception as exc:
+        result = controlled_probe_error(exc)
+    duration_ms = int((time.perf_counter() - started) * 1000)
+    _provider_test_log(provider_id, model, result, duration_ms)
+    public = {"ok": bool(result.get("ok"))}
+    if not public["ok"]:
+        public["error"] = str(result.get("error") or "Model request failed")
+    return public
+
+
+def _run_provider_test(provider_id: str, overrides: dict[str, str]) -> dict:
+    """Load and merge the request-local draft inside the worker thread."""
+    settings = dict(load_settings())
+    if provider_id == "openai-compatible":
+        # No-edit requests retain the historical OPENAI_* fallback. An explicit
+        # Clear on the dedicated card must not silently restore the corresponding
+        # legacy value for this request-local probe.
+        legacy_fallbacks = {
+            "OPENAI_COMPATIBLE_API_KEY": "OPENAI_API_KEY",
+            "OPENAI_COMPATIBLE_BASE_URL": "OPENAI_BASE_URL",
+        }
+        if not any(str(settings.get(key, "") or "").strip() for key in legacy_fallbacks):
+            # A legacy install has no dedicated compatible pair yet. Preserve the
+            # saved half the owner did not edit while the other half is a draft.
+            for dedicated_key, legacy_key in legacy_fallbacks.items():
+                if dedicated_key not in overrides:
+                    settings[dedicated_key] = str(settings.get(legacy_key, "") or "").strip()
+        for dedicated_key, legacy_key in legacy_fallbacks.items():
+            if dedicated_key in overrides and not overrides[dedicated_key].strip():
+                settings[legacy_key] = ""
+    settings.update({key: value.strip() for key, value in overrides.items()})
+    minimax_region = str(settings.get("MINIMAX_REGION", "") or "").strip().lower()
+    if provider_id == "minimax" and minimax_region and minimax_region not in MINIMAX_REGION_ENDPOINTS:
+        return {"error": "unknown MiniMax region", "_http_status": 400}
+    zai_plan = str(settings.get("ZAI_PLAN", "") or "").strip().lower()
+    if provider_id == "zai" and zai_plan and zai_plan not in ZAI_PLAN_ENDPOINTS:
+        return {"error": "unknown Z.ai plan", "_http_status": 400}
+    return _run_provider_test_with_settings(provider_id, settings)
+
+
+async def api_provider_test(request: Request) -> JSONResponse:
+    """Run one request-local, physically accounted completion probe."""
+    try:
+        body = await request.json()
+    except Exception:
+        return json_error("request body must be a JSON object", 400)
+    if not isinstance(body, dict):
+        return json_error("request body must be a JSON object", 400)
+    # Executable gateway ABI (ABI-3, Q7=A): ProviderTestRequest schema gate.
+    from ouroboros.gateway.contracts import ProviderTestRequest
+    from ouroboros.gateway.schema import validate_ingress
+
+    schema_errors = validate_ingress(body, ProviderTestRequest)
+    if schema_errors:
+        return json_error(
+            f"invalid request body: {schema_errors[0]}", 400,
+            schema_errors=schema_errors[:8],
+        )
+    provider_id = str(body.get("provider_id", "") or "").strip()
+    if not provider_id:
+        return json_error("provider_id is required", 400)
+    if provider_id not in _PROVIDER_TEST_KNOWN_IDS:
+        return json_error("unknown provider id", 400)
+
+    overrides = body.get("overrides")
+    if overrides is None:
+        overrides = {}
+    if not isinstance(overrides, dict):
+        return json_error("overrides must be an object", 400)
+    unknown = sorted(str(key) for key in overrides if str(key) not in _PROVIDER_TEST_OVERRIDE_KEYS)
+    if unknown:
+        return json_error(f"unsupported override keys: {', '.join(unknown)}", 400)
+    if any(not isinstance(value, str) for value in overrides.values()):
+        return json_error("override values must be strings", 400)
+
+    result = await asyncio.to_thread(
+        _run_provider_test,
+        provider_id,
+        {str(key): value for key, value in overrides.items()},
+    )
+    status_code = int(result.pop("_http_status", 200))
+    return JSONResponse(result, status_code=status_code)
 
 
 async def api_local_model_install_runtime(request: Request) -> JSONResponse:

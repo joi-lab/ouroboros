@@ -1,67 +1,66 @@
-import json
+"""Observability blobs are never deleted and never counted (CPL4-C22, owner 7A; TZ-1 A).
+
+The retention knob that deleted nothing is retired (absent from the module, listed in
+``RETIRED_SETTING_KEYS`` so stored ghosts drop on settings load), and the startup census
+that walked every manifest and blob to count them is gone with it: startup neither lists
+nor touches the store.
+"""
+
+from __future__ import annotations
+
 import os
-
-from ouroboros.observability import persist_call, prune_observability_blobs, write_blob
-
-
-def test_observability_retention_preserves_old_manifests_and_orphan_blobs(tmp_path):
-    persist_call(
-        tmp_path,
-        task_id="old-task",
-        call_id="old-call",
-        call_type="llm_call",
-        payload={"message": "old"},
-    )
-    keep = persist_call(
-        tmp_path,
-        task_id="new-task",
-        call_id="new-call",
-        call_type="llm_call",
-        payload={"message": "new"},
-    )
-    orphan = write_blob(tmp_path, {"message": "orphan"})
-
-    old_manifest = tmp_path / "observability" / "calls" / "old-task" / "old-call.json"
-    new_manifest = tmp_path / "observability" / "calls" / "new-task" / "new-call.json"
-    old_time = 1_000_000.0
-    new_time = old_time + 10 * 86400
-    os.utime(old_manifest, (old_time, old_time))
-    os.utime(new_manifest, (new_time, new_time))
-    os.utime(orphan["path"], (old_time, old_time))
-
-    report = prune_observability_blobs(tmp_path, retention_days=7, now=new_time)
-
-    assert report["preserved_indefinitely"] is True
-    assert report["deleted_manifests"] == 0
-    assert report["deleted_blobs"] == 0
-    assert old_manifest.exists()
-    assert new_manifest.exists()
-    assert os.path.exists(orphan["path"])
-    assert report["manifest_count"] == 2
-    assert report["blob_count"] >= 3
-    manifest = json.loads(new_manifest.read_text(encoding="utf-8"))
-    assert os.path.exists(manifest["full_payload_ref"]["path"])
-    assert os.path.exists(manifest["redacted_projection_ref"]["path"])
-    assert keep["manifest_ref"]["path"] == str(new_manifest)
+import pathlib
+import time
 
 
-def test_observability_retention_preserves_fresh_orphan_blobs(tmp_path):
-    orphan = write_blob(tmp_path, {"message": "fresh service log blob"})
-    now = 1_000_000.0
-    os.utime(orphan["path"], (now, now))
+def _seed_store(tmp_path):
+    calls = tmp_path / "observability" / "calls" / "t1"
+    blobs = tmp_path / "observability" / "blobs"
+    calls.mkdir(parents=True)
+    blobs.mkdir(parents=True)
+    aged = time.time() - 4000 * 86400
+    paths = [calls / "a.json", calls / "b.json", blobs / "x.gz", blobs / "y.gz", blobs / "z.gz"]
+    for path in paths:
+        path.write_bytes(b"data")
+        os.utime(path, (aged, aged))
+    return paths
 
-    report = prune_observability_blobs(tmp_path, retention_days=7, now=now)
 
-    assert report["deleted_blobs"] == 0
-    assert os.path.exists(orphan["path"])
+def test_startup_neither_counts_nor_deletes_observability_blobs(tmp_path, monkeypatch):
+    import ouroboros.observability as observability
+    from ouroboros import server_maintenance as sm
+
+    monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
+    monkeypatch.setenv("OUROBOROS_OBSERVABILITY_RETENTION_DAYS", "1")  # inert: retired
+    paths = _seed_store(tmp_path)
+    touched = []
+    real_stat = os.stat
+
+    def spy(path, *args, **kwargs):
+        if "observability" in str(path):
+            touched.append(str(path))
+        return real_stat(path, *args, **kwargs)
+
+    # The spy watches startup only: from Python 3.11 pathlib stats through ``os.stat``, so the
+    # checks below would otherwise count themselves as startup touches. Python 3.10 pathlib
+    # bound ``os.stat`` at import in its accessor, which a pathlib census would stat through.
+    with monkeypatch.context() as startup:
+        startup.setattr(os, "stat", spy)
+        if hasattr(pathlib, "_NormalAccessor"):
+            startup.setattr(pathlib._NormalAccessor, "stat", staticmethod(spy))
+        sm._startup_prune_sweeps()
+    assert touched == [], touched
+    assert all(path.read_bytes() == b"data" for path in paths)
+    assert not hasattr(observability, "prune_observability_blobs")
 
 
-def test_observability_retention_disabled_without_env(tmp_path, monkeypatch):
-    orphan = write_blob(tmp_path, {"message": "kept"})
-    monkeypatch.delenv("OUROBOROS_OBSERVABILITY_RETENTION_DAYS", raising=False)
+def test_retention_knob_is_retired_everywhere():
+    import inspect
 
-    report = prune_observability_blobs(tmp_path)
+    import ouroboros.observability as observability
+    from ouroboros.settings_defaults import RETIRED_SETTING_KEYS
 
-    assert report["enabled"] is False
-    assert report["preserved_indefinitely"] is True
-    assert os.path.exists(orphan["path"])
+    source = inspect.getsource(observability)
+    # The docstring may still NAME the retired knob; nothing may READ it.
+    assert 'environ.get("OUROBOROS_OBSERVABILITY_RETENTION_DAYS"' not in source
+    assert "OUROBOROS_OBSERVABILITY_RETENTION_DAYS" in RETIRED_SETTING_KEYS

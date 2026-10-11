@@ -1,0 +1,302 @@
+"""Regression tests for the provider-death owner-notification single-shot gate.
+
+Slime-saga TASK 3 settled a disputed claim by test: the old ``and task`` gate in
+``_finish_task_done_dispatch`` claimed reaper-only delivery still notifies, but
+the reaper LOOP pops RUNNING BEFORE ``reap_timed_out_task`` emits its task_done
+(that function's docstring: "The loop already popped RUNNING/cleared
+busy_task_id"), so a reaper-delivered provider-death terminal arrived with
+``task={}`` and the notification was silently swallowed — the external
+reviewer's claim was CORRECT. The fix keys single-shot on the process-local
+``_PROVIDER_DEATH_NOTIFIED`` registry: a duplicate ``already_done`` terminal
+stays silent, a reaper-delivered terminal fires.
+"""
+
+from __future__ import annotations
+
+import types
+
+import pytest
+
+from ouroboros.owner_mailbox import (
+    _ack_path,
+    _mailbox_path,
+    acknowledge_task_messages,
+    write_owner_message,
+)
+from ouroboros.task_results import load_task_result, write_task_result
+from supervisor import events as events_mod
+from supervisor import queue as queue_mod
+
+
+@pytest.fixture()
+def sent_and_ctx(tmp_path, monkeypatch):
+    monkeypatch.setattr(events_mod, "_PROVIDER_DEATH_NOTIFIED", set())
+    sent: list[tuple[int, str]] = []
+
+    def make_ctx(running):
+        return types.SimpleNamespace(
+            DRIVE_ROOT=tmp_path, RUNNING=running, PENDING=[], WORKERS={},
+            send_with_budget=lambda cid, text, **_k: sent.append((cid, str(text))),
+            append_jsonl=lambda *_a, **_k: None,
+            persist_queue_snapshot=lambda **_k: True,
+            bridge=types.SimpleNamespace(push_log=lambda _e: None),
+        )
+
+    return sent, make_ctx
+
+
+def _provider_death_event(task_id: str) -> dict:
+    return {
+        "type": "task_done", "task_id": task_id, "chat_id": 7,
+        "status": "failed", "reason_code": "provider_unavailable",
+    }
+
+
+def _outage_lines(sent):
+    return [text for _cid, text in sent if "provider outage" in text]
+
+
+def _write_mailbox_pair(root, task_id):
+    assert write_owner_message(root, "exact terminal bytes", task_id, msg_id="owner-1")
+    assert acknowledge_task_messages(
+        root, task_id, ["owner-1"], wake_id="attempt-1", attempt_key=1,
+    )
+    assert _mailbox_path(root, task_id).exists()
+    assert _ack_path(root, task_id).exists()
+
+
+def test_duplicate_already_done_after_normal_delivery_notifies_exactly_once(
+    sent_and_ctx,
+):
+    """Path (a): the worker delivered its own task_done (RUNNING row present,
+    notification fires and the dispatch releases the row), died, and the crash
+    detector emitted a second already_done terminal whose dispatch sees
+    task={} — the owner is notified exactly once."""
+    sent, make_ctx = sent_and_ctx
+    root_task = {"id": "rootA", "chat_id": 7}
+    running = {"rootA": {"task": root_task, "worker_id": 0}}
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx(running),
+        task_id="rootA", worker_id=0, task=root_task, final_task_result={},
+        task_done_event=_provider_death_event("rootA"),
+    )
+    assert len(_outage_lines(sent)) == 1
+    assert "rootA" not in running
+
+    # The duplicate already_done terminal: RUNNING no longer holds the row.
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({}),
+        task_id="rootA", worker_id=0, task={}, final_task_result={},
+        task_done_event=_provider_death_event("rootA"),
+    )
+    assert len(_outage_lines(sent)) == 1, "duplicate terminal must stay silent"
+
+
+def test_reaper_delivered_terminal_with_popped_running_row_still_notifies(
+    sent_and_ctx,
+):
+    """Path (b), the proven bug: the reaper loop pops RUNNING before the reap
+    job's task_done dispatches, so the FIRST and only delivery arrives with
+    task={} — the old `and task` gate swallowed the notification entirely.
+    Also pins the wording: neither resume nor a blind re-run is promised;
+    the preserved facts must be inspected before another run."""
+    sent, make_ctx = sent_and_ctx
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({}),
+        task_id="rootB", worker_id=0, task={}, final_task_result={},
+        task_done_event=_provider_death_event("rootB"),
+    )
+
+    lines = _outage_lines(sent)
+    assert lines, "reaper-delivered provider-death terminal must notify the owner"
+    assert "NOT completed" in lines[0]
+    assert "inspect the task details before starting another run" in lines[0]
+    assert "re-run" not in lines[0]
+    assert "resume" not in lines[0]
+
+
+def test_raising_send_keeps_cleanup_and_allows_a_later_retry(sent_and_ctx):
+    """A raising ``send_with_budget`` must not abort the task-done bookkeeping,
+    and the id must NOT enter the single-shot registry (a later dispatch may
+    retry the notification); the success path stays single-shot."""
+    sent, make_ctx = sent_and_ctx
+    root_task = {"id": "rootF", "chat_id": 7}
+    running = {"rootF": {"task": root_task, "worker_id": 0}}
+    ctx = make_ctx(running)
+
+    def _boom(_cid, _text, **_k):
+        raise RuntimeError("chat transport down")
+
+    ctx.send_with_budget = _boom
+    events_mod._finish_task_done_dispatch(
+        {}, ctx,
+        task_id="rootF", worker_id=0, task=root_task, final_task_result={},
+        task_done_event=_provider_death_event("rootF"),
+    )
+    assert "rootF" not in running, "cleanup must run despite the failed send"
+    assert "rootF" not in events_mod._PROVIDER_DEATH_NOTIFIED
+
+    # A later dispatch (e.g. the duplicate already_done terminal) retries and
+    # registers the id only now, on the successful send.
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({}),
+        task_id="rootF", worker_id=0, task={}, final_task_result={},
+        task_done_event=_provider_death_event("rootF"),
+    )
+    assert len(_outage_lines(sent)) == 1
+    assert "rootF" in events_mod._PROVIDER_DEATH_NOTIFIED
+
+
+def test_reaper_delivered_child_terminal_stamps_parent_activity(sent_and_ctx):
+    """The parent activity stamp must land even when ``task`` is {} (the
+    reaper-delivered popped-RUNNING shape): ``parent_task_id`` falls back to
+    the durable ``final_task_result``, same as the notification gate."""
+    _sent, make_ctx = sent_and_ctx
+    parent_meta = {"task": {"id": "rootG"}, "worker_id": 0}
+    running = {"rootG": parent_meta}
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx(running),
+        task_id="kidG", worker_id=1, task={},
+        final_task_result={"parent_task_id": "rootG", "delegation_role": "subagent"},
+        task_done_event=_provider_death_event("kidG"),
+    )
+
+    assert "last_progress_at" in parent_meta, (
+        "a reaper-delivered child terminal must count as the parent's progress"
+    )
+
+
+
+
+def test_subagent_provider_death_never_pings_the_owner(sent_and_ctx):
+    """A child's provider death keeps the ordinary subagent toast only — the
+    parent absorbs child failures; the registry gate must not change that."""
+    sent, make_ctx = sent_and_ctx
+    child_task = {
+        "id": "kidE", "chat_id": 7, "parent_task_id": "rootE",
+        "root_task_id": "rootE", "delegation_role": "subagent",
+    }
+
+    events_mod._finish_task_done_dispatch(
+        {"status": "failed"}, make_ctx({"kidE": {"task": child_task, "worker_id": 1}}),
+        task_id="kidE", worker_id=1, task=child_task, final_task_result={},
+        task_done_event=_provider_death_event("kidE"),
+    )
+
+    assert not _outage_lines(sent)
+    assert [text for _cid, text in sent if "Subagent kidE failed" in text]
+
+
+def test_provider_incident_is_system_unkeyed_and_host_salvage_suppresses_duplicate(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setattr(events_mod, "_PROVIDER_DEATH_NOTIFIED", set())
+    sent = []
+    ctx = types.SimpleNamespace(
+        send_with_budget=lambda cid, text, **kwargs: sent.append((cid, text, kwargs)),
+    )
+    event = _provider_death_event("root-origin")
+
+    events_mod._maybe_notify_provider_death(
+        ctx, "root-origin", {"chat_id": 7},
+        {"terminal_origin": "host_salvage"}, event,
+    )
+    assert sent == []
+
+    events_mod._maybe_notify_provider_death(
+        ctx, "root-origin", {"chat_id": 7},
+        {
+            "terminal_origin": "model_final",
+            "terminal_plan_review_open": True,
+        }, event,
+    )
+    assert len(sent) == 1
+    _chat, text, kwargs = sent[0]
+    assert text == (
+        "🔌 Task root-origin was NOT completed.\n\n"
+        "A model-provider outage stopped this task. Partial work and workspace files "
+        "are preserved; inspect the task details before starting another run.\n\n"
+        "Plan review was still open when the outage forced finalization; "
+        "its details remain in the task."
+    )
+    assert kwargs == {"role": "system", "system_type": "terminal_incident"}
+    assert "task_id" not in kwargs
+
+
+def test_settled_dispatch_cleans_mailbox_only_after_durable_terminal(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "terminal-mailbox"
+    task = {"id": task_id, "chat_id": 7}
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(tmp_path, task_id, "completed", result="done")
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({task_id: {"task": task, "worker_id": 0}}),
+        task_id=task_id, worker_id=0, task=task,
+        final_task_result=load_task_result(tmp_path, task_id),
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "completed"},
+    )
+
+    assert not _mailbox_path(tmp_path, task_id).exists()
+    assert not _ack_path(tmp_path, task_id).exists()
+
+
+def test_interrupted_dispatch_preserves_mailbox_for_retry(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "interrupted-mailbox"
+    task = {"id": task_id, "chat_id": 7}
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(tmp_path, task_id, "interrupted", result="retry pending")
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({task_id: {"task": task, "worker_id": 0}}),
+        task_id=task_id, worker_id=0, task=task,
+        final_task_result=load_task_result(tmp_path, task_id),
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "interrupted"},
+    )
+
+    assert _mailbox_path(tmp_path, task_id).exists()
+    assert _ack_path(tmp_path, task_id).exists()
+
+
+def test_reaper_terminal_cleans_split_drive_not_canonical_mailbox(
+    sent_and_ctx, tmp_path, monkeypatch,
+):
+    _sent, make_ctx = sent_and_ctx
+    task_id = "split-mailbox"
+    child_drive = tmp_path / "child-drive"
+    _write_mailbox_pair(child_drive, task_id)
+    _write_mailbox_pair(tmp_path, task_id)
+    write_task_result(
+        tmp_path, task_id, "failed", result="terminal",
+        child_drive_root=str(child_drive),
+    )
+    durable = load_task_result(tmp_path, task_id)
+    monkeypatch.setattr(queue_mod, "DRIVE_ROOT", tmp_path)
+
+    events_mod._finish_task_done_dispatch(
+        {}, make_ctx({}), task_id=task_id, worker_id=0, task={},
+        final_task_result=durable,
+        task_done_event={"type": "task_done", "task_id": task_id, "status": "failed"},
+    )
+
+    # The loop-thread seam copies nothing: a split drive's mailbox (its acknowledged history
+    # may carry inputs to promote) waits for the off-loop owner, which releases it; the
+    # canonical mailbox is never the split task's to clean.
+    assert _mailbox_path(child_drive, task_id).exists()
+    from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+
+    cleanup_settled_owner_mailbox(tmp_path, task_id, {}, carry_inputs=True)
+    assert not _mailbox_path(child_drive, task_id).exists()
+    assert not _ack_path(child_drive, task_id).exists()
+    assert _mailbox_path(tmp_path, task_id).exists()
+    assert _ack_path(tmp_path, task_id).exists()

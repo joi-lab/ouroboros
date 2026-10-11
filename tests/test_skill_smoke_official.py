@@ -64,7 +64,6 @@ pytestmark = pytest.mark.skill_smoke
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 OFFICIAL_SKILLS = [
-    "telegram-bridge",
     "a2a",
     "duckduckgo",
     "perplexity",
@@ -315,30 +314,6 @@ def test_manifest_parses_and_matches_contract(slug, install_skill):
     keyed = {"perplexity", "nanobanana", "music_gen"}
     if slug in keyed:
         assert "OPENROUTER_API_KEY" in manifest.env_from_settings
-    if slug == "telegram-bridge":
-        # The protected bot token is REQUESTED by the manifest. The
-        # install/probe tiers never grant it; Tier 6 auto-grants it
-        # request-keyed (empty settings value, temp DATA_DIR) and persists
-        # enablement only — no extension is ever loaded with the token.
-        assert "TELEGRAM_BOT_TOKEN" in manifest.env_from_settings
-        assert manifest.subscribe_events
-    if slug in {"duckduckgo", "weather", "backlog_manager", "a2a"}:
-        assert not manifest.env_from_settings, f"{slug}: expected a keyless manifest"
-    if slug == "a2a":
-        # Companion daemon is validated STATICALLY only — never spawned here
-        # (owner decision): install/preflight paths start no processes.
-        assert len(manifest.companion_processes) == 1
-        companion = manifest.companion_processes[0]
-        assert companion.get("name") == "a2a_server"
-        assert companion.get("runtime") == "python3"
-        # Contract-level shape only (a hub-side flag addition must not red the
-        # release gate): python3 runs the daemon script, which exists on disk.
-        # command[1] is the parser-pinned script position (skill_manifest.py
-        # rejects inline -c/-m forms), so trailing flags stay legal.
-        command = companion.get("command") or []
-        assert len(command) >= 2 and command[0] == "python3", command
-        assert str(command[1]).endswith("a2a_daemon.py"), command
-        assert (target / "scripts" / "a2a_daemon.py").is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -565,15 +540,17 @@ def test_backlog_manager_summary_offline(install_skill, tmp_path):
 # CI run for the 4-skill subset on one OS; a verdict retry doubles at most.
 # ---------------------------------------------------------------------------
 
-# Owner-picked subset: telegram-bridge + a2a (mandated) + duckduckgo (core
-# keyless search; exercises the review→deps production ordering) + perplexity
-# (keyed skill; exercises OPENROUTER_API_KEY auto-grant).
-REVIEW_SKILLS = ("telegram-bridge", "a2a", "duckduckgo", "perplexity")
+# Owner-picked subset: a2a (mandated) + duckduckgo (core keyless search;
+# exercises the review→deps production ordering) + perplexity (keyed skill;
+# exercises OPENROUTER_API_KEY auto-grant). The subset carried telegram-bridge
+# for the protected-token and chat-permission path until that skill was retired
+# from the official catalog; no remaining official skill requests a protected
+# token, so that tier is unexercised here.
+REVIEW_SKILLS = ("a2a", "duckduckgo", "perplexity")
 _REVIEW_MODEL = "google/gemini-3.5-flash"
 # Expected auto-granted settings keys per skill (grants are request-keyed,
 # not value-keyed; empty values grant fine and only bite at runtime).
 _REVIEW_EXPECTED_KEYS = {
-    "telegram-bridge": {"TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY"},
     "a2a": set(),
     "duckduckgo": set(),
     "perplexity": {"OPENROUTER_API_KEY"},
@@ -653,9 +630,8 @@ def _review_diag(name: str, status: str, error: str, payload: Dict[str, Any]) ->
     return "\n".join(parts)
 
 
-def _actor_cost_usd(review: Dict[str, Any]) -> float:
-    # SkillReviewOutcome.cost_usd is never populated from actor usage; the
-    # authoritative per-call costs live in raw_actor_records.
+def _actor_reported_valuation_usd(review: Dict[str, Any]) -> float:
+    """Non-authoritative reviewer telemetry, kept only for live-smoke diagnostics."""
     return sum(float(rec.get("cost_usd") or 0.0) for rec in review.get("raw_actor_records") or [])
 
 
@@ -708,15 +684,19 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
     review = json.loads((_skill_state_dir(name) / "review.json").read_text(encoding="utf-8"))
     assert review.get("content_hash") == loaded.content_hash
     models = list(review.get("reviewer_models") or [])
-    assert len(models) == 1 and models[0].rsplit("#", 1)[0] == _REVIEW_MODEL, models
+    assert len(models) == 1, models
+    # Reviewer identity may carry the stable slot attribution suffix introduced
+    # by the shared review substrate, while the model id remains the contract.
+    model_id = models[0].split(" [", 1)[0].rsplit("#", 1)[0]
+    assert model_id == _REVIEW_MODEL, models
     # Hash-verified official payloads get the official_hub profile (the
     # severity-downgrade that stabilizes verdicts); losing it silently would
     # change what this lane proves.
     assert review.get("review_profile") == "official_hub", review.get("review_profile")
 
     # Auto-grant ran inside review_skill (blocking enforcement ⇒ only on
-    # clean/warnings). Grants are request-keyed: TELEGRAM_BOT_TOKEN grants
-    # with an empty settings value.
+    # clean/warnings). Grants are request-keyed: a requested key grants with an
+    # empty settings value.
     grants = grant_status_for_skill(DATA_DIR, loaded)
     assert grants.get("all_granted") is True, grants
     expected_keys = _REVIEW_EXPECTED_KEYS[slug]
@@ -724,14 +704,9 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
     assert granted_keys == expected_keys, (
         f"{slug}: granted_keys={sorted(granted_keys)} expected={sorted(expected_keys)}"
     )
-    if slug == "telegram-bridge":
-        granted_permissions = set(grants.get("granted_permissions") or [])
-        assert "inject_chat" in granted_permissions, grants
-        assert any(p.startswith("subscribe_event:chat.") for p in granted_permissions), grants
-
     # Enable persistence prerequisites: the production toggle-gate facts plus
     # the top static readiness gate. Nothing runtime starts here (no server,
-    # temp DATA_DIR) — enabling telegram-bridge/a2a cannot poll or spawn.
+    # temp DATA_DIR) — enabling a2a cannot poll or spawn.
     save_enabled(DATA_DIR, name, True)
     assert load_enabled(DATA_DIR, name) is True
     reloaded = find_skill(DATA_DIR, name)
@@ -745,5 +720,6 @@ def test_review_grants_and_enable(slug, review_secret, install_skill, review_env
 
     print(
         f"{slug}: review={status} slots={models} "
-        f"cost=${_actor_cost_usd(review):.4f} elapsed={time.time() - started:.1f}s"
+        f"actor_reported_valuation=${_actor_reported_valuation_usd(review):.4f} "
+        f"elapsed={time.time() - started:.1f}s"
     )

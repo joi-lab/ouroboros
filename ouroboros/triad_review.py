@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -26,10 +26,29 @@ class ReviewActorRecord:
     tokens_out: int = 0
     cost_usd: float = 0.0
     slot: int = 0
+    slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
     response_ref: Dict[str, Any] = field(default_factory=dict)
+    failure_code: str = ""
+    reset_at: str = ""
+    http_status: Optional[int] = None
+    transport_status: str = ""
+    reported_cause: str = ""  # the engine's reported words for a failed run; opaque, "" = none
+    operation_id: str = ""
+    operation_state: str = "settled"
+    late_result_pending: bool = False
+    pending_invocation_id: str = ""
+    delegated_run_id: str = ""
+    recovery_binding: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
+        # The durable id is the one the review substrate actually ran this row
+        # under, carried on the envelope. Re-deriving it from the record's
+        # position is wrong whenever position is not row: an oversized skill
+        # review merges C chunk passes over M rows into ONE results list
+        # (skill_review_passes), so position M+1 is row 1 on its second pass.
+        from ouroboros.review_substrate import slot_id_for_row
+
         return {
             "model_id": self.model_id,
             "status": self.status,
@@ -39,9 +58,24 @@ class ReviewActorRecord:
             "tokens_out": self.tokens_out,
             "cost_usd": self.cost_usd,
             "slot": self.slot,
-            "slot_id": f"slot_{self.slot}" if self.slot else "",
+            # LEGACY-READ-ONLY fallback: every live producer stamps slot_id (the one
+            # dispatch entry is review._handle_multi_model_review — skill_review binds
+            # run_review to exactly it, pinned by test), so the positional mint here
+            # can only fire when re-serializing an envelope persisted before the carry.
+            "slot_id": self.slot_id or (slot_id_for_row(self.slot) if self.slot else ""),
             "prompt_ref": dict(self.prompt_ref),
             "response_ref": dict(self.response_ref),
+            "failure_code": self.failure_code,
+            "reset_at": self.reset_at,
+            "http_status": self.http_status,
+            "transport_status": self.transport_status,
+            **({"reported_cause": self.reported_cause} if self.reported_cause else {}),
+            "operation_id": self.operation_id,
+            "operation_state": self.operation_state,
+            "late_result_pending": self.late_result_pending,
+            "pending_invocation_id": self.pending_invocation_id,
+            "delegated_run_id": self.delegated_run_id,
+            "recovery_binding": dict(self.recovery_binding),
         }
 
 
@@ -87,8 +121,20 @@ def _actor_record(
         tokens_out=int(actor.get("tokens_out", 0) or 0),
         cost_usd=float(actor.get("cost_estimate", 0.0) or 0.0),
         slot=idx + 1,
+        slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
         response_ref=dict(actor.get("response_ref") or {}),
+        failure_code=str(actor.get("failure_code") or ""),
+        reset_at=str(actor.get("reset_at") or ""),
+        http_status=(int(actor["http_status"]) if isinstance(actor.get("http_status"), int) else None),
+        transport_status=str(actor.get("transport_status") or ""),
+        reported_cause=str(actor.get("reported_cause") or ""),
+        operation_id=str(actor.get("operation_id") or ""),
+        operation_state=str(actor.get("operation_state") or "settled"),
+        late_result_pending=bool(actor.get("late_result_pending")),
+        pending_invocation_id=str(actor.get("pending_invocation_id") or ""),
+        delegated_run_id=str(actor.get("delegated_run_id") or ""),
+        recovery_binding=dict(actor.get("recovery_binding") or {}),
     )
 
 
@@ -168,6 +214,129 @@ def _normalize_items(items: List[Any]) -> List[Any]:
         return normalize_reviewer_items(items)
     except Exception:
         return items
+
+
+def extract_fenced_json(text: str) -> Any:
+    """Best-effort parse of a fenced/embedded JSON object or array from model output.
+
+    Reviewers often wrap their verdict in a ```json ... ``` fence; a fenced JSON
+    OBJECT (e.g. {"verdict":"PASS","findings":[]}) would otherwise fail json.loads
+    and be missed by the array-only extractor, producing a false DEGRADED signal.
+    """
+    if "```" not in text:
+        return None
+    for chunk in text.split("```"):
+        candidate = chunk.strip()
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+        if not candidate:
+            continue
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, (dict, list)):
+            return obj
+    return None
+
+
+# Output SHAPE per surface — the ONE form fact the retrieving-route canonicalizer,
+# the session output schema and the strict parser branch on. Shape is FORM only
+# (no surface policy lives here: acceptance rules, tier classification and
+# quorum authority stay with their owners). Every surface not listed returns
+# the findings ARRAY contract; ``object`` is the whole-object acceptance verdict
+# (verdict/outcome_tier/criteria_used/dialogue_status/findings/summary), which
+# the array-only canonicalizer used to reduce to its findings list; ``report``
+# is a free-form markdown product that is never canonicalized or extracted.
+REVIEW_OUTPUT_SHAPES: Dict[str, str] = {
+    "task_acceptance": "object",
+    "deep_self_review": "report",
+}
+OBJECT_VERDICT_REQUIRED_KEYS = ("verdict",)
+
+# Default output contract per SHAPE for a retrieving delivery whose surface did
+# not hand over its own `policy["output_contract"]`: the prompt must ask for the
+# same form the canonicalizer parses, or an obedient reviewer answering the
+# array contract on an object surface is demoted to malformed by its own host.
+REVIEW_JSON_OBJECT_CONTRACT = """\
+Return ONLY one JSON object with keys: verdict (PASS|FAIL|DEGRADED), findings
+([{severity, item, evidence, recommendation}] — an empty list when nothing is
+wrong), and summary, plus any keys the task's contract names. Never a bare
+array, never prose around the object: your host parses the object structurally
+and treats anything else as a non-response.
+"""
+REVIEW_REPORT_CONTRACT = """\
+Deliver the report itself as plain markdown prose — no JSON wrapper, no code
+fence around the whole answer. Most critical findings first, each with the
+evidence you read; mark anything you could not verify as unverified.
+"""
+
+
+def review_output_shape(surface: str) -> str:
+    """``array`` | ``object`` | ``report`` for one review surface."""
+    return REVIEW_OUTPUT_SHAPES.get(str(surface or ""), "array")
+
+
+def default_output_contract(shape: str) -> str:
+    """The prompt contract a retrieving row is asked for when its surface hands
+    over no ``policy["output_contract"]`` — keyed by the same shape the
+    canonicalizer parses, so the ask and the parse can never disagree."""
+    return {
+        "object": REVIEW_JSON_OBJECT_CONTRACT, "report": REVIEW_REPORT_CONTRACT,
+    }.get(str(shape or ""), REVIEW_JSON_ARRAY_CONTRACT)
+
+
+def object_verdict_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    """The WHOLE object verdict, or None — mirroring `parse_review_findings`'
+    object ladder (a verdict signal is required, findings are optional) with
+    the array branch's type discipline: a non-empty string verdict and, when
+    present, findings as a list of dicts. Shape only: semantic demotion
+    (tier/coach/criteria) stays with ``review_actor_aggregation``."""
+    if not isinstance(payload, dict) or not all(key in payload for key in OBJECT_VERDICT_REQUIRED_KEYS):
+        return None
+    if not isinstance(payload.get("verdict"), str) or not payload["verdict"].strip():
+        return None
+    findings = payload.get("findings")
+    if findings is not None and (
+        not isinstance(findings, list) or not all(isinstance(item, dict) for item in findings)
+    ):
+        return None
+    return payload
+
+
+def parse_review_findings(raw_text: str) -> tuple[Any, List[Dict[str, Any]], str]:
+    """Reviewer response -> (parsed, findings, signal), by the object/array ladder."""
+    text = str(raw_text or "").strip()
+    parsed: Any = None
+    findings: List[Dict[str, Any]] = []
+    signal = "UNKNOWN"
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = extract_fenced_json(text)
+        if parsed is None:
+            extracted = extract_json_array(text)
+            if extracted is None:
+                # Keep non-JSON output untruncated; reviewer raw_text is still useful.
+                return None, [], "DEGRADED"
+            parsed = extracted
+    if isinstance(parsed, dict):
+        signal = str(parsed.get("verdict") or parsed.get("status") or "UNKNOWN").upper()
+        raw_findings = parsed.get("findings") or []
+        if isinstance(raw_findings, list):
+            findings = [item for item in raw_findings if isinstance(item, dict)]
+    elif isinstance(parsed, list):
+        findings = [item for item in parsed if isinstance(item, dict)]
+        verdicts = {str(item.get("verdict") or item.get("status") or "").upper() for item in findings}
+        if "FAIL" in verdicts:
+            signal = "FAIL"
+        elif "PASS" in verdicts:
+            signal = "PASS"
+        elif "DEGRADED" in verdicts:
+            signal = "DEGRADED"
+        else:
+            signal = "UNKNOWN"
+    return parsed, findings, signal
 
 
 # The review output contract lives beside the parser that enforces it: the
@@ -252,6 +421,7 @@ def parse_model_review_results(
     """
     findings: List[Dict[str, Any]] = []
     responsive: List[str] = []
+    responsive_ids: set[str] = set()
     records: List[ReviewActorRecord] = []
     required = set(required_items or [])
     for idx, actor in enumerate(result_json.get("results") or []):
@@ -260,6 +430,13 @@ def parse_model_review_results(
         model = str(actor.get("model") or actor.get("request_model") or "").strip()
         raw_text = str(actor.get("text") or "")
         model_label = model or "reviewer"
+        actor_slot_id = str(actor.get("slot_id") or "")
+        if str(actor.get("operation_state") or "") == "not_dispatched":
+            records.append(_actor_record(
+                actor, idx=idx, model_label=model_label,
+                status="not_dispatched", raw_text=raw_text,
+            ))
+            continue
         if str(actor.get("verdict") or "").upper() == "ERROR":
             records.append(_actor_record(actor, idx=idx, model_label=model_label, status="error", raw_text=raw_text))
             continue
@@ -291,13 +468,18 @@ def parse_model_review_results(
                 "severity": str(entry.get("severity") or "advisory").lower(),
                 "reason": str(entry.get("reason") or "").strip(),
                 "model": model_label,
+                "slot_id": actor_slot_id,
                 **({"obligation_id": str(entry.get("obligation_id") or "")} if entry.get("obligation_id") else {}),
             })
         if required and not required.issubset(covered_items):
             records.append(_actor_record(actor, idx=idx, model_label=model_label, status="partial", raw_text=raw_text, parsed_items=actor_findings))
             continue
         findings.extend(actor_findings)
-        responsive.append(f"{model_label}#{idx + 1}")
+        responsive_id = f"{model_label} [{actor_slot_id}]" if actor_slot_id else f"{model_label}#{idx + 1}"
+        response_identity = f"slot:{actor_slot_id}" if actor_slot_id else f"actor:{idx}"
+        if response_identity not in responsive_ids:
+            responsive.append(responsive_id)
+            responsive_ids.add(response_identity)
         records.append(_actor_record(actor, idx=idx, model_label=model_label, status="responded", raw_text=raw_text, parsed_items=actor_findings))
     return ParsedTriadReview(findings=findings, responsive_models=responsive, actor_records=records)
 
@@ -340,11 +522,17 @@ def emit_review_model_error_events(ctx: Any, parsed: ParsedTriadReview, *, sourc
 # governance segment).
 
 TIER_CLASSIFICATION_RULES = (
-        "outcome_tier classifies the CURRENT deliverable and completion_coach is the single "
-        "highest-value change that would move it one tier up. Never classify solved unless the "
+        "outcome_tier classifies the CURRENT deliverable against the task's requirements and "
+        "evidence. Never classify solved unless the "
         "claimed result is actually verified by the evidence — your veto over false success "
         "claims is the point of this review. A real partial deliverable with honestly marked "
-        "gaps is best_effort, not a failure. "
+        "gaps is best_effort, not a failure; it does not discharge useful work still owed to the "
+        "accepted goal. completion_coach is separate advice: the most useful authorized next "
+        "action under the real constraints, not necessarily a higher tier. A sufficient result "
+        "needs no invented improvement. For an incomplete tier, keep the coach nonempty: name "
+        "a reachable action or explain concretely why none remains for the author and whose "
+        "action is needed. Keep that advice consistent with DIALOGUE STATUS / REACHABILITY; "
+        "the coach is neither evidence of success nor authority to stop or change the goal. "
 )
 
 ACCEPTANCE_SURFACE_RULES = (
@@ -362,14 +550,19 @@ ACCEPTANCE_SURFACE_RULES = (
         "(the actual test/command and its observed output) — not a narrative that it passes. "
         "If the evidence covers only part of the affected surface list, do not classify solved; "
         "name the uncovered criteria/surfaces in findings or completion_coach. "
-        "EVIDENCE INDEPENDENCE: a passing test is only credible if it is not graded by the "
-        "agent's own hand. From the diff and tool trace, identify which test/check files the "
-        "agent CREATED or MODIFIED this turn versus which were pre-existing or grader-owned; if "
-        "the only passing evidence comes from tests the agent wrote or edited this same turn, "
-        "treat the success claim as UNVERIFIED (outcome_tier at most best_effort, never solved) "
-        "and completion_coach must name an independent check (the pre-existing suite, the grader "
-        "command, or a behavior the agent did not also author). State in your summary which "
-        "evidence you judged independent. "
+        "EVIDENCE INDEPENDENCE: from the diff and tool trace, identify which test/check files "
+        "the agent CREATED or MODIFIED this turn versus which were pre-existing or grader-owned. "
+        "Authorship and age are provenance, not proof or an automatic ceiling. Judge what grounds "
+        "the expected result independently of the implementation and whether the executed check "
+        "can expose a defect in the claimed consumer behavior. Task examples, an independent "
+        "oracle or derivation, and an unchanged relevant external expectation can support a new "
+        "test; a recorded discriminating failure before the fix strengthens that evidence. An "
+        "old test that misses the changed behavior is insufficient. Expectations copied from "
+        "the implementation's output, including edited expectations in an old test, or mocks "
+        "that replace the very behavior being claimed do not independently verify that behavior. "
+        "If those are the only passing evidence, treat the success claim as UNVERIFIED "
+        "(outcome_tier at most best_effort, never solved) and name the needed independent check. "
+        "State in your summary which evidence you judged independent and why. "
         "VISIBLE UI EVIDENCE: when the deliverable changes a user-visible interface, require "
         "evidence that at least one relevant real consumer flow was opened in an available browser "
         "and the rendered result was actually inspected with vision. A screenshot file or attachment "
@@ -433,9 +626,14 @@ ACCEPTANCE_SURFACE_RULES = (
         "it — and a masked check naming NO criterion is cleared by ANY later clean verification; "
         "so that green is weak evidence until such a clean re-grounding appears), or the "
         "final claim "
-        "is not supported by the trajectory, say so: a deliverable that looks superficially "
-        "correct but was reached the wrong way, or that contradicts the agent's own checks, is at "
-        "most best_effort, and completion_coach must name the process fix. PROVENANCE: every "
+        "is not supported by the trajectory, say so. Judge whether a still-red check tests an "
+        "enduring requirement of the current task. Lawfully replacing or removing a chosen "
+        "means can make its check inapplicable when independent evidence verifies the "
+        "requirement through the path now used; explain that applicability without changing "
+        "the historical red receipt. Renaming a check or criterion does not retire the same "
+        "remaining defect. A claim that contradicts an applicable check or rests on an "
+        "unsupported process is at most best_effort; completion_coach names the useful "
+        "authorized next action. PROVENANCE: every "
         "evidence block is tagged in `__provenance__` (host_attested / agent_supplied / "
         "tool_result / artifact / hidden_or_restricted) — weigh host_attested over agent_supplied, "
         "and NEVER credit a success claim to `hidden_or_restricted` evidence (a benchmark/test leak). "
@@ -474,3 +672,72 @@ ACCEPTANCE_SURFACE_RULES = (
         "terminal judgement ends the loop and surfaces both positions to the owner; it is not a "
         "concession. "
 )
+
+
+def review_query_error_payload(
+    *,
+    ctx: Any,
+    model: str,
+    messages: list,
+    slot_id: str,
+    error: str,
+    slot: Any = None,
+) -> dict:
+    """Durable failure envelope for one errored multi-model review row.
+
+    The envelope carries the row id too: an errored row is still a row, and
+    its durable actor record must name the same one its refs do. Imports stay
+    lazy so this module's dependency graph remains the primitives it declares.
+    """
+    payload = {"error": error, "usage": {}, "slot_id": slot_id, "prompt_ref": {}, "response_ref": {}}
+    try:
+        from ouroboros.observability import new_call_id, persist_call
+        from ouroboros.tools.review_helpers import review_drive_root
+
+        drive_root = review_drive_root(ctx)
+        task_id = str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
+        call_id = new_call_id(f"review_multi_model_review_{slot_id}_error")
+        prompt_payload = {"messages": messages, "slot_id": slot_id, "model": model}
+        if slot is not None:
+            # Match the normal substrate prompt receipt. The outer asyncio
+            # timeout happens after this ReviewSlot was constructed, so losing
+            # it made a present receipt look absent to provenance binders.
+            prompt_payload["slot"] = asdict(slot)
+        payload["prompt_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_prompt",
+            call_type="multi_model_review_prompt",
+            payload=prompt_payload,
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "synthetic": True},
+        )
+        payload["response_ref"] = persist_call(
+            drive_root,
+            task_id=task_id,
+            call_id=f"{call_id}_error",
+            call_type="multi_model_review_error",
+            payload={"error": error},
+            manifest={"surface": "multi_model_review", "slot_id": slot_id, "model": model, "status": "error", "synthetic": True},
+        )
+    except Exception:
+        pass
+    return payload
+
+
+_PROVIDER_OVERSIZE_MARKERS = (
+    # Anthropic: "prompt is too long: 1166914 tokens > 1000000 maximum"
+    "prompt is too long",
+    # Anthropic: "input length and `max_tokens` exceed context limit"
+    "exceed context limit",
+    # OpenAI error code + message variants
+    "context_length_exceeded",
+    "maximum context length",
+)
+
+
+def is_provider_oversize_error(error_text: str) -> bool:
+    """Mechanical fault classification: does this provider error mean the prompt
+    exceeded the model's REAL context window? Deliberately tight markers — any
+    other provider/transport error keeps the fail-closed blocking path."""
+    low = str(error_text or "").lower()
+    return any(marker in low for marker in _PROVIDER_OVERSIZE_MARKERS)

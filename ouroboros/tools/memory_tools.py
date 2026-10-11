@@ -1,5 +1,7 @@
 """Memory registry tools for tracking data sources, gaps, and trust."""
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
+
 import re
 import logging
 from pathlib import Path
@@ -16,6 +18,7 @@ def _registry_file(ctx: ToolContext) -> Path:
     return ctx.drive_path(REGISTRY_PATH)
 
 
+@completed_local_read
 def _memory_map(ctx: ToolContext) -> str:
     """Read the memory registry — a map of all data sources."""
     path = _registry_file(ctx)
@@ -32,10 +35,10 @@ def _memory_update_registry(
 ) -> str:
     """Update or create an entry in the memory registry."""
     if not source_id or not isinstance(source_id, str):
-        return "⚠️ source_id must be a non-empty string."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ source_id must be a non-empty string.")))
     source_id = source_id.strip()
     if "/" in source_id or "\\" in source_id or ".." in source_id:
-        return "⚠️ Invalid characters in source_id."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Invalid characters in source_id.")))
 
     path = _registry_file(ctx)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -5,6 +5,7 @@ import asyncio
 import pathlib
 import sys
 import threading
+import time
 
 import pytest
 
@@ -487,6 +488,55 @@ def test_async_isolated_site_scope_cancel_while_waiting_does_not_wedge_lock(tmp_
         extension_isolated_deps._execution_lock.release()
 
     asyncio.run(main())
+
+
+def test_no_deps_scopes_overlap_but_dependency_writer_excludes_new_reader(tmp_path):
+    """The supported reader/writer topology does not serialize no-deps handlers."""
+    from ouroboros import extension_isolated_deps as deps
+
+    entered = threading.Barrier(2)
+    release = threading.Event()
+    observed = []
+
+    def reader(label):
+        with deps.isolated_site_dirs_scope(tmp_path / label, enabled=False):
+            observed.append(label)
+            entered.wait(timeout=2)
+            release.wait(timeout=2)
+
+    first = threading.Thread(target=reader, args=("a",))
+    second = threading.Thread(target=reader, args=("b",))
+    first.start(); second.start()
+    deadline = time.monotonic() + 2
+    while len(observed) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(observed) == 2
+    assert sorted(observed) == ["a", "b"]
+    release.set()
+    first.join(timeout=2); second.join(timeout=2)
+    assert not first.is_alive() and not second.is_alive()
+
+    writer_entered = threading.Event()
+    writer_release = threading.Event()
+    reader_entered = threading.Event()
+
+    def writer():
+        with deps.isolated_site_dirs_scope(tmp_path / "writer", enabled=True):
+            writer_entered.set()
+            writer_release.wait(timeout=2)
+
+    def later_reader():
+        with deps.isolated_site_dirs_scope(tmp_path / "later", enabled=False):
+            reader_entered.set()
+
+    wt = threading.Thread(target=writer); wt.start()
+    assert writer_entered.wait(timeout=2)
+    rt = threading.Thread(target=later_reader); rt.start()
+    assert not reader_entered.wait(timeout=0.05)
+    writer_release.set()
+    assert reader_entered.wait(timeout=2)
+    wt.join(timeout=2); rt.join(timeout=2)
+    assert not wt.is_alive() and not rt.is_alive()
 
 
 def test_release_isolated_site_dirs_removes_path_when_module_scan_fails(tmp_path, monkeypatch):

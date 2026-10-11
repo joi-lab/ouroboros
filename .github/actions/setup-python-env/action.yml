@@ -1,0 +1,42 @@
+name: Set up locked Python environment
+description: Install the pinned Python and uv toolchain, then sync the reviewed lock.
+
+inputs:
+  profile:
+    description: Dependency profile to sync (test or build).
+    required: false
+    default: test
+
+  install-project:
+    description: Install the checkout as an editable package (false for exact candidate browser tests).
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      with:
+        python-version: '3.10'
+    - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      with:
+        version: '0.12.1'
+        enable-cache: true
+        cache-dependency-glob: uv.lock
+        activate-environment: true
+    - name: Sync locked dependencies
+      shell: bash
+      run: |
+        PROJECT_ARGS=()
+        if [[ "${{ inputs.install-project }}" == false ]]; then PROJECT_ARGS+=(--no-install-project); fi
+        case "${{ inputs.profile }}" in
+          test) uv sync --locked --extra browser --group dev "${PROJECT_ARGS[@]}" ;;
+          build) uv sync --locked --extra browser --extra desktop --extra build --group dev "${PROJECT_ARGS[@]}" ;;
+          *) echo "Unknown Python dependency profile: ${{ inputs.profile }}" >&2; exit 2 ;;
+        esac
+        python -m pip --version
+    - name: Verify generated release dependency exports
+      shell: bash
+      run: |
+        uv export --locked --no-dev --extra browser --no-emit-project --no-hashes --no-annotate --output-file requirements-runtime.lock
+        git diff --exit-code -- requirements-runtime.lock

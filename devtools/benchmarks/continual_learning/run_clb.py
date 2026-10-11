@@ -57,6 +57,11 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, live_repo_roots, run_root
 from devtools.benchmarks.common.secrets import load_secret_env, redacted_env_summary
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
+)
+from ouroboros.context_mode_compat import normalize_context_mode_compat
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
@@ -85,7 +90,6 @@ ADAPTER_PINNED_COMMIT = "56764d61afa2860e4893bc14e6229e33fcebf06b"
 # fairness: the external adapter pins the same set inside the container).
 _PINNED_MODEL_KEYS = (
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_FALLBACKS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
@@ -120,9 +124,17 @@ def render_run_settings(base_path: pathlib.Path, run_dir: pathlib.Path, *, solve
     actually enforces.
     """
     settings = json.loads(pathlib.Path(base_path).expanduser().read_text(encoding="utf-8"))
+    if ("OUROBOROS_CONTEXT_MODE" in settings
+            and "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in settings):
+        # A benchmark template mode is an explicit operator declaration.
+        settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+    settings = normalize_context_mode_compat(settings)
+    settings.pop("OUROBOROS_MODEL_HEAVY", None)
+    settings.pop("USE_LOCAL_HEAVY", None)
     bare = _bare_model(solve_model)
     for key in _PINNED_MODEL_KEYS:
         settings[key] = bare
+    settings["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(bare)
     # Reviewer roster: honor an explicit template declaration (e.g. a single
     # low-effort reviewer for a campaign); default to the triple-slot parity
     # roster only when the template does not declare one.
@@ -173,7 +185,11 @@ ADAPTER_PATCH_MARKERS: dict[str, tuple[str, tuple[str, ...]]] = {
     "clb_docker_runtime_attestation.v6746": ("_docker_launcher.py", (
         "def _attest_runtime(", "self.runtime_attestation")),
     "clb_env_campaign_overrides.v6745": ("_docker_launcher.py", (
-        "Operator env overrides (campaign knobs)", "_v = os.environ.get(_k)")),
+        "Operator env overrides (campaign knobs)", "_v = os.environ.get(_k)",
+        '"OUROBOROS_SUBAGENTS"):')),
+    "clb_host_available_subagents.phase1d": ("_launcher.py", (
+        "Canonical benchmark actor bytes are authored by run_clb.py through Phase-1A",
+        'OUROBOROS_SUBAGENTS=os.environ.get("OUROBOROS_SUBAGENTS", "")')),
     "clb_disabled_tools_env.v6745": ("run_clbench_bridge_agent.py", (
         "Operator patch 2026-07-23: honor CLBENCH_SOLVE_DISABLED_TOOLS",
         '_os.environ.get("CLBENCH_SOLVE_DISABLED_TOOLS"')),
@@ -258,10 +274,11 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
                      patch_probe: dict | None = None) -> dict:
     """Declared-vs-enforced template knobs, read off the EXECUTION CLONE rather than a constant.
 
-    Three knobs — safety mode, review enforcement and the solve-time disabled-tools list —
-    are forwarded only by tracked operator patches. Whether they are enforced is therefore a
-    fact about the clone this run will execute, not about the pinned commit id: on a patched
-    clone the old text understated a run that was actually STRICTER than declared, and a
+    Four knobs — safety mode, review enforcement, the exact Available-subagents value and the
+    solve-time disabled-tools list — are forwarded only by tracked operator patches. Whether
+    they are enforced is therefore a fact about the clone this run will execute, not about
+    the pinned commit id: on a patched clone the old text understated a run that was actually
+    STRICTER than declared, and a
     reader trusting it would discount the numbers. ``patch_probe`` supplies the fact; when it
     is absent (callers that never resolved a runner) every knob falls back to the pinned
     adapter's unpatched behaviour, which is the conservative direction.
@@ -272,12 +289,21 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
     """
     disabled = list(settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or [])
     applied = dict((patch_probe or {}).get("patches") or {})
-    # ONE marker for the three env knobs is CORRECT, not a shortcut: the campaign-override
-    # patch adds OUROBOROS_RUNTIME_MODE, OUROBOROS_REVIEW_ENFORCEMENT and OUROBOROS_SAFETY_MODE
-    # in a single loop in a single hunk, so they arrive together or not at all.
-    # The host engine boots a real `IsolatedServer`, which inherits the launcher's env, so the
-    # env knobs are enforced there whether or not the docker-only patch is applied.
+    # ONE marker for the env knobs is CORRECT, not a shortcut: the campaign-override
+    # patch adds OUROBOROS_RUNTIME_MODE, OUROBOROS_REVIEW_ENFORCEMENT,
+    # OUROBOROS_SAFETY_MODE and OUROBOROS_SUBAGENTS in one loop/hunk, so they arrive
+    # together or not at all. The patch probe includes the new key itself as a marker;
+    # an older applied copy is conservatively reported as not enforcing actor purity.
+    # The host engine boots a real `IsolatedServer`, so the ordinary scalar env knobs remain
+    # effective there whether or not the docker-only patch is applied. The structured actor
+    # value is different: IsolatedServer strips inherited runtime env, so it requires the
+    # host adapter's explicit settings transport marker below.
     env_knobs_forwarded = (not args.docker) or bool(applied.get("clb_env_campaign_overrides.v6745"))
+    subagents_forwarded = (
+        bool(applied.get("clb_env_campaign_overrides.v6745"))
+        if args.docker
+        else bool(applied.get("clb_host_available_subagents.phase1d"))
+    )
     # ENTRYPOINT-SPECIFIC. The patch lives in `run_clbench_bridge_agent.py`, which ONLY the
     # bridge entrypoint executes. On the DEFAULT `--path standard` the run goes
     # run_benchmark.py -> system.py -> `_docker_launcher.submit()`, which hardcodes
@@ -306,6 +332,18 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
         "declared": settings.get("OUROBOROS_REVIEW_ENFORCEMENT"),
         "status": _env_status,
     }
+    _subagents_status = (
+        "exported in env and materialized in isolated settings by the host adapter"
+        if not args.docker and subagents_forwarded
+        else _env_status
+    ) if subagents_forwarded else (
+        "exported in env, but the selected external adapter does not materialize the "
+        "structured value into isolated settings"
+    )
+    (enforced if subagents_forwarded else gap)["OUROBOROS_SUBAGENTS"] = {
+        "declared": settings.get("OUROBOROS_SUBAGENTS"),
+        "status": _subagents_status,
+    }
     (enforced if tools_forwarded else gap)["CLBENCH_SOLVE_DISABLED_TOOLS"] = {
         "declared": disabled,
         "status": ("exported in env as a comma list and read by operator patch "
@@ -331,7 +369,7 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
         "enforced_via_operator_patch": enforced,
         "declared_only_pinned_adapter_gap": gap,
         "enforced_via_runner_interface": {
-            "model_slots": _bare_model(args.model) + " (adapter pins every slot in-container)",
+            "model_slots": _bare_model(args.model) + " (adapter pins every active slot in-container)",
             "OUROBOROS_MAX_WORKERS": int(settings.get("OUROBOROS_MAX_WORKERS") or 1),
             "OUROBOROS_POST_TASK_EVOLUTION": settings.get("OUROBOROS_POST_TASK_EVOLUTION"),
             "OUROBOROS_EFFORT_TASK": args.effort + " (env; adapter applies uniformly to all effort knobs)",
@@ -361,6 +399,7 @@ def _print_fidelity_warnings(fidelity: dict) -> None:
 def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.Namespace) -> dict:
     """Child env for the external runner: strip live-runtime/secret env, add the knobs the
     adapter observes, resolve provider keys env-first (never printed)."""
+    settings = normalize_context_mode_compat(settings)
     env = {
         key: value for key, value in os.environ.items()
         if not key.startswith(("OUROBOROS_", "USE_LOCAL_"))
@@ -395,10 +434,15 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
     # when the template declares them, so unpatched adapters keep parity defaults.
     for _knob in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
                   "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_CONTEXT_MODE",
-                  "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_MAX_WORKERS"):
+                  "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_MAX_WORKERS",
+                  "OUROBOROS_SUBAGENTS"):
         _val = settings.get(_knob)
-        if _val:
-            env[_knob] = str(_val)
+        if _val not in (None, ""):
+            env[_knob] = (
+                "false" if _knob == "OUROBOROS_CONTEXT_MODE_AUTO_LOW"
+                and str(_val).strip().lower() in {"0", "false", "off"}
+                else str(_val)
+            )
     if args.or_provider:
         env["OUROBOROS_OR_PROVIDER"] = args.or_provider
     return env
@@ -823,6 +867,10 @@ def main(argv: list[str] | None = None) -> int:
         # same class one file over (a manifest naming the template's model, not the run's).
         rendered_path = out / "_run_settings.json"
         manifest["model_slots"] = model_slot_snapshot(rendered_path, env_overrides=not args.docker)
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            rendered_path,
+            env_overrides=False,
+        )
         runner_python = args.runner_python
         if not runner_python:
             venv_python = pathlib.Path(runner_report["path"]) / ".venv" / "bin" / "python"

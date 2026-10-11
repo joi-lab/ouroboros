@@ -28,7 +28,29 @@ def _write_task(root, name, *, result="done", ts="2026-01-01T00:00:00Z", **extra
 
 def test_recent_tasks_empty_drive(tmp_path):
     data = json.loads(_handle_recent_tasks(_ctx(tmp_path)))
-    assert data == {"running": [], "tasks": [], "unreadable_tasks": []}
+    assert data["running"] == []
+    assert data["tasks"] == []
+    assert data["unreadable_tasks"] == []
+    assert data["total"] == 0
+    assert data["remaining"] == 0
+    assert data["next"] is None
+
+
+def test_recent_tasks_uses_canonical_budget_root_from_fork(tmp_path):
+    canonical = tmp_path / "canonical"
+    child = tmp_path / "child"
+    child.mkdir()
+    _write_task(canonical, "owner-task", result="canonical-result")
+    ctx = SimpleNamespace(
+        drive_root=child,
+        budget_drive_root=str(canonical),
+        task_metadata={},
+    )
+
+    data = json.loads(_handle_recent_tasks(ctx, include_results=True))
+
+    assert data["tasks"][0]["task_id"] == "owner-task"
+    assert data["tasks"][0]["result"] == "canonical-result"
 
 
 def test_recent_tasks_returns_preview_by_default(tmp_path):

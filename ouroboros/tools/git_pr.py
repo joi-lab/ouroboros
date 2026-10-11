@@ -200,7 +200,7 @@ def _create_integration_branch(
         f"                                              original author attribution\n"
         f"  2. stage_adaptations()                   ← optional: stage Ouroboros\n"
         f"                                              adaptation changes (no commit)\n"
-        f"  3. stage_pr_merge(branch='{branch_name}') → advisory_review → commit_reviewed\n"
+        f"  3. stage_pr_merge(branch='{branch_name}') → preflight_review → commit_reviewed\n"
         f"     (staged adaptations from step 2 land in the final merge commit)"
     )
 
@@ -413,7 +413,7 @@ def _cherry_pick_pr_commits(
         + f"\n\nNext:\n"
           f"  stage_adaptations()                      ← optional: stage Ouroboros\n"
           f"                                              adaptation changes (no commit)\n"
-          f"  stage_pr_merge(branch='{current_branch}') → advisory_review → commit_reviewed\n"
+          f"  stage_pr_merge(branch='{current_branch}') → preflight_review → commit_reviewed\n"
           f"  (staged adaptations land in the merge commit — no intermediate commit needed)"
         + override_note
         + author_hint
@@ -598,7 +598,7 @@ def _stage_pr_merge(
         f"  with both parents, preserving integration branch history.\n"
         f"  Branch '{branch}' left intact.\n\n"
         f"Next:\n"
-        f"  advisory_review(commit_message='...')\n"
+        f"  preflight_review(commit_message='...')\n"
         f"  commit_reviewed(commit_message='...')"
         + author_hint
     )
@@ -684,7 +684,7 @@ def get_tools() -> List[ToolEntry]:
             "description": (
                 "Stage all current working-tree changes on the integration branch WITHOUT "
                 "committing (git add -A only). Use after cherry_pick_pr_commits to prepare "
-                "Ouroboros adaptation/fixup changes. Finalize via advisory_review + "
+                "Ouroboros adaptation/fixup changes. Finalize via preflight_review + "
                 "commit_reviewed to comply with BIBLE.md P3 (all commits must pass review). "
                 "Must be on an integrate/pr-N branch."
             ),
@@ -700,7 +700,7 @@ def get_tools() -> List[ToolEntry]:
                 "always ouroboros (commit_reviewed always checks out branch_dev before "
                 "committing — any other target would lose MERGE_HEAD). The "
                 "integration-branch history (with original author commits) is permanently "
-                "linked. Finalize via advisory_review + commit_reviewed."
+                "linked. Finalize via preflight_review + commit_reviewed."
             ),
             "parameters": {"type": "object", "properties": {
                 "branch": {"type": "string",

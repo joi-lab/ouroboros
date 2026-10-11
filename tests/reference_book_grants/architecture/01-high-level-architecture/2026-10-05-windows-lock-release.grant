@@ -1,0 +1,2 @@
+63
+A Windows lock probe refused while its holder deletes the name is contention, not a permission failure (the usage-lock release race of #1498).

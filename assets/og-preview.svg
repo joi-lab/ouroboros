@@ -51,7 +51,7 @@ assets/social-preview.svg remains the separate GitHub social-preview source.
     <text x="376" y="339" fill="#f4f1f4" font-size="41" font-weight="620">with autonomous evolution and</text>
     <text x="376" y="400" fill="#f4f1f4" font-size="41" font-weight="620">implementation-level self-modification.</text>
 
-    <text x="376" y="512" fill="#aaa3ad" font-size="22" font-weight="500" letter-spacing="0.15">SOTA on Terminal-Bench 2.1 · OSWorld-Verified · CL-Bench</text>
+    <text x="376" y="512" fill="#aaa3ad" font-size="22" font-weight="500" letter-spacing="0.15">Self-reported SOTA · public runs · full traces</text>
   </g>
 
   <circle cx="1100" cy="512" r="5" fill="#c93545"/>

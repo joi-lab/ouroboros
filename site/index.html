@@ -3,22 +3,25 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Ouroboros is an open-source, general-purpose AI agent with persistent identity, agent swarms, autonomous evolution, and implementation-level self-modification. State of the art on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.">
+  <meta name="description" content="Ouroboros is an open-source AI agent with persistent identity, agent swarms, autonomous evolution, and reproducible self-reported SOTA results on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.">
   <meta name="robots" content="index, follow, max-image-preview:large">
   <link rel="canonical" href="https://ouroboros-agent.ai/">
   <meta property="og:type" content="website">
+  <meta property="og:locale" content="en_US">
   <meta property="og:site_name" content="Ouroboros">
   <meta property="og:title" content="Ouroboros: an AI agent that can rewrite its own implementation">
-  <meta property="og:description" content="Open-source, general-purpose AI agent with persistent identity, agent swarms, and autonomous evolution. State of the art on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.">
+  <meta property="og:description" content="Open-source AI agent with persistent identity, agent swarms, autonomous evolution, and reproducible self-reported SOTA results with public runs and traces.">
   <meta property="og:url" content="https://ouroboros-agent.ai/">
-  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png">
+  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta property="og:image:type" content="image/png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="Ouroboros, an open-source general-purpose AI agent with autonomous evolution">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Ouroboros: an AI agent that can rewrite its own implementation">
-  <meta name="twitter:description" content="Open-source, general-purpose AI agent with persistent identity, agent swarms, and autonomous evolution. State of the art on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.">
-  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png">
+  <meta name="twitter:description" content="Open-source AI agent with persistent identity, agent swarms, autonomous evolution, and reproducible self-reported SOTA results with public runs and traces.">
+  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta name="twitter:image:alt" content="Ouroboros, an open-source AI agent with reproducible public benchmark evidence">
   <title>Ouroboros: open-source AI agent with autonomous evolution</title>
   <link rel="icon" href="/assets/icon_1024.png" type="image/png">
   <script type="application/ld+json">
@@ -28,10 +31,13 @@
       "name": "Ouroboros",
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "macOS, Linux, Windows",
-      "description": "Open-source, general-purpose AI agent with persistent identity, agent swarms, autonomous evolution, and implementation-level self-modification. State of the art on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench.",
+      "description": "Open-source, general-purpose AI agent with persistent identity, agent swarms, autonomous evolution, implementation-level self-modification, and reproducible self-reported benchmark results.",
       "url": "https://ouroboros-agent.ai/",
+      "installUrl": "https://ouroboros-agent.ai/install/",
       "codeRepository": "https://github.com/razzant/ouroboros",
-      "license": "https://github.com/razzant/ouroboros/blob/ouroboros/LICENSE"
+      "license": "https://github.com/razzant/ouroboros/blob/ouroboros/LICENSE",
+      "isAccessibleForFree": true,
+      "sameAs": "https://github.com/razzant/ouroboros"
     }
   </script>
   <link rel="stylesheet" href="/src/ouroboros.css">
@@ -41,9 +47,9 @@
   <div class="ambient" aria-hidden="true"></div>
   <div class="site-shell">
     <nav class="site-nav" aria-label="Primary navigation">
-      <a class="brand" href="#top"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a>
-      <div class="nav-links"><a href="#work">Work</a><a href="#benchmarks">Benchmarks</a><a href="#run">Run</a><a href="#evolution">Evolution</a><a href="#origin">Origin</a></div>
-      <div class="nav-actions"><a class="btn btn-quiet" href="https://github.com/razzant/ouroboros">GitHub</a><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Download</a></div>
+      <a class="brand" href="#top" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a>
+      <div class="nav-links"><a href="#work">Work</a><a href="/paper/">Paper</a><a href="/benchmarks/">Benchmarks</a><a href="/install/">Install</a><a href="#evolution">Evolution</a><a href="/about/">About</a></div>
+      <div class="nav-actions"><a class="btn btn-quiet" href="https://github.com/razzant/ouroboros">GitHub</a><a class="btn btn-primary" href="/install/">Download</a></div>
     </nav>
 
     <main id="top">
@@ -52,7 +58,7 @@
           <p class="eyebrow">Open source · General purpose · Self-modifying</p>
           <h1 id="hero-title">An AI agent that can rewrite the system it inhabits.</h1>
           <p class="lede">Ouroboros works on external projects, coordinates a live swarm of specialist agents, and can evolve its own implementation across code, architecture, prompts, tools, and dependencies. Its identity, memory, and history continue across tasks and restarts.</p>
-          <div class="hero-actions"><a class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/latest">Download the desktop app</a><a class="btn btn-quiet" href="#run">Run it headless</a></div>
+          <div class="hero-actions"><a class="btn btn-primary" href="/install/">Download the desktop app</a><a class="btn btn-quiet" href="#run">Run it headless</a></div>
           <div class="proof-line"><span>External workspaces</span><span>Root-owned integration</span><span>Reviewed evolution</span></div>
         </div>
 
@@ -86,13 +92,14 @@
       </section>
 
       <section class="chapter bench-chapter" id="benchmarks" aria-labelledby="bench-title">
-        <div class="chapter-heading reveal"><p class="chapter-index">02 / EVIDENCE</p><h2 id="bench-title">Measured against the strongest harnesses.</h2><p class="lede">State of the art on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench — ahead of Codex, Claude Code, Cursor, and Hermes on matched models — with statistical parity on SWE-bench Pro and GAIA. Results link to submissions, public traces, and methodology.</p></div>
+        <div class="chapter-heading reveal"><p class="chapter-index">02 / EVIDENCE</p><h2 id="bench-title">Measured against the strongest harnesses.</h2><p class="lede">Ouroboros has reproducible self-reported state-of-the-art results on Terminal-Bench 2.1, OSWorld-Verified, and CL-Bench. In those model-matched results, it leads Codex, Claude Code, Cursor, and Hermes. The public SWE-bench Pro matched pair is a statistical tie with Codex CLI. A separate GAIA result is marked as awaiting its scrubbed trace capsule.</p></div>
+        <p class="evidence-status reveal"><strong>Publication status</strong><span>Self-reported results are published with evidence and each submission's status.</span><a href="/benchmarks/">Read the evidence table</a></p>
         <div class="bench-grid">
-          <figure class="media-panel bench-wide reveal"><img src="/assets/bench-terminal-bench.svg?v=c9a52261ba" alt="Terminal-Bench 2.1 results: Ouroboros 86.97% with Claude Opus-5, ahead of Claude Code, Codex, Cursor, and Hermes on matched models" loading="lazy" width="1800" height="1478"><figcaption><span>Terminal-Bench 2.1 · 86.97% with Claude Opus-5</span><span><a href="https://github.com/harbor-framework/terminal-bench-2-1/pull/175">Submission</a> · <a href="https://hub.harborframework.com/jobs/2b145543-edeb-4a3b-b46f-4800310f1182">Full run</a></span></figcaption></figure>
-          <figure class="media-panel reveal"><img src="/assets/bench-osworld.svg?v=e5fc781cdd" alt="OSWorld-Verified leaderboard: Ouroboros 90.69% with Claude Opus-5 and 83.27% with Claude Sonnet-4.6" loading="lazy" width="1800" height="1000"><figcaption><span>OSWorld-Verified · 90.69% with Claude Opus-5</span><span><a href="https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-opus5">Full traces</a></span></figcaption></figure>
-          <figure class="media-panel reveal"><img src="/assets/bench-cl-bench.svg?v=fe166d5686" alt="CL-Bench: Ouroboros normalized reward 0.2301 with Claude Sonnet-4.6, rank 1" loading="lazy" width="1800" height="760"><figcaption><span>CL-Bench · 0.2301, rank #1</span><span><a href="https://github.com/pgasawa/continual-learning-bench/pull/10">Submission</a> · <a href="https://huggingface.co/datasets/razzant/ouroboros-clbench-traces">Full traces</a></span></figcaption></figure>
+          <figure class="media-panel bench-wide reveal"><img src="/assets/bench-terminal-bench.svg?v=7a4871c0bb" alt="Self-reported Terminal-Bench 2.1 results: Ouroboros 86.74% with Claude Opus-5 after a disclosed reward-hack correction, ahead of Claude Code, Codex, Cursor, and Hermes on matched models" loading="lazy" width="1800" height="1478"><figcaption><span>Terminal-Bench 2.1 · 86.74% corrected · self-reported</span><span><a href="https://github.com/harbor-framework/terminal-bench-2-1/pull/175">Submission</a> · <a href="https://hub.harborframework.com/jobs/2b145543-edeb-4a3b-b46f-4800310f1182">Full run</a></span></figcaption></figure>
+          <figure class="media-panel reveal"><img src="/assets/bench-osworld.svg?v=26e6cdc7db" alt="Self-reported OSWorld-Verified results: Ouroboros 90.69% with Claude Opus-5 and 83.27% with Claude Sonnet-4.6" loading="lazy" width="1800" height="1000"><figcaption><span>OSWorld-Verified · 90.69% · self-reported</span><span><a href="https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-opus5">Full traces</a></span></figcaption></figure>
+          <figure class="media-panel reveal"><img src="/assets/bench-cl-bench.svg?v=633474d172" alt="Self-reported CL-Bench result: Ouroboros normalized reward 0.2301 with Claude Sonnet-4.6, rank 1" loading="lazy" width="1800" height="760"><figcaption><span>CL-Bench · 0.2301 · self-reported rank #1</span><span><a href="https://github.com/pgasawa/continual-learning-bench/pull/10">Open submission</a> · <a href="https://huggingface.co/datasets/razzant/ouroboros-clbench-traces">Full traces</a></span></figcaption></figure>
         </div>
-        <p class="bench-note reveal">On SWE-bench Pro and GAIA, Ouroboros lands at statistical parity with Codex and Claude Code (<a href="https://huggingface.co/datasets/razzant/swepro-luna-matched-pair">matched-pair traces</a>). Adapters, run scripts, and per-benchmark methodology live in <a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">devtools/benchmarks</a>; the full story with audits is in the <a href="https://habr.com/ru/companies/airi/articles/1065428/">launch write-up</a>.</p>
+        <p class="bench-note reveal">The <a href="https://huggingface.co/datasets/razzant/swepro-luna-matched-pair">SWE-bench Pro matched-pair traces</a> support the statistical comparison with Codex CLI. A separate GAIA campaign reports 129/165 for Ouroboros and 131/165 for Claude Code, with strict pass@1 at 128/165 for both; its scrubbed trace capsule is still pending. Adapters, run scripts, and per-benchmark methodology live in <a href="https://github.com/razzant/ouroboros/tree/ouroboros/devtools/benchmarks">devtools/benchmarks</a>. The <a href="/paper/">technical report</a> describes the system, campaigns, corrections, and limitations.</p>
       </section>
 
       <section class="chapter run-chapter" id="run" aria-labelledby="run-title">
@@ -105,9 +112,22 @@
   --workspace /path/to/project \
   "Investigate the failure, implement the fix, and verify it."</code></pre>
             <p>The command streams progress to stderr and returns the final result through the same queue, memory, swarm, and review surfaces used by the app.</p>
-            <div class="inline-actions"><a href="https://github.com/razzant/ouroboros#cli--headless">CLI guide</a><a href="https://github.com/razzant/ouroboros#install">Install</a></div>
+            <div class="inline-actions"><a href="https://github.com/razzant/ouroboros#cli--headless">CLI guide</a><a href="/install/">Install</a></div>
           </div>
         </div>
+        <aside class="integration-card reveal" aria-labelledby="claudexor-card-title">
+          <div class="integration-copy">
+            <p class="chapter-index">Delegated execution</p>
+            <h3 id="claudexor-card-title">Ouroboros runs connected coding agents through Claudexor.</h3>
+            <p>Ouroboros keeps ownership of its tasks, memory, review, and final integration. Claudexor runs the selected harness and returns durable execution evidence.</p>
+            <div class="inline-actions"><a href="https://claudexor.ai/">Explore Claudexor</a><a href="https://github.com/razzant/claudexor">View source</a></div>
+          </div>
+          <ol class="integration-flow" aria-label="Delegated execution flow">
+            <li><strong>Ouroboros</strong><span>tasks · memory · review</span></li>
+            <li><strong>Claudexor</strong><span>routing · execution · evidence</span></li>
+          </ol>
+        </aside>
+        <p class="bench-note reveal" id="resources"><strong>Resources:</strong> <a href="https://www.youtube.com/watch?v=8IWLBsQU7qE&amp;t=4881s">Talk in Russian</a>. An introduction to Ouroboros and its agent architecture at Practical ML Conf 2026.</p>
       </section>
 
       <section class="chapter evolution-chapter" id="evolution" aria-labelledby="evolution-title">
@@ -120,7 +140,7 @@
           <div role="listitem"><span>Dependencies</span><small>its working environment</small></div>
           <div role="listitem"><span>Memory and identity</span><small>reflection and continuity</small></div>
         </div>
-        <figure class="wide-media reveal"><img src="/assets/evolution.png" alt="Code, prompt, and memory growth across Ouroboros releases, from v3.0.0 to the v6.85 line" loading="lazy" width="1600" height="601"><figcaption><span>Code, prompts, and memory across releases — the record of the body changing.</span><span>Evolution tab capture</span></figcaption></figure>
+        <figure class="wide-media reveal"><img src="/assets/evolution.png" alt="Code, prompt, and memory growth across Ouroboros releases, from v3.0.0 to the v6.85 line" loading="lazy" width="1600" height="601"><figcaption><span>Code, prompts, and memory across releases, the record of the body changing.</span><span>Evolution tab capture</span></figcaption></figure>
       </section>
 
       <section class="chapter continuity-chapter" id="continuity" aria-labelledby="continuity-title">
@@ -154,7 +174,7 @@
       </section>
     </main>
 
-    <footer class="site-footer"><span>Ouroboros · open source</span><span><a href="/history/first-48-hours/">First 48 hours</a> · <a href="https://github.com/razzant/ouroboros/releases">Releases</a> · <a href="https://github.com/razzant/ouroboros/blob/ouroboros/CONTRIBUTING.md">Contributing</a></span></footer>
+    <footer class="site-footer"><span>Ouroboros · open source</span><span><a href="/paper/">Paper</a> · <a href="/about/">About</a> · <a href="/install/">Install</a> · <a href="/benchmarks/">Benchmarks</a> · <a href="/llms.txt">llms.txt</a> · <a href="https://github.com/razzant/ouroboros/releases">Releases</a> · <a href="https://github.com/razzant/ouroboros/blob/ouroboros/CONTRIBUTING.md">Contributing</a> · <a href="/history/first-48-hours/">First 48 hours</a></span></footer>
   </div>
   <button class="motion-toggle" type="button" aria-label="Pause motion" aria-pressed="false"><span aria-hidden="true">Ⅱ</span><span class="motion-label">Pause motion</span></button>
   <script type="module" src="/src/ouroboros.js"></script>

@@ -77,6 +77,9 @@ class FakeAPI:
 
 def test_register_writes_nonsecret_runtime_config_and_companion(tmp_path: Path) -> None:
     api = FakeAPI(tmp_path, port=9012)
+    (api.state_dir / "settings.json").write_text(json.dumps({
+        "TELEGRAM_CHAT_ID": "12345", "TELEGRAM_PROXY": "socks5://owner:proxy-secret@127.0.0.1:1080",
+    }))
     plugin.register(api)
     config_path = api.state_dir / plugin._CONFIG_NAME
     config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -146,6 +149,113 @@ def test_unsupported_platform_skips_only_miniapp_companion(
     status = plugin._read_status(api)
     assert status["state"] == "unavailable"
     assert status["reason_code"] == "unsupported_platform"
+
+
+@pytest.mark.parametrize("build", ["win-amd64", "win-arm64", "win32", "unknown"])
+def test_empty_windows_machine_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, build: str,
+) -> None:
+    from telegram_native_test.scripts import platform_support
+
+    monkeypatch.setattr(plugin.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(plugin.platform, "machine", lambda: "")
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: build)
+    api = FakeAPI(tmp_path)
+    plugin.register(api)
+    if build == "win-amd64":
+        assert api.companions == ["miniapp_gateway"]
+        assert plugin._read_status(api)["state"] == "starting"
+    else:
+        assert api.companions == []
+        status = plugin._read_status(api)
+        assert status["state"] == "unavailable"
+        assert status["reason_code"] == "unsupported_platform"
+
+
+@pytest.mark.serial
+def test_real_companion_environment_platform_consumers(tmp_path, monkeypatch, record_property):
+    """Run the real interpreter with the core companion's environment construction.
+
+    Windows CPython 3.10/3.11 reproduces the empty-machine defect; 3.12+ may
+    discover a machine through WMI. Other hosts exercise their unchanged path.
+    No companion, tunnel, download, or Telegram request is started.
+    """
+    import subprocess
+    import textwrap
+
+    from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
+    from ouroboros.extension_companion import _companion_base_env, companion_spawn_env
+    from ouroboros.tools import skill_exec
+
+    manifest = parse_skill_manifest_text((SKILL_ROOT / "SKILL.md").read_text(encoding="utf-8"))
+    spec = next(item for item in manifest.companion_processes if item["name"] == "miniapp_gateway")
+    monkeypatch.setattr(skill_exec, "load_settings", lambda: {"TELEGRAM_BOT_TOKEN": "test-bot-token"})
+    # Exactly the descriptor env plus supervisor base env used by start().
+    env = {**_companion_base_env(), **companion_spawn_env(
+        spec, "test-host-token", env_allow=manifest.env_from_settings,
+        granted_upper=manifest.env_from_settings, skill=manifest.name,
+        skill_dir=SKILL_ROOT, state_dir=tmp_path / "skill-state",
+    )}
+    assert env["TELEGRAM_BOT_TOKEN"] == "test-bot-token"
+    assert not any(key.upper().startswith("PROCESSOR_") for key in env)
+    probe = textwrap.dedent("""
+        import json, os, platform, sys, sysconfig
+        from pathlib import Path
+
+        sys.path.insert(0, sys.argv[1])
+        sys.path.insert(0, str(Path.cwd() / "scripts"))
+        from tests.test_telegram_miniapp_plugin import FakeAPI, plugin
+        import cloudflare_tunnel as cloudflare
+        from platform_support import machine_architecture
+        from runtime_status import RuntimeStatus
+
+        assert not any(key.upper().startswith("PROCESSOR_") for key in os.environ)
+        api = FakeAPI(Path(os.environ["OUROBOROS_SKILL_STATE_DIR"]).parent)
+        plugin.register(api)
+        registration = plugin._read_status(api)
+        try:
+            asset = cloudflare._current_asset().platform_id
+        except cloudflare.CloudflaredError:
+            asset = None
+        RuntimeStatus(api.state_dir, cloudflared_version=cloudflare.CLOUDFLARED_VERSION).publish()
+        print(json.dumps({
+            "system": platform.system(), "raw_machine": platform.machine(),
+            "build": sysconfig.get_platform(), "python": sys.version,
+            "implementation": sys.implementation.name, "version": list(sys.version_info[:2]),
+            "architecture": machine_architecture(), "asset": asset,
+            "companions": api.companions, "registration": registration,
+            "status": json.loads((api.state_dir / "status.json").read_text(encoding="utf-8")),
+        }))
+    """)
+    result = subprocess.run(
+        [sys.executable, "-c", probe, str(SKILL_ROOT.parents[1].resolve())],
+        cwd=SKILL_ROOT, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout)
+    record_property("companion_platform", result.stdout.strip())
+    print("COMPANION_PLATFORM " + result.stdout.strip())
+    raw = observed["raw_machine"].lower()
+    if (observed["system"] == "Windows" and observed["implementation"] == "cpython"
+            and observed["version"] in ([3, 10], [3, 11])):
+        assert raw == "", observed
+    expected = raw
+    if observed["system"] == "Windows" and not raw:
+        expected = {"win-amd64": "amd64", "win-arm64": "arm64", "win32": "x86"}.get(
+            observed["build"].lower(), "",
+        )
+    assert observed["architecture"] == expected, observed
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(expected, expected)
+    supported = ((observed["system"] in {"Darwin", "Linux"} and arch in {"amd64", "arm64"})
+                 or (observed["system"] == "Windows" and arch == "amd64"))
+    if supported:
+        assert observed["asset"] == observed["system"].lower() + "-" + arch, observed
+        assert observed["companions"] == ["miniapp_gateway"], observed
+        assert observed["registration"]["state"] == "starting", observed
+    else:
+        assert observed["asset"] is None and observed["companions"] == [], observed
+        assert observed["registration"]["reason_code"] == "unsupported_platform", observed
+    assert observed["status"]["platform"] == observed["system"].lower() + "-" + expected, observed
 
 
 def test_windows_status_uses_heartbeat_without_destructive_kill(

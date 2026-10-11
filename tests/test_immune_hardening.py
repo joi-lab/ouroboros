@@ -8,6 +8,8 @@ visibility, dispatcher-level worktree-mutation invalidation, and the
 import json
 import pathlib
 
+import pytest
+
 from ouroboros.triad_review import parse_model_review_results
 
 
@@ -159,6 +161,82 @@ class TestCentralWorktreeInvalidation:
         registry._invalidate_advisory_if_worktree_changed("run_command", " M a.py")
         assert calls["invalidate"] == 1
 
+    @pytest.mark.serial
+    def test_worktree_snapshot_reads_real_git_status(self, tmp_path):
+        # The test above stubs _worktree_status_snapshot, so it cannot see the
+        # snapshot itself failing. This one drives the real method against a real
+        # repo: run_cmd used to reject the timeout= kwarg it is called with, so
+        # every snapshot degraded to "<status-unavailable>", before == after, and
+        # _invalidate_advisory_if_worktree_changed became a permanent no-op.
+        import subprocess
+
+        from ouroboros.tools.registry import ToolRegistry
+
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+
+        registry = ToolRegistry.__new__(ToolRegistry)
+
+        class _Ctx:
+            repo_dir = tmp_path
+            drive_root = tmp_path / "data"
+
+        registry._ctx = _Ctx()
+
+        before = registry._worktree_status_snapshot()
+        assert before != "<status-unavailable>"
+
+        (tmp_path / "written_by_tool.py").write_text("x = 1\n", encoding="utf-8")
+        after = registry._worktree_status_snapshot()
+
+        assert after != "<status-unavailable>"
+        assert "written_by_tool.py" in after
+        assert after != before, "a mutated worktree must not look unchanged"
+
+    @pytest.mark.parametrize("failure", ["before", "after", "both"])
+    @pytest.mark.parametrize("handler_fails", [False, True])
+    def test_unreadable_status_invalidates_after_mutating_dispatch(self, tmp_path, monkeypatch, failure, handler_fails):
+        from types import SimpleNamespace
+        from ouroboros.tools.registry import ToolRegistry
+        from ouroboros import review_state, utils
+
+        registry = ToolRegistry.__new__(ToolRegistry)
+        registry._ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path / "data")
+        statuses = iter([failure in {"before", "both"}, failure in {"after", "both"}])
+
+        def status(*args, **kwargs):
+            if next(statuses):
+                raise RuntimeError("git status unavailable")
+            return ""
+
+        invalidations = []
+        monkeypatch.setattr(utils, "run_cmd", status)
+        monkeypatch.setattr(review_state, "invalidate_advisory_after_mutation", lambda *a, **k: invalidations.append(k))
+
+        def handler(ctx):
+            (ctx.repo_dir / "changed.txt").write_text("changed", encoding="utf-8")
+            if handler_fails:
+                raise RuntimeError("failed after writing")
+            return "done"
+
+        before = registry._worktree_status_snapshot()
+        registry._invoke_builtin_handler("fixture", SimpleNamespace(handler=handler, mutates_worktree=True), {}, None, None, before)
+        assert (tmp_path / "changed.txt").read_text() == "changed"
+        assert len(invalidations) == 1
+
+    @pytest.mark.serial
+    def test_run_cmd_accepts_and_honors_timeout(self, tmp_path):
+        import subprocess
+        import sys
+
+        from ouroboros.utils import run_cmd
+
+        subprocess.run(["git", "init"], cwd=str(tmp_path), capture_output=True, check=True)
+        assert run_cmd(["git", "status", "--porcelain"], cwd=tmp_path, timeout=20) == ""
+        assert run_cmd(["git", "status", "--porcelain"], cwd=tmp_path) == ""
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            run_cmd([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.2)
+
     def test_mutating_tools_are_flagged(self):
         from ouroboros.tools import git_pr, services, shell
 
@@ -168,7 +246,7 @@ class TestCentralWorktreeInvalidation:
             for entry in mod.get_tools()
             if entry.mutates_worktree
         }
-        for name in ("run_command", "run_script", "claude_code_edit",
+        for name in ("run_command", "run_script",
                      "start_service", "stop_service", "cherry_pick_pr_commits",
                      "stage_pr_merge", "stage_adaptations"):
             assert name in flagged, f"{name} must be mutates_worktree-flagged"
@@ -184,15 +262,59 @@ class TestFindNotSafe:
         assert "ls" in SAFE_SHELL_COMMANDS
 
 
+class TestGitInfo:
+    @pytest.mark.parametrize(
+        "failed_lookup,failure,expected",
+        [
+            (None, None, ("ouroboros", "abc123")),
+            (0, "timeout", ("", "abc123")),
+            (1, "timeout", ("ouroboros", "")),
+            (0, "exit", ("", "abc123")),
+            (1, "exit", ("ouroboros", "")),
+        ],
+    )
+    def test_bounded_lookups_preserve_partial_results(
+        self, tmp_path, monkeypatch, failed_lookup, failure, expected,
+    ):
+        import subprocess
+
+        from ouroboros.utils import get_git_info
+
+        calls = []
+        monkeypatch.setenv("LC_ALL", "ru_RU.UTF-8")
+        monkeypatch.setenv("LANG", "ru_RU.UTF-8")
+
+        def fake_run(cmd, **kwargs):
+            index = len(calls)
+            calls.append(cmd)
+            assert kwargs["cwd"] == str(tmp_path)
+            assert kwargs["timeout"] == 2
+            assert kwargs["env"]["LC_ALL"] == kwargs["env"]["LANG"] == "C"
+            if index == failed_lookup:
+                if failure == "timeout":
+                    raise subprocess.TimeoutExpired(cmd, 2)
+                return subprocess.CompletedProcess(cmd, 1, "", "git failed")
+            return subprocess.CompletedProcess(cmd, 0, ("ouroboros\n", "abc123\n")[index], "")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        assert get_git_info(tmp_path) == expected
+        assert calls == [
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            ["git", "rev-parse", "HEAD"],
+        ]
+
+
 class TestScopeChecklistFailClosed:
     def test_missing_checklist_raises(self, monkeypatch):
         import pytest
 
-        import ouroboros.tools.scope_review as scope_review
+        import ouroboros.tools.scope_review_session as scope_session
 
-        monkeypatch.setattr(scope_review, "load_checklist_section", lambda *_a, **_k: "")
+        monkeypatch.setattr(scope_session, "load_checklist_section", lambda *_a, **_k: "")
         with pytest.raises(RuntimeError, match="fail-closed"):
-            scope_review._build_scope_prompt(pathlib.Path("."), "msg")
+            scope_session.build_scope_session_task(
+                pathlib.Path("."), scope_session.ScopeBriefInputs(commit_message="msg"),
+            )
 
 
 class TestStatusSetSSOT:

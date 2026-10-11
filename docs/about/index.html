@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A plain-language overview of Ouroboros, its persistent identity, agent swarm, self-modification, local runtime, and review boundaries.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://ouroboros-agent.ai/about/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ouroboros">
+  <meta property="og:title" content="About Ouroboros">
+  <meta property="og:description" content="How Ouroboros works, what it can change, and how its identity and history continue across tasks and restarts.">
+  <meta property="og:url" content="https://ouroboros-agent.ai/about/">
+  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta property="og:image:alt" content="Ouroboros, an open-source AI agent with a continuing identity">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta name="twitter:image:alt" content="Ouroboros, an open-source AI agent with a continuing identity">
+  <title>About Ouroboros</title>
+  <link rel="icon" href="/assets/icon_1024.png" type="image/png">
+  <link rel="stylesheet" crossorigin href="/assets/ouroboros-CMTHrJbp.css">
+</head>
+<body class="text-page">
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="text-nav"><a class="brand" href="/" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a><nav aria-label="Text pages"><a href="/paper/">Paper</a><a href="/install/">Install</a><a href="/benchmarks/">Benchmarks</a><a href="https://github.com/razzant/ouroboros">GitHub</a></nav></header>
+  <main class="text-document">
+    <p class="chapter-index">ABOUT / PLAIN TEXT</p>
+    <h1>Ouroboros is an AI agent with a continuing identity and an editable implementation.</h1>
+    <p class="text-lede">It works on external projects, coordinates specialist agents, and can change the code, prompts, tools, architecture, and dependencies that make up its own runtime. Its memory, history, and identity continue across tasks, restarts, and releases.</p>
+
+    <h2>How it runs</h2>
+    <p>Ouroboros runs as a native desktop app or through a headless CLI. The runtime, repository, memory, logs, and task history stay on your machine. Model inference can use remote APIs that you configure or a local GGUF model.</p>
+
+    <h2>How it works</h2>
+    <ul>
+      <li>One root agent remains responsible for the task and the final result.</li>
+      <li>Specialist agents can research, build, test, and review work in parallel.</li>
+      <li>External projects use separate workspaces, so their files stay apart from the Ouroboros runtime.</li>
+      <li>Git history, task records, tests, and review evidence keep changes inspectable.</li>
+    </ul>
+
+    <h2>Self-modification</h2>
+    <p>Ouroboros can edit its implementation and carry accepted changes into later versions. Protected constitutional and safety files have stricter rules. The full boundaries live in the repository documents linked below.</p>
+
+    <h2>Primary sources</h2>
+    <ul class="link-list">
+      <li><a href="https://github.com/razzant/ouroboros/blob/ouroboros/BIBLE.md">BIBLE.md</a> defines the identity and constitutional principles.</li>
+      <li><a href="https://github.com/razzant/ouroboros/blob/ouroboros/docs/ARCHITECTURE.md">ARCHITECTURE.md</a> maps the runtime, storage, tools, and data flow.</li>
+      <li><a href="https://github.com/razzant/ouroboros/blob/ouroboros/docs/DEVELOPMENT.md">DEVELOPMENT.md</a> explains engineering and release practice.</li>
+      <li><a href="/history/first-48-hours/">The first 48 hours</a> preserve the original generation as an archive.</li>
+    </ul>
+  </main>
+  <footer class="text-footer"><a href="/">Home</a><a href="/paper/">Paper</a><a href="/install/">Install</a><a href="/benchmarks/">Benchmarks</a><a href="/llms.txt">llms.txt</a></footer>
+</body>
+</html>

@@ -6,6 +6,7 @@ call asyncio.run() do not contaminate subsequent tests, and fixture finalizers
 that call asyncio.get_event_loop() after asyncio.run() still work correctly.
 """
 import asyncio
+import socket
 import pytest
 
 
@@ -62,3 +63,33 @@ def test_fixture_finalizer_sees_valid_loop_after_asyncio_run(_finalizer_reads_lo
     asyncio.get_event_loop() without RuntimeError.
     """
     asyncio.run(asyncio.sleep(0))
+
+
+@pytest.fixture
+def _guarded_phase_loops(monkeypatch):
+    def no_connect(*args, **kwargs):
+        raise AssertionError("test network guard remains active")
+
+    monkeypatch.setattr(socket.socket, "connect", no_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", no_connect)
+    observed = {"call_loop": None, "callbacks": []}
+    yield observed
+    # This finalizer still runs under the guard, after the call loop closes.
+    assert observed["call_loop"].is_closed()
+    loop = asyncio.get_event_loop()
+    assert loop is not observed["call_loop"] and not loop.is_closed()
+    loop.run_until_complete(asyncio.sleep(0))
+    assert observed["callbacks"] == []
+    with socket.socket() as sock, pytest.raises(AssertionError, match="network guard"):
+        sock.connect(("127.0.0.1", 9))
+
+
+def test_network_guard_keeps_call_and_finalizer_loops_usable(_guarded_phase_loops):
+    """Windows loop construction must precede the fixture's socket guard."""
+    loop = asyncio.get_event_loop()
+    _guarded_phase_loops["call_loop"] = loop
+    loop.run_until_complete(asyncio.sleep(0))
+    with socket.socket() as sock, pytest.raises(AssertionError, match="network guard"):
+        sock.connect(("127.0.0.1", 9))
+    # Closing this loop must discard its callback, not run it on teardown's loop.
+    loop.call_soon(_guarded_phase_loops["callbacks"].append, "leaked callback")

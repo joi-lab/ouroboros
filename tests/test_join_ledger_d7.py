@@ -85,3 +85,36 @@ def test_peek_task_reads_without_absorbing(tmp_path):
     assert "child1" in out
     assert "NOT absorbed" in out  # peek must not look like an absorbed result
     assert "intermediate finding X" in out  # result tail is visible
+
+
+def test_delegated_peek_is_lineage_scoped(tmp_path):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.join_ledger import _peek_task
+
+    _write_child(tmp_path, "mine", "parent1", result="owned")
+    _write_child(tmp_path, "sibling", "other_parent", result="not owned")
+    ctx = _ctx(tmp_path)
+    ctx.task_constraint = TaskConstraint(
+        mode="local_readonly_subagent", allow_enable=False,
+    )
+
+    assert "owned" in _peek_task(ctx, "mine")
+    assert "may inspect only its own children" in _peek_task(ctx, "sibling")
+
+
+def test_peek_preserves_full_review_request_binding(tmp_path, monkeypatch):
+    import ouroboros.task_tree_ledger as ledger
+    from ouroboros.tools.join_ledger import _peek_task
+
+    monkeypatch.setattr(ledger, "DATA_DIR", str(tmp_path))
+    _write_child(tmp_path, "mine", "parent1", result="owned")
+    ctx = _ctx(tmp_path)
+    assert ledger.tree_ledger_append(
+        "parent1", "review_requested", "Check the interface evidence.",
+        task_id="mine",
+        payload={"evidence_ref": "artifact:interface", "evidence_sha256": "b" * 64},
+    ).startswith("OK:")
+
+    out = _peek_task(ctx, "mine")
+    assert "artifact:interface" in out
+    assert "b" * 64 in out

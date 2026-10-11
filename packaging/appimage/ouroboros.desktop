@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ouroboros
+Comment=Self-creating AI agent with persistent identity
+Exec=Ouroboros
+Icon=ouroboros
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true
+StartupWMClass=Ouroboros
+X-AppImage-Name=Ouroboros

@@ -112,6 +112,7 @@ def find_semantic_duplicate_id(
                 drive_root=pathlib.Path(drive_root),
                 task_id="semantic_dedup",
                 call_type=call_type,
+                model_role="light" if model is None else "",
                 messages=messages,
                 model=use_model,
                 reasoning_effort=reasoning_effort,
@@ -119,7 +120,8 @@ def find_semantic_duplicate_id(
             )
         else:
             resp, usage = client.chat(
-                messages=messages, model=use_model, reasoning_effort=reasoning_effort, max_tokens=512
+                messages=messages, model=use_model, reasoning_effort=reasoning_effort, max_tokens=512,
+                model_role="light" if model is None else "",
             )
         if usage:
             try:
@@ -140,5 +142,7 @@ def find_semantic_duplicate_id(
         dup_id = str(verdict.get("duplicate_id") or "").strip()
         # Exact membership only — a substring/near id is treated as no match.
         return dup_id if dup_id in valid_ids else None
-    except Exception:
+    except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         return None

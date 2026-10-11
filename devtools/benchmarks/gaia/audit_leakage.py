@@ -51,7 +51,6 @@ if str(pathlib.Path(__file__).resolve().parents[3]) not in sys.path:
 
 # SSOT for leak-target hosts/URL/query patterns (shared with tests). See
 # leak_targets.py for the pattern-design constraints.
-from devtools.benchmarks.gaia.leak_targets import LEAK_QUERY_RE, LEAK_URL_RE  # noqa: E402
 # The solvers' SSOT prompt instructions are stripped from full-text traces before
 # scanning, so an echoed prompt cannot self-trip LEAK_QUERY_RE (the anti-leak text
 # names the answer-source concept; the format text contains "final answer").
@@ -60,6 +59,8 @@ from devtools.benchmarks.gaia.inspect_solver import (  # noqa: E402
     GAIA_EPISTEMIC_INSTRUCTION,
     GAIA_FORMAT_INSTRUCTION,
 )
+from devtools.benchmarks.gaia.leak_targets import LEAK_QUERY_RE, LEAK_URL_RE  # noqa: E402
+from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS  # noqa: E402
 
 # Web-ish Ouroboros tools whose args/results can carry URLs or retrieved text.
 # Every network-capable tool that stays ENABLED in the bench profiles must be
@@ -342,8 +343,15 @@ def _judge(sample_id: str, gold: str, acts: list, model: str, api_key: str) -> d
     )
     body = json.dumps({"model": model, "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": 200, "temperature": 0}).encode()
-    req = urllib.request.Request("https://openrouter.ai/api/v1/chat/completions", data=body,
-                                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/chat/completions",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            **OPENROUTER_APP_HEADERS,
+        },
+    )
     try:
         with urllib.request.urlopen(req, timeout=90) as r:
             txt = json.load(r)["choices"][0]["message"]["content"]

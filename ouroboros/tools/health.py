@@ -1,7 +1,8 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
+
 import logging
-import os
 import pathlib
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
@@ -9,21 +10,24 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 log = logging.getLogger(__name__)
 
 
+@completed_local_read
 def _codebase_health(ctx: ToolContext) -> str:
     """Compute and format codebase health report."""
     try:
-        from ouroboros.review import collect_sections, compute_complexity_metrics
+        from ouroboros.review import collect_size_ratchet_inventory, compute_repo_complexity_metrics, size_headroom_lines
 
         repo_dir = pathlib.Path(ctx.repo_dir)
-        drive_root = pathlib.Path(os.environ.get("DRIVE_ROOT", str(pathlib.Path.home() / "Ouroboros" / "data")))
-
-        sections, stats = collect_sections(repo_dir, drive_root)
-        metrics = compute_complexity_metrics(sections)
+        inventory = collect_size_ratchet_inventory(repo_dir)
+        metrics = compute_repo_complexity_metrics(repo_dir, inventory=inventory)
+        stats = {
+            "files": metrics["total_files"],
+            "chars": metrics["total_bytes"],
+        }
 
         # Format report
         lines = []
         lines.append("## Codebase Health Report\n")
-        lines.append(f"**Analyzed:** {stats['files']} files, {stats['chars']:,} chars")
+        lines.append(f"**Analyzed:** {stats['files']} files, {stats['chars']:,} UTF-8 bytes")
         if stats.get("truncated"):
             lines.append(f"**Compacted files:** {stats['truncated']}")
         if stats.get("dropped"):
@@ -33,16 +37,19 @@ def _codebase_health(ctx: ToolContext) -> str:
                 f"**Dropped files due review budget:** {stats['dropped']}"
                 + (f" ({preview}{' ...' if len(dropped_paths) > 5 else ''})" if preview else "")
             )
-        lines.append(f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python)")
+        lines.append(
+            f"**Files:** {metrics['total_files']} ({metrics['py_files']} Python, {metrics.get('js_files', 0)} gated JS)"
+        )
         lines.append(f"**Total lines:** {metrics['total_lines']:,}")
         lines.append(f"**Functions:** {metrics['total_functions']}")
         lines.append(f"**Avg function length:** {metrics['avg_function_length']} lines")
         lines.append(f"**Max function length:** {metrics['max_function_length']} lines")
+        lines.append("\n### Size Headroom (information; official CI enforces the limits)")
+        lines.extend(size_headroom_lines(inventory))
 
         from ouroboros.review import (
             MAX_FUNCTION_LINES,
             MAX_MODULE_LINES,
-            MAX_TOTAL_FUNCTIONS,
             TARGET_FUNCTION_LINES,
             TARGET_MODULE_LINES,
         )
@@ -74,30 +81,32 @@ def _codebase_health(ctx: ToolContext) -> str:
         # Warnings
         target_drift_funcs = metrics.get("target_drift_functions", [])
         target_drift_mods = metrics.get("target_drift_modules", [])
+        grandfathered_funcs = metrics.get("grandfathered_functions", [])
         grandfathered_mods = metrics.get("grandfathered_modules", [])
         oversized_funcs = metrics.get("oversized_functions", [])
         oversized_mods = metrics.get("oversized_modules", [])
-        function_count_violation = int(metrics.get("total_functions") or 0) > MAX_TOTAL_FUNCTIONS
 
         if (
             oversized_funcs
             or oversized_mods
+            or grandfathered_funcs
             or grandfathered_mods
             or target_drift_funcs
             or target_drift_mods
-            or function_count_violation
         ):
             lines.append("\n### Complexity Status (Principle 7: Minimalism)")
-            if function_count_violation:
-                lines.append(
-                    f"  Hard-limit total functions > {MAX_TOTAL_FUNCTIONS}: {metrics['total_functions']}"
-                )
             if oversized_funcs:
                 lines.append(f"  Hard-limit functions > {MAX_FUNCTION_LINES} lines: {len(oversized_funcs)}")
                 for path, start, length in oversized_funcs:
                     lines.append(f"    - {path}:{start} ({length} lines)")
             elif target_drift_funcs:
                 lines.append(f"  Target-drift functions > {TARGET_FUNCTION_LINES} lines: {len(target_drift_funcs)}")
+            if grandfathered_funcs:
+                lines.append(
+                    f"  Grandfathered functions still above {MAX_FUNCTION_LINES} lines: {len(grandfathered_funcs)}"
+                )
+                for path, start, length in grandfathered_funcs:
+                    lines.append(f"    - {path}:{start} ({length} lines)")
             if oversized_mods:
                 lines.append(f"  Hard-limit modules > {MAX_MODULE_LINES} lines: {len(oversized_mods)}")
                 for path, size in oversized_mods:
@@ -111,22 +120,46 @@ def _codebase_health(ctx: ToolContext) -> str:
         else:
             lines.append(
                 "\n✅ No hard P7 limit violations detected "
-                f"(all functions <= {MAX_FUNCTION_LINES} lines, total function count <= {MAX_TOTAL_FUNCTIONS}, "
+                f"(all functions <= {MAX_FUNCTION_LINES} lines, "
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
+
+        # Size-ratchet validator findings (manifest matches the tree + shrink-only
+        # transition). The official repository CI `size_ratchet` lane is the
+        # enforcing surface; this report and check_worktree_readiness only warn.
+        try:
+            from ouroboros.review import validate_size_ratchet
+
+            ratchet_findings = validate_size_ratchet(repo_dir, inventory=inventory)
+        except Exception as ratchet_exc:
+            lines.append(f"\n### Size-Ratchet Findings\n  ⚠️ validator unavailable: {ratchet_exc}")
+        else:
+            if ratchet_findings:
+                lines.append("\n### Size-Ratchet Findings (official CI will enforce)")
+                for finding in ratchet_findings:
+                    lines.append(f"  - {finding}")
+            else:
+                lines.append(
+                    "\n✅ Size-ratchet manifest matches the live tree and is shrink-only "
+                    "against the committed authority"
+                )
 
         return "\n".join(lines)
 
     except Exception as e:
         log.warning("codebase_health failed: %s", e, exc_info=True)
-        return f"⚠️ Failed to compute codebase health: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ Failed to compute codebase health: {e}")))
 
 
 def get_tools():
     return [
-        ToolEntry("codebase_health", {
-            "name": "codebase_health",
-            "description": "Get codebase complexity metrics: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
-            "parameters": {"type": "object", "properties": {}, "required": []},
-        }, _codebase_health),
+        ToolEntry(
+            "codebase_health",
+            {
+                "name": "codebase_health",
+                "description": "Get codebase complexity metrics: file sizes, longest functions, modules exceeding limits. Useful for self-assessment per Bible Principle 7 (Minimalism).",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+            _codebase_health,
+        ),
     ]

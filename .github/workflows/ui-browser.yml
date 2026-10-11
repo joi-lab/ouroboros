@@ -1,0 +1,279 @@
+# The ONE browser-lane definition, called by two triggers that share this runner:
+#   - .github/workflows/ci.yml       → pull requests into `ouroboros`, manual runs, `v*` tags
+#   - .github/workflows/ui-browser-push.yml → every push to `ouroboros`, with no path filter
+# Deliberately NOT wired to `schedule`: the owner decision adds no browser cron,
+# and the existing manual/tag checks stay exactly as they were.
+#
+# The complete lane runs as four shards on four runners. Every shard collects and
+# guards the WHOLE lane, then executes every fourth node of the sorted node ids;
+# `ui-manifest` collects the lane once with no shard option, and the `ui-smoke`
+# aggregator fails unless the shards' evidence proves that each manifest node ran
+# in exactly the shard it belongs to. A node no shard executed is named there.
+#
+# This file is the COMPLETE lane and nothing else: it takes no input, so no caller
+# can select a part of it, and every job below runs whenever browsers are needed.
+# `ui-shard` and `ui-manifest` are skipped only for a documentation-only event.
+# The single-scenario PARTIAL DIAGNOSTIC lives in ui-browser-push.yml, its only selector.
+name: UI browser lane
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  scope:
+    name: ui-scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run_browser: ${{ steps.scope.outputs.run_browser }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      # `github` here is the CALLING workflow's event, so one selection rule
+      # serves pull requests and pushes; manual runs and tags never compute one.
+      - name: Select browser coverage from the event diff
+        id: scope
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          EVENT_HEAD: ${{ github.sha }}
+        shell: bash
+        run: |
+          if [[ "$EVENT_NAME" == workflow_dispatch || "$EVENT_REF" == refs/tags/v* ]]; then
+            echo "run_browser=true" >> "$GITHUB_OUTPUT"
+          else
+            python3 -I -S scripts/browser_ci_scope.py --base "$EVENT_BASE" --head "$EVENT_HEAD" >> "$GITHUB_OUTPUT"
+          fi
+
+  ui-shard:
+    name: ui-shard (${{ matrix.shard }}/4)
+    needs: scope
+    if: ${{ needs.scope.outputs.run_browser == 'true' }}
+    runs-on: ubuntu-latest
+    # Above the sum of the step ceilings below: a step ceiling fails its step and
+    # the evidence steps still run, while the job ceiling cancels them.
+    timeout-minutes: 170
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-python-env
+        with:
+          install-project: 'false'
+        id: setup_python
+      - name: Install UI smoke Chromium and WebKit
+        id: install_browsers
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+        run: python -m playwright install --with-deps chromium webkit
+      # `--session-timeout` stops the session BETWEEN tests, so a slow shard still
+      # ends through its session finish: the guard names the nodes it did not run
+      # and the evidence is exported. The step ceiling bounds a test that hangs;
+      # the incremental journal names it. There is no per-test timeout.
+      - name: Run complete host UI lane with collection and availability guards
+        id: ui_tests
+        if: ${{ !cancelled() && steps.install_browsers.outcome == 'success' }}
+        timeout-minutes: 90
+        env:
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+        run: >-
+          python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short
+          --ui-browser-shard=${{ matrix.shard }}/4 --session-timeout=4500
+          --junitxml="${{ runner.temp }}/ci-private/ui/host.xml"
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui/host"
+      - name: Run browser tools Chromium/WebKit smoke
+        id: browser_tools
+        timeout-minutes: 20
+        if: ${{ !cancelled() && steps.install_browsers.outcome == 'success' && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) && matrix.shard == 1 }}
+        env:
+          OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+        run: >-
+          python -I -S scripts/safe_test.py -- python -m pytest tests/test_browser_tools_smoke.py -m browser -q --tb=short
+          --junitxml="${{ runner.temp }}/ci-private/ui/tools.xml"
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui/tools"
+      # The lane's projection is this shard's proof for `ui-smoke`, not a diagnostic: an
+      # attempt whose export or upload failed must be red itself, or the verdict would fall
+      # back to an earlier attempt's proof of a lane this attempt may have collected differently.
+      - name: Require this shard's lane proof
+        id: ui_proof
+        if: ${{ !cancelled() && steps.ui_tests.outcome != 'skipped' }}
+        shell: bash
+        run: test -s "${{ runner.temp }}/ci-evidence/ui/host/results.json"
+      - name: Upload UI test evidence
+        id: ui_evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-ci-full-shard-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence/ui/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Summarize host UI test results
+        id: ui_summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          PRODUCER_OUTCOME: ${{ steps.ui_tests.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.ui_evidence.outcome }}
+          ARTIFACT_URL: ${{ steps.ui_evidence.outputs.artifact-url }}
+        run: >-
+          python -m tests.ci_evidence summarize
+          --evidence-dir "${{ runner.temp }}/ci-evidence/ui/host"
+          --producer-outcome "$PRODUCER_OUTCOME" --scope full
+          --artifact-outcome "$ARTIFACT_OUTCOME" --artifact-url "$ARTIFACT_URL"
+          --summary "$GITHUB_STEP_SUMMARY" --label "shard ${{ matrix.shard }}/4"
+      - name: Summarize browser tools results
+        id: tools_summary
+        if: ${{ !cancelled() && steps.browser_tools.outcome != 'skipped' }}
+        continue-on-error: true
+        env:
+          PRODUCER_OUTCOME: ${{ steps.browser_tools.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.ui_evidence.outcome }}
+          ARTIFACT_URL: ${{ steps.ui_evidence.outputs.artifact-url }}
+        run: >-
+          python -m tests.ci_evidence summarize
+          --evidence-dir "${{ runner.temp }}/ci-evidence/ui/tools"
+          --producer-outcome "$PRODUCER_OUTCOME"
+          --artifact-outcome "$ARTIFACT_OUTCOME" --artifact-url "$ARTIFACT_URL"
+          --summary "$GITHUB_STEP_SUMMARY"
+      # GitHub shows at most ten error annotations per step; the summary lists the rest.
+      - name: Annotate failed and in-flight UI tests
+        id: ui_annotations
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: >-
+          python -I -S tests/ci_evidence.py annotate
+          --evidence-dir "${{ runner.temp }}/ci-evidence/ui/host"
+          --evidence-dir "${{ runner.temp }}/ci-evidence/ui/tools" --limit 10
+      - name: Disclose incomplete UI diagnostics
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() &&
+          (steps.ui_summary.outcome != 'success' ||
+           (steps.browser_tools.outcome != 'skipped' && steps.tools_summary.outcome != 'success') ||
+           steps.ui_evidence.outcome != 'success' || steps.ui_evidence.outputs.artifact-url == '') }}
+        run: |
+          echo "::warning::UI diagnostics are incomplete; see the original test and reporting steps."
+          echo "UI diagnostics_incomplete. The original test outcomes are unchanged." >> "$GITHUB_STEP_SUMMARY"
+
+  # The independent witness of the lane's composition: one collection that never
+  # sees the shard option, under the environment the shards collect with.
+  ui-manifest:
+    name: ui-manifest
+    needs: scope
+    if: ${{ needs.scope.outputs.run_browser == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-python-env
+        with:
+          install-project: 'false'
+      - name: Collect the complete host UI lane as the shard manifest
+        id: ui_manifest
+        env:
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
+        run: >-
+          python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser --collect-only -q
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui-manifest/host"
+      # Mandatory proof, not a diagnostic: an attempt whose export failed leaves only the
+      # journal behind, and the verdict would fall back to an earlier attempt's manifest.
+      - name: Require the lane manifest
+        id: manifest_proof
+        shell: bash
+        run: test -s "${{ runner.temp }}/ci-evidence/ui-manifest/host/results.json"
+      - name: Upload the lane manifest
+        id: manifest_evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-ci-full-manifest-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence/ui-manifest/
+          retention-days: 30
+          if-no-files-found: error
+
+  # The lane's one verdict. `!cancelled()` lets it judge failed and skipped needs:
+  # an unknown coverage decision, a red shard, a missing manifest, a red session
+  # and an unexecuted node all end RED here; only a documentation-only event or a
+  # proven complete lane ends green.
+  ui-smoke:
+    name: ui-smoke
+    needs: [scope, ui-shard, ui-manifest]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Judge the lane from its jobs
+        id: verdict
+        shell: bash
+        env:
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          RUN_BROWSER: ${{ needs.scope.outputs.run_browser }}
+          SHARD_RESULT: ${{ needs.ui-shard.result }}
+          MANIFEST_RESULT: ${{ needs.ui-manifest.result }}
+        run: |
+          red() {
+            echo "::error title=UI browser lane::$1"
+            echo "**UI browser lane RED** — $1" >> "$GITHUB_STEP_SUMMARY"
+          }
+          if [[ "$SCOPE_RESULT" != success || ( "$RUN_BROWSER" != true && "$RUN_BROWSER" != false ) ]]; then
+            red "the coverage decision is unknown (scope job: ${SCOPE_RESULT:-none}, run_browser: ${RUN_BROWSER:-none})."
+            exit 1
+          fi
+          if [[ "$RUN_BROWSER" == false ]]; then
+            echo "Browser lane not run — event changes documentation only." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          failed=0
+          if [[ "$MANIFEST_RESULT" != success ]]; then
+            red "the lane manifest job did not succeed (ui-manifest: ${MANIFEST_RESULT:-none})."
+            failed=1
+          fi
+          if [[ "$SHARD_RESULT" != success ]]; then
+            red "at least one shard job did not succeed (ui-shard: ${SHARD_RESULT:-none})."
+            failed=1
+          fi
+          exit "$failed"
+      # Reconciliation runs whenever browsers are needed, after a red verdict too: it
+      # names the nodes that a failed, cancelled or silent shard left unexecuted, and it
+      # refuses the proof of a red session whatever result GitHub reports for the jobs.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        if: ${{ !cancelled() && needs.scope.outputs.run_browser == 'true' }}
+      - name: Download the lane manifest
+        if: ${{ !cancelled() && needs.scope.outputs.run_browser == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ui-ci-full-manifest-${{ github.sha }}-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/ui-proof/manifest
+      - name: Download every shard's evidence
+        if: ${{ !cancelled() && needs.scope.outputs.run_browser == 'true' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: ui-ci-full-shard-*-${{ github.sha }}-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/ui-proof/shards
+      # Authoritative: a missing, foreign, incomplete or red proof fails the lane.
+      - name: Reconcile executed shards against the lane manifest
+        id: reconcile
+        if: ${{ !cancelled() && needs.scope.outputs.run_browser == 'true' }}
+        run: >-
+          python3 -I -S tests/ci_evidence.py reconcile-shards
+          --manifest "${{ runner.temp }}/ui-proof/manifest"
+          --shards "${{ runner.temp }}/ui-proof/shards"
+          --count 4 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
+          --summary "$GITHUB_STEP_SUMMARY"

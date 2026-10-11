@@ -22,9 +22,6 @@ import types
 
 import pytest
 
-from tests._shared import ensure_claude_agent_sdk_mock
-
-ensure_claude_agent_sdk_mock()
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,11 +47,18 @@ def test_tool_registered(tool_name):
     assert tool_name in names
 
 
-def test_blocked_attempt_cap_refuses_identical_diff_resubmission(tmp_path):
-    """B4: after BLOCKED_ATTEMPT_FINGERPRINT_CAP review-blocks of the SAME
-    staged-diff fingerprint, the next attempt is refused BEFORE triad+scope;
-    a changed diff or a review_rebuttal lifts the cap; refusal records do not
-    reset the streak."""
+CONTRACT_FP = "contract-fp-1"
+
+
+def _identical_ctx(tmp_path, task_id="t-cap"):
+    return types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id=task_id)
+
+
+def _add_attempt(tmp_path, status, fingerprint, *, block_reason="critical_findings",
+                 attempt=1, phase="blocking_review", task_id="t-cap",
+                 block_class="", rebuttal_sha256="",
+                 review_contract_fingerprint=CONTRACT_FP,
+                 critical_findings=None, paid=True):
     import pathlib
 
     from ouroboros.review_state import (
@@ -63,67 +67,155 @@ def test_blocked_attempt_cap_refuses_identical_diff_resubmission(tmp_path):
         update_state,
         _utc_now,
     )
-    from ouroboros.tools.commit_gate import (
-        BLOCKED_ATTEMPT_FINGERPRINT_CAP,
-        check_blocked_attempt_cap,
-    )
 
-    ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-cap")
     repo_key = make_repo_key(pathlib.Path(tmp_path))
 
-    def _add_attempt(status, fingerprint, block_reason="critical_findings", attempt=1,
-                     phase="blocking_review", task_id="t-cap"):
-        def _mutate(state):
-            state.attempts.append(CommitAttemptRecord(
-                ts=_utc_now(), commit_message="msg", status=status,
-                block_reason=block_reason if status == "blocked" else "",
-                repo_key=repo_key, tool_name="commit_reviewed", task_id=task_id,
-                attempt=attempt, phase=phase,
-                pre_review_fingerprint=fingerprint,
-            ))
-        update_state(pathlib.Path(tmp_path), _mutate)
+    def _mutate(state):
+        state.attempts.append(CommitAttemptRecord(
+            ts=_utc_now(), commit_message="msg", status=status,
+            block_reason=block_reason if status == "blocked" else "",
+            repo_key=repo_key, tool_name="commit_reviewed", task_id=task_id,
+            attempt=attempt, phase=phase,
+            pre_review_fingerprint=fingerprint,
+            block_class=block_class,
+            rebuttal_sha256=rebuttal_sha256,
+            review_contract_fingerprint=review_contract_fingerprint,
+            critical_findings=list(critical_findings or []),
+            paid=paid,
+        ))
+    update_state(pathlib.Path(tmp_path), _mutate)
 
-    # Below the cap: allowed. The second block comes from a DIFFERENT task —
-    # the cap is diff-scoped, so a new task with the same unchanged diff
-    # continues the streak instead of resetting it.
-    _add_attempt("blocked", "fp-same", attempt=1)
-    for i in range(BLOCKED_ATTEMPT_FINGERPRINT_CAP - 2):
-        _add_attempt("blocked", "fp-same", attempt=i + 1, task_id="t-other")
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
 
-    # A preflight block (e.g. stale advisory) inheriting the same fingerprint
-    # is NOT a review verdict: it must neither inflate nor reset the streak.
-    _add_attempt("blocked", "fp-same", block_reason="no_advisory",
-                 attempt=BLOCKED_ATTEMPT_FINGERPRINT_CAP, phase="preflight")
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
+def test_identical_diff_refused_free_from_first_verdict_block(tmp_path, monkeypatch):
+    """Q12/Q16 contract: identical bytes are never re-reviewed for pay. ONE
+    review-verdict block of a staged-diff fingerprint refuses a byte-identical
+    resubmission (quoting the recorded verdict), regardless of the cycles knob;
+    a changed diff starts fresh; a cross-task identical resubmit stays refused
+    (anti-laundering); a success ends the streak."""
+    from ouroboros.tools.commit_gate import check_identical_verdict_refusal
 
-    # At the cap: refused.
-    _add_attempt("blocked", "fp-same", attempt=BLOCKED_ATTEMPT_FINGERPRINT_CAP + 1)
-    msg = check_blocked_attempt_cap(ctx, "fp-same")
-    assert "REVIEW_ATTEMPT_CAP" in msg
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")  # refusal is knob-independent
+    ctx = _identical_ctx(tmp_path)
 
-    # A rebuttal-bearing call is exempt (rebuttal IS new review input).
-    assert check_blocked_attempt_cap(ctx, "fp-same", has_rebuttal=True) == ""
+    # FIRST verdict-block already refuses — no paid streak of N is required.
+    _add_attempt(tmp_path, "blocked", "fp-same", block_class="verdict",
+                 critical_findings=[{"item": "bug_x", "reason": "boom", "severity": "critical"}])
+    msg = check_identical_verdict_refusal(ctx, "fp-same", contract_fingerprint=CONTRACT_FP)
+    assert "IDENTICAL_DIFF_REFUSED" in msg
+    assert "bug_x" in msg  # quotes the recorded verdict
+    # Cross-task: the byte-identical diff is the identity.
+    other = _identical_ctx(tmp_path, task_id="t-other")
+    assert "IDENTICAL_DIFF_REFUSED" in check_identical_verdict_refusal(
+        other, "fp-same", contract_fingerprint=CONTRACT_FP)
+    # A different staged diff is a fresh paid case.
+    assert check_identical_verdict_refusal(ctx, "fp-other", contract_fingerprint=CONTRACT_FP) == ""
+    # A refusal record must not reset the streak.
+    _add_attempt(tmp_path, "blocked", "fp-same", block_reason="identical_diff_refused",
+                 phase="preflight", attempt=2)
+    assert "IDENTICAL_DIFF_REFUSED" in check_identical_verdict_refusal(
+        ctx, "fp-same", contract_fingerprint=CONTRACT_FP)
+    # A successful commit ends the streak.
+    _add_attempt(tmp_path, "succeeded", "fp-same", attempt=3, phase="commit")
+    assert check_identical_verdict_refusal(ctx, "fp-same", contract_fingerprint=CONTRACT_FP) == ""
 
-    # A different staged diff starts fresh.
-    assert check_blocked_attempt_cap(ctx, "fp-other") == ""
 
-    # Cap-refusal records themselves must not reset the streak.
-    _add_attempt("blocked", "fp-same", block_reason="attempt_cap_reached",
-                 attempt=BLOCKED_ATTEMPT_FINGERPRINT_CAP + 2)
-    assert "REVIEW_ATTEMPT_CAP" in check_blocked_attempt_cap(ctx, "fp-same")
+def test_identical_refusal_rebuttal_by_content_and_contract_lapse(tmp_path, monkeypatch):
+    """Q16/Q22 contract: a rebuttal hash NEW to the streak buys exactly one
+    paid re-review; the SAME hash is refused free; a changed (or unknown)
+    review-contract fingerprint lapses the streak entirely."""
+    from ouroboros.tools.commit_gate import (
+        check_identical_verdict_refusal,
+        compute_rebuttal_sha256,
+    )
 
-    # A successful commit breaks the streak.
-    _add_attempt("committed", "fp-same", attempt=BLOCKED_ATTEMPT_FINGERPRINT_CAP + 3)
-    assert check_blocked_attempt_cap(ctx, "fp-same") == ""
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    ctx = _identical_ctx(tmp_path)
+    _add_attempt(tmp_path, "blocked", "fp-r", block_class="verdict")
+
+    new_sha = compute_rebuttal_sha256("the finding is a false positive because ...")
+    assert new_sha and compute_rebuttal_sha256("") == ""
+    # NEW rebuttal content: exempt (buys one paid re-review).
+    assert check_identical_verdict_refusal(
+        ctx, "fp-r", rebuttal_sha256=new_sha, contract_fingerprint=CONTRACT_FP) == ""
+    # That rebuttal is spent on the streak (recorded on the next verdict-block):
+    _add_attempt(tmp_path, "blocked", "fp-r", attempt=2, block_class="verdict",
+                 rebuttal_sha256=new_sha)
+    repeated = check_identical_verdict_refusal(
+        ctx, "fp-r", rebuttal_sha256=new_sha, contract_fingerprint=CONTRACT_FP)
+    assert "IDENTICAL_DIFF_REFUSED" in repeated
+    assert "repeated rebuttal" in repeated
+    # A genuinely different rebuttal buys again.
+    assert check_identical_verdict_refusal(
+        ctx, "fp-r", rebuttal_sha256=compute_rebuttal_sha256("different evidence"),
+        contract_fingerprint=CONTRACT_FP) == ""
+    # A rebuttal is "spent" only when it BOUGHT a dispatch (machine-4/wording-2):
+    # one recorded on an UNDISPATCHED refusal row (e.g. a ceiling refusal) stays
+    # fresh — after the owner raises the cap it still buys its paid re-review.
+    undispatched = compute_rebuttal_sha256("never dispatched")
+    _add_attempt(tmp_path, "blocked", "fp-r", attempt=3,
+                 block_reason="review_cycles_exhausted", phase="preflight",
+                 rebuttal_sha256=undispatched, paid=False)
+    assert check_identical_verdict_refusal(
+        ctx, "fp-r", rebuttal_sha256=undispatched, contract_fingerprint=CONTRACT_FP) == ""
+    # Q22: a changed contract fingerprint invalidates the streak — a paid
+    # review is allowed and the refusal never quotes across the change.
+    assert check_identical_verdict_refusal(
+        ctx, "fp-r", contract_fingerprint="another-contract") == ""
+    # An unknown current contract (fail-open "") never refuses.
+    assert check_identical_verdict_refusal(ctx, "fp-r", contract_fingerprint="") == ""
+    # The lapse applies to the streak HEAD only: an OLDER row from a previous
+    # contract ends the streak but a NEWER verdict under the current contract
+    # keeps its refusal authority.
+    _add_attempt(tmp_path, "blocked", "fp-mixed", attempt=1, block_class="verdict",
+                 review_contract_fingerprint="old-contract")
+    _add_attempt(tmp_path, "blocked", "fp-mixed", attempt=2, block_class="verdict",
+                 review_contract_fingerprint=CONTRACT_FP)
+    assert "IDENTICAL_DIFF_REFUSED" in check_identical_verdict_refusal(
+        ctx, "fp-mixed", contract_fingerprint=CONTRACT_FP)
+
+
+def test_identical_refusal_skips_infra_and_preflight_rows(tmp_path, monkeypatch):
+    """Δ5 contract: infra-blocks (fit/quorum/transport/revalidation) and
+    preflight facts neither build the refusal streak nor reset it — the
+    recorded verdict stays authoritative through infra noise, and infra-only
+    history never refuses anything."""
+    from ouroboros.tools.commit_gate import check_identical_verdict_refusal
+
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    ctx = _identical_ctx(tmp_path)
+
+    # Infra-only history: retry freely, never a refusal.
+    _add_attempt(tmp_path, "blocked", "fp-i", block_reason="review_quorum",
+                 block_class="infra")
+    _add_attempt(tmp_path, "blocked", "fp-i", block_reason="fixed_overflow",
+                 block_class="infra", attempt=2)
+    assert check_identical_verdict_refusal(ctx, "fp-i", contract_fingerprint=CONTRACT_FP) == ""
+
+    # A verdict-block, then infra + preflight noise: still refused.
+    _add_attempt(tmp_path, "blocked", "fp-i", attempt=3, block_class="verdict")
+    _add_attempt(tmp_path, "blocked", "fp-i", block_reason="review_quorum",
+                 block_class="infra", attempt=4)
+    _add_attempt(tmp_path, "blocked", "fp-i", block_reason="tests_preflight_blocked",
+                 phase="preflight", attempt=5)
+    _add_attempt(tmp_path, "blocked", "", block_reason="tests_preflight_blocked",
+                 phase="preflight", task_id="t-new", attempt=1)
+    # machine-2: a FAILED infra/expired row (lock timeout, path error, expired
+    # reviewing attempt) is a transient too — it must not reset the streak.
+    _add_attempt(tmp_path, "failed", "fp-i", phase="infra", attempt=6, paid=False)
+    _add_attempt(tmp_path, "failed", "fp-i", phase="expired", attempt=7)
+    assert "IDENTICAL_DIFF_REFUSED" in check_identical_verdict_refusal(
+        ctx, "fp-i", contract_fingerprint=CONTRACT_FP)
+    # A POST-REVIEW failure (the paid review completed, usually with a PASS)
+    # supersedes the old verdict and ends the streak.
+    _add_attempt(tmp_path, "failed", "fp-i", phase="post_commit_tests", attempt=8)
+    assert check_identical_verdict_refusal(ctx, "fp-i", contract_fingerprint=CONTRACT_FP) == ""
 
 
 def test_tests_preflight_block_recorded_with_preflight_phase():
     """The tests-preflight `_record_commit_attempt` call site must stamp
     phase="preflight": without it `infer_review_phase` defaults a blocked
-    record to "blocking_review" and the identical-diff cap would count a flaky
-    test failure as a review verdict (inflating the streak same-task) or break
-    the streak from a new task (empty inherited fingerprint)."""
+    record to "blocking_review" and legacy-row classification could read a
+    flaky test failure as a review verdict for the identical-diff refusal."""
     git_mod = _get_git_module()
     source = inspect.getsource(git_mod)
     idx = source.find('block_reason="tests_preflight_blocked"')
@@ -133,55 +225,46 @@ def test_tests_preflight_block_recorded_with_preflight_phase():
     assert 'phase="preflight"' in window
 
 
-def test_blocked_attempt_cap_ignores_tests_preflight_blocks(tmp_path):
-    """A tests-preflight block recorded the way ouroboros/tools/git.py records
-    it (block_reason=tests_preflight_blocked, phase=preflight) neither inflates
-    nor resets the identical-diff streak — in BOTH directions: same-task with
-    an inherited fingerprint, and new-task with an empty fingerprint."""
-    import pathlib
+def test_legacy_rows_classify_by_block_reason(tmp_path, monkeypatch):
+    """Pre-upgrade ledger rows carry no block_class: critical_findings rows
+    keep building the refusal streak (verdict), while quorum/fit/transport
+    rows classify infra and never refuse; preflight/refusal rows stay
+    unclassified."""
+    import types as _types
 
-    from ouroboros.review_state import (
-        CommitAttemptRecord,
-        make_repo_key,
-        update_state,
-        _utc_now,
-    )
     from ouroboros.tools.commit_gate import (
-        BLOCKED_ATTEMPT_FINGERPRINT_CAP,
-        check_blocked_attempt_cap,
+        BLOCK_CLASS_INFRA,
+        BLOCK_CLASS_VERDICT,
+        attempt_block_class,
+        check_identical_verdict_refusal,
     )
 
-    ctx = types.SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="t-cap")
-    repo_key = make_repo_key(pathlib.Path(tmp_path))
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
 
-    def _add(status, fingerprint, block_reason="critical_findings",
-             phase="blocking_review", task_id="t-cap"):
-        def _mutate(state):
-            state.attempts.append(CommitAttemptRecord(
-                ts=_utc_now(), commit_message="msg", status=status,
-                block_reason=block_reason if status == "blocked" else "",
-                repo_key=repo_key, tool_name="commit_reviewed", task_id=task_id,
-                attempt=1, phase=phase,
-                pre_review_fingerprint=fingerprint,
-            ))
-        update_state(pathlib.Path(tmp_path), _mutate)
+    def _legacy(status, block_reason, phase="blocking_review", scope_raw=None):
+        return _types.SimpleNamespace(
+            status=status, block_reason=block_reason, phase=phase,
+            block_class="", scope_raw_result=scope_raw or {},
+        )
 
-    # CAP-1 genuine verdicts, then a tests-preflight block with the SAME
-    # inherited fingerprint: must NOT count as the capping verdict.
-    for _ in range(BLOCKED_ATTEMPT_FINGERPRINT_CAP - 1):
-        _add("blocked", "fp-x")
-    _add("blocked", "fp-x", block_reason="tests_preflight_blocked", phase="preflight")
-    assert check_blocked_attempt_cap(ctx, "fp-x") == ""
+    assert attempt_block_class(_legacy("blocked", "critical_findings")) == BLOCK_CLASS_VERDICT
+    assert attempt_block_class(_legacy("blocked", "review_quorum")) == BLOCK_CLASS_INFRA
+    assert attempt_block_class(_legacy("blocked", "fixed_overflow")) == BLOCK_CLASS_INFRA
+    assert attempt_block_class(_legacy("blocked", "no_advisory", phase="advisory_gate")) == ""
+    assert attempt_block_class(_legacy("blocked", "attempt_cap_reached", phase="preflight")) == ""
+    # Legacy scope_blocked rows: verdict only when a RESPONDED actor row
+    # carried critical findings; sub-floor/overflow scope blocks are infra.
+    responded = {"raw_results": [{"status": "responded", "critical_findings": [{"item": "x"}]}]}
+    sub_floor = {"raw_results": [{"status": "sub_floor", "critical_findings": []}]}
+    assert attempt_block_class(_legacy("blocked", "scope_blocked", scope_raw=responded)) == BLOCK_CLASS_VERDICT
+    assert attempt_block_class(_legacy("blocked", "scope_blocked", scope_raw=sub_floor)) == BLOCK_CLASS_INFRA
 
-    # One more genuine verdict reaches the cap.
-    _add("blocked", "fp-x")
-    assert "REVIEW_ATTEMPT_CAP" in check_blocked_attempt_cap(ctx, "fp-x")
-
-    # A NEW-task tests-preflight block with an EMPTY fingerprint (no inherited
-    # stage in that task yet) must not break the capped streak either.
-    _add("blocked", "", block_reason="tests_preflight_blocked",
-         phase="preflight", task_id="t-new")
-    assert "REVIEW_ATTEMPT_CAP" in check_blocked_attempt_cap(ctx, "fp-x")
+    # End-to-end on the ledger: a legacy critical_findings row (no block_class)
+    # still refuses the identical resubmission.
+    ctx = _identical_ctx(tmp_path)
+    _add_attempt(tmp_path, "blocked", "fp-legacy", block_class="")
+    assert "IDENTICAL_DIFF_REFUSED" in check_identical_verdict_refusal(
+        ctx, "fp-legacy", contract_fingerprint=CONTRACT_FP)
 
 
 def test_non_committing_review_cycle_exists_and_reuses_shared_stage_cycle():
@@ -194,13 +277,14 @@ def test_non_committing_review_cycle_exists_and_reuses_shared_stage_cycle():
     assert '["git", "commit"' not in source
 
 
-def test_non_committing_review_cycle_runtime_unstages_on_success(monkeypatch):
+def test_non_committing_review_cycle_runtime_unstages_on_success(monkeypatch, tmp_path):
     git_mod = _get_git_module()
     reset_calls = []
     recorded = []
     released = []
 
     monkeypatch.setattr(git_mod, "_check_overlapping_review_attempt", lambda ctx: None)
+    monkeypatch.setattr(git_mod, "_reconcile_advisory_before_preparation", lambda *a, **kw: "")
     monkeypatch.setattr(git_mod, "_acquire_git_lock", lambda ctx: "lock-token")
     monkeypatch.setattr(git_mod, "_release_git_lock", lambda lock: released.append(lock))
     monkeypatch.setattr(
@@ -226,7 +310,7 @@ def test_non_committing_review_cycle_runtime_unstages_on_success(monkeypatch):
         lambda cmd, cwd=None: reset_calls.append((tuple(cmd), cwd)) or "",
     )
 
-    ctx = types.SimpleNamespace(repo_dir="/tmp/repo")
+    ctx = types.SimpleNamespace(repo_dir="/tmp/repo", drive_root=tmp_path)
     outcome = git_mod._run_non_committing_review_cycle(ctx, "test commit")
 
     assert outcome["status"] == "passed"
@@ -237,12 +321,13 @@ def test_non_committing_review_cycle_runtime_unstages_on_success(monkeypatch):
     assert reset_calls == [(("git", "reset", "HEAD"), "/tmp/repo")]
 
 
-def test_non_committing_review_cycle_runtime_unstages_on_block(monkeypatch):
+def test_non_committing_review_cycle_runtime_unstages_on_block(monkeypatch, tmp_path):
     git_mod = _get_git_module()
     reset_calls = []
     released = []
 
     monkeypatch.setattr(git_mod, "_check_overlapping_review_attempt", lambda ctx: None)
+    monkeypatch.setattr(git_mod, "_reconcile_advisory_before_preparation", lambda *a, **kw: "")
     monkeypatch.setattr(git_mod, "_acquire_git_lock", lambda ctx: "lock-token")
     monkeypatch.setattr(git_mod, "_release_git_lock", lambda lock: released.append(lock))
     monkeypatch.setattr(
@@ -260,7 +345,7 @@ def test_non_committing_review_cycle_runtime_unstages_on_block(monkeypatch):
         lambda cmd, cwd=None: reset_calls.append((tuple(cmd), cwd)) or "",
     )
 
-    ctx = types.SimpleNamespace(repo_dir="/tmp/repo")
+    ctx = types.SimpleNamespace(repo_dir="/tmp/repo", drive_root=tmp_path)
     outcome = git_mod._run_non_committing_review_cycle(ctx, "test commit")
 
     assert outcome["status"] == "blocked"
@@ -436,13 +521,15 @@ def test_auto_push_is_best_effort():
     assert "non-fatal" in source.lower() or "non_fatal" in source.lower()
 
 
-def test_auto_push_outside_git_lock():
-    """Auto-push call must happen AFTER _release_git_lock, not inside the try/finally."""
+def test_only_evolution_authority_recheck_and_auto_push_hold_git_lock():
+    """Evolution push stays inside the lock; ordinary push returns outside it."""
     git_mod = _get_git_module()
     source = inspect.getsource(git_mod._repo_commit_push)
-    lock_release_pos = source.rfind("_release_git_lock")
-    push_pos = source.rfind("_auto_push")
-    assert lock_release_pos < push_pos, "_repo_commit_push: _auto_push must come after _release_git_lock"
+    authority_pos = source.find("_evolution_publication_stopped_result")
+    evolution_push_pos = source.find("_auto_push", authority_pos)
+    lock_release_pos = source.find("_release_git_lock", evolution_push_pos)
+    ordinary_push_pos = source.find("_auto_push", lock_release_pos)
+    assert authority_pos < evolution_push_pos < lock_release_pos < ordinary_push_pos
 
 
 # --- Credential configuration (legacy token-in-URL migration retired) ---
@@ -500,19 +587,23 @@ def test_review_status_registered():
 
 
 def test_advisory_gate_in_repo_commit_push():
-    """The shared reviewed stage must gate review on advisory freshness."""
+    """The shared reviewed stage must gate review on advisory freshness (the
+    check lives in the extracted _advisory_and_tests_gate helper, called before
+    any paid dispatch and after the free Max-Review-Cycles gate)."""
     git_mod = _get_git_module()
     source = inspect.getsource(git_mod._run_reviewed_stage_cycle)
-    assert "_check_advisory_freshness" in source
-    # Advisory gate must come before parallel review (which contains unified review)
-    advisory_pos = source.find("_check_advisory_freshness")
+    gate_pos = source.find("_advisory_and_tests_gate")
     review_pos = source.find("_run_parallel_review")
-    assert advisory_pos != -1, "_check_advisory_freshness not found in _run_reviewed_stage_cycle"
+    assert gate_pos != -1, "_advisory_and_tests_gate not found in _run_reviewed_stage_cycle"
     assert review_pos != -1, "_run_parallel_review not found in _run_reviewed_stage_cycle"
-    assert advisory_pos < review_pos, "Advisory gate must precede parallel review"
-    # Verify _run_parallel_review contains _run_unified_review
+    assert gate_pos < review_pos, "Advisory gate must precede parallel review"
+    gate_source = inspect.getsource(git_mod._advisory_and_tests_gate)
+    assert "_check_advisory_freshness" in gate_source
+    # Verify _run_parallel_review contains the triad phases (Q25-A: assembly
+    # before dispatch superseded the single _run_unified_review call).
     parallel_source = inspect.getsource(git_mod._run_parallel_review)
-    assert "_run_unified_review" in parallel_source
+    assert "_prepare_unified_review" in parallel_source
+    assert "_dispatch_unified_review" in parallel_source
 
 
 def test_advisory_freshness_blocks_without_fresh_run(tmp_path):
@@ -887,13 +978,50 @@ def test_repo_commit_schema_has_skip_advisory_param():
     assert "skip_advisory_review" in props
 
 
+def test_advisory_choice_guidance_is_shared_across_model_facing_schemas():
+    adv_mod = _get_advisory_module()
+    git_mod = _get_git_module()
+    advisory_tools = {tool.name: tool for tool in adv_mod.get_tools()}
+    git_tools = {tool.name: tool for tool in git_mod.get_tools()}
+
+    advisory_tool = advisory_tools["preflight_review"]
+    status_tool = advisory_tools["review_status"]
+    commit_tool = git_tools["commit_reviewed"]
+    alias_tool = git_tools["vcs_commit_reviewed"]
+    advisory_skip = advisory_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+    commit_skip = commit_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+    alias_skip = alias_tool.schema["parameters"]["properties"]["skip_advisory_review"]
+
+    guidance = adv_mod.ADVISORY_REVIEW_CHOICE_GUIDANCE
+    surfaces = [
+        advisory_tool.schema["description"],
+        advisory_skip["description"],
+        status_tool.schema["description"],
+        commit_tool.schema["description"],
+        commit_skip["description"],
+        alias_tool.schema["description"],
+        alias_skip["description"],
+    ]
+    assert all(guidance in surface for surface in surfaces)
+    assert all("skip_advisory_review=True" in surface for surface in surfaces)
+    assert "bypasses only the requirements for advisory freshness" in guidance
+    assert "records remain visible" in guidance
+    assert "removes only advisory" not in guidance
+    assert commit_tool.schema["description"] == alias_tool.schema["description"]
+    assert commit_skip["description"] == alias_skip["description"]
+    assert "advisory-readiness projection" in status_tool.schema["description"]
+    assert "not the full commit gate" in status_tool.schema["description"]
+    assert "bypass the entire commit gate" not in " ".join(surfaces).lower()
+
+
 def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
-    """advisory_pre_review must auto-bypass with audit when ANTHROPIC_API_KEY is absent."""
+    """advisory_pre_review auto-bypasses with audit when the advisory model's
+    provider credentials are absent (the retired ANTHROPIC_API_KEY probe's
+    successor: availability follows the routed model)."""
     import json
     import subprocess
     adv_mod = _get_advisory_module()
     rs_mod = _get_review_state_module()
-
     repo_dir = tmp_path / "repo"
     repo_dir.mkdir()
     drive_root = tmp_path / "drive"
@@ -902,8 +1030,10 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     (drive_root / "logs").mkdir()
     subprocess.run(["git", "init"], cwd=str(repo_dir), capture_output=True)
 
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    for _key in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+                 "MINIMAX_API_KEY", "GIGACHAT_AUTH_KEY", "CLOUD_RU_API_KEY"):
+        monkeypatch.delenv(_key, raising=False)
     progress_calls = []
 
     class FakeCtx:
@@ -920,7 +1050,7 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
 
     # Must be bypassed, not errored
     assert result["status"] == "bypassed"
-    assert "ANTHROPIC_API_KEY" in result["bypass_reason"]
+    assert "no provider credentials" in result["bypass_reason"]
 
     # Must create a fresh advisory state (bypassed counts as fresh for gate)
     state = rs_mod.load_state(drive_root)
@@ -933,7 +1063,7 @@ def test_advisory_auto_bypass_on_missing_key(tmp_path, monkeypatch):
     events = [json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
     bypass_events = [e for e in events if e.get("type") == "advisory_review_bypassed"]
     assert len(bypass_events) == 1
-    assert "ANTHROPIC_API_KEY" in bypass_events[0]["bypass_reason"]
+    assert "no provider credentials" in bypass_events[0]["bypass_reason"]
 
 
 def test_advisory_prompt_contains_blocking_history_when_blocked(tmp_path):
@@ -1050,11 +1180,13 @@ def test_advisory_prompt_strictness_formulations():
 
 
 def test_advisory_prompt_references_architecture_doc_via_read_tool():
-    """Advisory prompt must inline ARCHITECTURE.md content when available.
+    """The advisory brief NAMES ARCHITECTURE.md with the read instruction.
 
-    The v4.15.1 prompt restores ARCHITECTURE.md directly into the advisory context so
-    the reviewer always sees version-sync and module-structure facts without an extra
-    read step. The touched-file pack must avoid duplicating it separately.
+    The map is the one governance tier that is never inlined whole (the
+    governance tiers, owner decision 2026-09-17): a retrieving reviewer reads
+    the version-sync and module-structure facts it needs from the exact
+    chapter, so the brief carries the addressable navigation instead of the
+    body.
     """
     import subprocess
     adv_mod = _get_advisory_module()
@@ -1072,10 +1204,12 @@ def test_advisory_prompt_references_architecture_doc_via_read_tool():
 
         prompt = adv_mod._build_advisory_prompt(repo_dir, "test commit")
 
-        assert "ARCHITECTURE.md" in prompt, "Prompt must include an ARCHITECTURE.md section"
-        assert "## ARCHITECTURE.md" in prompt, "Prompt should expose ARCHITECTURE.md as a first-class section"
-        assert "Ouroboros v99.0.0" in prompt, (
-            "ARCHITECTURE.md content should now be inlined for advisory review"
+        assert "docs/ARCHITECTURE.md" in prompt, "the brief must name ARCHITECTURE.md"
+        assert 'read_file(root="system_repo"' in prompt, (
+            "the brief must carry the instruction that reaches it"
+        )
+        assert "Ouroboros v99.0.0" not in prompt, (
+            "the map is delivered as navigation, never inlined whole"
         )
 
 
@@ -1130,8 +1264,10 @@ def test_blocking_history_section_with_scope_blocked(tmp_path):
     assert "ARCHITECTURE.md" in section
 
 
-def test_review_blocked_message_prefers_fix_over_rebuttal():
-    """v4.9.2: REVIEW_BLOCKED message directs agent to fix first, rebuttal only for factual errors."""
+def test_review_blocked_message_keeps_evidence_based_rebuttal_on_repeat():
+    """REVIEW_BLOCKED coaching (issue #447, В8=A): fix first; rebuttal is legitimate
+    for factual errors, unsupported severity, or disproportionate remedies — but it
+    never overrides owner-chosen enforcement. Repetition is not evidence."""
     from ouroboros.tools.review import _build_critical_block_message
 
     class FakeCtx:
@@ -1141,49 +1277,69 @@ def test_review_blocked_message_prefers_fix_over_rebuttal():
     msg = _build_critical_block_message(
         FakeCtx(), "test commit", ["bible_compliance: violation"], [], ""
     )
-    assert "factually incorrect" in msg.lower()
-    assert "not to argue" in msg.lower() or "not to argue against" in msg.lower()
+    # Whitespace-normalized: the message wraps lines mid-phrase.
+    lowered = " ".join(msg.lower().split())
+    assert "factually incorrect" in lowered
+    # Proportionality channel is open: disproportionate remedies are arguable.
+    assert "disproportionate" in lowered
+    # Non-override clause: rebuttal is argument, not authority.
+    assert "never overrides owner-chosen enforcement" in lowered
+    assert "repetition alone does not validate a finding" in lowered
+    assert "retaining a justified rebuttal" in lowered
 
 
-def test_review_blocked_5plus_hint_suggests_split():
-    """v4.9.2: After 5+ attempts, hint suggests implementing the fix or splitting."""
+def test_review_blocked_later_attempts_keep_judgment_without_numeric_stop():
+    """Later attempts keep reassessment options as examples; no attempt number
+    or fix count turns them into a mandatory STOP or message format."""
     from ouroboros.tools.review import _build_critical_block_message
 
     class FakeCtx:
-        # v4.33.0 lowered the threshold from 5 to 3 — 5 still triggers but
-        # the phrasing changed from "report the blockage" to "send_user_message
-        # to escalate" which carries the same semantic weight.
         _review_iteration_count = 5
         _review_history = []
 
     msg = _build_critical_block_message(
         FakeCtx(), "test commit", ["tests_affected: missing tests"], [], ""
     )
-    lowered = msg.lower()
-    assert "split" in lowered, f"missing split-the-diff guidance: {msg!r}"
-    assert ("send_user_message" in lowered or "escalate" in lowered
-            or "report" in lowered), (
-        f"missing escalation guidance: {msg!r}"
-    )
+    lowered = " ".join(msg.lower().split())
+    assert "if attempts stop converging, reconsider the approach" in lowered
+    assert "split the diff" in lowered and "escalate" in lowered
+    for retired in ("circuit-breaker", "two concrete fixes", "stop retrying",
+                    "one subject line", "attempt 5+"):
+        assert retired not in lowered, retired
 
 
-def test_review_blocked_message_requires_reaudit_after_first_block():
-    """Blocked-review guidance should explicitly require a full-diff re-audit after the first block."""
+def test_review_blocked_retry_note_owes_outcome_not_procedure():
+    """From attempt 2 the note keeps every open finding and the unchanged review
+    state, defers paid/free retry to the gate's recorded eligibility, and leaves
+    inspection/grouping/order to the author."""
     from ouroboros.tools.review import _build_critical_block_message
+    from ouroboros.tools.review_prompt_text import REVIEW_REPAIR_JUDGMENT
 
     class FakeCtx:
         _review_iteration_count = 2
         _review_history = []
-        _last_review_critical_findings = [{"item": "code_quality"}]
+        _last_review_critical_findings = [
+            {"item": "code_quality"}, {"item": "tests_affected"}]
         _last_review_advisory_findings = []
 
     msg = _build_critical_block_message(
         FakeCtx(), "test commit", ["code_quality: review mismatch"], [], ""
     )
-    lowered = msg.lower()
-    assert "re-read the full diff" in lowered
-    assert "group obligations by root cause" in lowered
-    assert "rewrite the plan" in lowered
+    assert "REVIEW_BLOCKED (attempt 2)" in msg
+    note = msg.split("Before the next commit_reviewed:", 1)[1]
+    assert "  - Finding: code_quality" in note and "  - Finding: tests_affected" in note
+    assert REVIEW_REPAIR_JUDGMENT in note
+    lowered = " ".join(note.lower().split())
+    assert "recorded review state and the individual findings below stand" in lowered
+    assert "not rewrite them or the configured enforcement" in lowered
+    assert ("follows the gate's recorded replay eligibility, custody, budget and "
+            "cycle limit, not this note") in lowered
+    assert ("an eligible recorded verdict on an unchanged diff under the same review "
+            "contract is not re-reviewed without a genuinely new review_rebuttal") in lowered
+    for retired in ("do not call commit_reviewed", "addressed / rebutted / pending",
+                    "re-read the full diff", "group obligations by root cause",
+                    "rewrite the plan", "another paid review needs"):
+        assert retired not in lowered, retired
 
 
 def test_self_consistency_listed_as_critical_in_severity_rules():

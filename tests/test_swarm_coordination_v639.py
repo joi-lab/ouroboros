@@ -171,7 +171,6 @@ def _run_emit(tmp_path, task, monkeypatch):
     drive_root = tmp_path / "data"
     for sub in ("logs", "memory", "task_results"):
         (drive_root / sub).mkdir(parents=True, exist_ok=True)
-    monkeypatch.setattr(atp, "_run_chat_consolidation", lambda *a, **k: None)
     monkeypatch.setattr(atp, "_run_scratchpad_consolidation", lambda *a, **k: None)
     monkeypatch.setattr(atp, "_run_post_task_processing_async", lambda *a, **k: None)
     # Hermetic: isolate the live project-journal/state side effects (append + mirror both
@@ -206,3 +205,66 @@ def test_mirror_skipped_for_child_task(tmp_path, monkeypatch):
             "project_id": "proj1", "parent_task_id": "root1"}
     calls = _run_emit(tmp_path, task, monkeypatch)
     assert not calls  # a subagent/child does not re-mirror; the root absorbs the tree
+
+
+# ------------------------------- Q8: typed off-registry work-location journal row
+
+def _capture_journal(monkeypatch, tmp_path):
+    captured = []
+    monkeypatch.setattr(pj, "append_jsonl", lambda path, row: captured.append(row))
+    monkeypatch.setattr(pj, "project_journal_path", lambda pid: tmp_path / "journal.jsonl")
+    monkeypatch.setattr("ouroboros.projects_registry.touch_project", lambda *a, **k: None)
+    return captured
+
+
+def test_work_location_row_written_for_off_registry_tree(tmp_path, monkeypatch):
+    """A finished root whose effective tree differs from the registry working_dir
+    leaves ONE typed 'work lives at <path> @ <sha>' row — from facts the task
+    record already holds (no git subprocess)."""
+    captured = _capture_journal(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "ouroboros.projects_registry.get_project",
+        lambda root, pid: {"working_dir": str(tmp_path / "registered")},
+    )
+    task = {
+        "id": "r1",
+        "workspace_root": str(tmp_path / "elsewhere"),
+        "metadata": {"workspace_preflight": {"git": {"head": "abc123"}}},
+    }
+
+    pj._record_work_location("proj1", task)
+
+    assert len(captured) == 1
+    row = captured[0]
+    assert row["type"] == "work_location"
+    assert row["path"] == str(tmp_path / "elsewhere")
+    assert row["sha"] == "abc123"
+    assert row["registered_working_dir"] == str(tmp_path / "registered")
+    assert "work lives at" in row["text"] and "@ abc123" in row["text"]
+    assert row["task_id"] == "r1"
+
+
+def test_work_location_row_written_without_sha_when_unknown(tmp_path, monkeypatch):
+    captured = _capture_journal(monkeypatch, tmp_path)
+    monkeypatch.setattr("ouroboros.projects_registry.get_project", lambda root, pid: None)
+    task = {"id": "r2", "workspace_root": str(tmp_path / "tree")}
+
+    pj._record_work_location("proj1", task)
+
+    assert len(captured) == 1
+    assert captured[0]["sha"] == ""
+    assert "@" not in captured[0]["text"]  # path recorded without a fabricated sha
+
+
+def test_work_location_row_skipped_when_tree_matches_registry(tmp_path, monkeypatch):
+    captured = _capture_journal(monkeypatch, tmp_path)
+    tree = tmp_path / "tree"
+    monkeypatch.setattr(
+        "ouroboros.projects_registry.get_project",
+        lambda root, pid: {"working_dir": str(tree)},
+    )
+
+    pj._record_work_location("proj1", {"id": "r3", "workspace_root": str(tree)})
+    pj._record_work_location("proj1", {"id": "r4"})  # no working tree at all
+
+    assert captured == []

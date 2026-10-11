@@ -131,6 +131,56 @@ def test_platform_matrix_rejects_unpinned_targets(
         cloudflare._current_asset()
 
 
+@pytest.mark.parametrize("build,arch", [("win-amd64", "amd64"), ("win-arm64", "arm64"), ("win32", "x86"), ("unknown", "")])
+def test_empty_windows_machine_uses_interpreter_build(monkeypatch, tmp_path, build, arch):
+    import json
+    import platform_support
+    from runtime_status import RuntimeStatus
+
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "")
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: build)
+    assert platform_support.machine_architecture() == arch
+    if arch == "amd64":
+        assert cloudflare._current_asset().platform_id == "windows-amd64"
+    else:
+        with pytest.raises(cloudflare.CloudflaredError, match="Unsupported"):
+            cloudflare._current_asset()
+    RuntimeStatus(tmp_path, cloudflared_version="test").publish()
+    assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["platform"] == "windows-" + arch
+
+
+@pytest.mark.parametrize(
+    "system,machine,build,arch,platform_id",
+    [
+        ("Windows", "AMD64", "win32", "amd64", "windows-amd64"),
+        ("Windows", "ARM64", "win-amd64", "arm64", None),
+        ("Windows", "x86", "win-amd64", "x86", None),
+        ("Windows", "mystery", "win-amd64", "mystery", None),
+        ("Darwin", "arm64", "win32", "arm64", "darwin-arm64"),
+        ("Darwin", "x86_64", "win32", "x86_64", "darwin-amd64"),
+        ("Linux", "aarch64", "win32", "aarch64", "linux-arm64"),
+        ("Linux", "amd64", "win32", "amd64", "linux-amd64"),
+        ("Darwin", "", "win-amd64", "", None),
+        ("Linux", "", "win-amd64", "", None),
+    ],
+)
+def test_build_fallback_preserves_known_machine_and_other_os(
+    monkeypatch, system, machine, build, arch, platform_id,
+):
+    import platform_support
+
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: build)
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: system)
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: machine)
+    assert platform_support.machine_architecture() == arch
+    if platform_id is None:
+        with pytest.raises(cloudflare.CloudflaredError, match="Unsupported"):
+            cloudflare._current_asset()
+    else:
+        assert cloudflare._current_asset().platform_id == platform_id
+
+
 @pytest.mark.parametrize(
     "url",
     [
@@ -694,3 +744,135 @@ def test_stop_recovers_already_cancelled_owned_watcher(
 def test_quick_tunnel_accepts_only_a_numeric_sidecar_port(port: Any) -> None:
     with pytest.raises(cloudflare.CloudflaredError):
         cloudflare.QuickTunnel(Path("/not-used"), Path("/not-used"), port)
+
+
+def test_download_is_bounded_by_a_whole_download_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The per-read socket timeout bounds one stalled read, not a trickling
+    server; the whole download is bounded too, so the private install lock
+    (and the worker thread an async caller cannot cancel) is held at most
+    DOWNLOAD_DEADLINE_SEC."""
+    response = _FakeDownloadResponse(
+        b"12345",
+        "https://release-assets.githubusercontent.com/asset",
+    )
+    monkeypatch.setattr(cloudflare, "DOWNLOAD_DEADLINE_SEC", -1)
+    monkeypatch.setattr(
+        cloudflare.urllib.request,
+        "build_opener",
+        lambda *_args: _FakeDownloadOpener(response),
+    )
+    spec = cloudflare._AssetSpec(
+        platform_id="fixture",
+        arch="arm64",
+        filename="cloudflared",
+        kind="raw",
+        download_size=5,
+        url="https://github.com/pinned-asset",
+        archive_sha256=hashlib.sha256(b"12345").hexdigest(),
+        binary_sha256="0" * 64,
+    )
+    with pytest.raises(cloudflare.CloudflaredError, match="deadline"):
+        cloudflare._download_asset(spec, tmp_path / "asset.tgz")
+    assert not (tmp_path / "asset.tgz").exists() or (tmp_path / "asset.tgz").stat().st_size <= 5
+
+
+def _install_lock_is_free(lock_path: Path) -> bool:
+    """Probe the private install lock from a second descriptor (same process)."""
+    try:
+        fd = cloudflare.acquire_file_lock(lock_path, timeout_sec=0.0)
+    except cloudflare.PlatformSupportError:
+        return False
+    cloudflare.release_file_lock(fd)
+    return True
+
+
+def _leftover_candidates(directory: Path) -> list[str]:
+    return sorted(p.name for p in directory.iterdir() if p.name.startswith((".asset-", ".binary-")))
+
+
+def test_download_runs_outside_the_install_lock_and_promotion_under_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The install lock serializes only the atomic promote. The download (bounded
+    by DOWNLOAD_DEADLINE_SEC) used to run UNDER it, so a concurrent installer
+    waited out somebody else's whole download before it could even re-verify."""
+    payload = b"fresh-verified-binary"
+    archive_bytes = _archive(payload)
+    spec = _fixture_spec(payload, archive_bytes)
+    monkeypatch.setattr(cloudflare, "_current_asset", lambda: spec)
+    monkeypatch.setattr(cloudflare, "_verify_version", lambda *_args: None)
+    root = cloudflare._safe_state_root(tmp_path / "state")
+    target = cloudflare._installed_path(root, spec)
+    lock_path = target.parent / ".install.lock"
+    seen: list[str] = []
+
+    def download(_spec: Any, destination: Path) -> None:
+        seen.append("download:" + ("free" if _install_lock_is_free(lock_path) else "held"))
+        destination.write_bytes(archive_bytes)
+
+    real_fsync = cloudflare.fsync_directory
+
+    def fsync(directory: Path) -> None:
+        # Runs right after os.replace(candidate, target): the promote step.
+        seen.append("promote:" + ("free" if _install_lock_is_free(lock_path) else "held"))
+        real_fsync(directory)
+
+    monkeypatch.setattr(cloudflare, "_download_asset", download)
+    monkeypatch.setattr(cloudflare, "fsync_directory", fsync)
+    assert asyncio.run(cloudflare.ensure_cloudflared(tmp_path / "state")) == target
+    assert target.read_bytes() == payload
+    assert seen == ["download:free", "promote:held"]
+    assert _leftover_candidates(target.parent) == []
+    assert _install_lock_is_free(lock_path)
+
+
+def test_verified_install_promoted_during_the_download_is_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the download outside the lock, a sibling installer can promote its
+    own verified copy meanwhile: the promote re-verifies under the lock and
+    never replaces a verified install; the unused candidate is discarded."""
+    payload = b"sibling-verified-binary"
+    archive_bytes = _archive(payload)
+    spec = _fixture_spec(payload, archive_bytes)
+    monkeypatch.setattr(cloudflare, "_current_asset", lambda: spec)
+    monkeypatch.setattr(cloudflare, "_verify_version", lambda *_args: None)
+    root = cloudflare._safe_state_root(tmp_path / "state")
+    target = cloudflare._installed_path(root, spec)
+
+    def download(_spec: Any, destination: Path) -> None:
+        target.write_bytes(payload)  # the sibling's verified install lands
+        destination.write_bytes(archive_bytes)
+
+    monkeypatch.setattr(cloudflare, "_download_asset", download)
+    monkeypatch.setattr(
+        cloudflare, "fsync_directory", lambda _d: pytest.fail("a verified install must not be replaced")
+    )
+    assert asyncio.run(cloudflare.ensure_cloudflared(tmp_path / "state")) == target
+    assert target.read_bytes() == payload
+    assert _leftover_candidates(target.parent) == []
+
+
+def test_failed_download_leaves_no_candidate_and_releases_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"never-installed"
+    archive_bytes = _archive(payload)
+    spec = _fixture_spec(payload, archive_bytes)
+    monkeypatch.setattr(cloudflare, "_current_asset", lambda: spec)
+    monkeypatch.setattr(cloudflare, "_verify_version", lambda *_args: None)
+    root = cloudflare._safe_state_root(tmp_path / "state")
+    target = cloudflare._installed_path(root, spec)
+
+    def download(_spec: Any, destination: Path) -> None:
+        destination.write_bytes(b"partial")
+        raise cloudflare.CloudflaredError("Cloudflared download exceeded the deadline.")
+
+    monkeypatch.setattr(cloudflare, "_download_asset", download)
+    with pytest.raises(cloudflare.CloudflaredError, match="deadline"):
+        asyncio.run(cloudflare.ensure_cloudflared(tmp_path / "state"))
+    assert not target.exists()
+    assert _leftover_candidates(target.parent) == []
+    assert _install_lock_is_free(target.parent / ".install.lock")

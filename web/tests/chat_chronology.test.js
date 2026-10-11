@@ -2,9 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
-    insertTimelineNode,
+    chatMediaMessageKey,
+    durableChatMediaUrl,
+    isNonTerminalMediaHistoryRow,
     rawTimestampEpoch,
-} from '../modules/chat.js';
+} from '../modules/chat_activity.js';
+import { insertTimelineNode } from '../modules/chat.js';
 import { normalizeLogTs } from '../modules/log_events.js';
 
 function makeNode(id, ts = null, { height = 20, top = 100 } = {}) {
@@ -81,26 +84,17 @@ test('typing remains last and timestamp-free nodes keep append behavior', () => 
     assert.deepEqual(ids(timeline), ['dated', 'undated', 'typing']);
 });
 
-test('insertion above a scrolled-up viewport compensates scrollTop', () => {
+test('chronological insertion leaves viewport ownership to the chat boundary', () => {
     const typing = makeNode('typing', null, { height: 0 });
     const timeline = makeTimeline([makeNode('t3', 3, { height: 30, top: -10 }), typing]);
     timeline.scrollTop = 100;
-    const beforeHeight = timeline.scrollHeight;
     const result = insertTimelineNode(
         timeline,
         makeNode('t2', 2, { height: 24 }),
         typing,
     );
-    assert.equal(result.insertedAboveViewport, true);
-    assert.equal(timeline.scrollHeight - beforeHeight, 24);
-    assert.equal(timeline.scrollTop, 124);
-});
-
-test('near-bottom insertion keeps normal bottom stickiness', () => {
-    const typing = makeNode('typing', null, { height: 0 });
-    const timeline = makeTimeline([makeNode('t3', 3, { height: 30 }), typing]);
-    insertTimelineNode(timeline, makeNode('t1', 1, { height: 20 }), typing, { stickToBottom: true });
-    assert.equal(timeline.scrollTop, timeline.scrollHeight);
+    assert.equal(result.before.id, 't3');
+    assert.equal(timeline.scrollTop, 100);
 });
 
 test('raw source timestamps become numeric epoch values', () => {
@@ -115,4 +109,52 @@ test('log timestamps include the date outside today', () => {
     const older = normalizeLogTs('2025-07-18T10:00:00Z', now);
     assert.doesNotMatch(today, /2026/);
     assert.match(older, /2025/);
+});
+
+test('durable chat media accepts only the closed task-artifact URL shape', () => {
+    const good = `/api/tasks/task-1/artifacts/chat-media-${'a'.repeat(64)}.png`;
+    assert.equal(durableChatMediaUrl(good), good);
+    assert.equal(durableChatMediaUrl('/api/files/content?path=secret'), '');
+    assert.equal(durableChatMediaUrl(`/api/tasks/task-1/artifacts/${'a'.repeat(64)}.png`), '');
+});
+
+test('media replay dedup key is stable across live base64 and durable history URL', () => {
+    const common = { type: 'photo', task_id: 'task-photo', ts: '2026-08-21T00:00:00Z', caption: 'shot', mime: 'image/png' };
+    const live = { ...common, image_base64: 'aGVsbG8=' };
+    const replay = { ...common, msg_type: 'photo', download_url: `/api/tasks/t/artifacts/chat-media-${'b'.repeat(64)}.png` };
+    assert.equal(chatMediaMessageKey(live), chatMediaMessageKey(replay));
+    assert.notEqual(chatMediaMessageKey(live), chatMediaMessageKey({ ...live, task_id: 'parallel-task' }));
+});
+
+test('URL-less media history rows cannot finalize a live task card', () => {
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'photo', task_id: 'running' }), true);
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'video', task_id: 'running' }), true);
+    assert.equal(isNonTerminalMediaHistoryRow({ system_type: 'task_summary', task_id: 'done' }), false);
+});
+
+test('a timeline move keeps the caret of a focused text control instead of clearing document ranges', () => {
+    // Chromium mirrors a focused input's caret into the document Selection: the
+    // range save/restore around a node move collapsed a typed draft's selection.
+    const calls = [];
+    const input = {
+        tagName: 'INPUT', selectionStart: 2, selectionEnd: 8, selectionDirection: 'forward',
+        setSelectionRange(start, end, direction) { calls.push(['set', start, end, direction]); this.selectionStart = start; this.selectionEnd = end; },
+        focus() { calls.push(['focus']); },
+    };
+    const selection = {
+        rangeCount: 1,
+        getRangeAt: () => ({ startContainer: {}, startOffset: 0, endContainer: {}, endOffset: 0 }),
+        removeAllRanges() { calls.push(['removeAllRanges']); input.selectionStart = input.selectionEnd = 0; },
+        addRange() { calls.push(['addRange']); },
+    };
+    const typing = makeNode('typing');
+    const timeline = makeTimeline([makeNode('t3', 3), typing]);
+    timeline.ownerDocument = { activeElement: input, getSelection: () => selection, createRange: () => ({ setStart() {}, setEnd() {} }) };
+    const moving = makeNode('t1', 1);
+    moving.contains = () => false;
+    insertTimelineNode(timeline, moving, typing);
+    assert.deepEqual(ids(timeline), ['t1', 't3', 'typing']);
+    assert.ok(!calls.some(([name]) => name === 'removeAllRanges'), calls);
+    assert.deepEqual([input.selectionStart, input.selectionEnd], [2, 8]);
+    assert.deepEqual(calls, [['set', 2, 8, 'forward']]);
 });

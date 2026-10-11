@@ -12,6 +12,7 @@ const assetNames = [
   "evolution.png",
   "game-demo.png",
   "icon_1024.png",
+  "install-macos.png",
   "og-preview.png",
   "skill-hub.png",
   "social-preview.png",

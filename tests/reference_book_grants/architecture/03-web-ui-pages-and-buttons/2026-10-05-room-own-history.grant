@@ -1,0 +1,2 @@
+411
+Chat history now reads each room's own pages and reopens every room at its newest message: the paging, reading-position and history-control descriptions say so in place of the removed bookmark restore.

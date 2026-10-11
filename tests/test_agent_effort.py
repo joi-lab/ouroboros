@@ -73,10 +73,14 @@ def test_review_effort_configurable():
 # Consciousness
 # ---------------------------------------------------------------------------
 
-def test_consciousness_effort_default_is_high():
-    """Default consciousness effort is high-horizon, not cheap helper mode."""
+def test_consciousness_effort_default_inherits_task_effort():
+    """An empty consciousness slot is Main's effort: a wake-up is an ordinary Main turn."""
     with patch.dict(os.environ, {}, clear=True):
-        assert resolve_effort("consciousness") == "high"
+        assert resolve_effort("consciousness") == resolve_effort("task")
+    with patch.dict(os.environ, {"OUROBOROS_EFFORT_TASK": "xhigh"}, clear=True):
+        assert resolve_effort("consciousness") == "xhigh"
+    with patch.dict(os.environ, {"OUROBOROS_EFFORT_TASK": "xhigh", "OUROBOROS_EFFORT_CONSCIOUSNESS": "bogus"}, clear=True):
+        assert resolve_effort("consciousness") == "xhigh"  # an invalid value is treated as empty
 
 
 def test_consciousness_effort_configurable():
@@ -94,4 +98,4 @@ def test_task_type_is_case_insensitive():
     with patch.dict(os.environ, {}, clear=True):
         assert resolve_effort("EVOLUTION") == "high"
         assert resolve_effort("Review") == "high"
-        assert resolve_effort("CONSCIOUSNESS") == "high"
+        assert resolve_effort("CONSCIOUSNESS") == resolve_effort("task")

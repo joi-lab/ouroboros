@@ -1,20 +1,16 @@
 """Shared pure synthesis and normalization for reviewer outputs.
 
-Commit-review claims use the optional LLM deduplicator; plan-review helpers below
-normalize its existing handoff artifact and exact follow-up contract without I/O.
+Commit-review claims use the optional LLM deduplicator; the plan-review engine
+(``tools/plan_review.py`` + ``plan_spec``/``plan_packet``) keeps only the shared
+control-line prefix, the mixed-window input-cap helpers, the cache-friendly
+message pair and the usage-emission shim here.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
-from datetime import timedelta
-from hashlib import sha256
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
-
-if TYPE_CHECKING:
-    from ouroboros.tools.plan_review import _PlanReviewRequest
+from typing import Any, Dict, List, Optional
 
 from ouroboros.triad_review import REVIEW_JSON_MATRIX_CONTRACT, extract_json_array
 from ouroboros.tools.review_helpers import (
@@ -32,8 +28,9 @@ _MIN_CLAIMS_FOR_SYNTHESIS = 2
 
 _SYNTHESIS_PROMPT_TEMPLATE = (
     "You are a code-review claim synthesizer. You receive a list of raw findings\n"
-    "from multiple independent reviewers (triad diff-reviewers + one Atlas-backed\n"
-    "scope reviewer). Your job is to produce a deduplicated canonical list.\n"
+    "from multiple independent reviewers (triad diff-reviewers + the\n"
+    "whole-repository scope reviewer). Your job is to produce a deduplicated\n"
+    "canonical list.\n"
     "\n"
     "## Rules\n"
     "\n"
@@ -196,6 +193,8 @@ def synthesize_to_canonical_issues(
     try:
         raw_response = _call_synthesis_llm(prompt, ctx=ctx)
     except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         log.warning("review_synthesis: LLM call raised exception: %s — using original findings", exc)
         return critical_findings
 
@@ -230,6 +229,7 @@ def _call_synthesis_llm(prompt: str, *, ctx: Any = None) -> Optional[str]:
         msg, usage = client.chat(
             messages=[{"role": "user", "content": prompt}],
             model=model,
+            model_role="light",
             max_tokens=16384,
             reasoning_effort="low",
             no_proxy=True,
@@ -262,6 +262,8 @@ def _call_synthesis_llm(prompt: str, *, ctx: Any = None) -> Optional[str]:
         return str(content) if content else None
 
     except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         log.warning("review_synthesis: LLM call failed: %s", exc)
         return None
 
@@ -275,206 +277,7 @@ def _has_billable_usage(usage: Any) -> bool:
     )
 
 
-# Pure plan-review contract helpers live here so plan_review.py remains the single
-# state/LLM orchestrator without crossing the repository's module-size gate.
-_PLAN_SCOPE_LIST_FIELDS = ("in_scope", "invariants", "non_goals", "rejected_expansions")
 PLAN_REVIEW_CONTROL_PREFIX = "PLAN_REVIEW_CONTROL_JSON: "
-
-
-def normalize_plan_scope(raw: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if raw is None:
-        raw = {}
-    if not isinstance(raw, dict):
-        raise ValueError("scope must be an object")
-    allowed = set(_PLAN_SCOPE_LIST_FIELDS) | {"selected_seam"}
-    unknown = sorted(str(key) for key in raw if key not in allowed)
-    if unknown:
-        raise ValueError(f"unknown scope fields: {', '.join(unknown)}")
-    result: Dict[str, Any] = {key: [] for key in _PLAN_SCOPE_LIST_FIELDS}
-    for key in _PLAN_SCOPE_LIST_FIELDS:
-        value = raw.get(key)
-        if value is None:
-            continue
-        if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-            raise ValueError(f"scope.{key} must be an array of strings")
-        items = [item.strip() for item in value if item.strip()]
-        result[key] = items
-    seam = raw.get("selected_seam")
-    if seam is not None and not isinstance(seam, str):
-        raise ValueError("scope.selected_seam must be a string")
-    result["selected_seam"] = seam.strip() if isinstance(seam, str) else ""
-    return result
-
-
-def plan_review_fingerprint(
-    *,
-    plan: str,
-    goal: str,
-    files_to_touch: List[str],
-    context_level: str,
-    context_notes: str,
-    plan_class: str = "",
-    scope: Optional[Dict[str, Any]] = None,
-    include_tests: bool = False,
-) -> str:
-    payload: Dict[str, Any] = {
-        "plan": plan,
-        "goal": goal,
-        "files_to_touch": list(files_to_touch or []),
-        "context_level": context_level,
-        "context_notes": context_notes or "",
-        "scope": normalize_plan_scope(scope),
-        "include_tests": bool(include_tests),
-    }
-    if str(plan_class or "").strip():
-        payload["plan_class"] = str(plan_class).strip()
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    return sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def plan_text_fingerprint(plan: str) -> str:
-    return sha256(plan.encode("utf-8")).hexdigest()
-
-
-# Review identity is the fingerprint of the AGENT-PASSED envelope only. Component
-# hashes exist purely to DIAGNOSE a mismatch, so they may carry host-resolved values
-# (resolved plan_class / context_level) that must never enter the binding identity.
-_PLAN_COMPONENT_KEYS = (
-    "goal", "files_to_touch", "context_notes", "scope",
-    "include_tests", "plan_class", "context_level",
-)
-
-
-def plan_review_component_hashes(request: Any) -> Dict[str, str]:
-    """Per-field hashes of one plan-review envelope, for ENVELOPE_MISMATCH detail."""
-    hashes: Dict[str, str] = {}
-    for key in _PLAN_COMPONENT_KEYS:
-        value = getattr(request, key, None)
-        if key == "scope":
-            value = normalize_plan_scope(value if isinstance(value, dict) else None)
-        encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
-        hashes[key] = sha256(encoded.encode("utf-8")).hexdigest()[:16]
-    return hashes
-
-
-def plan_envelope_mismatch_fields(stored: Any, submitted: Any) -> List[str]:
-    """Component names that differ between two envelopes.
-
-    Only components present in BOTH maps are compared, so a wave stored before per-slot
-    hashes existed reports nothing. There is no "omitted vs explicitly empty" axis to
-    honour: ``_handle_plan_task`` coerces every omitted optional field to ``""``/``[]``/
-    ``False`` before it is hashed OR fingerprinted, so an omission and an explicit empty
-    are the same envelope — and both already changed the request fingerprint."""
-    stored_map = dict(stored or {})
-    submitted_map = dict(submitted or {})
-    return [
-        key for key in _PLAN_COMPONENT_KEYS
-        if key in stored_map and key in submitted_map
-        and stored_map[key] != submitted_map[key]
-    ]
-
-
-def plan_envelope_mismatch_note(wave: Any, request: Any) -> str:
-    """Free ENVELOPE_MISMATCH warning when a disposition BOUND a drifted envelope.
-
-    Since the binding identity is the agent envelope's own fingerprint and a disposition
-    may only close a review of the SAME fingerprint (``bindable_claimed_wave``), a bound
-    wave can differ only in HOST-RESOLVED components (resolved ``plan_class`` /
-    ``context_level``), which are diagnosed here and deliberately excluded from identity.
-    Agent-authored drift such as ``files_to_touch`` is no longer bindable at all — it is
-    rejected by ``unbindable_disposition_error``, which reports the same field list."""
-    if request is None:
-        return ""
-    drifted = plan_envelope_mismatch_fields(
-        (wave or {}).get("component_hashes"), plan_review_component_hashes(request),
-    )
-    if not drifted:
-        return ""
-    return (
-        "NOTE: ENVELOPE_MISMATCH on: " + ", ".join(drifted) + ". Your review_disposition "
-        "closed the review it named, but that review saw a DIFFERENT envelope for these "
-        "components, so the findings you dispositioned do not cover what changed.\n\n"
-    )
-
-
-def bindable_claimed_wave(
-    state: Any, disposition: Any, plan_text_hash: str, request_fingerprint: str,
-) -> Optional[Dict[str, Any]]:
-    """The wave a disposition HONESTLY names, or None.
-
-    Binds only when all four hold: the claimed ``review_fingerprint`` equals the
-    SUBMITTED envelope's fingerprint, it is the state's latest review fingerprint,
-    that wave's review is an OPEN ``REVIEW_REQUIRED``, and the submitted plan text
-    still hashes to the stored ``plan_text_hash``.
-
-    The envelope-equality condition is the P3 plan gate itself. ``files_to_touch`` is
-    exported in the tool schema as PART OF THE REVIEW IDENTITY ("a review_disposition
-    can only close a review submitted with the SAME list"), and the binding fingerprint
-    is a pure function of the AGENT's envelope, so a claimed fingerprint that differs
-    from the submitted one means the reviewers never saw what is now being planned.
-    Binding it with a warning let a review of ``[a.py]`` authorise ``[a.py, b.py,
-    c.py]`` — stale evidence closing materially expanded scope. A mismatch is therefore
-    UNBINDABLE: the caller fails fast (no wave, no money) and the always-available
-    escape is to omit the disposition and run a real review of the new envelope."""
-    claimed = str((disposition or {}).get("review_fingerprint") or "").strip()
-    if not claimed or not isinstance(state, dict):
-        return None
-    if claimed != str(request_fingerprint or "").strip():
-        return None
-    if str(state.get("latest_review_fingerprint") or "") != claimed:
-        return None
-    for wave in state.get("waves") or []:
-        if str(wave.get("request_fingerprint") or "") != claimed:
-            continue
-        review = wave.get("review") if isinstance(wave.get("review"), dict) else {}
-        if str(review.get("aggregate_signal") or "") != "REVIEW_REQUIRED" or bool(review.get("closed")):
-            return None
-        if not plan_text_hash or str(wave.get("plan_text_hash") or "") != str(plan_text_hash):
-            return None
-        return dict(wave)
-    return None
-
-
-def unbindable_disposition_error(
-    state: Any, fingerprint: str, disposition: Any, plan_text_hash: str = "",
-    request: Any = None,
-) -> str:
-    """Fail-fast text for a non-empty disposition that can close nothing.
-
-    Discarding it silently and paying for a whole scout+reviewer wave hid the real
-    cause from the agent (v6.65.0/1 chose the discard to un-wedge submissions; the
-    wedge escape is preserved EXPLICITLY in this message instead).
-
-    The submitted envelope comes from the CALLER's ``request``: a disposition never
-    carries component hashes, so reading them off it made the ENVELOPE_MISMATCH clause
-    unreachable and the wave's stored hashes write-only data."""
-    claimed = str((disposition or {}).get("review_fingerprint") or "").strip() or "(none)"
-    latest = str((state or {}).get("latest_review_fingerprint") or "") or "(none)"
-    stored_plan_hash = ""
-    for wave in (state or {}).get("waves") or []:
-        if str(wave.get("request_fingerprint") or "") == latest:
-            stored_plan_hash = str(wave.get("plan_text_hash") or "")
-            break
-    plan_matches = bool(plan_text_hash) and stored_plan_hash == str(plan_text_hash)
-    mismatches = plan_envelope_mismatch_fields(
-        (next((w for w in (state or {}).get("waves") or []
-               if str(w.get("request_fingerprint") or "") == latest), {}) or {}).get("component_hashes"),
-        plan_review_component_hashes(request) if request is not None else None,
-    )
-    return (
-        "ERROR: PLAN_REVIEW_DISPOSITION_UNBINDABLE: your review_disposition names "
-        f"review_fingerprint={claimed}, but that does not name an OPEN REVIEW_REQUIRED "
-        "review OF THE ENVELOPE YOU JUST SUBMITTED "
-        f"(latest stored review fingerprint={latest}; submitted request fingerprint="
-        f"{str(fingerprint or '') or '(none)'}; plan text "
-        f"{'matches' if plan_matches else 'does NOT match'} the stored plan)."
-        + (f" ENVELOPE_MISMATCH on: {', '.join(mismatches)}." if mismatches else "")
-        + " Nothing was reviewed and no wave was launched, so no money was spent. Two "
-        "ways forward: (1) OMIT review_disposition entirely — that is ALWAYS available "
-        "and runs a real review of this plan; or (2) re-submit the exact plan and "
-        "envelope that produced the REVIEW_REQUIRED result you are trying to close, "
-        "with its own review_fingerprint."
-    )
 
 
 def quorum_input_token_limit(models: Any, slot_limits: Any) -> int:
@@ -484,8 +287,8 @@ def quorum_input_token_limit(models: Any, slot_limits: Any) -> int:
     The global minimum let the SMALLEST window dictate the Atlas for everyone — with caps
     [545K, 745K, 745K] and quorum 2 it discarded ~200K of context the two large reviewers could
     have read, and refused an irreducible 600K prompt that those two would have accepted. Here the
-    small slot drops OUT of the quorum instead of shrinking it: ``plan_slot_fit`` then records it as
-    a typed ``preflight_oversize`` result, so a slot that cannot fit is REPORTED as not participating,
+    small slot drops OUT of the quorum instead of shrinking it: the caller records it as a typed
+    ``preflight_oversize`` result, so a slot that cannot fit is REPORTED as not participating,
     never silently ignored. Quorum is counted over the CONFIGURED slots, so an unavailable or
     uncalibrated slot reads 0 and simply cannot be part of the quorum that justifies a bigger prompt."""
     from ouroboros.config import adaptive_quorum
@@ -497,765 +300,51 @@ def quorum_input_token_limit(models: Any, slot_limits: Any) -> int:
     return caps[min(adaptive_quorum(len(caps)), len(caps)) - 1]
 
 
-def plan_slot_fit(models: Any, slot_limits: Any, estimated_tokens: int) -> tuple:
-    """``(callable_models, oversize_records, error)`` for one shared plan prompt.
-
-    A slot whose calibrated cap the shared prompt exceeds gets a FREE deterministic
-    ``preflight_oversize`` record instead of a call with a guaranteed provider 400.
-    Fewer callable slots than the review quorum is a LOUD typed degradation — never a
-    silent absence of review."""
-    from ouroboros.config import adaptive_quorum
-
-    limits = dict(slot_limits or {})
-    slots = [str(model) for model in (models or [])]
-    callable_models = [m for m in slots if int(estimated_tokens or 0) <= int(limits.get(m, 0) or 0)]
-    oversize = [
-        {
-            "model": m, "request_model": m, "text": "",
-            "error": (
-                f"preflight_oversize: assembled prompt {int(estimated_tokens or 0):,} estimated "
-                f"tokens exceeds this slot's calibrated input cap {int(limits.get(m, 0) or 0):,}"
-            ),
-            "prompt_ref": {}, "response_ref": {},
-            "tokens_in": 0, "tokens_out": 0, "cost": 0.0,
-        }
-        for m in slots if m not in callable_models
-    ]
-    error = ""
-    if slots and len(callable_models) < adaptive_quorum(len(slots)):
-        error = (
-            "⚠️ PLAN_REVIEW_DEGRADED_PREFLIGHT_OVERSIZE: the assembled prompt "
-            f"({int(estimated_tokens or 0):,} estimated tokens) exceeds the calibrated input "
-            "cap of too many reviewer slots ("
-            + ", ".join(f"{m}<={int(limits.get(m, 0) or 0):,}" for m in slots)
-            + "), so fewer than the review quorum remain callable and NO reviewer was "
-            "called. Reduce files_to_touch, choose a smaller context_level, or split the plan."
-        )
-    return callable_models, oversize, error
-
-
 def per_slot_input_token_limits(
     models: Any,
     *,
-    context_window: int,
+    context_window: Optional[int] = None,
     output_reserve: int,
     tokenizer_margin: int,
+    slots: Any = None,
 ) -> Dict[str, int]:
-    """Per-slot calibrated input caps for a prompt fanned across mixed families."""
+    """Per-slot calibrated input caps for a prompt fanned across mixed families.
+
+    ``context_window=None`` (the default) resolves each slot's REAL window from
+    Capability Evidence and scales the reserves to it, so a sub-1M slot gets a
+    fit-sized pack instead of a prompt sized for a window it does not have.
+    An explicit window stays honoured for callers that pin one deliberately.
+    Frozen ``slots`` return caps keyed by stable slot ID; legacy model-only
+    callers retain model keys. Equal models may have different account limits."""
+    from ouroboros.reviewer_window import reviewer_context_window, reviewer_window_binding, window_scaled_reserves
     from ouroboros.tools.review_helpers import calibrated_input_token_limit
 
-    return {
-        str(model): calibrated_input_token_limit(
+    limits: Dict[str, int] = {}
+    models = list(models or [])
+    rows = list(slots) if slots is not None else None
+    if rows is not None and len(rows) != len(models):
+        raise ValueError("Reviewer capacity rows must align with their frozen models")
+    for index, model in enumerate(models):
+        row = rows[index] if rows is not None else None
+        binding = reviewer_window_binding(row) if row is not None else {}
+        key = binding.get("model_role", "").removeprefix("reviewer:") if row is not None else str(model)
+        if not key or (key in limits and row is not None):
+            raise ValueError("Reviewer capacity requires unique stable slot IDs")
+        window = (
+            int(context_window)
+            if context_window is not None
+            else reviewer_context_window(str(model), **binding)
+        )
+        slot_output_reserve, slot_margin = window_scaled_reserves(
+            window, output_reserve=output_reserve, tokenizer_margin=tokenizer_margin,
+        )
+        limits[key] = max(0, calibrated_input_token_limit(
             str(model),
-            context_window=context_window,
-            output_reserve=output_reserve,
-            tokenizer_margin=tokenizer_margin,
-        )
-        for model in (models or [])
-    }
-
-
-def parse_plan_review_signal(text: str) -> str:
-    matches = re.findall(
-        r"^\s*AGGREGATE\s*:\s*(GREEN|REVIEW_REQUIRED|REVISE_PLAN)\s*$",
-        text,
-        re.IGNORECASE | re.MULTILINE,
-    )
-    return matches[0].upper() if len(matches) == 1 else ""
-
-
-def _strict_plan_findings_block(text: str) -> tuple[Optional[List[Any]], str]:
-    """Parse the one required JSON block immediately before the final verdict."""
-    markers = list(re.finditer(r"(?m)^[ \t]*PLAN_FINDINGS_JSON:[ \t]*", text))
-    if len(markers) != 1:
-        return None, (
-            "PLAN_FINDINGS_JSON is missing"
-            if not markers
-            else "PLAN_FINDINGS_JSON appears more than once"
-        )
-    aggregates = list(re.finditer(
-        r"(?im)^[ \t]*AGGREGATE[ \t]*:[ \t]*(GREEN|REVIEW_REQUIRED|REVISE_PLAN)[ \t]*$",
-        text,
-    ))
-    if len(aggregates) != 1:
-        return None, "the response must contain exactly one AGGREGATE verdict"
-    marker, aggregate = markers[0], aggregates[0]
-    if marker.start() > aggregate.start():
-        return None, "PLAN_FINDINGS_JSON must precede AGGREGATE"
-    if text[aggregate.end():].strip():
-        return None, "AGGREGATE must be the final non-empty line"
-    payload = text[marker.end():aggregate.start()].strip()
-    try:
-        parsed = json.loads(payload)
-    except (TypeError, ValueError):
-        return None, "PLAN_FINDINGS_JSON is not a valid standalone JSON array"
-    if not isinstance(parsed, list):
-        return None, "PLAN_FINDINGS_JSON is not a JSON array"
-    return parsed, ""
-
-
-def addressable_plan_findings(
-    result: Dict[str, Any], *, reviewer_index: int, signal: str
-) -> tuple[List[Dict[str, Any]], str]:
-    model = str(result.get("model") or result.get("request_model") or f"Model {reviewer_index}")
-    text = str(result.get("text") or "")
-    if result.get("error") or not text.strip() or not signal:
-        return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:reviewer-unavailable",
-            "reviewer_slot": reviewer_index,
-            "model": model,
-            "level": "RISK",
-            "summary": "Reviewer failed to return a usable, parseable planning verdict.",
-            "recommendation": "Disposition this disclosed evidence gap explicitly before proceeding.",
-        }], "reviewer_unavailable")
-    parsed, parse_error = _strict_plan_findings_block(text)
-    findings: List[Dict[str, Any]] = []
-    local_ids: set[str] = set()
-    if isinstance(parsed, list):
-        for index, item in enumerate(parsed):
-            if not isinstance(item, dict):
-                parse_error = f"finding {index} is not an object"
-                break
-            local_id = str(item.get("id") or "").strip()
-            level = str(item.get("level") or "").strip().upper()
-            summary = str(item.get("summary") or "").strip()
-            recommendation = str(item.get("recommendation") or "").strip()
-            if (not local_id or local_id in local_ids or level not in {"RISK", "FAIL"}
-                    or not summary or not recommendation):
-                parse_error = f"finding {index} has invalid id/level/summary/recommendation"
-                break
-            local_ids.add(local_id)
-            findings.append({
-                "finding_id": f"plan-slot-{reviewer_index}:{local_id}",
-                "reviewer_slot": reviewer_index,
-                "model": model,
-                "level": level,
-                "summary": summary,
-                "recommendation": recommendation,
-            })
-    if not parse_error and findings:
-        return findings, "green_with_findings" if signal == "GREEN" else ""
-    if not parse_error and parsed == [] and signal == "GREEN":
-        return [], ""
-    if signal in {"REVIEW_REQUIRED", "REVISE_PLAN"}:
-        reason = parse_error or "PLAN_FINDINGS_JSON contains no addressable finding"
-        return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:reviewer-response",
-            "reviewer_slot": reviewer_index,
-            "model": model,
-            "level": "FAIL" if signal == "REVISE_PLAN" else "RISK",
-            "summary": f"Reviewer declared {signal}, but {reason}.",
-            "recommendation": "Disposition the full reviewer response as one fail-closed bundle.",
-        }], reason)
-    if parse_error:
-        return ([{
-            "finding_id": f"plan-slot-{reviewer_index}:findings-contract",
-            "reviewer_slot": reviewer_index,
-            "model": model,
-            "level": "RISK",
-            "summary": f"Reviewer findings projection is malformed: {parse_error}.",
-            "recommendation": "Treat the reviewer as degraded and disposition the evidence gap.",
-        }], parse_error)
-    return [], ""
-
-
-def summarize_plan_review_results(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    signals: List[str] = []
-    findings: List[Dict[str, Any]] = []
-    projection_errors: Dict[int, str] = {}
-    for index, result in enumerate(raw_results, start=1):
-        text = str(result.get("text") or "")
-        signal = "DEGRADED" if result.get("error") or not text.strip() else (
-            parse_plan_review_signal(text) or "DEGRADED"
-        )
-        projected, error = addressable_plan_findings(
-            result, reviewer_index=index, signal="" if signal == "DEGRADED" else signal
-        )
-        if error:
-            projection_errors[index] = error
-            if signal == "GREEN":
-                signal = "DEGRADED"
-        findings.extend(projected)
-        signals.append(signal)
-    counts = {name: signals.count(name) for name in (
-        "REVISE_PLAN", "REVIEW_REQUIRED", "DEGRADED", "GREEN"
-    )}
-    from ouroboros.config import adaptive_quorum
-    if signals and counts["REVISE_PLAN"] >= adaptive_quorum(len(signals)):
-        aggregate = "REVISE_PLAN"
-    elif counts["REVISE_PLAN"] == 1 or counts["REVIEW_REQUIRED"] or counts["DEGRADED"]:
-        aggregate = "REVIEW_REQUIRED"
-    elif signals and counts["GREEN"] == len(signals):
-        aggregate = "GREEN"
-    else:
-        aggregate = "REVIEW_REQUIRED"
-    return {
-        "signals": signals,
-        "findings": findings,
-        "projection_errors": projection_errors,
-        "aggregate_signal": aggregate,
-        "revise_count": counts["REVISE_PLAN"],
-        "review_required_count": counts["REVIEW_REQUIRED"],
-        "degraded_count": counts["DEGRADED"],
-        "green_count": counts["GREEN"],
-    }
-
-
-def _quote_public_plan_review_control_lines(text: str) -> str:
-    """Keep reviewer prose visible without impersonating the host control footer."""
-    return "".join(
-        "> " + line if line.startswith(PLAN_REVIEW_CONTROL_PREFIX) else line
-        for line in str(text or "").splitlines(keepends=True)
-    )
-
-
-def format_plan_review_output(
-    raw_results: List[Dict[str, Any]], models: List[str], goal: str, estimated_tokens: int
-) -> str:
-    summary = summarize_plan_review_results(raw_results)
-    lines = [
-        "## Plan Review Results", "", f"**Goal:** {goal}",
-        f"**Models:** {len(models)} parallel reviewers",
-        f"**Prompt size:** ~{estimated_tokens:,} tokens per reviewer", "", "---", "",
-    ]
-    signals = list(summary["signals"])
-    for index, result in enumerate(raw_results, start=1):
-        model = result.get("model") or result.get("request_model") or f"Model {index}"
-        lines.extend([f"### Reviewer {index}: {model}", ""])
-        if result.get("error"):
-            lines.extend([f"⚠️ **ERROR:** {result['error']}", "", "---", ""])
-            continue
-        text = str(result.get("text") or "").strip()
-        if not text:
-            lines.extend(["⚠️ **ERROR:** Empty response from reviewer.", "", "---", ""])
-            continue
-        lines.extend([text, ""])
-        error = summary["projection_errors"].get(index)
-        if error:
-            lines.extend([
-                f"⚠️ **FINDINGS CONTRACT:** {error}; the response is represented by a "
-                "fail-closed addressable finding.", "",
-            ])
-        lines.extend(["---", ""])
-    if not signals:
-        lines.extend([
-            "## Aggregate Signal", "", "❓ **REVIEW_REQUIRED**", "",
-            "No reviewer responses were collected (empty reviewer list). Treat as "
-            "REVIEW_REQUIRED — re-run plan_task with at least one reviewer configured.",
-        ])
-        return _quote_public_plan_review_control_lines("\n".join(lines))
-    aggregate = str(summary["aggregate_signal"])
-    emoji = {"GREEN": "✅", "REVIEW_REQUIRED": "⚠️", "REVISE_PLAN": "❌"}.get(aggregate, "❓")
-    lines.extend([
-        "## Aggregate Signal", "", f"{emoji} **{aggregate}**", "",
-        f"Per-reviewer signals: REVISE_PLAN={summary['revise_count']}, "
-        f"REVIEW_REQUIRED={summary['review_required_count']}, GREEN={summary['green_count']}, "
-        f"DEGRADED={summary['degraded_count']}.",
-    ])
-    if len(signals) < 2:
-        lines.append(
-            "⚠️ single_reviewer_no_diversity: this plan review ran with a single reviewer "
-            "slot — no cross-model diversity. The signal is honored but is structurally "
-            "lower-confidence; configure ≥2 reviewer slots for a diverse plan review."
-        )
-    lines.append("")
-    if aggregate == "GREEN":
-        lines.append("All reviewers converged on GREEN. Read every reviewer's PROPOSALS section and proceed with implementation.")
-    elif aggregate == "REVIEW_REQUIRED":
-        reasons = []
-        if summary["revise_count"] == 1:
-            reasons.append("one reviewer dissented with REVISE_PLAN; read the dissenting response in full")
-        if summary["review_required_count"]:
-            reasons.append(f"{summary['review_required_count']} reviewer(s) raised RISKs or concerns")
-        if summary["degraded_count"]:
-            reasons.append(f"{summary['degraded_count']} reviewer(s) returned no parseable verdict")
-        if reasons:
-            lines.append("Reason: " + "; ".join(reasons) + ".")
-        lines.append("Read every full response and disposition the addressable findings before coding.")
-    else:
-        lines.append(
-            f"{summary['revise_count']} reviewer(s) independently flagged REVISE_PLAN; "
-            "change the plan before writing code."
-        )
-    lines.extend([
-        "", "## Findings Requiring Disposition", "", "```json",
-        json.dumps(summary["findings"], ensure_ascii=False, indent=2, default=str), "```",
-    ])
-    return _quote_public_plan_review_control_lines("\n".join(lines))
-
-
-def render_plan_review_result(review: Dict[str, Any], *, cached: bool = False) -> str:
-    aggregate = str(review.get("aggregate_signal") or "REVIEW_REQUIRED")
-    closed = bool(review.get("closed"))
-    if aggregate == "GREEN":
-        explanation = "The exact plan fingerprint was accepted by the reviewer panel."
-    elif aggregate == "REVIEW_REQUIRED" and closed:
-        explanation = "Every finding was dispositioned for this unchanged fingerprint; no reviewer was called."
-    elif aggregate == "REVISE_PLAN":
-        explanation = "The plan text must change, producing a new fingerprint and review."
-    else:
-        explanation = "Disposition every finding id before implementation; do not rerun reviewers."
-    findings = [item for item in (review.get("findings") or []) if isinstance(item, dict)]
-    return "\n".join([
-        "## Plan Review Results", "",
-        f"**Plan fingerprint:** `{review.get('request_fingerprint') or ''}`",
-        f"**Cached exact review:** {bool(cached)}", "",
-        "## Findings Requiring Disposition", "", "```json",
-        json.dumps(findings, ensure_ascii=False, indent=2, default=str), "```", "",
-        "## Aggregate Signal", "", f"**{aggregate}**", "", explanation, "",
-        PLAN_REVIEW_CONTROL_PREFIX + json.dumps(
-            {"outcome": aggregate, "closed": closed}, separators=(",", ":")
-        ),
-        f"PLAN_REVIEW_OUTCOME: {aggregate}", f"AGGREGATE: {aggregate}",
-    ])
-
-
-VACUOUS_DISPOSITION_NOTE = (
-    "\n\nNOTE: an empty review_disposition was ignored as absent. Omit the field "
-    "entirely unless you are closing the immediately preceding REVIEW_REQUIRED "
-    "result for this exact unchanged plan."
-)
-
-def vacuous_review_disposition(value: object) -> bool:
-    """True for a schema-shaped but semantically empty disposition: models routinely
-    fill an optional object param with an empty default instead of omitting it. An
-    empty disposition has no closing power by construction, so it means "absent" —
-    never a stale-disposition failure. A populated-but-wrong disposition (non-empty
-    fingerprint or items) is NOT vacuous and keeps failing closed in the validator."""
-    if not isinstance(value, dict):
-        return False
-    if set(value) - {"review_fingerprint", "items"}:
-        return False
-    if str(value.get("review_fingerprint") or "").strip():
-        return False
-    items = value.get("items")
-    return items is None or items == []
-
-
-def validate_plan_review_disposition(
-    review: Dict[str, Any], fingerprint: str, disposition: Any
-) -> tuple[Optional[Dict[str, Any]], str]:
-    invalid = "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: "
-    if not isinstance(disposition, dict):
-        return None, invalid + "review_disposition must be an object"
-    unknown = sorted(str(key) for key in disposition if key not in {"review_fingerprint", "items"})
-    if unknown:
-        return None, invalid + f"unknown fields: {', '.join(unknown)}"
-    expected_fp = str(review.get("request_fingerprint") or "")
-    if str(disposition.get("review_fingerprint") or "").strip() != expected_fp or fingerprint != expected_fp:
-        return None, (
-            "ERROR: PLAN_REVIEW_DISPOSITION_STALE: review_disposition must name the "
-            "exact immediately preceding plan fingerprint."
-        )
-    aggregate = str(review.get("aggregate_signal") or "")
-    if aggregate == "REVISE_PLAN":
-        return None, "ERROR: PLAN_REVIEW_REVISION_REQUIRED: change the plan text before a fresh review."
-    if aggregate == "GREEN":
-        return None, invalid + "the prior result is already GREEN"
-    if aggregate != "REVIEW_REQUIRED":
-        return None, invalid + "the prior aggregate is missing or invalid"
-    raw_items = disposition.get("items")
-    if not isinstance(raw_items, list):
-        return None, invalid + "items must be an array"
-    expected = [
-        str(item.get("finding_id") or "") for item in (review.get("findings") or [])
-        if isinstance(item, dict) and str(item.get("finding_id") or "")
-    ]
-    if not expected:
-        return None, invalid + "the prior REVIEW_REQUIRED result has no addressable findings"
-    normalized = []
-    seen: set[str] = set()
-    allowed = {"finding_id", "decision", "rationale", "plan_revision"}
-    for index, item in enumerate(raw_items):
-        if not isinstance(item, dict):
-            return None, invalid + f"items[{index}] must be an object"
-        item_unknown = sorted(str(key) for key in item if key not in allowed)
-        if item_unknown:
-            return None, invalid + f"items[{index}] has unknown fields: {', '.join(item_unknown)}"
-        finding_id = str(item.get("finding_id") or "").strip()
-        decision = str(item.get("decision") or "").strip().lower()
-        rationale = str(item.get("rationale") or "").strip()
-        revision = str(item.get("plan_revision") or "").strip()
-        if not finding_id or finding_id in seen:
-            return None, invalid + f"items[{index}].finding_id is blank or duplicated"
-        if finding_id not in expected:
-            return None, invalid + f"unknown finding_id {finding_id!r}"
-        if decision not in {"accept", "reject", "defer"}:
-            return None, invalid + f"items[{index}].decision must be accept, reject, or defer"
-        if not rationale:
-            return None, invalid + f"items[{index}].rationale is required"
-        if decision == "accept" and not revision:
-            return None, invalid + f"items[{index}].plan_revision is required when accepting a finding"
-        seen.add(finding_id)
-        normalized.append({
-            "finding_id": finding_id,
-            "decision": decision,
-            "rationale": rationale,
-            "plan_revision": revision,
-        })
-    missing = [finding_id for finding_id in expected if finding_id not in seen]
-    if missing:
-        return None, invalid + "missing finding ids: " + ", ".join(missing)
-    updated = dict(review)
-    updated["disposition"] = {
-        "review_fingerprint": expected_fp,
-        "items": normalized,
-    }
-    updated["closed"] = True
-    return updated, ""
-
-
-def build_plan_review_system_prompt(
-    checklist: str,
-    bible_text: str,
-    dev_md: str,
-    arch_md: str,
-    checklists_md: str = "",
-    context_level: str = "",
-    plan_class: str = "self_mod",
-) -> str:
-    """Build the pure, reusable plan-review system prompt."""
-    atlas_note = (
-        f"Repository evidence is bounded by context_level={context_level!r}: "
-        "`minimal` includes governance docs, the plan, and touched-file snapshots "
-        "without a generated Atlas; `localized`, `broad`, and `constitutional` add "
-        "progressively larger generated Atlas context. Use only evidence actually present."
-    )
-    if plan_class and plan_class != "self_mod":
-        atlas_note += (
-            f"\nThis plan is classified plan_class={plan_class!r} (NOT a self-modification "
-            "of the Ouroboros system repo): ARCHITECTURE.md is provided as a lossless "
-            "navigation map (sections + line ranges) rather than inline full text — judge "
-            "the plan against ITS OWN domain (the external codebase / creative deliverable / "
-            "research question), and consult the map only where the plan genuinely touches "
-            "the runtime's own surfaces."
-        )
-    parts = [(
-        "You are a senior design reviewer for Ouroboros, a self-creating AI agent.\n"
-        "Your job is to review a proposed implementation plan BEFORE any code is written.\n"
-        "You are validating a concrete candidate plan, not brainstorming from zero. If the plan is weak, say exactly why and what boundary or contract was missed.\n"
-        f"{atlas_note}\n\n"
-        "## Review stance — GENERATIVE, not audit\n\n"
-        "Your primary job is to CONTRIBUTE ideas the implementer may not see, using the repository evidence provided for this context level.\n"
-        "Finding defects in the plan is secondary; proposing concrete alternatives, surfacing existing surfaces that already solve the goal, and flagging subtle contract breaks is primary.\n"
-        "Assume the implementer has already thought through the first-pass design — you are a design PARTNER who contributes, not an auditor who rubber-stamps.\n\n"
-        "## Required output structure (follow exactly)\n\n"
-        "1. **Your own approach**. State what YOU would do with the available repository evidence: the concrete alternative path, the existing file/function you would reuse, or the simpler route. If after real effort you see no better approach, say so explicitly.\n"
-        "2. **`## PROPOSALS` section**. Offer every material idea you judge useful; there is no issue quota. A proposal may identify:\n   - An existing function/module that already solves this (named exactly).\n   - A subtle contract break or shared-state interaction the plan likely missed.\n   - A simpler path with less surface area preserving the goal.\n   - A risk pattern visible from codebase history in your context.\n   - A BIBLE.md alignment issue with a specific principle cited.\n"
-        "3. **Per-item verdicts**. For each checklist item below:\n   - **verdict**: PASS | RISK | FAIL\n   - **explanation**: enough context to make the judgment understandable\n   - **concrete fix** (if RISK or FAIL): exact file, function, or line to address\n   - **alternative approaches** (if applicable): any more elegant solution you genuinely recommend\n"
-        "4. **Addressable findings block**. Immediately before the final line, write `PLAN_FINDINGS_JSON:` followed by one JSON array. Include every material RISK/FAIL as an object with unique local `id`, `level` (`RISK` or `FAIL`), `summary`, and `recommendation`. Use `[]` when GREEN. Do not invent findings to fill a quota.\n"
-        "5. **Final line** (exactly one of):\n   - `AGGREGATE: GREEN` — no critical issues, implementer can proceed\n   - `AGGREGATE: REVIEW_REQUIRED` — risks or minor concerns, implementer should consider adjustments\n   - `AGGREGATE: REVISE_PLAN` — critical structural issues, plan must be revised before coding\n\n"
-        "Be specific. Name exact files, functions, constants, or call sites.\nVague concerns without a concrete pointer are advisory at most.\nIf you see a simpler solution, say so directly — don't just hint.\n\n"
-        "## Rules (what NOT to flag)\n\n"
-        "- A minimalism/SOLID finding must name a concrete defect, duplicated authority or coupling, "
-        "or a specifically smaller EXISTING extension seam. Diff size, line count, and file count are "
-        "not findings by themselves.\n"
-        "- Do NOT penalise missing tests, `VERSION` bumps, `README.md` changelog rows, or `docs/ARCHITECTURE.md` updates — the plan has no code yet. Focus on design correctness and elegance, not commit hygiene. Commit-gate reviewers handle that later.\n\n"
-        "## Aggregate level — adaptive-quorum coordination across the configured reviewer slots\n\n"
-        "- `AGGREGATE: REVISE_PLAN` should be used ONLY when you are confident the plan has a concrete structural problem that warrants a redesign. The coordinator escalates to final `REVISE_PLAN` only when a quorum of reviewer slots independently flag it (`config.adaptive_quorum`: 2-of-N for 3+ slots, both in a 2-slot setup, and a single reviewer in a 1-slot setup) — a lone dissenting `REVISE_PLAN` in a multi-reviewer setup will surface as `REVIEW_REQUIRED` with your dissent noted. Use `REVIEW_REQUIRED` for real but non-structural risks; reserve `REVISE_PLAN` for defects that require changed plan text and a fresh fingerprint review.\n\n---\n"
-    )]
-    if checklist and not checklists_md:
-        parts.append(f"## Plan Review Checklist\n\n{checklist}\n\n---\n")
-    for title, body in (
-        ("## BIBLE.md (Constitution — highest priority)", bible_text),
-        ("## DEVELOPMENT.md (Engineering handbook)", dev_md),
-        ("## ARCHITECTURE.md (Current system structure)", arch_md),
-    ):
-        if body:
-            parts.append(f"{title}\n\n{body}\n\n---\n")
-    if checklists_md:
-        parts.append(
-            "## CHECKLISTS.md (review contracts and critical thresholds)\n\n"
-            "Use the `## Plan Review Checklist` section inside this file as the per-item matrix for this plan review.\n\n"
-            f"{checklists_md}\n\n---\n"
-        )
-    return "\n".join(parts)
-
-
-def build_plan_review_user_content(
-    request: _PlanReviewRequest,
-    head_snapshots: str,
-    repo_pack: str,
-    omitted_note: str,
-) -> tuple:
-    """Build the plan-review user prompt; returns ``(content, stable_prefix_len)``.
-
-    Repository evidence (HEAD snapshots + generated Atlas) leads and the plan
-    text follows: the evidence is byte-stable across plan revisions that keep
-    the same ``files_to_touch`` (the dominant re-review case), so leading with
-    it lets the provider prompt cache reuse the large evidence prefix while
-    only the revised plan tail re-tokenizes. ``stable_prefix_len`` marks that
-    evidence/plan boundary for the dispatch-time cache breakpoint."""
-    plan = request.plan
-    goal = request.goal
-    files_to_touch = request.files_to_touch
-    context_level = request.context_level
-    context_notes = request.context_notes
-    include_tests = request.include_tests
-    scope = request.scope
-    stable_parts = []
-    if head_snapshots or repo_pack:
-        stable_parts.append(
-            "## Repository Evidence (read first — the plan under review follows it)\n"
-        )
-    if head_snapshots:
-        stable_parts.append(f"## Current State of Planned-Touch Files (HEAD)\n\n{head_snapshots}\n")
-    if repo_pack:
-        stable_parts.append(f"## Generated Repository Atlas (for cross-module analysis)\n\n{repo_pack}\n")
-    dynamic_parts = [
-        (
-            "## Implementation Plan Under Review\n\n"
-            "### Goal and Scope\n\n"
-            "```json\n"
-            + json.dumps(
-                {"goal": goal, "scope": normalize_plan_scope(scope)},
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n```\n\n"
-            f"**Proposed Plan:**\n{plan}\n"
-        ),
-        (
-            "## Plan Context Contract\n\n"
-            f"**Context level:** {context_level}\n"
-            f"**Include tests in generated Atlas:** {bool(include_tests)}\n"
-        ),
-    ]
-    if context_notes:
-        dynamic_parts.append(f"**Agent context notes:** {context_notes}\n")
-    if files_to_touch:
-        dynamic_parts.append(f"**Files planned to touch:** {', '.join(files_to_touch)}\n")
-    if omitted_note:
-        dynamic_parts.append(omitted_note)
-    stable = "\n".join(stable_parts)
-    if stable:
-        stable += "\n"
-    return stable + "\n".join(dynamic_parts), len(stable)
-
-
-def planning_swarm_context(
-    *, plan: str, goal: str, files_to_touch: List[str], context_level: str,
-    context_notes: str, scope: Optional[Dict[str, Any]] = None,
-) -> str:
-    return "\n".join([
-        "Review this proposed implementation plan before any edits are made.", "",
-        "[GOAL_AND_SCOPE]",
-        json.dumps({"goal": goal, "scope": normalize_plan_scope(scope)}, ensure_ascii=False, indent=2),
-        "", "[PLAN]", plan, "", "[FILES_TO_TOUCH]",
-        json.dumps(files_to_touch or [], ensure_ascii=False, indent=2),
-        "", "[CONTEXT_LEVEL]", context_level, "", "[CONTEXT_NOTES]",
-        context_notes or "(none)",
-    ])
-
-
-def planning_scout_framing(plan_class: str) -> tuple[str, str]:
-    if plan_class == "self_mod" or not plan_class:
-        return (
-            "Independently review the proposed implementation plan before code edits. "
-            "Inspect repo/docs/logs if useful. Focus on missing touchpoints, hidden "
-            "contracts, sequencing risks, and simpler alternatives. Do not implement.",
-            "Readonly planning only. Do not edit files, commit, run shell, or request review "
-            "gates. Use concrete file/symbol references when possible.",
-        )
-    domain = {
-        "external": "the external codebase/workspace this plan targets",
-        "creative": "the creative deliverable (content, design, UX, audience fit)",
-        "research": "the research question (sources, method, evidence quality)",
-    }.get(plan_class, "the task's own domain")
-    return (
-        f"Independently review the proposed plan before execution. This is a {plan_class} "
-        f"plan: scout {domain} — pick the angle that most improves THIS plan, NOT Ouroboros-"
-        "repo archaeology. Focus on missing requirements, risks, sequencing, and simpler "
-        "alternatives. Do not implement.",
-        "Readonly planning only. Do not edit files, commit, run shell, or request review gates. "
-        "Ground findings in the plan's own domain and cite concrete references when possible.",
-    )
-
-
-# A scout needs room to self-finalize INSIDE the window the parent still reads, so its deadline
-# sits below the shared cutoff by a reserve of (finalization grace + a dispatch/collection
-# margin). That margin is DERIVED from the grace rather than being a wait constant of its own:
-# `OUROBOROS_FINALIZATION_GRACE_SEC` is already the configured authority for "how long a task
-# needs to wrap up", and an operator who raises it because their models are slow needs the
-# dispatch slack to grow with it — a second knob would be a second thing to keep in sync. Both
-# numbers below are dimensionless fractions of an existing authority, not new timeouts (see the
-# timeout-SSOT rule in docs/DEVELOPMENT.md). At the default 120s grace the margin is 30s.
-# On a window too short to hold the whole reserve, the reserve shrinks to a FRACTION of the
-# window instead of swallowing it: a short-window wave still gets a short, honest child deadline
-# rather than no scouts at all.
-PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION = 0.25
-PLANNING_SCOUT_MAX_RESERVE_FRACTION = 0.25
-
-
-def planning_scout_wave_plan(
-    cutoff_at: str, *, max_workers: int, grace_sec: int, now: Any,
-) -> tuple[str, str]:
-    """Pure admission math for a NEW planning-scout wave: ``(child_deadline_at, refusal)``.
-
-    The child deadline is bound to the window in which its handoff can still be CONSUMED,
-    because the parent stops reading at the wave's one shared cutoff and everything a scout
-    does after that is paid for and thrown away. The deadline is therefore always strictly
-    INSIDE that window: the cutoff minus a reserve derived from ``grace_sec`` alone, capped
-    at a fraction of the window so a short window yields a short deadline instead of a
-    refusal. A wave with no spare worker, or whose window has already closed, is refused
-    before launch with a typed reason instead of being started and then omitted. Callers
-    apply this to NEW waves only: a recovery/collection pass gathers handoffs that are
-    already paid for, and refusing those abandons spend rather than saving it."""
-    from ouroboros.deadline_utils import parse_deadline_ts
-
-    if int(max_workers) < 2:
-        return "", "no spare worker capacity; increase OUROBOROS_MAX_WORKERS to at least 2"
-    cutoff = parse_deadline_ts(str(cutoff_at or ""))
-    if cutoff is None:
-        return "", "the scout cutoff is missing or malformed, so no consumable child window exists"
-    window = (cutoff - now).total_seconds()
-    if window <= 0:
-        return "", (
-            "the scout handoff window has already closed — a child launched now could not "
-            "produce a handoff this wave would still read"
-        )
-    grace = max(0, int(grace_sec))
-    reserve = min(grace + int(grace * PLANNING_SCOUT_DEADLINE_MARGIN_FRACTION),
-                  window * PLANNING_SCOUT_MAX_RESERVE_FRACTION)
-    return (cutoff - timedelta(seconds=reserve)).isoformat(), ""
-
-
-def bounded_planning_reason(value: Any, *, limit: int = 600) -> str:
-    """Redact and bound diagnostics with an explicit omission disclosure."""
-    from ouroboros.observability import redact_projection
-    from ouroboros.utils import truncate_review_artifact
-
-    if value in (None, "", {}, []):
-        return ""
-    redacted_value = redact_projection(value).value
-    if isinstance(redacted_value, str):
-        text = redacted_value
-    else:
-        text = json.dumps(redacted_value, ensure_ascii=False, default=str, sort_keys=True)
-    redacted = str(text).strip()
-    if len(redacted) <= limit:
-        return redacted
-
-    # ``truncate_review_artifact`` is the existing disclosed-omission seam.  Its
-    # limit covers the preview, so shrink that preview until the complete value
-    # (including the omission metadata) fits this projection's bound.  Returning
-    # the disclosure intact is more important than honoring an unrealistically
-    # tiny caller limit.
-    preview_limit = max(0, int(limit))
-    while True:
-        disclosed = truncate_review_artifact(redacted, limit=preview_limit)
-        if len(disclosed) <= limit or preview_limit == 0:
-            return disclosed
-        preview_limit = max(0, preview_limit - max(1, len(disclosed) - limit))
-
-
-def planning_handoff_selection(
-    intended_scouts: List[Dict[str, Any]], tasks: Dict[str, Any], stop_reason: str
-) -> tuple[List[str], List[Dict[str, Any]]]:
-    """Select usable results and emit exactly one omission per unfulfilled intent."""
-    included: List[str] = []
-    omissions: List[Dict[str, Any]] = []
-    terminal_statuses = {"completed", "failed", "cancelled", "rejected_duplicate"}
-    for attempt in intended_scouts:
-        role = str(attempt.get("role") or "")
-        schedule_status = str(attempt.get("schedule_status") or "pending")
-        task_ids = [str(item) for item in attempt.get("task_ids") or [] if str(item)]
-        if schedule_status != "started" or not task_ids:
-            reason = "schedule_failed" if schedule_status == "failed" else "schedule_outcome_unknown"
-            omission = {"task_id": "", "role": role, "status": "not_started", "reason": reason}
-            detail = bounded_planning_reason(attempt.get("schedule_reason"))
-            if detail:
-                omission["detail"] = detail
-            omissions.append(omission)
-            continue
-
-        missing: List[tuple[str, Dict[str, Any]]] = []
-        for task_id in task_ids:
-            row = tasks.get(task_id) if isinstance(tasks, dict) else None
-            row = row if isinstance(row, dict) else {}
-            status = str(row.get("status") or "unknown").strip().lower() or "unknown"
-            if status == "completed" and str(row.get("result") or "").strip():
-                included.append(task_id)
-            else:
-                missing.append((task_id, row))
-        if not missing:
-            continue
-        task_id, row = missing[0]
-        status = str(row.get("status") or "unknown").strip().lower() or "unknown"
-        if status not in terminal_statuses:
-            reason = f"not_terminal_at_review_cutoff:{stop_reason or 'unknown'}"
-        elif status == "completed":
-            reason = "completed_without_nonempty_handoff"
-        else:
-            reason = f"terminal_without_usable_handoff:{status}"
-        omission = {"task_id": task_id, "role": role, "status": status, "reason": reason}
-        detail = bounded_planning_reason({
-            key: row.get(key) for key in ("reason_code", "error", "result", "trace_summary") if row.get(key)
-        })
-        if detail:
-            omission["detail"] = detail
-        if len(missing) > 1:
-            omission["task_ids"] = [item[0] for item in missing]
-        omissions.append(omission)
-    return list(dict.fromkeys(included)), omissions
-
-
-def completed_planning_handoffs(tasks: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return [
-        row for row in (tasks or {}).values()
-        if isinstance(row, dict)
-        and str(row.get("status") or "").strip().lower() == "completed"
-        and str(row.get("result") or "").strip()
-    ]
-
-
-def all_planning_tasks_terminal(task_ids: List[str], tasks: Dict[str, Any]) -> bool:
-    terminal = {"completed", "failed", "cancelled", "rejected_duplicate"}
-    return bool(task_ids) and all(
-        isinstance(tasks.get(task_id), dict)
-        and str(tasks[task_id].get("status") or "").strip().lower() in terminal
-        for task_id in task_ids
-    )
-
-
-def format_planning_handoffs(handoffs: Dict[str, Any], *, raw: bool) -> str:
-    if not handoffs:
-        return ""
-    wait = handoffs.get("wait") if isinstance(handoffs.get("wait"), dict) else {}
-    tasks = (wait or {}).get("tasks") if isinstance((wait or {}).get("tasks"), dict) else {}
-    included = [str(item) for item in (handoffs.get("included_task_ids") or [])]
-    if not included:  # legacy schema: infer the same terminal non-empty subset
-        included = [
-            str(task_id) for task_id, row in tasks.items() if isinstance(row, dict)
-            and str(row.get("status") or "").lower() == "completed"
-            and str(row.get("result") or "").strip()
-        ]
-    if raw:
-        selected = {task_id: tasks[task_id] for task_id in included if isinstance(tasks.get(task_id), dict)}
-    else:
-        selected = {
-            task_id: {key: row.get(key) for key in (
-                "status", "role", "result", "subagent_envelope"
-            )}
-            for task_id in included for row in [tasks.get(task_id)] if isinstance(row, dict)
-        }
-    payload = {
-        "schema_version": handoffs.get("schema_version", 1),
-        "included_task_ids": included,
-        "consumed_task_ids": handoffs.get("consumed_task_ids") or [],
-        "omissions": handoffs.get("omissions") or [],
-        "timed_out": (wait or {}).get("timed_out"),
-        "wait_stop_reason": handoffs.get("wait_stop_reason") or "",
-        "wait_elapsed_sec": handoffs.get("wait_elapsed_sec"),
-        "tasks": selected,
-        "artifact": handoffs.get("artifact") or {},
-    }
-    return (
-        "## Planning Subagent Handoffs\n\nEvery terminal non-empty scout handoff selected "
-        "before the shared cutoff is reviewer evidence. Every other scout is listed under "
-        "omissions; a later result is audit-only and cannot reopen this review.\n\n```json\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n```"
-    )
+            context_window=window,
+            output_reserve=slot_output_reserve,
+            tokenizer_margin=slot_margin,
+        ))
+    return limits
 
 
 def build_scope_review_prompt(
@@ -1268,18 +357,19 @@ def build_scope_review_prompt(
     diff_text: str,
     repo_pack_placeholder: str,
     critical_calibration: str,
+    task_evidence_section: str = "",
 ) -> tuple:
-    # STABLE-FIRST for provider prompt caching: instructions, checklist and
-    # canonical docs are byte-stable across commits and form the cache-marked
-    # prefix; goal/scope/history/diff/atlas are the per-commit tail. The
-    # boundary is recorded in _SCOPE_STABLE_PREFIX_LEN (later placeholder
-    # substitution and touched-file degradation only edit the dynamic tail).
+    # STABLE-FIRST for provider prompt caching: instructions, checklist and the
+    # always-inline governance tier are byte-stable across commits and form the
+    # cache-marked prefix; goal/scope/history/diff/index are the per-commit
+    # tail. The returned boundary is the length of that prefix.
     stable = f"""\
 {REVIEW_PREAMBLE}
 
 ## Your role
 
-You are the Atlas-backed whole-repository reviewer. Diff reviewers cover line-level mistakes;
+You are the whole-repository reviewer, and you REACH the repository with your own
+read-only tools. Diff reviewers cover line-level mistakes;
 you cover cross-module contracts, forgotten touchpoints, hidden regressions,
 prompt/doc sync, architecture fit, and end-to-end intent completeness.
 
@@ -1347,8 +437,9 @@ Do NOT invent a new id for the same root cause.
 
 ## Canonical Documentation Context
 
-These files are always included explicitly. Do not treat their absence from the
-wider repository pack as omission.
+These rules are inlined for every review of every change. Every other governance
+document is named in the navigation below and is one read away; none of them is
+omitted.
 
 {canonical_docs}
 """
@@ -1357,12 +448,14 @@ wider repository pack as omission.
 
 {history_block}
 
-## Current touched files (post-change — what the file looks like NOW)
+{task_evidence_section}
 
-Files deleted by this diff appear here with an explicit `DELETED` marker and
-their HEAD content inlined; other removed lines are visible via the staged
-diff below. HEAD versions of modified files are not sent as a separate
-section — the staged diff below already shows every `-` line.
+## Touched files
+
+The manifest below names every path this change touches, with what happened to
+it and how large it is in the candidate tree. No file body is inlined: the
+staged diff carries every added and removed line, and you read any file itself
+with your own tools.
 
 {current_files_section}
 
@@ -1375,32 +468,6 @@ section — the staged diff below already shows every `-` line.
 {repo_pack_placeholder}
 """
     return stable + "\n" + dynamic, len(stable) + 1
-
-
-def emit_plan_review_usage(ctx: Any, raw_results: list) -> None:
-    """Compatibility helper for explicit plan-review usage emission tests.
-
-    The live plan path emits through ReviewCoordinator; this helper preserves
-    the small SSOT conversion from old raw result dictionaries to events.
-    """
-
-    for result in raw_results:
-        if result.get("error"):
-            continue
-        tokens_in = result.get("tokens_in", 0)
-        tokens_out = result.get("tokens_out", 0)
-        if not tokens_in and not tokens_out:
-            continue
-        model = result.get("model") or result.get("request_model") or ""
-        raw_cost = result.get("cost")
-        cost = float(raw_cost) if raw_cost is not None else None
-        emit_review_usage(
-            ctx,
-            model=model,
-            usage={"prompt_tokens": tokens_in, "completion_tokens": tokens_out, "cost": cost},
-            source="plan_review",
-            extra={"cost": cost},
-        )
 
 
 def build_plan_review_messages(

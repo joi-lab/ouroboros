@@ -1,10 +1,22 @@
+"""The repository index a retrieving reviewer's brief carries.
+
+The index is a MAP, not a pack: every tracked path is accounted for, the
+policy-excluded classes collapse per directory, and only the change-relative
+paths (the touched files and the files that import them) carry structural
+detail. No budget decides what a reviewer may see, and no file body is ever
+rendered here.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
 
 from ouroboros.tools.review_context_atlas import (
-    ReviewContextAtlasRequest,
-    compile_review_context_atlas,
+    INDEX_MAX_ROW_IMPORTS,
+    INDEX_MAX_ROW_SYMBOLS,
+    INDEX_MAX_TOUCHED_IMPORTERS,
+    REPOSITORY_INDEX_SCHEMA_VERSION,
+    repository_index,
 )
 
 
@@ -13,314 +25,260 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _coverage(pack):
-    return {row["path"]: row for row in pack.manifest["coverage"]}
+def _index_rows(text: str) -> dict[str, str]:
+    """``path -> disposition`` for every row of the coverage index section."""
+    body = text.split("```text\n", 1)[1].split("```", 1)[0]
+    rows = {}
+    for line in body.splitlines():
+        if "\t" in line:
+            disposition, path = line.split("\t", 1)
+            rows[path] = disposition
+        elif line.strip():
+            rows[line] = "indexed"  # a bare row is the ordinary indexed class
+    return rows
 
 
-def test_atlas_accounts_for_every_tracked_path_and_excludes_unrelated_tests(tmp_path):
+def test_index_accounts_for_every_tracked_path_with_no_file_body(tmp_path):
     _write(tmp_path / "app.py", "import helper\n\ndef run():\n    return helper.value()\n")
     _write(tmp_path / "helper.py", "def value():\n    return 42\n")
     _write(tmp_path / "pkg" / "__init__.py", "")
     _write(tmp_path / "pkg" / "main.py", "from .helper import thing\n\nanswer = thing()\n")
     _write(tmp_path / "pkg" / "helper.py", "def thing():\n    return 7\n")
-    _write(tmp_path / "tests" / "test_app.py", "def test_app():\n    assert True\n")
     _write(tmp_path / "docs" / "CHECKLISTS.md", "canonical checklist\n")
+    tracked = ("app.py", "helper.py", "pkg/__init__.py", "pkg/main.py",
+               "pkg/helper.py", "docs/CHECKLISTS.md")
 
+    text, manifest = repository_index(tmp_path, touched_paths=["app.py"], tracked_paths=tracked)
+
+    assert manifest["schema_version"] == REPOSITORY_INDEX_SCHEMA_VERSION
+    assert manifest["strategy"] == "repository_index"
+    assert manifest["tracked_count"] == len(tracked)
+    assert set(_index_rows(text)) == set(tracked)
+    assert manifest["dispositions"] == {"indexed": 6}
+    # Facts, never bodies: no file content reaches the index.
+    assert "def value():" not in text
+    assert "canonical checklist" not in text
+    assert manifest["index_chars"] == len(text)
+    assert manifest["tokens_estimate"] > 0
+
+
+def test_policy_excluded_classes_collapse_to_one_row_per_directory(tmp_path):
+    _write(tmp_path / "app.py", "x = 1\n")
+    for idx in range(4):
+        _write(tmp_path / "tests" / f"test_mod_{idx}.py", "def test_ok():\n    assert True\n")
+    _write(tmp_path / "devtools" / "helper.py", "y = 2\n")
+    _write(tmp_path / "assets" / "notes.txt", "asset text\n")
+    _write(tmp_path / "web" / "vendor" / "chart.umd.min.js", "minified();\n")
+    (tmp_path / "web" / "icon.png").write_bytes(b"\x89PNG\r\n\x00")
     tracked = (
         "app.py",
-        "helper.py",
-        "pkg/__init__.py",
-        "pkg/main.py",
-        "pkg/helper.py",
-        "tests/test_app.py",
-        "docs/CHECKLISTS.md",
-    )
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=tracked,
-            anchors=("app.py",),
-            already_included=frozenset({"docs/CHECKLISTS.md"}),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-            include_tests=False,
-        )
+        *(f"tests/test_mod_{idx}.py" for idx in range(4)),
+        "devtools/helper.py",
+        "assets/notes.txt",
+        "web/vendor/chart.umd.min.js",
+        "web/icon.png",
     )
 
-    coverage = _coverage(pack)
-    assert set(coverage) == set(tracked)
-    assert coverage["docs/CHECKLISTS.md"]["disposition"] == "already_included"
-    assert coverage["tests/test_app.py"]["disposition"] == "excluded_test"
-    assert "pkg.helper" in coverage["pkg/main.py"]["imports"]
-    assert "def test_app" not in pack.text
+    text, manifest = repository_index(tmp_path, touched_paths=["app.py"], tracked_paths=tracked)
 
-
-def test_atlas_include_tests_allows_test_files(tmp_path):
-    _write(tmp_path / "tests" / "test_app.py", "def test_app():\n    assert True\n")
-
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("tests/test_app.py",),
-            anchors=("tests/test_app.py",),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-            include_tests=True,
-        )
-    )
-
-    coverage = _coverage(pack)
-    assert coverage["tests/test_app.py"]["disposition"] == "full"
-    assert "def test_app" in pack.text
-
-
-def test_atlas_compact_manifest_keeps_full_coverage_out_of_prompt(tmp_path):
-    _write(tmp_path / "app.py", "import helper\n\nprint(helper.VALUE)\n")
-    _write(tmp_path / "helper.py", "VALUE = 42\n")
-    _write(tmp_path / "other.py", "def unused():\n    return 'ok'\n")
-
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("app.py", "helper.py", "other.py"),
-            anchors=("app.py",),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-            compact_manifest=True,
-        )
-    )
-
-    assert pack.manifest["compact_manifest_in_prompt"] is True
-    assert {row["path"] for row in pack.manifest["coverage"]} == {
-        "app.py",
-        "helper.py",
-        "other.py",
+    rows = _index_rows(text)
+    assert rows["tests/ (4 files)"] == "excluded_test"
+    assert rows["devtools/ (1 files)"] == "excluded_dir"
+    assert rows["assets/ (1 files)"] == "excluded_dir"  # a physical class would win first
+    assert rows["web/vendor/ (1 files)"] == "vendored_minified"
+    assert rows["web/ (1 files)"] == "binary_media"
+    assert rows["app.py"] == "indexed"
+    # No per-path row for a collapsed member…
+    assert "tests/test_mod_0.py" not in rows
+    # …while the disposition counts still account for every path individually.
+    assert manifest["dispositions"] == {
+        "binary_media": 1, "excluded_dir": 2, "excluded_test": 4,
+        "indexed": 1, "vendored_minified": 1,
     }
-    assert '"coverage": [' not in pack.text
-    assert '"coverage_in_prompt": "compact_full_index_plus_bounded_samples"' in pack.text
-    assert '"coverage_samples"' in pack.text
-    assert '"coverage_sample_counts"' in pack.text
-    assert '"coverage_index_count": 3' in pack.text
-    assert "### Compact full coverage index" in pack.text
-    for rel_path in ("app.py", "helper.py", "other.py"):
-        assert f"\t{rel_path}" in pack.text
-    assert "compact coverage mode" in pack.text
+    assert manifest["tracked_count"] == len(tracked)
 
 
-def test_atlas_force_includes_protected_workflow_even_under_skipped_github_dir(tmp_path):
-    _write(tmp_path / ".github" / "workflows" / "ci.yml", "name: CI\n")
-    _write(tmp_path / "ouroboros" / "tools" / "review_context_atlas.py", "ATLAS = True\n")
-    _write(tmp_path / "assets" / "logo.txt", "asset text\n")
-    _write(tmp_path / "main.py", "print('main')\n")
+def test_rich_rows_cover_the_touched_paths_and_their_direct_importers(tmp_path):
+    _write(tmp_path / "pkg" / "__init__.py", "")
+    _write(tmp_path / "pkg" / "core.py", "VERSION = 3\n\ndef run():\n    return VERSION\n")
+    _write(tmp_path / "pkg" / "caller_a.py", "import pkg.core\n\nvalue = pkg.core.run()\n")
+    _write(tmp_path / "pkg" / "caller_b.py", "from pkg import core\n\nvalue = core.run()\n")
+    _write(tmp_path / "pkg" / "unrelated.py", "import json\n")
+    tracked = ("pkg/__init__.py", "pkg/core.py", "pkg/caller_a.py",
+               "pkg/caller_b.py", "pkg/unrelated.py")
 
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=(
-                ".github/workflows/ci.yml",
-                "ouroboros/tools/review_context_atlas.py",
-                "assets/logo.txt",
-                "main.py",
-            ),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-        )
+    text, manifest = repository_index(
+        tmp_path, touched_paths=["pkg/core.py"], tracked_paths=tracked)
+
+    assert [row["path"] for row in manifest["touched"]] == ["pkg/core.py"]
+    touched = manifest["touched"][0]
+    assert touched["imported_by"] == ["pkg/caller_a.py", "pkg/caller_b.py"]
+    assert touched["imported_by_total"] == 2
+    assert touched["symbols"] == ["VERSION", "run"] and touched["symbols_total"] == 2
+    assert touched["size"] == (tmp_path / "pkg" / "core.py").stat().st_size
+    assert len(touched["sha256"]) == 16 and touched["language"] == "py"
+    # `from pkg import core` counts exactly like `import pkg.core`.
+    assert [row["path"] for row in manifest["importers"]] == [
+        "pkg/caller_a.py", "pkg/caller_b.py"]
+    # A file that imports nothing touched gets a coverage row and nothing more.
+    assert "pkg/unrelated.py" in _index_rows(text)
+    assert "- pkg/unrelated.py —" not in text
+    assert "- pkg/core.py —" in text and "- pkg/caller_b.py —" in text
+
+
+def test_javascript_importers_resolve_through_relative_specifiers(tmp_path):
+    _write(tmp_path / "web" / "modules" / "chat.js", "export const chat = 1;\n")
+    _write(tmp_path / "web" / "app.js", "import { chat } from './modules/chat.js';\n")
+    _write(tmp_path / "web" / "modules" / "panel.js",
+           "import { chat } from './chat.js';\nimport 'external-pkg';\n")
+    tracked = ("web/modules/chat.js", "web/app.js", "web/modules/panel.js")
+
+    _text, manifest = repository_index(
+        tmp_path, touched_paths=["web/modules/chat.js"], tracked_paths=tracked)
+
+    assert manifest["touched"][0]["imported_by"] == ["web/app.js", "web/modules/panel.js"]
+    assert [row["path"] for row in manifest["importers"]] == [
+        "web/app.js", "web/modules/panel.js"]
+    # A bare package specifier names no tracked path, so it is not an edge.
+    panel = [row for row in manifest["importers"] if row["path"] == "web/modules/panel.js"][0]
+    assert panel["imports"] == ["web/modules/chat.js"]
+
+
+def test_importer_list_is_capped_per_touched_path_with_the_total_disclosed(tmp_path):
+    _write(tmp_path / "hub.py", "VALUE = 1\n")
+    importers = [f"mod_{idx:03d}.py" for idx in range(INDEX_MAX_TOUCHED_IMPORTERS + 7)]
+    for rel in importers:
+        _write(tmp_path / rel, "import hub\n")
+
+    text, manifest = repository_index(
+        tmp_path, touched_paths=["hub.py"], tracked_paths=("hub.py", *importers))
+
+    touched = manifest["touched"][0]
+    assert touched["imported_by_total"] == len(importers)
+    assert len(touched["imported_by"]) == INDEX_MAX_TOUCHED_IMPORTERS
+    assert touched["imported_by"] == sorted(importers)[:INDEX_MAX_TOUCHED_IMPORTERS]
+    assert manifest["importer_count"] == INDEX_MAX_TOUCHED_IMPORTERS
+    assert manifest["importer_cap_per_touched_path"] == INDEX_MAX_TOUCHED_IMPORTERS
+    # The cap is disclosed, not silent (BIBLE P1).
+    assert f"(+7 more of {len(importers)})" in text
+
+
+def test_symbol_and_import_lists_are_capped_with_their_totals(tmp_path):
+    source = "\n".join(f"import pkg_{idx}" for idx in range(30))
+    source += "\n" + "\n".join(f"def f_{idx}():\n    return {idx}\n" for idx in range(20))
+    _write(tmp_path / "wide.py", source)
+
+    _text, manifest = repository_index(
+        tmp_path, touched_paths=["wide.py"], tracked_paths=("wide.py",))
+
+    row = manifest["touched"][0]
+    assert len(row["symbols"]) == INDEX_MAX_ROW_SYMBOLS and row["symbols_total"] == 20
+    assert len(row["imports"]) == INDEX_MAX_ROW_IMPORTS and row["imports_total"] == 30
+
+
+def test_a_touched_path_keeps_its_own_row_whatever_its_class(tmp_path):
+    _write(tmp_path / "tests" / "test_touched.py", "import mod\n\ndef test_ok():\n    assert mod\n")
+    _write(tmp_path / "tests" / "test_other.py", "def test_other():\n    assert True\n")
+    _write(tmp_path / "devtools" / "touched_script.py", "import mod\n")
+    _write(tmp_path / "mod.py", "x = 1\n")
+    tracked = ("tests/test_touched.py", "tests/test_other.py",
+               "devtools/touched_script.py", "mod.py")
+
+    text, manifest = repository_index(
+        tmp_path,
+        touched_paths=["tests/test_touched.py", "devtools/touched_script.py"],
+        tracked_paths=tracked,
     )
 
-    coverage = _coverage(pack)
-    assert coverage[".github/workflows/ci.yml"]["disposition"] == "full"
-    assert coverage["ouroboros/tools/review_context_atlas.py"]["disposition"] == "full"
-    assert "name: CI" in pack.text
-    assert coverage["assets/logo.txt"]["disposition"] == "excluded_dir"
-    assert "asset text" not in pack.text
+    rows = _index_rows(text)
+    assert rows["tests/test_touched.py"] == "indexed"
+    assert rows["devtools/touched_script.py"] == "indexed"
+    # The unrelated wider test is still collapsed by policy.
+    assert rows["tests/ (1 files)"] == "excluded_test"
+    assert [row["path"] for row in manifest["touched"]] == [
+        "tests/test_touched.py", "devtools/touched_script.py"]
 
 
-def test_atlas_devtools_manifest_only_unless_touched(tmp_path):
-    _write(tmp_path / "devtools" / "benchmarks" / "programbench" / "run.py", "VALUE = 'devtools full text'\n")
-    _write(tmp_path / "ouroboros" / "core.py", "print('core')\n")
+def test_a_listed_importer_from_a_collapsed_class_keeps_its_own_indexed_row(tmp_path):
+    """The row the index prints and the class it prints cannot disagree: a test
+    that imports a touched module is shown per path, so it is not reported as an
+    excluded one."""
+    _write(tmp_path / "mod.py", "x = 1\n")
+    _write(tmp_path / "tests" / "test_mod.py", "import mod\n")
+    _write(tmp_path / "tests" / "test_other.py", "def test_other():\n    assert True\n")
+    tracked = ("mod.py", "tests/test_mod.py", "tests/test_other.py")
 
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("devtools/benchmarks/programbench/run.py", "ouroboros/core.py"),
-            anchors=("ouroboros/core.py",),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-        )
-    )
+    text, manifest = repository_index(
+        tmp_path, touched_paths=["mod.py"], tracked_paths=tracked)
 
-    coverage = _coverage(pack)
-    assert coverage["devtools/benchmarks/programbench/run.py"]["disposition"] == "excluded_dir"
-    assert "devtools full text" not in pack.text
-    assert coverage["ouroboros/core.py"]["disposition"] == "full"
-
-    touched = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("devtools/benchmarks/programbench/run.py",),
-            anchors=("devtools/benchmarks/programbench/run.py",),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-        )
-    )
-
-    touched_coverage = _coverage(touched)
-    assert touched_coverage["devtools/benchmarks/programbench/run.py"]["disposition"] == "full"
-    assert "devtools full text" in touched.text
+    rows = _index_rows(text)
+    assert rows["tests/test_mod.py"] == "indexed"
+    assert rows["tests/ (1 files)"] == "excluded_test"
+    assert manifest["dispositions"] == {"excluded_test": 1, "indexed": 2}
 
 
-def test_atlas_marks_sensitive_binary_oversized_and_vendored_files(tmp_path):
-    _write(tmp_path / ".env.example", "TOKEN=secret\n")
+def test_physical_classes_are_reported_and_secrets_are_never_read_into_the_index(tmp_path):
+    _write(tmp_path / ".env.production", "TOKEN=secret-value\n")
     (tmp_path / "image.png").write_bytes(b"\x89PNG\r\n\x00")
     _write(tmp_path / "script.min.js", "minified();\n")
     (tmp_path / "huge.py").write_bytes(b"x" * (1_048_576 + 1))
-    normal_source = "\n".join(f"import pkg_{idx}" for idx in range(30))
-    normal_source += '\nDATABASE_URL = "postgres://alice:secretpw@db.local/app"\n'
-    normal_source += "\n".join(f"def f_{idx}():\n    return {idx}\n" for idx in range(20))
-    _write(tmp_path / "normal.py", normal_source)
+    _write(tmp_path / "gone.py", "placeholder\n")
+    (tmp_path / "gone.py").unlink()
+    tracked = (".env.production", "image.png", "script.min.js", "huge.py", "gone.py")
 
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=(".env.example", "image.png", "script.min.js", "huge.py", "normal.py"),
-            fixed_prompt_tokens=100,
-            target_total_tokens=20_000,
-            hard_total_tokens=25_000,
-        )
-    )
+    text, manifest = repository_index(
+        tmp_path, touched_paths=[".env.production", "huge.py"], tracked_paths=tracked)
 
-    coverage = _coverage(pack)
-    assert coverage[".env.example"]["disposition"] == "sensitive"
-    assert coverage[".env.example"]["sha256"] == ""
-    assert coverage[".env.example"]["size"] == 0
-    assert coverage["image.png"]["disposition"] == "binary_media"
-    assert coverage["script.min.js"]["disposition"] == "vendored_minified"
-    assert coverage["huge.py"]["disposition"] == "oversized"
-    assert coverage["normal.py"]["disposition"] == "full"
-    assert coverage["normal.py"]["imports_total"] == 30
-    assert coverage["normal.py"]["symbols_total"] >= 20
-    assert len(coverage["normal.py"]["imports"]) <= 12
-    assert "secretpw" not in pack.text
-    assert "postgres://***REDACTED***@db.local/app" in pack.text
+    rows = {row["path"]: row for row in manifest["touched"]}
+    assert rows[".env.production"]["disposition"] == "sensitive"
+    assert rows[".env.production"]["size"] == 0 and rows[".env.production"]["sha256"] == ""
+    assert rows["huge.py"]["disposition"] == "oversized"
+    index_rows = _index_rows(text)
+    assert index_rows["gone.py"] == "missing"
+    assert index_rows[".env.production"] == "sensitive"
+    assert "secret-value" not in text
+    assert manifest["dispositions"]["binary_media"] == 1
+    assert manifest["dispositions"]["vendored_minified"] == 1
 
 
-def test_atlas_respects_total_prompt_target_and_reports_budget_manifest_only(tmp_path):
-    tracked = []
-    for idx in range(8):
-        rel = f"pkg/mod_{idx}.py"
-        tracked.append(rel)
-        _write(tmp_path / rel, ("def f():\n    return 'x'\n" * 120))
+def test_a_touched_path_outside_the_tracked_set_is_disclosed_not_dropped(tmp_path):
+    _write(tmp_path / "mod.py", "x = 1\n")
 
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=tuple(tracked),
-            fixed_prompt_tokens=100,
-            target_total_tokens=5_000,
-            hard_total_tokens=8_000,
-        )
-    )
+    _text, manifest = repository_index(
+        tmp_path, touched_paths=["mod.py", "brand_new.py"], tracked_paths=("mod.py",))
 
-    assert pack.manifest["estimated_total_tokens"] <= 8_000
-    assert pack.manifest["selected_count"] < len(tracked)
-    assert any(row["disposition"] == "manifest_only" for row in pack.manifest["coverage"])
-    assert pack.status in {"budget_constrained", "ok"}
-
-    _write(tmp_path / "BIBLE.md", "constitution\n" * 500)
-    overflow = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("BIBLE.md",),
-            fixed_prompt_tokens=100,
-            target_total_tokens=300,
-            hard_total_tokens=350,
-        )
-    )
-    # Even the content-free manifest exceeds this micro budget (hard context
-    # allowance is 0 after fixed+headroom) — only then budget_exceeded survives.
-    assert overflow.status == "budget_exceeded"
-    assert _coverage(overflow)["BIBLE.md"]["disposition"] == "budget_omitted"
+    rows = {row["path"]: row for row in manifest["touched"]}
+    assert rows["brand_new.py"]["disposition"] == "untracked"
+    assert rows["brand_new.py"]["imported_by"] == []
 
 
-def test_atlas_required_overflow_degrades_to_manifest_not_exceeded(tmp_path):
-    """Guaranteed-fit: a required file that cannot fit the hard budget degrades
-    to an explicit budget_omitted manifest entry; the atlas stays usable
-    (budget_constrained), it does NOT give up with budget_exceeded."""
-    _write(tmp_path / "BIBLE.md", "constitution\n" * 3000)  # ~9K tokens > hard allowance
-    _write(tmp_path / "small.py", "def f():\n    return 'x'\n" * 30)
+def test_the_index_is_byte_identical_for_one_tree_and_one_change(tmp_path):
+    for idx in range(6):
+        _write(tmp_path / f"mod_{idx}.py", f"import mod_{(idx + 1) % 6}\n\nVALUE = {idx}\n")
+    tracked = tuple(f"mod_{idx}.py" for idx in range(6))
 
-    pack = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=("BIBLE.md", "small.py"),
-            fixed_prompt_tokens=100,
-            target_total_tokens=4_000,
-            hard_total_tokens=10_000,
-        )
-    )
+    first = repository_index(tmp_path, touched_paths=["mod_2.py"], tracked_paths=tracked)
+    second = repository_index(
+        tmp_path, touched_paths=["mod_2.py"], tracked_paths=tuple(reversed(tracked)))
 
-    coverage = _coverage(pack)
-    assert pack.status == "budget_constrained"
-    assert coverage["BIBLE.md"]["disposition"] == "budget_omitted"
-    assert "degraded to manifest entry" in coverage["BIBLE.md"]["reason"]
-    assert coverage["small.py"]["disposition"] == "full"
-    assert pack.manifest["estimated_total_tokens"] <= 10_000
+    assert first[0] == second[0]
+    assert first[1] == second[1]
 
 
-def test_atlas_centrality_scores_default_off_is_identical(tmp_path):
-    """Empty centrality_scores (the scope/plan path) must produce byte-identical
-    selection to the heuristic baseline — D2 is strictly additive."""
-    tracked = [f"mod_{i}.py" for i in range(6)]
-    for rel in tracked:
-        _write(tmp_path / rel, ("def f():\n    return 'x'\n" * 60))
+def test_the_index_walks_git_when_the_caller_names_no_tracked_paths(tmp_path):
+    import subprocess
 
-    def _compile(**extra):
-        return compile_review_context_atlas(
-            ReviewContextAtlasRequest(
-                repo_dir=tmp_path,
-                tracked_paths=tuple(tracked),
-                fixed_prompt_tokens=100,
-                target_total_tokens=4_000,
-                hard_total_tokens=6_000,
-                **extra,
-            )
-        )
+    _write(tmp_path / "tracked.py", "x = 1\n")
+    _write(tmp_path / "untracked.py", "y = 2\n")
+    env = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+    import os
 
-    baseline = _compile()
-    explicit_empty = _compile(centrality_scores={})
-    assert [r.rel_path for r in baseline.selected] == [r.rel_path for r in explicit_empty.selected]
-    assert baseline.text == explicit_empty.text
+    for args in (["init", "-q"], ["add", "tracked.py"], ["commit", "-qm", "base"]):
+        subprocess.run(["git", *args], cwd=str(tmp_path), check=True,
+                       capture_output=True, env={**os.environ, **env})
 
+    text, manifest = repository_index(tmp_path, touched_paths=["tracked.py"])
 
-def test_atlas_centrality_scores_boost_selection_order(tmp_path):
-    """A centrality bonus must pull a hub module into the bounded selection
-    ahead of equal-sized peers, without touching required/anchor tiers."""
-    tracked = [f"mod_{i}.py" for i in range(6)]
-    for rel in tracked:
-        _write(tmp_path / rel, ("def f():\n    return 'x'\n" * 60))
-
-    # Target budget fits only ~3 of 6 equal-sized files (selection pressure);
-    # hard budget leaves real headroom past the atlas's 5K hard reserve.
-    boosted = compile_review_context_atlas(
-        ReviewContextAtlasRequest(
-            repo_dir=tmp_path,
-            tracked_paths=tuple(tracked),
-            fixed_prompt_tokens=100,
-            target_total_tokens=2_300,
-            hard_total_tokens=7_000,
-            centrality_scores={"mod_5.py": 600.0},
-        )
-    )
-
-    selected = [r.rel_path for r in boosted.selected]
-    assert selected, "tight budget must still select at least one file"
-    assert selected[0] == "mod_5.py", "the centrality-boosted hub must be picked first"
-    assert "mod_2.py" not in selected, "the boost must displace an unboosted peer"
-    cov = _coverage(boosted)
-    assert "graph_centrality" in cov["mod_5.py"]["reason"]
+    assert manifest["tracked_count"] == 1
+    assert set(_index_rows(text)) == {"tracked.py"}

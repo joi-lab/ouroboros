@@ -1,11 +1,17 @@
-"""Monotonic lifecycle guard for write_task_result (v6.7.0-rc.1).
+"""Monotonic lifecycle guard for write_task_result (v6.7.0-rc.1; cancel redesign
+phase A, 2026-08-11).
 
 Pins the "ghost subagent" / status-corruption protections:
-- a stale scheduled/running mirror cannot overwrite a cancel-intent or terminal
-- a terminal status is sticky against a *different* terminal status
-- cancel_requested still advances to the real terminal
+- a stale scheduled/running mirror cannot overwrite a terminal or a legacy latch
+- a terminal status is sticky against a *different* terminal status — including
+  cancelled-over-completed: natural completion WINS (owner 4=A), there is no
+  explicit-cancellation override any more
+- a LEGACY ``cancel_requested`` latch (pre-intent files) yields to ANY terminal,
+  including a racing ``completed``
 - normal forward progress and same-status enrichment are unaffected
 """
+
+import json
 
 import pytest
 
@@ -53,6 +59,110 @@ def test_same_terminal_status_enrichment_allowed(drive):
     assert data["trace_summary"] == "trace"
 
 
+@pytest.mark.parametrize("previous", [None, tr.STATUS_RUNNING])
+@pytest.mark.parametrize("terminal", [
+    tr.STATUS_COMPLETED, tr.STATUS_FAILED, tr.STATUS_CANCELLED, tr.STATUS_REJECTED_DUPLICATE,
+])
+def test_first_accepted_root_terminal_write_originates_projection_debt(drive, previous, terminal):
+    if previous is not None:
+        tr.write_task_result(drive, "root", previous)
+    stored = tr.write_task_result(drive, "root", terminal)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+    assert "canonical_terminal_projection_ready" not in stored
+    assert tr.load_task_result(drive, "root", strict=True) == stored
+    enriched = tr.write_task_result(drive, "root", terminal,
+                                   canonical_terminal_projection_origin=None, result="enriched")
+    assert enriched["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("lineage", [
+    {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"},
+    {"metadata": {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"}},
+    {"root_task_id": "other"},
+])
+def test_child_or_unproven_lineage_cannot_originate_projection_debt(drive, lineage):
+    tr.write_task_result(drive, "child", tr.STATUS_RUNNING, **lineage)
+    stored = tr.write_task_result(drive, "child", tr.STATUS_COMPLETED,
+                                 canonical_terminal_projection_origin="terminal_transition")
+    assert "canonical_terminal_projection_origin" not in stored
+
+
+def test_root_retry_transition_uses_merged_lineage(drive):
+    tr.write_task_result(drive, "retry", tr.STATUS_RUNNING, root_task_id="logical-root",
+                        parent_task_id="", delegation_role="root", original_task_id="previous",
+                        timeout_retry_from="previous")
+    stored = tr.write_task_result(drive, "retry", tr.STATUS_COMPLETED)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("projector", ["plain", "replica", "enrichment"])
+def test_terminal_enrichment_cannot_adopt_a_historical_result(drive, projector):
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    path = tr.task_result_path(drive, "historical")
+    path.write_text(json.dumps({"_schema_version": tr.TASK_RESULT_SCHEMA_VERSION,
+                               "task_id": "historical", "status": tr.STATUS_COMPLETED}), encoding="utf-8")
+
+    def enrich(_current, fields):
+        return {**fields, "canonical_terminal_projection_origin": "terminal_transition"}
+
+    reducer = {"plain": None, "replica": project_replica_task_result_fields, "enrichment": enrich}[projector]
+    stored = tr.write_task_result(drive, "historical", tr.STATUS_COMPLETED, result="refreshed",
+                                 canonical_terminal_projection_origin="terminal_transition",
+                                 _field_projector=reducer)
+    assert stored["result"] == "refreshed"
+    assert "canonical_terminal_projection_origin" not in stored
+    # A rejected lifecycle write cannot create provenance either.
+    assert tr.write_task_result(drive, "historical", tr.STATUS_FAILED,
+                                canonical_terminal_projection_origin="terminal_transition") == stored
+
+
+def test_replica_cannot_supply_terminal_origin_to_an_effective_read():
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    replica = {"canonical_terminal_projection_origin": "terminal_transition", "result": "worker"}
+    assert project_replica_task_result_fields({}, replica) == {"result": "worker"}
+
+
+def test_replica_projector_keeps_terminal_lifecycle_guard(drive):
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    tr.write_task_result(drive, "t", tr.STATUS_CANCELLED, result="cancelled")
+    result = tr.write_task_result(
+        drive,
+        "t",
+        tr.STATUS_COMPLETED,
+        _field_projector=project_replica_task_result_fields,
+        result="late child",
+    )
+    assert result["status"] == tr.STATUS_CANCELLED
+    assert result["result"] == "cancelled"
+
+
+def test_writer_selects_current_review_before_locked_projector(drive):
+    panel = {"surface": "task_acceptance", "panel_id": "p", "panel_index": 0,
+             "task_attempt": 1, "publication_revision": 2, "superseded": True,
+             "aggregate_signal": "FAIL", "applied_source_ref": {"path": "original"}}
+    tr.write_task_result(drive, "review", tr.STATUS_COMPLETED, review_projection={"panels": [panel]})
+    stale = {**panel, "superseded": False, "aggregate_signal": "PASS",
+             "applied_source_ref": {"path": "stale"}}
+    calls = []
+
+    def project(current, fields):
+        assert (drive / "task_results" / "review.json.lock").exists()
+        assert fields["review_projection"] == current["review_projection"] == {"panels": [panel]}
+        calls.append(True)
+        return {**fields, "status": current["status"], "review_projection": {
+            "panels": [{**fields["review_projection"]["panels"][0],
+                        "applied_source_ref": {"path": "promoted"}}]}}
+
+    saved = tr.write_task_result(drive, "review", tr.STATUS_RUNNING,
+                                 review_projection={"panels": [stale]}, _field_projector=project)
+    assert calls == [True]
+    assert saved["status"] == tr.STATUS_COMPLETED
+    assert saved["review_projection"] == {"panels": [{**panel, "applied_source_ref": {"path": "promoted"}}]}
+
+
 def test_cancel_requested_blocks_running_but_allows_cancelled(drive):
     tr.write_task_result(drive, "t", tr.STATUS_CANCEL_REQUESTED)
     tr.write_task_result(drive, "t", tr.STATUS_RUNNING)
@@ -61,67 +171,57 @@ def test_cancel_requested_blocks_running_but_allows_cancelled(drive):
     assert _status(drive, "t") == tr.STATUS_CANCELLED
 
 
-def test_cancel_requested_not_masked_by_late_completion(drive):
-    # A worker finishing just after the cancel latch must NOT flip the task to
-    # "completed" — the requested cancel wins.
+def test_legacy_cancel_latch_yields_to_natural_completion(drive):
+    # Phase A (owner 4=A): natural completion WINS. A worker finishing after a
+    # LEGACY cancel latch flips the task to "completed" and keeps its result —
+    # cancel means "stop spending", never "discard the result".
     tr.write_task_result(drive, "t", tr.STATUS_CANCEL_REQUESTED)
     tr.write_task_result(drive, "t", tr.STATUS_COMPLETED, result="late success")
-    assert _status(drive, "t") == tr.STATUS_CANCEL_REQUESTED
-    # ...but a real teardown crash (failed) or the cancellation itself may land.
+    assert _status(drive, "t") == tr.STATUS_COMPLETED
+    # ...and once completed, a late cancelled write is refused (sticky terminal).
     tr.write_task_result(drive, "t", tr.STATUS_CANCELLED)
-    assert _status(drive, "t") == tr.STATUS_CANCELLED
+    assert _status(drive, "t") == tr.STATUS_COMPLETED
+    # A legacy latch still advances to the real teardown outcome when no natural
+    # completion raced it.
+    tr.write_task_result(drive, "u", tr.STATUS_CANCEL_REQUESTED)
+    tr.write_task_result(drive, "u", tr.STATUS_CANCELLED)
+    assert _status(drive, "u") == tr.STATUS_CANCELLED
 
 
-def test_explicit_cancellation_wins_only_a_completed_race(drive):
+def test_completed_result_survives_a_late_cancellation(drive):
+    # Phase A: the explicit-cancellation completed-overwrite is REMOVED. A late
+    # cancel must neither flip the status nor strip the completed payload
+    # (discarding a kept result is a separate explicit parent action).
     tr.write_task_result(
         drive,
         "won-race",
         tr.STATUS_COMPLETED,
-        result="late child result",
-        final_answer="late answer",
-        trace_summary="late trace",
-        artifacts=[{"name": "late.txt"}],
+        result="real child result",
+        final_answer="real answer",
+        trace_summary="real trace",
+        artifacts=[{"name": "real.txt"}],
         artifact_bundle={"status": "ready"},
         outcome_axes={"objective": {"status": "solved"}},
-        failure={"message": "stale"},
         review_evidence={"verdict": "PASS"},
         root_phase_checkpoint={"post_task_synthesis": "completed"},
         cost_usd=1.25,
         parent_task_id="parent",
     )
     tr.write_task_result(
-        drive,
-        "won-race",
-        tr.STATUS_CANCEL_REQUESTED,
-        _explicit_cancellation=True,
-        result="owner cancelled",
+        drive, "won-race", tr.STATUS_CANCELLED, result="owner cancelled",
     )
-    cancelled = tr.load_task_result(drive, "won-race")
-    assert cancelled["status"] == tr.STATUS_CANCEL_REQUESTED
-    assert cancelled["result"] == "owner cancelled"
-    assert cancelled["cost_usd"] == 1.25
-    assert cancelled["parent_task_id"] == "parent"
-    for field in (
-        "final_answer",
-        "trace_summary",
-        "artifacts",
-        "artifact_bundle",
-        "outcome_axes",
-        "failure",
-        "review_evidence",
-        "root_phase_checkpoint",
-    ):
-        assert field not in cancelled
-    tr.write_task_result(drive, "won-race", tr.STATUS_COMPLETED, result="stale completion")
-    assert _status(drive, "won-race") == tr.STATUS_CANCEL_REQUESTED
+    kept = tr.load_task_result(drive, "won-race")
+    assert kept["status"] == tr.STATUS_COMPLETED
+    assert kept["result"] == "real child result"
+    assert kept["final_answer"] == "real answer"
+    assert kept["artifacts"] == [{"name": "real.txt"}]
+    # ABI-3 fix-round-2: stored under the honest name only (the write above
+    # used the legacy kwarg — deprecated-wins honored it, then stripped it).
+    assert kept["accounted_upper_bound_usd"] == 1.25
+    assert "cost_usd" not in kept
 
     tr.write_task_result(drive, "failed", tr.STATUS_FAILED, result="real failure")
-    tr.write_task_result(
-        drive,
-        "failed",
-        tr.STATUS_CANCELLED,
-        _explicit_cancellation=True,
-    )
+    tr.write_task_result(drive, "failed", tr.STATUS_CANCELLED)
     assert _status(drive, "failed") == tr.STATUS_FAILED
 
 
@@ -184,8 +284,22 @@ def test_read_paths_do_not_create_task_results_dir(tmp_path):
     assert (root / "task_results").is_dir()
 
 
-def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkeypatch):
-    """v6.40.0 #1: the proactive namer must persist ``suggested_name`` even when the task
+def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):
+    """The exact pollution repro: a MagicMock-derived root (``MagicMock/mock``) reaching a
+    READ scan must not create a ``MagicMock`` tree in the cwd."""
+    import pathlib
+    from unittest.mock import MagicMock
+
+    monkeypatch.chdir(tmp_path)
+    stub_root = pathlib.Path(MagicMock()).parent  # == Path("MagicMock/mock")
+    assert tr.list_task_results(stub_root) == []
+    assert tr.load_task_result(stub_root, "x") is None
+    leaked = [p.name for p in pathlib.Path(".").iterdir() if "MagicMock" in p.name]
+    assert leaked == [], f"read scan leaked mock-named paths: {leaked}"
+
+
+def test_turn_namer_persists_name_on_already_terminal_task(tmp_path, monkeypatch):
+    """v6.40.0 #1: the turn namer must persist ``suggested_name`` even when the task
     already raced to a terminal status — it enriches under the CURRENT status instead of a
     regressing RUNNING write (which the monotonic guard would drop, losing the convert-reuse
     name)."""
@@ -196,7 +310,7 @@ def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkey
 
     tr.write_task_result(tmp_path, "t", tr.STATUS_COMPLETED, result="fast done")
     monkeypatch.setattr(project_naming, "llm_project_name", lambda *a, **k: "Nice Title")
-    project_naming.spawn_proactive_namer(tmp_path, "t", "build me a thing")
+    project_naming.spawn_turn_namer(tmp_path, "t", "build me a thing")
     for _ in range(100):  # join the daemon namer thread (best-effort, bounded)
         if not any(th.name == "namer-t" for th in threading.enumerate()):
             break
@@ -206,7 +320,7 @@ def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkey
     assert r.get("suggested_name") == "Nice Title", "suggested_name must survive on a terminal task"
 
 
-def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_path, monkeypatch):
+def test_turn_namer_late_settlement_refreshes_cost_without_late_name(tmp_path, monkeypatch):
     """A provider thread outliving the cosmetic deadline still closes accounting only."""
     import threading
     import time
@@ -218,7 +332,7 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
         "late-root",
         tr.STATUS_COMPLETED,
         root_task_id="late-root",
-        cost_usd=0.0,
+        accounted_upper_bound_usd=0.0,
         cost_final=True,
         root_phase_checkpoint={"post_task_synthesis": "completed"},
     )
@@ -245,7 +359,7 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
     monkeypatch.setattr(project_naming, "llm_project_name", late_paid_name)
     monkeypatch.setattr(project_naming, "_naming_timeout_sec", lambda: -29.98)
     broadcasts = []
-    project_naming.spawn_proactive_namer(
+    project_naming.spawn_turn_namer(
         tmp_path, "late-root", "build a thing", broadcast=broadcasts.append,
     )
     assert entered.wait(1)
@@ -256,14 +370,21 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
     assert not any(th.name == "namer-late-root" for th in threading.enumerate())
 
     release.set()
-    for _ in range(200):
+    # The subject is that the late settlement's refresh LANDS, not how fast: the
+    # detached thread runs reserve → dispatch → settle → cost reconstruction →
+    # locked task-result write, each a real lock cycle with fsyncs, and the
+    # Windows full-test leg took longer than a 2 s poll twice out of five runs
+    # (d0bb839e, 5fbdabd3) while green on the others. A refresh that never lands
+    # still fails here — after a bound wide enough for a loaded runner.
+    started = time.monotonic()
+    for _ in range(2000):
         stored = tr.load_task_result(tmp_path, "late-root")
-        if stored.get("cost_usd") == 0.25:
+        if stored.get("accounted_upper_bound_usd") == 0.25:
             break
         time.sleep(0.01)
     stored = tr.load_task_result(tmp_path, "late-root")
-    assert stored["cost_usd"] == 0.25
-    assert stored["cost_usd_with_children"] == 0.25
+    assert stored["accounted_upper_bound_usd"] == 0.25, f"no refresh after {time.monotonic() - started:.1f}s"
+    assert stored["accounted_upper_bound_usd_with_children"] == 0.25
     assert stored["cost_final"] is True
     assert stored.get("suggested_name") is None
     assert broadcasts == []
@@ -271,17 +392,3 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
         type("Env", (), {"drive_root": tmp_path})(),
         {"id": "late-root", "root_task_id": "late-root"},
     )
-
-
-def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):
-    """The exact pollution repro: a MagicMock-derived root (``MagicMock/mock``) reaching a
-    READ scan must not create a ``MagicMock`` tree in the cwd."""
-    import pathlib
-    from unittest.mock import MagicMock
-
-    monkeypatch.chdir(tmp_path)
-    stub_root = pathlib.Path(MagicMock()).parent  # == Path("MagicMock/mock")
-    assert tr.list_task_results(stub_root) == []
-    assert tr.load_task_result(stub_root, "x") is None
-    leaked = [p.name for p in pathlib.Path(".").iterdir() if "MagicMock" in p.name]
-    assert leaked == [], f"read scan leaked mock-named paths: {leaked}"

@@ -11,23 +11,30 @@ from __future__ import annotations
 import hashlib
 import logging
 import pathlib
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+import stat
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from ouroboros.contracts.skill_manifest import SkillManifest, SkillManifestError, canonical_skill_name, parse_skill_manifest_text
 from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
+from ouroboros.contracts.schema_versions import with_schema_version
+# Peer-conflict projection lives in its own leaf (module-size gate); it is
+# re-exported here so every historical import site keeps working unchanged.
+from ouroboros.skill_conflicts import (
+    _MAX_CONFLICT_PROJECTION,  # noqa: F401
+    enabled_skill_conflicts,  # noqa: F401
+    skill_conflict_status,  # noqa: F401
+)
 from ouroboros.skill_review_status import STATUS_BLOCKERS, STATUS_CLEAN, STATUS_PENDING, STATUS_WARNINGS, VALID_SKILL_REVIEW_STATUSES, aggregate_skill_review_status, normalize_skill_review_status, skill_review_gate
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import append_jsonl, atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
-
-
-# Constants
 
 _MANIFEST_NAMES = ("SKILL.md", "skill.json")
 # Only metadata/cache names are skipped. Non-metadata dotfiles remain hashed
 # and reviewed because a skill subprocess can import/source/read them.
-_SKILL_DIR_CACHE_NAMES = frozenset({"__pycache__", "node_modules", ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".ouroboros_env", ".DS_Store"})
+_SKILL_DIR_CACHE_NAMES = frozenset({"__pycache__", "node_modules", ".git", ".hg", ".svn", ".idea", ".vscode", ".tox", ".pytest_cache", ".ouroboros_env", ".DS_Store"})
 # Launcher/lifecycle control files are NOT runtime payload: they mark seed
 # provenance and must not invalidate (or be covered by) the review hash —
 # otherwise writing .seed-origin after hashing flips the verdict stale.
@@ -52,9 +59,9 @@ def review_status_allows_execution(status: str) -> bool:
 
 GRANTS_FILENAME = "grants.json"
 SELF_AUTHORED_MARKER_FILENAME = ".self_authored.json"
-
-
-# Dataclasses
+# Stamp every authored skill owner-state document (CPL4-C10 / ABI-2);
+# legacy-0 readers never retrofit a stamp on read.
+SKILL_OWNER_STATE_SCHEMA_VERSION = 1
 
 
 @dataclass
@@ -72,13 +79,18 @@ class SkillReviewState:
     raw_actor_records: List[Dict[str, Any]] = field(default_factory=list)
     advisory_result: Dict[str, Any] = field(default_factory=dict)
     review_profile: str = ""
+    # Reviewer identity and current author acceptance are independent evidence.
+    author_disposition: Dict[str, Any] = field(default_factory=dict)
+    reviewed_content_hash: str = ""  # Original reviewer hash on earlier author-finish records.
 
     def is_stale_for(self, current_hash: str) -> bool:
-        if not current_hash:
-            return True
-        if not self.content_hash:
-            return True
-        return self.content_hash != current_hash
+        return not current_hash or (self.reviewed_content_hash or self.content_hash) != current_hash
+
+    def gate_for(self, current_hash: str, *, enforcement: Optional[str] = None) -> Dict[str, Any]:
+        return {**skill_review_gate(self.status, stale=self.is_stale_for(current_hash),
+                                   enforcement=enforcement, findings=self.findings,
+                                   author_disposition=self.author_disposition, current_hash=current_hash),
+                "reviewed_content_hash": self.reviewed_content_hash or self.content_hash}
 
     def to_dict(self) -> Dict[str, Any]:
         data = {
@@ -95,6 +107,10 @@ class SkillReviewState:
             data["review_profile"] = str(self.review_profile)
         if self.advisory_result:
             data["advisory_result"] = dict(self.advisory_result)
+        if self.author_disposition:
+            data["author_disposition"] = dict(self.author_disposition)
+        if self.reviewed_content_hash:
+            data["reviewed_content_hash"] = str(self.reviewed_content_hash)
         has_review_verdicts = any(
             str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
             for f in self.findings
@@ -118,6 +134,11 @@ class LoadedSkill:
     load_error: str = ""
     source: str = "native"
     is_self_authored: bool = False
+    identity_collision: bool = False
+
+    @property
+    def conflicts(self) -> tuple[str, ...]:
+        return tuple(self.manifest.conflicts or ())
 
     @property
     def available_for_execution(self) -> bool:
@@ -129,14 +150,12 @@ class LoadedSkill:
         if not self.manifest.is_script():
             # instruction has no payload; extension runs through PluginAPI.
             return False
-        if not review_status_allows_execution(self.review.status):
-            return False
-        if self.review.is_stale_for(self.content_hash):
+        if not self.review.gate_for(self.content_hash)["executable_review"]:
             return False
         from ouroboros.tools.skill_exec import _resolve_runtime_binary, _resolve_script_path
 
         runtime = (self.manifest.runtime or "").strip().lower()
-        if _resolve_runtime_binary(runtime) is None:
+        if _resolve_runtime_binary(runtime)[0] is None:
             return False
         for entry in self.manifest.scripts or []:
             if not isinstance(entry, dict):
@@ -154,21 +173,38 @@ class LoadedSkill:
         return False
 
 
-# Disk paths
+@dataclass(frozen=True)
+class _SkillLocationCandidate:
+    """Package location without payload or state reads."""
+
+    name: str
+    location: str
+    skill_dir: pathlib.Path
 
 
 def _skills_state_root(drive_root: pathlib.Path) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / "skills"
 
 
-def skill_state_dir(drive_root: pathlib.Path, name: str) -> pathlib.Path:
-    """Return ``~/Ouroboros/data/state/skills/<name>/`` (created on demand).
+def skill_state_dir_path(drive_root: pathlib.Path, name: str) -> pathlib.Path:
+    """The skill's state dir path WITHOUT creating it — for read-only
+    consumers (``load_review_state``, the RC auditor's admission reuse):
+    reading state must never mutate the root it reads from.
+
+    The generation-fenced companion recovery resolves the state dir through
+    here BEFORE its fence (fix-round-6); creation belongs to the post-fence
+    attach in ``_publish_registrations``, so a stale refusal creates no
+    directories. ``skill_state_dir`` is the creating variant for load paths.
 
     The name is normalized to its alnum-dashes shape before joining so a
     malicious manifest ``name: ../foo`` cannot escape the state root.
     """
-    safe = _sanitize_skill_name(name)
-    path = _skills_state_root(drive_root) / safe
+    return _skills_state_root(drive_root) / _sanitize_skill_name(name)
+
+
+def skill_state_dir(drive_root: pathlib.Path, name: str) -> pathlib.Path:
+    """Return ``~/Ouroboros/data/state/skills/<name>/`` (created on demand)."""
+    path = skill_state_dir_path(drive_root, name)
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -226,9 +262,6 @@ def is_self_authored_skill_dir(
     )
 
 
-# Manifest discovery
-
-
 class _ManifestUnreadable(RuntimeError):
     """A manifest file exists but could not be read (permissions,
     truncation, IO error, etc.). Callers translate this into a
@@ -266,7 +299,12 @@ def _manifest_text_for_dir(skill_dir: pathlib.Path) -> Optional[tuple[str, pathl
     return None
 
 
-def _broken_skill(skill_dir: pathlib.Path, load_error: str) -> LoadedSkill:
+def _broken_skill(
+    skill_dir: pathlib.Path,
+    load_error: str,
+    *,
+    identity_collision: bool = False,
+) -> LoadedSkill:
     name = _sanitize_skill_name(skill_dir.name)
     return LoadedSkill(
         name=name,
@@ -279,6 +317,7 @@ def _broken_skill(skill_dir: pathlib.Path, load_error: str) -> LoadedSkill:
         ),
         content_hash="",
         load_error=load_error,
+        identity_collision=identity_collision,
     )
 
 
@@ -289,20 +328,21 @@ def _iter_payload_files(
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     include_control_files: bool = False,
 ) -> List[pathlib.Path]:
-    """Return files hashed for review freshness.
+    """List regular runtime payload files, excluding cache trees and symlink escapes.
 
-    The hash covers every regular runtime-reachable file under ``skill_dir``
-    except metadata/cache/sensitive paths, lifecycle control files
-    (``HASH_EXEMPT_CONTROL_FILENAMES``), and symlink escapes. Manifest entry
-    points are re-added only when confined, keeping executable and reviewed
-    surfaces aligned. ``include_control_files=True`` reproduces the legacy
-    pre-v6.31 hash (control files included) for one-shot state migration.
+    Confined manifest entries are re-added even under excluded directories,
+    keeping executable entry points inside the reviewed surface.
+    Native lifecycle markers are omitted unless ``include_control_files`` requests
+    their legacy pre-v6.31 hash. Sensitive filenames refuse ordinary loading;
+    Cyber includes them in the byte hash and review pack.
     """
     out: List[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
     resolved_root = skill_dir.resolve()
 
     def _add(path: pathlib.Path) -> None:
-        if path not in out:
+        if path not in seen:
+            seen.add(path)
             out.append(path)
 
     def _add_if_confined(relpath: str) -> None:
@@ -314,19 +354,21 @@ def _iter_payload_files(
         resolved = (skill_dir / rel).resolve()
         try:
             resolved.relative_to(resolved_root)
-        except ValueError:
+            # is_file() hides ELOOP; an unreadable declared entry cannot be omitted from its hash.
+            if stat.S_ISREG(resolved.stat().st_mode):
+                _add(resolved)
+        except (ValueError, FileNotFoundError, NotADirectoryError):
             return
-        if resolved.is_file():
-            _add(resolved)
 
-    # Broad walk: everything runtime-reachable, minus metadata/cache names.
-    # Every candidate is resolved back under skill_dir so symlinks cannot leak
-    # outside files into reviewer prompts. Sensitive-path policy is shared with
-    # repo review.
+    # Confinement and the shared sensitive-path policy still cover every candidate.
     from ouroboros.tools.review_helpers import (
         _SENSITIVE_EXTENSIONS,
         _SENSITIVE_NAMES,
     )
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+    cyber = runtime_mode_at_least(get_runtime_mode(), "cyber_pro")
 
     def _is_sensitive(path: pathlib.Path) -> bool:
         lowered = path.name.lower()
@@ -338,15 +380,21 @@ def _iter_payload_files(
         return False
 
     if resolved_root.is_dir():
-        for path in sorted(resolved_root.rglob("*")):
+        paths = []
+        pending = [resolved_root]
+        while pending:
+            directory = pending.pop()
+            for path in directory.glob("*"):
+                if path.name in _SKILL_DIR_CACHE_NAMES:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    pending.append(path)
+                else:
+                    paths.append(path)
+        for path in sorted(paths):
             if not path.is_file():
                 continue
-            try:
-                rel_parts = path.relative_to(resolved_root).parts
-            except ValueError:
-                continue
-            if any(part in _SKILL_DIR_CACHE_NAMES for part in rel_parts):
-                continue
+            rel_parts = path.relative_to(resolved_root).parts
             # Only the TOP-LEVEL lifecycle marker of a NATIVE-bucket payload is
             # hash-exempt (the launcher writes it there; P3: everywhere else a
             # file by that name is ordinary runtime-reachable payload and stays
@@ -358,15 +406,16 @@ def _iter_payload_files(
                 and resolved_root.parent.name == "native"
             ):
                 continue
-            if _is_sensitive(path):
+            if _is_sensitive(path) and not cyber:
                 # Fail closed: a reviewed skill could still read a skipped
                 # credential-shaped file at runtime.
                 raise SkillPayloadUnreadable(
                     str(path.relative_to(resolved_root)),
                     RuntimeError(
-                        "sensitive-shape filename present in skill tree "
-                        "(e.g. .env / credentials.json / .pem). Rename "
-                        "or relocate the file outside the skill checkout."
+                        "exact credential filename or .env-tail filename present "
+                        "in skill tree (e.g. .env / prod.env / credentials.json / "
+                        "id_rsa / .netrc). Rename or relocate the file outside "
+                        "the skill checkout."
                     ),
                 )
             # Symlink escape guard: resolve the final path and re-check
@@ -413,6 +462,16 @@ class SkillPayloadUnreadable(RuntimeError):
         self.err = err
 
 
+def reduce_skill_content_hash(file_digests: Iterable[tuple[str, bytes]]) -> str:
+    """Reduce canonically ordered relative paths and file digests."""
+    digest = hashlib.sha256()
+    for rel, file_digest in file_digests:
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(file_digest)
+    return digest.hexdigest()
+
+
 def compute_content_hash(
     skill_dir: pathlib.Path,
     *,
@@ -427,8 +486,8 @@ def compute_content_hash(
     ``include_control_files=True`` reproduces the legacy pre-v6.31 hash for
     one-shot state migration only.
     """
-    digest = hashlib.sha256()
     skill_dir = skill_dir.resolve()
+    file_digests: List[tuple[str, bytes]] = []
     for file_path in _iter_payload_files(
         skill_dir,
         manifest_entry=manifest_entry,
@@ -448,31 +507,57 @@ def compute_content_hash(
         except OSError as exc:
             log.warning("Failed to read skill payload file %s", file_path, exc_info=True)
             raise SkillPayloadUnreadable(rel, exc) from exc
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        digest.update(file_digest.digest())
-    return digest.hexdigest()
-
-
-# State persistence
+        file_digests.append((rel, file_digest.digest()))
+    return reduce_skill_content_hash(file_digests)
 
 
 def load_enabled(drive_root: pathlib.Path, name: str) -> bool:
-    state = read_json_dict(skill_state_dir(drive_root, name) / "enabled.json")
+    state = read_json_dict(skill_state_dir_path(drive_root, name) / "enabled.json")
     if not isinstance(state, dict):
         return False
     enabled = state.get("enabled")
     return enabled if isinstance(enabled, bool) else False
 
 
-def save_enabled(drive_root: pathlib.Path, name: str, enabled: bool) -> None:
+def save_enabled(
+    drive_root: pathlib.Path,
+    name: str,
+    enabled: bool,
+    *,
+    actor: str = "",
+    reason: str = "",
+) -> None:
+    """Persist enablement and best-effort append one typed disclosure row.
+
+    The host-derived ``actor`` also rides the state snapshot so a selected
+    development task can distinguish a later owner disable from a load-error
+    revert without replaying the event log. Missing actors remain unknown.
+    An append failure is logged and never blocks the enablement change.
+    """
+    previous = load_enabled(drive_root, name)
     atomic_write_json(
         skill_state_dir(drive_root, name) / "enabled.json",
-        {
-            "enabled": bool(enabled),
-            "updated_at": utc_now_iso(),
-        },
+        with_schema_version(
+            {
+                "enabled": bool(enabled),
+                "updated_at": utc_now_iso(),
+                "actor": str(actor or ""),
+            },
+            SKILL_OWNER_STATE_SCHEMA_VERSION,
+        ),
     )
+    try:
+        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "skill_enabled_changed",
+            "skill": name,
+            "enabled": bool(enabled),
+            "previous": bool(previous),
+            "actor": str(actor or ""),
+            "reason": str(reason or ""),
+        })
+    except Exception:
+        log.debug("Failed to append skill_enabled_changed for %s", name, exc_info=True)
 
 
 def load_review_state(
@@ -483,7 +568,9 @@ def load_review_state(
     is_module_widget: bool = False,
     skill_dir: Optional[pathlib.Path] = None,
 ) -> SkillReviewState:
-    data = read_json_dict(skill_state_dir(drive_root, name) / "review.json")
+    # Read-only over the state root (skill_state_dir_path, never mkdir): the
+    # RC auditor reuses this admission read over a root it must not mutate.
+    data = read_json_dict(skill_state_dir_path(drive_root, name) / "review.json")
     if not isinstance(data, dict):
         return SkillReviewState()
     raw_status = str(data.get("status") or "").lower()
@@ -517,7 +604,7 @@ def load_review_state(
     # the skill drops back to pending), exactly like native_seed provenance. Content edits
     # still stale the verdict through the normal content_hash check.
     if review_profile == "owner_attested":
-        if not (skill_state_dir(drive_root, name) / "owner_attestation.json").is_file():
+        if not (skill_state_dir_path(drive_root, name) / "owner_attestation.json").is_file():
             return SkillReviewState()
     has_review_verdicts = any(
         str(f.get("verdict") or "").upper() in {"PASS", "FAIL"}
@@ -549,6 +636,9 @@ def load_review_state(
         if isinstance(data.get("advisory_result"), dict)
         else {}
     )
+    author_disposition = validate_author_disposition(
+        data.get("author_disposition"),
+    ) or {}
     try:
         prompt_chars = int(data.get("prompt_chars") or 0)
     except (TypeError, ValueError):
@@ -569,6 +659,8 @@ def load_review_state(
         raw_actor_records=[r for r in raw_actor_records if isinstance(r, dict)],
         advisory_result=dict(advisory_result),
         review_profile=review_profile,
+        author_disposition=author_disposition,
+        reviewed_content_hash=str(data.get("reviewed_content_hash") or ""),
     )
 
 
@@ -579,22 +671,22 @@ def save_review_state(
 ) -> None:
     atomic_write_json(
         skill_state_dir(drive_root, name) / "review.json",
-        review.to_dict(),
+        with_schema_version(review.to_dict(), SKILL_OWNER_STATE_SCHEMA_VERSION),
     )
 
 
 def requested_core_setting_keys(env_keys: List[str]) -> List[str]:
     """Return manifest-requested setting keys that require explicit owner grants."""
+    if not env_keys:
+        return []  # nothing requested, nothing to classify: no settings read
     forbidden_upper = {key.upper() for key in FORBIDDEN_SKILL_SETTINGS}
     requestable_when_absent = {"TELEGRAM_BOT_TOKEN"}
     try:
         from ouroboros.config import SETTINGS_DEFAULTS, load_settings
         settings = load_settings()
         custom_secret_upper = {
-            str(key).upper()
-            for key in settings
-            if str(key).upper() not in SETTINGS_DEFAULTS
-            and str(key).upper().replace("_", "").isalnum()
+            str(key).upper() for key in settings
+            if str(key).upper() not in SETTINGS_DEFAULTS and str(key).upper().replace("_", "").isalnum()
         }
     except Exception:
         custom_secret_upper = set()
@@ -609,6 +701,8 @@ def requested_core_setting_keys(env_keys: List[str]) -> List[str]:
 
 _GRANTABLE_SKILL_PERMISSIONS = frozenset({
     "inject_chat",
+    "presence",
+    "notify_owner",
     "subscribe_event:chat.outbound",
     "subscribe_event:chat.typing",
     "subscribe_event:chat.photo",
@@ -623,8 +717,9 @@ def requested_skill_permissions(
     """Return manifest-requested privileged permissions needing owner grants."""
     requested: List[str] = []
     permission_set = {str(item or "").strip() for item in (permissions or [])}
-    if "inject_chat" in permission_set:
-        requested.append("inject_chat")
+    for permission in ("inject_chat", "presence", "notify_owner"):
+        if permission in permission_set:
+            requested.append(permission)
     if "subscribe_event" in permission_set:
         for raw_topic in subscribe_events or []:
             topic = str(raw_topic or "").strip()
@@ -656,7 +751,7 @@ def _merge_allowed(*value_groups: Any, allowed: set[str], upper: bool = False) -
 
 
 def load_skill_grants(drive_root: pathlib.Path, name: str) -> Dict[str, Any]:
-    data = read_json_dict(skill_state_dir(drive_root, name) / GRANTS_FILENAME)
+    data = read_json_dict(skill_state_dir_path(drive_root, name) / GRANTS_FILENAME)
     if not isinstance(data, dict):
         return {"granted_keys": [], "granted_permissions": [], "updated_at": ""}
     keys = _unique_text(data.get("granted_keys"), upper=True)
@@ -702,20 +797,43 @@ def save_skill_grants(
         granted_permissions,
         allowed=allowed_permissions,
     )
+    # Stamp at write (CPL4-C10): load_skill_grants normalizes to a fixed key
+    # set, so the stamp must be re-authored here rather than carried through
+    # the read-merge round trip.
     atomic_write_json(
         skill_state_dir(drive_root, name) / GRANTS_FILENAME,
-        {
-            "granted_keys": merged,
-            "requested_keys": sorted(allowed),
-            "granted_permissions": sorted(existing_permissions),
-            "requested_permissions": sorted(allowed_permissions),
-            "content_hash": str(content_hash or ""),
-            "updated_at": utc_now_iso(),
-        },
+        with_schema_version(
+            {
+                "granted_keys": merged,
+                "requested_keys": sorted(allowed),
+                "granted_permissions": sorted(existing_permissions),
+                "requested_permissions": sorted(allowed_permissions),
+                "content_hash": str(content_hash or ""),
+                "updated_at": utc_now_iso(),
+            },
+            SKILL_OWNER_STATE_SCHEMA_VERSION,
+        ),
     )
 
 
 def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict[str, Any]:
+    if bool(getattr(skill, "identity_collision", False)):
+        # Collision placeholders deliberately carry no manifest/state payload.
+        # Do not create ``state/skills/<name>`` merely to summarize a target
+        # whose physical identity has not been selected.
+        return {
+            "requested_keys": [],
+            "granted_keys": [],
+            "missing_keys": [],
+            "requested_permissions": [],
+            "granted_permissions": [],
+            "missing_permissions": [],
+            "all_granted": True,
+            "usable": False,
+            "unsupported_for_skill_type": False,
+            "content_hash": "",
+            "updated_at": "",
+        }
     requested = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
     requested_permissions = requested_skill_permissions(
         list(skill.manifest.permissions or []),
@@ -735,7 +853,7 @@ def grant_status_for_skill(drive_root: pathlib.Path, skill: LoadedSkill) -> Dict
     granted_permissions = [perm for perm in requested_permissions if perm in persisted_permissions]
     missing = [key for key in requested if key not in set(granted)]
     missing_permissions = [perm for perm in requested_permissions if perm not in set(granted_permissions)]
-    review_ready = review_status_allows_execution(skill.review.status) and not skill.review.is_stale_for(skill.content_hash)
+    review_ready = skill.review.gate_for(skill.content_hash)["executable_review"]
     # Scripts receive core keys via _scrub_env; extensions via PluginAPI.
     # Instruction skills cannot receive core keys.
     eligible_type = skill.manifest.is_script() or skill.manifest.is_extension()
@@ -783,11 +901,9 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         return outcome
     if skill.load_error:
         return outcome
-    if skill.review.is_stale_for(skill.content_hash):
-        return outcome
-    if not review_status_allows_execution(skill.review.status):
-        return outcome
-    if normalize_skill_review_status(skill.review.status) == _REVIEW_STATUS_PENDING:
+    gate = skill.review.gate_for(skill.content_hash)
+    if (not gate["executable_review"] or (gate["status"] == _REVIEW_STATUS_PENDING
+        and gate["blocking_reason"] != "author_accepted_advisory")):
         return outcome
     if not requested_keys and not requested_permissions:
         return outcome
@@ -807,9 +923,6 @@ def auto_grant_if_enabled(drive_root: pathlib.Path, skill: LoadedSkill) -> AutoG
         requested_permissions=requested_permissions,
         granted_permissions=list(requested_permissions),
     )
-
-
-# Discovery / loading
 
 
 def _safe_listdir(root: pathlib.Path) -> List[pathlib.Path]:
@@ -921,8 +1034,20 @@ def _is_orphan_marker_name(name: str) -> bool:
 
 def _walk_skill_packages(
     root: pathlib.Path,
+    *,
+    selected_manifestless_name: str = "",
+    include_manifestless_root: bool = False,
+    excluded_manifestless_children: frozenset[str] = frozenset(),
+    listdir: Optional[Callable[[pathlib.Path], List[pathlib.Path]]] = None,
 ) -> List[pathlib.Path]:
-    """Yield skill packages at root or one level deep, skipping install orphans."""
+    """Yield ordinary packages plus one exact selected manifestless target.
+
+    ``listdir`` overrides the traversal reader: the runtime keeps the
+    fail-soft ``_safe_listdir`` default (an unreadable repo loads as empty),
+    while a strict consumer (the RC auditor) passes a raising lister so a
+    traversal ``OSError`` surfaces instead of silently emptying the walk."""
+    if listdir is None:
+        listdir = _safe_listdir
     out: List[pathlib.Path] = []
     if not root.is_dir():
         return out
@@ -930,70 +1055,68 @@ def _walk_skill_packages(
         # Back-compat: OUROBOROS_SKILLS_REPO_PATH may point at one skill.
         out.append(root)
         return out
-    for child in _safe_listdir(root):
+    root_is_selected_manifestless = (
+        include_manifestless_root
+        and selected_manifestless_name
+        and not _is_orphan_marker_name(root.name)
+        and _sanitize_skill_name(root.name) == selected_manifestless_name
+    )
+    found_manifest_package = False
+    for child in listdir(root):
         if _is_orphan_marker_name(child.name):
             continue
         if _looks_like_skill_dir(child):
             out.append(child)
+            found_manifest_package = True
             continue
+        child_has_manifest_package = False
         # One level deeper for grouping containers such as native/clawhub.
-        for grandchild in _safe_listdir(child):
+        for grandchild in listdir(child):
             if _is_orphan_marker_name(grandchild.name):
                 continue
             if _looks_like_skill_dir(grandchild):
                 out.append(grandchild)
+                child_has_manifest_package = True
+                found_manifest_package = True
+            elif (
+                selected_manifestless_name
+                and _sanitize_skill_name(grandchild.name)
+                == selected_manifestless_name
+            ):
+                out.append(grandchild)
+        if (
+            selected_manifestless_name
+            and not child_has_manifest_package
+            and child.name not in excluded_manifestless_children
+            and _sanitize_skill_name(child.name) == selected_manifestless_name
+        ):
+            out.append(child)
+    if root_is_selected_manifestless and not found_manifest_package:
+        # Preserve the direct-checkout interpretation only for a leaf package;
+        # a checkout root containing real child packages remains a container.
+        return [root]
     return out
 
 
-def _classify_skill_source(
+def _classify_skill_location(
     skill_dir: pathlib.Path,
     *,
     data_skills_root: Optional[pathlib.Path],
     user_repo_root: Optional[pathlib.Path],
 ) -> str:
-    """Return the source tag, using provenance sidecars for trusted buckets."""
+    """Classify physical location without consulting provenance or state."""
     from ouroboros.config import (
-        SKILL_SOURCE_CLAWHUB,
         SKILL_SOURCE_EXTERNAL,
-        SKILL_SOURCE_NATIVE,
-        SKILL_SOURCE_OUROBOROSHUB,
-        SKILL_SOURCE_SELF_AUTHORED,
-        SKILL_SOURCE_USER_REPO,
         SKILL_SOURCE_SUBDIRS,
+        SKILL_SOURCE_USER_REPO,
     )
-    try:
-        resolved = skill_dir.resolve()
-    except OSError:
-        return SKILL_SOURCE_EXTERNAL
+
+    resolved = skill_dir.resolve()
     if data_skills_root is not None:
         try:
             rel = resolved.relative_to(data_skills_root.resolve())
-            parts = rel.parts
-            if parts:
-                try:
-                    marker_drive_root = data_skills_root.resolve().parent
-                except OSError:
-                    marker_drive_root = None
-                if is_self_authored_skill_dir(resolved, drive_root=marker_drive_root):
-                    return SKILL_SOURCE_SELF_AUTHORED
-                bucket = parts[0]
-                if bucket in SKILL_SOURCE_SUBDIRS:
-                    if bucket == SKILL_SOURCE_NATIVE:
-                        # Native means launcher-seeded; absent marker is external.
-                        if (resolved / ".seed-origin").is_file():
-                            return SKILL_SOURCE_NATIVE
-                        return SKILL_SOURCE_EXTERNAL
-                    if bucket == SKILL_SOURCE_CLAWHUB:
-                        # Marketplace lifecycle actions require provenance.
-                        if (resolved / ".clawhub.json").is_file():
-                            return SKILL_SOURCE_CLAWHUB
-                        return SKILL_SOURCE_EXTERNAL
-                    if bucket == SKILL_SOURCE_OUROBOROSHUB:
-                        if (resolved / ".ouroboroshub.json").is_file():
-                            return SKILL_SOURCE_OUROBOROSHUB
-                        return SKILL_SOURCE_EXTERNAL
-                    return bucket
-            # Unknown buckets are user-managed external skills.
+            if rel.parts and rel.parts[0] in SKILL_SOURCE_SUBDIRS:
+                return rel.parts[0]
             return SKILL_SOURCE_EXTERNAL
         except ValueError:
             pass
@@ -1006,6 +1129,236 @@ def _classify_skill_source(
     return SKILL_SOURCE_EXTERNAL
 
 
+def _skill_location_inventory(
+    drive_root: pathlib.Path,
+    repo_path: str | None = None,
+    *,
+    selected_manifestless_name: str = "",
+) -> tuple[_SkillLocationCandidate, ...]:
+    """Return deduplicated manifest locations without payload/state reads."""
+    from ouroboros.config import SKILL_SOURCE_SUBDIRS
+
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    repo_path = str(repo_path or "").strip()
+
+    data_skills_root = _resolve_data_skills_dir(drive_root)
+    user_repo_root: Optional[pathlib.Path] = None
+    if repo_path:
+        try:
+            candidate = pathlib.Path(repo_path).expanduser().resolve()
+        except OSError:
+            candidate = None
+        if candidate is not None and candidate.is_dir():
+            user_repo_root = candidate
+
+    roots: List[tuple[pathlib.Path, bool]] = []
+    if data_skills_root is not None:
+        roots.append((data_skills_root, False))
+    if user_repo_root is not None:
+        roots.append((user_repo_root, True))
+
+    inventory: List[_SkillLocationCandidate] = []
+    seen_dirs: set[pathlib.Path] = set()
+    for root, include_manifestless_root in roots:
+        excluded_children = (
+            frozenset(SKILL_SOURCE_SUBDIRS)
+            if not include_manifestless_root
+            else frozenset()
+        )
+        for entry in _walk_skill_packages(
+            root,
+            selected_manifestless_name=selected_manifestless_name,
+            include_manifestless_root=include_manifestless_root,
+            excluded_manifestless_children=excluded_children,
+        ):
+            try:
+                resolved = entry.resolve()
+            except OSError:
+                continue
+            if resolved in seen_dirs:
+                continue
+            seen_dirs.add(resolved)
+            try:
+                location = _classify_skill_location(
+                    resolved,
+                    data_skills_root=data_skills_root,
+                    user_repo_root=user_repo_root,
+                )
+            except OSError:
+                continue
+            inventory.append(
+                _SkillLocationCandidate(
+                    name=_sanitize_skill_name(resolved.name),
+                    location=location,
+                    skill_dir=resolved,
+                )
+            )
+
+    return tuple(
+        sorted(
+            inventory,
+            key=lambda item: (item.name, item.location, str(item.skill_dir)),
+        )
+    )
+
+
+def skill_identity_collision_names(
+    drive_root: pathlib.Path,
+    repo_path: str | None = None,
+) -> frozenset[str]:
+    """Return ambiguous canonical identities without loading payload state."""
+    counts: Dict[str, int] = {}
+    for candidate in _skill_location_inventory(drive_root, repo_path=repo_path):
+        counts[candidate.name] = counts.get(candidate.name, 0) + 1
+    return frozenset(name for name, count in counts.items() if count > 1)
+
+
+def _select_skill_location(
+    candidates: tuple[_SkillLocationCandidate, ...],
+    *,
+    name: str,
+    location: str,
+    require_unique_identity: bool = True,
+) -> Optional[_SkillLocationCandidate]:
+    """Select one physical location, preserving global collision evidence."""
+    canonical_name = _sanitize_skill_name(name)
+    identity = tuple(item for item in candidates if item.name == canonical_name)
+    if not identity:
+        # The caller alone decides whether a missing explicit ``external``
+        # location starts the existing manifest-first creation flow.
+        return None
+
+    evidence = ", ".join(
+        f"{item.location}:{item.skill_dir}" for item in identity
+    )
+    if require_unique_identity and len(identity) > 1:
+        raise ValueError(
+            f"Skill name collision for {canonical_name!r}: {evidence}"
+        )
+
+    selected = tuple(item for item in identity if item.location == location)
+    if len(selected) > 1:
+        raise ValueError(
+            f"Skill location collision for {canonical_name!r} in "
+            f"{location!r}: {evidence}"
+        )
+    if not selected:
+        raise ValueError(
+            f"Skill {canonical_name!r} exists, but not in requested "
+            f"location {location!r}: {evidence}"
+        )
+    return selected[0]
+
+
+def _skill_location_conflict_error(
+    drive_root: pathlib.Path,
+    *,
+    name: str,
+    location: str,
+    target_dir: pathlib.Path,
+    repo_path: str | None = None,
+) -> str:
+    """Purely reject an identity that cannot map to one exact target."""
+
+    try:
+        selected = _select_skill_location(
+            _skill_location_inventory(drive_root, repo_path=repo_path),
+            name=name,
+            location=location,
+        )
+    except ValueError as exc:
+        return f"Skill identity collision: {exc}"
+    if selected is not None and selected.skill_dir.resolve() != pathlib.Path(target_dir).resolve():
+        return (
+            f"Skill identity collision: {name!r} resolves to "
+            f"{selected.skill_dir}, not {target_dir}"
+        )
+    return ""
+
+
+def _classify_skill_source(
+    skill_dir: pathlib.Path,
+    *,
+    location: str,
+    drive_root: pathlib.Path,
+) -> str:
+    """Return the source tag, using provenance sidecars for trusted buckets."""
+    from ouroboros.config import (
+        SKILL_SOURCE_CLAWHUB,
+        SKILL_SOURCE_EXTERNAL,
+        SKILL_SOURCE_NATIVE,
+        SKILL_SOURCE_OUROBOROSHUB,
+        SKILL_SOURCE_SELF_AUTHORED,
+        SKILL_SOURCE_USER_REPO,
+    )
+    if location == SKILL_SOURCE_USER_REPO:
+        return SKILL_SOURCE_USER_REPO
+    if is_self_authored_skill_dir(skill_dir, drive_root=drive_root):
+        return SKILL_SOURCE_SELF_AUTHORED
+    marker_by_source = {
+        SKILL_SOURCE_NATIVE: ".seed-origin",
+        SKILL_SOURCE_CLAWHUB: ".clawhub.json",
+        SKILL_SOURCE_OUROBOROSHUB: ".ouroboroshub.json",
+    }
+    marker = marker_by_source.get(location)
+    if marker:
+        return location if (skill_dir / marker).is_file() else SKILL_SOURCE_EXTERNAL
+    return SKILL_SOURCE_EXTERNAL
+
+
+def _load_skill_location_candidates(
+    candidates: tuple[_SkillLocationCandidate, ...],
+    *,
+    drive_root: pathlib.Path,
+    include_manifestless: bool = False,
+) -> List[LoadedSkill]:
+    """Load one inventory with the ordinary collision/source semantics."""
+    skills: List[LoadedSkill] = []
+    by_name: Dict[str, List[_SkillLocationCandidate]] = {}
+    for candidate in candidates:
+        by_name.setdefault(candidate.name, []).append(candidate)
+    for name, group in by_name.items():
+        if len(group) > 1:
+            dirs = ", ".join(
+                f"{candidate.location}:{candidate.skill_dir}"
+                for candidate in group
+            )
+            error = (
+                f"Skill name collision: multiple checkout directories "
+                f"({dirs}) sanitise to {name!r}. Rename the directories "
+                "so their basenames yield distinct identifiers before "
+                "enabling / reviewing / executing."
+            )
+            for candidate in group:
+                broken = _broken_skill(
+                    candidate.skill_dir,
+                    error,
+                    identity_collision=True,
+                )
+                broken.source = candidate.location
+                skills.append(broken)
+            continue
+
+        candidate = group[0]
+        loaded = load_skill(candidate.skill_dir, drive_root)
+        if loaded is None and include_manifestless:
+            loaded = _broken_skill(candidate.skill_dir, "manifest missing")
+        if loaded is None:
+            continue
+        loaded.source = _classify_skill_source(
+            candidate.skill_dir,
+            location=candidate.location,
+            drive_root=drive_root,
+        )
+        skills.append(loaded)
+
+    skills.sort(key=lambda skill: (skill.name, str(skill.skill_dir)))
+    return skills
+
+
 def discover_skills(
     drive_root: pathlib.Path,
     repo_path: str | None = None,
@@ -1016,63 +1369,71 @@ def discover_skills(
         repo_path = get_skills_repo_path()
     repo_path = str(repo_path or "").strip()
 
-    data_skills_root = _resolve_data_skills_dir(drive_root)
-    user_repo_root: Optional[pathlib.Path] = None
-    if repo_path:
-        try:
-            user_repo_candidate = pathlib.Path(repo_path).expanduser().resolve()
-        except OSError:
-            user_repo_candidate = None
-        if user_repo_candidate is not None and user_repo_candidate.is_dir():
-            user_repo_root = user_repo_candidate
+    candidates = _skill_location_inventory(drive_root, repo_path=repo_path)
 
-    roots: List[pathlib.Path] = []
-    if data_skills_root is not None:
-        roots.append(data_skills_root)
-    if user_repo_root is not None:
-        # Avoid double-scanning when the optional checkout is the data root.
-        if data_skills_root is None or user_repo_root != data_skills_root.resolve():
-            roots.append(user_repo_root)
+    return _load_skill_location_candidates(candidates, drive_root=drive_root)
 
-    skills: List[LoadedSkill] = []
-    seen_dirs: set[pathlib.Path] = set()
-    for root in roots:
-        for entry in _walk_skill_packages(root):
-            try:
-                resolved = entry.resolve()
-            except OSError:
-                continue
-            if resolved in seen_dirs:
-                continue
-            seen_dirs.add(resolved)
-            loaded = load_skill(entry, drive_root)
-            if loaded is None:
-                continue
-            loaded.source = _classify_skill_source(
-                entry,
-                data_skills_root=data_skills_root,
-                user_repo_root=user_repo_root,
-            )
-            skills.append(loaded)
 
-    # Distinct dirs must not share enabled/review state after name sanitizing.
-    by_name: Dict[str, List[LoadedSkill]] = {}
-    for skill in skills:
-        by_name.setdefault(skill.name, []).append(skill)
-    for name, group in by_name.items():
-        if len(group) > 1:
-            dirs = ", ".join(str(s.skill_dir) for s in group)
-            for skill in group:
-                if not skill.load_error:
-                    skill.load_error = (
-                        f"Skill name collision: multiple checkout directories "
-                        f"({dirs}) sanitise to {name!r}. Rename the directories "
-                        "so their basenames yield distinct identifiers before "
-                        "enabling / reviewing / executing."
-                    )
+def discover_selected_skill_candidates(
+    drive_root: pathlib.Path,
+    name: str,
+    *,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Resolve one selected identity, including a just-deleted manifest.
 
-    skills.sort(key=lambda s: s.name)
-    return skills
+    The manifestless opt-in is intentionally unavailable to ordinary passive
+    discovery. It exists only so a card opened before deletion can still start
+    an agent repair task and so hidden physical collisions remain ambiguous.
+    """
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    configured_repo = str(repo_path or "").strip()
+    canonical_name = _sanitize_skill_name(name)
+    candidates = tuple(
+        candidate
+        for candidate in _skill_location_inventory(
+            drive_root,
+            repo_path=configured_repo,
+            selected_manifestless_name=canonical_name,
+        )
+        if candidate.name == canonical_name
+    )
+    return _load_skill_location_candidates(
+        candidates,
+        drive_root=drive_root,
+        include_manifestless=True,
+    )
+
+
+def discover_skill_identity(
+    drive_root: pathlib.Path,
+    name: str,
+    *,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Load one identity with ORDINARY discovery semantics, nothing else read.
+
+    Same inventory and collision rules as ``discover_skills`` restricted to one
+    canonical name — no manifestless opt-in, so a directory without a manifest
+    beside a valid skill of the same name stays invisible here exactly as it is
+    to passive discovery. This is the resolver every EXECUTION caller uses
+    (liveness, reconcile, the extension child); the repair/publication lanes
+    keep ``discover_selected_skill_candidates`` and its deliberately stricter
+    manifestless ambiguity.
+    """
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    safe = _sanitize_skill_name(name)
+    candidates = tuple(
+        item for item in _skill_location_inventory(drive_root, repo_path=repo_path)
+        if item.name == safe
+    )
+    return _load_skill_location_candidates(candidates, drive_root=drive_root)
 
 
 def find_skill(
@@ -1083,52 +1444,10 @@ def find_skill(
 ) -> Optional[LoadedSkill]:
     """Return one skill by name, including broken manifests with ``load_error``."""
     safe = _sanitize_skill_name(name)
-    for skill in discover_skills(drive_root, repo_path=repo_path):
+    for skill in discover_skill_identity(drive_root, name, repo_path=repo_path):
         if skill.name == safe:
             return skill
     return None
-
-
-_MAX_CONFLICT_PROJECTION = 8
-
-
-def enabled_skill_conflicts(
-    skill: LoadedSkill,
-    skills: List[LoadedSkill],
-) -> List[str]:
-    """Return enabled installed peers conflicting with ``skill``.
-
-    A declaration on either side is authoritative, so one-sided manifests are
-    enforced symmetrically. Missing and disabled peers are deliberately inert.
-    """
-    declared = set(skill.manifest.conflicts or [])
-    conflicts = {
-        peer.name
-        for peer in skills
-        if peer.name != skill.name
-        and peer.enabled
-        and (
-            peer.name in declared
-            or skill.name in set(peer.manifest.conflicts or [])
-        )
-    }
-    return sorted(conflicts)
-
-
-def skill_conflict_status(
-    skill: LoadedSkill,
-    skills: List[LoadedSkill],
-) -> Optional[Dict[str, Any]]:
-    """Return a bounded API-safe projection of enabled peer conflicts."""
-    names = enabled_skill_conflicts(skill, skills)
-    if not names:
-        return None
-    visible = names[:_MAX_CONFLICT_PROJECTION]
-    return {
-        "code": "skill_conflict",
-        "skills": visible,
-        "omitted": len(names) - len(visible),
-    }
 
 
 def list_available_for_execution(
@@ -1147,11 +1466,12 @@ def list_available_for_execution(
     return out
 
 
-# Status helpers consumed by /api/state and the Skills UI
+# Status helpers consumed by the model-facing catalogue: the per-turn Installed
+# Skills section (context.py) and the list_skills tool.
 
 
 def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
-    """Return a compact catalogue summary for the Skills UI / /api/state."""
+    """Return a compact catalogue summary for the model-facing skill catalogue."""
     skills = discover_skills(drive_root)
     tool_surfaces_by_skill: Dict[str, List[Dict[str, str]]] = {}
     try:
@@ -1174,16 +1494,26 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
     available = blocked_by_grants = pending_review = blocker_review = warning_review = broken = 0
     for s in skills:
         stale = s.review.is_stale_for(s.content_hash)
-        gate = skill_review_gate(s.review.status, stale=stale)
-        readiness = skill_readiness_for_execution(drive_root, s, skills=skills)
-        grant_status = readiness.grant_status or grant_status_for_skill(drive_root, s)
-        grants_usable = grant_status.get("usable", True)
-        runnable = s.available_for_execution and readiness.ready
+        gate = s.review.gate_for(s.content_hash)
+        if s.identity_collision:
+            # Readiness probes include lifecycle/dependency state. A collision
+            # has no unique lifecycle identity, so its UI projection must stay
+            # topology-only just like discovery.
+            grants_usable = True
+            runnable = False
+            conflict = None
+            readiness = None
+        else:
+            readiness = skill_readiness_for_execution(drive_root, s, skills=skills)
+            grant_status = readiness.grant_status or grant_status_for_skill(drive_root, s)
+            grants_usable = grant_status.get("usable", True)
+            runnable = s.available_for_execution and readiness.ready
+            conflict = readiness.conflict or None
         available += int(runnable)
         blocked_by_grants += int(s.available_for_execution and not grants_usable)
         pending_review += int(
             s.review.status in (_REVIEW_STATUS_PENDING, "")
-            or (review_status_allows_execution(s.review.status) and stale)
+            or (stale and not gate["executable_review"])
         )
         blocker_review += int(s.review.status == _REVIEW_STATUS_FAIL)
         warning_review += int(s.review.status == _REVIEW_STATUS_ADVISORY)
@@ -1192,12 +1522,19 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "name": s.name,
             "description": s.manifest.description,
             "when_to_use": s.manifest.when_to_use,
+            # CPL-7: optional Model Experience prose travels to every
+            # model-visible skill surface (list_skills JSON, context section).
+            "model_experience": s.manifest.model_experience,
             "type": s.manifest.type,
             "version": s.manifest.version,
+            "content_hash": s.content_hash,
+            "readiness": asdict(readiness) if readiness is not None else None,
             "enabled": s.enabled,
             "review_status": s.review.status,
             "review_stale": stale,
             "review_gate": gate,
+            "author_disposition": dict(s.review.author_disposition),
+            "reviewed_content_hash": gate["reviewed_content_hash"],
             "executable_review": gate["executable_review"],
             "available_for_execution": runnable,
             "runnable_via_skill_exec": s.available_for_execution,
@@ -1207,8 +1544,34 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
             "load_error": s.load_error,
             "source": s.source,
             "conflicts": list(s.manifest.conflicts or []),
-            "conflict": readiness.conflict or None,
+            "conflict": conflict,
+            # #447 G3: an unresolvable manual dependency must reach the CALLER,
+            # not just the internal readiness object — a skill that needs
+            # `brew:ffmpeg` installed by a human is otherwise reported ready
+            # and fails only at execution time.
+            "manual_dependencies": list(getattr(readiness, "manual_dependencies", []) or []),
         })
+        # Extension liveness is a different fact from script executability: the
+        # same producer /api/extensions reads, so the catalogue and the HTTP
+        # surface cannot disagree. `skills=` is mandatory — without it the state
+        # helper re-walks the whole skills tree once per row.
+        live: Dict[str, Any] = {}
+        if s.manifest.is_extension() and not s.identity_collision:
+            try:
+                from ouroboros.extension_loader import runtime_state_for_loaded_skill
+
+                live = runtime_state_for_loaded_skill(s, drive_root, skills=skills)
+            except Exception:
+                log.debug("extension liveness projection failed for %s", s.name, exc_info=True)
+                live = {}
+        rows[-1].update({
+            "desired_live": bool(live.get("desired_live")),
+            "live_loaded": bool(live.get("live_loaded")),
+            "live_reason": str(live.get("reason") or "not_extension"),
+            "process": str(live.get("process") or ""),
+        })
+        if live.get("load_error"):
+            rows[-1]["load_error"] = str(live.get("load_error"))
     return {
         "count": len(skills),
         "runtime_mode": get_runtime_mode(),
@@ -1225,7 +1588,8 @@ def summarize_skills(drive_root: pathlib.Path) -> Dict[str, Any]:
 __all__ = [
     "AutoGrantOutcome", "LoadedSkill", "HASH_EXEMPT_CONTROL_FILENAMES",
     "SkillReviewState", "auto_grant_if_enabled",
-    "VALID_REVIEW_STATUSES", "compute_content_hash", "discover_skills", "find_skill",
+    "VALID_REVIEW_STATUSES", "compute_content_hash", "reduce_skill_content_hash", "discover_skills",
+    "discover_selected_skill_candidates", "discover_skill_identity", "find_skill",
     "enabled_skill_conflicts", "skill_conflict_status",
     "grant_status_for_skill", "is_self_authored_skill_dir", "list_available_for_execution",
     "load_enabled", "load_review_state", "load_skill_grants", "load_skill",

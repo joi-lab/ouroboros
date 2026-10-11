@@ -63,10 +63,21 @@ def test_health_discloses_when_incident_tail_omits_prefix(tmp_path, monkeypatch)
     assert "clean" not in txt
     assert "none in bounded tail" in txt
     assert "earlier coverage may be incomplete" in txt
+    # Another language reads the same English rows through the install's translation memory.
+    from ouroboros import i18n_memory as memory
+
+    plugin.telegram_i18n.configure(data)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(data, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.health.tail_none": {"text": "в ограниченном хвосте не найдено"},
+        "code:tg.health.tail_limited": {"text": "ранняя часть периода может быть неполной"},
+    }, model="test"), doc)[1], create=True)
     ru = plugin._collect_health(api, "ru")
-    assert "чисто" not in ru
+    assert "clean" not in ru and "чисто" not in ru
     assert "в ограниченном хвосте не найдено" in ru
     assert "ранняя часть периода может быть неполной" in ru
+    assert "Incidents (1h)" in ru, "a row the memory lacks stays English"
+    plugin.telegram_i18n.configure(None)
 
 
 def test_tasks_idle_and_list(tmp_path):
@@ -84,14 +95,23 @@ def test_tasks_idle_and_list(tmp_path):
     assert "task" in txt and "subagent" in txt
 
 
-def test_tasks_panel_builds():
+def test_tasks_panel_builds(tmp_path, monkeypatch):
     plugin = _load_plugin()
 
     class A:
         def get_state_dir(self): return "/tmp/nope-telegram-bridge"
+    header, kb = plugin._build_menu_tasks(A(), "safe_commands", "")
+    assert header.startswith("📋 Tasks")
+    assert kb[-1][0]["callback_data"] == "nav:menu"
+    from ouroboros import i18n_memory as memory
+
+    plugin.telegram_i18n.configure(tmp_path)
+    monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+    memory.update_memory(tmp_path, "ru", lambda doc: (memory.apply_generated(doc, {
+        "code:tg.menu.tasks_title": {"text": "📋 Задачи"}}, model="test"), doc)[1], create=True)
     header, kb = plugin._build_menu_tasks(A(), "safe_commands", "ru")
     assert "Задачи" in header
-    assert kb[-1][0]["callback_data"] == "nav:menu"
+    plugin.telegram_i18n.configure(None)
 
 
 

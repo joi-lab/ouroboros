@@ -240,6 +240,84 @@ def test_restore_does_not_count_enqueue_admission_rejection(monkeypatch, tmp_pat
     assert restored["blocked_admission"] == ["blocked"]
 
 
+def test_queue_rejects_negative_depth_before_admission_side_effects(monkeypatch, tmp_path):
+    queue_mod, pending = _isolated_queue(monkeypatch, tmp_path)
+
+    for index, raw_depth in enumerate((-1, -0.5, "-1", "not-a-depth")):
+        task_id = f"invalid-queue-depth-{index}"
+        token = f"token-{index}"
+        queue_mod.ADMISSION_RESERVATIONS[task_id] = token
+        admitted = queue_mod.enqueue_task({
+            "id": task_id, "type": "task", "depth": raw_depth,
+            "_admission_token": token,
+        })
+        assert admitted["_admission_blocked"] == "invalid_task_depth"
+        assert task_id not in queue_mod.ADMISSION_RESERVATIONS
+        assert pending == []
+
+
+def test_queue_unique_id_wins_over_malformed_depth_replay(monkeypatch, tmp_path):
+    from ouroboros.task_results import STATUS_SCHEDULED, load_task_result, write_task_result
+
+    queue_mod, pending = _isolated_queue(monkeypatch, tmp_path)
+    task_id = "queue-live-replay"
+    write_task_result(
+        tmp_path,
+        task_id,
+        STATUS_SCHEDULED,
+        root_task_id=task_id,
+        delegation_role="root",
+        result="keep live work",
+    )
+    result_path = tmp_path / "task_results" / f"{task_id}.json"
+    original = result_path.read_bytes()
+
+    admitted = queue_mod.enqueue_task({
+        "id": task_id,
+        "type": "task",
+        "depth": -1,
+        "_require_unique_task_id": True,
+    })
+
+    assert admitted["_admission_blocked"] == "duplicate_task_id"
+    assert result_path.read_bytes() == original
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_SCHEDULED
+    assert pending == []
+
+
+def test_restore_terminalizes_invalid_depth_at_task_budget_root(monkeypatch, tmp_path):
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+
+    queue_mod, pending = _isolated_queue(monkeypatch, tmp_path)
+    budget_root = tmp_path / "budget-root"
+    task = {
+        "id": "restore-invalid-depth",
+        "type": "task",
+        "text": "x",
+        "chat_id": 1,
+        "depth": -1,
+        "budget_drive_root": str(budget_root),
+    }
+    _write_restore_snapshot(tmp_path, [task], [])
+
+    assert queue_mod.restore_pending_from_snapshot() == 0
+    assert pending == []
+    result = load_task_result(budget_root, task["id"])
+    assert result["status"] == STATUS_FAILED
+    assert result["reason_code"] == "invalid_task_depth"
+    assert result["depth"] == 0
+    assert result["raw_task_depth"] == -1
+    assert not (tmp_path / "task_results" / f"{task['id']}.json").exists()
+    snapshot = json.loads(queue_mod.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+    assert snapshot["pending"] == []
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()
+    ]
+    restored = next(event for event in events if event.get("type") == "queue_restored_from_snapshot")
+    assert restored["invalid_task_depth"] == [task["id"]]
+
+
 def test_acceptance_ack_sidecar_compacts_stale_and_bounds_rows(monkeypatch, tmp_path):
     from supervisor import events, queue
 
@@ -254,29 +332,33 @@ def test_acceptance_ack_sidecar_compacts_stale_and_bounds_rows(monkeypatch, tmp_
         queue, "transition_acceptance_fence",
         lambda **_kwargs: {"ok": True, "status": "active"},
     )
-    token = "f" * 64
+    token, req = "f" * 64, "e" * 32
     events._handle_acceptance_fence(
-        {"token": token, "action": "begin", "root_task_id": "r", "task_id": "r"},
+        {"token": token, "req": req, "action": "begin", "root_task_id": "r", "task_id": "r"},
         SimpleNamespace(DRIVE_ROOT=tmp_path),
     )
 
     rows = list(ack_dir.glob("*.json"))
     assert len(rows) <= 256
-    assert (ack_dir / f"{token}.json").is_file()
+    assert (ack_dir / f"{token}.{req}.json").is_file()
     assert all(path.stat().st_mtime > old for path in rows)
 
 
-def test_split_drive_worker_reads_acceptance_ack_from_budget_root(tmp_path):
+def test_split_drive_worker_reads_acceptance_ack_from_budget_root(tmp_path, monkeypatch):
+    import queue as stdqueue
+
+    from ouroboros import runtime_limits
     from ouroboros.agent import Env, OuroborosAgent
 
+    monkeypatch.setattr(runtime_limits, "get_acceptance_fence_ack_wait_sec", lambda: 0.2)
     canonical = tmp_path / "canonical-data"
     child = canonical / "state" / "headless_tasks" / "root-1" / "data"
     repo = tmp_path / "repo"
     child.mkdir(parents=True)
     repo.mkdir()
-    token = "a" * 32
+    token, req = "a" * 32, "b" * 32
     payload = {"ok": True, "status": "active", "token": token}
-    ack = canonical / "state" / "acceptance_fence_acks" / f"{token}.json"
+    ack = canonical / "state" / "acceptance_fence_acks" / f"{token}.{req}.json"
     ack.parent.mkdir(parents=True)
     ack.write_text(json.dumps(payload), encoding="utf-8")
 
@@ -285,8 +367,10 @@ def test_split_drive_worker_reads_acceptance_ack_from_budget_root(tmp_path):
     agent = object.__new__(OuroborosAgent)
     agent.env = Env(repo_dir=repo, drive_root=child)
     agent._current_task_metadata = {"budget_drive_root": str(canonical)}
+    agent._event_queue = stdqueue.Queue()
 
-    assert agent._await_acceptance_fence_ack(token, timeout_sec=0.1) == payload
+    event = {"type": "acceptance_fence", "action": "inspect", "token": token, "req": req}
+    assert agent._send_fence_event(event) == payload
     assert not ack.exists()
-    child_ack = child / "state" / "acceptance_fence_acks" / f"{token}.json"
+    child_ack = child / "state" / "acceptance_fence_acks" / f"{token}.{req}.json"
     assert not child_ack.exists()

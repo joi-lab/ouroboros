@@ -4,6 +4,7 @@ import asyncio
 import json
 import types
 
+import pytest
 from starlette.requests import Request
 
 from ouroboros import usage_accounting as ua
@@ -94,6 +95,10 @@ def test_cost_breakdown_uses_ledger_not_later_compatibility_events(tmp_path, mon
     assert "fabricated/compatibility-only" not in payload["by_model"]
     assert payload["by_model"]["openai/gpt-5.2"]["cost"] == 0.25
     assert payload["by_task_category"]["review"]["calls"] == 1
+    external = payload["by_api_key"]["external-skill"]
+    assert external["cost"] == 0.0
+    assert external["unknown_unmetered"] == 1
+    assert external["cost_final"] is False
     assert payload["accounting"] == {
         "available": True,
         "settled_usd": 0.25,
@@ -104,11 +109,39 @@ def test_cost_breakdown_uses_ledger_not_later_compatibility_events(tmp_path, mon
         "accounted_usd": 1.75,
         "unknown_unmetered": 1,
         "cost_final": False,
+        # The disclosed cause of `cost_final: False`, and broader than
+        # `unknown_unmetered`: three of the four seeded rows are still open --
+        # the reserved attempt, the unresolved one, and the external unmetered
+        # dispatch whose price is unknown. Only the settled $0.25 row is final.
+        "non_final_rows": 3,
         "attempt_counts": {"reserved": 1, "settled": 2, "unresolved": 1},
         "authority": "physical_attempt_ledger",
         "limit_usd": 7.5,
         "remaining_known_usd": 5.75,
     }
+
+
+@pytest.mark.parametrize("raw", [None, "not-a-number"])
+def test_cost_breakdown_uses_resolved_default_for_absent_or_invalid_budget(
+    tmp_path, monkeypatch, raw,
+):
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.gateway.history import make_cost_breakdown_endpoint
+    from supervisor import state as supervisor_state
+
+    root = _data_root(tmp_path, monkeypatch)
+    if raw is None:
+        monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+    else:
+        monkeypatch.setenv("TOTAL_BUDGET", raw)
+    monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 0.0)
+
+    response = asyncio.run(make_cost_breakdown_endpoint(root)(None))
+    payload = json.loads(response.body)
+
+    expected = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"])
+    assert payload["accounting"]["limit_usd"] == expected
+    assert payload["accounting"]["remaining_known_usd"] == expected
 
 
 def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeypatch):
@@ -131,7 +164,7 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     app = types.SimpleNamespace(state=types.SimpleNamespace(
         drive_root=root,
         app_start=0.0,
@@ -161,6 +194,69 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     assert payload["accounting"]["remaining_known_usd"] == 5.75
 
 
+@pytest.mark.serial
+def test_api_state_unbounded_budget_does_not_expose_private_breakdown_keys(tmp_path, monkeypatch):
+    """The no-limit branch keeps internal ledger provenance off the wire."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        ua,
+        "usage_writer_snapshot",
+        lambda *_args, **_kwargs: {
+            "accounted_usd": 2.0,
+            "physical_calls": 1,
+            "settled_usd": 2.0,
+            "confirmed_usd": 2.0,
+            "estimated_usd": 0.0,
+            "reserved_usd": 0.0,
+            "unresolved_upper_bound_usd": 0.0,
+            "unknown_unmetered": 0,
+            "cost_final": True,
+            "attempt_counts": {},
+            "integrity_degraded": False,
+            "_ledger_high_water_seq": [0, 7],
+            "_root_accounting_snapshot": {"accounted_usd": 2.0},
+        },
+    )
+    monkeypatch.setattr(
+        ua,
+        "usage_projection",
+        lambda *_args, **_kwargs: pytest.fail("unbounded /api/state must not call usage_projection"),
+    )
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+        "query_string": b"", "scheme": "http", "server": ("test", 80),
+        "client": ("test", 1),
+        "app": types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root, app_start=0.0)),
+    })
+
+    response = asyncio.run(api_state(request))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["budget_limit"] == 0.0
+
+    def walk_keys(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield key
+                yield from walk_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk_keys(child)
+
+    assert all(not str(key).startswith("_") for key in walk_keys(payload))
+    assert payload["accounting"]["accounted_usd"] == 2.0
+
+
 def test_cost_breakdown_fails_loudly_when_authoritative_history_is_corrupt(tmp_path, monkeypatch):
     from ouroboros.gateway.history import make_cost_breakdown_endpoint
 
@@ -185,6 +281,54 @@ def test_cost_breakdown_fails_loudly_when_authoritative_history_is_corrupt(tmp_p
     assert "total_cost" not in payload
 
 
+def test_api_state_passes_projection_only_when_roots_match_and_computation_succeeded(
+    tmp_path, monkeypatch,
+):
+    """De-triplication seam pin: the snapshot receives this request's projection
+    exactly when the request root IS the supervisor root and accounting
+    computed; a foreign root or a failed computation passes NOTHING, so the
+    snapshot's own strict attempt keeps owning the paused-evolution disclosure."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_accounting(root)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 7.5)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    captured: list = []
+    monkeypatch.setattr(
+        queue, "get_evolution_status_snapshot",
+        lambda **kwargs: captured.append(kwargs) or {},
+    )
+
+    def _request():
+        return Request({
+            "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+            "query_string": b"", "scheme": "http", "server": ("test", 80),
+            "client": ("test", 1),
+            "app": types.SimpleNamespace(
+                state=types.SimpleNamespace(drive_root=root, app_start=0.0),
+            ),
+        })
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert list(captured[-1]) == ["budget_projection"]
+    assert captured[-1]["budget_projection"]["limit_usd"] == 7.5
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(tmp_path / "other-root"))
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+    monkeypatch.setattr(state, "DRIVE_ROOT", str(root))
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    assert asyncio.run(api_state(_request())).status_code == 200
+    assert captured[-1] == {}
+
+
 def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, monkeypatch):
     from ouroboros.gateway.state import api_state
     from supervisor import queue, state, workers
@@ -198,7 +342,7 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda: {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
     request = Request({
         "type": "http", "method": "GET", "path": "/api/state", "headers": [],
         "query_string": b"", "scheme": "http", "server": ("test", 80),
@@ -216,3 +360,181 @@ def test_api_state_marks_accounting_unavailable_without_legacy_zero(tmp_path, mo
     assert payload["accounting"]["accounted_usd"] is None
     assert payload["accounting"]["remaining_known_usd"] is None
     assert payload["accounting"]["error_code"] == "ledger_unavailable"
+
+
+# --- v6.91 root task-detail cost_breakdown view ------------------------------
+
+
+def _settled_attempt(root, *, task_id, cost, category="task"):
+    attempt = _attempt(root, reservation_usd=cost, task_id=task_id, category=category)
+    ua.mark_dispatched(attempt)
+    ua.settle_attempt(
+        attempt,
+        {"prompt_tokens": 10, "completion_tokens": 5},
+        cost_usd=cost,
+        cost_final=True,
+    )
+    return attempt
+
+
+def _seed_tree_accounting(root):
+    """Root own spend + child spend + one disclosed-free and one undisclosed
+    delegated session — the submarine 'where did the money go' shape."""
+    _settled_attempt(root, task_id="root-1", cost=0.30)
+    _settled_attempt(root, task_id="child-1", cost=0.50)
+    ua.record_subscription_session(
+        "session-free", drive_root=root, route="claudexor/claude",
+        task_id="child-1", root_task_id="root-1", spend_usd=0.0,
+    )
+    ua.record_subscription_session(
+        "session-undisclosed", drive_root=root, route="claudexor/codex",
+        task_id="child-1", root_task_id="root-1", spend_usd=None,
+    )
+
+
+def test_usage_breakdown_delegated_axis_is_a_filter_not_a_new_sum(tmp_path, monkeypatch):
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    breakdown = ua.usage_breakdown(root, root_task_id="root-1")
+    delegated = breakdown["delegated"]
+    # The delegated bucket is the SAME subscription rows already counted in the
+    # top-level summary (sessions axis), filtered by execution kind.
+    assert delegated["subscription_sessions"] == 2
+    assert breakdown["subscription_sessions"] == 2
+    assert delegated["settled_usd"] == 0.0  # disclosed-free session
+    assert delegated["unknown_unmetered"] == 1  # undisclosed spend, never $0
+    assert delegated["physical_calls"] == 0  # sessions are not provider sends
+
+
+def test_task_detail_cost_breakdown_view_for_root(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.30
+    assert view["children_usd"] == 0.50  # subtree minus own — the by-hand subtraction, formalized
+    assert view["delegated_disclosed_usd"] == 0.0
+    assert view["subscription_sessions"] == 2
+    assert view["unknown_unmetered"] == 1
+    assert view["cost_final"] is False  # the undisclosed session keeps finality honest
+    assert view["authority"] == "physical_attempt_ledger"
+
+
+def test_task_detail_cost_breakdown_view_only_for_roots_and_fails_soft(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_tree_accounting(root)
+    # Non-root: subtree math is not ledger-attributable mid-tree — omitted.
+    assert _task_cost_breakdown_view(root, {"task_id": "child-1", "root_task_id": "root-1"}) is None
+    # Unreadable ledger: absent view, never a confident $0 object.
+    (root / ua.LEDGER_REL).write_text("not-json\n{}\n", encoding="utf-8")
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is None or view.get("cost_final") is False
+
+
+def test_task_detail_cost_breakdown_view_absent_when_nothing_was_accounted(tmp_path, monkeypatch):
+    """A READABLE but empty/legacy-only ledger must not publish a confident $0.
+
+    `_summary()` always returns a float for `accounted_usd`, so availability
+    decided on the dollar sum reports `own 0 / children 0 / cost_final true`
+    for a root whose real money was never ledger-attributed — the v6.64.1
+    "unknown rendered as a confident $0" class. Availability is decided on the
+    attributable ROW COUNTS instead."""
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    empty = ua.usage_breakdown(root, root_task_id="root-1")
+    # The trap: the ledger answers 0.0/final for a subtree it never measured.
+    assert empty["accounted_usd"] == 0.0 and empty["cost_final"] is True
+    assert _task_cost_breakdown_view(
+        root, {"task_id": "root-1", "root_task_id": "root-1", "cost_usd": 42.75},
+    ) is None
+
+    # Legacy-imported money is real but carries no root_task_id, so the
+    # root-filtered subtree is empty while the ledger holds dollars.
+    legacy_root = tmp_path / "legacy"
+    (legacy_root / "state").mkdir(parents=True)
+    (legacy_root / "logs").mkdir(parents=True)
+    (legacy_root / "state" / "state.json").write_text(
+        json.dumps({"spent_usd": 42.75, "spent_calls": 12}), encoding="utf-8",
+    )
+    ua.ensure_legacy_imported(legacy_root)
+    assert ua.usage_breakdown(legacy_root)["accounted_usd"] > 0.0
+    assert _task_cost_breakdown_view(
+        legacy_root, {"task_id": "root-1", "root_task_id": "root-1"},
+    ) is None
+
+    # One priced row makes the SAME subtree genuinely measured: the view returns
+    # and a root that spent nothing itself keeps its honest measured zero.
+    _settled_attempt(root, task_id="child-1", cost=0.25)
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.0 and view["children_usd"] == 0.25
+
+
+def test_task_detail_unknown_zero_subtree_is_omitted_not_reported_free(tmp_path, monkeypatch):
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    ua.record_unmetered_external_dispatch(
+        "detail-opaque", drive_root=root, provider="external-skill",
+        task_id="root-1", root_task_id="root-1",
+    )
+    assert _task_cost_breakdown_view(
+        root, {"task_id": "root-1", "root_task_id": "root-1"},
+    ) is None
+
+
+def test_task_detail_cost_breakdown_view_discloses_unattributed_money(tmp_path, monkeypatch):
+    """Subtree money that no task id claims gets its own axis, not the children's."""
+    from ouroboros.gateway.tasks import _task_cost_breakdown_view
+
+    root = _data_root(tmp_path, monkeypatch)
+    _settled_attempt(root, task_id="root-1", cost=0.30)
+    _settled_attempt(root, task_id="", cost=0.20)
+    view = _task_cost_breakdown_view(root, {"task_id": "root-1", "root_task_id": "root-1"})
+    assert view is not None
+    assert view["own_usd"] == 0.30
+    assert view["unattributed_usd"] == 0.20
+    # Not silently folded into the children's share; the three axes still sum.
+    assert view["children_usd"] == 0.0
+    assert round(view["own_usd"] + view["children_usd"] + view["unattributed_usd"], 6) == 0.50
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("limit", [7.5, 0.0])
+def test_api_state_reads_the_slim_writer_snapshot_never_the_full_breakdown(tmp_path, monkeypatch, limit):
+    """Both budget branches serve the same values without the five grouped axes."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    _seed_accounting(root)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", limit)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
+    app = types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root, app_start=0.0))
+
+    def call():
+        request = Request({
+            "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+            "query_string": b"", "scheme": "http", "server": ("test", 80), "client": ("test", 1), "app": app,
+        })
+        payload = json.loads(asyncio.run(api_state(request)).body)
+        return {key: payload[key] for key in ("spent_usd", "spent_calls", "budget_limit", "budget_pct", "accounting")}
+
+    with_full_breakdown_available = call()
+    monkeypatch.setattr(ua, "usage_breakdown",
+                        lambda *_a, **_k: pytest.fail("/api/state must not render the full breakdown"))
+    assert call() == with_full_breakdown_available
+    assert with_full_breakdown_available["spent_calls"] == 3
+    assert with_full_breakdown_available["accounting"]["accounted_usd"] == 1.75
+    assert with_full_breakdown_available["accounting"]["remaining_known_usd"] == (5.75 if limit else None)

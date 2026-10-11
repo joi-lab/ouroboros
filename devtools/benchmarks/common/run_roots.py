@@ -95,11 +95,23 @@ def safe_benchmark_id(value: str, *, field: str = "instance_id") -> str:
     return text
 
 
+def _comparison_path(path: pathlib.PurePath) -> pathlib.PurePath:
+    """Compare resolved Windows paths in the same namespace; keep IO paths intact."""
+    if isinstance(path, pathlib.PureWindowsPath):
+        text = str(path)
+        if text.startswith("\\\\?\\UNC\\"):
+            text = "\\\\" + text[8:]
+        else:
+            text = text.removeprefix("\\\\?\\")
+        return pathlib.PureWindowsPath(text)
+    return path
+
+
 def safe_join_under(root: pathlib.Path, *parts: str) -> pathlib.Path:
     base = pathlib.Path(root).expanduser().resolve(strict=False)
     resolved = base.joinpath(*[str(part or "") for part in parts]).resolve(strict=False)
     try:
-        resolved.relative_to(base)
+        _comparison_path(resolved).relative_to(_comparison_path(base))
     except ValueError as exc:
         raise ValueError(f"benchmark output path escapes run root: {resolved}") from exc
     return resolved

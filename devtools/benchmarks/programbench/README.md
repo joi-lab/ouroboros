@@ -30,7 +30,15 @@ export OUROBOROS_BENCH_RUNS_ROOT=<workspace>/bench_runs
 #   OUROBOROS_SAFETY_MODE=light.
 # - The solve task itself disables claude_code_edit (house rule: benches measure
 #   the single-model Ouroboros harness, not an external coding agent).
-# - Model slots pin openai/gpt-5.5: the id must exist in the OpenRouter catalog
+# - Active model slots pin openai/gpt-5.5, local routing is explicitly off,
+#   OUROBOROS_SUBAGENTS contains one api_model row on that exact route, and the
+#   authoritative reviewer panel contains only exact API triad/scope rows. The
+#   Claude-SDK advisory is explicitly disabled instead of receiving an OpenRouter
+#   model id. Preflight requires a declared Main or
+#   --solve-model, then fetches the target server's /api/settings and binds the
+#   manifest to that effective actor and reviewer/local-route projection;
+#   missing/different target state refuses before
+#   instance discovery or paid work. The id must exist in the OpenRouter catalog
 #   (there is no openai/gpt-5.5-mini there — it 400s on every task).
 
 # Terminal 1 — source server (not the desktop app; the sandboxed desktop cannot
@@ -49,7 +57,8 @@ python devtools/benchmarks/programbench/run_programbench_e2e.py \
 Useful flags:
 
 - `--instance-id <id>` — single task
-- `--solve-model <id>` — expected OUROBOROS_MODEL; validated against `--settings-path`
+- `--solve-model <id>` — expected measured model; validated against both
+  `--settings-path` and the target server's `/api/settings`
 - `--dry-run` — docker + `ouroboros_task_body.json` only (no solve)
 - `--skip-pull` — reuse already-pulled images
 - `--redo-existing` — rerun even when `submission.tar.gz` exists (clears the task checkpoint)
@@ -72,8 +81,9 @@ The task body carries `metadata.budget_profile` (see `schemas.programbench_budge
 `POST /api/tasks` normalizes it additively into `task_contract.budget_profile`
 (there is deliberately no top-level `task_contract` field on the gateway):
 
-- `improvement_policy=until_deadline`, `max_improvement_passes=6` (the explicit cap remains authoritative under every policy),
-  `reserve_finalization_pct=15` (0–100 pct), `stall_rounds_threshold=12`.
+- `improvement_policy=fixed`, `max_improvement_passes=6` (the explicit cap is authoritative under every policy;
+  the legacy `until_deadline` alias and `stall_rounds_threshold` knob were removed in ABI 7.0, Q10=A),
+  `reserve_finalization_pct=15` (0–100 pct).
 - The 6h official budget flows through the body's `timeout_sec` (gateway →
   `deadline_at`); round caps come from settings (`OUROBOROS_MAX_ROUNDS`).
 

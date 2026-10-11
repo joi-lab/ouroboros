@@ -17,7 +17,6 @@ migration in ``config.py``).
 
 from __future__ import annotations
 
-import os
 import time
 from typing import Any, Optional
 
@@ -101,10 +100,12 @@ def get_gc_retention_days() -> int:
 
     Precedence: ``OUROBOROS_GC_RETENTION_DAYS`` -> first set legacy key
     (backward-compat) -> configured default. Always clamped to ``[1, 365]``."""
-    raw = os.environ.get("OUROBOROS_GC_RETENTION_DAYS", "")
+    from ouroboros.config import runtime_setting
+
+    raw = runtime_setting("OUROBOROS_GC_RETENTION_DAYS", "")
     if str(raw or "").strip():
         return clamp_retention_days(raw)
-    seed = pick_legacy_retention_seed(lambda key: os.environ.get(key, ""))
+    seed = pick_legacy_retention_seed(lambda key: runtime_setting(key, ""))
     if seed is not None and str(seed).strip():
         return clamp_retention_days(seed)
     return clamp_retention_days(_default_gc_days())

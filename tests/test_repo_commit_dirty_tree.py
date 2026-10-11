@@ -74,7 +74,7 @@ def test_checkout_already_on_branch_proceeds_after_failure(tmp_path):
          patch.object(git_module, "_acquire_git_lock", return_value=None), \
          patch.object(git_module, "_release_git_lock"), \
          patch.object(git_module, "_record_commit_attempt"), \
-         patch.object(git_module, "_post_commit_result"), \
+         patch.object(git_module, "_post_commit_result", return_value=None), \
          patch.object(git_module, "_auto_tag_on_version_bump", return_value={}), \
          patch.object(git_module, "_auto_push", return_value="ok"):
         try:
@@ -214,7 +214,7 @@ def test_checkout_succeeds_normally_when_clean(tmp_path):
          patch.object(git_module, "_acquire_git_lock", return_value=None), \
          patch.object(git_module, "_release_git_lock"), \
          patch.object(git_module, "_record_commit_attempt"), \
-         patch.object(git_module, "_post_commit_result"), \
+         patch.object(git_module, "_post_commit_result", return_value=None), \
          patch.object(git_module, "_auto_tag_on_version_bump", return_value={}), \
          patch.object(git_module, "_auto_push", return_value="ok"):
         try:

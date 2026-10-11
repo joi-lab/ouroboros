@@ -4,7 +4,8 @@ Trimmed in v5.16.0-rc.2: only the fixture-backed parametrized contract
 remains here. The previous CSS/JS source-string assertions (chat composer
 geometry, live-card timeline, plan-mode dropdown, mobile keyboard layout,
 etc.) were retired — those surfaces are exercised by the Playwright
-``ui_browser`` smoke suite where it applies (`tests/test_ui_smoke_playwright.py`)
+``ui_browser`` smoke suite where it applies (`tests/test_ui_smoke_playwright.py`
+and `tests/test_ui_smoke_review_checkpoint.py`)
 and by manual UI review for the rest. Static pin-by-string assertions
 were retired with the understanding that a regression in those visual
 surfaces will surface in the ui_browser CI lane rather than in unit

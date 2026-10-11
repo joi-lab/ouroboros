@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 
 
 def tree_root_id(ctx: ToolContext) -> str:
@@ -32,6 +33,12 @@ def _tree_note(
             )
         # The join ledger is the sole lineage/hash/write authority. Invalid tagged
         # payloads return here and are never downgraded into ordinary text notes.
+        # A `children` array is the batch form: one call, one shared rationale,
+        # expanded into the same per-child authoritative rows as the single form.
+        if "children" in payload:
+            from ouroboros.tools.join_ledger import _record_child_result_disposition_batch
+
+            return _record_child_result_disposition_batch(ctx, payload, text)
         from ouroboros.tools.join_ledger import _record_child_result_disposition
 
         return _record_child_result_disposition(ctx, payload, text)
@@ -51,24 +58,53 @@ def _tree_note(
     )
 
 
-def _tree_read(ctx: ToolContext, limit: int = 40) -> str:
-    from ouroboros.task_tree_ledger import tree_ledger_tail_digest
+@completed_local_read
+def _tree_read(
+    ctx: ToolContext,
+    limit: int = 40,
+    offset: int = 0,
+    snapshot: str = "",
+) -> str:
+    from ouroboros.task_tree_ledger import tree_ledger_page
+    from ouroboros.tool_access import canonical_data_root
 
     rid = tree_root_id(ctx)
     if not rid:
         return "⚠️ TOOL_ARG_ERROR (tree_read): no task-tree scope."
-    try:
-        lim = max(1, min(int(limit), 200))
-    except (TypeError, ValueError):
-        lim = 40
-    digest = tree_ledger_tail_digest(rid, limit=lim)
-    if not digest:
+    page = tree_ledger_page(
+        rid,
+        limit=limit,
+        offset=offset,
+        snapshot=snapshot,
+        data_root=canonical_data_root(ctx),
+    )
+    if not page:
         return f"(task-tree coordination ledger [{rid}] is empty)"
-    return f"## Task-tree coordination ledger ({rid})\n\n{digest}"
+    if page.startswith("TREE_READ_SNAPSHOT_CHANGED"):
+        return page
+    return f"## Task-tree coordination ledger ({rid})\n\n{page}"
 
 
 def get_tools() -> List[ToolEntry]:
-    from ouroboros.task_tree_ledger import DELEGATION_CONSTRAINT_DIRECTIVES, LEDGER_KINDS
+    from ouroboros.task_tree_ledger import (
+        CHILD_RESULT_DISPOSITIONS, DELEGATION_CONSTRAINT_DIRECTIVES, LEDGER_KINDS,
+        _MAX_TEXT_CHARS,
+    )
+
+    # The schema is where the model learns WHEN to choose each value, so the
+    # per-value consequence belongs here rather than in prose elsewhere. Read
+    # from the validator's own frozenset, sorted so the enum order is stable
+    # across worker processes (a frozenset's iteration order is not).
+    disposition_schema = {
+        "type": "string",
+        "enum": sorted(CHILD_RESULT_DISPOSITIONS),
+        "description": (
+            "integrated = consumed by this answer (item closes); irrelevant = not needed "
+            "here (the child result stays as evidence; item closes); deferred = STILL OWED: "
+            "your terminal answer reads degraded/best_effort until you re-disposition this "
+            "exact child_result_sha256."
+        ),
+    }
 
     return [
         ToolEntry("tree_note", {
@@ -79,8 +115,9 @@ def get_tools() -> List[ToolEntry]:
                 "siblings/descendants of THIS task tree). Use it to publish the shared "
                 "frame BEFORE fanning out interdependent children and to coordinate while "
                 "they run. kind: contract|decision|fact|note (coordination) or "
-                "milestone|partial_finding|blocker|question|interface_contract|delegation_constraint "
-                "(child->parent beacon). blocker/question/interface_contract/delegation_constraint (or "
+                "milestone|partial_finding|blocker|question|interface_contract|review_requested|"
+                "delegation_constraint (child->parent beacon). blocker/question/interface_contract/"
+                "review_requested/delegation_constraint (or "
                 "needs_parent_attention=true) surface an early return "
                 "in the parent's wait. Domain-agnostic: 'contract' = code APIs OR "
                 "presentation section-ownership OR a research claim schema — the seam for "
@@ -88,25 +125,53 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "required": ["kind", "text"], "properties": {
                 "kind": {"type": "string", "enum": list(LEDGER_KINDS)},
-                "text": {"type": "string", "description": "Short coordination text (<=4000 chars)."},
-                "needs_parent_attention": {"type": "boolean", "default": False, "description": "Force a parent early-wait return (implied by blocker/question/interface_contract)."},
+                # The bound is enforced by the validator; sourcing maxLength from ITS
+                # constant keeps the schema from becoming a false promise on drift.
+                "text": {"type": "string", "maxLength": _MAX_TEXT_CHARS,
+                         "description": f"Short coordination text (<={_MAX_TEXT_CHARS} chars)."},
+                "needs_parent_attention": {"type": "boolean", "default": False, "description": "Force a parent early-wait return (implied by blocker/question/interface_contract/review_requested)."},
                 "payload": {
                     "type": "object",
                     "description": (
-                        "Structured payload. Required for delegation_constraint. For a parent "
+                        "Structured payload. For review_requested, provide exactly evidence_ref "
+                        "and evidence_sha256; this records a non-blocking exact-evidence request "
+                        "and never starts a reviewer. If the parent launches a check, it carries "
+                        "that hash into the existing accounting/dedup path. Required for "
+                        "delegation_constraint. For a parent "
                         "decision about a direct child result, set type=child_result_disposition, "
                         "child_task_id, disposition, and the exact SHA-256 shown by child evidence; "
-                        "tree_note text is the rationale."
+                        "tree_note text is the rationale (<=500 chars for a "
+                        "child_result_disposition). To disposition MANY children in one call, "
+                        "set type=child_result_disposition and a children array of "
+                        "{child_task_id, disposition, child_result_sha256} entries (one shared "
+                        "rationale; each entry is validated exactly like the single form)."
                     ),
                     "properties": {
                         "type": {"type": "string", "enum": ["child_result_disposition"]},
                         "child_task_id": {"type": "string"},
-                        "disposition": {
-                            "type": "string",
-                            "enum": ["integrated", "irrelevant", "deferred"],
-                        },
+                        "disposition": disposition_schema,
                         "child_result_sha256": {"type": "string"},
+                        "children": {
+                            "type": "array",
+                            "description": (
+                                "Batch child dispositions: entries of {child_task_id, "
+                                "disposition, child_result_sha256}."
+                            ),
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "child_task_id": {"type": "string"},
+                                    "disposition": disposition_schema,
+                                    "child_result_sha256": {"type": "string"},
+                                },
+                                "required": [
+                                    "child_task_id", "disposition", "child_result_sha256",
+                                ],
+                            },
+                        },
                         "constraint_id": {"type": "string"},
+                        "evidence_ref": {"type": "string"},
+                        "evidence_sha256": {"type": "string"},
                         "directive": {"type": "string", "enum": list(DELEGATION_CONSTRAINT_DIRECTIVES)},
                         "scope": {},
                         "rationale": {"type": "string"},
@@ -123,8 +188,20 @@ def get_tools() -> List[ToolEntry]:
             ),
             "parameters": {"type": "object", "properties": {
                 "limit": {"type": "integer", "default": 40, "description": "Max entries (<=200)."},
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": "Number of newer entries already consumed.",
+                },
+                "snapshot": {
+                    "type": "string",
+                    "default": "",
+                    "description": "Stable cursor returned by the preceding page.",
+                },
             }},
-        }, lambda ctx, limit=40: _tree_read(ctx, limit), timeout_sec=15),
+        }, lambda ctx, limit=40, offset=0, snapshot="": _tree_read(
+            ctx, limit, offset, snapshot,
+        ), timeout_sec=15),
     ]
 
 

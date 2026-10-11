@@ -286,9 +286,9 @@ def test_e1v2_entrypoint_solve_argv_pins_workspace_and_budget_metadata():
     # /app default via ${VAR-default} (an EXPLICIT empty string keeps legacy mode).
     assert 'OBO_SOLVE_WORKSPACE_ROOT="${OBO_SOLVE_WORKSPACE_ROOT-/app}"' in entry
     assert '--workspace "$OBO_SOLVE_WORKSPACE_ROOT"' in entry
-    # Budget metadata: until_deadline pacing + no in-task cost stop.
+    # Budget metadata: fixed policy + explicit pass cap, no in-task cost stop.
     assert "--task-metadata-json" in entry
-    assert '"improvement_policy": "until_deadline"' in entry
+    assert '"improvement_policy": "fixed"' in entry
     assert '"max_improvement_passes": 6' in entry
     assert '"cost_hard_stop_pct": 0' in entry
     # Fresh child memory drive is the explicit entrypoint default.
@@ -297,13 +297,39 @@ def test_e1v2_entrypoint_solve_argv_pins_workspace_and_budget_metadata():
     assert "SOLVE_ARGS=(" in entry and '"${SOLVE_ARGS[@]}"' in entry
 
 
-def test_workspace_allowlist_includes_acting_integration_tools():
-    """v6.56.0 owner-approved registry change: a workspace parent can absorb acting
-    children's patches (integrate) and compare best-of-N candidates."""
-    from ouroboros.tools.registry import _WORKSPACE_ALLOWED_TOOLS
+def test_all_live_swe_producers_share_the_methodology_tool_default():
+    default = (
+        "web_search,browse_page,browser_action,analyze_screenshot,vlm_query,"
+        "view_image,youtube_transcript,claude_code_edit,switch_model"
+    )
+    base = REPO_ROOT / "devtools" / "benchmarks" / "swe_bench_pro" / "e1v2"
+    run_pro = (base / "run_pro.py").read_text(encoding="utf-8")
+    entrypoint = (base / "entrypoint_pro.sh").read_text(encoding="utf-8")
+    probe = (base / "orchestrate_probe.py").read_text(encoding="utf-8")
 
-    assert "integrate_subagent_patch" in _WORKSPACE_ALLOWED_TOOLS
-    assert "compare_subagent_patches" in _WORKSPACE_ALLOWED_TOOLS
+    assert f'default="{default}"' in run_pro
+    assert f'default="{default}"' in probe
+    assert f'OBO_DISABLE_TOOLS="${{OBO_DISABLE_TOOLS:-{default}}}"' in entrypoint
+    names = set(default.split(","))
+    assert {"youtube_transcript", "switch_model", "claude_code_edit"} <= names
+    assert "schedule_subagent" not in names  # same-model decomposition is part of the method
+
+
+def test_workspace_parent_sees_acting_integration_tools(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system, workspace, data = tmp_path / "system", tmp_path / "workspace", tmp_path / "data"
+    for path in (system, workspace, data):
+        path.mkdir()
+    registry = ToolRegistry(system, data)
+    registry.set_context(ToolContext(
+        repo_dir=system,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+    names = set(registry.available_tools())
+    assert {"integrate_subagent_patch", "compare_subagent_patches"} <= names
 
 
 def test_e1v2_ensure_util_image_preflights_pull_never_dependency(monkeypatch):
@@ -1049,5 +1075,3 @@ def test_e1v2_auto_run_records_the_typed_seed_shape_refusal(tmp_path, monkeypatc
     assert extra["refusal"] == {"stage": "seed_shape", "exit_code": 2,
                                 "reason": "seed_is_not_a_git_directory"}
     assert extra["task_count"] == 0
-
-

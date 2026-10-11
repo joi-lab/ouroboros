@@ -141,7 +141,13 @@ def test_deterministic_preflight_persists_pending_and_is_non_executable(tmp_path
     import ouroboros.skill_review as sr
     import ouroboros.tools.skill_preflight as pf
     from ouroboros.skill_review_status import skill_review_gate
-    monkeypatch.setattr(pf, "_handle_skill_preflight", lambda ctx, skill=None: json.dumps({"ok": False, "error": "bad manifest schema"}))
+    monkeypatch.setattr(
+        pf,
+        "_handle_skill_preflight",
+        lambda ctx, skill=None, _resolved_binding=None: json.dumps(
+            {"ok": False, "error": "bad manifest schema"}
+        ),
+    )
     granted = []
     monkeypatch.setattr(sr, "auto_grant_if_enabled", lambda drive_root, skill: granted.append(skill))
     monkeypatch.setattr(sr, "save_review_state", lambda *a, **k: None)

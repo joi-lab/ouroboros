@@ -1,14 +1,10 @@
-# Ouroboros has moved
+# Ouroboros moved to razzant/ouroboros
 
-> [!CAUTION]
-> This repository is an outdated, read-only archive.
+> [!IMPORTANT]
+> This is a read-only archive. Ouroboros is developed in the official repository: **https://github.com/razzant/ouroboros**
 >
-> Do not install Ouroboros from this mirror. Do not open issues or pull requests here.
->
-> Official repository: https://github.com/razzant/ouroboros
->
-> Latest release: https://github.com/razzant/ouroboros/releases/latest
->
-> Official website: https://ouroboros-agent.ai/
->
-> Historical first 48 hours: https://ouroboros-agent.ai/history/first-48-hours/
+> - Download the current version: https://github.com/razzant/ouroboros/releases/latest
+> - Issues, pull requests, discussions and stars: https://github.com/razzant/ouroboros
+> - Website: https://ouroboros-agent.ai/
+
+This repository was the first public home of Ouroboros (the Google Colab version) and later a mirror of the official repository. After each stable release these branches are refreshed automatically: `main`, `ouroboros`, `ouroboros-stable`. They hold Ouroboros v7.6.0 (official commit 4b37f9622); other branches are historical.

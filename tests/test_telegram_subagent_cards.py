@@ -1,6 +1,8 @@
 import asyncio, importlib.util, json, sys, types
 from pathlib import Path
 
+import pytest
+
 
 def _load_plugin():
     root = Path(__file__).resolve().parents[1] / "skills" / "telegram"
@@ -20,7 +22,7 @@ class _Api:
 
 class _Rec:
     sent = []; edited = []; _id = [1000]
-    def __init__(self, token): pass
+    def __init__(self, token, **_kwargs): pass
     async def send_message(self, chat_id, text, parse_mode="HTML"):
         _Rec._id[0] += 1; _Rec.sent.append((chat_id, text, parse_mode, _Rec._id[0])); return _Rec._id[0]
     async def edit_message_text(self, chat_id, message_id, text, parse_mode="HTML"):
@@ -71,6 +73,101 @@ def test_real_reply_is_sent(tmp_path, monkeypatch):
     handle = plugin._make_outbound(api)
     asyncio.run(handle({"text": "Here is your answer", "is_progress": False}))
     assert len(_Rec.sent) == 1 and "answer" in _Rec.sent[0][1]
+
+
+@pytest.mark.parametrize("silent", [None, "off", "on"], ids=["default", "off", "on"])
+def test_a_terminal_answer_reaches_telegram_alone_and_keeps_the_silent_reply_chain(tmp_path, monkeypatch, silent):
+    """The real terminal delivery sends the model's answer alone through Telegram's
+    edit mode: the host notice stays a field of the result and never becomes a
+    second message (the non-clean line of the notifier carries that fact now)."""
+    from collections import deque
+    import queue
+
+    from ouroboros.task_finalization import prepare_terminal_send_event, register_final_answer_owed
+    from ouroboros.tools.control_runtime import _send_user_message
+    from ouroboros.utils import append_jsonl
+    from supervisor import events_chat_delivery as delivery, message_bus
+    from supervisor.terminal_delivery import pending_deliveries
+
+    settings = {} if silent is None else {"TELEGRAM_SILENT_MODE": silent}
+    plugin, api = _setup(tmp_path, monkeypatch, **settings)
+    handle = plugin._make_outbound(api)
+    published, frames = [], []
+
+    def publish(_topic, event):
+        published.append(dict(event))
+        asyncio.run(handle(event))
+
+    bridge = message_bus.LocalChatBridge({})
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat: None)
+    monkeypatch.setattr(message_bus, "publish_event", publish)
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    host = types.SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
+                                 send_with_budget=message_bus.send_with_budget)
+    task = {"id": "native-reply", "type": "task", "chat_id": 1, "_is_direct_chat": True}
+    events = queue.Queue()
+    tool_ctx = types.SimpleNamespace(current_chat_id=1, task_id=task["id"], task_metadata={},
+                                     event_queue=events, pending_events=[], drive_root=tmp_path,
+                                     drive_logs=lambda: tmp_path / "logs")
+    ongoing = ["I found the source.", "I am checking the result."]
+    for text in ongoing:
+        assert "sent to owner chat" in _send_user_message(tool_ctx, text)
+        delivery._handle_send_message(events.get_nowait(), host)
+    assert not tool_ctx.pending_events
+    assert all(row["system_type"] == "proactive_message" for row in published)
+    assert all("task_terminal_status" not in row for row in published)
+    assert len(_Rec.edited) == (1 if silent == "on" else 0)
+
+    answer, notice = "Complete model answer: λ", "Plan review stayed open; inspect the task details."
+    event = prepare_terminal_send_event(tmp_path, task, answer, {
+        "terminal_origin": "model_final", "terminal_host_notice": notice,
+    }, {"type": "send_message", "task_id": task["id"], "chat_id": 1,
+        "text": answer, "log_text": answer, "format": "markdown"}, presence=False)
+    assert "terminal_host_notice" not in event
+    register_final_answer_owed(task, event, env_drive_root=tmp_path)
+    delivery_id = event["delivery_id"]
+    delivery._handle_send_message(event, host)
+    sent_counts = len(_Rec.sent), len(_Rec.edited), len(published)
+    delivery._handle_send_message(event, host)  # Buffered final after its live copy.
+    assert sent_counts == (len(_Rec.sent), len(_Rec.edited), len(published))
+    assert event["text"] == event["log_text"] == answer and event["delivery_id"] == delivery_id
+    assert [(row["role"], row["content"]) for row in frames] == [
+        *(('assistant', text) for text in ongoing), ('assistant', answer),
+    ]
+    assert pending_deliveries(tmp_path) == []
+    visible = {row[3]: row[1] for row in _Rec.sent}
+    for _chat, message_id, text, _format in _Rec.edited:
+        visible[message_id] = text
+    assert list(visible.values()) == ([answer] if silent == "on" else [*ongoing, answer])
+    assert all(notice not in text for text in visible.values())
+    if silent == "on":
+        # The system notice neither overwrites nor takes ownership of the normal edit chain.
+        assert plugin._get_silent_msg(api, 42) == _Rec.sent[0][3]
+        delivery._handle_send_message({"type": "send_message", "chat_id": 1,
+                                       "text": "Separate host receipt", "role": "system",
+                                       "system_type": "terminal_incident"}, host)
+        receipt_id = _Rec.sent[-1][3]
+        assert "sent to owner chat" in _send_user_message(tool_ctx, "A later ongoing reply.")
+        delivery._handle_send_message(events.get_nowait(), host)
+        assert _Rec.edited[-1][1:3] == (_Rec.sent[0][3], "A later ongoing reply.")
+        assert all(row[1] != receipt_id for row in _Rec.edited)
+
+
+def test_routing_refusal_speaks_in_the_third_person(tmp_path, monkeypatch):
+    """astra A-miss1: the mirror's routing refusal names no narrator."""
+    plugin, api = _setup(tmp_path, monkeypatch)
+    handle = plugin._make_outbound(api)
+    asyncio.run(handle({"annotation_type": "routing_ack", "status": "needs_manual_target",
+                        "options": [{"task_id": "t1", "label": "Fix the parser"}]}))
+    (message,) = [row[1] for row in _Rec.sent]
+    lines = message.splitlines()
+    assert lines[0] == "Choose a target for the last message:"
+    assert "1. Fix the parser" in lines
+    assert not any(line.startswith("I ") for line in lines) and "I couldn't" not in message
 
 
 def test_subagent_cards_off_hides_activity(tmp_path, monkeypatch):

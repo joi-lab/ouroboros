@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "6.87.5"
+version = "7.6.0"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -29,7 +29,14 @@ dependencies = [
     "openai>=1.66.0",
     "gigachat>=0.2.1,<0.3",
     "requests",
-    "httpx",
+    # Runtime self-update and install paths execute ``sys.executable -m pip``.
+    # uv-created source/tool environments do not seed pip unless it is declared.
+    "pip",
+    "httpx[socks]>=0.28",  # SOCKS transport plus socks5h URL support (HTTPX 0.28+).
+    # Native process command/tree observations for shared-daemon custody on Windows.
+    "psutil>=7.2; sys_platform == 'win32'",
+    # Runtime custom-tool calls are validated against the exact projected schema.
+    "jsonschema>=4.0",
     "ddgs",
     "dulwich",
     "huggingface_hub",
@@ -40,7 +47,13 @@ dependencies = [
     "uvicorn[standard]",
     "websockets",
     "pytest>=7.0",
-    "claude-agent-sdk>=0.1.60",
+    # Runtime, not test-only: the hermetic commit gate's parallel pass hard-blocks
+    # with PREFLIGHT_PLUGIN_MISSING rather than degrading to serial, so a wheel /
+    # `pip install .` that carries pytest without these cannot commit at all.
+    # Floors kept in step with _REQUIRED_PREFLIGHT_PLUGINS. These remain runtime
+    # dependencies because the packaged hermetic commit gate invokes them.
+    "pytest-xdist>=3.5",
+    "pytest-timeout>=2.1",
     "mcp>=1.6,<2.0",
     "PyYAML>=6.0",
     "croniter",
@@ -66,26 +79,45 @@ Issues = "https://github.com/razzant/ouroboros/issues"
 "Previous Version (Colab)" = "https://github.com/razzant/ouroboros/tree/legacy-google-colab"
 
 [project.optional-dependencies]
-claude-sdk = ["claude-agent-sdk>=0.1.60"]
 browser = ["playwright", "playwright-stealth"]
+desktop = [
+    "pywebview==5.4",
+    "pythonnet==3.0.5; platform_system == 'Windows'",
+    "clr_loader==0.2.7.post0; platform_system == 'Windows'",
+]
 local-model = ["llama-cpp-python"]
 build = ["pyinstaller>=6.0"]
-all = ["claude-agent-sdk>=0.1.60", "playwright", "playwright-stealth", "llama-cpp-python", "huggingface_hub"]
+all = [
+    "playwright",
+    "playwright-stealth",
+    "pywebview==5.4",
+    "pythonnet==3.0.5; platform_system == 'Windows'",
+    "clr_loader==0.2.7.post0; platform_system == 'Windows'",
+    "llama-cpp-python",
+    "huggingface_hub",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.12"]
+
+[tool.uv]
+required-version = "==0.12.1"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 # Default local pytest excludes token-burning integration/browser suites.
-addopts = "-q --tb=short -m 'not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke'"
+addopts = "-q --tb=short -m 'not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet' --durations=25 --durations-min=1.0"
 markers = [
-    "integration: requires real provider API keys (OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY); excluded from default local runs, opt in via `pytest -m integration`",
+    "integration: real external-surface suites excluded from default local runs — the CI provider-contract lane (requires real provider API keys: OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / MINIMAX_API_KEY / DEEPSEEK_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY / GIGACHAT_CREDENTIALS; opt in via `pytest -m integration`) AND the KEYLESS tests/system_e2e/ scenario lane (real isolated servers, no provider keys; additionally env-gated on OUROBOROS_E2E_DEEP)",
     "browser: launches real Playwright Chromium; excluded from default local runs, opt in via `pytest -m browser`",
     "ui_browser: launches the real Ouroboros web UI in host/direct mode; excluded from default local runs",
     "ui_browser_docker: launches UI smoke checks against Docker runtime; excluded from default local runs",
     "portable_detail: portable/build artifact detail checks; excluded from default local runs",
-    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml)",
+    "serial: real subprocess / real port / mutable module-global test — run in a serial pass, excluded from the `-n auto` parallel pass via `-m 'not serial'` (see .github/workflows/ci.yml AND the hermetic commit gate ouroboros/preflight_runner.py, which runs the same two-pass split)",
     "skill_smoke: real-network OuroborosHub official-skill install + review-flow smoke; excluded from default local runs, opt in via `pytest -m skill_smoke` (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
+    "size_ratchet: per-module line/UTF-8 byte and per-function length gates against the live repo (manifest exactness, shrink-only pairwise transition) — a BLOCKING lane only in official-repository CI; excluded from default local runs, which surface the same validator findings as warnings (canonical lane description: docs/DEVELOPMENT.md 'Pytest marker lanes')",
 ]
 
 [tool.setuptools]
@@ -95,6 +127,9 @@ py-modules = ["server"]
 include = ["ouroboros*", "supervisor*", "web*"]
 
 [tool.setuptools.package-data]
+ouroboros = [
+    "domains.toml",
+]
 web = [
     "*.html",
     "*.js",
@@ -105,6 +140,12 @@ web = [
     "providers/*.svg",
     "providers/*.png",
     "providers/*.ico",
+    "vendor/VENDOR-MANIFEST.md",
+    "vendor/katex/*.css",
+    "vendor/katex/*.js",
+    "vendor/katex/contrib/*.js",
+    "vendor/katex/fonts/*.woff2",
+    "vendor/licenses/*",
 ]
 [tool.ruff]
 line-length = 120

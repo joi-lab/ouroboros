@@ -62,7 +62,8 @@ def _ensure_clean_worktree(repo_root: pathlib.Path) -> None:
     if status:
         raise SystemExit(
             "Refusing to build repo.bundle from a dirty working tree. "
-            "Commit or stash changes first so the embedded managed repo matches the packaged code."
+            "Commit or stash changes first so the embedded managed repo matches the packaged code.\n"
+            + status
         )
 
 

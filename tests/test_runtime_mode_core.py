@@ -40,18 +40,39 @@ def test_settings_defaults_include_phase2_keys():
 
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "x-ai/grok-4.5"
-    # Heavy default EMPTY -> fall back to Main (role-model, v6.39). Since v6.82.0 the
-    # Light lane and the resilience Fallbacks chain carry real cheap defaults.
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.8-flash"
+    # Empty role slots inherit Main; Light and Fallback use Luna explicitly.
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.6-flash"
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_VISION"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CONSCIOUSNESS"] == ""
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-luna"
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
+    assert (
+        SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
+        == ""  # unauthored; the getter resolves the route's default
+    )
+    assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
+    assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
+
+
+def test_llm_internal_fallbacks_follow_shipped_model_defaults(monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.llm import DEFAULT_LIGHT_MODEL, LLMClient
+
+    monkeypatch.delenv("OUROBOROS_MODEL", raising=False)
+    monkeypatch.delenv("OUROBOROS_MODEL_HEAVY", raising=False)
+    monkeypatch.delenv("OUROBOROS_MODEL_LIGHT", raising=False)
+    client = LLMClient.__new__(LLMClient)
+
+    assert DEFAULT_LIGHT_MODEL == SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"]
+    assert client.default_model() == SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+    assert client.available_models() == [SETTINGS_DEFAULTS["OUROBOROS_MODEL"]]
 
 
 def test_valid_runtime_modes_is_frozen_tuple():
     from ouroboros.config import VALID_RUNTIME_MODES
 
-    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro")
+    assert VALID_RUNTIME_MODES == ("light", "advanced", "pro", "cyber_pro")
 
 
 @pytest.mark.parametrize("mode", ["light", "advanced", "pro"])
@@ -108,6 +129,11 @@ def test_apply_settings_to_env_propagates_phase2_keys(monkeypatch):
     settings = dict(SETTINGS_DEFAULTS)
     settings["OUROBOROS_RUNTIME_MODE"] = "light"
     settings["OUROBOROS_SKILLS_REPO_PATH"] = "/tmp/skills"
+    # ``apply_settings_to_env`` intentionally authors every supplied key. Track
+    # the whole write set so this in-process test restores the caller's env
+    # instead of leaking shipped empty credentials/defaults into later tests.
+    for key in settings:
+        monkeypatch.delenv(key, raising=False)
 
     apply_settings_to_env(settings)
 
@@ -301,9 +327,10 @@ def test_settings_ui_renders_runtime_mode_and_skills_path():
 
 
 def test_settings_js_reads_and_writes_phase2_keys():
-    src = (REPO / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
+    src = "\n".join((REPO / "web" / "modules" / name).read_text(encoding="utf-8")
+                     for name in ("settings.js", "settings_local_model.js"))
     assert "OUROBOROS_RUNTIME_MODE" in src
-    assert "OUROBOROS_CONTEXT_MODE_DRAFT" in src
+    assert "OUROBOROS_CONTEXT_MODE'" in src
     assert "OUROBOROS_SKILLS_REPO_PATH" in src
     assert "['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced']" in src
     assert "['s-context-mode', 'OUROBOROS_CONTEXT_MODE', 'max']" in src
@@ -320,12 +347,14 @@ def test_chat_context_mode_toggle_reports_owner_endpoint_errors():
 
 def test_onboarding_js_has_runtime_mode_selector_and_save_payload():
     src = (REPO / "web" / "modules" / "onboarding_wizard.js").read_text(encoding="utf-8")
+    agents = (REPO / "web" / "modules" / "onboarding_agents_step.js").read_text(encoding="utf-8")
     html = build_onboarding_html({})
     for mode in ("light", "advanced", "pro"):
         assert f'"value": "{mode}"' in html
     assert "data-runtime-mode" in src
-    assert "OUROBOROS_RUNTIME_MODE" in src
-    assert "OUROBOROS_SKILLS_REPO_PATH" in src
+    assert "onboardingSettingsDraft" in src
+    assert "OUROBOROS_RUNTIME_MODE" in agents
+    assert "OUROBOROS_SKILLS_REPO_PATH" in agents
 
 
 def test_phase4_ui_copy_matches_shipped_runtime():
@@ -374,6 +403,20 @@ def test_onboarding_css_has_three_column_variant():
 # ===========================================================================
 
 
+def _restore_gateway_settings_bindings_after_test(monkeypatch, server_module) -> None:
+    """Track assignments made by server's legacy gateway-sync compatibility seam."""
+    for name in (
+        "load_settings", "save_settings", "_apply_settings_to_env",
+        "apply_runtime_provider_defaults",
+    ):
+        monkeypatch.setattr(
+            server_module._gateway_settings,
+            name,
+            getattr(server_module._gateway_settings, name, None),
+            raising=False,
+        )
+
+
 def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
     """POSTing an invalid runtime mode must be normalized to 'advanced'
     before save — so /api/settings and /api/state can never disagree."""
@@ -382,6 +425,7 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
     from unittest.mock import patch
 
     saved: dict = {}
+    _restore_gateway_settings_bindings_after_test(monkeypatch, srv)
 
     def fake_load_settings():
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -390,12 +434,15 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         return out
 
     def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
-                           authored_keys=()):
+                           authored_keys=(), boundary=None):
         # Stands in for both save_settings (allow_elevation) and _owner_write_settings
         # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
-        # names the disk-authored keys it really authors, see prepare_settings_for_persist).
+        # names the disk-authored keys it really authors, see prepare_settings_for_persist;
+        # boundary marks the commit point, so the stub marks it as the real writer would).
         saved.clear()
         saved.update(payload)
+        if boundary is not None:
+            boundary.commit()
 
     with patch.object(srv, "load_settings", side_effect=fake_load_settings), \
             patch.object(srv, "save_settings", side_effect=fake_save_settings), \
@@ -418,7 +465,7 @@ def test_api_settings_post_clamps_unknown_runtime_mode(tmp_path, monkeypatch):
         assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
 
 
-def test_api_settings_post_silently_drops_runtime_mode_changes():
+def test_api_settings_post_silently_drops_runtime_mode_changes(monkeypatch):
     """v5.1.2 elevation ratchet: even a VALID runtime_mode in the body
     is silently dropped — the API never accepts mode changes."""
     import server as srv
@@ -426,6 +473,7 @@ def test_api_settings_post_silently_drops_runtime_mode_changes():
     from unittest.mock import patch
 
     saved: dict = {}
+    _restore_gateway_settings_bindings_after_test(monkeypatch, srv)
 
     def fake_load_settings():
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -435,12 +483,15 @@ def test_api_settings_post_silently_drops_runtime_mode_changes():
         return out
 
     def fake_save_settings(payload, *, allow_elevation: bool = False, allow_context_lowering: bool = False,
-                           authored_keys=()):
+                           authored_keys=(), boundary=None):
         # Stands in for both save_settings (allow_elevation) and _owner_write_settings
         # (allow_context_lowering, added in v6.33.0 P4; authored_keys in v6.80.0 — the caller
-        # names the disk-authored keys it really authors, see prepare_settings_for_persist).
+        # names the disk-authored keys it really authors, see prepare_settings_for_persist;
+        # boundary marks the commit point, so the stub marks it as the real writer would).
         saved.clear()
         saved.update(payload)
+        if boundary is not None:
+            boundary.commit()
 
     with patch.object(srv, "load_settings", side_effect=fake_load_settings), \
             patch.object(srv, "save_settings", side_effect=fake_save_settings), \
@@ -509,20 +560,20 @@ def _git_repo(tmp_path: pathlib.Path) -> pathlib.Path:
 # ----- Light mode blanket block -----
 
 
-@pytest.mark.parametrize("tool_name", [
-    "write_file",
-    "commit_reviewed",
-    "edit_text",
-    "vcs_revert",
-    "vcs_pull_ff",
-    "vcs_restore",
-    "vcs_rollback",
-    "promote_to_stable",
+@pytest.mark.parametrize(("tool_name", "args"), [
+    ("write_file", {"path": "README.md", "content": "changed\n"}),
+    ("commit_reviewed", {"commit_message": "test"}),
+    ("edit_text", {"path": "README.md", "old_str": "ok", "new_str": "changed"}),
+    ("vcs_revert", {"sha": "HEAD"}),
+    ("vcs_pull_ff", {}),
+    ("vcs_restore", {}),
+    ("vcs_rollback", {"target": "HEAD"}),
+    ("promote_to_stable", {"reason": "test"}),
 ])
-def test_light_mode_blocks_repo_mutation_tools(tool_name, tmp_path, monkeypatch):
+def test_light_mode_blocks_repo_mutation_tools(tool_name, args, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
-    result = reg.execute(tool_name, {"path": "README.md"})
+    result = reg.execute(tool_name, args)
     assert "LIGHT_MODE_BLOCKED" in result, result[:200]
 
 
@@ -751,6 +802,152 @@ def test_restore_to_head_blocks_protected_rename_source(tmp_path, monkeypatch):
     assert "BIBLE.md" in result
 
 
+def test_restore_to_head_gate_and_action_share_one_normalizer(tmp_path, monkeypatch):
+    """D8: the protected-path gate and the checkout action must judge and act on
+    the IDENTICAL normalized path. The action used lstrip("./") (strips '.' and
+    '/'), so `../ouroboros/safety.py` passed the gate (not equal to the protected
+    literal) and was then checked out against the real protected file — a
+    protected-path bypass. An escaping path must be refused before any checkout,
+    and the dirty protected file must survive untouched."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    # Dirty the protected file with uncommitted work that must NOT be discarded.
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(
+        ctx, confirm=True, paths=["../ouroboros/safety.py"],
+    )
+
+    assert "escapes the repository root" in result, result[:200]
+    # The bypass is closed: the uncommitted edit survives (no checkout ran).
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
+def test_restore_to_head_gate_judges_the_pathspec_damage_set(tmp_path, monkeypatch):
+    """D8, third form: a pathspec is not a path. Git expands ".", directories,
+    and fnmatch wildcards to a FILE SET, so a gate that judged only the requested
+    STRING let `paths=["."]` / `["ouroboros"]` / `["ouroboros/safety.*"]` reach a
+    dirty protected file and report success. The gate must judge the files the
+    restore would actually mutate, resolved by git from the SAME pathspecs."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+
+    for spec in (["."], ["ouroboros"], ["ouroboros/safety.*"], ["tests/.."]):
+        result = git_mod._restore_to_head(ctx, confirm=True, paths=spec)
+        assert "RESTORE_BLOCKED" in result or "escapes the repository root" in result, (spec, result[:200])
+        assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n", spec
+
+    # Pathspec magic re-scopes behind the gate's back: refused outright.
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=[":/ouroboros/safety.py"])
+    assert "pathspec magic is not supported" in result, result[:200]
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
+def test_restore_to_head_pathspec_gate_sees_staged_deletion_and_rename(tmp_path, monkeypatch):
+    """D8, fourth form: `git ls-files` resolves against the INDEX, so a staged
+    deletion or rename-away of a protected file is invisible to it while
+    `checkout HEAD -- .` would resurrect the file and discard the protected
+    staged change. The damage set must come from pathspec-scoped porcelain."""
+    from ouroboros.tools import git as git_mod
+
+    for staging in ("rm", "mv"):
+        (tmp_path / staging).mkdir()
+        repo = _git_repo(tmp_path / staging)
+        ctx = _CommitCtx(repo, tmp_path / staging / "drive")
+        if staging == "rm":
+            subprocess.run(["git", "rm", "-q", "BIBLE.md"], cwd=repo, check=True)
+        else:
+            subprocess.run(["git", "mv", "BIBLE.md", "BIBLE2.md"], cwd=repo, check=True)
+
+        result = git_mod._restore_to_head(ctx, confirm=True, paths=["."])
+
+        assert "RESTORE_BLOCKED" in result, (staging, result[:200])
+        assert not (repo / "BIBLE.md").exists(), staging
+
+
+def test_restore_to_head_directory_pathspec_still_restores_unprotected_files(tmp_path, monkeypatch):
+    """Capability preservation for the damage-set gate: a directory pathspec whose
+    matches are all unprotected must still restore (the gate judges damage, not
+    the shape of the request)."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "docs").mkdir()
+    doc = repo / "docs" / "notes.md"
+    doc.write_text("committed\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "docs"], cwd=repo, check=True, capture_output=True)
+    doc.write_text("scratch edit\n", encoding="utf-8")
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=["docs"])
+    assert "Restored" in result, result[:200]
+    assert doc.read_text(encoding="utf-8") == "committed\n"
+
+
+def test_restore_to_head_gate_collapses_inner_parent_segments(tmp_path, monkeypatch):
+    """D8, second form: an INNER '..' does not escape the repository, so a
+    containment check alone lets it through — but normalize_repo_path() does not
+    collapse '..' while git resolves it inside a pathspec. The gate therefore read
+    'tests/../ouroboros/safety.py' as an unprotected string while the checkout
+    landed on the real protected file. The gate and the action must both judge the
+    COLLAPSED path."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / "ouroboros").mkdir()
+    (repo / "tests").mkdir()
+    safety = repo / "ouroboros" / "safety.py"
+    safety.write_text("REAL = 'committed'\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "safety"], cwd=repo, check=True, capture_output=True)
+    safety.write_text("REAL = 'uncommitted local edit'\n", encoding="utf-8")
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(
+        ctx, confirm=True, paths=["tests/../ouroboros/safety.py"],
+    )
+
+    assert "RESTORE_BLOCKED" in result, result[:300]
+    assert "ouroboros/safety.py" in result
+    assert safety.read_text(encoding="utf-8") == "REAL = 'uncommitted local edit'\n"
+
+
+def test_restore_to_head_does_not_mangle_leading_dot_paths(tmp_path, monkeypatch):
+    """D8: lstrip("./") turned `.gitignore` into `gitignore`, so the restore acted
+    on the wrong (or a nonexistent) path. The normalizer must preserve a leading
+    dot so an ordinary dotfile is actually restored."""
+    from ouroboros.tools import git as git_mod
+
+    repo = _git_repo(tmp_path)
+    (repo / ".gitignore").write_text("build/\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "gitignore"], cwd=repo, check=True, capture_output=True)
+    # Delete it (a dirty, restorable change).
+    (repo / ".gitignore").unlink()
+
+    ctx = _CommitCtx(repo, tmp_path / "drive")
+    result = git_mod._restore_to_head(ctx, confirm=True, paths=[".gitignore"])
+
+    assert "Restored 1 path" in result, result[:200]
+    assert (repo / ".gitignore").read_text(encoding="utf-8") == "build/\n"
+
+
 def test_revert_commit_blocks_protected_contract_path(tmp_path, monkeypatch):
     from ouroboros.tools import git as git_mod
 
@@ -801,25 +998,163 @@ def test_run_shell_blocks_shell_wrapped_git_mutation(cmd, tmp_path, monkeypatch)
     assert "GIT_VIA_SHELL_BLOCKED" in result
 
 
-def test_advanced_mode_blocks_runshell_protected_python_writer(tmp_path, monkeypatch):
+def _outside_runtime_registry(tmp_path, monkeypatch):
+    """Registry whose repo/data/user-files roots are DISJOINT, so an out-of-runtime
+    git target is actually outside every protected root (repo_dir == drive_root ==
+    tmp_path in _registry makes everything runtime-contained)."""
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    repo = tmp_path / "repo"; repo.mkdir()
+    data = tmp_path / "data"; data.mkdir()
+    home = tmp_path / "home"; (home / "proj").mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    return ToolRegistry(repo_dir=repo, drive_root=data), repo, home
+
+
+@pytest.mark.parametrize("runtime_mode", ["light", "advanced"])
+def test_default_lane_allows_mutating_git_outside_runtime(runtime_mode, tmp_path, monkeypatch):
+    """Q4=A sandbox unwind: the default (non-workspace) lane is TARGET-aware in
+    every runtime mode — `git init` in a user tree is legitimate task work."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", runtime_mode)
+    reg, _repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute("run_command", {"cmd": ["git", "init"], "cwd": str(home / "proj")})
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+    assert "WORKSPACE_GIT_BLOCKED" not in result
+
+
+def test_default_lane_blocks_mutating_git_targeting_runtime(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute(
+        "run_command",
+        {"cmd": ["git", "-C", str(repo), "commit", "-m", "x"], "cwd": str(home)},
+    )
+    assert "GIT_VIA_SHELL_BLOCKED" in result
+    assert "commit_reviewed" in result
+
+
+def test_default_lane_allows_readonly_git_at_runtime_cwd(tmp_path, monkeypatch):
+    """Read-only git stays allowed even at the system-repo cwd (v4.5.1 line)."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, _repo, _home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute("run_command", {"cmd": ["git", "status"]})
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+
+
+def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypatch):
+    """The default lane's DEFAULT cwd is the system repo; `git -C <outside>` must
+    be judged by its effective (-C) target, not the shell cwd, or the flip
+    re-creates the false-block class it removes."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    reg, _repo, home = _outside_runtime_registry(tmp_path, monkeypatch)
+    result = reg.execute(
+        "run_command",
+        {"cmd": ["git", "-C", str(home / "proj"), "init"]},  # no cwd -> repo default
+    )
+    assert "GIT_VIA_SHELL_BLOCKED" not in result
+    assert "WORKSPACE_GIT_BLOCKED" not in result
+
+
+@pytest.mark.parametrize("mode", ["advanced", "pro"])
+def test_shell_python_writer_reaches_the_selected_process(tmp_path, tmp_path_factory, monkeypatch, mode):
+    """Source text is executed under selected supervision without guessed targets."""
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    # Only an argv LIST is interpreter-resolved; this string form launches the bare
+    # `python` from PATH, which a host shipping only `python3` (stock macOS) lacks.
+    # Put the running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     reg = _registry(tmp_path)
     result = reg.execute(
         "run_command",
         {"cmd": "python -c \"from pathlib import Path; Path('BIBLE.md').write_text('x')\""},
     )
-    assert "SAFETY_VIOLATION" in result
-    assert "BIBLE.md" in result
+    assert "SAFETY_VIOLATION" not in result
+    assert "exit_code=0" in result, result
+    assert (tmp_path / "BIBLE.md").read_text(encoding="utf-8") == "x"
 
 
-def test_advanced_mode_blocks_runshell_protected_backslash_path(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+def test_pro_mode_keeps_bible_delete_blocked_but_allows_ordinary_rm(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
+    (tmp_path / "BIBLE.md").write_text("constitution\n", encoding="utf-8")
+    (tmp_path / "scratch.txt").write_text("scratch\n", encoding="utf-8")
     reg = _registry(tmp_path)
-    result = reg.execute(
-        "run_command",
-        {"cmd": "python -c \"open('ouroboros\\\\contracts\\\\plugin_api.py','w').write('x')\""},
+    bible_result = reg.execute("run_command", {"cmd": "rm BIBLE.md"})
+    assert "BIBLE_DELETE_BLOCKED" in bible_result
+    assert (tmp_path / "BIBLE.md").exists()
+    rename_result = reg.execute("run_command", {"cmd": "git mv BIBLE.md BIBLE.old"})
+    assert "BIBLE_DELETE_BLOCKED" in rename_result
+    assert (tmp_path / "BIBLE.md").exists()
+    update_index_result = reg.execute(
+        "run_command", {"cmd": "git update-index --force-remove BIBLE.md"},
     )
-    assert "SAFETY_VIOLATION" in result
+    assert "BIBLE" in update_index_result
+    identity = tmp_path / "memory" / "identity.md"
+    identity.parent.mkdir()
+    identity.write_text("identity\n", encoding="utf-8")
+    identity_result = reg.execute("run_command", {"cmd": "rm memory/identity.md"})
+    assert "IDENTITY_DELETE_BLOCKED" in identity_result
+    assert identity.exists()
+    ordinary = reg.execute("run_command", {"cmd": ["rm", "scratch.txt"]})
+    assert "exit_code=0" in ordinary and not (tmp_path / "scratch.txt").exists()
+
+
+@pytest.mark.parametrize("mode", ["pro", "cyber_pro"])
+def test_runtime_identity_deletion_uses_the_selected_mode(tmp_path, monkeypatch, mode):
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    (data / "memory").mkdir(parents=True)
+    identity = data / "memory/identity.md"
+    identity.write_text("identity\n", encoding="utf-8")
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data))
+    result = reg.execute("run_command", {"cmd": ["rm", str(identity)]})
+    if mode == "cyber_pro":
+        assert "exit_code=0" in result and not identity.exists(), result
+    else:
+        assert "IDENTITY_DELETE_BLOCKED" in result, result  # owner 5A: the bare word no longer fences a root; the identity guard refuses
+        assert identity.read_text() == "identity\n"
+
+
+def test_runtime_mode_rank_preserves_the_access_order():
+    from ouroboros.runtime_mode_policy import runtime_mode_at_least, runtime_mode_rank
+
+    assert runtime_mode_rank("pro") >= runtime_mode_rank("advanced")
+    assert runtime_mode_at_least("pro", "pro")
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rebase HEAD~1",
+    "git checkout -- BIBLE.md",
+    "git restore BIBLE.md",
+    "git commit -m rewrite BIBLE.md",
+    "git update-ref refs/heads/feature HEAD",
+    "git filter-repo --path other.txt --invert-paths",
+])
+def test_bible_history_predicate_allows_unrelated_git_history_operations(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert protected_bible_history_delete_reason(cmd) == ""
+
+
+@pytest.mark.parametrize("cmd", [
+    "git rm BIBLE.md",
+    "git mv BIBLE.md BIBLE.old",
+    "git update-index --remove BIBLE.md",
+    "git filter-repo --path BIBLE.md --invert-paths",
+])
+def test_bible_history_predicate_blocks_explicit_bible_targets(cmd):
+    from ouroboros.runtime_mode_policy import protected_bible_history_delete_reason
+
+    assert "BIBLE" in protected_bible_history_delete_reason(cmd)
 
 
 def test_light_mode_allows_extension_tool_dispatch(tmp_path, monkeypatch):
@@ -851,32 +1186,17 @@ def test_light_mode_allows_extension_tool_dispatch(tmp_path, monkeypatch):
             extension_loader._tools.pop(tool_name, None)
 
 
-@pytest.mark.parametrize("bad_cmd", [
-    "sed -i 's/foo/bar/' docs/README.md",
-    "perl -i -pe 's/foo/bar/' docs/README.md",
-    "truncate -s 0 docs/README.md",
-    "chmod 755 docs/README.md",
-    "chown anton docs/README.md",
-    "ln -s /tmp/x docs/link",
+@pytest.mark.parametrize(("tool_name", "args"), [
+    ("fetch_pr_ref", {"pr_number": 1}),
+    ("create_integration_branch", {"pr_number": 1}),
+    ("cherry_pick_pr_commits", {"shas": ["deadbeef"]}),
+    ("stage_adaptations", {}),
+    ("stage_pr_merge", {"branch": "integration/test"}),
 ])
-def test_light_mode_blocks_inplace_mutation_tools(bad_cmd, tmp_path, monkeypatch):
+def test_light_mode_blocks_pr_integration_tools(tool_name, args, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
-    result = reg.execute("run_command", {"cmd": bad_cmd})
-    assert "LIGHT_MODE_BLOCKED" in result, f"cmd={bad_cmd!r}: {result[:200]}"
-
-
-@pytest.mark.parametrize("tool_name", [
-    "fetch_pr_ref",
-    "create_integration_branch",
-    "cherry_pick_pr_commits",
-    "stage_adaptations",
-    "stage_pr_merge",
-])
-def test_light_mode_blocks_pr_integration_tools(tool_name, tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    reg = _registry(tmp_path)
-    result = reg.execute(tool_name, {})
+    result = reg.execute(tool_name, args)
     assert "LIGHT_MODE_BLOCKED" in result
 
 
@@ -903,26 +1223,17 @@ def test_light_mode_allows_non_repo_shell_file_operations(cmd, tmp_path, monkeyp
     assert "LIGHT_MODE_BLOCKED" not in result, result[:200]
 
 
-def test_advanced_mode_blocks_python_os_remove_protected_path(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = _registry(tmp_path)
-    result = reg.execute("run_command", {"cmd": "python3 -c \"import os; os.remove('BIBLE.md')\""})
-    assert "SAFETY_VIOLATION" in result
-
-
 @pytest.mark.parametrize("cmd", [
-    "sort -o BIBLE.md BIBLE.md",
-    "uniq BIBLE.md BIBLE.md",
+    "cat BIBLE.md",
+    "git diff BIBLE.md",
+    "du BIBLE.md",
+    # Mode-aware write shape (write_shape.py): pure-filter reads and prose-word
+    # inspection lines are reads, not "modifications" of the mentioned file.
+    "sed -n '1,40p' BIBLE.md",
+    "grep -n delete ouroboros/safety.py",
+    "rg truncate ouroboros/runtime_mode_policy.py",
+    "python3 -c \"print(open('ouroboros/safety.py').read())\"",
 ])
-def test_run_shell_blocks_sort_uniq_protected_output_paths(cmd, tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = _registry(tmp_path)
-    result = reg.execute("run_command", {"cmd": cmd})
-    assert "SAFETY_VIOLATION" in result
-    assert "BIBLE.md" in result or "protected" in result.lower()
-
-
-@pytest.mark.parametrize("cmd", ["cat BIBLE.md", "git diff BIBLE.md", "du BIBLE.md"])
 def test_run_shell_allows_readonly_mentions_of_protected_paths(cmd, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = _registry(tmp_path)
@@ -934,11 +1245,13 @@ def test_run_shell_allows_readonly_mentions_of_protected_paths(cmd, tmp_path, mo
     ["bash", "-c", "printf x > README.md"],
     ["sh", "-c", "touch README.md"],
 ])
-def test_light_mode_blocks_simple_shell_c_repo_writer(cmd, tmp_path, monkeypatch):
+def test_light_mode_preserves_direct_repo_write_authority(cmd, tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
     reg = _registry(tmp_path)
     result = reg.execute("run_command", {"cmd": cmd})
-    assert "LIGHT_MODE_BLOCKED" in result
+    assert "LIGHT_MODE_BLOCKED" in result, result
+    assert not (tmp_path / "README.md").exists()
 
 
 def test_light_mode_allows_shell_wrapper_non_repo_writer(tmp_path, monkeypatch):
@@ -948,7 +1261,8 @@ def test_light_mode_allows_shell_wrapper_non_repo_writer(tmp_path, monkeypatch):
     assert "LIGHT_MODE_BLOCKED" not in result, result[:200]
 
 
-def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
+def test_light_mode_inline_writer_preserves_effect_and_discloses_it(tmp_path, monkeypatch):
+    """The completed effect is observed without replacing its execution result."""
     import ouroboros.safety as safety_mod
 
     repo = _git_repo(tmp_path)
@@ -961,7 +1275,25 @@ def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
         {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('README.md').write_text('hacked\\n')"]},
     )
 
-    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
+    assert "exit_code=0" in result, result
+    assert "LIGHT_MODE_REPO_CHANGED" in result
+    assert (repo / "README.md").read_text(encoding="utf-8") == "hacked\n"
+
+
+def test_light_mode_tripwire_catches_python_repo_writer(tmp_path, monkeypatch):
+    """A script-file invocation retains its effect and the observed changed paths."""
+    import ouroboros.safety as safety_mod
+
+    repo = _git_repo(tmp_path)
+    payload = tmp_path / "writer.py"
+    payload.write_text("from pathlib import Path\nPath('README.md').write_text('hacked\\n')\n")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
+
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
+
+    assert "LIGHT_MODE_REPO_CHANGED" in result, result[:300]
     assert "README.md" in result
     assert (repo / "README.md").read_text(encoding="utf-8") == "hacked\n"
 
@@ -974,12 +1306,11 @@ def test_light_mode_tripwire_catches_untracked_repo_file(tmp_path, monkeypatch):
     monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
     reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
 
-    result = reg.execute(
-        "run_command",
-        {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('new_tool.py').write_text('x\\n')"]},
-    )
+    payload = tmp_path / "creator.py"
+    payload.write_text("from pathlib import Path\nPath('new_tool.py').write_text('x\\n')\n")
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
 
-    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
+    assert "LIGHT_MODE_REPO_CHANGED" in result, result[:300]
     assert "new_tool.py" in result
     assert (repo / "new_tool.py").read_text(encoding="utf-8") == "x\n"
 
@@ -1007,7 +1338,7 @@ def test_light_mode_workspace_artifact_does_not_trip_self_repo_snapshot(tmp_path
         {"cmd": ["python3", "-c", "from pathlib import Path; Path('build.out').write_text('ok\\n')"]},
     )
 
-    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" not in result, result[:300]
+    assert "LIGHT_MODE_REPO_CHANGED" not in result, result[:300]
     assert "WORKSPACE_GIT_REF_CHANGED" not in result, result[:300]
     assert (workspace / "build.out").read_text(encoding="utf-8") == "ok\n"
 
@@ -1020,12 +1351,12 @@ def test_light_mode_tripwire_runs_after_failed_command(tmp_path, monkeypatch):
     monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
     reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
 
-    result = reg.execute(
-        "run_command",
-        {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('README.md').write_text('bad\\n'); raise SystemExit(2)"]},
-    )
+    payload = tmp_path / "failing_writer.py"
+    payload.write_text(
+        "from pathlib import Path\nPath('README.md').write_text('bad\\n')\nraise SystemExit(2)\n")
+    result = reg.execute("run_command", {"cmd": [sys.executable, str(payload)]})
 
-    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" in result, result[:300]
+    assert "LIGHT_MODE_REPO_CHANGED" in result, result[:300]
     assert "SHELL_EXIT_ERROR" in result
 
 
@@ -1042,7 +1373,7 @@ def test_advanced_mode_does_not_run_light_tripwire(tmp_path, monkeypatch):
         {"cmd": [sys.executable, "-c", "from pathlib import Path; Path('README.md').write_text('advanced\\n')"]},
     )
 
-    assert "LIGHT_MODE_REPO_WRITE_BLOCKED" not in result, result[:300]
+    assert "LIGHT_MODE_REPO_CHANGED" not in result, result[:300]
 
 
 # ===========================================================================
@@ -1059,6 +1390,10 @@ def _make_skill_payload(tmp_path, bucket, name):
     sees an existing payload root."""
     payload = tmp_path / "skills" / bucket / name
     payload.mkdir(parents=True)
+    (payload / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: test\nversion: 1.0.0\ntype: skill\n---\n",
+        encoding="utf-8",
+    )
     (payload / "plugin.py").write_text("def register(api):\n    pass\n", encoding="utf-8")
     return payload
 
@@ -1124,12 +1459,8 @@ def test_light_data_write_with_bucket_skill_name_resolves_under_payload(tmp_path
     assert landed.is_file(), f"expected file at {landed}; got result={result[:200]}"
 
 
-def test_light_bucket_native_rejected_at_gate(tmp_path, monkeypatch):
-    """bucket=native MUST not be honoured — launcher seed update lane stays
-    authoritative. With the post-triad partial-args check in place, the gate
-    surfaces the specific SKILL_PAYLOAD_ARG_ERROR (which lists `native excluded`)
-    BEFORE the generic LIGHT_MODE_BLOCKED would fire — giving the agent a
-    clearer signal."""
+def test_light_missing_native_payload_creation_rejected_at_gate(tmp_path, monkeypatch):
+    """A missing native payload is not a user-managed package to create in place."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     reg = _registry(tmp_path)
     result = reg.execute(
@@ -1143,7 +1474,8 @@ def test_light_bucket_native_rejected_at_gate(tmp_path, monkeypatch):
         },
     )
     assert "SKILL_PAYLOAD_ARG_ERROR" in result, result[:200]
-    assert "native excluded" in result
+    assert "read/review only" in result
+    assert "root=system_repo" in result
 
 
 @pytest.mark.parametrize("tool_name,base_args", [
@@ -1174,7 +1506,15 @@ def test_light_partial_args_surface_specific_error_not_generic_light_block(
         f"expected specific partial-args error for {tool_name} {partial!r}; "
         f"got: {result[:300]}"
     )
-    assert "bucket and skill_name must be supplied together" in result, result[:300]
+    assert any(
+        hint in result
+        for hint in (
+            "bucket and skill_name must be supplied together",
+            "requires a non-empty skill_name",
+            "requires bucket/location",
+            "read/review only",
+        )
+    ), result[:300]
 
 
 def test_b2_external_workspace_stray_bucket_is_ignored_not_blocked(tmp_path, monkeypatch):
@@ -1271,6 +1611,20 @@ def _ctx_with_skill_repair(tmp_path, skill_name: str, bucket: str = "external"):
         skill_name=skill_name,
         payload_root=f"skills/{bucket}/{skill_name}",
     )
+    # X3/F8: a repair TASK writes only under its admission binding (the promote
+    # seam records one for every real repair, and a repair without one is typed
+    # STALE rather than silently unverified). Mint the same binding here so these
+    # tests keep exercising runtime-mode routing rather than the CAS gate.
+    payload_dir = tmp_path / "skills" / bucket / skill_name
+    if payload_dir.is_dir():
+        from ouroboros.skill_loader import compute_content_hash
+        from ouroboros.skill_repair_admission import record_repair_admission
+
+        reg._ctx.task_id = str(getattr(reg._ctx, "task_id", "") or "repair-runtime-mode-test")
+        record_repair_admission(
+            tmp_path, skill_name, task_id=reg._ctx.task_id,
+            base_content_hash=compute_content_hash(payload_dir),
+        )
     return reg
 
 
@@ -1456,6 +1810,7 @@ def test_explicit_data_skills_path_wins_over_stale_bucket_skill_name(tmp_path, m
     repo.mkdir()
     skill = drive / "skills" / "external" / "alpha"
     skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
 

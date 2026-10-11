@@ -14,7 +14,7 @@ index 5932259..3f32bfd 100644
 +                   "OUROBOROS_REVIEW_MODELS", "OUROBOROS_EFFORT_REVIEW",
 +                   "OUROBOROS_EFFORT_SCOPE_REVIEW", "OUROBOROS_REVIEW_ENFORCEMENT",
 +                   "OUROBOROS_SAFETY_MODE", "OUROBOROS_MAX_SUBAGENT_DEPTH",
-+                   "OUROBOROS_MAX_WORKERS", "OUROBOROS_CONTEXT_MODE"):
++                   "OUROBOROS_MAX_WORKERS", "OUROBOROS_CONTEXT_MODE", "OUROBOROS_SUBAGENTS"):
 +            _v = os.environ.get(_k)
 +            if _v:
 +                ov[_k] = _v

@@ -1,0 +1,93 @@
+name: Submit Claudexor dependency
+
+on:
+  push:
+    branches:
+      - main
+      - ouroboros
+    paths:
+      - ouroboros/claudexor_runtime_pin.json
+      - .github/workflows/dependency-graph.yml
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  submit:
+    name: Submit managed runtime snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build dependency snapshot
+        env:
+          SNAPSHOT_PATH: ${{ runner.temp }}/claudexor-dependency-snapshot.json
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          pin_path = Path("ouroboros/claudexor_runtime_pin.json")
+          pin = json.loads(pin_path.read_text(encoding="utf-8"))
+          version = pin["release"]["version"]
+          tag = f"v{version}"
+          package_url = f"pkg:github/razzant/claudexor@{tag}"
+          snapshot = {
+              "version": 0,
+              "sha": os.environ["GITHUB_SHA"],
+              "ref": os.environ["GITHUB_REF"],
+              "job": {
+                  "correlator": "claudexor-runtime-pin",
+                  "id": os.environ["GITHUB_RUN_ID"],
+              },
+              "detector": {
+                  "name": "ouroboros-claudexor-runtime-pin",
+                  "version": "1",
+                  "url": (
+                      "https://github.com/razzant/ouroboros/blob/"
+                      f"{os.environ['GITHUB_SHA']}/.github/workflows/dependency-graph.yml"
+                  ),
+              },
+              "scanned": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+              "manifests": {
+                  str(pin_path): {
+                      "name": "Managed Claudexor runtime",
+                      "file": {"source_location": str(pin_path)},
+                      "resolved": {
+                          package_url: {
+                              "package_url": package_url,
+                              "relationship": "direct",
+                              "scope": "runtime",
+                              "dependencies": [],
+                              "metadata": {
+                                  "release_version": version,
+                                  "build_sha": pin["release"]["build_sha"],
+                                  "archive_url": pin["release"]["archive_url"],
+                              },
+                          }
+                      },
+                  }
+              },
+          }
+          Path(os.environ["SNAPSHOT_PATH"]).write_text(
+              json.dumps(snapshot, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Submit dependency snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_PATH: ${{ runner.temp }}/claudexor-dependency-snapshot.json
+        run: |
+          gh api --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${GITHUB_REPOSITORY}/dependency-graph/snapshots" \
+            --input "$SNAPSHOT_PATH"

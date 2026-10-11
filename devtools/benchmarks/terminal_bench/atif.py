@@ -55,6 +55,28 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _read_jsonl_chain(data_dir: Path, name: str, archive_prefix: str) -> list[dict[str, Any]]:
+    """Read ``logs/<name>`` plus its rotated ``archive/<prefix>_*.jsonl`` chain.
+
+    The runtime rotates chat.jsonl, progress.jsonl and — since the CPL4-C1/C2
+    rotation train — events.jsonl and tools.jsonl into ``archive/`` once they
+    cross ~800KB. Rotation is suppressed in sentinel-marked isolated benchmark
+    roots, but not every harness writes the sentinel — so the trajectory builder
+    must read the full chain (oldest archive first, then live) rather than assume
+    a from-birth single file. Every ATIF source goes through here: a live-only
+    read of a rotated log publishes a trajectory missing its early tool calls,
+    which is a FALSE trajectory, not a short one."""
+    rows: list[dict[str, Any]] = []
+    try:
+        archives = sorted((data_dir / "archive").glob(f"{archive_prefix}_*.jsonl"))
+    except OSError:
+        archives = []
+    for path in archives:
+        rows.extend(_read_jsonl(path))
+    rows.extend(_read_jsonl(data_dir / "logs" / name))
+    return rows
+
+
 def _read_text(path: Path) -> str:
     try:
         return path.read_text(encoding="utf-8", errors="replace")
@@ -191,8 +213,13 @@ def _detect_version(events: list[dict[str, Any]]) -> str | None:
 
 
 def _final_answer(agent_dir: Path) -> str:
-    chat = _read_jsonl(agent_dir / "ouroboros-data" / "logs" / "chat.jsonl")
+    chat = _read_jsonl_chain(agent_dir / "ouroboros-data", "chat.jsonl", "chat")
     for row in reversed(chat):
+        if row.get("type"):
+            # Typed structural rows (quiz/links/document/photo/video,
+            # proactive_message, project lifecycle) are deliveries, never the
+            # task's final answer.
+            continue
         if row.get("direction") == "out" and isinstance(row.get("text"), str):
             return row["text"]
     try:
@@ -206,6 +233,55 @@ def _final_answer(agent_dir: Path) -> str:
     return ""
 
 
+def _tool_call_steps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ONE row per logical tool call (#1316), shaped like a settlement row.
+
+    A call's ``tool_call_started`` / ``tool_call`` / ``tool_call_timeout`` rows share
+    one ``invocation_id``; a legacy row without it stands alone. What the model SAW
+    is the step: a call whose wait ended shows the timeout text at the timeout's
+    position (a late settlement is only noted); a call with only a start is kept
+    as an unknown outcome, never dropped and never read as a failure."""
+    calls: dict[str, dict[str, dict[str, Any]]] = {}
+    order: list[Any] = []
+    for row in rows:
+        kind = row.get("type")
+        if kind not in ("tool_call", "tool_call_started", "tool_call_timeout"):
+            continue
+        invocation_id = str(row.get("invocation_id") or "")
+        if not invocation_id:
+            if kind == "tool_call":
+                order.append(row)
+            continue
+        if invocation_id not in calls:
+            calls[invocation_id] = {}
+            order.append(invocation_id)
+        held = calls[invocation_id].get(kind)
+        # A duplicate settlement never replaces a real result with a host_error row.
+        if held is None or (kind == "tool_call" and held.get("status") == "host_error"
+                            and row.get("status") != "host_error"):
+            calls[invocation_id][kind] = row
+    out: list[dict[str, Any]] = []
+    for item in order:
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        call = calls[item]
+        started, settled, waited = (call.get(k) for k in ("tool_call_started", "tool_call", "tool_call_timeout"))
+        if waited is not None:
+            text = str(waited.get("result_preview") or "")
+            if settled is not None:
+                text += (f"\n[the worker also settled (status={settled.get('status')} "
+                         f"is_error={bool(settled.get('is_error'))}), but the model saw only this timeout]")
+            out.append({**waited, "status": "timeout", "is_error": True, "result_preview": text})
+        elif settled is not None:
+            out.append(settled)
+        else:
+            out.append({**(started or {}), "status": "unknown", "is_error": False,
+                        "result_preview": "(no outcome recorded: host processing began; "
+                                          "neither a result nor a wait end was logged)"})
+    return out
+
+
 def build_trajectory(
     agent_dir: Path,
     *,
@@ -215,15 +291,12 @@ def build_trajectory(
 ) -> dict[str, Any]:
     """Build an ATIF trajectory dict from a Harbor trial ``agent/`` directory."""
     agent_dir = Path(agent_dir)
-    logs_dir = agent_dir / "ouroboros-data" / "logs"
-
-    events = _read_jsonl(logs_dir / "events.jsonl")
-    tool_rows = [
-        r for r in _read_jsonl(logs_dir / "tools.jsonl") if r.get("type") == "tool_call"
-    ]
+    data_dir = agent_dir / "ouroboros-data"
+    events = _read_jsonl_chain(data_dir, "events.jsonl", "events")
+    tool_rows = _tool_call_steps(_read_jsonl_chain(data_dir, "tools.jsonl", "tools"))
     narration_rows = [
         r
-        for r in _read_jsonl(logs_dir / "progress.jsonl")
+        for r in _read_jsonl_chain(agent_dir / "ouroboros-data", "progress.jsonl", "progress")
         if r.get("type") == "send_message" and isinstance(r.get("text"), str)
     ]
 

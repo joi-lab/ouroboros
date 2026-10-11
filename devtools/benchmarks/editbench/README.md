@@ -1,0 +1,183 @@
+# editbench — file-editing tool benchmark
+
+> **Outcome note.** This benchmark drove the final toolset decision:
+> `apply_patch` and `edit_batch` were adopted; `edit_sketch` (fast-apply via
+> the LIGHT model) was evaluated here and REMOVED — the sketch/apply split
+> never beat direct tools on cost or robustness. Its verification rails
+> (unified diff in the result, pre-write syntax check) moved into
+> `write_file`. The edit_sketch rows below are the historical evaluation data.
+
+Measures Ouroboros' file-editing tools on a trap-laden multi-file rename task:
+correctness, tokens, wall time, tool-call error rates, and which tools the agent
+picks when free to choose.
+
+## Task
+
+`fixtures/toyproj/` is an 8-file Python project. The task: rename every
+**module-level** function named exactly `ddd` to `aaa` (def lines, calls,
+imports, aliases, qualified refs) while leaving everything else byte-identical.
+
+Traps a naive replace-all falls into:
+
+| Trap | Where |
+|---|---|
+| method `Widget.ddd` must keep its name (and `w.ddd()` call sites) | models.py |
+| `w.ddd() + ddd() + core.ddd(2)` — rename 2 of 3 refs in one line | models.py |
+| `ddd_helper`, `addd`, `dddx` identifiers | core/utils/legacy.py |
+| local variable `ddd` (not a function) | utils.py `local_shadow` |
+| string literals `"ddd"`, dict key, `"ddd mode"` | config.py |
+| comments and docstrings mentioning ddd | core/report/utils.py |
+| README.md mentions ddd and must not be touched | README.md |
+
+Ground truth: `fixtures/expected/` (both versions pass `python main.py` → `OK`).
+Grading (`checker.py`): per-file text equality (trailing whitespace normalized)
++ behavior check. `pass` requires 8/8 files AND behavior OK.
+
+## Configs
+
+Each config restricts the editing toolset via `disabled_tools`; shell/process,
+web, delegation, review tools are disabled in EVERY config so the agent cannot
+bypass the editing tool under test (e.g. `sed` via run_command).
+`OUROBOROS_TASK_REVIEW_MODE=off`, `OUROBOROS_SAFETY_MODE=off` keep token counts
+about editing work only. Its isolated settings also write the canonical explicit
+`enabled=false` Available-subagents value with one API row naming the effective
+Main model. Delegation is outside the measured editing surface and cannot reappear
+through install defaults or a legacy Heavy value, while the manifest still records
+the exact model the disabled route would have used. With no `--model`, Main is
+materialized from the live benchmark seed (then environment/shipped default).
+
+- `write_file_only`, `edit_text_only`, `apply_patch_only`, `edit_batch_only`
+  — exactly one editing tool available (`edit_sketch_only` was removed with the
+  tool; its rows below are historical data, not a config you can run today);
+- `default` — the historical toolset (write_file + edit_text);
+- `full` — all editing tools available (agent's free choice).
+
+## Run
+
+```bash
+python devtools/benchmarks/editbench/run_editbench.py --configs all --runs 3 --parallel 2
+```
+
+Spawns one isolated Ouroboros server from the CURRENT working tree (clone +
+`git diff HEAD` + untracked files), submits tasks over HTTP, mines
+`llm_usage` rows (events.jsonl, deduped by ledger attempt ids) and `tool_call`
+rows (tools.jsonl) from the isolated data root. Results: `runs.json` +
+`summary.json` (see `--out`).
+
+## Results (2026-08-02, main model x-ai/grok-4.5, 3 runs/config)
+
+All configs passed 8/8 files + behavior on every run — the traps did not catch
+the main model regardless of tool. The discriminating signals were mechanism
+overhead and format robustness.
+
+| config | pass | avg wall s | avg completion tok | avg LLM calls | edit calls (3 runs) | edit errors |
+|---|---|---|---|---|---|---|
+| edit_batch_only | 3/3 | 66.3 | 2432 | 5.0 | 3 (1/run) | 0 |
+| edit_text_only | 3/3 | 64.3 | 2542 | 5.7 | 19 | 0 |
+| write_file_only | 3/3 | 69.3 | 2594 | 5.0 | 18 | 0 |
+| apply_patch_only (v2) | 3/3 | 70.4 | 2438 | 6.7 | 10 | 0 |
+| edit_sketch_only (v2) | 3/3 | 67.3 | 2351 | 5.0 | 18 (6/run) | 0 |
+| default (write_file+edit_text) | 3/3 | 75.3 | 2541 | 5.0 | 18 edit_text | 0 |
+| full (free choice) | 3/3 | 75.3 | 2542 | 5.7 | 13 edit_text + 1 edit_batch | 0 |
+
+v1 (before robustness fixes) recorded the two failure modes the fixes removed:
+- apply_patch v1: 3 errors / 11 calls — the model decorated headers as
+  `*** Update File: x ***`; the parser now tolerates trailing asterisks.
+- edit_sketch v1: 18 errors / 36 calls, 123 s and 6036 completion tokens per
+  run — on these tiny files the model naturally sends complete-file sketches
+  without `... existing code ...` markers, which were rejected. Marker-less
+  sketches are now verified and written directly (no apply model call).
+
+Takeaways: `edit_batch` (counted replace-all) finishes the whole task in ONE
+tool call; format-tolerant parsing matters more than clever matching for
+apply_patch; the free-choice agent prefers edit_text, so tool descriptions are
+the steering surface if a different mix is desired.
+
+## v2: real-file tasks (fixtures_v2, generated by make_fixtures_v2.py)
+
+| task | file(s) | shape |
+|---|---|---|
+| t2_surgical | review_state.py (1691 lines) | 2 helper renames + 2 constant bumps = 11 changed lines |
+| t3_blocks | shell_parse.py (460 lines) | replace 3 whole functions with code given verbatim in the prompt |
+| t4_move | shell_parse.py + git_shell_policy.py | move a function across files (delete + insert renamed + fix import/call site) |
+| t5_overhaul | provider_models.py (423 lines) | flip 208 double-quoted literals to single quotes (119 lines change, AST-identical) |
+
+### v2 results (2026-08-02, grok-4.5, 3 runs/config, 63/63 pass)
+
+Avg per run; errors are failed edit-tool calls across the 3 runs.
+
+| task | config | wall s | completion tok | cost $ | edit calls | errors |
+|---|---|---|---|---|---|---|
+| t2_surgical | apply_patch | 57 | 1427 | 0.129 | 1.3 | 0 |
+| t2_surgical | edit_batch | 54 | 1180 | 0.140 | 1.3 | 1 |
+| t2_surgical | edit_text | 59 | 1856 | 0.181 | 9.7 | 0 |
+| t2_surgical | edit_sketch | **229** | **20972** | **0.352** | 1 | 0 |
+| t2_surgical | full → chose edit_batch | **48** | **1065** | 0.174 | 1 | 0 |
+| t3_blocks | apply_patch | 47 | 1208 | 0.115 | 1 | 0 |
+| t3_blocks | edit_text | 52 | 1536 | 0.122 | 3 | 0 |
+| t3_blocks | edit_sketch | 99 | 6549 | 0.155 | 1 | 0 |
+| t3_blocks | full → chose edit_text | 53 | 1372 | 0.117 | 2 | 0 |
+| t4_move | edit_text | 63 | 2519 | 0.110 | 4 | 0 |
+| t4_move | apply_patch | 62 | 2395 | 0.131 | 1 | 0 |
+| t4_move | edit_sketch | 161 | 12107 | 0.232 | 2 | 0 |
+| t4_move | full → chose edit_text | 62 | 2584 | 0.121 | 4 | 0 |
+| t5_overhaul | edit_sketch (marker-less → direct write) | **125** | 6965 | **0.162** | 1 | 0 |
+| t5_overhaul | write_file | 130 | 7364 | 0.196 | 1 | 0 |
+| t5_overhaul | edit_text | 166 | 11373 | 0.261 | 8.3 | 0 |
+| t5_overhaul | edit_batch | 178 | 11488 | 0.278 | 4.7 | 0 |
+| t5_overhaul | apply_patch | **196** | 13344 | **0.309** | 13.3 | 2 |
+| t5_overhaul | full → chose write_file | 134 | 8111 | 0.176 | 1 | 0 |
+
+### v2 takeaways
+
+- **No universal winner — the profile follows task shape.** Scattered surgery in a
+  big file: apply_patch/edit_batch (edit_text needs 29 calls and re-reads).
+  Whole-block replacement: edit_text/apply_patch tie. Near-full rewrite:
+  write_file / marker-less edit_sketch; apply_patch is the WORST there (patch ≈
+  file size split over 40 calls, 491k prompt tokens).
+- **edit_sketch inverts**: worst for surgical edits in big files (the light model
+  regenerates all 1700 lines: 21k completion tokens, 4× wall) — best for
+  near-full rewrites (marker-less sketch = verified direct write).
+- **The free-choice agent picked the right tool on every task** (edit_batch on
+  t2, edit_text on t3/t4, write_file on t5) and was never worst, twice fastest.
+  Tool diversity + honest descriptions is enough; no routing logic needed.
+- Correctness was never the discriminator (63/63): the value of the new tools is
+  fewer round trips, fewer retries, and the counted/atomic safety rails.
+
+## Weak-model run (google/gemini-3.6-flash, t1+t2, old-vs-new configs, 2 runs each)
+
+Pinned via `--model` (main lane + fallbacks). 16/16 pass — correctness did not
+break even on the weak model at this task scale; the errors that did happen were
+all caught atomically by the tools. What changed is the SIZE of the efficiency gap:
+
+| task | config | wall s | prompt tok | completion tok | cost $ | edit calls | errors |
+|---|---|---|---|---|---|---|---|
+| t1 | edit_batch | **292** | **1.40M** | 10.3k | **0.70** | 1 | 0 |
+| t1 | apply_patch | 349 | 1.70M | 11.6k | 0.80 | 1.5 | 1 |
+| t1 | edit_text | 482 | 2.55M | 11.2k | 1.04 | 11 | 0 |
+| t1 | write_file | 540 | 2.68M | 15.8k | 1.12 | 6 | 0 |
+| t2 | edit_batch | **89** | **0.56M** | **2.7k** | **0.44** | 1 | 0 |
+| t2 | edit_text | 148 | 1.04M | 4.1k | 0.58 | 9 | 0 |
+| t2 | apply_patch | 229 | 1.28M | 11.0k | 0.68 | 3 | **4** |
+| t2 | write_file | 224 | 1.23M | **38.5k** | 0.96 | 1.5 | 0 |
+
+- The old toolset's cost/latency penalty roughly DOUBLES on the weak model:
+  edit_batch is 1.5× cheaper than edit_text and 2.2-2.5× cheaper/faster than
+  write_file (which finally shows the asymptotic completion-token pain: 38k
+  tokens to rewrite 1691 lines — byte-perfect, but slow and expensive).
+- apply_patch degrades on the weak model: flash writes sloppier patches (4
+  format/context errors in one t2 run, all rejected atomically, retried to
+  success). Its value is model-quality-dependent; edit_batch is robust everywhere.
+- Flash is ~7× more expensive per run than grok-4.5 here despite cheaper
+  tokens — weak models iterate far more (38-66 LLM calls vs 5) and cache poorly.
+
+## Caveats
+
+- Toy files are ~20 lines, so `write_file` (full rewrite) is barely penalized on
+  completion tokens; on real-sized files the gap grows with file size. The
+  benchmark discriminates mechanism overhead (round trips, retries, error
+  rates), not asymptotic token cost.
+- Prompt tokens are dominated by the system prompt (~30k/call, mostly
+  prompt-cached); the discriminating signals are completion tokens, LLM call
+  count, wall time, and edit-tool error counts.
+- One grading run == one agent task; `--runs 3` per config for variance.

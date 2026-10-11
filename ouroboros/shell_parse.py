@@ -12,10 +12,27 @@ from typing import Any, List
 
 EMBEDDED_ABSOLUTE_PATH_RE = re.compile(r"(?<![A-Za-z0-9_.\-])/[^\s'\"\\),;\]]+")
 _HTML_CLOSING_TAG_PATH_RE = re.compile(r"/[A-Za-z][A-Za-z0-9:-]*>")
+# A path absolute in WINDOWS grammar: a drive letter plus a separator, or a UNC
+# share. The UNC alternative REQUIRES both segments (`\\server\share`) because a
+# bare `\\`-plus-text is not a path at all — it is the commonest escape idiom in
+# every other language (`s.replace(/\\/g,'/')`, `"a\\b"`, `'\\b'`), and matching it
+# made the light-mode inline fence refuse ordinary `node -e` payloads that named no
+# repo path (v6.89.x). A share segment cannot be spelled by accident.
+# A BACKTICK is deliberately NOT a delimiter, in either grammar. Treating it as one
+# (added and then removed 2026-08-05) closed the template-literal exact-root hole
+# (``rmSync(String.raw`<root>`)`` harvests root+backtick = a sibling, so deleting the
+# exact root is ALLOWED — only the root itself; anything under it still resolves
+# inside) but also newly refused writes to real sibling paths with a literal backtick
+# in the name, which the base allowed. Owner policy: protection may be weakened, never
+# strengthened, and a review-found adjacent hole is disclosed, not fenced. The hole is
+# pinned as disclosed in test_interpreter_family_write_fence.py.
 EMBEDDED_WINDOWS_ABSOLUTE_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:[A-Za-z]:[\\/][^\s'\"),;\]]+|\\\\[^\s'\"),;\]]+)"
+    r"(?<![A-Za-z0-9_.-])(?:"
+    r"[A-Za-z]:[\\/][^\s'\"),;\]]+"
+    r"|\\\\[^\s'\"),;\]\\/]+[\\/][^\s'\"),;\]]+"
+    r")"
 )
-_SHELLS = {"sh", "bash", "zsh"}
+POSIX_SHELL_HEADS = frozenset({"sh", "bash", "zsh", "dash", "ash"})
 
 
 def recover_stringified_argv(text: Any) -> List[str] | None:
@@ -93,6 +110,107 @@ def unwrap_env_argv(argv: List[str]) -> List[str]:
             continue
         break
     return argv[idx:] if idx < len(argv) else []
+
+
+def env_chdir_operand(argv: List[str]) -> str:
+    """Return an ``env`` wrapper's effective cwd operand, if one is present."""
+    if not argv or pathlib.PurePath(argv[0]).name.lower() != "env":
+        return ""
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token == "--":
+            break
+        if token in {"-C", "--chdir"}:
+            return str(argv[index + 1]) if index + 1 < len(argv) else ""
+        if token.startswith("--chdir="):
+            return token.split("=", 1)[1]
+        if token in {"-u", "--unset", "--argv0"}:
+            index += 2
+            continue
+        if token == "-S" or token.startswith("--split-string="):
+            break
+        if token.startswith("-") or ("=" in token and not token.startswith("=")):
+            index += 1
+            continue
+        break
+    return ""
+
+
+def interpreter_reads_program_from_stdin(argv: List[str]) -> bool:
+    """Whether an interpreter argv has no inline body or script-file operand."""
+    return bool(argv) and not any(
+        str(token) != "-" and not str(token).startswith("-") for token in argv[1:]
+    )
+
+
+def sequential_effective_cwds(target_rows: list, initial_cwd: pathlib.Path) -> list[pathlib.Path]:
+    """Symlink-resolved cwd in force at the start of each parsed command row."""
+    current = pathlib.Path(initial_cwd).resolve(strict=False)
+    result: list[pathlib.Path] = []
+    for argv, _targets, _inline, _unknown in target_rows:
+        result.append(current)
+        head = pathlib.PurePath(str(argv[0])).name.lower() if argv else ""
+        if head not in {"cd", "pushd"}:
+            continue
+        operand = next((str(item) for item in argv[1:] if str(item) and not str(item).startswith("-")), "")
+        if operand:
+            path = pathlib.Path(operand).expanduser()
+            current = (path if path.is_absolute() else current / path).resolve(strict=False)
+    return result
+
+
+def directory_destination_child_name(command: str, argv: List[str], source: str) -> str:
+    """Return the child path a directory destination receives from ``source``."""
+    source_text = str(source or "").replace("\\", "/").rstrip("/")
+    if command == "cp" and "--parents" in {str(item) for item in argv[1:]}:
+        parts = [part for part in pathlib.PurePosixPath(source_text).parts if part not in {"", ".", "/"}]
+        if not parts or ".." in parts:
+            return ""
+        return "/".join(parts)
+    return pathlib.PurePath(source_text).name
+
+
+def replacement_placeholders(argv: List[str]) -> frozenset[str]:
+    """Replacement words are templates, never concrete filesystem targets."""
+    executable = pathlib.PurePath(str(argv[0])).name.lower() if argv else ""
+    placeholders = {"{}"} if executable in {"find", "xargs"} else set()
+    if executable != "xargs":
+        return frozenset(placeholders)
+    index = 1
+    while index < len(argv):
+        token = str(argv[index])
+        if token in {"-I", "--replace"} and index + 1 < len(argv):
+            placeholders.add(str(argv[index + 1]))
+            index += 2
+            continue
+        if token.startswith("--replace="):
+            placeholders.add(token.split("=", 1)[1])
+        elif token.startswith("-I") and len(token) > 2:
+            placeholders.add(token[2:])
+        index += 1
+    return frozenset(item for item in placeholders if item)
+
+
+def replacement_target_uncertain(
+    argv: List[str], targets: List[str], *, write_shaped: bool,
+) -> tuple[List[str], bool]:
+    """Drop template-shaped targets and report when replacement hides a write."""
+    placeholders = replacement_placeholders(argv)
+    uncertain = any(
+        placeholder in str(target)
+        for target in targets for placeholder in placeholders
+    )
+    executable = pathlib.PurePath(str(argv[0])).name.lower() if argv else ""
+    uncertain = uncertain or (
+        executable == "xargs" and write_shaped
+        and any(placeholder in str(token) for token in argv[1:] for placeholder in placeholders)
+    )
+    concrete = [
+        target for target in targets
+        if not any(placeholder in str(target) for placeholder in placeholders)
+    ]
+    return concrete, uncertain
 
 
 def strip_leading_env_assignments(argv: List[str]) -> List[str]:
@@ -312,6 +430,201 @@ def shell_segments(raw_cmd: Any) -> List[List[str]]:
     return segments
 
 
+_HEREDOC_START_RE = re.compile(
+    r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)"
+)
+
+
+def shell_segment_rows(raw_cmd: Any) -> List[tuple[List[str], str, tuple[str, ...]]]:
+    """Segments with their leading operator and any visible heredoc program body.
+
+    Literal/static heredoc bodies are removed from shell tokenization and attached
+    to the command that owns the redirection. This lets interpreter guards inspect
+    stdin code without mistaking its lines for independent shell commands.
+    """
+    if not isinstance(raw_cmd, str) or "<<" not in raw_cmd:
+        scrubbed = raw_cmd
+        body_owners: list[tuple[int, str]] = []
+    else:
+        lines = raw_cmd.splitlines()
+        scrubbed_lines = list(lines)
+        pending: list[tuple[int, str]] = []
+        index = 0
+        while index < len(lines):
+            match = _HEREDOC_START_RE.search(lines[index])
+            delimiter = str(match.group("delimiter") or "") if match else ""
+            if not delimiter:
+                index += 1
+                continue
+            end = index + 1
+            strip_tabs = match.group(0).startswith("<<-")
+            while end < len(lines):
+                candidate = lines[end].lstrip("\t") if strip_tabs else lines[end]
+                if candidate == delimiter:
+                    break
+                end += 1
+            if end >= len(lines):
+                index += 1
+                continue
+            body = "\n".join(lines[index + 1:end])
+            for body_index in range(index + 1, end + 1):
+                scrubbed_lines[body_index] = ""
+            owner_lines = [*scrubbed_lines[:index], lines[index][:match.end()]]
+            owner_count = len(shell_segments("\n".join(owner_lines)))
+            if owner_count:
+                pending.append((owner_count - 1, body))
+            index = end + 1
+        scrubbed = "\n".join(scrubbed_lines)
+        body_owners = pending
+
+    tokens = shell_tokens(scrubbed)
+    if tokens is None:
+        tokens = [t for t in str(scrubbed or "").split() if t]
+    rows: List[tuple[List[str], str, tuple[str, ...]]] = []
+    current: List[str] = []
+    leading = ""
+    for token in tokens:
+        if token in _SEGMENT_SEPARATORS:
+            if current:
+                rows.append((current, leading, ()))
+                current = []
+            leading = token
+            continue
+        current.append(token)
+    if current:
+        rows.append((current, leading, ()))
+    for owner, body in body_owners:
+        if 0 <= owner < len(rows):
+            argv, operator, bodies = rows[owner]
+            rows[owner] = (argv, operator, (*bodies, body))
+    return rows
+
+
+# The ONE redirection grammar of this module. A redirection operator is only an
+# operator at the START of a token (after an optional file-descriptor prefix), so
+# `s/>/x/` and `--pretty=<x>` never match, while both the glued (`2>/dev/null`)
+# and the split (`2` `>` `/dev/null`) spellings the two lexers emit are covered.
+_REDIRECT_OPERATOR_RE = re.compile(
+    r"^(?P<fd>[0-9]+)?(?P<op><<<|<<|<&|<|&>>|&>|>>|>\||>&|>)(?P<operand>.*)$"
+)
+
+
+def split_redirections(tokens: List[str], *, redirect_tokens: List[str] | None = None) -> tuple[List[str], List[str]]:
+    """Split redirections off a command segment.
+
+    Returns ``(argv_without_redirections, output_targets)``. Input redirections
+    (``<``, ``<<``, ``<<<``, ``<&``) and descriptor duplication/closure
+    (``2>&1``, ``>&2``, ``>&-``) yield no target; ``/dev/null`` is exempted on
+    the clean operand. Without this split the writer-target lane counted the
+    redirect OPERAND as the command's own operand — `cp x y >> log.txt` reported
+    `log.txt` and LOST the destination `y`, and a glued `2>/dev/null;` was forged
+    into the path `/dev/null;`. ``redirect_tokens`` optionally receives the
+    exact removed tokens, including input redirects, for local-effect views.
+    """
+    items = [str(token) for token in (tokens or [])]
+    argv: List[str] = []
+    targets: List[str] = []
+    index = 0
+    while index < len(items):
+        start = index
+        token = items[index]
+        match = _REDIRECT_OPERATOR_RE.match(token)
+        if match is None and token.isdigit() and index + 1 < len(items):
+            # A bare descriptor token belongs to the operator that follows it.
+            following = _REDIRECT_OPERATOR_RE.match(items[index + 1])
+            if following is not None and not following.group("fd"):
+                match = following
+                index += 1
+        if match is None:
+            argv.append(token)
+            index += 1
+            continue
+        operator = match.group("op")
+        operand = match.group("operand")
+        if not operand and index + 1 < len(items):
+            index += 1
+            operand = items[index]
+        index += 1
+        if redirect_tokens is not None:
+            redirect_tokens.extend(items[start:index])
+        if operator.startswith("<"):
+            continue
+        if operator == ">&" and (operand == "-" or operand.isdigit()):
+            continue
+        if not operand or operand == "/dev/null":
+            continue
+        targets.append(operand)
+    return argv, targets
+
+
+def local_shell_subject(raw_cmd: Any, _depth: int = 0) -> Any:
+    """Local-effect view of SSH argv; execution always keeps the original input.
+
+    OpenSSH sends command/arguments after destination to the remote host
+    (https://man.openbsd.org/ssh). Its options, -E log sink, and every outer
+    redirection remain local. Unknown option syntax retains the original view.
+    Shell wrappers reuse the existing segment/redirection grammar; no remote
+    command is parsed as a local program or assigned a local filesystem path.
+    """
+    if _depth >= 3:
+        return raw_cmd
+    changed = False
+    result: List[str] = []
+    for segment, leading, bodies in shell_segment_rows(raw_cmd):
+        if bodies:
+            return raw_cmd  # an unmodelled stdin program keeps its prior guard
+        if result:
+            result.append(leading or ";")
+        argv = shell_argv(segment)
+        head = pathlib.PurePath(argv[0]).name.lower().removesuffix(".exe") if argv else ""
+        if head in POSIX_SHELL_HEADS:
+            body = shell_command_string(argv)
+            local = local_shell_subject(body, _depth + 1) if body else body
+            if local != body:
+                redirects: List[str] = []
+                split_redirections(argv, redirect_tokens=redirects)
+                result.extend([*shell_argv(local), *redirects])
+                changed = True
+                continue
+        if head != "ssh":
+            result.extend(argv)
+            continue
+        redirects = []
+        program, _targets = split_redirections(argv, redirect_tokens=redirects)
+        index = 1
+        logs: List[str] = []
+        valid = True
+        while index < len(program) and program[index].startswith("-"):
+            token = program[index]
+            if token == "--":
+                index += 1
+                break
+            letters = token[1:]
+            if not letters or letters.startswith("-"):
+                valid = False
+                break
+            for position, letter in enumerate(letters):
+                if letter in "BbcDEeFIiJLlmOoPpQRSWw":
+                    value = letters[position + 1:]
+                    if not value:
+                        index += 1
+                        value = program[index] if index < len(program) else ""
+                    if not value:
+                        valid = False
+                    if letter == "E" and value:
+                        logs.extend([">", value])
+                    break
+                if letter not in "46AaCfGgKkMNnqsTtVvXxYyZ":
+                    valid = False
+                    break
+            index += 1
+        if not valid:
+            return raw_cmd
+        result.extend([*program[:index + 1], *logs, *redirects])
+        changed = changed or index + 1 < len(program) or bool(logs)
+    return result if changed else raw_cmd
+
+
 def collect_leading_env(argv: List[str]) -> tuple[dict, List[str]]:
     """Peel leading environment assignments off a command segment.
 
@@ -343,27 +656,57 @@ def collect_leading_env(argv: List[str]) -> tuple[dict, List[str]]:
     return assignments, rest[idx:]
 
 
-def sudo_noninteractive_violation(argv: List[str]) -> bool:
-    if argv and pathlib.PurePath(argv[0]).name.lower() in _SHELLS:
-        inline = shell_command_string(argv)
-        if inline:
-            return sudo_noninteractive_violation(shell_argv(inline))
-    for idx, token in enumerate(argv):
-        command_name = pathlib.PurePath(token).name.lower()
-        if command_name == "sudoedit":
-            return True
-        if command_name != "sudo":
-            continue
-        has_noninteractive = False
-        for option in _sudo_option_tokens(argv[idx + 1 :]):
-            if option == "-S" or (option.startswith("-") and not option.startswith("--") and "S" in option[1:]):
+# Heads that only forward to the command that follows them: sudo behind one of
+# these is still an invocation. A wrapper flag that consumes a VALUE token
+# (``nice -n 10 sudo ...``) hides the wrapped head — a disclosed residual that
+# can only miss a hang, never refuse work (this is a hang guard, not a
+# privilege boundary).
+_SUDO_FORWARDING_WRAPPERS = frozenset({
+    "command", "builtin", "exec", "nohup", "time", "nice", "ionice", "stdbuf",
+    "setsid", "timeout",
+})
+
+
+def sudo_noninteractive_violation(raw_cmd: Any) -> bool:
+    """True when the command actually INVOKES interactive sudo/sudoedit.
+
+    Judged by COMMAND POSITION per segment (the head after env/wrapper peeling),
+    never by token mention: ``rg sudo README.md`` or ``ls /usr/bin/sudo`` name
+    sudo as DATA and invoke nothing (issue #447 A3). Interactive sudo hangs
+    forever on a password prompt in the headless runtime; ``sudo -n`` is fine,
+    ``-S`` (password on stdin) is refused outright as before.
+    """
+    for segment in shell_segments(raw_cmd):
+        _env, command = collect_leading_env(segment)
+        while command:
+            head = pathlib.PurePath(str(command[0])).name.lower()
+            if head in POSIX_SHELL_HEADS:
+                inline = shell_command_string(command)
+                if inline and sudo_noninteractive_violation(inline):
+                    return True
+                break
+            if head == "sudoedit":
                 return True
-            if option == "-n" or (option.startswith("-") and not option.startswith("--") and "n" in option[1:]):
-                has_noninteractive = True
-            if option.startswith("--non-interactive"):
-                has_noninteractive = True
-        if not has_noninteractive:
-            return True
+            if head == "sudo":
+                has_noninteractive = False
+                for option in _sudo_option_tokens(command[1:]):
+                    if option == "-S" or (option.startswith("-") and not option.startswith("--") and "S" in option[1:]):
+                        return True
+                    if option == "-n" or (option.startswith("-") and not option.startswith("--") and "n" in option[1:]):
+                        has_noninteractive = True
+                    if option.startswith("--non-interactive"):
+                        has_noninteractive = True
+                if not has_noninteractive:
+                    return True
+                # `sudo -n sh -c "sudo ..."` — keep walking the wrapped command.
+                command = _sudo_wrapped_command(command[1:])
+                continue
+            if head in _SUDO_FORWARDING_WRAPPERS:
+                command = command[1:]
+                while command and str(command[0]).startswith("-"):
+                    command = command[1:]
+                continue
+            break
     return False
 
 
@@ -376,7 +719,7 @@ def shell_command_string(argv: List[str]) -> str:
 
 def shell_argv_with_inline(raw_cmd: Any) -> List[str]:
     argv = shell_argv(raw_cmd)
-    if argv and pathlib.PurePath(argv[0]).name.lower() in _SHELLS:
+    if argv and pathlib.PurePath(argv[0]).name.lower() in POSIX_SHELL_HEADS:
         inline = shell_command_string(argv)
         if inline:
             return argv + shell_argv(inline)
@@ -440,14 +783,18 @@ def embedded_absolute_path_tokens(text: Any) -> List[str]:
     return tokens
 
 
+# -A/--askpass and -b/--background are FLAGS (no argument): listing them here
+# made the walker eat the wrapped command's head as an "option value".
+_SUDO_OPTIONS_WITH_ARG = frozenset({
+    "-a", "-C", "-c", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u",
+    "--auth-type", "--chdir", "--close-from", "--command-timeout",
+    "--context", "--group", "--host", "--login-class", "--prompt", "--role", "--type", "--user",
+    "--other-user",
+})
+
+
 def _sudo_option_tokens(rest: List[str]) -> List[str]:
     options: List[str] = []
-    options_with_arg = {
-        "-A", "-a", "-b", "-C", "-c", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u",
-        "--askpass", "--auth-type", "--background", "--chdir", "--close-from", "--command-timeout",
-        "--context", "--group", "--host", "--login-class", "--prompt", "--role", "--type", "--user",
-        "--other-user",
-    }
     idx = 0
     while idx < len(rest):
         token = rest[idx]
@@ -456,5 +803,19 @@ def _sudo_option_tokens(rest: List[str]) -> List[str]:
         if not token.startswith("-") or token == "-":
             break
         options.append(token)
-        idx += 2 if token in options_with_arg else 1
+        idx += 2 if token in _SUDO_OPTIONS_WITH_ARG else 1
     return options
+
+
+def _sudo_wrapped_command(rest: List[str]) -> List[str]:
+    """The command sudo runs: its own options and leading VAR=val tokens peeled."""
+    idx = 0
+    while idx < len(rest):
+        token = rest[idx]
+        if token == "--":
+            idx += 1
+            break
+        if not token.startswith("-") or token == "-":
+            break
+        idx += 2 if token in _SUDO_OPTIONS_WITH_ARG else 1
+    return strip_leading_env_assignments(rest[idx:])

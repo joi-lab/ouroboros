@@ -9,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..scripts.platform_support import process_alive
+from ..scripts.platform_support import machine_architecture, process_alive
 from ..scripts.telegram_settings import owner_chat_id
 
 
@@ -28,7 +28,7 @@ def _bounded_text(value: Any, maximum: int = 200) -> str:
 
 def _platform_error() -> str:
     system = platform.system()
-    machine = platform.machine().lower()
+    machine = machine_architecture()
     arch = {
         "arm64": "arm64",
         "aarch64": "arm64",
@@ -241,7 +241,7 @@ def register(api: Any) -> None:
                 "state": "unavailable",
                 "reason_code": "unsupported_platform",
                 "message": platform_error,
-                "platform": f"{platform.system() or 'unknown'}/{platform.machine() or 'unknown'}",
+                "platform": f"{platform.system() or 'unknown'}/{machine_architecture() or 'unknown'}",
                 "pid": 0,
                 "updated_at_epoch": int(time.time()),
             },

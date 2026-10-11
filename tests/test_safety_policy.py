@@ -67,8 +67,11 @@ class _StubLLMClient:
 
 def _patch_llm_client(monkeypatch, stub: _StubLLMClient) -> None:
     import ouroboros.safety as safety
+    from ouroboros.llm import LLMClient
 
-    monkeypatch.setattr(safety, "LLMClient", lambda: stub)
+    factory = lambda: stub
+    factory.supports_response_format = LLMClient.supports_response_format
+    monkeypatch.setattr(safety, "LLMClient", factory)
 
 
 # ---------------------------------------------------------------------------
@@ -84,6 +87,21 @@ def test_policy_skip_does_not_call_llm(monkeypatch):
     _patch_llm_client(monkeypatch, stub)
 
     ok, msg = check_safety("read_file", {"path": "README.md"})
+
+    assert ok is True
+    assert msg == ""
+    assert stub.calls == []
+
+
+def test_send_links_policy_skip_does_not_call_llm(monkeypatch):
+    from ouroboros.safety import check_safety
+
+    stub = _StubLLMClient('{"status":"DANGEROUS","reason":"should not be called"}')
+    _patch_llm_client(monkeypatch, stub)
+
+    ok, msg = check_safety(
+        "send_links", {"links": [{"label": "Docs", "url": "https://example.com"}]},
+    )
 
     assert ok is True
     assert msg == ""
@@ -381,6 +399,15 @@ def test_tool_policy_values_are_valid():
     assert bad == {}, f"Invalid policy values: {bad}"
 
 
+def test_cross_focus_projection_tools_have_explicit_skip_policy():
+    """Awareness projections use their existing host guards and never add a
+    model safety round or an unexpected provider call."""
+    from ouroboros.safety import TOOL_POLICY, POLICY_SKIP
+
+    assert TOOL_POLICY["live_roots"] == POLICY_SKIP
+    assert TOOL_POLICY["update_focus"] == POLICY_SKIP
+
+
 # ---------------------------------------------------------------------------
 # Secret redaction + non-JSON argument safety
 # ---------------------------------------------------------------------------
@@ -440,7 +467,7 @@ def test_build_check_prompt_includes_runtime_mode(monkeypatch):
     from ouroboros.safety import _build_check_prompt
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
-    prompt = _build_check_prompt("claude_code_edit", {"prompt": "edit"})
+    prompt = _build_check_prompt("run_command", {"command": "ls"})
 
     assert "Runtime mode: pro" in prompt
 
@@ -486,6 +513,7 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -502,6 +530,25 @@ def test_unknown_tool_under_local_only_config_uses_local_light(monkeypatch):
     assert stub.calls[0]["use_local"] is True
 
 
+def test_minimax_key_enables_remote_safety_routing(monkeypatch):
+    from ouroboros.safety import (
+        _REMOTE_PROVIDER_KEYS,
+        _any_remote_provider_configured,
+        _light_model_has_reachable_provider,
+    )
+
+    for key in _REMOTE_PROVIDER_KEYS:
+        monkeypatch.delenv(key, raising=False)
+
+    assert not _any_remote_provider_configured()
+    assert not _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-key")
+
+    assert _any_remote_provider_configured()
+    assert _light_model_has_reachable_provider("minimax::MiniMax-M2.7")
+
+
 def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch):
     """When the runtime has neither remote keys nor local routing configured,
     the safety check must fail open with a visible ``SAFETY_WARNING`` rather
@@ -515,6 +562,7 @@ def test_unknown_tool_with_no_safety_backend_fails_open_with_warning(monkeypatch
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -546,6 +594,7 @@ def test_openrouter_only_with_direct_provider_light_model_fails_open(monkeypatch
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -581,6 +630,7 @@ def test_mixed_remote_local_provider_mismatch_local_failure_fails_open(monkeypat
     for k in (
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -612,6 +662,7 @@ def test_explicit_local_light_failure_still_blocks(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -638,6 +689,7 @@ def test_local_fallback_runtime_error_fails_open_with_warning(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -958,7 +1010,7 @@ def test_no_event_queue_preserves_unknown_cost_in_budget_fallback(monkeypatch):
     def _record(usage):
         captured.append(dict(usage))
 
-    monkeypatch.setattr(safety_mod, "update_budget_from_usage", _record)
+    monkeypatch.setattr("supervisor.state.update_budget_from_usage", _record)
 
     # ctx=None path
     ok, _ = check_safety("create_github_issue", {"title": "x"}, ctx=None)
@@ -988,6 +1040,7 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
         "OPENAI_COMPATIBLE_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
         "GIGACHAT_CREDENTIALS",
@@ -1014,3 +1067,85 @@ def test_usage_event_uses_local_provider_when_use_local_light(monkeypatch):
     assert ok is True
     assert captured["provider"] == "local"
     assert "(local)" in captured["model_name"]
+
+
+# ---------------------------------------------------------------------------
+# Host facts of a safety call (ADOPTION D05): where its records land, and who
+# charges it. Both were cwd-/import-coupled before the port.
+# ---------------------------------------------------------------------------
+
+
+def test_safety_drive_root_without_context_is_the_configured_data_root(monkeypatch, tmp_path):
+    """``ctx=None`` — the extension/MCP dispatch shape — used to resolve to the
+    literal ``../data``: whatever directory happens to sit beside the process's
+    cwd. The configured data root is the SSOT, and it is read LATE so a test or
+    a runtime rebind of ``config.DATA_DIR`` is honored rather than frozen at
+    import time."""
+    from ouroboros import config
+    from ouroboros.safety import _safety_drive_root
+
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path / "configured-root")
+    assert _safety_drive_root(None) == tmp_path / "configured-root"
+
+    # A context-shaped object that carries no drive_root falls the same way —
+    # never onto a cwd-relative guess.
+    class _NoRoot:
+        task_id = "t"
+
+    assert _safety_drive_root(_NoRoot()) == tmp_path / "configured-root"
+
+
+def test_safety_drive_root_prefers_the_context(tmp_path):
+    """The context owns the answer whenever it has one (isolated benchmark
+    servers and per-worker drives depend on this)."""
+    from ouroboros.safety import _safety_drive_root
+
+    class _Ctx:
+        drive_root = str(tmp_path / "ctx-root")
+
+    assert _safety_drive_root(_Ctx()) == tmp_path / "ctx-root"
+
+
+def test_importing_safety_does_not_import_supervisor_state():
+    """The budget writer is imported AT CALL TIME. ``ouroboros.safety`` is
+    imported by every worker and consulted on every guarded tool call, so an
+    import-time edge into the supervisor package is a cycle risk the six
+    sibling call sites of this writer already avoid. Asserted in a CLEAN
+    interpreter: in-process, an earlier test's import would mask a regression."""
+    import subprocess
+    import sys
+
+    proc = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; import ouroboros.safety; "
+         "print('supervisor.state' in sys.modules)"],
+        capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "False", proc.stdout
+
+
+def test_record_safety_usage_prefers_the_injected_ledger_writer(monkeypatch):
+    """A context that owns its accounting is charged where it lives; the
+    process-wide supervisor state is the FALLBACK, not the first choice."""
+    import supervisor.state as sup_state
+    from ouroboros.safety import _record_safety_usage
+
+    def _explode(_usage):  # pragma: no cover — guardrail
+        raise AssertionError("the injected sink must win over supervisor state")
+
+    monkeypatch.setattr(sup_state, "update_budget_from_usage", _explode)
+
+    seen: list = []
+
+    class _Ctx:
+        update_budget_from_usage = staticmethod(seen.append)
+
+    _record_safety_usage(_Ctx(), {"cost": 0.5})
+    assert seen == [{"cost": 0.5}]
+
+    # No sink on the context -> the process's own supervisor state.
+    fallback: list = []
+    monkeypatch.setattr(sup_state, "update_budget_from_usage", fallback.append)
+    _record_safety_usage(None, {"cost": 0.25})
+    assert fallback == [{"cost": 0.25}]

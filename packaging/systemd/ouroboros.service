@@ -1,0 +1,22 @@
+[Unit]
+Description=Ouroboros agent runtime
+Documentation=https://github.com/razzant/ouroboros
+
+[Service]
+Type=simple
+# Native packages install the release-reviewed launcher at this fixed path.
+# The launcher remains the sole owner of bootstrap, restart, panic, and cleanup.
+ExecStart=/opt/ouroboros/Ouroboros --launch-intent automatic
+
+# Stop the complete launcher/server/worker tree started by this unit.
+KillMode=control-group
+KillSignal=SIGTERM
+# SIGTERM is sent immediately. This is only the upper bound systemd waits for
+# remaining cgroup processes before escalating to SIGKILL.
+TimeoutStopSec=120
+
+# Deliberately no systemd restart policy: the launcher owns its crash fuse and
+# treats a panic exit as a complete stop until the owner starts Ouroboros again.
+
+[Install]
+WantedBy=default.target

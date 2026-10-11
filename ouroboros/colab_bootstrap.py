@@ -14,14 +14,45 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
-from ouroboros.config import SETTINGS_DEFAULTS
-from ouroboros.utils import atomic_write_json
+from ouroboros.config import (
+    SETTINGS_DEFAULTS, defaults_for_settings_document, normalize_settings_raw, serialize_settings,
+)
+from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
+from ouroboros.utils import atomic_write_json, write_text_atomic
 
 DEFAULT_COLAB_APP_ROOT = "/content/drive/MyDrive/Ouroboros"
 DEFAULT_COLAB_REPO_DIR = "/content/ouroboros_repo"
 DEFAULT_OFFICIAL_REPO_URL = "https://github.com/razzant/ouroboros.git"
 
-_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+
+
+def _run_colab_git_network(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
+    """Run clone/fetch non-interactively with the managed-update wall-clock ceiling."""
+    from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
+
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C", "LANG": "C"}
+    proc = subprocess.Popen(
+        ["git", "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30", *args],
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        **subprocess_new_group_kwargs(),
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=get_managed_update_fetch_timeout_sec())
+    except subprocess.TimeoutExpired as exc:
+        kill_process_tree(proc)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:
+            pass
+        raise RuntimeError("official git operation timed out") from exc
+    if proc.returncode != 0:
+        raise RuntimeError((stderr or stdout or "official git operation failed").strip())
+    return (stdout or "").strip()
 
 
 def get_colab_secret(name: str, *, required: bool = True) -> str:
@@ -47,21 +78,25 @@ def collect_colab_secrets() -> Dict[str, str]:
     """Collect runtime secrets without printing their values.
 
     The Telegram bot token is required (the bridge needs it). Any supported
-    provider key works — OpenRouter, OpenAI, or Anthropic are collected
-    optionally, and OpenRouter is prompted only if none is found, so an
-    OpenAI-only or Anthropic-only Colab user is not forced to enter OpenRouter.
+    provider key works — OpenRouter, OpenAI, Anthropic, MiniMax, DeepSeek and
+    Cloud.ru are collected optionally, and OpenRouter is prompted only if none
+    is found, so a single-direct-provider Colab user is not forced to enter
+    OpenRouter.
     The GitHub token is optional (it only enables personal self-modification
     persistence), so a quick prototype never blocks on a GitHub prompt.
     """
     # Providers the one-click Colab launch can auto-route models for via
     # apply_runtime_provider_defaults (OpenRouter is the default aggregator;
-    # OpenAI/Anthropic/Cloud.ru have direct model defaults). OpenAI-compatible
+    # OpenAI/Anthropic/MiniMax/DeepSeek/Z.ai/Cloud.ru have direct model defaults). OpenAI-compatible
     # endpoints have no universal model default and need explicit OUROBOROS_MODEL_*
     # config, so they are an advanced manual path, not part of the quick launch.
     provider_keys = (
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "ANTHROPIC_API_KEY",
+        "MINIMAX_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     )
     out: Dict[str, str] = {}
@@ -80,7 +115,18 @@ def masked_secret_status(settings: Dict[str, Any]) -> Dict[str, bool]:
     return {key: bool(str(settings.get(key, "") or "").strip()) for key in _SECRET_KEYS}
 
 
-def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", total_budget: float = 10.0, runtime_mode: str = "advanced", max_workers: int = 1, models: Dict[str, str] | None = None, network_password: str = "", existing: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def build_colab_settings(
+    secrets: Dict[str, str],
+    *,
+    github_repo: str = "",
+    total_budget: float = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"]),
+    runtime_mode: str = "advanced",
+    max_workers: int = 1,
+    models: Dict[str, str] | None = None,
+    network_password: str = "",
+    existing: Optional[Dict[str, Any]] = None,
+    drive_document_present: Optional[bool] = None,
+) -> Dict[str, Any]:
     """Build a Drive-persisted settings payload for Colab.
 
     On a re-run, ``existing`` (the current Drive ``settings.json``) is merged over
@@ -88,18 +134,22 @@ def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", tota
     explicitly — a pinned ``TELEGRAM_CHAT_ID``, tweaked model slots, an auto-grant
     preference — survive instead of being reset to defaults. The launch knobs
     below (secrets, budget, runtime mode, workers, host, repo) then win.
+    ``drive_document_present`` says whether that Drive file existed (default: a
+    non-empty ``existing``): an existing document keeps the finite optional bounds it
+    ran under when it lacks them (``config.defaults_for_settings_document``).
     """
-    settings = dict(SETTINGS_DEFAULTS)
+    present = bool(existing) if drive_document_present is None else bool(drive_document_present)
+    settings = defaults_for_settings_document(present)
     if existing:
-        # Apply the same v6.39 slot rename-alias migration load_settings uses, BEFORE
-        # merging over the defaults — exactly as load_settings migrates the raw loaded file
-        # before layering SETTINGS_DEFAULTS. (Migrating after the merge would see the new
-        # key already present as its empty default and skip the copy.) This keeps a Drive
-        # settings.json with legacy OUROBOROS_MODEL_CODE / USE_LOCAL_CODE /
-        # OUROBOROS_MODEL_FALLBACK customizations alive on a re-run.
-        from ouroboros.config import migrate_legacy_slot_keys
-        migrated = migrate_legacy_slot_keys(dict(existing))
-        settings.update({k: v for k, v in migrated.items() if not str(k).startswith("_")})
+        # The Drive document is an install's settings document, so it is read the way
+        # every reader reads one: the raw-stage normalization (coercion, retention fold,
+        # review-cycle seed, retired purge, slot rename, secret repair) runs BEFORE the
+        # defaults are merged — after the merge the renamed key is already present as its
+        # default and the customization under the former key is lost, then written back
+        # to Drive as the owner's choice. Private sentinel keys stay out of the document.
+        settings.update({
+            k: v for k, v in normalize_settings_raw(existing).items() if not str(k).startswith("_")
+        })
     for key, value in secrets.items():
         # Only overwrite when the freshly collected secret is non-empty, so a
         # re-run that omits an optional provider/GitHub key (collect_colab_secrets
@@ -112,6 +162,9 @@ def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", tota
     settings["OUROBOROS_RUNTIME_MODE"] = runtime_mode
     settings["OUROBOROS_MAX_WORKERS"] = int(max_workers)
     settings["OUROBOROS_SERVER_HOST"] = "127.0.0.1"
+    settings["OUROBOROS_UPDATE_CHANNEL"] = normalize_update_channel(
+        settings.get("OUROBOROS_UPDATE_CHANNEL")
+    )
     if network_password:
         settings["OUROBOROS_NETWORK_PASSWORD"] = network_password
     for key, value in (models or {}).items():
@@ -127,18 +180,26 @@ def build_colab_settings(secrets: Dict[str, str], *, github_repo: str = "", tota
 
 
 def write_colab_settings(data_dir: pathlib.Path, settings: Dict[str, Any]) -> pathlib.Path:
+    """Persist the generated document for the Drive data root, in the one on-disk spelling.
+
+    Deliberately NOT routed through the persistence prologue: it proves the owner-only
+    ratchets against THIS process's ``config.SETTINGS_PATH``, and the Drive root is another
+    path (the quickstart exports the Colab paths only after this write). The bytes are
+    still ``serialize_settings`` bytes, so the next reader of the Drive file meets the
+    spelling every other writer produces."""
     path = pathlib.Path(data_dir) / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, dict(settings), trailing_newline=True)
+    write_text_atomic(path, serialize_settings(dict(settings)))
     return path
 
 
 def export_colab_env(repo_dir: pathlib.Path, data_dir: pathlib.Path, settings_path: pathlib.Path) -> Dict[str, str]:
-    # Colab forks workers from the long-lived, multi-threaded supervisor; a forked
-    # child can deadlock on the CPython import lock the first time it lazily imports
-    # the OpenAI client (llm._make_no_proxy_client). spawn is the safe start method
-    # for fork-from-threads, so default to it here and respect an explicit override.
-    start_method = (os.environ.get("OUROBOROS_WORKER_START_METHOD") or "spawn").strip().lower()
+    # A child forked from the long-lived, multi-threaded supervisor can deadlock on
+    # the CPython import lock the first time it lazily imports the OpenAI client
+    # (llm._make_no_proxy_client). forkserver -- the runtime's Linux default since
+    # G13 (supervisor/workers.py) -- forks from one single-threaded server instead;
+    # export it explicitly here and respect an explicit override.
+    start_method = (os.environ.get("OUROBOROS_WORKER_START_METHOD") or "forkserver").strip().lower()
     env = {"OUROBOROS_APP_ROOT": str(pathlib.Path(data_dir).parent), "OUROBOROS_REPO_DIR": str(repo_dir), "OUROBOROS_DATA_DIR": str(data_dir), "OUROBOROS_SETTINGS_PATH": str(settings_path), "OUROBOROS_WORKER_START_METHOD": start_method, "PYTHONUNBUFFERED": "1", "PYTHONPATH": str(repo_dir)}
     os.environ.update(env)
     return env
@@ -154,8 +215,7 @@ def _ff_to_origin_if_ahead(repo_dir: pathlib.Path, branch: str) -> bool:
     """
     cwd = str(repo_dir)
     try:
-        if subprocess.run(["git", "fetch", "origin", branch], cwd=cwd, capture_output=True).returncode != 0:
-            return False
+        _run_colab_git_network(["fetch", "origin", branch], cwd=repo_dir)
         rc = subprocess.run(["git", "merge", "--ff-only", f"origin/{branch}"], cwd=cwd, capture_output=True).returncode
         return rc == 0
     except Exception:
@@ -178,12 +238,20 @@ def configure_colab_personal_origin(repo_dir: pathlib.Path, data_dir: pathlib.Pa
     return {"ok": ok, "message": message, "repo": resolved, "restored_from_origin": restored}
 
 
-def clone_or_update_repo(repo_dir: pathlib.Path, source_url: str = DEFAULT_OFFICIAL_REPO_URL, branch: str = "ouroboros") -> pathlib.Path:
+def clone_or_update_repo(
+    repo_dir: pathlib.Path,
+    source_url: str = DEFAULT_OFFICIAL_REPO_URL,
+    source_branch: str = "main",
+    local_branch: str = "ouroboros",
+) -> pathlib.Path:
+    """Fetch one official channel while keeping the local work branch stable."""
     repo_dir = pathlib.Path(repo_dir)
+    fresh_clone = False
     if not (repo_dir / ".git").exists():
         if repo_dir.exists():
             raise RuntimeError(f"{repo_dir} exists but is not a git repository")
-        subprocess.run(["git", "clone", "--branch", branch, source_url, str(repo_dir)], check=True)
+        _run_colab_git_network(["clone", "--no-checkout", source_url, str(repo_dir)])
+        fresh_clone = True
     remotes = subprocess.run(["git", "remote"], cwd=str(repo_dir), capture_output=True, text=True, check=False).stdout.split()
     if "managed" in remotes:
         subprocess.run(["git", "remote", "set-url", "managed", source_url], cwd=str(repo_dir), check=False)
@@ -200,16 +268,131 @@ def clone_or_update_repo(repo_dir: pathlib.Path, source_url: str = DEFAULT_OFFIC
             subprocess.run(["git", "remote", "set-url", "managed", source_url], cwd=str(repo_dir), check=False)
         else:
             subprocess.run(["git", "remote", "add", "managed", source_url], cwd=str(repo_dir), check=False)
-    subprocess.run(["git", "fetch", "managed"], cwd=str(repo_dir), check=False)
-    remote_ref = f"managed/{branch}"
-    has_remote_ref = subprocess.run(["git", "rev-parse", "--verify", remote_ref], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
-    if has_remote_ref:
-        has_local_branch = subprocess.run(["git", "rev-parse", "--verify", branch], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
-        if has_local_branch:
-            subprocess.run(["git", "checkout", branch], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "merge", "--ff-only", remote_ref], cwd=str(repo_dir), check=True)
-        else:
-            subprocess.run(["git", "checkout", "-B", branch, remote_ref], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.name", "Ouroboros"], cwd=str(repo_dir), check=True)
+    subprocess.run(["git", "config", "user.email", "ouroboros@local.mac"], cwd=str(repo_dir), check=True)
+    try:
+        from supervisor.update_source import MANAGED_TAG_NAMESPACE
+
+        _run_colab_git_network(
+            [
+                "fetch",
+                "managed",
+                "+refs/heads/*:refs/remotes/managed/*",
+                f"+refs/tags/*:{MANAGED_TAG_NAMESPACE}/*",
+            ],
+            cwd=repo_dir,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(f"official update fetch failed: {exc}") from exc
+    branch_ref = f"managed/{source_branch}"
+    has_remote_ref = subprocess.run(["git", "rev-parse", "--verify", branch_ref], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
+    if not has_remote_ref:
+        raise RuntimeError(f"official update branch is unavailable: {branch_ref}")
+    from supervisor.update_source import (
+        official_ref_has_constitution,
+        resolve_managed_update_target,
+    )
+
+    def _capture(args):
+        result = subprocess.run(
+            args,
+            cwd=str(repo_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+    update_channel = "stable" if source_branch == "main" else (
+        "qa" if source_branch == "ouroboros-stable" else "development"
+    )
+    remote_ref, resolved, target_error = resolve_managed_update_target(
+        "managed",
+        source_branch,
+        branch_ref,
+        update_channel=update_channel,
+        capture=_capture,
+    )
+    if not remote_ref or not resolved:
+        raise RuntimeError(target_error or f"official update target is unavailable: {branch_ref}")
+
+    if not official_ref_has_constitution(remote_ref, repo_dir=repo_dir):
+        raise RuntimeError(
+            f"official update target lacks a non-empty regular BIBLE.md: {remote_ref}"
+        )
+    has_local_branch = subprocess.run(["git", "rev-parse", "--verify", local_branch], cwd=str(repo_dir), capture_output=True, check=False).returncode == 0
+    if fresh_clone:
+        # `git clone --no-checkout` still creates a local branch for the remote
+        # HEAD. Never let that unrelated default override the selected channel.
+        subprocess.run(["git", "checkout", "-B", local_branch, remote_ref], cwd=str(repo_dir), check=True)
+    elif has_local_branch:
+        subprocess.run(["git", "checkout", local_branch], cwd=str(repo_dir), check=True)
+        can_fast_forward = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", "HEAD", remote_ref],
+            cwd=str(repo_dir),
+            capture_output=True,
+        )
+        if can_fast_forward.returncode == 0:
+            # Failure here (for example local dirty files) must preserve the
+            # checkout; the normal smart updater can reconcile it later.
+            subprocess.run(
+                ["git", "merge", "--ff-only", remote_ref],
+                cwd=str(repo_dir),
+                capture_output=True,
+                check=False,
+            )
+        elif can_fast_forward.returncode != 1:
+            raise RuntimeError(f"could not compare local {local_branch} with {remote_ref}")
+        # Local-ahead and truly diverged checkouts stay untouched. The selected
+        # channel is persisted below and the normal smart updater owns merging.
+    else:
+        subprocess.run(["git", "checkout", "-B", local_branch, remote_ref], cwd=str(repo_dir), check=True)
+    local_stable_branch = "ouroboros-stable"
+    has_local_stable = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_stable_branch}"],
+        cwd=str(repo_dir),
+        check=False,
+    ).returncode == 0
+    if not has_local_stable:
+        # Desktop creates this fallback from its bundled source SHA. Colab has
+        # no bundle: prefer the fetched Stable channel even when the first run
+        # intentionally selected QA/Development, then never auto-advance it.
+        stable_seed, _stable_sha, _stable_error = resolve_managed_update_target(
+            "managed",
+            "main",
+            "managed/main",
+            update_channel="stable",
+            capture=_capture,
+        )
+        stable_seed = stable_seed or remote_ref
+        if not official_ref_has_constitution(stable_seed, repo_dir=repo_dir):
+            stable_seed = remote_ref
+        subprocess.run(
+            ["git", "branch", local_stable_branch, stable_seed],
+            cwd=str(repo_dir),
+            check=True,
+        )
+    version_path = repo_dir / "VERSION"
+    app_version = version_path.read_text(encoding="utf-8").strip() if version_path.is_file() else ""
+    # Source-mode Colab owns the same managed-update contract as desktop. This
+    # marker describes provenance/local branches; runtime settings choose the feed.
+    atomic_write_json(
+        repo_dir / ".git" / "ouroboros-managed.json",
+        {
+            "schema_version": 1,
+            "app_version": app_version,
+            "source_sha": resolved,
+            "source_branch": source_branch,
+            "managed_remote_name": "managed",
+            "managed_remote_url": source_url,
+            "managed_remote_branch": source_branch,
+            "managed_local_branch": local_branch,
+            "managed_local_stable_branch": local_stable_branch,
+            "managed_remote_stable_branch": "ouroboros-stable",
+            "colab_source_mode": True,
+        },
+        trailing_newline=True,
+    )
     return repo_dir
 
 

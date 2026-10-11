@@ -17,6 +17,15 @@ v4.33.0 separates the two:
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
 
 class TestResolveIntentSubjectOnly:
     def test_subject_only_from_multiline_commit_message(self):
@@ -156,6 +165,9 @@ def test_triad_prompt_keeps_distinct_goal_and_scope_in_production_wiring(
         return json.dumps({"results": []})
 
     monkeypatch.setattr(review, "run_cmd", fake_run_cmd)
+    import ouroboros.tools.review_binary_context as _rbc
+    monkeypatch.setattr(_rbc, "capture_staged_diff",
+                        lambda _repo, *, unified=3: "diff --git a/x.py b/x.py\n+x = 1")
     monkeypatch.setattr(review, "_preflight_check", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(review, "_load_checklist_section", lambda: "checklist")
     monkeypatch.setattr(review, "load_governance_doc", lambda *_args, **_kwargs: "governance")

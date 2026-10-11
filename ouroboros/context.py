@@ -1,20 +1,20 @@
 from __future__ import annotations
 
+from ouroboros.config import runtime_setting
+
 import json
 import logging
 import os
 import pathlib
 import re
 import sys
-from collections import Counter
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_context_mode
+from ouroboros.desktop_autostart import runtime_facts as desktop_runtime_facts
 from ouroboros.context_budget import (
-    CONTEXT_SOFT_CAP_TOKENS,
     LARGE_CONTEXT_SECTION_CHARS,
-    MAX_RECENT_CHAT_TAIL,
-    SCRATCHPAD_BLOAT_WARN_CHARS,
     SCRATCHPAD_SECTION_BUDGET_CHARS,
 )
 from ouroboros.context_fit import (
@@ -33,15 +33,41 @@ from ouroboros.context_fit import (
 from ouroboros.context_fit import (
     estimate_context_prompt_tokens as estimate_context_prompt_tokens,
 )
-from ouroboros.context_layout import architecture_context_section
-from ouroboros.contracts.task_contract import normalize_bool
-from ouroboros.memory import Memory
+from ouroboros.context_input_selection import (
+    _capture_declared_context_core,
+    _explicit_self_body_docs_flag as _explicit_self_body_docs_flag,
+    _task_requires_development_context,
+    _task_requires_self_body_docs,
+    _task_uses_external_context,
+    _validate_declared_input_task,
+)
+from ouroboros.context_health import (
+    _compute_cache_hit_rate as _compute_cache_hit_rate,
+)
+from ouroboros.context_health import (
+    _iter_recent_jsonl as _iter_recent_jsonl,
+)
+from ouroboros.context_health import (
+    _STRAY_PROBE_CACHE as _STRAY_PROBE_CACHE,
+)
+from ouroboros.context_health import (
+    _stray_server_note as _stray_server_note,
+)
+from ouroboros.context_health import (
+    build_health_invariants as build_health_invariants,
+)
+from ouroboros.context_health import (
+    safe_read as safe_read,
+)
+from ouroboros.contracts.task_contract import normalize_bool, task_input_sources
+from ouroboros.memory import Memory, render_scratchpad_markdown
+from ouroboros.update_letter import official_update_projection  # contract: never raises
+from ouroboros.i18n_memory import current_language as _ui_language_tag
 from ouroboros.utils import (
-    estimate_tokens,
     get_git_info,
-    iter_jsonl_objects,
     read_json_dict,
     read_text,
+    safe_relpath,
     truncate_review_artifact,
     utc_now_iso,
 )
@@ -50,33 +76,37 @@ log = logging.getLogger(__name__)
 _LARGE_CONTEXT_SECTION_CHARS = LARGE_CONTEXT_SECTION_CHARS
 
 
-def _chat_log_signature_matches(expected: Any, current: Dict[str, Any]) -> bool:
-    if not isinstance(expected, dict) or not current:
-        return False
-    try:
-        return (
-            expected.get("first_line_sha256") == current.get("first_line_sha256")
-            and int(current.get("size") or 0) >= int(expected.get("size") or 0)
-        )
-    except (TypeError, ValueError):
-        return False
-
-
 def build_user_content(task: Dict[str, Any]) -> Any:
+    from ouroboros.presence_context import frame_presence_user_content
+
     text = task.get("text", "")
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    author = metadata.get("objective_author")
+    if isinstance(author, dict) and author.get("kind") == "task":
+        text = (f"[OBJECTIVE_AUTHOR] The objective below was drafted by task {author.get('task_id')}, "
+                "not spoken by the owner. The owner's words retain their own source. "
+                "[/OBJECTIVE_AUTHOR]\n\n" + str(text or ""))
     if metadata.get("force_plan"):
         source = str(metadata.get("force_plan_source") or "operator").strip() or "operator"
+        from ouroboros.config import get_review_enforcement
+
+        review_enforcement = get_review_enforcement()
         plan_notice = (
             "[SWARM_INITIATIVE]\n"
             f"Source: {source}.\n"
-            "First call plan_task with an explicit context_level appropriate to this task to think "
-            "deeply about the approach. THEN, when the work decomposes into parts that can progress "
-            "in parallel, fan out subagents with schedule_subagent (acting/mutative where the work "
-            "needs changes and the owner toggle permits it) within the configured child/worker caps, "
-            "and reconcile their results; publish the shared frame to the task-tree ledger first if "
-            "their outputs must integrate. If the task is genuinely atomic, a deep plan alone is fine. "
-            "Treat this as a planning+delegation initiative for this task, not as user-authored content.\n"
+            f"Resolved review enforcement: {review_enforcement}.\n"
+            "Plan review applies to this work (BIBLE P3); whether to ask, explore or plan first is "
+            "your judgment. Under blocking, continue analysis, evidence gathering, and "
+            "non-mutating preparation while review is open, but begin implementation only after review closes "
+            "or a real task-wide rail fires. Under advisory, you may proceed by judgment with explicit "
+            "disclosure. When the work decomposes into independent parts, fan out subagents within the "
+            "configured caps and reconcile them. State the chosen execution shape explicitly in the plan's "
+            "decisions or acceptance claims — delegation required, optional, or intentionally not used — so "
+            "reviewers can judge it. Parallel children each work from your base snapshot and cannot see each "
+            "other's edits; their patches integrate independently, so two children writing the same region of "
+            "the same file conflict at integration — expected mechanics, not a failure. Give children disjoint "
+            "write regions, or explicitly plan the parent-synthesis step that resolves the expected overlap. "
+            "Planning or reviewer unavailability must not replace useful work with a terminal planning error.\n"
             "[/SWARM_INITIATIVE]\n\n"
         )
         text = plan_notice + str(text or "")
@@ -84,7 +114,7 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     attachment_image_blocks = _build_attachment_image_blocks(task)
 
     if not image_b64 and not attachment_image_blocks:
-        return text or "(empty message)"
+        return frame_presence_user_content(task, text or "(empty message)")
 
     if image_b64:
         # Backward-compat: the legacy single-image path (screenshots, desktop chat
@@ -104,7 +134,7 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     else:
         content = [{"type": "text", "text": text or "(empty message)"}]
     content.extend(attachment_image_blocks)
-    return content
+    return frame_presence_user_content(task, content)
 
 
 def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -117,11 +147,17 @@ def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]
     live; the rest stay manifest-readable via read_file(root='artifact_store', ...).
     Never raises — a per-file error skips just that image."""
     entries = task.get("attachment_images")
-    if not isinstance(entries, list) or not entries:
-        return []
-    drive_root = task.get("drive_root")
-    task_id = task.get("id")
+    drive_root, task_id = task.get("drive_root"), task.get("id")
     if not drive_root or not task_id:
+        return []
+    contract = task.get("task_contract") or {}
+    if "attachment_manifest_ref" in contract:
+        from ouroboros.artifacts import resolve_attachment_manifest
+        try:
+            entries = resolve_attachment_manifest(drive_root, str(task_id), contract)
+        except (OSError, ValueError, TypeError) as exc:
+            return [{"type": "text", "text": f"Attachment source unavailable: {exc}. The inline rows are not the complete input set."}]
+    if not isinstance(entries, list) or not entries:
         return []
     import base64 as _b64
 
@@ -170,65 +206,9 @@ def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]
     return blocks
 
 
-def _task_requires_development_context(task: Dict[str, Any]) -> bool:
-    """Return whether low mode should inline the engineering handbook.
-
-    Web chat tasks are direct-chat but still may ask for code/self-modification.
-    Err toward preserving engineering competence unless a structured caller
-    explicitly declares that this task does not need DEVELOPMENT.md.
-    """
-    explicit = task.get("context_requires_development")
-    if explicit is not None:
-        return normalize_bool(explicit)
-    return str(task.get("type") or "") == "task" or not bool(task.get("_is_direct_chat"))
-
-
-def _explicit_self_body_docs_flag(task: Dict[str, Any]) -> Optional[bool]:
-    """Explicit context_requires_self_body_docs from the task or its contract;
-    None when neither declares it."""
-    explicit = task.get("context_requires_self_body_docs")
-    if explicit is not None:
-        return normalize_bool(explicit)
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
-    explicit = contract.get("context_requires_self_body_docs") if isinstance(contract, dict) else None
-    if explicit is not None:
-        return normalize_bool(explicit)
-    return None
-
-
-def _task_requires_self_body_docs(task: Dict[str, Any]) -> bool:
-    """Return True when the task is structurally about Ouroboros itself."""
-
-    explicit = _explicit_self_body_docs_flag(task)
-    if explicit is not None:
-        return explicit
-    contract = task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {}
-    task_type = str(task.get("type") or contract.get("task_type") or "").strip().lower()
-    return task_type in {"evolution", "deep_self_review", "review"}
-
-
-def _task_uses_external_context(task: Dict[str, Any]) -> bool:
-    """Return True for structured headless/workspace/delegated task surfaces."""
-
-    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    source = str(metadata.get("source") or task.get("source") or "").strip().lower()
-    actor = str(task.get("actor_id") or metadata.get("actor_id") or "").strip().lower()
-    delegation_role = str(task.get("delegation_role") or metadata.get("delegation_role") or "").strip().lower()
-    if str(task.get("workspace_root") or metadata.get("workspace_root") or "").strip():
-        return True
-    if delegation_role == "subagent":
-        return True
-    if source in {"api_task", "cli", "scheduled_task", "skill_scheduled_task"}:
-        return True
-    if actor in {"cli", "scheduler"}:
-        return True
-    return False
-
-
 def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, Any]]:
-    """Compact digest of active cron schedules for task/consciousness context.
-
-    Keeps the agent aware of standing cron schedules without inlining the full
+    """Compact digest of active schedules (cron + one-shot) for task/consciousness
+    context. Keeps the agent aware of standing schedules without inlining the full
     schedule table; notes how many active schedules were omitted past ``limit``.
     """
     try:
@@ -236,79 +216,126 @@ def _scheduled_tasks_digest(env: Any, *, limit: int = 8) -> Optional[Dict[str, A
     except Exception:
         log.debug("Failed to read scheduled tasks for context digest", exc_info=True)
         return None
-    tasks = [
-        t for t in (data.get("tasks") or [])
-        if isinstance(t, dict) and t.get("enabled", True)
-    ]
+    from supervisor.followup_policy import observed_store
+    from supervisor.queue_schedules import schedule_lifecycle_status
+    root = pathlib.Path(env.drive_path("state/scheduled_tasks.json")).parent.parent
+    data = observed_store(root, data)
+    # A deleted row still finishing accepted work stays in view until it goes.
+    tasks = [t for t in data.get("tasks", []) if isinstance(t, dict) and (t.get("enabled", True)
+             or t.get("followup_hold") or t.get("followup_wait") or t.get("delete_requested_at"))]
     if not tasks:
         return None
-    digest: List[Dict[str, Any]] = []
+    out: Dict[str, Any] = {"active": [], "held": [], "waiting": []}
     for record in tasks[:limit]:
-        trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
-        digest.append({
-            "id": str(record.get("id") or ""),
-            "name": str(record.get("name") or ""),
-            "cron": str(trigger.get("expr") or record.get("cron") or ""),
-            "timezone": str(record.get("timezone") or "") or "local",
-            "next_run_at": str(record.get("next_run_at") or ""),
-        })
-    out: Dict[str, Any] = {"active": digest}
+        trigger = record.get("trigger") or {}
+        status = schedule_lifecycle_status(record)
+        entry = {"id": record.get("id"), "name": record.get("name"), "status": status,
+                 "relation": record.get("relation"), "followup_hold": record.get("followup_hold"),
+                 "followup_wait": record.get("followup_wait"), "hold_persisted": record.get("hold_persisted"),
+                 "timezone": record.get("timezone") or "local", "next_run_at": record.get("next_run_at") or ""}
+        entry["run_at" if trigger.get("type") == "once" else "cron"] = trigger.get("run_at" if trigger.get("type") == "once" else "expr", "")
+        if status == "delete_pending":
+            out.setdefault("delete_pending", []).append(entry)
+            continue
+        out["held" if record.get("followup_hold") else "waiting" if record.get("followup_wait") else "active"].append(entry)
     if len(tasks) > limit:
         out["omitted_count"] = len(tasks) - limit
     return out
 
 
-# v6.70.0 LLM-first outcome contract for ephemeral decision turns (no gate): a
-# decision turn once ANSWERED a side-effect request with a promise ("I'll open
-# the PR") while its read-only toolset could not do the work and no task
-# existed — the owner watched a placebo. State the rule where the decision is
-# made instead of policing prose afterwards.
-_DECISION_TURN_OUTCOME_RULE = (
-    "This is a short DECISION turn with read/inspect tools only. A request "
-    "carrying an external side effect (submit/publish/repair/commit/install/"
-    "write) MUST either become a real supervised task via promote_chat_to_task "
-    "or be explicitly declined in the answer. Ending this turn with a promise "
-    "of future work that no tool call actually scheduled is a forbidden "
-    "outcome — an unscheduled promise reads to the owner as work in motion. "
-    "After any routing tool call, the final no-tool response MUST be self-contained: "
-    "state what was attempted and the outcome known to you, because prose from the "
-    "tool-call round is transient progress and is not durable conversation history."
+# The owner-surface note is shared by the runtime-section builder.
+_OWNER_CLIENT_NOTE = (
+    "owner_client is the client surface that SENT the message that started/steered "
+    "this work. Provenance: browser observables are CLIENT-REPORTED (the owner's own "
+    "SPA measured them; not host-attested); received_at is a HOST stamp; {channel: ...} "
+    "is a host stamp for bridge/command ingress but CALLER-DECLARED for external "
+    "/api/tasks admissions (default api_task); captured_at is the client clock at "
+    "SEND time (delivery can lag it — received_at is the honest arrival mark). "
+    "runtime_env.presentation is the server process's own shell, NOT the sender. "
+    "When owner_client is absent, the surface is unknown: ask or hedge rather than "
+    "assuming a browser."
 )
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) -> str:
+# The runtime section's fact builders live in ouroboros/context_runtime_facts.py
+# (extracted at this module's size ceiling); re-exported here because the section
+# builder below and the tests that monkeypatch these names address them on THIS
+# surface.
+from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported public surface
+    _context_clock_note,
+    snapshot_labelled,
+    _delegation_capability_fact,
+    _project_room_fact,
+    _queue_context_fact,
+    _runtime_budget_info,
+    task_execution_clock_fact,
+    task_schedule_fact,
+)
+
+
+def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]:
+    """Exact active task/origin/plan authority, before route-specific fitting."""
+    canonical_root = pathlib.Path(
+        task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root
+    )
+    from ouroboros.main_context_authority import project_main_task_authority
+
+    projection = project_main_task_authority(task, drive_root=canonical_root)
+    task_id = str(task.get("id") or "").strip()
+    if not task_id:
+        return projection
+    source = {
+        "tool": "get_task_result",
+        "arguments": {"task_id": task_id, "include_authority": True},
+    }
+    try:
+        from ouroboros.task_results import current_plan_review_wave, load_plan_review_state
+
+        state = load_plan_review_state(canonical_root, task_id)
+        wave = current_plan_review_wave(state)
+        if wave is not None or state.get("current_attempt") or state.get("legacy_v1"):
+            projection["plan_review_authority"] = {
+                "current_attempt": state.get("current_attempt") or {},
+                "current_wave": wave,
+                "legacy_v1_projection": state.get("legacy_v1_projection") or {},
+                "waves_omitted": int(state.get("waves_omitted") or 0),
+                "source": source,
+            }
+    except Exception as exc:
+        projection["plan_review_authority"] = {
+            "status": "authority_source_unavailable", "source": source,
+            "error": type(exc).__name__,
+            "rule": "Do not treat the current plan/review authority as complete.",
+        }
+    return projection
+
+
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None, captured_at: str = "") -> str:
+    declared = task_input_sources(task) == "declared"
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
     except Exception:
         log.debug("Failed to get git info for context", exc_info=True)
         git_branch, git_sha = "unknown", "unknown"
 
-    budget_info = None
-    try:
-        from ouroboros.usage_accounting import usage_projection
-
-        total_usd = float(os.environ.get("TOTAL_BUDGET", "1"))
-        budget_root = pathlib.Path(task.get("budget_drive_root") or env.drive_root)
-        projection = usage_projection(budget_root, global_limit_usd=total_usd)
-        spent_usd = float(projection.get("accounted_usd") or 0.0)
-        budget_info = {
-            "status": "available", "total_usd": total_usd,
-            "spent_usd": spent_usd, "remaining_usd": total_usd - spent_usd,
-            "reserved_usd": float(projection.get("reserved_usd") or 0.0),
-            "unresolved_upper_bound_usd": float(projection.get("unresolved_upper_bound_usd") or 0.0),
-            "unknown_unmetered": int(projection.get("unknown_unmetered") or 0),
-        }
-    except Exception:
-        log.error("Budget authority unavailable for runtime context", exc_info=True)
-        budget_info = {"status": "unavailable"}
+    budget_info = _runtime_budget_info(env, task, ctx)
 
     try:
         from ouroboros.config import get_runtime_mode
         runtime_mode = get_runtime_mode()
     except Exception:
         runtime_mode = os.environ.get("OUROBOROS_RUNTIME_MODE", "advanced")
+    if not bool(task.get("_is_direct_chat")):
+        # A root consciousness started carries a per-task mode cap (Act/Observe = light) that
+        # the dispatcher enforces: its Runtime block names the mode it actually runs in. The
+        # wake itself is a direct turn and keeps Main's block byte-identical (В31=B).
+        from ouroboros.consciousness_authority import effective_runtime_mode, is_consciousness_origin
+
+        if is_consciousness_origin(task.get("metadata")):
+            runtime_mode = effective_runtime_mode(str(runtime_mode or ""), task.get("metadata"))
     runtime_data = {
-        "utc_now": utc_now_iso(),
+        "context_captured_at": captured_at or utc_now_iso(),
+        "clock_note": _context_clock_note(task),
         "repo_dir": str(env.repo_dir),
         "drive_root": str(env.drive_root),
         "git_head": git_sha,
@@ -327,17 +354,34 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "child_drive_root": task.get("child_drive_root"),
             "budget_drive_root": task.get("budget_drive_root"),
             "deadline_at": task.get("deadline_at"),
+            **task_execution_clock_fact(task, ctx),
+            **task_schedule_fact(task),
             "allowed_resources": task.get("allowed_resources"),
+            "context": task.get("context"),
         },
-        "runtime_env": {"is_desktop": bool(os.environ.get("OUROBOROS_DESKTOP_MODE", "")), "platform": sys.platform},
+        # Host shell/lifecycle, not the sender's per-message `owner_client`.
+        # Launcher-exported presentation is absent on web/headless processes.
+        "runtime_env": {
+            "presentation": os.environ.get("OUROBOROS_PRESENTATION", "").strip() or "web",
+            "platform": sys.platform,
+            **desktop_runtime_facts(),
+        },
+        # The interface language my human chose for this install (OUROBOROS_UI_LANGUAGE):
+        # the chrome, the task rows and Telegram render in it; "chosen": false means the
+        # English source renders because no choice was made. One fact, captured once per
+        # attempt — the live readers (gateway, Telegram) follow a change at once, this
+        # block at the next attempt.
+        "ui_language": {"tag": _ui_language_tag() or "en", "chosen": bool(_ui_language_tag())},
     }
-    if isinstance(task.get("task_contract"), dict):
-        runtime_data["task_contract"] = task.get("task_contract")
+    runtime_data.update(_task_authority_projection(env, task))
+    if declared:
+        runtime_data["task_constraint"] = task.get("task_constraint") or getattr(ctx, "task_constraint", {})
     runtime_data["operational_reality_rule"] = (
-        "This live runtime context is authoritative over stale paths, tool lists, "
+        "This captured runtime context is authoritative over stale paths, tool lists, "
         "or capability assumptions embedded in the task text. Use the visible "
         "task_contract, [ATTACHMENTS], disabled_tools, filesystem roots, and queue "
-        "capacity here when they conflict with older prompt wording."
+        "observations here when they conflict with older prompt wording. Queue load is dated "
+        "evidence at context construction, not a continuously refreshed capacity reading."
     )
     if str(task.get("workspace_root") or "").strip():
         runtime_data["active_workspace"] = {
@@ -345,8 +389,10 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "workspace_mode": str(task.get("workspace_mode") or ""),
             "memory_mode": str(task.get("memory_mode") or ""),
             "rule": (
-                "read_file/write_file/list_files/search_code/run_command target the active workspace; "
-                "Ouroboros self-review/commit tools are unavailable; final changes are exported as artifacts."
+                "File and process tools default to the active workspace; explicit typed root/cwd "
+                "selectors target other authorized resources per call. Project focus does not remove "
+                "the ordinary top-level toolset: Ouroboros self-review/commit tools remain available "
+                "for system_repo changes, while external-project changes are exported as artifacts."
             ),
         }
     if str(runtime_mode).lower() == "light":
@@ -360,24 +406,38 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
     try:
         from ouroboros.config import get_allow_mutative_subagents
         from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES
+        from ouroboros.workspace_copies import workspace_copy_source_is_system
 
+        copy_source_is_system = workspace_copy_source_is_system(ctx or env, str(task.get("workspace_root") or ""))
         runtime_data["capabilities"] = {
             "allow_mutative_subagents": bool(get_allow_mutative_subagents()),
+            "mutative_subagent_surfaces": sorted(
+                s for s in VALID_WRITE_SURFACES
+                if get_allow_mutative_subagents(s, source_is_system_repo=copy_source_is_system)
+            ),
             "write_surfaces": sorted(VALID_WRITE_SURFACES),
-            "web_search_backend": os.environ.get("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
+            "web_search_backend": runtime_setting("OUROBOROS_WEBSEARCH_BACKEND", "auto"),
             "main_web_search": {
-                "mode": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH", "off"),
-                "engine": os.environ.get("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
+                "mode": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH", "off"),
+                "engine": runtime_setting("OUROBOROS_MAIN_WEB_SEARCH_ENGINE", "auto"),
             },
             "note": (
-                "allow_mutative_subagents is the MASTER gate (the owner toggle overrides the "
-                "runtime-mode default; runtime mode only sets the default when the toggle is "
-                "empty). light blocks ONLY Ouroboros self-repo/control-plane mutation "
-                "(write_surface=self_worktree), NOT user/task/project deliverables: acting "
-                "subagents with write_surface=external_workspace or genesis remain valid in "
-                "light. Read THIS value before declaring you cannot spawn acting subagents."
+                "allow_mutative_subagents is the MASTER gate (an explicit owner toggle "
+                "applies to every surface; when it is empty the runtime mode decides, "
+                "SURFACE-AWARE: advanced/pro/cyber_pro allow every surface, light allows "
+                "external_workspace/genesis — they build outside the Ouroboros runtime — "
+                "including isolated project copies; own-body self_worktree stays off). "
+                "mutative_subagent_surfaces lists what is "
+                "actually schedulable RIGHT NOW. Read THIS before declaring you cannot "
+                "spawn acting subagents."
             ),
         }
+        # B4-lite: honestly-labeled HISTORY, never live health. Own nested
+        # fail-soft inside the helper: a failure there must
+        # never drop the whole capabilities digest above.
+        _delegation_fact = None if declared else _delegation_capability_fact()
+        if _delegation_fact is not None:
+            runtime_data["capabilities"]["delegation"] = _delegation_fact
         if ctx is not None:
             from ouroboros.tool_access import filesystem_affordance_map
 
@@ -386,71 +446,50 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
                 runtime_mode=str(runtime_mode or ""),
             )
             # v6.57.0 (1.6): a delegated child sees its OWN effective tool profile
-            # (shell/writable roots/lane) up front — the same summary the parent got at
-            # schedule time — so it never wastes a round discovering shell is off.
+            # (shell/writable roots/lane) up front. The lane is the one dispatch
+            # resolved; a fallback to the REQUEST would name an unresolved strength.
             try:
                 if str(task.get("delegation_role") or "").strip() == "subagent":
                     from ouroboros.tool_access import active_tool_profile, summarize_subagent_profile
 
                     runtime_data["capabilities"]["self_profile"] = summarize_subagent_profile(
                         active_tool_profile(ctx),
-                        effective_lane=str(task.get("effective_model_lane") or task.get("requested_model_lane") or ""),
+                        effective_lane=str(task.get("effective_model_lane") or ""),
                     )
             except Exception:
                 log.debug("Failed to build subagent self_profile summary", exc_info=True)
     except Exception:
         log.debug("Failed to build capability digest for context", exc_info=True)
     try:
-        from ouroboros.config import DATA_DIR, get_max_active_subagents_per_root, get_max_workers
-        from ouroboros.task_status import _load_queue_snapshot
-
-        # The supervisor persists the snapshot at the canonical data root, NOT a forked
-        # child drive — so read it from budget_drive_root (the main root for a subagent)
-        # or DATA_DIR. Reading env.drive_root would leave subagents (the actors most likely
-        # to mis-reason about "starved" siblings) with no live-queue honesty signal.
-        _snap_root = str(task.get("budget_drive_root") or "").strip() or str(DATA_DIR)
-        _snap = _load_queue_snapshot(_snap_root)
-        if not (_snap.get("_snapshot_missing") or _snap.get("_snapshot_invalid")):
-            _running = [r for r in (_snap.get("running") or []) if isinstance(r, dict)]
-            _pending = [r for r in (_snap.get("pending") or []) if isinstance(r, dict)]
-            _maxw = int(get_max_workers())
-            _reaping = int(_snap.get("reaping_count") or 0)
-            # Prefer the ACTUAL assignable-idle worker count persisted from the live pool
-            # (the real pool can be smaller than the configured max, and a mid-reap slot is
-            # unavailable); fall back to a derived estimate for older snapshots.
-            _assignable = _snap.get("assignable_idle_workers")
-            if _assignable is not None:
-                _free = max(0, int(_assignable))
-            else:
-                _free = max(0, _maxw - len(_running) - _reaping)
-            runtime_data["queue"] = {
-                "running_count": len(_running),
-                "pending_count": len(_pending),
-                "reaping_count": _reaping,
-                "max_workers": _maxw,
-                "worker_total": int(_snap.get("worker_total") or _maxw),
-                "free_worker_slots": _free,
-                "max_active_subagents_per_root": int(get_max_active_subagents_per_root()),
-                "note": (
-                    "live worker/queue load. Read THIS before claiming children are 'starved' "
-                    "or the queue is 'saturated' — derive resource facts from here, not guesses."
-                ),
-            }
+        runtime_data["queue"] = _queue_context_fact(task)
     except Exception:
         log.debug("Failed to build queue digest for context", exc_info=True)
     if budget_info:
         runtime_data["budget"] = budget_info
-    schedule_digest = _scheduled_tasks_digest(env)
+    schedule_digest = None if declared else _scheduled_tasks_digest(env)
     if schedule_digest:
         runtime_data["scheduled_tasks"] = schedule_digest
-    # WS1: surface the tasks already RUNNING in this chat so a busy-chat decision
-    # turn can steer_task the right one instead of spawning a duplicate. Structural
-    # fact only — the agent chooses the target by judgment (BIBLE P5), code never
-    # auto-routes. (Also gives a project-room message its "you are in project X"
-    # default scene, closing the re-ask case.)
+        if scheduled_tasks_digest_out is not None:
+            scheduled_tasks_digest_out.update(schedule_digest)
+    # Surface running tasks so a busy-chat turn can steer instead of duplicating it.
     _meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    # Owner Surface Fact: the surface that SENT the message this task/turn came
+    # from. A web message carries raw observables (pywebview/ua/viewport/...);
+    # a non-web ingress carries {"channel": <source>} STAMPED AT ITS PRODUCER
+    # (bridge routing, /api/command, /api/tasks admission).
+    # Absence is an honest gap — no key, never a guessed default (BIBLE P1).
+    # ONE shared projection of the producer-assembled fact — the mailbox
+    # surface-note baseline reads the same function, so the two can't disagree.
+    # The renderer never infers a surface from metadata.source (overloaded by
+    # internal producers: scheduler, skill schedules); absence stays honest.
+    from ouroboros.client_surface import owner_client_fact
+
+    _owner_client = owner_client_fact(_meta)
+    if _owner_client:
+        runtime_data["owner_client"] = dict(_owner_client)
+        runtime_data["owner_client_note"] = _OWNER_CLIENT_NOTE
     _current_chat = _meta.get("current_chat") if isinstance(_meta.get("current_chat"), dict) else None
-    if _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
+    if not declared and _current_chat and (_current_chat.get("running_tasks") or _current_chat.get("addressable_root_tasks")):
         runtime_data["current_chat"] = _current_chat
         runtime_data["current_chat_rule"] = (
             "addressable_root_tasks are RUNNING/PENDING roots in THIS chat. If a new message continues or "
@@ -458,74 +497,31 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
-    if bool(task.get("_ephemeral_turn")):
-        runtime_data["decision_turn_rule"] = _DECISION_TURN_OUTCOME_RULE
-    _main_manifest = (
-        _meta.get("main_routing_manifest")
-        if isinstance(_meta.get("main_routing_manifest"), dict)
-        else None
-    )
-    if _main_manifest:
-        runtime_data["main_routing_manifest"] = _main_manifest
+    # Host-built ground truth about what THIS lane may continue: Main's bounded
+    # manifest, a project room's own hint (its recent ROOT results and the roots
+    # still live in it) and the thread's most recent result (id/status/workspace
+    # facts/artifact refs). Read these before framing a "continue" promotion;
+    # never reconstruct prior work from chat memory. What promote ACCEPTS is the
+    # predicate in ARCHITECTURE ch. 10 - these rows are the hint, not the door.
+    for _routing_key in (
+        "main_routing_manifest", "project_routing_manifest", "project_last_task_result",
+    ):
+        _routing_fact = _meta.get(_routing_key)
+        if not declared and isinstance(_routing_fact, dict) and _routing_fact:
+            runtime_data[_routing_key] = _routing_fact
     _routing_contract = (
         _meta.get("routing_contract")
         if isinstance(_meta.get("routing_contract"), dict)
         else None
     )
-    if _routing_contract:
+    if not declared and _routing_contract:
         # Host-built facts and choices, not model-authored routing state.  Keeping
         # the compact contract beside the manifest closes the former split where
         # server.py computed both but the decision model could see neither.
         runtime_data["routing_contract"] = _routing_contract
-    # v6.58.0 (2.2): a conversation/decision turn in a project ROOM sees the room's
-    # working folder as a structural FACT — it can promote work into that folder
-    # without ITSELF becoming a workspace task (decision turns deliberately keep the
-    # promote/steer/route toolset, which workspace profiles exclude). The default
-    # transport: promote_chat_to_task from this room inherits working_dir unless
-    # workspace='none'. Registry read is anchored at the canonical DATA_DIR.
-    # v6.61.3 room lens: the rule now states the REAL chat-lane affordances (reads +
-    # default shell cwd resolve to the folder; writes go through promoted tasks) —
-    # the robot-room incident was exactly a fact/affordance split. A set-but-broken
-    # working_dir is disclosed loudly instead of a silent system-repo fallback.
-    try:
-        _room_pid = str(task.get("project_id") or "").strip()
-        if _room_pid and not str(task.get("workspace_root") or "").strip():
-            from ouroboros.config import DATA_DIR as _DATA_DIR
-            from ouroboros.projects_registry import get_project as _get_project
-            from ouroboros.workspace_admission import room_chat_lens_dir as _room_lens
-
-            _room = _get_project(_DATA_DIR, _room_pid) or {}
-            _room_wd = str(_room.get("working_dir") or "").strip()
-            if _room_wd:
-                # Same resolver the agent uses for the tool lens, so the stated rule
-                # and the actual tool surface cannot diverge (the robot incident).
-                _lens_dir, _room_note = _room_lens(_DATA_DIR, _room_pid)
-                _lens_active = bool(task.get("_is_direct_chat")) and bool(_lens_dir)
-                runtime_data["project_room"] = {
-                    "project_id": _room_pid,
-                    "working_dir": _room_wd,
-                    "rule": (
-                        (
-                            "This room's chat lane LOOKS AT the project folder: read_file/"
-                            "list_files/search_code/query_code with root=active_workspace and "
-                            "the DEFAULT shell cwd resolve to working_dir. The Ouroboros "
-                            "system repo needs explicit root=\"system_repo\" (reads) or an "
-                            "explicit cwd (shell). File WRITES here go through "
-                            "promote_chat_to_task — the promoted task inherits this folder as "
-                            "its workspace (workspace='none' opts out)."
-                        )
-                        if _lens_active
-                        else (
-                            "This project has a working folder. Tasks promoted from this room "
-                            "run with it as their active workspace by default; pass "
-                            "workspace='none' to promote a folder-less task."
-                        )
-                    ),
-                }
-                if _room_note:
-                    runtime_data["project_room"]["working_dir_warning"] = _room_note
-    except Exception:
-        log.debug("Failed to inject project_room working_dir fact", exc_info=True)
+    _room_fact = None if declared else _project_room_fact(task)
+    if _room_fact:
+        runtime_data["project_room"] = _room_fact
     # v6.60.0 answer protocol (quiz 16b, C+B): the FINAL ANSWER marker doctrine moved
     # OUT of SYSTEM.md into a per-task contract field. Only a task whose contract
     # declares answer_protocol="final_answer_line" (bench adapters, exact-match
@@ -556,25 +552,42 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None) ->
             }
     except Exception:
         log.debug("Failed to inject answer_protocol rule", exc_info=True)
-    runtime_ctx = json.dumps(runtime_data, ensure_ascii=False, indent=2)
-    out = "## Runtime context\n\n" + runtime_ctx
+    if not declared:
+        runtime_data["official_update"] = official_update_projection(git_sha)
+    out = "## Runtime context\n\n" + json.dumps(runtime_data, ensure_ascii=False, indent=2)
+    if declared:
+        return out
     try:
         from ouroboros.task_tree_ledger import tree_ledger_tail_digest
-
         _root_id = str(task.get("root_task_id") or task.get("id") or "")
-        _tree_digest = tree_ledger_tail_digest(_root_id, limit=40) if _root_id else ""
+        from ouroboros.tool_access import canonical_data_root
+        _tree_root = (canonical_data_root(ctx) if ctx is not None else pathlib.Path(
+            task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or env.drive_root
+        ).resolve(strict=False))
+        _tree_digest = tree_ledger_tail_digest(
+            _root_id, limit=40, data_root=_tree_root,
+        ) if _root_id else ""
         if _tree_digest:
             out += (
                 "\n\n## Task-tree coordination ledger (shared swarm blackboard)\n\n"
                 "Shared across this task tree via tree_note/tree_read. Before fanning out "
                 "INTERDEPENDENT children, publish the shared frame (contract/decision/fact); "
-                "children build against it and raise blocker/question/interface_contract beacons "
-                "for attention (interface_contract when the shared seam/contract must change).\n\n"
+                "children build against it and raise blocker/question/interface_contract or exact-hash "
+                "review_requested beacons for attention (interface_contract when the shared seam/contract must change).\n\n"
                 + _tree_digest
             )
     except Exception:
         log.debug("Failed to inject task-tree ledger digest", exc_info=True)
     return out
+
+
+# An unauthored common orientation is a VISIBLE GAP, never silence. Static text: this
+# section is cached with the semi-stable block, so it carries no timestamp.
+_SHARED_UNDERSTANDING_GAP = (
+    "## Shared understanding\n\nNot authored yet. "
+    "knowledge_write(topic='overview', scope='global', content=...) creates it; "
+    "it is then loaded here in every context."
+)
 
 
 def build_knowledge_sections(
@@ -583,29 +596,55 @@ def build_knowledge_sections(
     project_id: str = "",
     warn_large: bool = False,
     pattern_header: str = "## Known error patterns (Pattern Register)",
+    include_pattern_body: bool = True,
 ) -> List[str]:
     sections: List[str] = []
-    # Knowledge base index: for a project-scoped task load ONLY the current
-    # project's facts (`projects/<id>/knowledge`), isolated from the global
-    # memory/knowledge tree and from any other project (Phase 3b). The Pattern
-    # Register stays global (general error patterns are cross-project cognition).
+    # One mind keeps its authored common orientation across rooms. The generated
+    # inventory is navigation, not a substitute for that understanding; a
+    # project's shelf adds focus without hiding the common corpus.
+    from ouroboros.knowledge import (INDEX_FILE, OVERVIEW_TOPIC, inventory_knowledge,
+                                     read_knowledge_note, render_knowledge_index, resolve_knowledge_address)
+
     pid = str(project_id or "").strip()
+    global_address = resolve_knowledge_address(env.drive_path("memory").parent, OVERVIEW_TOPIC, "global")
+    authored_overview = False
+    try:
+        overview = read_knowledge_note(global_address)
+        overview_text = overview.source.text_at(overview.source.body_span) if overview.source else overview.text
+        if overview_text.strip():
+            authored_overview = overview.source is not None
+            sections.append(f"## Shared understanding\n\nSource: knowledge_read(topic='{OVERVIEW_TOPIC}', scope='global').\n\n" + overview_text)
+        else:
+            sections.append(_SHARED_UNDERSTANDING_GAP)  # present but empty is still unauthored
+    except FileNotFoundError:
+        sections.append(_SHARED_UNDERSTANDING_GAP)
+    except (OSError, UnicodeDecodeError) as exc:
+        sections.append(f"Shared understanding source unavailable: knowledge_read(topic='{OVERVIEW_TOPIC}', scope='global'). {type(exc).__name__}.")
+    knowledge_indexes = [(global_address.shelf / INDEX_FILE,
+                          "## Knowledge base\n\nGlobal navigation: knowledge_list(scope='global'); read linked topics with knowledge_read(topic=..., scope='global').",
+                          "knowledge index")]
     if pid:
         from ouroboros.project_facts import project_knowledge_dir
 
-        knowledge_index = (project_knowledge_dir(pid) / "index-full.md", f"## Project knowledge ({pid})", "project knowledge index")
-    else:
-        knowledge_index = (env.drive_path("memory/knowledge/index-full.md"), "## Knowledge base", "knowledge index")
-    for path, header, label in (
-        knowledge_index,
-        (env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"),
-    ):
-        text = safe_read(path)
+        knowledge_indexes.append((project_knowledge_dir(pid) / INDEX_FILE,
+                                  f"## Project knowledge ({pid})", "project knowledge index"))
+    if include_pattern_body:
+        knowledge_indexes.append((env.drive_path("memory/knowledge/patterns.md"), pattern_header, "patterns register"))
+    for path, header, label in knowledge_indexes:
+        # The authored summary is the resident face of a note, so the index carries it
+        # whether or not a common orientation exists; the fresh inventory render also
+        # covers the case where the index file is absent (a note landed before any
+        # rebuild); an existing stale index is still read as written.
+        is_global_index = path == global_address.shelf / INDEX_FILE
+        text = (render_knowledge_index(inventory_knowledge(global_address), include_summaries=True)
+                if is_global_index and (authored_overview or not path.exists()) else safe_read(path))
         if not text.strip():
             continue
         if warn_large and len(text) > _LARGE_CONTEXT_SECTION_CHARS:
             log.warning("context: %s is large (%d chars)", label, len(text))
         sections.append(f"{header}\n\n{text}")
+    if not include_pattern_body:
+        sections.append("Pattern Register details: knowledge_read(topic='patterns', scope='global').")
     if pid:
         # Bounded per-project journal tail + workpad (multi-project, v6.32.0):
         # the project's durable progress memory rides along with its knowledge.
@@ -633,22 +672,6 @@ def build_knowledge_sections(
     return sections
 
 
-def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label: str = "context") -> List[str]:
-    sections: List[str] = []
-    bible_text = safe_read(env.repo_path("BIBLE.md"))
-    if bible_text:
-        if warn_large and len(bible_text) > _LARGE_CONTEXT_SECTION_CHARS:
-            log.warning("%s: BIBLE.md is large (%d chars)", warn_label, len(bible_text))
-        sections.append("## BIBLE.md\n\n" + bible_text)
-    # ARCHITECTURE: full in max, navigation map in low (context_layout SSOT).
-    arch_section = architecture_context_section(env, context_mode=get_context_mode())
-    if arch_section:
-        sections.append(arch_section)
-    else:
-        log.warning("%s: docs/ARCHITECTURE.md not found or empty", warn_label)
-    return sections
-
-
 _SECTION_BUDGETS = {"scratchpad": SCRATCHPAD_SECTION_BUDGET_CHARS, "identity": 80_000, "registry": 30_000, "world": 16_000}
 
 
@@ -658,16 +681,102 @@ def _warn_if_over_budget(name: str, content: str) -> None:
         log.warning("Context section '%s' exceeds budget: %d chars > %d", name, len(content), budget)
 
 
-def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
+def _render_scratchpad_for_context(memory: "Memory", budget: int) -> str:
+    """Render the scratchpad SECTION BODY for context, with block-boundary degradation.
+
+    ibl-2b09abdadd25: when scratchpad.md exceeds the consumer budget, return
+    the newest WHOLE blocks that fit (drop oldest-first) instead of the raw
+    file. Always retain the single newest block (even if it alone exceeds
+    budget) paired with an in-band gap marker (BIBLE P1 — never silent).
+    Falls back to raw markdown when scratchpad_blocks.json is absent/empty
+    (legacy flat scratchpad) so a missing source-switch does not introduce
+    silent amnesia. Block-boundary cuts only — never mid-block, never
+    mid-string. The caller wraps the returned body with the section header
+    ("## Scratchpad (from `memory/scratchpad.md` ...)") inline, same as before.
+
+    The kept slice is rendered by the writer's own
+    ouroboros.memory.render_scratchpad_markdown, so the degraded body is the
+    same markdown, in the same newest-first order, as the prefix of
+    scratchpad.md it stands in for.
+    """
+    raw = memory.load_scratchpad()
+    if len(raw) <= budget:
+        return raw
+
+    blocks = memory.load_scratchpad_blocks()
+    if not blocks:
+        # Legacy fallback: scratchpad.md has content but blocks.json is
+        # missing or unparseable. Return raw unchanged; we cannot trim by
+        # block. _has_retired_flat_scratchpad_without_blocks elsewhere
+        # already prevents NEW writes on this state.
+        return raw
+
+    # Render through the writer's own renderer so a degraded build reads in
+    # the SAME order (newest-first) as the scratchpad.md it stands in for.
+    journal_pointer = memory.journal_path().exists()
+
+    def _build(kept: List[Dict[str, Any]]) -> str:
+        return render_scratchpad_markdown(kept, journal_pointer=journal_pointer)
+
+    n_total = len(blocks)
+    # Find the largest k (newest-first kept) such that the section fits.
+    n_kept = n_total
+    while n_kept > 1:
+        section = _build(blocks[-n_kept:])
+        if len(section) <= budget:
+            break
+        n_kept -= 1
+    # Always retain at least the single newest, even if it alone exceeds
+    # budget (BIBLE P1 — never silent, paired with the gap marker below).
+    n_kept = max(1, n_kept)
+    section = _build(blocks[-n_kept:])
+    omitted = n_total - n_kept
+    # Fire the gap marker whenever older blocks were dropped OR the retained
+    # newest block(s) alone still exceed budget (n_kept forced to 1 above) —
+    # both are a silent-looking truncation from the consumer's point of view
+    # and BIBLE P1 requires either be disclosed in-band, not just logged.
+    # The marker names the LIVE store: a context build retires nothing, so the
+    # dropped blocks are still in scratchpad.md (the journal only holds blocks
+    # the writer actually retired/replaced — pointing there cannot resolve).
+    if omitted > 0 or len(section) > budget:
+        if omitted > 0:
+            first_ts = str(blocks[0].get("ts", ""))[:16]
+            last_ts = str(blocks[omitted - 1].get("ts", ""))[:16]
+            reason = (
+                f"{omitted} oldest block(s) ({first_ts}..{last_ts}) omitted from "
+                "this context build for size; they are still live"
+            )
+        else:
+            reason = "newest block exceeds the section budget"
+        section += (
+            f"\n⚠️ [budget gap: {reason} — re-read the full working memory with "
+            "`read_file(root='runtime_data', path='memory/scratchpad.md', start_line=1)`.]\n"
+        )
+    return section
+
+
+def build_memory_sections(memory: Memory, partition: str = "all", *, include_scratchpad: bool = True) -> List[str]:
+    """Identity and WORLD (stable), the scratchpad (volatile); my story and rooms are ``memory_view``'s."""
     sections = []
 
     include_stable = partition in {"all", "stable"}
     include_volatile = partition in {"all", "volatile"}
 
-    if include_volatile:
+    if include_volatile and include_scratchpad:
         scratchpad_raw = memory.load_scratchpad()
+        # WARNING is preserved on the RAW (pre-trim) value: it signals the rot
+        # class is present, even when the helper trims it down for the consumer.
+        # ibl-2b09abdadd25 closes the gap where the trimmed output alone would
+        # never re-fire the warning.
         _warn_if_over_budget("scratchpad", scratchpad_raw)
-        sections.append("## Scratchpad (from `memory/scratchpad.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/scratchpad.md'))\n\n" + scratchpad_raw)
+        scratchpad_body = _render_scratchpad_for_context(memory, SCRATCHPAD_SECTION_BUDGET_CHARS)
+        # A trimmed body must not carry the "do not re-read" instruction: the
+        # omitted blocks are only reachable by re-reading the live file.
+        if scratchpad_body != scratchpad_raw:
+            header = "## Scratchpad (from `memory/scratchpad.md` — PARTIAL: trimmed to the section budget; re-read via read_file(root='runtime_data', path='memory/scratchpad.md') for the full working memory)"
+        else:
+            header = "## Scratchpad (from `memory/scratchpad.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/scratchpad.md'))"
+        sections.append(header + "\n\n" + scratchpad_body)
 
     if include_stable:
         identity_raw = memory.load_identity()
@@ -675,21 +784,9 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
         sections.append("## Identity (from `memory/identity.md` — already loaded; do not re-read via read_file(root='runtime_data', path='memory/identity.md'))\n\n" + identity_raw)
         world_raw = memory.load_world_profile().strip()
         if world_raw:
-            # Generated environment profile: include in FULL and warn rather than
-            # silently prefix-slicing (BIBLE P1 no-silent-truncation). An oversized
-            # WORLD.md is a generation-discipline bug, not a context-budget excuse.
+            # Generated profile is full; oversize is a generation-discipline bug.
             _warn_if_over_budget("world", world_raw)
             sections.append("## Environment Profile (from `memory/WORLD.md` — already loaded; delete WORLD.md and restart to regenerate if the host environment changes)\n\n" + world_raw)
-
-    if include_volatile:
-        dialogue_blocks = memory.load_dialogue_blocks()
-        if dialogue_blocks:
-            blocks_md = memory.format_blocks_as_markdown(dialogue_blocks)
-            if blocks_md.strip():
-                sections.append("## Dialogue History\n\n" + blocks_md)
-        legacy_summary = safe_read(memory.drive_root / "memory" / "dialogue_summary.md").strip()
-        if legacy_summary:
-            sections.append("## Legacy Dialogue Summary (retired flat format, read-only fallback)\n\n" + legacy_summary)
 
     if partition == "all":
         registry_path = memory.drive_root / "memory" / "registry.md"
@@ -702,7 +799,7 @@ def build_memory_sections(memory: Memory, partition: str = "all") -> List[str]:
     return sections
 
 
-def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -> str:
+def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 20) -> str:
     if not entries:
         return ""
 
@@ -717,11 +814,32 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
         ] if bit]
         header = " | ".join(header_bits) or "unknown reflection"
 
+        if str(entry.get("type", "")) == "project_reflection_pointer":
+            # Bounded canonical pointer row (full text lives on the project
+            # drive) — render one informative line, not an empty block.
+            where = str(entry.get("reflection_path", "")).strip() or "(unknown path)"
+            pid = str(entry.get("project_id", "")).strip() or "(unknown project)"
+            note = " (project write FAILED)" if entry.get("write_failed") else ""
+            blocks.append(
+                f"### {header}\n- Full reflection lives on project drive: "
+                f"{pid} — {where}{note}"
+            )
+            continue
+
         lines = [f"### {header}"]
 
+        # A run's first text is not its goal: the recorded origin says whose it was,
+        # and it renders even when the text is empty (empty is not "not recorded").
+        origin = ((entry.get("review_evidence") or {}).get("task_inputs") or {}).get("run_origin")
+        presence = origin.get("presence") if isinstance(origin, dict) and isinstance(origin.get("presence"), dict) else {}
+        lines.append("- Origin: " + (", ".join(
+            [f"owner_ingress={origin.get('owner_ingress')}"]
+            + [f"{key}={origin[key]}" for key in ("task_type", "source", "initiator", "text_author") if origin.get(key)]
+            + [f"{key}={presence[key]}" for key in ("provider", "conversation_id") if presence.get(key)]
+        ) if isinstance(origin, dict) else "not recorded"))
         goal = str(entry.get("goal", "")).strip()
         if goal:
-            lines.append(f"- Goal: {goal}")
+            lines.append(f"- Initial text: {goal}")
 
         markers = [str(m).strip() for m in (entry.get("key_markers") or []) if str(m).strip()]
         if markers:
@@ -745,440 +863,54 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
     return "\n\n".join(blocks)
 
 
-def _entry_chat_id(entry: Any) -> int:
-    """Best-effort chat_id of a chat.jsonl row (missing/blank -> 0 = main)."""
-    try:
-        return int((entry or {}).get("chat_id", 0) or 0)
-    except (TypeError, ValueError, AttributeError):
-        return 0
+def build_recent_sections(memory: Memory, env: Any, task_id: str = "", project_id: str = "") -> List[str]:
+    """My own recent process: this task's windows, the supervisor, reflections (the project's too).
 
-
-# How many trailing chat.jsonl rows to scan when reconstructing a single project
-# thread's own recent tail (project threads are bounded/recent, unlike the штаб's
-# fully-consolidated main dialogue).
-_PROJECT_THREAD_SCAN = 4000
-
-
-def build_recent_sections(
-    memory: Memory, env: Any, task_id: str = "", thread_chat_id: int = 0
-) -> List[str]:
+    Conversations are not here: the current room's open conversation, its task facts
+    and the other live rooms are the memory view's (``memory_view.render_room``).
+    """
     sections = []
 
-    # Full project awareness (v6.32.0): registry membership is the SSOT for "is
-    # this a project thread" (a numeric range cannot disambiguate large external
-    # transport ids). The one identity (main chat + background consciousness) sees
-    # its WHOLE conversation, project threads included, because Ouroboros is one
-    # awareness/biography (BIBLE P1). A project TASK gets a FOCUSED view of its own
-    # thread as working context to reduce interference — focus, not isolation.
-    try:
-        from ouroboros.projects_registry import reserved_project_chat_ids
+    # Each task reads ITS OWN newest rows through a bounded window (#131): a
+    # global tail filtered afterwards handed every task whatever share of the
+    # shared suffix it happened to occupy (Memory.recent_activity_sections).
+    from ouroboros.jsonl_tail import coverage_line
 
-        _project_chat_ids = reserved_project_chat_ids(memory.drive_root)
-    except Exception:
-        _project_chat_ids = set()
+    sections.extend(memory.recent_activity_sections(task_id))
 
-    _context_mode = get_context_mode()
-    _chat_tail = MAX_RECENT_CHAT_TAIL
-
-    if thread_chat_id and thread_chat_id in _project_chat_ids:
-        # Project task: a FOCUSED working view of its OWN thread (reduces
-        # cross-project interference while executing) — NOT isolation from the one
-        # mind, which sees everything via the main/background path below. Read the
-        # project's raw tail directly. Post-hoc bound tasks keep their original main
-        # chat_id but belong to this project — include their rows via the binding.
-        try:
-            from ouroboros.projects_registry import all_task_bindings
-
-            _bound = all_task_bindings(memory.drive_root)
-        except Exception:
-            _bound = {}
-        recent = memory.read_jsonl_tail("chat.jsonl", _PROJECT_THREAD_SCAN)
-        chat_entries = [
-            e for e in recent
-            if _entry_chat_id(e) == thread_chat_id
-            or _bound.get(str((e or {}).get("task_id") or "")) == thread_chat_id
-        ][-_chat_tail:]
-    else:
-        dialogue_meta = memory.load_dialogue_meta()
-        try:
-            consolidated_offset = int(dialogue_meta.get("last_consolidated_offset") or 0)
-        except (TypeError, ValueError):
-            consolidated_offset = 0
-        if consolidated_offset > 0:
-            expected_signature = dialogue_meta.get("chat_log_signature")
-            current_signature = memory.jsonl_generation_signature("chat.jsonl")
-            if not _chat_log_signature_matches(expected_signature, current_signature):
-                log.warning(
-                    "Ignoring dialogue consolidation offset %s because chat log generation signature is missing or stale",
-                    consolidated_offset,
-                )
-                consolidated_offset = 0
-        # Raw recent-dialogue tail: smaller in low context mode only when it cannot
-        # silently drop unconsolidated dialogue. If a valid consolidation offset
-        # exists, the older span is represented by dialogue_blocks.json and the whole
-        # suffix after that offset remains raw (P1: horizon preserved, granularity
-        # varies but unconsolidated dialogue is not cut away).
-        if _context_mode == "low" and consolidated_offset > 0:
-            _chat_tail = 10**9
-        # read_jsonl_tail_after_offset returns the one identity's WHOLE dialogue
-        # (main + project threads; only A2A virtual transport excluded), aligned
-        # with the consolidator so the shared offset indexes the same stream.
-        chat_entries = memory.read_jsonl_tail_after_offset(
-            "chat.jsonl",
-            consolidated_offset,
-            _chat_tail,
-        )
-    # Pass the same tail intent down: summarize_chat's internal default cap
-    # would silently re-cut the low-mode full-window read to 1000 lines.
-    chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
-    if chat_summary:
-        sections.append("## Recent chat\n\n" + chat_summary)
-
-    for log_name, header, formatter in (
-        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50)),
-        ("tools.jsonl", "## Recent tools", memory.summarize_tools),
-        ("events.jsonl", "## Recent events", memory.summarize_events),
-    ):
-        entries = memory.read_jsonl_tail(log_name, 200)
-        if task_id:
-            entries = [e for e in entries if str(e.get("task_id", "")).strip() == task_id]
-        summary = formatter(entries)
-        if summary:
-            sections.append(f"{header}\n\n{summary}")
-
-    supervisor_summary = memory.summarize_supervisor(memory.read_jsonl_tail("supervisor.jsonl", 200))
+    supervisor_rows, supervisor_coverage = memory.read_task_recent("supervisor.jsonl", "", 200)
+    supervisor_summary = memory.summarize_supervisor(supervisor_rows)
     if supervisor_summary:
-        sections.append("## Supervisor\n\n" + supervisor_summary)
+        sections.append(f"## Supervisor ({coverage_line(supervisor_coverage)})\n\n" + supervisor_summary)
 
-    reflections_entries = memory.read_jsonl_tail("task_reflections.jsonl", 20)
-    reflections_text = _format_recent_reflections(reflections_entries, limit=10)
+    reflections_entries = memory.read_task_recent("task_reflections.jsonl", "", 20)[0]
+    reflections_text = _format_recent_reflections(reflections_entries, limit=20)
     if reflections_text:
         sections.append("## Execution reflections\n\n" + reflections_text)
 
+    # Read-back of the project's OWN full reflections (F5 wrote them to the
+    # project drive; the canonical tail above carries only pointer rows). Same
+    # bounds as the canonical read: last 20 rows, all 20 rendered.
+    _pid = str(project_id or "").strip()
+    if _pid:
+        try:
+            from ouroboros.project_facts import project_reflections_path
+            from ouroboros.utils import iter_jsonl_objects
+
+            project_rows = list(iter_jsonl_objects(
+                project_reflections_path(_pid), max_entries=20,
+            ))
+            project_text = _format_recent_reflections(project_rows, limit=20)
+            if project_text:
+                sections.append(
+                    f"## Project execution reflections (this project's own: {_pid})\n\n"
+                    + project_text
+                )
+        except Exception:
+            log.debug("project reflections read-back failed", exc_info=True)
+
     return sections
 
-
-def _iter_recent_jsonl(path: pathlib.Path, max_bytes: int = 256_000):
-    yield from iter_jsonl_objects(path, tail_bytes=max_bytes)
-
-
-def _collect_log_analysis_checks(env: Any, checks: List[str]) -> None:
-    import hashlib
-    import time as _time
-
-    try:
-        from ouroboros.consciousness import BackgroundConsciousness
-        consciousness_md = safe_read(env.repo_path("prompts/CONSCIOUSNESS.md"))
-        if consciousness_md:
-            whitelist = BackgroundConsciousness._BG_TOOL_WHITELIST
-            scan_text = re.sub(r'```.*?```', '', consciousness_md, flags=re.DOTALL)
-            tool_prefixes = (
-                "schedule_", "update_", "knowledge_", "browse_", "analyze_",
-                "web_", "send_", "repo_", "data_", "chat_", "list_", "get_",
-                "wait_", "set_", "memory_",
-            )
-            prompt_tool_refs = {
-                match.group(1)
-                for match in re.finditer(r'\b([a-z][a-z0-9]*(?:_[a-z0-9]+)+)\b', scan_text)
-                if match.group(1) in whitelist or any(match.group(1).startswith(prefix) for prefix in tool_prefixes)
-            }
-            phantom = prompt_tool_refs - whitelist
-            if phantom:
-                checks.append(f"WARNING: PROMPT-RUNTIME DRIFT — CONSCIOUSNESS.md references tools not in BG whitelist: {', '.join(sorted(phantom))}")
-            else:
-                checks.append("OK: prompt-runtime sync (no phantom tools)")
-    except Exception:
-        pass
-
-    try:
-        msg_hash_to_tasks: Dict[str, set] = {}
-        for log_path, type_field, type_value in (
-            (env.drive_path("logs/events.jsonl"), "type", "owner_message_injected"),
-            (env.drive_path("logs/supervisor.jsonl"), "event_type", "owner_message_injected"),
-        ):
-            for ev in _iter_recent_jsonl(log_path):
-                if ev.get(type_field) != type_value:
-                    continue
-                text = ev.get("text", "")
-                if not text and "event_repr" in ev:
-                    event_repr = str(ev.get("event_repr", ""))
-                    text = event_repr[:200] + f" [...{len(event_repr) - 200} chars omitted]" if len(event_repr) > 200 else event_repr
-                if text:
-                    task_ids = msg_hash_to_tasks.setdefault(hashlib.md5(text.encode()).hexdigest()[:12], set())
-                    task_ids.add(ev.get("task_id") or "unknown")
-        dupes = {h: tids for h, tids in msg_hash_to_tasks.items() if len(tids) > 1}
-        if dupes:
-            checks.append(f"CRITICAL: DUPLICATE PROCESSING — {len(dupes)} message(s) appeared in multiple tasks: {', '.join(str(sorted(tids)) for tids in dupes.values())}")
-        else:
-            checks.append("OK: no duplicate message processing detected")
-    except Exception:
-        pass
-
-    try:
-        hit_rate = _compute_cache_hit_rate(env)
-        if hit_rate is not None:
-            if hit_rate < 0.30:
-                checks.append(f"WARNING: LOW CACHE HIT RATE — {hit_rate:.0%} cached. Context structure may be degrading prompt caching efficiency.")
-            elif hit_rate >= 0.50:
-                checks.append(f"OK: cache hit rate ({hit_rate:.0%})")
-            else:
-                checks.append(f"INFO: cache hit rate moderate ({hit_rate:.0%})")
-    except Exception:
-        pass
-
-    try:
-        events_path = env.drive_path("logs/events.jsonl")
-        llm_error_models: Counter = Counter()
-        local_overflow_models: Counter = Counter()
-        remote_overflow_models: Counter = Counter()
-        for ev in _iter_recent_jsonl(events_path):
-            evt_type = str(ev.get("type") or "")
-            model = str(ev.get("model") or "unknown")
-            if evt_type in {"llm_api_error", "review_model_error", "consciousness_llm_error", "provider_incomplete_response"}:
-                llm_error_models[model] += 1
-            elif evt_type == "local_context_overflow":
-                local_overflow_models[model] += 1
-            elif evt_type == "remote_context_overflow":
-                remote_overflow_models[model] += 1
-        if llm_error_models:
-            top = ", ".join(f"{model} x{count}" for model, count in llm_error_models.most_common(3))
-            checks.append(f"WARNING: PROVIDER/ROUTING ERRORS — {sum(llm_error_models.values())} recent failures ({top}). Reliability or failover may need attention.")
-        else:
-            checks.append("OK: no recent provider/routing errors")
-        if local_overflow_models:
-            top = ", ".join(f"{model} x{count}" for model, count in local_overflow_models.most_common(3))
-            checks.append(f"WARNING: LOCAL CONTEXT OVERFLOW — {sum(local_overflow_models.values())} recent overflow event(s) ({top}). Local context may need more compaction or a larger window.")
-        else:
-            checks.append("OK: no recent local context overflows")
-        if remote_overflow_models:
-            top = ", ".join(f"{model} x{count}" for model, count in remote_overflow_models.most_common(3))
-            checks.append(f"WARNING: REMOTE CONTEXT OVERFLOW — {sum(remote_overflow_models.values())} recent provider context-window rejection(s) ({top}). Switch to low context mode or reduce the prompt footprint before retrying the same request.")
-    except Exception:
-        pass
-
-    try:
-        rescue_dir = env.drive_path("archive/rescue")
-        if rescue_dir.exists():
-            recent = []
-            now = _time.time()
-            for entry in sorted(rescue_dir.iterdir(), reverse=True):
-                if not entry.is_dir():
-                    continue
-                age_sec = now - entry.stat().st_mtime
-                if age_sec < 7200:
-                    file_count = sum(1 for item in entry.rglob("*") if item.is_file())
-                    age_str = f"{int(age_sec // 60)}m ago" if age_sec < 3600 else f"{age_sec / 3600:.1f}h ago"
-                    recent.append(f"{entry.name} ({age_str}, {file_count} files)")
-                if len(recent) >= 3:
-                    break
-            if recent:
-                checks.append(
-                    f"WARNING: RESCUE SNAPSHOT AVAILABLE — {', '.join(recent)}. "
-                    "Uncommitted changes were saved before last restart. "
-                    "Use read_file(root='runtime_data', path='archive/rescue/<dirname>/rescue_meta.json') "
-                    "and changes.diff to decide if recovery is needed."
-                )
-    except Exception:
-        pass
-
-
-
-# Live stray-server probe cache: pgrep + per-pid /proc reads are cheap but not
-# free on every task turn; a 15-minute TTL keeps the invariant LIVE (the v6.70.0
-# field incident was weeks-long, not minutes-long) without a per-turn scan.
-_STRAY_PROBE_CACHE: Dict[str, Any] = {"ts": 0.0, "note": ""}
-_STRAY_PROBE_TTL_SEC = 900
-
-
-def _stray_server_note(env: Any) -> str:
-    import time as _time
-
-    now = _time.time()
-    if now - float(_STRAY_PROBE_CACHE["ts"]) < _STRAY_PROBE_TTL_SEC:
-        return str(_STRAY_PROBE_CACHE["note"])
-    from ouroboros.agent_startup_checks import check_stray_server_processes
-
-    result, issues = check_stray_server_processes(env)
-    note = ""
-    if issues and result.get("status") == "stray_processes":
-        procs = result.get("processes") or []
-        preview = ", ".join(str(p.get("pid")) for p in procs[:5])
-        note = (
-            f"WARNING: STRAY SERVER PROCESS(ES) — {len(procs)} ouroboros server process(es) "
-            f"outside this install (pids: {preview}). Another install may be mutating shared state; "
-            f"investigate before assuming exclusive custody."
-        )
-    _STRAY_PROBE_CACHE["ts"] = now
-    _STRAY_PROBE_CACHE["note"] = note
-    return note
-
-
-def build_health_invariants(env: Any) -> str:
-    import time as _time
-
-    checks: List[str] = []
-
-    try:
-        from ouroboros.tools.release_sync import (
-            _normalize_pep440,
-            _shields_escape,
-            extract_architecture_header_version,
-            extract_readme_badge_version,
-            is_release_version,
-        )
-        ver_file = read_text(env.repo_path("VERSION")).strip()
-        desync_parts = []
-        pyproject_ver = next(
-            (
-                line.split("=", 1)[1].strip().strip('"').strip("'")
-                for line in read_text(env.repo_path("pyproject.toml")).splitlines()
-                if line.strip().startswith("version")
-            ),
-            "",
-        )
-        if is_release_version(ver_file) and pyproject_ver and _normalize_pep440(ver_file) != pyproject_ver:
-            desync_parts.append(f"pyproject.toml={pyproject_ver}")
-        try:
-            web_package = read_text(env.repo_path("web/package.json"))
-            web_match = re.search(r'"version"\s*:\s*"([^"]+)"', web_package)
-            web_ver = str(web_match.group(1) or "").strip() if web_match else ""
-            if is_release_version(ver_file) and web_ver and web_ver != ver_file:
-                desync_parts.append(f"web/package.json={web_ver}")
-        except Exception:
-            pass
-        try:
-            readme = read_text(env.repo_path("README.md"))
-            badge_ver = extract_readme_badge_version(readme)
-            rm = None if badge_ver else re.search(r'\*\*Version:\*\*\s*([^\s]+)', readme)
-            readme_ver = badge_ver or (str(rm.group(1) or "").strip() if rm else "")
-            badge_token_ok = not (badge_ver and is_release_version(ver_file)) or f"version-{_shields_escape(ver_file)}-green" in readme
-            if readme_ver and readme_ver != ver_file:
-                desync_parts.append(f"README={readme_ver}")
-            elif readme_ver and not badge_token_ok:
-                desync_parts.append("README badge URL token")
-        except Exception:
-            pass
-        try:
-            arch = read_text(env.repo_path("docs/ARCHITECTURE.md"))
-            arch_ver = extract_architecture_header_version(arch)
-            if arch_ver and arch_ver != ver_file:
-                desync_parts.append(f"ARCHITECTURE.md={arch_ver}")
-        except Exception:
-            pass
-        if desync_parts:
-            checks.append(f"CRITICAL: VERSION DESYNC — VERSION={ver_file}, {', '.join(desync_parts)}")
-        elif ver_file:
-            checks.append(f"OK: version sync ({ver_file})")
-    except Exception:
-        pass
-
-    try:
-        state_data = read_json_dict(env.drive_path("state/state.json")) or {}
-        from ouroboros.usage_accounting import usage_breakdown
-
-        accounted = float(usage_breakdown(env.drive_root).get("accounted_usd") or 0.0)
-        if state_data.get("budget_drift_alert"):
-            checks.append(f"WARNING: BUDGET DRIFT {state_data.get('budget_drift_pct', 0):.1f}% — tracked=${accounted:.2f} vs OpenRouter=${state_data.get('openrouter_total_usd', 0):.2f}")
-        else:
-            checks.append("OK: budget drift within tolerance")
-    except Exception:
-        checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — budget drift check skipped")
-
-    try:
-        from supervisor.state import per_task_cost_summary
-        costly = [t for t in per_task_cost_summary(5) if t["cost"] > 5.0]
-        for t in costly:
-            checks.append(f"WARNING: HIGH-COST TASK — task_id={t['task_id']} cost=${t['cost']:.2f} rounds={t['rounds']}")
-        if not costly:
-            checks.append("OK: no high-cost tasks (>$5)")
-    except Exception:
-        checks.append("WARNING: COST ACCOUNTING UNAVAILABLE — high-cost task check skipped")
-
-    try:
-        identity_path = env.drive_path("memory/identity.md")
-        if identity_path.exists():
-            age_hours = (_time.time() - identity_path.stat().st_mtime) / 3600
-            if age_hours > 8:
-                checks.append(f"WARNING: STALE IDENTITY — identity.md last updated {age_hours:.0f}h ago")
-            else:
-                checks.append("OK: identity.md recent")
-    except Exception:
-        pass
-    try:
-        identity_content = read_text(env.drive_path("memory/identity.md"))
-        if len(identity_content.strip()) < 200:
-            checks.append(f"WARNING: THIN IDENTITY — identity.md is only {len(identity_content)} chars. Cognitive decay signal.")
-    except Exception:
-        pass
-
-    try:
-        sp_len = len(read_text(env.drive_path("memory/scratchpad.md")).strip())
-        if sp_len < 50:
-            checks.append("WARNING: EMPTY SCRATCHPAD — scratchpad is nearly empty. Memory loss signal.")
-        elif sp_len > SCRATCHPAD_BLOAT_WARN_CHARS:
-            checks.append(f"WARNING: BLOATED SCRATCHPAD — {sp_len} chars. Extract durable insights to knowledge base.")
-        else:
-            checks.append(f"OK: scratchpad size ({sp_len} chars)")
-    except Exception:
-        pass
-
-    try:
-        crash_report = env.drive_path("state/crash_report.json")
-        crash_data = read_json_dict(crash_report)
-        if crash_data:
-            checks.append(
-                f"CRITICAL: RECENT CRASH ROLLBACK — rolled back from "
-                f"{crash_data.get('rolled_back_from', '?')[:12]} to tag "
-                f"{crash_data.get('tag', '?')} at {crash_data.get('ts', '?')}"
-            )
-    except Exception:
-        pass
-
-    try:
-        from ouroboros.extension_health import regressed_extensions
-
-        drive_root = getattr(env, "drive_root", None) or env.drive_path("state").parent
-        for rec in regressed_extensions(drive_root):
-            good = rec.get("last_known_good") or {}
-            observed = rec.get("last_observed") or {}
-            checks.append(
-                f"CRITICAL: EXTENSION REGRESSION — {rec.get('skill', '?')} was live at "
-                f"{str(good.get('sha') or '?')[:12]} ({good.get('version') or '?'}), broken now at "
-                f"{str(observed.get('sha') or '?')[:12]}: {str(observed.get('load_error') or '')[:200]}"
-            )
-    except Exception:
-        pass
-
-    try:
-        stray_note = _stray_server_note(env)
-        if stray_note:
-            checks.append(stray_note)
-    except Exception:
-        pass
-
-    _collect_log_analysis_checks(env, checks)
-    if not checks:
-        return ""
-    return "## Health Invariants\n\n" + "\n".join(f"- {check}" for check in checks)
-
-
-def _compute_cache_hit_rate(env: Any) -> Optional[float]:
-    total_prompt = total_cached = count = 0
-    try:
-        for ev in _iter_recent_jsonl(env.drive_path("logs/events.jsonl")):
-            if ev.get("type") != "llm_round":
-                continue
-            usage = ev.get("usage", ev)
-            pt = int(usage.get("prompt_tokens", 0))
-            if pt > 0:
-                total_prompt += pt
-                total_cached += int(usage.get("cached_tokens", 0))
-                count += 1
-    except Exception:
-        return None
-    if count < 5 or total_prompt == 0:
-        return None
-    return total_cached / total_prompt
 
 
 def _build_registry_digest(env: Any) -> str:
@@ -1251,7 +983,6 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
         if (
             not skill.get("enabled")
             or not bool(skill.get("executable_review"))
-            or skill.get("review_stale")
         ):
             continue
         name = _field(skill.get("name"), 80)
@@ -1269,12 +1000,25 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
         ]
         meta = f"{kind}{', v' + version if version else ''}{', ' + review_status if review_status else ''}"
         lines.append(f"- {name} ({meta}): {description or 'No description.'}")
+        if skill.get("review_gate", {}).get("author_accepted"):
+            lines.append("  Current payload accepted by author under Advisory; reviewer evidence remains at its original hash.")
         if when:
             lines.append(f"  Trigger: {when}")
+        # CPL-7 Model Experience: bounded prose; absent section renders nothing.
+        experience = skill.get("model_experience")
+        if isinstance(experience, dict):
+            sees = _field(experience.get("what_model_sees"), 220)
+            token_effect = _field(experience.get("token_effect"), 160)
+            if sees:
+                lines.append(f"  Model experience: {sees}")
+            if token_effect:
+                lines.append(f"  Token effect: {token_effect}")
         if surfaces:
             lines.append(f"  Tools: {', '.join(surfaces[:8])}")
         elif skill.get("runnable_via_skill_exec"):
             lines.append("  Tools: skill_exec")
+        if skill.get("type") == "extension" and not skill.get("live_loaded"):
+            lines.append(f"  Live ({_field(skill.get('process') or 'unknown', 20)}): no ({_field(skill.get('live_reason') or 'unknown', 60)})")
         count += 1
         if len(lines) >= max_lines:
             lines.append("- ... (truncated; call list_skills for the full catalogue)")
@@ -1282,6 +1026,34 @@ def _build_installed_skills_section(env: Any, *, max_lines: int = 100) -> str:
     if count == 0:
         return ""
     return "\n".join(lines)
+
+
+def _drive_state_section(env: Any) -> str:
+    """Typed projection of ``state/state.json`` + an on-demand pointer. Keys =
+    what the agent REASONS about; the rest is internal caches or a second spend
+    narrative build_runtime_section already renders from the usage-accounting
+    authority. P1: disclosed omission — keys NAMED, full file one read away."""
+    keys = ("session_id", "current_branch", "current_sha", "evolution_mode_enabled",
+            "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
+            "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
+            "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
+    from supervisor.state import CONTROL_KEYS, RECOVERY_KEY, control_value, read_state
+
+    observed = read_state(env.drive_path("state/state.json").parent.parent)
+    raw = observed.values
+    authority = observed.projection()
+    projected = {k: (raw[k] if k not in CONTROL_KEYS or control_value(authority, k)[0]
+                     else {"status": "unknown"}) for k in keys if k in raw or k in observed.unconfirmed}
+    omitted = sorted(set(raw) - set(projected) - {RECOVERY_KEY})
+    note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
+            "section, from the usage-accounting authority)."
+            + (f" State authority is {observed.quality}: {observed.reason}. "
+               f"UNKNOWN controls: {', '.join(observed.unconfirmed)}." if observed.quality != "current" else "")
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full raw source: "
+                "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
+    return ("## Drive state\n\n"
+            + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+            + "\n\n" + note)
 
 
 def _capture_context_core(
@@ -1292,47 +1064,115 @@ def _capture_context_core(
     ctx: Any,
 ) -> _ContextCore:
     """Read each context source once before producing route-specific views."""
+    declared = task_input_sources(task) == "declared"
+    if declared:
+        _validate_declared_input_task(task)
+    captured_at = utc_now_iso()  # one capture instant for the runtime fact and every snapshot label
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
     )
     bible_md = safe_read(env.repo_path("BIBLE.md"))
-    architecture_md = safe_read(env.repo_path("docs/ARCHITECTURE.md"))
-    development_md = safe_read(env.repo_path("docs/DEVELOPMENT.md"))
-    state_json = safe_read(env.drive_path("state/state.json"), fallback="{}")
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, compose_book, load_reference_book
 
-    memory.ensure_files()
+    books = []
+    book_text = {}
+    book_errors = []
+    for book_id, entrypoint in BOOK_ENTRYPOINTS.items():
+        try:
+            book = load_reference_book(env.repo_dir, book_id, read_bytes=lambda path: env.repo_path(path).read_bytes())
+            books.append(book)
+            book_text[book_id] = compose_book(book)
+        except (OSError, ValueError) as exc:
+            log.warning("Reference book unavailable (%s): %s", entrypoint, exc)
+            book_errors.append(f"Reference book source unavailable: {entrypoint}. {exc}. Full context is not established.")
+            book_text[book_id] = ""
+    architecture_md = book_text["architecture"]
+    development_md = book_text["development"]
 
-    docs_need_development = _task_requires_development_context(task)
-    force_low_docs = False
-    if _task_uses_external_context(task) and not _task_requires_self_body_docs(task):
-        force_low_docs = True
-        docs_need_development = False
-    elif (
-        str(task.get("type") or "").strip().lower() == "evolution"
-        and _explicit_self_body_docs_flag(task) is not True
-    ):
-        # Evolution cycles are long multi-round code tasks: serve ARCHITECTURE as
-        # the lossless navigation map (sections read on demand) instead of ~45K
-        # always-resident tokens, but keep the engineering handbook inline. An
-        # explicit context_requires_self_body_docs=true (task field or contract)
-        # keeps the full docs.
-        force_low_docs = True
-        docs_need_development = True
+    if declared:
+        return _capture_declared_context_core(
+            env, memory, task, ctx, runtime_builder=build_runtime_section,
+            user_builder=build_user_content, captured_at=captured_at, base_prompt=base_prompt,
+            bible_md=bible_md, architecture_md=architecture_md, development_md=development_md,
+            books=books, book_errors=book_errors,
+        )
 
-    semi_stable_parts = []
-    semi_stable_parts.extend(build_memory_sections(memory, partition="stable"))
+    # A fork is an execution boundary, not a second mind.  Keep the agent's
+    # writable Memory object task-local, but capture identity/dialogue from the
+    # already-existing canonical budget root for promoted roots and subagents.
+    canonical_root = pathlib.Path(
+        task.get("budget_drive_root")
+        or getattr(env, "budget_drive_root", None)
+        or memory.drive_root
+    )
+    context_memory = (
+        memory
+        if canonical_root.resolve(strict=False) == memory.drive_root.resolve(strict=False)
+        else Memory(drive_root=canonical_root, repo_dir=memory.repo_dir)
+    )
+    context_memory.ensure_files()
+    context_env = SimpleNamespace(
+        repo_dir=env.repo_dir,
+        drive_root=canonical_root,
+        budget_drive_root=canonical_root,
+        branch_dev=getattr(env, "branch_dev", "ouroboros"),
+        repo_path=env.repo_path,
+        drive_path=lambda rel: (canonical_root / safe_relpath(rel)).resolve(),
+    )
+
     from ouroboros.project_facts import resolve_project_id
 
-    semi_stable_parts.extend(build_knowledge_sections(env, project_id=resolve_project_id(task)))
+    task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    is_child = str(task.get("delegation_role") or task_metadata.get("delegation_role") or "") == "subagent"
+    # My memory view: one spec by role, its facts read once from the canonical root
+    # (the one chronicle activation happens here); rendered per mode by the fit plan.
+    view_spec, view, view_json = _capture_memory_view(task, canonical_root, ctx)
 
-    deep_review_path = env.drive_path("memory/deep_review.md")
+    # Max keeps the full capability/WHY map even for external work: binding a
+    # folder changes tools' default target, not the mind's knowledge of its body.
+    # Its handbook follows the active self-body binding, with explicit task
+    # requirements taking precedence. Low/Nano and children instead receive both
+    # books' authored orientation through the same captured-source projection.
+    explicit_dev = task.get("context_requires_development")
+    if explicit_dev is not None:
+        docs_need_development = normalize_bool(explicit_dev)
+    elif _task_requires_self_body_docs(task):
+        docs_need_development = True
+    elif _task_uses_external_context(task):
+        docs_need_development = False
+    else:
+        docs_need_development = _task_requires_development_context(task)
+
+    semi_stable_parts = []
     try:
-        if deep_review_path.exists():
+        from ouroboros.subagent_runtime import current_model_visible_subagent_catalog
+
+        subagent_catalog = current_model_visible_subagent_catalog()
+        if subagent_catalog:
+            semi_stable_parts.append(
+                "## Available subagents\n\n"
+                + json.dumps(subagent_catalog, ensure_ascii=False, indent=1)
+            )
+    except Exception:
+        log.debug("Failed to build Available subagents catalog", exc_info=True)
+    semi_stable_parts.extend(build_memory_sections(context_memory, partition="stable"))
+    # Knowledge leads the changing block (its edits never cost the cached story) and
+    # rides only where the view holds it: a child or nanny reads it by knowledge_read.
+    head_parts = (build_knowledge_sections(context_env, project_id=resolve_project_id(task),
+                                           include_pattern_body=not is_child) if view_spec.knowledge else [])
+
+    deep_review_path = context_env.drive_path("memory/deep_review.md")
+    try:
+        if not is_child and deep_review_path.exists():
             dr_text = deep_review_path.read_text(encoding="utf-8")
             if dr_text.strip():
                 semi_stable_parts.append(
                     "## Last Deep Self-Review\n\n"
+                    "Historical report from memory/deep_review.md, not a verdict on the current tree. "
+                    "Use its recorded provenance; an unrecorded date or source revision is unknown, "
+                    "not implied by the file timestamp or today's checkout. Recheck findings against "
+                    "current evidence.\n\n"
                     + truncate_review_artifact(dr_text, limit=8000)
                 )
     except Exception:
@@ -1340,21 +1180,23 @@ def _capture_context_core(
 
     semi_stable_text = "\n\n".join(semi_stable_parts)
 
-    health_section = build_health_invariants(env)
+    from ouroboros.tools.tool_resolution import active_repo_dir_for
+    active_root = str(active_repo_dir_for(ctx)) if ctx is not None else ""
+    health_section = build_health_invariants(context_env, task_id=str(task.get("id") or ""), active_root=active_root)
     dynamic_parts = []
     if health_section:
         dynamic_parts.append(health_section)
-    dynamic_parts.extend(build_memory_sections(memory, partition="volatile"))
+    dynamic_parts.extend(build_memory_sections(context_memory, partition="volatile", include_scratchpad=not is_child))
 
-    registry_digest = _build_registry_digest(env)
+    registry_digest = _build_registry_digest(context_env)
     if registry_digest:
         dynamic_parts.append(registry_digest)
-    installed_skills = _build_installed_skills_section(env)
+    installed_skills = _build_installed_skills_section(context_env)
     if installed_skills:
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
-        "## Drive state\n\n" + state_json,
-        build_runtime_section(env, task, ctx=ctx),
+        snapshot_labelled(_drive_state_section(context_env), captured_at),
+        build_runtime_section(env, task, ctx=ctx, captured_at=captured_at),
         (
             "## Task Contract Discipline\n\n"
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
@@ -1368,8 +1210,8 @@ def _capture_context_core(
     try:
         from ouroboros.improvement_backlog import format_backlog_digest
 
-        backlog_digest = format_backlog_digest(env.drive_root)
-        if backlog_digest:
+        backlog_digest = format_backlog_digest(canonical_root)
+        if backlog_digest and str(task.get("type") or "") in {"evolution", "deep_self_review"}:
             dynamic_parts.append(backlog_digest)
     except Exception:
         log.debug("Failed to build improvement backlog digest", exc_info=True)
@@ -1385,7 +1227,7 @@ def _capture_context_core(
     else:
         try:
             from ouroboros.review_state import format_status_section, load_state
-            advisory_state = load_state(pathlib.Path(env.drive_root))
+            advisory_state = load_state(canonical_root)
             if advisory_state.advisory_runs or advisory_state.latest_attempt():
                 advisory_section = format_status_section(
                     advisory_state,
@@ -1396,9 +1238,39 @@ def _capture_context_core(
         except Exception:
             log.debug("Failed to build advisory review status section", exc_info=True)
 
-    dynamic_parts.extend(build_recent_sections(
-        memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0)
-    ))
+    # Same resolver the reflection WRITER uses (append_reflection_routed), so
+    # read-back sees exactly the file the task's own reflections land in.
+    try:
+        from ouroboros.project_facts import resolve_project_id
+
+        _reflections_pid = resolve_project_id(task)
+    except Exception:
+        _reflections_pid = ""
+    if is_child:
+        # The role line lists exactly what this child's view loaded (the same spec).
+        from ouroboros.memory_view import working_sources_line
+
+        dynamic_parts.append(working_sources_line(view_spec, view))
+        # A child keeps its own process memory too (owner decision 2026-09-22):
+        # its execution drive holds exactly its worker rows, progress is canonical.
+        own_drive = memory if context_memory is not memory else None
+        recent = context_memory.recent_activity_sections(str(task.get("id") or ""), own_drive=own_drive)
+    else:
+        recent = build_recent_sections(context_memory, env, task_id=task.get("id", ""), project_id=_reflections_pid)
+    dynamic_parts.extend(snapshot_labelled(section, captured_at) for section in recent)
+    try:
+        from ouroboros.presence_context import build_presence_context_section
+
+        presence_section = build_presence_context_section(
+            pathlib.Path(env.drive_root),
+            task_metadata.get("presence"),
+            str(task.get("id") or ""),
+            status_root=canonical_root,  # a forked promoted root finds its binding's work canonically
+        )
+        if presence_section:
+            dynamic_parts.append(presence_section)
+    except Exception:
+        log.debug("Failed to inject presence context", exc_info=True)
 
     return _ContextCore(
         base_prompt=base_prompt,
@@ -1411,8 +1283,22 @@ def _capture_context_core(
             build_user_content(task), ensure_ascii=False, sort_keys=True,
         ),
         docs_need_development=docs_need_development,
-        force_low_docs=force_low_docs,
+        reference_books=tuple(books),
+        reference_book_errors=tuple(book_errors),
+        compact_reference_docs=is_child,
+        dynamic_head_text="\n\n".join(head_parts),
+        memory_view_json=view_json,
     )
+
+
+def _capture_memory_view(task: Dict[str, Any], canonical_root: pathlib.Path, ctx: Any) -> Tuple[Any, Any, str]:
+    """``(ViewSpec, MemoryViewSnapshot, its canonical JSON)``, captured once from the canonical root."""
+    from ouroboros.memory_view import capture_memory_view, snapshot_json, view_spec_for_task
+
+    view_ctx = ctx if isinstance(getattr(ctx, "task_metadata", None), dict) else None
+    spec = view_spec_for_task(task, canonical_root, ctx=view_ctx)
+    snapshot = capture_memory_view(canonical_root, task, spec)
+    return spec, snapshot, snapshot_json(snapshot)
 
 
 def _context_fit_route(
@@ -1432,6 +1318,7 @@ def build_context_fit_plan(
     *,
     preferred_mode: Optional[str] = None,
     ctx: Any = None,
+    tool_schemas: Optional[List[Dict[str, Any]]] = None,
 ) -> ContextFitPlan:
     """Compatibility wrapper over the cohesive context-fit implementation."""
     core = _capture_context_core(env, memory, task, review_context_builder, ctx)
@@ -1441,7 +1328,27 @@ def build_context_fit_plan(
         task,
         preferred_mode=str(preferred_mode or get_context_mode() or "max"),
         route_resolver=_context_fit_route,
+        tool_schemas=tool_schemas,
     )
+
+
+def _record_memory_view(env: Any, memory: Memory, task: Dict[str, Any], ctx: Any,
+                        plan: ContextFitPlan) -> Dict[str, Any]:
+    """The view fact of the first send's projection: on the task context and one event receipt."""
+    facts = dict(plan.projection(plan.initial_mode).memory_facts or {})
+    if not facts:  # a declared-input child carries no memory view
+        return {}
+    if ctx is not None:
+        from ouroboros.memory_floor import trace_facts
+
+        ctx.memory_view_facts = trace_facts(facts)
+    from ouroboros.utils import append_jsonl
+
+    root = pathlib.Path(task.get("budget_drive_root") or getattr(env, "budget_drive_root", None) or memory.drive_root)
+    if not append_jsonl(root / "logs/events.jsonl", {"ts": utc_now_iso(), "type": "context_memory_view",
+                                                     "task_id": str(task.get("id") or ""), **facts}):
+        log.warning("Context memory view receipt could not be written")
+    return facts
 
 
 def build_llm_messages(
@@ -1449,9 +1356,14 @@ def build_llm_messages(
     memory: Memory,
     task: Dict[str, Any],
     review_context_builder: Optional[Any] = None,
-    soft_cap_tokens: int = CONTEXT_SOFT_CAP_TOKENS,
     ctx: Any = None,
+    *, tool_schemas: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """The first request of a task: the plan's projection for its starting mode, and the cap info.
+
+    No model is called on this path: my memory is rendered, never prepared by a paid pass;
+    a window too small for it addresses lines and pages instead.
+    """
     # Keep the legacy public shape while publishing the immutable plan on the
     # existing ToolContext for the ordinary loop.  Commit/scope reviewers do not
     # call this builder and therefore cannot take the Low retry.
@@ -1462,59 +1374,27 @@ def build_llm_messages(
         review_context_builder,
         preferred_mode=get_context_mode(),
         ctx=ctx,
+        tool_schemas=tool_schemas,
     )
     if ctx is not None:
         ctx.context_fit_plan = plan
-    messages, cap_info = apply_message_token_soft_cap(
-        plan.messages_for(plan.initial_mode), soft_cap_tokens,
-    )
-    cap_info["context_fit"] = {
+    messages = plan.messages_for(plan.initial_mode)
+    cap_info: Dict[str, Any] = {"context_fit": {
         "core_sha256": plan.core_sha256,
         "preferred_mode": plan.preferred_mode,
         "initial_mode": plan.initial_mode,
         "route_fp": plan.route_fp,
-        "evidence_status": plan.evidence_status,
-        "evidence_stale": plan.evidence_stale,
+        "evidence_status": plan.status,
+        "evidence_stale": plan.stale,
         "window_tokens": plan.window_tokens,
         "max_estimated_tokens": plan.max_projection.estimated_tokens,
         "max_calibrated_tokens": plan.max_projection.calibrated_tokens,
         "low_estimated_tokens": plan.low_projection.estimated_tokens,
         "low_calibrated_tokens": plan.low_projection.calibrated_tokens,
-    }
+        "nano_estimated_tokens": plan.nano_projection.estimated_tokens if plan.nano_projection else None,
+        "nano_calibrated_tokens": plan.nano_projection.calibrated_tokens if plan.nano_projection else None,
+    }}
+    view_facts = _record_memory_view(env, memory, task, ctx, plan)
+    if view_facts:
+        cap_info["memory_view"] = view_facts
     return messages, cap_info
-
-
-def apply_message_token_soft_cap(
-    messages: List[Dict[str, Any]],
-    soft_cap_tokens: int,
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    def _estimate_message_tokens(msg: Dict[str, Any]) -> int:
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            total = sum(estimate_tokens(str(b.get("text", "")))
-                        for b in content if isinstance(b, dict) and b.get("type") == "text")
-            return total + 6
-        return estimate_tokens(str(content)) + 6
-
-    estimated = sum(_estimate_message_tokens(m) for m in messages)
-    info: Dict[str, Any] = {"estimated_tokens_before": estimated, "estimated_tokens_after": estimated, "soft_cap_tokens": soft_cap_tokens, "trimmed_sections": []}
-    if soft_cap_tokens > 0 and estimated > soft_cap_tokens:
-        info["trimmed_sections"].append("disabled_no_silent_truncation")
-    return messages, info
-
-
-
-
-def safe_read(path: pathlib.Path, fallback: str = "") -> str:
-    try:
-        exists = path.exists()
-    except Exception:
-        log.debug("safe_read: path.exists() raised for %s", path, exc_info=True)
-        return fallback
-    if not exists:
-        return fallback
-    try:
-        return read_text(path)
-    except Exception as exc:
-        log.warning("safe_read: file %s exists but read failed (%s: %s); using fallback", path, type(exc).__name__, exc)
-        return fallback

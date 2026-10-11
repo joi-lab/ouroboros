@@ -75,6 +75,30 @@ else:
           'search_code will rely on PATH rg or the Python fallback. Run '
           'scripts/download_ripgrep_standalone.sh (or .ps1) before PyInstaller for a release build.')
 
+# Betterleaks is the one secret-scanning engine for outbound skill publication.
+# The package-local installer stages one checksum-pinned platform binary, its
+# license, and identity metadata in this normalized layout. Release build
+# scripts guarantee it is present; ad-hoc PyInstaller runs remain possible but
+# Publish will then report the exact explicit repair command instead of
+# downloading at runtime.
+if os.path.isdir('betterleaks-standalone'):
+    _extra_datas.append(('betterleaks-standalone', 'betterleaks-standalone'))
+else:
+    print('WARNING: betterleaks-standalone/ not found — packaged skill publication '
+          'will report scanner_missing. Run python -m '
+          'ouroboros.betterleaks_runtime install --build-output '
+          'betterleaks-standalone before PyInstaller for a release build.')
+
+# Seed the exact reviewed Claudexor engine closure. The archive stays compressed
+# inside the app and is extracted into Ouroboros's writable data plane on first
+# delegated use; Node remains a separate host-owned bundled runtime.
+if os.path.isdir('claudexor-runtime'):
+    _extra_datas.append(('claudexor-runtime', 'claudexor-runtime'))
+else:
+    print('WARNING: claudexor-runtime/ not found — managed Claudexor installation '
+          'will download the exact pinned archive on first use. Release builds run '
+          'scripts/fetch_claudexor_runtime.py before PyInstaller and must bundle it.')
+
 if _is_windows:
     for _pkg in ('pythonnet', 'clr_loader'):
         try:
@@ -112,8 +136,8 @@ a = Analysis(
         ('.gitignore', '.'),
         ('BIBLE.md', '.'),
         ('README.md', '.'),
-        ('requirements.txt', '.'),
-        ('requirements-launcher.txt', '.'),
+        ('requirements-runtime.lock', '.'),
+        ('uv.lock', '.'),
         ('pyproject.toml', '.'),
         ('Makefile', '.'),
         ('server.py', '.'),

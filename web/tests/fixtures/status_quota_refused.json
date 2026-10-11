@@ -1,0 +1,67 @@
+{
+  "daemon": {
+    "state": "unreachable",
+    "engine_version": "3.3.13",
+    "runtime": {
+      "state": "ready",
+      "version": "3.3.13"
+    },
+    "last_error": "quota_probe_failed: quota read died"
+  },
+  "config_dir": "/tmp/x",
+  "harnesses": [
+    {
+      "id": "codex",
+      "display_name": "Codex CLI",
+      "status": "ok",
+      "enabled": true,
+      "provider_family": "openai",
+      "access_profiles_supported": [
+        "readonly",
+        "workspace_write"
+      ]
+    }
+  ],
+  "profiles": {
+    "profiles": [
+      {
+        "profile": {
+          "harness_id": "codex",
+          "profile_id": "koshak",
+          "enabled": true
+        },
+        "status": {
+          "verification": "passed",
+          "verification_source": "vendor"
+        },
+        "identity": {
+          "email": "owner@example.com",
+          "plan": "pro"
+        }
+      }
+    ],
+    "harnessAccounts": [
+      {
+        "harness_id": "codex",
+        "native_login_detected": true,
+        "identity": {
+          "email": "owner@example.com",
+          "plan": "pro"
+        }
+      }
+    ]
+  },
+  "quota": [],
+  "reads": {
+    "catalog": "ok",
+    "accounts": "ok",
+    "quota": "failed"
+  },
+  "subagent_last_delegation": {
+    "ts": "2026-08-08T13:25:18.652941+00:00",
+    "route": "claude",
+    "requested_model": "opus",
+    "applied_model": "opus",
+    "run_id": "run-0c2b54cea35d"
+  }
+}

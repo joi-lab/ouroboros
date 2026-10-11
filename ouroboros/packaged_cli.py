@@ -12,6 +12,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -27,8 +28,16 @@ from typing import Iterable, Sequence
 sys.dont_write_bytecode = True
 os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 
-from ouroboros.launcher_bootstrap import BootstrapContext, bootstrap_repo, check_git, python_bytecode_env
-from ouroboros.platform_layer import IS_MACOS, IS_WINDOWS, embedded_python_candidates, git_install_hint
+from ouroboros.launcher_bootstrap import (
+    BootstrapContext, appimage_extracts_and_runs, bootstrap_repo, check_git, embedded_python_env,
+)
+from ouroboros.platform_layer import (
+    BUNDLE_DIR_ENV,
+    IS_MACOS,
+    IS_WINDOWS,
+    embedded_python_candidates,
+    git_install_hint,
+)
 
 
 DEFAULT_HOST = "127.0.0.1"
@@ -82,7 +91,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _set_global_bytecode_suppression(data_dir: pathlib.Path) -> None:
     """WA6: globally suppress bytecode writes for the packaged CLI process itself.
 
-    Parity with ``_inner_cli_env``'s ``python_bytecode_env`` call so the CLI entry
+    Parity with ``_inner_cli_env``'s ``embedded_python_env`` call so the CLI entry
     process and any naive ``os.environ.copy()`` child inherit the suppression. A
     signed+notarized macOS .app must never write ``__pycache__/*.pyc`` into its own
     bundle at runtime — that breaks the codesign seal. Reuses the same
@@ -202,10 +211,33 @@ def _hidden_run(command: Sequence[str], **kwargs: object) -> subprocess.Complete
 
 
 def _save_settings(path: pathlib.Path, settings: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    """The packaged bootstrap's settings writer — same prologue, same bytes.
+
+    It is a THIRD writer only in the sense that it owns its own path; what it persists
+    goes through the one persistence prologue (which proves the owner-only context/safety
+    ratchets against the value on disk), the one serializer and the one byte-exact commit
+    helper, so a bootstrap save cannot be the save that skips them. The path
+    it writes is the path the prologue reads: the packaged runtime resolves its data
+    dir to ``~/Ouroboros/data``, which is exactly what ``config`` resolves in a
+    process that was given no path overrides — pinned by
+    tests/test_settings_read_seam.py. That identity is CONDITIONAL on the outer
+    packaged process carrying no ``OUROBOROS_*`` path override: the packaged runtime
+    ignores the environment by design (the inner CLI child is handed the packaged
+    paths explicitly), while the prologue proves against ``config.SETTINGS_PATH``,
+    which honours one. Dormant today — ``BootstrapContext.save_settings`` has no
+    caller — and disclosed rather than papered over.
+
+    The write GUARDS are taken on the path this saver actually writes, not on
+    ``config.SETTINGS_PATH``: under a pinned benchmark snapshot, or from pytest against the
+    live install, a bootstrap save must refuse for the same reason the other two writers
+    refuse. Passing its own path is what keeps that honest while the disclosed override
+    split above exists."""
+    from ouroboros.config import prepare_settings_for_persist, serialize_settings
+    from ouroboros.settings_integrity import guard_live_settings_write
+    from ouroboros.utils import write_text_atomic
+
+    guard_live_settings_write(path, pathlib.Path.home())
+    write_text_atomic(path, serialize_settings(prepare_settings_for_persist(dict(settings))))
 
 
 def _run_inner_cli(runtime: PackagedRuntime, args: Sequence[str]) -> int:
@@ -231,6 +263,7 @@ def _inner_cli_env(runtime: PackagedRuntime) -> dict[str, str]:
             "OUROBOROS_SETTINGS_PATH",
             "OUROBOROS_PID_FILE",
             "OUROBOROS_PORT_FILE",
+            BUNDLE_DIR_ENV,
         }
     }
     keep.update(
@@ -243,9 +276,12 @@ def _inner_cli_env(runtime: PackagedRuntime) -> dict[str, str]:
             "OUROBOROS_PID_FILE": str(runtime.app_root / "ouroboros.pid"),
             "OUROBOROS_APP_VERSION": runtime.app_version,
             "OUROBOROS_PACKAGED_CLI": "1",
+            # The inner CLI runs out of the managed repo; bundled payloads
+            # (node, ripgrep) are only reachable through this root.
+            BUNDLE_DIR_ENV: str(runtime.bundle_root),
         }
     )
-    return python_bytecode_env(runtime.data_dir, keep)
+    return embedded_python_env(runtime.data_dir, keep)
 
 
 def _prepare_start_if_requested(args: list[str], runtime: PackagedRuntime) -> list[str]:
@@ -387,10 +423,45 @@ def _launch_desktop_app(runtime: PackagedRuntime) -> None:
     elif IS_WINDOWS:
         subprocess.Popen([str(app)], cwd=str(app.parent))
     else:
-        subprocess.Popen([str(app)], cwd=str(app.parent))
+        relaunch_env = _linux_appimage_relaunch_env(app)
+        if relaunch_env is None:
+            subprocess.Popen([str(app)], cwd=str(app.parent))
+        else:
+            subprocess.Popen([str(app)], cwd=str(app.parent), env=relaunch_env)
+
+
+def _linux_appimage_relaunch_env(app: pathlib.Path) -> dict[str, str] | None:
+    """Give a nested extract-and-run AppImage its own extraction namespace."""
+    if IS_MACOS or IS_WINDOWS:
+        return None
+    appimage = os.environ.get("APPIMAGE", "").strip()
+    if not appimage or pathlib.Path(appimage) != app:
+        return None
+    if not appimage_extracts_and_runs():
+        return None
+
+    env = os.environ.copy()
+    env["APPIMAGE_EXTRACT_AND_RUN"] = "1"
+    env["OUROBOROS_APPIMAGE_RESTORE_TMPDIR"] = "1"
+    env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET"] = "1" if "TMPDIR" in os.environ else "0"
+    env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR"] = os.environ.get("TMPDIR", "")
+    # The type-2 runtime keys extract-and-run paths only by TMPDIR + AppImage
+    # digest. A nested launch of the same AppImage must therefore use a private
+    # temp base or the short-lived CLI runtime removes the desktop payload.
+    env["TMPDIR"] = tempfile.mkdtemp(prefix="ouroboros-appimage-runtime-")
+    return env
 
 
 def _desktop_app_path(bundle_root: pathlib.Path) -> pathlib.Path | None:
+    if not IS_MACOS and not IS_WINDOWS:
+        # Inside an AppImage, the inner PyInstaller launcher lives on a mount (or
+        # temporary extract tree) owned by the outer runtime.  Starting that raw
+        # binary would let the CLI exit and release the payload underneath the
+        # detached desktop process. Relaunch the stable AppImage path instead so
+        # its own runtime owns the payload for the launcher's whole lifetime.
+        appimage = pathlib.Path(os.environ.get("APPIMAGE", "").strip())
+        if appimage.is_file():
+            return appimage
     for parent in (bundle_root, *bundle_root.parents):
         if IS_MACOS and parent.suffix == ".app":
             return parent

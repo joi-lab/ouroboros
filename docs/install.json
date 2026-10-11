@@ -1,0 +1,85 @@
+{
+  "schemaVersion": 1,
+  "name": "Ouroboros",
+  "channel": "stable",
+  "homepage": "https://ouroboros-agent.ai/",
+  "installPage": "https://ouroboros-agent.ai/install/",
+  "repository": "https://github.com/razzant/ouroboros",
+  "releaseDiscovery": {
+    "latestReleaseApi": "https://api.github.com/repos/razzant/ouroboros/releases/latest",
+    "releasesPage": "https://github.com/razzant/ouroboros/releases",
+    "tagTemplate": "v{version}",
+    "checksumsAssetCandidates": [
+      "SHA256SUMS",
+      "SHA256SUMS-v{version}.txt"
+    ],
+    "evidenceAssetCandidates": [
+      "release-evidence.json",
+      "release-proof-v{version}.json"
+    ]
+  },
+  "artifacts": [
+    {
+      "platform": "macos",
+      "architecture": "arm64",
+      "minimumVersion": "12",
+      "format": "dmg",
+      "nameTemplate": "Ouroboros-{version}.dmg"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "tar.gz",
+      "nameTemplate": "Ouroboros-{version}-linux-x86_64.tar.gz"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "AppImage",
+      "availability": "per-release",
+      "nameTemplate": "Ouroboros-{version}-linux-x86_64.AppImage"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "deb",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros_{version}_amd64.deb"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "rpm",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros-{version}-1.x86_64.rpm"
+    },
+    {
+      "platform": "linux",
+      "architecture": "x86_64",
+      "format": "rpm",
+      "distribution": "redos8",
+      "availability": "per-release",
+      "nameTemplate": "ouroboros-{version}-1.red80.x86_64.rpm"
+    },
+    {
+      "platform": "windows",
+      "architecture": "x64",
+      "format": "zip",
+      "nameTemplate": "Ouroboros-{version}-windows-x64.zip"
+    }
+  ],
+  "verification": {
+    "availability": "per-release",
+    "githubAttestations": {
+      "availability": "per-release",
+      "predicates": [
+        "https://slsa.dev/provenance/v1",
+        "https://cyclonedx.org/bom"
+      ]
+    }
+  },
+  "sourceInstall": {
+    "python": ">=3.10",
+    "instructions": "https://github.com/razzant/ouroboros#run-from-source"
+  }
+}

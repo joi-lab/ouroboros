@@ -18,11 +18,12 @@ def _ctx_tools(monkeypatch, expected_output="The answer is 42", answer_protocol=
     contract = {"expected_output": expected_output}
     if answer_protocol:
         contract["answer_protocol"] = answer_protocol
+    drive_root = Path(tempfile.mkdtemp())
     ctx = _t.SimpleNamespace(
-        task_contract=contract, task_metadata={},
+        task_contract=contract, task_metadata={}, drive_root=drive_root,
         _skill_finalization_injected=True, _verify_red_nudged=True, _verify_nudged=True,
     )
-    return Path(tempfile.mkdtemp()), ctx, _t.SimpleNamespace(_ctx=ctx)
+    return drive_root, ctx, _t.SimpleNamespace(_ctx=ctx)
 
 
 def _trace(tool_calls=None):

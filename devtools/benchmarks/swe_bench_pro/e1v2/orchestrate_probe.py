@@ -181,7 +181,7 @@ def main() -> int:
     ap.add_argument("--mem-limit", default="8g")
     ap.add_argument("--model-name", default="ouroboros-v6501-sonnet46")
     ap.add_argument("--disable-tools",
-                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit")
+                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,youtube_transcript,claude_code_edit,switch_model")
     ap.add_argument("--start", type=int, default=1)
     ap.add_argument("--limit", type=int, default=10_000)
     ap.add_argument("--host-python", default=sys.executable)

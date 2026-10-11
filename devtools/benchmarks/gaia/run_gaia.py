@@ -19,10 +19,14 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
 from devtools.benchmarks.common.manifests import (
-    MODEL_SLOT_KEYS,
+    ACTIVE_MODEL_SLOT_KEYS,
     admit_benchmark_run,
     finalize_run_manifest,
     write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    single_model_subagents_setting,
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, run_root
 from ouroboros.config import SETTINGS_DEFAULTS
@@ -32,7 +36,6 @@ REPO = pathlib.Path(__file__).resolve().parents[3]
 HERE = pathlib.Path(__file__).resolve().parent
 _GAIA_PINNED_MODEL_KEYS = {
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION",
     "OUROBOROS_MODEL_CONSCIOUSNESS",
@@ -51,6 +54,9 @@ _PROVIDER_ENV_KEYS = {
     "ANTHROPIC_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_BASE_URL",
+    "MINIMAX_API_KEY",
+    "MINIMAX_REGION",
+    "DEEPSEEK_API_KEY",
     "GIGACHAT_CREDENTIALS",
     "GIGACHAT_USER",
     "GIGACHAT_PASSWORD",
@@ -94,6 +100,10 @@ def _credential_keys_for_model(model: str) -> set[str]:
         return {"CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL"}
     if text.startswith("gigachat::"):
         return {"GIGACHAT_CREDENTIALS", "GIGACHAT_USER", "GIGACHAT_PASSWORD"}
+    if text.startswith("minimax::"):
+        return {"MINIMAX_API_KEY", "MINIMAX_REGION"}
+    if text.startswith("deepseek::"):
+        return {"DEEPSEEK_API_KEY"}
     if text.startswith("openai-compatible::"):
         return {"OPENAI_COMPATIBLE_API_KEY", "OPENAI_COMPATIBLE_BASE_URL"}
     return {"OPENROUTER_API_KEY"}
@@ -145,7 +155,9 @@ def _render_run_settings(
     main_web_search_max_total_results: int = 10,
 ) -> pathlib.Path:
     settings = json.loads(base_settings_path.read_text(encoding="utf-8"))
-    for key in MODEL_SLOT_KEYS:
+    settings.pop("OUROBOROS_MODEL_HEAVY", None)
+    settings.pop("USE_LOCAL_HEAVY", None)
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         if key.startswith("OUROBOROS_EFFORT_"):
             continue
         if key not in _GAIA_PINNED_MODEL_KEYS:
@@ -154,6 +166,9 @@ def _render_run_settings(
             settings[key] = review_models or ",".join([solve_model] * 3)
         elif key:
             settings[key] = solve_model
+    # One exact API actor preserves fixed-model methodology even when the product's
+    # install defaults would otherwise add a Light scout or a session-backed row.
+    settings["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(solve_model)
     # A fixed MAIN reasoner may route vision to a SEPARATE model (e.g. sonnet main +
     # gpt-4o vision, the HAL methodology) without breaking the fixed-model claim.
     if vision_model:
@@ -212,7 +227,7 @@ def _settings_env(settings_path: pathlib.Path, solve_model: str, run_dir: pathli
         for k, v in settings.items()
         if k not in _PROVIDER_ENV_KEYS and v not in (None, "") and not isinstance(v, (list, dict))
     }
-    for key in MODEL_SLOT_KEYS:
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         if key.startswith("OUROBOROS_EFFORT_") or key not in _GAIA_PINNED_MODEL_KEYS:
             continue
         if key in ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_MODEL_VISION") and settings.get(key):
@@ -305,8 +320,12 @@ def _augment_manifest(manifest: dict, args: argparse.Namespace, root: pathlib.Pa
     """
     manifest["model_slots"] = {
         k: v for k, v in _settings_env(settings_path, args.solve_model, root).items()
-        if k in MODEL_SLOT_KEYS
+        if k in ACTIVE_MODEL_SLOT_KEYS
     }
+    manifest["available_subagents"] = configured_subagents_snapshot(
+        settings_path,
+        env_overrides=False,
+    )
     manifest.setdefault("extra", {})["image_input_mode"] = json.loads(
         settings_path.read_text(encoding="utf-8")
     ).get("OUROBOROS_IMAGE_INPUT_MODE", "")

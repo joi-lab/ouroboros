@@ -140,10 +140,12 @@ def test_consolidator_skips_invalid_topic(tmp_path):
     kdir = tmp_path / "knowledge"
     _write_knowledge_entries(kdir, [
         {"topic": "valid-topic", "content": "ok"},
-        {"topic": "has spaces!", "content": "should be skipped"},
+        {"topic": "has spaces!", "content": "useful name is preserved"},
+        {"topic": "../evil", "content": "must not escape the shelf"},
     ])
     assert (kdir / "valid-topic.md").exists()
-    assert not list(kdir.glob("*spaces*"))
+    assert "useful name is preserved" in (kdir / "has spaces!.md").read_text()
+    assert not (tmp_path / "evil.md").exists()
 
 
 # --------------------------------------------------------------------------- #

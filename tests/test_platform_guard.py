@@ -211,17 +211,13 @@ def test_normalize_repo_path_handles_windows_style_paths():
 
 
 @pytest.mark.skipif(not IS_WINDOWS_PLATFORM, reason="Windows-only")
-def test_win32_overlapped_class_cached():
-    """_win32_overlapped_class must return the same class object on every call.
+def test_win32_lock_and_unlock_share_the_same_overlapped_abi():
+    """Both APIs must accept the identical structure class, not just equal layouts.
 
-    ctypes rejects pointer arguments when the underlying Structure class differs
-    even if the layout is identical.  If lock creates one OVERLAPPED class and
-    unlock creates another, UnlockFileEx will raise ctypes.ArgumentError.
+    ctypes rejects pointer arguments for structurally equal but distinct classes.
+    The platform's one Windows ABI declaration owns both native signatures.
     """
-    from ouroboros.platform_layer import _win32_overlapped_class
-    cls1 = _win32_overlapped_class()
-    cls2 = _win32_overlapped_class()
-    assert cls1 is cls2, (
-        "_win32_overlapped_class() returned different class objects — "
-        "this will cause ctypes.ArgumentError in unlock path"
-    )
+    from ouroboros.platform_layer import _OVERLAPPED, _kernel32
+
+    assert _kernel32.LockFileEx.argtypes[-1]._type_ is _OVERLAPPED
+    assert _kernel32.UnlockFileEx.argtypes[-1]._type_ is _OVERLAPPED

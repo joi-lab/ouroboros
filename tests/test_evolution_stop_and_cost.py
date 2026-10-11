@@ -3,7 +3,8 @@ cost reconstruction.
 
 Covers:
   - reconstruct_task_cost using the durable physical-attempt ledger by task_id;
-  - cancel_running_evolution_tasks cancelling only evolution workers;
+  - stop_evolution_tasks cancelling only evolution tasks (pending AND running)
+    through the durable-intent + typed-custody ingress;
   - the hard-timeout retry gate: a killed evolution task is NOT re-enqueued when
     the campaign is stopped, IS re-enqueued when still enabled, and either way
     records reconstructed cost/rounds (never zeros).
@@ -59,14 +60,17 @@ def test_reconstruct_task_cost_never_fabricates_zero_when_ledger_unavailable(
     assert fields["cost_accounting_status"] == "unavailable"
     assert fields["cost_final"] is False
     assert fields["cost_accounting_error"] == "ledger_unavailable"
-    assert fields["cost_usd"] is None
+    assert fields["accounted_upper_bound_usd"] is None
     assert fields["total_rounds"] is None
     assert fields["ledger_integrity_degraded"] is True
     with pytest.raises(accounting.UsageAccountingError):
         state.reconstruct_task_cost("paid-task")
 
 
-def test_cancel_running_evolution_tasks_cancels_only_evolution(monkeypatch):
+def test_stop_evolution_tasks_cancels_only_evolution_pending_and_running(monkeypatch):
+    """GR2-13: PENDING evolution tasks go through the same durable-intent +
+    typed-custody ingress as running ones (never an in-place prune), and only
+    evolution tasks are touched."""
     import supervisor.queue as q
 
     monkeypatch.setattr(q, "RUNNING", {
@@ -74,13 +78,54 @@ def test_cancel_running_evolution_tasks_cancels_only_evolution(monkeypatch):
         "task2": {"task": {"type": "task"}},
         "evo3": {"task": {"type": "evolution"}},
     })
-    cancelled = []
-    monkeypatch.setattr(q, "cancel_task_by_id", lambda tid: cancelled.append(tid) or True)
+    monkeypatch.setattr(q, "PENDING", [
+        {"id": "evo-pending", "type": "evolution"},
+        {"id": "plain-pending", "type": "chat"},
+    ])
+    intents: list = []
+    monkeypatch.setattr(
+        "ouroboros.cancel_intents.request_cancel",
+        lambda root, tid, **kw: intents.append((tid, kw.get("source"))) or {},
+    )
+    custody: list = []
+    monkeypatch.setattr(q, "cancel_task_custody",
+                        lambda tid, **_kw: custody.append(tid) or q.CANCEL_CANCELLED)
 
-    out = q.cancel_running_evolution_tasks("test stop")
+    out = q.stop_evolution_tasks("test stop")
 
-    assert sorted(out) == ["evo1", "evo3"]
-    assert sorted(cancelled) == ["evo1", "evo3"]
+    assert sorted(out["cancelled"]) == ["evo-pending", "evo1", "evo3"]
+    assert sorted(custody) == ["evo-pending", "evo1", "evo3"]
+    assert sorted(tid for tid, _src in intents) == ["evo-pending", "evo1", "evo3"]
+    assert all(src == "evolution_stop" for _tid, src in intents)
+    assert not any(bucket for key, bucket in out.items() if key != "cancelled")
+
+
+def test_stop_evolution_tasks_reports_settled_and_failed_honestly(monkeypatch):
+    """GR2-13: 'cancelled' names only CANCEL_CANCELLED outcomes; already-settled
+    and failed teardowns are separate buckets, and the report composer marks the
+    stop incomplete only for still-live tasks."""
+    import supervisor.queue as q
+
+    monkeypatch.setattr(q, "RUNNING", {
+        "evo-done": {"task": {"type": "evolution"}},
+        "evo-stuck": {"task": {"type": "evolution"}},
+    })
+    monkeypatch.setattr(q, "PENDING", [])
+    monkeypatch.setattr("ouroboros.cancel_intents.request_cancel",
+                        lambda root, tid, **kw: {})
+    outcomes = {"evo-done": q.CANCEL_ALREADY_SETTLED, "evo-stuck": q.CANCEL_FAILED}
+    monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: outcomes[tid])
+
+    out = q.stop_evolution_tasks("test stop")
+
+    assert out["cancelled"] == []
+    assert out["already_settled"] == ["evo-done"]
+    assert out["failed"] == ["evo-stuck"]
+    lines, incomplete = q.evolution_stop_report(out)
+    assert incomplete is True
+    assert any("Already settled" in line and "evo-done" in line for line in lines)
+    assert any("INCOMPLETE" in line and "evo-stuck" in line for line in lines)
+    assert not any(line.startswith("🛑 Cancelled") for line in lines)
 
 
 def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
@@ -90,11 +135,24 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
 
     import supervisor.queue as q
     import supervisor.state as state
+    from supervisor import evolution_lifecycle
     from supervisor import workers as workers_mod
     import ouroboros.tools.services as services_mod
 
-    monkeypatch.setattr(q, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)
+    state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
+    q.init(tmp_path)
+    campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
+    state.update_state(lambda live: live.update(
+        owner_chat_id=7,
+        evolution_mode_enabled=True,
+        evolution_owner_stopped=False,
+    ))
+    transaction = evolution_lifecycle.begin_evolution_transaction(
+        "evo1", cycle=1, campaign=campaign,
+    )
+    if not evolution_enabled:
+        state.update_state(lambda live: live.update(evolution_mode_enabled=False))
     monkeypatch.setattr(q, "FINALIZATION_GRACE_SEC", 0)
     # Activity model: drive an IDLE kill (no progress for the idle window), not a flat
     # wall-clock/ceiling kill — small idle/ceiling getters + a recent started_at keep
@@ -115,7 +173,13 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
         for index in range(3)
     ])
 
-    task = {"id": "evo1", "type": "evolution", "chat_id": 7, "_attempt": 1, "metadata": {}}
+    task = {
+        "id": "evo1",
+        "type": "evolution",
+        "chat_id": 7,
+        "_attempt": 1,
+        "metadata": {"evolution_transaction": transaction},
+    }
     monkeypatch.setattr(q, "RUNNING", {
         "evo1": {"task": task, "started_at": time.time() - 1000, "worker_id": 0, "attempt": 1},
     })
@@ -136,8 +200,18 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     monkeypatch.setattr(services_mod, "archive_task_service_logs", lambda *a, **k: None)
 
     enqueued = []
-    monkeypatch.setattr(q, "enqueue_task", lambda t, front=False: enqueued.append(t))
-    monkeypatch.setattr(q, "persist_queue_snapshot", lambda reason="": None)
+    for key, value in {"PENDING": [], "QUEUE_SEQ_COUNTER_REF": {"value": 0},
+                       "ADMISSION_RESERVATIONS": {}, "ACCEPTANCE_FENCES": {},
+                       "BUDGET_ROOT_FENCES": {}}.items():
+        monkeypatch.setattr(q, key, value)
+    real_enqueue = q.enqueue_task
+    def enqueue(task, front=False):
+        admitted = real_enqueue(task, front=front)
+        assert not admitted.get("_admission_blocked"), admitted
+        assert any(row is admitted for row in q.PENDING)
+        enqueued.append(admitted)
+        return admitted
+    monkeypatch.setattr(q, "enqueue_task", enqueue)
     monkeypatch.setattr(q, "send_with_budget", lambda *a, **k: None)
     monkeypatch.setattr(q, "load_state", lambda: {"evolution_mode_enabled": evolution_enabled, "owner_chat_id": 0})
 
@@ -151,17 +225,30 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     return enqueued, emitted, written
 
 
-def test_hard_timeout_cleans_owner_mailbox(tmp_path, monkeypatch):
-    """Block 5 (v6.29.0 scope advisory): a hard-killed worker never reaches the
-    loop's mailbox cleanup, so the kill path must remove the task mailbox —
-    otherwise finalize_now files accumulate and a stale control would instantly
-    force-finalize a subagent retry reusing the same task id."""
+def test_hard_timeout_cleans_owner_mailbox_at_terminal_dispatch(tmp_path, monkeypatch):
+    """A hard kill preserves authority until its durable terminal is dispatched."""
     from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, _mailbox_path, write_owner_message
+    from supervisor import events as events_mod
 
     write_owner_message(tmp_path, "hard_timeout", "evo1", kind=KIND_FINALIZE_NOW)
     assert _mailbox_path(tmp_path, "evo1").exists()
 
-    _drive_hard_timeout(tmp_path, monkeypatch, evolution_enabled=False)
+    _enqueued, emitted, written = _drive_hard_timeout(
+        tmp_path, monkeypatch, evolution_enabled=False,
+    )
+    assert _mailbox_path(tmp_path, "evo1").exists()
+    done = next(evt for evt in emitted if evt.get("type") == "task_done")
+    task = {"id": "evo1", "type": "evolution", "chat_id": 7, "_attempt": 1}
+    ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[], WORKERS={},
+        send_with_budget=lambda *_a, **_k: None,
+        persist_queue_snapshot=lambda **_k: True,
+        bridge=SimpleNamespace(push_log=lambda _evt: None),
+    )
+    events_mod._finish_task_done_dispatch(
+        {}, ctx, task_id="evo1", worker_id=0, task=task,
+        final_task_result=written, task_done_event=done,
+    )
 
     assert not _mailbox_path(tmp_path, "evo1").exists()
 
@@ -173,25 +260,34 @@ def test_hard_timeout_evolution_stopped_no_requeue_records_cost(tmp_path, monkey
     assert enqueued == []
     # Terminal status records reconstructed cost/rounds, not zeros.
     assert written.get("status") == "failed"
-    assert round(float(written.get("cost_usd") or 0), 6) == 1.5
+    assert round(float(written.get("accounted_upper_bound_usd") or 0), 6) == 1.5
     assert int(written.get("total_rounds") or 0) == 3
     # The terminal task_done carries the reconstructed cost for the campaign tally.
     done = [e for e in emitted if e.get("type") == "task_done"]
-    assert done and round(float(done[0].get("cost_usd") or 0), 6) == 1.5
+    assert done and round(float(done[0].get("accounted_upper_bound_usd") or 0), 6) == 1.5
     assert int(done[0].get("total_rounds") or 0) == 3
 
 
 def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
     """A zeroed terminal event and stale result cannot override the ledger."""
     from ouroboros import usage_accounting as accounting
-    from supervisor import queue
+    from supervisor import evolution_lifecycle as lifecycle, queue
     from supervisor import state as supervisor_state
     from supervisor.events import _handle_task_done
     from ouroboros.task_results import STATUS_CANCELLED, write_task_result
 
     supervisor_state.init(tmp_path)
-    queue.init(tmp_path, 600, 1800)
-    queue.start_evolution_campaign("Improve", source="test")
+    supervisor_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
+    queue.init(tmp_path)
+    campaign = queue.start_evolution_campaign("Improve", source="test")
+    supervisor_state.update_state(lambda live: live.update(
+        owner_chat_id=1,
+        evolution_mode_enabled=True,
+        evolution_owner_stopped=False,
+    ))
+    transaction = lifecycle.begin_evolution_transaction(
+        "evo-zero", cycle=1, campaign=campaign,
+    )
 
     reservation = accounting.reserve_attempt(accounting.AttemptRequest(
         model="openai/gpt-5.2", provider="openai", reservation_usd=2.5,
@@ -221,13 +317,14 @@ def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
         {
             "type": "task_done", "task_id": "evo-zero", "task_type": "evolution",
             "result_status": "cancelled", "cost_usd": 0, "total_rounds": 0,
+            "metadata": {"evolution_transaction": transaction},
         },
         ctx,
     )
 
     # The broadcast task_done carries the reconstructed cost, not the zeroed event value.
     done = [e for e in broadcast if e.get("type") == "task_done"]
-    assert done and float(done[0].get("cost_usd") or 0) == 2.5
+    assert done and float(done[0].get("accounted_upper_bound_usd") or 0) == 2.5
     assert int(done[0].get("total_rounds") or 0) == 1
     # Reconstructed cost/rounds are preserved, but a cancelled task is still an
     # axis-level failure. Cost no longer proves evolution success.
@@ -240,8 +337,8 @@ def test_hard_timeout_evolution_enabled_requeues(tmp_path, monkeypatch):
     # Campaign still enabled: the timed-out task is re-enqueued (one retry).
     assert len(enqueued) == 1
     assert enqueued[0].get("type") == "evolution"
-    assert enqueued[0].get("_attempt") == 2
+    assert enqueued[0].get("_attempt") == 2 and enqueued[0]["id"] == "evo1"
     # A retry keeps the live card active, so no terminal task_done is emitted.
     assert [e for e in emitted if e.get("type") == "task_done"] == []
     # The interrupted rollup still records reconstructed cost (not zeros).
-    assert round(float(written.get("cost_usd") or 0), 6) == 1.5
+    assert round(float(written.get("accounted_upper_bound_usd") or 0), 6) == 1.5

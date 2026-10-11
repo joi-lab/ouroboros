@@ -1,9 +1,12 @@
 import { escapeHtml } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { setInlineStatus } from './ui_helpers.js';
+import { harnessIdentityMarkup } from './harness_presentation.js';
 import {
     LOG_CATEGORIES,
     categorizeLogEvent,
     duplicateLogEventKey,
+    executorChip,
     formatReviewProjection,
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -22,6 +25,7 @@ export function initLogs({ ws, state, mount }) {
     // reconnect re-backfill) render once. Bounded; a rare full clear briefly
     // disables the guard, which at worst re-shows one row — never drops one.
     const renderedLogKeys = new Set();
+    let backfillRevision = 0;
 
     state.activeFilters = state.activeFilters || Object.fromEntries(
         Object.keys(LOG_CATEGORIES).map((key) => [key, true]),
@@ -32,12 +36,14 @@ export function initLogs({ ws, state, mount }) {
     page.className = 'settings-embedded-content settings-logs-panel';
     page.innerHTML = `
         <div class="logs-filters" id="log-filters"><button class="btn btn-default logs-inline-clear" id="btn-clear-logs">Clear</button></div>
+        <div class="ui-status logs-history-status" role="status"></div>
         <div id="log-entries"></div>
     `;
     mount.appendChild(page);
 
     const filtersDiv = page.querySelector('#log-filters');
     const logEntries = page.querySelector('#log-entries');
+    const historyStatus = page.querySelector('.logs-history-status');
     function isLogsVisible() {
         return state.activePage === 'dashboard' && state.dashboardActiveSubtab === 'logs';
     }
@@ -47,6 +53,18 @@ export function initLogs({ ws, state, mount }) {
         requestAnimationFrame(() => {
             logEntries.scrollTop = logEntries.scrollHeight;
         });
+    }
+
+    // Live entries must not yank the view away from history the reader
+    // scrolled up to: per-entry autoscroll sticks only while the reader is
+    // already at the bottom. Callers capture this BEFORE appending — the
+    // append itself grows scrollHeight, which would misread a pinned reader
+    // as scrolled-up. Deliberate jumps (filter toggle, tab switch, backfill)
+    // stay unconditional. A hidden panel measures 0/0/0 → pinned, matching
+    // the tab-switch jump the reader gets on return.
+    const PINNED_SLACK_PX = 48;
+    function isPinnedToLatest() {
+        return logEntries.scrollHeight - logEntries.scrollTop - logEntries.clientHeight <= PINNED_SLACK_PX;
     }
 
     function updateVisibility(entry) {
@@ -121,7 +139,8 @@ export function initLogs({ ws, state, mount }) {
 
     function createStandaloneEntry(evt) {
         const view = summarizeLogEvent(evt);
-        const cat = categorizeLogEvent(evt);
+        const execution = executorChip(evt);
+        const cat = categorizeLogEvent(evt, view);
         const dedupeKey = duplicateLogEventKey(evt);
         const now = (() => {
             const parsed = evt.ts ? Date.parse(evt.ts) : NaN;
@@ -165,6 +184,10 @@ export function initLogs({ ws, state, mount }) {
                 phase: view.phase || 'info',
                 headline: view.headline || 'Event',
             })}
+            ${execution ? `<div class="harness-chip log-executor-chip" title="${escapeHtml(execution.title || '')}">${harnessIdentityMarkup(execution.harness, {
+                label: execution.label || '',
+                className: 'log-executor-identity',
+            })}</div>` : ''}
             ${metaPills(view.meta)}
             ${bodyHtml}
             <div class="log-actions">
@@ -174,6 +197,7 @@ export function initLogs({ ws, state, mount }) {
         `;
         bindRawToggle(entry);
         updateVisibility(entry);
+        const pinned = isPinnedToLatest();
         logEntries.appendChild(entry);
 
         if (dedupeKey) {
@@ -181,17 +205,17 @@ export function initLogs({ ws, state, mount }) {
         }
 
         trimEntries();
-        if (state.activeFilters[cat]) scrollToLatest();
+        if (state.activeFilters[cat] && pinned) scrollToLatest();
     }
 
-    function createTaskGroupCard(groupId, category) {
+    function createTaskGroupCard(groupId, category, kindLabel) {
         const entry = document.createElement('div');
         entry.className = 'log-entry log-task-card';
         entry.dataset.category = category;
         entry.dataset.taskGroup = groupId;
         entry.innerHTML = `
             ${logMainHtml({
-                type: { className: category, label: groupId === 'bg-consciousness' ? 'background' : 'task' },
+                type: { className: category, label: kindLabel },
                 phase: 'info',
                 headline: 'Task activity',
                 attrs: {
@@ -203,6 +227,7 @@ export function initLogs({ ws, state, mount }) {
                 },
             })}
             <div class="log-task-summary" data-task-summary></div>
+            <div class="harness-chip log-executor-chip" data-task-executor hidden></div>
             <div class="log-body log-task-review" data-task-review hidden></div>
             <details class="log-task-details">
                 <summary>Timeline</summary>
@@ -217,6 +242,7 @@ export function initLogs({ ws, state, mount }) {
             headline: entry.querySelector('[data-task-headline]'),
             count: entry.querySelector('[data-task-count]'),
             summary: entry.querySelector('[data-task-summary]'),
+            executor: entry.querySelector('[data-task-executor]'),
             review: entry.querySelector('[data-task-review]'),
             timeline: entry.querySelector('[data-task-timeline]'),
             events: 0,
@@ -255,28 +281,48 @@ export function initLogs({ ws, state, mount }) {
         }
 
         const view = summarizeLogEvent(evt);
-        const eventCategory = categorizeLogEvent(evt);
-        const category = groupId === 'bg-consciousness'
-            ? 'consciousness'
-            : (eventCategory === 'errors' ? 'errors' : 'tasks');
-        const record = taskGroups.get(groupId) || createTaskGroupCard(groupId, category);
+        const eventCategory = categorizeLogEvent(evt, view);
+        // A task group stays under Errors once one of its events earned it
+        // (#323): the next heartbeat must not flip the card back to amber and
+        // drop it out of the Errors filter while the failure is still in its
+        // timeline. The phase pill still follows the latest event.
+        const earlier = taskGroups.get(groupId);
+        // A wake-up's group is labelled by the origin fact its frames carry
+        // (sticky once seen).
+        const wake = evt.initiator === 'consciousness' || Boolean(earlier?.wake);
+        const category = eventCategory === 'errors' || earlier?.category === 'errors' ? 'errors'
+            : (wake ? 'consciousness' : 'tasks');
+        const kindLabel = wake ? 'Consciousness' : `task ${groupId}`;
+        // Captured before ANY record mutation: an already-mounted card grows
+        // in place (summary rewrite, review unhide, timeline render) before
+        // the append below, and that growth alone can push a pinned reader
+        // past the slack allowance.
+        const pinned = isPinnedToLatest();
+        const record = taskGroups.get(groupId) || createTaskGroupCard(groupId, category, kindLabel);
         const ts = normalizeLogTs(evt.ts || evt.timestamp);
 
         record.events += 1;
         record.category = category;
+        record.wake = wake;
         record.entry.dataset.category = category;
         record.ts.textContent = ts;
-        record.kind.textContent = groupId === 'bg-consciousness' ? 'background' : `task ${groupId}`;
+        record.kind.textContent = kindLabel;
         record.kind.className = `log-type ${category}`;
         record.phase.textContent = view.phase || 'info';
         record.phase.className = `log-phase ${view.phase || 'info'}`;
         record.headline.textContent = view.headline || 'Task activity';
         record.count.textContent = `x${record.events}`;
         record.count.hidden = record.events <= 1;
-        record.summary.innerHTML = metaPills([
-            groupId === 'bg-consciousness' ? 'background' : `task=${groupId}`,
-            ...view.meta,
-        ]);
+        record.summary.innerHTML = metaPills([`task=${groupId}`, ...view.meta]);
+        const execution = executorChip(evt);
+        if (execution && record.executor) {
+            record.executor.title = execution.title || '';
+            record.executor.innerHTML = harnessIdentityMarkup(execution.harness, {
+                label: execution.label || '',
+                className: 'log-executor-identity',
+            });
+            record.executor.hidden = false;
+        }
         const reviewDetails = formatReviewProjection(evt.review_projection);
         if (reviewDetails && record.review) {
             record.review.textContent = reviewDetails;
@@ -309,7 +355,7 @@ export function initLogs({ ws, state, mount }) {
         updateVisibility(record.entry);
         logEntries.appendChild(record.entry);
         trimEntries();
-        if (state.activeFilters[category]) scrollToLatest();
+        if (state.activeFilters[category] && pinned) scrollToLatest();
     }
 
     function addLogEntry(evt) {
@@ -348,20 +394,31 @@ export function initLogs({ ws, state, mount }) {
     // with the live stream, so this neither drops the pre-connect window nor
     // double-renders the post-connect overlap.
     async function backfillRecentLogs() {
+        const revision = ++backfillRevision;
+        setInlineStatus(historyStatus, 'Loading recent history…');
+        historyStatus.hidden = false;
         const merged = [];
+        const failed = [];
         for (const name of ['events', 'tools', 'progress', 'supervisor']) {
             try {
                 const resp = await apiFetch(`/api/logs/${name}?limit=150`, { cache: 'no-store' });
-                if (!resp.ok) continue;
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                 const data = await resp.json();
-                if (Array.isArray(data.entries)) merged.push(...data.entries);
-            } catch (err) {
-                /* best-effort backfill: live stream still works without it */
+                if (!Array.isArray(data?.entries)) throw new Error('History unavailable');
+                merged.push(...data.entries);
+            } catch {
+                failed.push(name);
             }
         }
         const tsOf = (evt) => Date.parse(evt?.ts || evt?.timestamp || '') || 0;
         merged.sort((a, b) => tsOf(a) - tsOf(b));
         for (const evt of merged) addLogEntry(evt);
+        if (revision === backfillRevision) {
+            setInlineStatus(historyStatus, failed.length
+                ? `Recent history is incomplete: ${failed.join(', ')} could not be loaded. Live events are shown as they arrive; reconnect reloads recent history.`
+                : '', 'error');
+            historyStatus.hidden = failed.length === 0;
+        }
         scrollToLatest();
     }
 
@@ -382,5 +439,16 @@ export function initLogs({ ws, state, mount }) {
 
     window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
         if (event.detail?.tab === 'logs') scrollToLatest();
+    });
+
+    // A `.page` display round-trip destroys the scroll position (documented in
+    // chat.js: WebKit re-shows a hidden column at scrollTop=0), which would
+    // read as scrolled-up and silently disarm the pinned-only autoscroll.
+    // Returning to the dashboard is the same class of deliberate navigation
+    // as a subtab switch (evolution.js listens to both events the same way),
+    // so re-pin on it; this also covers the very first dashboard show, where
+    // the backfill's own jump ran while the panel was still hidden.
+    window.addEventListener('ouro:page-shown', (event) => {
+        if (event.detail?.page === 'dashboard' && state.dashboardActiveSubtab === 'logs') scrollToLatest();
     });
 }

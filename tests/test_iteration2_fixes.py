@@ -6,6 +6,7 @@
 #3 vision.view_image — bring a LOCAL image natively into the active model's context (local-only, not
    web-gated, reuses vlm_query's exact trust checks; blind-model + fail-closed paths covered).
 """
+import json
 import os
 import pathlib
 import shutil
@@ -34,7 +35,7 @@ def _stub_tool_timeout_settings(monkeypatch):
     deterministic regardless of the developer's real data/settings.json (CI is already
     isolated via OUROBOROS_DATA_DIR, but local runs should not depend on it)."""
     try:
-        monkeypatch.setattr("ouroboros.tools.shell.load_settings", lambda: {})
+        monkeypatch.setattr("ouroboros.tools.shell_process.load_settings", lambda: {})
     except Exception:
         pass
     yield
@@ -69,6 +70,8 @@ def test_apply_all_model_one_low_reviewer_by_default(monkeypatch):
     assert os.environ["OUROBOROS_REVIEW_MODELS"] == "google/gemini-3.5-flash"  # one reviewer, no commas
     assert os.environ["OUROBOROS_EFFORT_REVIEW"] == "low"
     assert os.environ["OUROBOROS_EFFORT_SCOPE_REVIEW"] == "low"
+    actors = json.loads(os.environ["OUROBOROS_SUBAGENTS"])
+    assert [row["route"]["target_id"] for row in actors["items"]] == ["google/gemini-3.5-flash"]
 
 
 def test_apply_all_model_configurable_slots_and_effort(monkeypatch):

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 
 from platform_support import fsync_directory, path_is_link_or_reparse
+from telegram_settings import telegram_proxy
 
 
 _API_ROOT = "https://api.telegram.org"
@@ -152,6 +153,7 @@ class TelegramMenuManager:
             timeout=12,
             follow_redirects=False,
             trust_env=False,
+            proxy=telegram_proxy(self.state_dir),
         )
         request_options: dict[str, Any] = {}
         if request_timeout_sec is not None:
@@ -165,12 +167,12 @@ class TelegramMenuManager:
                 json=payload,
                 **request_options,
             )
-        except httpx.TimeoutException as exc:
-            raise TelegramMenuTransportError(f"Telegram API timed out during {method}.") from exc
+        except httpx.TimeoutException:
+            raise TelegramMenuTransportError(f"Telegram API timed out during {method}.") from None
         except httpx.HTTPError as exc:
             raise TelegramMenuTransportError(
                 f"Telegram API transport failed during {method} ({type(exc).__name__})."
-            ) from exc
+            ) from None
         finally:
             if owned_client:
                 await client.aclose()

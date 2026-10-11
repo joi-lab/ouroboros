@@ -7,6 +7,7 @@
 // honest trust line: attaching gives the agent write+shell in that folder
 // (notification model — attaching IS the grant; no second confirmation).
 import { openConfirmDialog } from './confirm_dialog.js';
+import { bindDialogFocus, bindMenu } from './ui_interactions.js';
 
 // Mirrored from the frozen backend PROJECT_NAME_MAX contract.
 const PROJECT_NAME_MAX = 80;
@@ -23,15 +24,15 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
                     <button type="button" class="btn btn-default btn-sm" data-np-cancel aria-label="Close">Close</button>
                 </div>
                 <div class="marketplace-modal-body">
-                    <label class="new-project-field">
+                    <label class="new-project-field ui-field">
                         <span>Name</span>
-                        <input class="files-modal-input" data-np-name type="text" placeholder="My project" maxlength="${maxNameLength}">
+                        <input class="files-modal-input ui-control" data-np-name name="project-name" type="text" placeholder="My project" maxlength="${maxNameLength}">
                     </label>
                     <fieldset class="new-project-sources">
                         <legend>Working folder</legend>
                         <label><input type="radio" name="np-source" value="fileless" checked> None — chat/research project (no folder)</label>
                         <label><input type="radio" name="np-source" value="genesis"> New managed folder (fresh git repo under the projects root)</label>
-                        <label><input type="radio" name="np-source" value="attach"> Attach an existing folder…</label>
+                        <label><input type="radio" name="np-source" value="attach"> Attach an existing folder (Git optional)…</label>
                         <label><input type="radio" name="np-source" value="clone"> Clone a git URL…</label>
                     </fieldset>
                     <div class="new-project-source-detail" data-np-attach hidden>
@@ -39,21 +40,22 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
                             <div class="new-project-browser-path" data-np-path></div>
                             <div class="new-project-browser-list" data-np-dirs></div>
                         </div>
-                        <label class="local-toggle" title="Runs git init + an 'attach snapshot' commit of the current state with a local identity. Never done without this checkbox.">
-                            <input type="checkbox" data-np-initgit>
-                            Initialize git here if missing (attach-snapshot commit)
+                        <p class="new-project-selected-target ui-field-help" data-np-selected role="status" aria-live="polite">No folder selected.</p>
+                        <label class="local-toggle ui-field ui-field-inline" title="Runs git init + an 'attach snapshot' commit of the current state with a local identity. Never done without this checkbox.">
+                            <input class="ui-checkbox" type="checkbox" name="project-init-git" data-np-initgit>
+                            Initialize Git and commit current files
                         </label>
                     </div>
                     <div class="new-project-source-detail" data-np-clone hidden>
-                        <label class="new-project-field">
+                        <label class="new-project-field ui-field">
                             <span>Git URL</span>
-                            <input class="files-modal-input" data-np-giturl type="text" placeholder="https://github.com/user/repo.git or git@github.com:user/repo.git">
+                            <input class="files-modal-input ui-control" data-np-giturl name="project-git-url" type="text" placeholder="https://github.com/user/repo.git or git@github.com:user/repo.git">
                         </label>
                     </div>
                     <p class="new-project-trust-note" data-np-trust hidden>
                         The agent gets <strong>read, write and shell</strong> in this folder when working on this project's tasks.
                     </p>
-                    <p class="new-project-error" data-np-error hidden></p>
+                    <p class="new-project-error" data-np-error role="alert" hidden></p>
                 </div>
                 <div class="marketplace-modal-actions">
                     <button type="button" class="btn btn-default" data-np-cancel>Cancel</button>
@@ -64,6 +66,9 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
         const q = (sel) => backdrop.querySelector(sel);
         let selectedDir = '';
         let browsePath = '';
+        let settled = false;
+        let browseRequest = 0;
+        let disposeFocus = () => {};
 
         const setError = (text) => {
             const el = q('[data-np-error]');
@@ -72,11 +77,13 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
         };
 
         async function renderDirs(path) {
+            const request = ++browseRequest;
             const listEl = q('[data-np-dirs]');
             const pathEl = q('[data-np-path]');
             listEl.textContent = 'Loading…';
             try {
                 const data = await apiClient.fsDirs(path);
+                if (settled || request !== browseRequest) return;
                 browsePath = data.path;
                 pathEl.textContent = '';
                 const cur = document.createElement('strong');
@@ -89,7 +96,9 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
                 select.addEventListener('click', () => {
                     selectedDir = data.path;
                     q('[data-np-trust]').hidden = false;
-                    renderDirs(data.path);
+                    q('[data-np-selected]').textContent = `Selected folder: ${selectedDir}`;
+                    select.classList.replace('btn-default', 'btn-primary');
+                    select.textContent = 'Selected ✓';
                 });
                 pathEl.appendChild(select);
                 listEl.textContent = '';
@@ -123,6 +132,7 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
                     listEl.appendChild(more);
                 }
             } catch (e) {
+                if (settled || request !== browseRequest) return;
                 listEl.textContent = `Cannot browse: ${e?.message || e}`;
             }
         }
@@ -140,20 +150,16 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
             radio.addEventListener('change', syncSource);
         });
 
-        let settled = false;
         const finish = (value) => {
             if (settled) return;
             settled = true;
-            document.removeEventListener('keydown', onKey);
+            disposeFocus();
             backdrop.remove();
             resolve(value);
         };
-        const onKey = (event) => {
-            if (event.key === 'Escape') finish(null);
-        };
-        document.addEventListener('keydown', onKey);
 
         async function create() {
+            if (settled || q('[data-np-create]').disabled) return;
             setError('');
             const name = (q('[data-np-name]').value || '').trim();
             const source = backdrop.querySelector('input[name="np-source"]:checked')?.value || 'fileless';
@@ -179,6 +185,7 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
                 finish(data?.project || null);
                 onCreated?.(data?.project || null);
             } catch (e) {
+                if (settled) return;
                 const detail = e?.body?.error || e?.message || String(e);
                 const code = e?.body?.error_code || '';
                 setError(code === 'auth_required'
@@ -193,7 +200,10 @@ export function openNewProjectDialog({ apiClient, onCreated }) {
             else if (event.target.closest('[data-np-create]')) create();
         });
         document.body.appendChild(backdrop);
-        q('[data-np-name]').focus();
+        disposeFocus = bindDialogFocus(q('[role="dialog"]'), {
+            initialFocus: q('[data-np-name]'),
+            onEscape: () => finish(null),
+        });
     });
 }
 
@@ -205,44 +215,19 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
     const maxNameLength = PROJECT_NAME_MAX;
     closeOpenProjectRowMenu?.();
     const menu = document.createElement('div');
-    menu.className = 'project-row-menu';
+    menu.className = 'project-row-menu ui-popup';
     menu.setAttribute('role', 'menu');
     menu.setAttribute('aria-label', `Actions for ${project.name || project.id}`);
     menu.innerHTML = `
         <button type="button" role="menuitem" data-prm="rename">Rename…</button>
         <button type="button" role="menuitem" class="danger" data-prm="delete">Delete project…</button>
     `;
-    const rect = anchorEl.getBoundingClientRect();
-    const close = ({ restoreFocus = false } = {}) => {
-        menu.remove();
-        document.removeEventListener('click', onDoc, true);
-        document.removeEventListener('keydown', onKey, true);
-        if (closeOpenProjectRowMenu === close) closeOpenProjectRowMenu = null;
-        if (restoreFocus && anchorEl.isConnected) anchorEl.focus();
-    };
-    const onDoc = (event) => { if (!menu.contains(event.target)) close(); };
-    const onKey = (event) => {
-        const items = Array.from(menu.querySelectorAll('[role="menuitem"]'));
-        const index = items.indexOf(document.activeElement);
-        if (event.key === 'Escape') {
-            event.preventDefault();
-            close({ restoreFocus: true });
-        } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
-            event.preventDefault();
-            const delta = event.key === 'ArrowDown' ? 1 : -1;
-            items[(index + delta + items.length) % items.length]?.focus();
-        } else if (event.key === 'Home' || event.key === 'End') {
-            event.preventDefault();
-            items[event.key === 'Home' ? 0 : items.length - 1]?.focus();
-        }
-    };
-    closeOpenProjectRowMenu = close;
-    document.addEventListener('click', onDoc, true);
-    document.addEventListener('keydown', onKey, true);
+    let binding;
+    const close = (options) => binding?.close(options);
     menu.addEventListener('click', async (event) => {
         const action = event.target.closest('[data-prm]')?.dataset?.prm;
         if (!action) return;
-        close();
+        close({ restoreFocus: true });
         if (action === 'rename') {
             const res = await openConfirmDialog({
                 title: 'Rename project',
@@ -253,10 +238,20 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
             });
             const newName = res?.confirmed ? String(res.value || '').trim() : '';
             if (newName.length > maxNameLength) {
-                alert(`Project names are limited to ${maxNameLength} characters.`);
+                await openConfirmDialog({
+                    title: 'Rename project',
+                    body: `Project names are limited to ${maxNameLength} characters.`,
+                    alert: true,
+                });
             } else if (newName && newName !== project.name) {
                 try { await apiClient.projectUpdate(project.id, newName); onChanged?.(); }
-                catch (e) { alert(`Rename failed: ${e?.body?.error || e?.message || e}`); }
+                catch (e) {
+                    await openConfirmDialog({
+                        title: 'Rename failed',
+                        body: `Rename failed: ${e?.body?.error || e?.message || e}`,
+                        alert: true,
+                    });
+                }
             }
             if (anchorEl.isConnected) anchorEl.focus();
         } else if (action === 'delete') {
@@ -269,24 +264,28 @@ export async function openProjectRowMenu(project, { apiClient, anchorEl, onChang
             if (ok === true) {
                 onChanged?.({ projectId: project.id, lifecycle: 'deleting', optimistic: true });
                 try { await apiClient.projectDelete(project.id); }
-                catch (e) { alert(`Delete did not finish: ${e?.body?.error || e?.message || e}`); }
+                catch (e) {
+                    await openConfirmDialog({
+                        title: 'Delete did not finish',
+                        body: `Delete did not finish: ${e?.body?.error || e?.message || e}`,
+                        alert: true,
+                    });
+                }
                 finally { onChanged?.({ authoritative: true }); }
             }
             if (anchorEl.isConnected) anchorEl.focus();
         }
     });
     document.body.appendChild(menu);
-    const menuRect = menu.getBoundingClientRect();
-    const margin = 8;
-    const top = Math.min(
-        Math.max(margin, rect.bottom + 4),
-        Math.max(margin, window.innerHeight - menuRect.height - margin),
-    );
-    const left = Math.min(
-        Math.max(margin, rect.right - menuRect.width),
-        Math.max(margin, window.innerWidth - menuRect.width - margin),
-    );
-    menu.style.setProperty('--prm-top', `${Math.round(top)}px`);
-    menu.style.setProperty('--prm-left', `${Math.round(left)}px`);
-    menu.querySelector('[role="menuitem"]')?.focus();
+    anchorEl.setAttribute('aria-haspopup', 'menu');
+    anchorEl.setAttribute('aria-expanded', 'true');
+    binding = bindMenu(menu, {
+        anchor: anchorEl,
+        onClose: () => {
+            menu.remove();
+            anchorEl.setAttribute('aria-expanded', 'false');
+            if (closeOpenProjectRowMenu === close) closeOpenProjectRowMenu = null;
+        },
+    });
+    closeOpenProjectRowMenu = close;
 }

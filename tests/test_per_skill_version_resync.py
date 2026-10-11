@@ -348,3 +348,146 @@ def test_read_version_returns_empty_for_missing_files(tmp_path):
     skill = tmp_path / "skill"
     skill.mkdir()
     assert _read_skill_manifest_version(skill) == ""
+
+
+def test_telegram_owner_wait_upgrade_reseeds_current_version(tmp_path, fake_log):
+    """The launcher-owned Telegram payload must deliver the owner-wait update.
+
+    The pinned string is the RESYNC KEY, not decoration: `_per_skill_version_resync`
+    re-seeds a marker-owned native skill only when the seed and installed `SKILL.md`
+    `version` differ, so a payload change shipped without a bump never reaches an
+    existing install. Re-pin this whenever skills/telegram payload changes.
+    """
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync
+
+    seed_dir = pathlib.Path(__file__).resolve().parents[1] / "skills"
+    drive_root = tmp_path / "data"
+    native_root = drive_root / "skills" / "native"
+    installed = _write_skill(native_root, "telegram", version="1.2.0")
+    (installed / ".seed-origin").write_text("seeded_from=test\n", encoding="utf-8")
+
+    upgraded = _per_skill_version_resync(
+        seed_dir,
+        native_root,
+        fake_log,
+        drive_root=drive_root,
+    )
+
+    assert upgraded == 1
+    assert "version: 1.2.11" in (installed / "SKILL.md").read_text(encoding="utf-8")
+    for path in ("plugin.py", "lib/telegram_quiz.py", "lib/telegram_state.py"):
+        assert (installed / path).read_bytes() == (seed_dir / "telegram" / path).read_bytes()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("name,source,old_version,new_version", [
+    ("telegram", "d918b6973235013e5d7b9d78fe98701979396d4f", "1.2.6", "1.2.11"),
+    ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.4.2"),
+])
+def test_resync_delivers_payload_from_real_previous_seed(
+    tmp_path, fake_log, monkeypatch, name, source, old_version, new_version,
+):
+    """Use the full preceding seed, including its real payload.
+
+    These official history objects are available in CI's full checkout; a missing
+    object is a fixture error, not evidence that an upgrade was exercised.
+    """
+    import io
+    import subprocess
+    import tarfile
+
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync, _read_skill_manifest
+    from ouroboros.skill_loader import compute_content_hash, load_review_state, save_enabled
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    drive = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "true")
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive / "settings.json")
+    native = drive / "skills" / "native"
+    installed = native / name
+    installed.mkdir(parents=True)
+    archived = subprocess.run(["git", "archive", f"{source}:skills/{name}"], cwd=repo,
+                              capture_output=True, check=True, timeout=30)
+    with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as archive:
+        for member in archive:
+            if member.isdir():
+                continue
+            target = installed / member.name
+            assert member.isfile() and target.resolve().is_relative_to(installed.resolve())
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(archive.extractfile(member).read())
+    (installed / ".seed-origin").write_text(f"seeded_from={source}\n", encoding="utf-8")
+    assert _read_skill_manifest(installed).version == old_version
+    changed_payload = (
+        "lib/miniapp_registration.py", "scripts/platform_support.py",
+        "scripts/cloudflare_tunnel.py", "scripts/runtime_status.py",
+        "lib/telegram_api.py", "lib/telegram_notifier.py",
+        "scripts/telegram_settings.py", "scripts/telegram_menu.py", "scripts/companion.py",
+    ) if name == "telegram" else ()
+    for path in changed_payload:
+        assert (installed / path).read_bytes() != (repo / "skills" / name / path).read_bytes()
+    save_enabled(drive, name, False)
+    state = drive / "state" / "skills" / name
+    (state / "settings.json").write_text('{"TELEGRAM_CHAT_ID":"12345"}', encoding="utf-8")
+    preserved = {path.name: path.read_bytes() for path in state.iterdir() if path.is_file()}
+    assert _per_skill_version_resync(repo / "skills", native, fake_log, drive_root=drive) == 1
+    manifest = _read_skill_manifest(installed)
+    assert manifest.version == new_version
+    hash_args = {"manifest_entry": manifest.entry, "manifest_scripts": manifest.scripts}
+    new_hash = compute_content_hash(installed, **hash_args)
+    assert new_hash == compute_content_hash(repo / "skills" / name, **hash_args)
+    for path in changed_payload:
+        assert (installed / path).read_bytes() == (repo / "skills" / name / path).read_bytes()
+    for path, payload in preserved.items():
+        assert (state / path).read_bytes() == payload
+    review = load_review_state(drive, name, skill_dir=installed)
+    assert review.review_profile == "native_seed"
+    assert review.content_hash == new_hash
+
+
+@pytest.mark.parametrize("drift", [False, True])
+def test_same_version_hash_drift_is_only_diagnostic(staging, fake_log, caplog, drift):
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync
+
+    seed_dir, native_root, drive_root = staging
+    seed = _write_skill(seed_dir, "weather")
+    installed = _write_skill(native_root, "weather")
+    (installed / ".seed-origin").write_text("seeded_from=test\n")
+    (seed / "payload.txt").write_text("seed")
+    (installed / "payload.txt").write_text("local" if drift else "seed")
+    state = drive_root / "state" / "skills" / "weather"
+    state.mkdir(parents=True)
+    for name in ("enabled.json", "grants.json", "review.json"):
+        (state / name).write_text('{"unchanged":true}')
+    before = {str(path.relative_to(drive_root)): path.read_bytes()
+              for path in drive_root.rglob("*") if path.is_file()}
+    with caplog.at_level(logging.WARNING, logger=fake_log.name):
+        assert _per_skill_version_resync(seed_dir, native_root, fake_log, drive_root=drive_root) == 0
+    after = {str(path.relative_to(drive_root)): path.read_bytes()
+             for path in drive_root.rglob("*") if path.is_file()}
+    assert after == before
+    assert ("installed files retained because the manifest version is unchanged" in caplog.text) is drift
+    assert len(caplog.records) == int(drift)
+
+
+def test_hash_comparison_failure_does_not_stop_next_skill(staging, fake_log, caplog, monkeypatch):
+    from ouroboros.launcher_bootstrap import _per_skill_version_resync
+    import ouroboros.skill_loader as loader
+
+    seed_dir, native_root, drive_root = staging
+    for name in ("first", "second"):
+        _write_skill(seed_dir, name, "1.0.0" if name == "first" else "2.0.0")
+        installed = _write_skill(native_root, name)
+        (installed / ".seed-origin").write_text("seeded_from=test\n")
+    original = loader.compute_content_hash
+    def unreadable(path, **kwargs):
+        if path.name == "first":
+            raise OSError("private error detail")
+        return original(path, **kwargs)
+    monkeypatch.setattr(loader, "compute_content_hash", unreadable)
+    with caplog.at_level(logging.WARNING, logger=fake_log.name):
+        assert _per_skill_version_resync(seed_dir, native_root, fake_log, drive_root=drive_root) == 1
+    assert "comparison unavailable (OSError)" in caplog.text
+    assert "private error detail" not in caplog.text
+    assert "version: 1.0.0" in (native_root / "first" / "SKILL.md").read_text()
+    assert "version: 2.0.0" in (native_root / "second" / "SKILL.md").read_text()

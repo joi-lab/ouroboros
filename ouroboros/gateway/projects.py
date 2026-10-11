@@ -155,10 +155,15 @@ def _derive_project_name(drive_root: object, task_id: str) -> str:
 
 
 def _preset_suggested_name(drive_root: object, task_id: str) -> str:
-    """The LLM title the proactive card namer already coined for this task (Cluster B),
-    read from the persisted result then the live queue. Reused by turn-into-project so
-    the conversion needs no extra LLM call. Empty when the namer has not run yet (a
-    convert click within the first ~second). Never raises."""
+    """The name already sitting in this task's ``suggested_name`` slot, read from
+    the persisted result then the live queue. Reused by turn-into-project so the
+    conversion needs no extra LLM call.
+
+    Two producers fill that slot and this function cannot tell them apart, which
+    is why its naming reason says only where the name was READ: the proactive
+    card namer coins one with a model for a Main-chat turn, and headless
+    admission derives one lexically from the request's first line. Empty when
+    neither has run (a convert click within the first ~second). Never raises."""
     try:
         from ouroboros.task_results import load_task_result
 
@@ -171,6 +176,22 @@ def _preset_suggested_name(drive_root: object, task_id: str) -> str:
         value = str((src or {}).get("suggested_name") or "").strip()
         if value:
             return value
+    return ""
+
+
+def _explicit_task_title(drive_root: object, task_id: str) -> str:
+    """Existing model-authored task title, before any naming fallback/call."""
+    try:
+        from ouroboros.task_results import load_task_result
+
+        result = load_task_result(drive_root, task_id) or {}
+    except Exception:
+        log.debug("_explicit_task_title: load_task_result failed", exc_info=True)
+        result = {}
+    for source in (result, _task_from_live_queue(drive_root, task_id)):
+        value = str((source or {}).get("title") or "").strip()
+        if value:
+            return _cap_name(value)
     return ""
 
 
@@ -246,26 +267,139 @@ def _system_task_display_name(drive_root: object, task_id: str) -> str:
 
 
 def _emit_naming_reason(drive_root: object, task_id: str, name: str, reason: str) -> None:
-    """Durable structured telemetry for HOW a project was named (which fallback
-    path fired) so a future "New project" regression is visible in events.jsonl
-    instead of silent (north star: transparency). Best-effort; never raises."""
+    """Durable structured telemetry for HOW a project was named (which fallback path
+    fired) so a future "New project" regression is visible in events.jsonl instead of
+    silent (north star: transparency). Written only where a project is really CREATED.
+    Best-effort; never raises."""
     try:
         import pathlib
 
         from ouroboros.utils import append_jsonl, utc_now_iso
 
-        append_jsonl(
-            pathlib.Path(str(drive_root)) / "logs" / "events.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "project_named",
-                "task_id": str(task_id),
-                "name": str(name),
-                "reason": str(reason),
-            },
-        )
+        append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", {
+            "ts": utc_now_iso(), "type": "project_named",
+            "task_id": str(task_id), "name": str(name), "reason": str(reason),
+        })
     except Exception:
         log.debug("_emit_naming_reason failed", exc_info=True)
+
+
+def _mark_task_lane(task_id: str, pid: str, *, project: dict = None, restore: dict = None) -> dict:
+    """Point the live queue/lease copy of ``task_id`` at ``pid`` under the queue lock
+    and persist the snapshot; returns the value the lane held BEFORE the call, so a
+    refused durable bind can put it back. SSOT for every post-hoc convert path here
+    (fresh bind, origin adopt, sibling claim). It shares the lane MECHANICS — queue
+    lock plus snapshot — with the in-task ``ensure_project_scope`` mark so those
+    cannot drift apart, but NOT the authority policy: that call passes
+    ``authority="binding"`` only when the origin adopt named the project.
+
+    The lease + assignment read ``task["project_id"]`` from the supervisor's in-memory
+    RUNNING map and PENDING list, NOT the durable bindings — so this mark, not
+    ``bind_task_to_project``, is a conversion's effective commit point for one-writer
+    serialization, and the caller makes it BEFORE the durable bind (an assign pass and
+    the mark are mutually exclusive on the queue RLock, so once the mark lands the next
+    pass already sees the lane; the bind's relative timing is irrelevant because
+    assignment never reads it). ``authority="binding"`` because the caller OWNS the
+    binding it is about to write, so the in-memory copy follows the truth even when the
+    row carries a derived id from a bare-workspace promote. The snapshot keeps a
+    still-PENDING converted task scoped across a restart, and is BEST-EFFORT: raising
+    after the mark landed cost the caller its ``previous`` value, so a later bind
+    refusal "restored" an empty lane it never set, clearing a project the task really
+    had. The main loop persists every tick anyway. No-op when the task is neither
+    running nor pending — the durable bind alone is then correct."""
+    from ouroboros.project_lease import mark_task_project, task_lane_project_state
+    from supervisor.queue import _queue_lock, persist_queue_snapshot
+    from supervisor.workers import PENDING, RUNNING
+
+    with _queue_lock:
+        previous = task_lane_project_state(RUNNING, PENDING, task_id)
+        marked = mark_task_project(RUNNING, PENDING, task_id, pid, authority="binding",
+                                   project=project, restore=restore)
+    if marked:
+        try:
+            persist_queue_snapshot(reason="project_from_task")
+        except Exception:
+            log.debug("_mark_task_lane: snapshot persist failed for %s", task_id, exc_info=True)
+    return previous
+
+
+def _live_origin_siblings(origin_ref: Any, clicked_task_id: str) -> list:
+    """Live task ids OTHER than ``clicked_task_id`` carrying the same owner-message
+    origin. The live scan itself is ``projects_registry.live_origin_lanes`` — the
+    /api/state binding projection reads the SAME lanes, so a card this claim does
+    not reach cannot keep offering a second conversion. Never raises."""
+    from ouroboros.projects_registry import live_origin_lanes, origin_key
+
+    key = origin_key(origin_ref)
+    clicked = str(clicked_task_id)
+    if key is None:
+        return []
+    return list(dict.fromkeys(
+        tid for tid, ref in live_origin_lanes() if origin_key(ref) == key and tid != clicked
+    ))
+
+
+def _claim_origin_siblings(
+    drive_root: object, project: dict, origin_ref: Any, clicked_task_id: str,
+) -> dict:
+    """Bind the FRESHLY created project's live origin siblings to it, so one owner
+    message cannot keep a second convertible unit. A sibling already bound elsewhere
+    (an explicit ``route_to_project``/``project_name`` root) is SKIPPED — its binding
+    is immutable and the model's explicit choice stays the ceiling — with its lane
+    restored and a DEBUG line; the owner never sees a 4xx for it. Returns
+    ``{"bound": [...], "skipped": [...]}`` for the disclosure row. Never raises."""
+    from ouroboros.projects_registry import bind_task_to_project, project_id_for_task
+    outcome: dict = {"bound": [], "skipped": []}
+    pid = str(project.get("id") or "")
+    for tid in _live_origin_siblings(origin_ref, clicked_task_id):
+        try:
+            existing = str(project_id_for_task(drive_root, tid) or "")
+        except Exception:
+            existing = ""
+            log.debug("_claim_origin_siblings: binding read failed for %s", tid, exc_info=True)
+        if existing:
+            # Bound already: an explicit choice, or an earlier claim. Immutable either
+            # way - read it BEFORE the lane mark so nothing has to be rolled back.
+            outcome["skipped"].append({"task_id": tid, "reason": f"already_bound:{existing}"})
+            continue
+        try:
+            previous = _mark_task_lane(tid, pid, project=project)
+        except Exception:
+            previous = None
+            log.debug("_claim_origin_siblings: lane mark failed for %s", tid, exc_info=True)
+        try:
+            bind_task_to_project(
+                drive_root, tid, pid, project.get("chat_id"),
+                origin=_owner_task_origin(drive_root, tid),
+            )
+            outcome["bound"].append(tid)
+        except Exception as exc:
+            try:
+                if previous is not None:
+                    _mark_task_lane(tid, previous.get("project_id", ""), restore=previous)
+            except Exception:
+                log.debug("_claim_origin_siblings: lane restore failed for %s", tid, exc_info=True)
+            outcome["skipped"].append({"task_id": tid, "reason": f"{type(exc).__name__}: {exc}"})
+            log.debug("_claim_origin_siblings: %s keeps its own binding", tid, exc_info=True)
+    if outcome["bound"] or outcome["skipped"]:
+        try:  # durable disclosure (P1) of who else joined, and who could not
+            import pathlib
+
+            from ouroboros.utils import append_jsonl, utc_now_iso
+
+            append_jsonl(
+                pathlib.Path(str(drive_root)) / "logs" / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "project_origin_siblings_bound",
+                    "task_id": str(clicked_task_id),
+                    "project_id": pid,
+                    **outcome,
+                },
+            )
+        except Exception:
+            log.debug("project_origin_siblings_bound row failed", exc_info=True)
+    return outcome
 
 
 async def api_projects_list(request: Request) -> JSONResponse:
@@ -314,6 +448,18 @@ async def api_projects_create(request: Request) -> JSONResponse:
         body = await request.json()
         if not isinstance(body, dict):
             return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+        # Executable gateway ABI (ABI-3, Q7=A): type-check the declared
+        # ProjectCreateRequest fields (all optional) before bespoke parsing.
+        from ouroboros.gateway.contracts import ProjectCreateRequest
+        from ouroboros.gateway.schema import validate_ingress
+
+        schema_errors = validate_ingress(body, ProjectCreateRequest)
+        if schema_errors:
+            return JSONResponse(
+                {"error": f"invalid request body: {schema_errors[0]}",
+                 "schema_errors": schema_errors[:8]},
+                status_code=400,
+            )
         name = str(body.get("name") or "").strip()
         if len(name) > PROJECT_NAME_MAX:
             return JSONResponse(
@@ -349,7 +495,7 @@ async def api_projects_create(request: Request) -> JSONResponse:
         # and the fresh clone dangling. Source-less create stays idempotent.
         from ouroboros.projects_registry import get_project
 
-        _existing = get_project(drive_root, sanitize_project_id(raw_id))
+        _existing = get_project(drive_root, sanitize_project_id(raw_id), strict=True)
         if _existing and (attach_path or git_url or with_workspace):
             return JSONResponse(
                 {
@@ -364,12 +510,13 @@ async def api_projects_create(request: Request) -> JSONResponse:
 
         working_dir, provenance, clone_url = "", "none", ""
         init_git_skipped: list = []
+        init_git_warnings: list = []
         if attach_path:
             from ouroboros.project_sources import (
                 attach_snapshot_init,
-                is_git_worktree_root,
                 validate_attach_path,
             )
+            from ouroboros.workspace_admission import WorkspaceRootError, validate_workspace_root
 
             resolved, error = validate_attach_path(
                 attach_path, system_repo_dir=repo_dir, drive_root=drive_root
@@ -377,23 +524,17 @@ async def api_projects_create(request: Request) -> JSONResponse:
             if error:
                 return JSONResponse({"error": error}, status_code=400)
             if bool(body.get("init_git")):
-                init_error, init_git_skipped = await asyncio.to_thread(attach_snapshot_init, resolved)
+                # The explicit choice may create a standalone repository inside
+                # an existing one. Validate that resulting worktree geometry.
+                init_error, init_git_skipped = await asyncio.to_thread(attach_snapshot_init, resolved, warnings=init_git_warnings)
                 if init_error:
                     return JSONResponse({"error": f"init_git failed: {init_error}"}, status_code=400)
-            elif not await asyncio.to_thread(is_git_worktree_root, resolved):
-                # Task admission requires a git worktree root — registering a non-git
-                # folder would create a project whose room tasks are born dead
-                # (triad r5). Actionable refusal BEFORE any registry mutation.
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"{resolved} is not a git repository — enable init_git "
-                            "(makes an attach-snapshot commit) or pick a git worktree root"
-                        ),
-                        "error_code": "attach_requires_git",
-                    },
-                    status_code=400,
+            try:
+                resolved = await asyncio.to_thread(
+                    validate_workspace_root, resolved, system_repo_dir=repo_dir, drive_root=drive_root
                 )
+            except WorkspaceRootError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
             working_dir, provenance = str(resolved), "attached"
         elif git_url:
             from ouroboros.project_sources import clone_project_repo
@@ -432,6 +573,16 @@ async def api_projects_create(request: Request) -> JSONResponse:
             trusted_at=utc_now_iso() if provenance in ("attached", "cloned") else str(entry.get("trusted_at") or ""),
         )
         payload: dict = {"project": stamped or entry}
+        if init_git_warnings:
+            from ouroboros.utils import append_jsonl
+            payload["init_git_warnings"] = init_git_warnings
+            try:
+                append_jsonl(drive_root / "logs" / "events.jsonl", {
+                    "ts": utc_now_iso(), "type": "project_capture_advisory", "project_id": entry["id"],
+                    "findings": init_git_warnings,
+                })
+            except Exception:
+                log.warning("Project capture advisory could not be logged", exc_info=True)
         if init_git_skipped:
             # Disclosed omission (P1): credential-shaped files excluded from the
             # attach snapshot; they stay untracked via .git/info/exclude.
@@ -454,7 +605,7 @@ async def api_project_update(request: Request) -> JSONResponse:
         if not isinstance(body, dict):
             return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
         drive_root = request_drive_root(request)
-        if get_project(drive_root, project_id) is None:
+        if get_project(drive_root, project_id, strict=True) is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         name = str(body.get("name") or "").strip()
         if not name:
@@ -488,7 +639,7 @@ async def api_project_delete(request: Request) -> JSONResponse:
 
         project_id = str(request.path_params.get("project_id") or "").strip()
         drive_root = request_drive_root(request)
-        entry = get_reserved_project(drive_root, project_id)
+        entry = get_reserved_project(drive_root, project_id, strict=True)
         if entry is None:
             return JSONResponse({"error": f"unknown project: {project_id}"}, status_code=404)
         # All queue/binding comparisons use the canonical registry id.  The
@@ -576,6 +727,10 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             PROJECT_NAME_MAX,
             bind_task_to_project,
             create_project,
+            get_project,
+            origin_claim_lock,
+            project_id_for_origin,
+            project_id_for_task,
             touch_project,
         )
 
@@ -592,13 +747,174 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                 status_code=400,
             )
         drive_root = request_drive_root(request)
-        # Auto-name from the task's own title/objective when the caller sends none
-        # (the one-click convert path), so no human input and no extra LLM call
-        # are needed (owner P1). An explicit name still wins. Order: explicit name ->
-        # server-derived (title/objective/queue) -> the frontend's objective_hint
-        # (the owner's original request, for a still in-progress DIRECT chat task
-        # with no server-side source yet) -> a neutral "New project". Never the bare
-        # task id — the owner explicitly does not want names surfacing as "task-…".
+        # An IMPLICIT conversion is the one-click owner act: the browser sends the
+        # default id for this task (chat_activity.js::projectIdFromTask) or none at all
+        # — and ``raw_id`` already defaults to that same ``task-<task_id>`` — so the
+        # request names no particular room and the work's own project answers it. Both
+        # halves go through the SERVER's own sanitizer (case and single stray characters;
+        # not the client's run-collapsing or dash trimming, which today's hex/sha task ids
+        # never trigger). An EXPLICIT different id is a caller naming a room.
+        implicit = sanitize_project_id(raw_id) == sanitize_project_id(f"task-{task_id}")
+        disclosed: list = []
+
+        def _conflicting_binding(*, disclose: bool) -> Any:
+            """The 409 answer when the task is READABLY bound to another project, None
+            otherwise. Read at EVERY side-effect boundary (owner decision B4=A): naming
+            can call a model, create_project mints a registry row and the lease mark
+            hands it a lane - all of which used to happen before the immutable bind
+            refused a task that already belonged somewhere else, and a single read taken
+            before the naming await cannot see a task that bound itself during it. The
+            refusal NAMES that project, so no surface has to invent an explanation (there
+            is no reload affordance in the desktop shell, the Telegram mini app or the
+            mobile layout). An UNREADABLE store is disclosed once and read as "no
+            binding", exactly as the hot path reads it, so the conversion proceeds as it
+            would for an unbound task."""
+            try:
+                bound = str(project_id_for_task(drive_root, task_id, strict=True) or "")
+            except Exception:
+                if disclose:
+                    log.warning(
+                        "project_binding_unreadable: convert of task %s continues as unbound",
+                        task_id, exc_info=True,
+                    )
+                return None
+            if not bound or bound == sanitize_project_id(raw_id):
+                return None
+            bound_name = str((get_project(drive_root, bound) or {}).get("name") or "").strip() or bound
+            return JSONResponse(
+                {"error": f"This task already belongs to {bound_name} (id={bound}); "
+                          "open it there or start a new task."},
+                status_code=409,
+            )
+
+        # The owner's message identity, read ONCE: the same value answers "which
+        # project does this WORK already have" below and rides the durable bind at
+        # the end. Never re-derived from content (DEVELOPMENT.md anti-pattern).
+        origin = _owner_task_origin(drive_root, task_id)
+        origin_ref = origin.get("ref") if isinstance(origin, dict) else None
+
+        def _bind_and_answer(project: dict, *, adopted: bool) -> Any:
+            """Mark the lane, write the durable bind, answer. Called with the claim
+            lock held, after ``_claim`` has refreshed the origin."""
+            pid = str(project["id"])
+            try:
+                previous_lane = _mark_task_lane(task_id, pid, project=project)
+            except Exception:
+                previous_lane = None
+                log.debug("api_project_from_task: in-memory project_id update failed for %s",
+                          task_id, exc_info=True)
+            try:
+                binding = bind_task_to_project(
+                    drive_root, task_id, pid, project.get("chat_id"), origin=origin,
+                )
+            except Exception:
+                # The lane mark anticipates a bind the immutable store can still
+                # refuse. Put the lane back where it was (its previous project, or
+                # none) before answering, so the durable binding stays the one truth
+                # and no lane points at a project that binds nothing.
+                try:
+                    if previous_lane is not None:
+                        _mark_task_lane(task_id, previous_lane.get("project_id", ""), restore=previous_lane)
+                except Exception:
+                    log.debug("api_project_from_task: lane restore failed for %s", task_id, exc_info=True)
+                refusal = _conflicting_binding(disclose=False)
+                if refusal is None:
+                    raise
+                return refusal
+            touch_project(drive_root, pid)
+            from ouroboros.project_handoff import enqueue_project_handoff, handoff_identity
+
+            # One typed word for the Main history receipt; the binding above is
+            # committed whatever it says (ouroboros/project_handoff.py).
+            handoff_receipt = enqueue_project_handoff(drive_root, task_id, source_ref=origin_ref)
+            if not adopted:
+                # This conversion minted the project for THIS owner message, so the
+                # message's other live task ids join it now instead of each keeping a
+                # convert button of its own (that second button is what minted the
+                # duplicate Project).
+                _claim_origin_siblings(drive_root, project, origin_ref, task_id)
+            # Broadcast so every open tab + the live WS fan-out learns the project
+            # immediately, instead of waiting for the periodic /api/state poll
+            # (mirrors the promote path in supervisor/workers.py).
+            _broadcast_projects_changed(pid, project.get("chat_id"))
+            # ``adopted`` is always stated: a client that must tell "this work
+            # already had a project" from "this click created one" cannot read
+            # that from a key's absence, which is also how a transport that drops
+            # unknown fields looks.
+            return JSONResponse(
+                {"project": project, "binding": binding, "adopted": bool(adopted),
+                 "handoff_receipt": handoff_receipt,
+                 "handoff_id": handoff_identity(pid, task_id, origin_ref)},
+            )
+
+        def _claim(project_name: str = "", naming_reason: str = "") -> Any:
+            """The whole claim under the ONE process-local claim lock: re-read the
+            authority, ADOPT the project this work already has, or — once a name is
+            settled — CREATE the requested one and bind to it. ``None`` when there is
+            nothing to adopt and no name has been coined yet.
+
+            One message spawns several task ids (the direct turn that received it, the
+            root it promoted); each was separately convertible, so converting the
+            second one minted a second Project for one piece of work. Adoption creates
+            nothing and names nothing: the task joins the project its own origin
+            already names, and a stale button on a card that is already bound answers
+            with its project instead of an error toast. The lock is what makes two
+            cards of one message clicked in two tabs (or the desktop shell and the mini
+            app) yield ONE project; the naming step, which may await a model for
+            seconds, stays outside it and its result is simply discarded on adopt.
+
+            An EXPLICIT different project id is an API caller naming a specific room,
+            never the one-click owner act: it is not adopted away, and the task-keyed
+            409 still answers it (P13)."""
+            nonlocal origin, origin_ref
+            with origin_claim_lock():
+                if "absent" in origin:
+                    # The ingress record may persist only after this click started (and
+                    # again during the naming await): a stale absence answers "this work
+                    # has no project" and mints the one the sibling already owns.
+                    origin = _owner_task_origin(drive_root, task_id)
+                    origin_ref = origin.get("ref")
+                try:
+                    bound = str(project_id_for_task(drive_root, task_id, strict=True) or "")
+                    adopted = str(project_id_for_origin(drive_root, origin_ref, strict=True) or "")
+                except Exception:
+                    bound, adopted = "", ""
+                    if not disclosed:
+                        disclosed.append(True)
+                        log.warning(
+                            "project_binding_unreadable: convert of task %s continues as unbound",
+                            task_id, exc_info=True,
+                        )
+                target = (bound or adopted) if implicit else ""
+                project = get_project(drive_root, target, strict=True) if target else None
+                if project is not None:
+                    return _bind_and_answer(project, adopted=True)
+                if not project_name:
+                    return None
+                # Re-validated BEFORE the first side effect: the naming step can await
+                # a model for seconds, and a running task that scopes itself in that
+                # window binds durably to ANOTHER project.
+                refusal = _conflicting_binding(disclose=False)
+                if refusal is not None:
+                    return refusal
+                # Only a really CREATED project gets a naming row: an adopt discards the
+                # coined name, and a row for a name nobody saw reads as a regression.
+                _emit_naming_reason(drive_root, task_id, project_name, naming_reason)
+                return _bind_and_answer(
+                    create_project(
+                        drive_root, sanitize_project_id(raw_id), name=project_name,
+                        origin="task_card",
+                    ),
+                    adopted=False,
+                )
+
+        claimed = _claim()
+        if claimed is not None:
+            return claimed
+        if not implicit:
+            refusal = _conflicting_binding(disclose=True)
+            if refusal is not None:
+                return refusal
         supplied_name = str(body.get("name") or "").strip()
         if len(supplied_name) > PROJECT_NAME_MAX:
             return JSONResponse(
@@ -613,21 +929,26 @@ async def api_project_from_task(request: Request) -> JSONResponse:
         if len(hint) > _MAX_DERIVED_NAME:
             hint = hint[: _MAX_DERIVED_NAME - 1].rstrip() + "…"
         owner_text = _owner_request_text(drive_root, task_id, full_hint)
-        # LLM-first project name (Cluster B): the owner wants a name the model coined,
-        # not the heuristic "task-…". Order: explicit caller name -> a title the proactive
-        # card namer already coined (reused with ZERO extra call) -> an inline bounded
-        # light-model call -> the heuristic (title/objective/queue) -> the frontend hint
-        # -> a neutral "New project". The async namer folds the heuristic/hint candidates
-        # into its own fail-soft fallback, so a missing key / timeout never blocks convert.
+        # LLM-first project name (Cluster B), with no human input and no extra LLM call
+        # on the one-click path (owner P1): explicit caller name -> explicit task title
+        # -> a title the proactive card namer already coined (both reused with ZERO extra
+        # call) -> an inline bounded light-model call -> the heuristic (title/objective/
+        # queue) -> the frontend's objective_hint (the owner's original request, for a
+        # still in-progress DIRECT chat task with no server-side source yet) -> a neutral
+        # "New project". Never the bare task id — the owner does not want names surfacing
+        # as "task-…". The async namer folds the heuristic/hint candidates into its own
+        # fail-soft fallback, so a missing key / timeout never blocks convert.
         if supplied_name:
-            project_name = supplied_name
-            _emit_naming_reason(drive_root, task_id, project_name, "supplied")
+            project_name, reason = supplied_name, "supplied"
         else:
             from ouroboros.project_naming import llm_project_name_async
 
+            explicit_title = _explicit_task_title(drive_root, task_id)
             preset = _preset_suggested_name(drive_root, task_id)
-            if preset:
-                project_name, reason = preset, "proactive_namer"
+            if explicit_title:
+                project_name, reason = explicit_title, "explicit_task_title"
+            elif preset:
+                project_name, reason = preset, "preset_suggested_name"
             else:
                 # A skill/system task carries no owner request text; give the namer an
                 # explicit skill-derived candidate so the conversion never dead-ends at
@@ -653,67 +974,11 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                 else:
                     reason = "hint_or_fallback"
             project_name = _cap_name(project_name)
-            _emit_naming_reason(drive_root, task_id, project_name, reason)
-        project = create_project(
-            drive_root,
-            sanitize_project_id(raw_id),
-            name=project_name,
-            origin="task_card",
-        )
-        # Scope the live task to its new project's one-writer lane BEFORE the durable
-        # bind. The lease + assignment read task["project_id"] from the supervisor's
-        # in-memory RUNNING map and PENDING list, NOT the durable bindings — so this
-        # in-memory mark, not bind_task_to_project, is the conversion's effective commit
-        # point for one-writer serialization. Without it a UI conversion could let a
-        # concurrent same-project task be assigned (two writers), AND a still-PENDING
-        # converted task would start unscoped and miss its lane. Marking BEFORE the
-        # durable bind closes the interleaving where assign_tasks runs AFTER the bind but
-        # BEFORE the mark (an assign pass and mark are mutually exclusive on the same
-        # queue RLock, so once the mark lands the next pass already sees the lane): the
-        # bind's relative timing is irrelevant since assignment never reads it. The
-        # supervisor runs in-process (a thread), so we take its queue lock and use the
-        # SSOT helper shared with the in-task ensure_project_scope path. No-op if the task
-        # is neither running nor pending (the durable bind alone is then correct — there
-        # is no live lane to occupy).
-        try:
-            from ouroboros.project_lease import mark_task_project
-            from supervisor.queue import _queue_lock, persist_queue_snapshot
-            from supervisor.workers import PENDING, RUNNING
-
-            with _queue_lock:
-                marked = mark_task_project(RUNNING, PENDING, task_id, str(project["id"]))
-            # Persist the snapshot so a still-PENDING converted task survives a restart
-            # STILL scoped: restore_pending_from_snapshot rebuilds PENDING from
-            # state/queue_snapshot.json (assignment reads task['project_id'] from there,
-            # NOT the durable bindings), and that snapshot is otherwise only rewritten on
-            # the next queue event — so without this a restart in the window would restore
-            # the task unscoped. Mirrors api_task_create persisting after enqueue.
-            if marked:
-                persist_queue_snapshot(reason="project_from_task")
-        except Exception:
-            log.debug("api_project_from_task: in-memory project_id update failed for %s", task_id, exc_info=True)
-        binding = bind_task_to_project(
-            drive_root,
-            task_id,
-            str(project["id"]),
-            project.get("chat_id"),
-            origin=_owner_task_origin(drive_root, task_id),
-        )
-        touch_project(drive_root, str(project["id"]))
-        # Broadcast so every open tab + the live WS fan-out learns the new project
-        # immediately, instead of waiting for the periodic /api/state poll (mirrors
-        # the promote path in supervisor/workers.py).
-        try:
-            from supervisor.message_bus import get_bridge
-
-            get_bridge().broadcast({
-                "type": "projects_changed",
-                "project_id": str(project["id"]),
-                "chat_id": project.get("chat_id"),
-            })
-        except Exception:
-            log.debug("api_project_from_task: projects_changed broadcast failed", exc_info=True)
-        return JSONResponse({"project": project, "binding": binding})
+        # The naming step ran OUTSIDE the claim lock because it can await a model
+        # call for seconds. Claim again: if a sibling card of this same owner
+        # message won the race meanwhile, the coined name is simply discarded and
+        # the task joins the project that work already has.
+        return _claim(project_name or "New project", reason)
     except Exception as exc:
         return json_exception(exc)
 

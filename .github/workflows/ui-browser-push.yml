@@ -1,0 +1,126 @@
+# Browser proof for the code that actually landed on the shared branch.
+#
+# Two pull requests can each be green against the same base and still break the
+# interface once merged sequentially; only the merged commit proves otherwise.
+# This trigger therefore carries NO path filter — a Makefile-, `Ouroboros.spec`-
+# or requirements-only push reaches the lane too, as it reaches every push job
+# of `ci.yml`. The documentation-only skip is decided inside the shared lane from
+# the event diff, not here.
+#
+# No schedule and no new cron. A push and a manual `full` run call the shared lane,
+# the same one the manual/tag checks in ci.yml call. This manual entry is also the
+# ONLY place a PARTIAL DIAGNOSTIC can be selected: one fixed scenario that runs in
+# its own job below, outside the shared lane, so the lane a release waits for has no
+# selectable part and no job that is skipped whenever browsers run.
+# A red run here reports the branch state; it does not block merges by itself.
+name: UI browser (ouroboros push)
+run-name: ${{ inputs.diagnostic && inputs.diagnostic != 'full' && format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) || 'UI browser full lane' }}
+
+on:
+  push:
+    branches: [ouroboros]
+  workflow_dispatch:
+    inputs:
+      diagnostic:
+        description: Full lane or a partial UI-only diagnostic (never full-suite proof)
+        type: choice
+        default: full
+        options:
+          - full
+          - viewport
+          - inflight
+
+permissions:
+  contents: read
+
+# Deliberately NO concurrency group. Each run skips browsers only when ITS OWN
+# `before..sha` range is documentation-only, so a later docs-only push cannot
+# vouch for an earlier code push. Cancelling in-progress runs — or replacing a
+# pending one, which a group does even without `cancel-in-progress` — would let
+# that docs-only tip end green while the code it follows was never exercised.
+# Every push keeps its own complete lane; overlapping runs cost runner time only.
+
+jobs:
+  # Exactly one of the two jobs runs: the complete lane for a push and for a manual
+  # `full` run, the single scenario for any other manual selection.
+  ui-smoke:
+    name: ui-smoke
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.diagnostic == 'full' }}
+    uses: ./.github/workflows/ui-browser.yml
+    permissions:
+      contents: read
+
+  # Never full-lane proof: one scenario, with no lane guard, no shard, no manifest,
+  # no reconciliation and no browser-tools smoke. Its name says so wherever it shows.
+  ui-diagnostic:
+    name: ${{ inputs.diagnostic && inputs.diagnostic != 'full' && format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) || 'ui-diagnostic' }}
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic != 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-python-env
+        with:
+          install-project: 'false'
+        id: setup_python
+      - name: Install UI smoke Chromium and WebKit
+        id: install_browsers
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        timeout-minutes: 45
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+        run: python -m playwright install --with-deps chromium webkit
+      - name: Run PARTIAL DIAGNOSTIC host UI scenario
+        id: ui_diagnostic
+        if: ${{ !cancelled() && steps.install_browsers.outcome == 'success' }}
+        env:
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+        shell: bash
+        run: |
+          case "$DIAGNOSTIC" in
+            viewport) target=tests/test_ui_smoke_playwright.py::test_ui_smoke_live_card_mutations_preserve_viewport ;;
+            inflight) target=tests/test_ui_smoke_inflight_indicator.py::test_ui_smoke_chat_inflight_indicator_lifecycle ;;
+            *) echo "Unknown UI diagnostic selection" >&2; exit 2 ;;
+          esac
+          python -I -S scripts/safe_test.py -- python -m pytest "$target" -m ui_browser -q --tb=short \
+            --junitxml="${{ runner.temp }}/ci-private/ui/host.xml" \
+            --ci-evidence-dir="${{ runner.temp }}/ci-evidence/ui/host"
+      - name: Upload UI test evidence
+        id: ui_evidence
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ui-ci-${{ inputs.diagnostic }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence/ui/
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Summarize host UI test results
+        id: ui_summary
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        env:
+          PRODUCER_OUTCOME: ${{ steps.ui_diagnostic.outcome }}
+          ARTIFACT_OUTCOME: ${{ steps.ui_evidence.outcome }}
+          ARTIFACT_URL: ${{ steps.ui_evidence.outputs.artifact-url }}
+          DIAGNOSTIC: ${{ inputs.diagnostic }}
+        run: >-
+          python -m tests.ci_evidence summarize
+          --evidence-dir "${{ runner.temp }}/ci-evidence/ui/host"
+          --producer-outcome "$PRODUCER_OUTCOME" --scope "$DIAGNOSTIC"
+          --artifact-outcome "$ARTIFACT_OUTCOME" --artifact-url "$ARTIFACT_URL"
+          --summary "$GITHUB_STEP_SUMMARY"
+      - name: Disclose incomplete UI diagnostics
+        continue-on-error: true
+        if: >-
+          ${{ !cancelled() &&
+          (steps.ui_summary.outcome != 'success' ||
+           steps.ui_evidence.outcome != 'success' || steps.ui_evidence.outputs.artifact-url == '') }}
+        run: |
+          echo "::warning::UI diagnostics are incomplete; see the original test and reporting steps."
+          echo "UI diagnostics_incomplete. The original test outcomes are unchanged." >> "$GITHUB_STEP_SUMMARY"

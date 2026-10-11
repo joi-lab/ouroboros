@@ -1,382 +1,334 @@
-"""Tests for tool-history compaction protection (context_compaction.py)."""
-from ouroboros.context_compaction import compact_tool_history
+"""Focused contract tests for complete-input context reclaim."""
+
+from __future__ import annotations
+
+import copy
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import context_compaction as cc
+from ouroboros.context_budget import ContextReclaimRequest
 
 
-def _make_messages(tool_name: str, result_content: str, num_rounds: int = 8):
-    """Build a message list with num_rounds of tool calls, all using the same tool."""
-    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
-    for i in range(num_rounds):
-        tc_id = f"call_{i}"
-        messages.append({
-            "role": "assistant",
-            "content": f"Round {i}",
-            "tool_calls": [{
-                "id": tc_id,
-                "function": {"name": tool_name, "arguments": "{}"},
-            }],
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "content": result_content,
-        })
-    return messages
-
-
-def _make_large_arg_messages(tool_name: str, num_rounds: int = 8):
-    """Build messages whose old assistant tool-call payloads should compact."""
-    messages = [{"role": "system", "content": [{"type": "text", "text": "system"}]}]
-    large_args = '{"content": "' + ("x" * 1000) + '"}'
-    for i in range(num_rounds):
-        tc_id = f"call_{i}"
-        messages.append({
-            "role": "assistant",
-            "content": f"Round {i}",
-            "tool_calls": [{
-                "id": tc_id,
-                "function": {"name": tool_name, "arguments": large_args},
-            }],
-        })
-        messages.append({
-            "role": "tool",
-            "tool_call_id": tc_id,
-            "content": "ok",
-        })
-    return messages
-
-
-def test_protected_tool_results_survive_compaction():
-    """repo_commit results must not be truncated even in old rounds."""
-    original_result = "OK: committed to ouroboros: v3.19.0 review feedback applied"
-    msgs = _make_messages("commit_reviewed", original_result, num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    commit_results = [
-        m["content"] for m in compacted
-        if m.get("role") == "tool" and m["content"] == original_result
-    ]
-    assert len(commit_results) == 10, "All repo_commit results must survive compaction"
-
-
-def test_warning_results_survive_compaction():
-    """Results starting with warning emoji must not be truncated."""
-    warn_result = "\u26a0\ufe0f REVIEW_BLOCKED: tests failed, commit rejected. Fix errors first."
-    msgs = _make_messages("run_command", warn_result, num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    warning_results = [
-        m["content"] for m in compacted
-        if m.get("role") == "tool" and m["content"] == warn_result
-    ]
-    assert len(warning_results) == 10, "Warning-prefixed results must survive compaction"
-
-
-def test_old_assistant_tool_payloads_are_compacted():
-    """Fallback compaction should compact oversized old assistant tool-call payloads."""
-    msgs = _make_large_arg_messages("write_file", num_rounds=10)
-    compacted = compact_tool_history(msgs, keep_recent=3)
-
-    compacted_assistants = [
-        m for m in compacted
-        if m.get("role") == "assistant"
-        and m.get("tool_calls")
-        and "<<CONTENT_OMITTED len=" in m["tool_calls"][0]["function"]["arguments"]
-    ]
-    assert len(compacted_assistants) >= 4, "Old oversized assistant tool-call payloads should be compacted"
-
-
-# ── Protected-content detection ──────────────────────────────────────────────
-#
-# v4.34.0: the structured-reflection checkpoint ceremony was retired, so
-# assistant messages with `CHECKPOINT_REFLECTION` / `CHECKPOINT_ANOMALY`
-# text no longer need compaction protection — they no longer exist. The
-# remaining protected-content rule covers tool-result messages for
-# critical tools and explicit error markers (`⚠️`-prefixed tool output).
-
-
-def test_round_has_protected_content_ignores_normal_assistant_text():
-    """Normal assistant messages (no tool role, no error marker) must not be protected.
-
-    Previously the function also protected `CHECKPOINT_REFLECTION` /
-    `CHECKPOINT_ANOMALY` markers; that branch was removed in v4.34.0 along
-    with the audit-only checkpoint ceremony. This test guards against a
-    regression that would re-introduce any checkpoint-text protection.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    messages = [
-        {
-            "role": "assistant",
-            "content": "Normal reasoning without any reflection marker",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "c1",
-            "content": "file content",
-        },
-    ]
-    assert _round_has_protected_content(messages, 0, 1) is False
-
-
-def test_round_has_protected_content_does_not_protect_checkpoint_text():
-    """v4.34.0 regression guard: legacy CHECKPOINT_REFLECTION text is no longer
-    protected. A future edit that accidentally re-adds the assistant-content
-    detection would silently bloat transcripts with stale audit artifacts.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    messages = [
-        {
-            "role": "assistant",
-            "content": "CHECKPOINT_REFLECTION:\n- Known: x\n- Blocker: none",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {"role": "tool", "tool_call_id": "c1", "content": "ok"},
-    ]
-    assert _round_has_protected_content(messages, 0, 1) is False
-
-
-def test_round_has_protected_content_protects_error_tool_results():
-    """Tool-result messages prefixed with ⚠️ remain protected from compaction —
-    this was the other half of the pre-v4.34.0 rule and is unaffected by the
-    checkpoint refactor.
-    """
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "read_file", "arguments": "{}"}}],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "c1",
-            "content": "⚠️ failed to read path: permission denied",
-        },
-    ]
-    assert _round_has_protected_content(messages, 0, 1) is True
-
-
-def _round_with_result(content: str):
+def _unit(call_id: str, *, argument: str = "a", result: str = "r") -> list[dict]:
     return [
         {
             "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "c1", "function": {"name": "run_command", "arguments": "{}"}}],
+            "content": f"reasoning-{call_id}",
+            "tool_calls": [{
+                "id": call_id,
+                "function": {"name": "read_file", "arguments": argument},
+            }],
         },
-        {"role": "tool", "tool_call_id": "c1", "content": content},
+        {"role": "tool", "tool_call_id": call_id, "content": result},
     ]
 
 
-def test_autocorrect_prefixed_warning_is_still_protected():
-    """shell can prepend an autocorrect note BEFORE the ⚠️ line; the old
-    startswith check silently unprotected such warnings."""
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    messages = _round_with_result(
-        "Note: autocorrected 'gti' -> 'git'\n⚠️ REVIEW_BLOCKED: tests failed"
+def _large_unit(call_id: str, marker: str = "x") -> list[dict]:
+    return _unit(
+        call_id,
+        argument=json.dumps({"content": marker * 4_000 + f"-arg-tail-{call_id}"}),
+        result=marker * 4_000 + f"-result-tail-{call_id}",
     )
-    assert _round_has_protected_content(messages, 0, 1) is True
 
 
-def test_blank_line_separated_warning_is_still_protected():
-    """A blank line between the autocorrect note and the ⚠️ marker must not
-    defeat protection — the scan counts non-empty lines only."""
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    messages = _round_with_result(
-        "Note: autocorrected 'gti' -> 'git'\n\n⚠️ REVIEW_BLOCKED: tests failed"
+def _request(messages: list[dict], *, goal: int = 1_000_000) -> ContextReclaimRequest:
+    return ContextReclaimRequest(
+        route_fp="main-route",
+        round_id="round-7",
+        transcript_sha256=cc.context_reclaim_transcript_sha256(messages),
+        measurement_basis="fresh_route_usage",
+        measurement_density=1.0,
+        reclaim_goal_tokens=goal,
+        allow_partial_shrink=True,
     )
-    assert _round_has_protected_content(messages, 0, 1) is True
 
 
-def test_failed_text_fallback_still_carries_structured_spend(monkeypatch, tmp_path):
-    """Structured-call spend survives a text-protocol fallback failure via
-    _BatchSummaryError so the caller can account it."""
-    import pytest
+def _install_successful_materializer(monkeypatch, events: list[str] | None = None) -> None:
+    monkeypatch.setattr(cc, "_summarizer_spec", lambda: {
+        "model": "light-model",
+        "resolved_model": "light-model",
+        "provider": "test",
+        "route_fp": "summary-route",
+        "effort": "low",
+        "output_budget": 32_768,
+        "use_local": False,
+    })
 
-    from ouroboros import context_compaction, llm_observability
+    def checkpoint(*_args, **_kwargs):
+        if events is not None:
+            events.append("checkpoint")
+        return {"path": "calls/checkpoint.json", "sha256": "c" * 64}
 
-    calls = []
-
-    def fake_chat_observed(_client, **kwargs):
-        calls.append(kwargs)
-        if "tools" in kwargs:
-            # Structured call: spend incurred, but no parseable summaries.
-            return {"content": "free-form prose without round markers"}, {"prompt_tokens": 11}
-        raise RuntimeError("text protocol call exploded")
-
-    monkeypatch.setattr(llm_observability, "chat_observed", fake_chat_observed)
-    monkeypatch.delenv("USE_LOCAL_LIGHT", raising=False)
-
-    with pytest.raises(context_compaction._BatchSummaryError) as exc_info:
-        context_compaction._summarize_round_batch(
-            [(2, "TOOL_CALL x: {}")], drive_root=tmp_path, task_id="t"
-        )
-    assert exc_info.value.usage == {"prompt_tokens": 11}
-    assert len(calls) == 2
-
-
-def test_shell_exit_error_rounds_are_compactable():
-    """SHELL_EXIT_ERROR rounds are trial-and-error history that MUST compact
-    (the summarizer keeps the first error line); plain and autocorrect-prefixed
-    shapes are both exempt from ⚠️ protection."""
-    from ouroboros.context_compaction import _round_has_protected_content
-
-    plain = _round_with_result("⚠️ SHELL_EXIT_ERROR exit=1\nTraceback (most recent call last): ...")
-    assert _round_has_protected_content(plain, 0, 1) is False
-
-    prefixed = _round_with_result(
-        "Note: autocorrected 'pyhton' -> 'python'\n⚠️ SHELL_EXIT_ERROR exit=127\ncommand not found"
-    )
-    assert _round_has_protected_content(prefixed, 0, 1) is False
-
-
-# ── LLM compaction batch isolation + structured protocol ────────────────────
-
-
-def _make_llm_round_messages(num_rounds: int):
-    messages = [{"role": "system", "content": "system"}]
-    for i in range(num_rounds):
-        tc_id = f"call_{i}"
-        messages.append({
-            "role": "assistant",
-            "content": f"Round {i}",
-            "tool_calls": [{"id": tc_id, "function": {"name": "read_file", "arguments": "{}"}}],
+    def summarize(parts, *, usage_total, **_kwargs):
+        if events is not None:
+            events.append("summary")
+        cc._record_usage(usage_total, {
+            "prompt_tokens": len(parts) * 11,
+            "completion_tokens": len(parts) * 3,
+            "provider": "test",
         })
-        messages.append({"role": "tool", "tool_call_id": tc_id, "content": f"result {i}"})
-    return messages
+        return {part.source_id: f"covered {part.sha256}" for part in parts}
+
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint", checkpoint)
+    monkeypatch.setattr(cc, "_call_summarizer", summarize)
 
 
-def test_failed_batch_keeps_other_batches(monkeypatch, tmp_path):
-    """One failed batch leaves only ITS rounds raw; other batches still
-    compact, and spend from the failed batch is still accounted."""
-    from ouroboros import context_compaction
+def test_atomic_units_require_all_and_only_contiguous_matching_results():
+    complete = _unit("ok", argument="{}", result="done")
+    missing = _unit("missing", argument="{}", result="never")[:1]
+    delayed = _unit("late", argument="{}", result="late-result")
+    duplicate = [{
+        "role": "assistant",
+        "tool_calls": [
+            {"id": "dup", "function": {"name": "x", "arguments": "{}"}},
+            {"id": "dup", "function": {"name": "y", "arguments": "{}"}},
+        ],
+    }, {"role": "tool", "tool_call_id": "dup", "content": "one"}]
+    messages = [
+        *complete,
+        {"role": "user", "content": "hard boundary"},
+        *missing,
+        {"role": "user", "content": "interrupt"},
+        delayed[1],
+        *duplicate,
+        *_unit("final", argument="{}", result="done"),
+    ]
 
-    calls = []
+    units = cc._atomic_units(messages)
 
-    def fake_batch(rendered_blocks, *, drive_root, task_id):
-        calls.append([start for start, _ in rendered_blocks])
-        if len(calls) == 1:
-            raise context_compaction._BatchSummaryError(
-                "boom", usage={"prompt_tokens": 7, "cost": 0.01}
-            )
-        return (
-            {start: f"summary-{start}" for start, _ in rendered_blocks},
-            {"prompt_tokens": 3, "cost": 0.02},
-        )
+    assert [(unit.start, unit.end) for unit in units] == [(0, 1), (8, 9)]
+    assert all(messages[unit.start]["role"] == "assistant" for unit in units)
+    assert messages[2] == {"role": "user", "content": "hard boundary"}
 
-    monkeypatch.setattr(context_compaction, "_summarize_round_batch", fake_batch)
-    messages = _make_llm_round_messages(20)  # 16 compactable -> 2 batches of 8
 
-    compacted, usage = context_compaction.compact_tool_history_llm(
-        messages, keep_recent=4, drive_root=tmp_path, task_id="t"
+@pytest.mark.parametrize(
+    "malformed_call",
+    ["not-a-tool-call", {"id": "bad", "function": "not-a-function"}],
+)
+def test_malformed_tool_call_set_stays_raw_without_crashing(malformed_call):
+    messages = [
+        {"role": "assistant", "tool_calls": [malformed_call]},
+        {"role": "tool", "tool_call_id": "bad", "content": "result"},
+    ]
+
+    assert cc._atomic_units(messages) == ()
+
+
+def test_atomic_source_keeps_complete_arguments_results_and_trace_ref():
+    messages = _large_unit("call-complete", "z")
+    trace_ref = {"path": "calls/tool.json", "sha256": "d" * 64}
+
+    unit = cc._atomic_units(
+        messages,
+        trace_refs_by_tool_call_id={"call-complete": trace_ref},
+    )[0]
+
+    assert "-arg-tail-call-complete" in unit.source_text
+    assert "-result-tail-call-complete" in unit.source_text
+    assert "CONTENT_OMITTED" not in unit.source_text
+    assert "LONG_STRING" not in unit.source_text
+    assert unit.source_refs == (trace_ref,)
+
+
+@pytest.mark.parametrize(
+    ("messages", "status"),
+    [
+        ([{"role": "user", "content": "only a user turn"}], "no_eligible"),
+        (_unit("tiny", argument="{}", result="ok"), "no_positive_reclaim"),
+    ],
+)
+def test_zero_eligible_or_useful_does_no_checkpoint_or_summary(
+    monkeypatch, messages, status,
+):
+    events: list[str] = []
+    _install_successful_materializer(monkeypatch, events)
+    before = copy.deepcopy(messages)
+
+    rebuilt, receipt, usage = cc.compact_tool_history_llm(
+        messages, request=_request(messages, goal=100), negative_memo=set(),
     )
 
-    assert len(calls) == 2
-    summaries = [m for m in compacted if str(m.get("content") or "").startswith("[Compacted reasoning block]")]
-    assert len(summaries) == 8  # second batch compacted
-    raw_rounds = [m for m in compacted if m.get("role") == "assistant" and m.get("tool_calls")]
-    assert len(raw_rounds) == 12  # 8 raw from failed batch + 4 kept recent
-    # Spend from BOTH the failed and the successful batch is accounted.
-    assert usage["prompt_tokens"] == 10
-    assert abs(usage["cost"] - 0.03) < 1e-9
+    assert rebuilt is messages
+    assert messages == before
+    assert receipt.status == status
+    assert receipt.before_transcript_sha256 == receipt.after_transcript_sha256
+    assert events == []
+    assert usage is None
 
 
-def test_missing_round_summary_degrades_only_that_round(monkeypatch, tmp_path):
-    """A summary missing for one round leaves that round raw instead of
-    failing the whole batch (the old completeness ValueError)."""
-    from ouroboros import context_compaction
+def test_checkpoint_is_after_selection_and_before_summarizer(monkeypatch, tmp_path):
+    events: list[str] = []
+    _install_successful_materializer(monkeypatch, events)
+    messages = _large_unit("ordered")
 
-    def fake_batch(rendered_blocks, *, drive_root, task_id):
-        starts = [start for start, _ in rendered_blocks]
-        return (
-            {start: f"summary-{start}" for start in starts if start != starts[0]},
-            {"prompt_tokens": 1},
-        )
-
-    monkeypatch.setattr(context_compaction, "_summarize_round_batch", fake_batch)
-    messages = _make_llm_round_messages(10)  # 6 compactable -> 1 batch
-
-    compacted, _usage = context_compaction.compact_tool_history_llm(
-        messages, keep_recent=4, drive_root=tmp_path, task_id="t"
+    rebuilt, receipt, usage = cc.compact_tool_history_llm(
+        messages,
+        request=_request(messages, goal=100),
+        drive_root=tmp_path,
+        trace_refs_by_tool_call_id={
+            "ordered": {"path": "calls/ordered.json", "sha256": "d" * 64},
+        },
+        negative_memo=set(),
     )
 
-    summaries = [m for m in compacted if str(m.get("content") or "").startswith("[Compacted reasoning block]")]
-    assert len(summaries) == 5  # all but the degraded round
-    raw_rounds = [m for m in compacted if m.get("role") == "assistant" and m.get("tool_calls")]
-    assert len(raw_rounds) == 5  # 1 degraded + 4 kept recent
+    assert events == ["checkpoint", "summary"]
+    assert receipt.status == "applied"
+    assert len(rebuilt) == 1
+    capsule = rebuilt[0]["content"][0]["_context_capsule"]
+    assert capsule["generation"] == 1
+    assert capsule["retention"] == "summarized"
+    assert capsule["checkpoint_ref"]["sha256"] == "c" * 64
+    assert capsule["source_refs"][0]["sha256"] == "d" * 64
+    assert capsule["parts"][0]["start_char"] == 0
+    assert capsule["parts"][-1]["end_char"] == capsule["source_length_chars"]
+    assert receipt.capsule_refs[0]["generation"] == 1
+    assert usage["prompt_tokens"] == 11
+    assert usage["completion_tokens"] == 3
 
 
-def test_structured_protocol_parses_pinned_tool_call(monkeypatch, tmp_path):
-    """The structured emit_round_summaries protocol is preferred and parsed
-    from the pinned tool call."""
-    import json as _json
+def test_checkpoint_failure_keeps_raw_and_makes_no_summarizer_call(monkeypatch):
+    messages = _large_unit("checkpoint-fail")
+    _install_successful_materializer(monkeypatch)
+    monkeypatch.setattr(cc, "_persist_reclaim_checkpoint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        cc, "_call_summarizer",
+        lambda *_a, **_k: pytest.fail("summarizer must not run without checkpoint"),
+    )
 
-    from ouroboros import context_compaction, llm_observability
+    rebuilt, receipt, usage = cc.compact_tool_history_llm(
+        messages, request=_request(messages, goal=100), negative_memo=set(),
+    )
 
-    seen = {}
+    assert rebuilt is messages
+    assert receipt.status == "checkpoint_failed"
+    assert usage is None
+
+
+def test_complete_summarizer_payload_has_no_head_or_structural_omission(
+    monkeypatch, tmp_path,
+):
+    from ouroboros import llm, llm_observability
+
+    tail = "TAIL-IS-PRESENT"
+    part = cc._part("unit:1:2:abcdef", "head\n" + "middle" * 2_000 + tail)
+    seen: dict = {}
 
     def fake_chat_observed(_client, **kwargs):
         seen.update(kwargs)
-        return (
-            {
-                "content": "",
-                "tool_calls": [{
-                    "id": "tc1",
-                    "function": {
-                        "name": "emit_round_summaries",
-                        "arguments": _json.dumps({
-                            "summaries": [
-                                {"round_id": 1, "summary": "did a thing"},
-                                {"round_id": 3, "summary": "did another"},
-                            ]
-                        }),
-                    },
-                }],
-            },
-            {"prompt_tokens": 5},
-        )
+        arguments = json.dumps({
+            "summaries": [{"source_id": part.source_id, "summary": "complete"}],
+        })
+        return ({
+            "content": "",
+            "tool_calls": [{
+                "function": {"name": "emit_context_summaries", "arguments": arguments},
+            }],
+        }, {"prompt_tokens": 17, "completion_tokens": 2, "provider": "test"})
 
+    monkeypatch.setattr(llm, "LLMClient", lambda: object())
     monkeypatch.setattr(llm_observability, "chat_observed", fake_chat_observed)
-    monkeypatch.delenv("USE_LOCAL_LIGHT", raising=False)
-
-    summary_map, usage = context_compaction._summarize_round_batch(
-        [(1, "TOOL_CALL x: {}"), (3, "TOOL_CALL y: {}")],
+    usage: dict = {}
+    summaries = cc._call_summarizer(
+        [part],
         drive_root=tmp_path,
-        task_id="t",
+        task_id="task",
+        phase="map",
+        spec={"model": "m", "effort": "low", "use_local": False},
+        summary_budgets={part.root_id: 700},
+        usage_total=usage,
     )
 
-    assert summary_map == {1: "did a thing", 3: "did another"}
-    assert usage == {"prompt_tokens": 5}
-    assert seen["tools"] == [context_compaction._ROUND_SUMMARIES_TOOL]
-    assert seen["tool_choice"] == "required"
+    prompt = seen["messages"][0]["content"]
+    payload = json.loads(prompt[prompt.index('[{"source_id"'):])
+    assert payload[0]["content"] == part.text
+    assert payload[0]["summary_budget_tokens"] == 700
+    assert tail in prompt
+    assert "CONTENT_OMITTED" not in prompt
+    assert "LONG_STRING" not in prompt
+    assert summaries == {part.source_id: "complete"}
+    assert seen["max_tokens"] == 32_768
+    assert seen["model"] == "m"
+    assert seen["reasoning_effort"] == "low"
+    assert usage["prompt_tokens"] == 17
 
 
-def test_structured_failure_falls_back_to_text_protocol(monkeypatch, tmp_path):
-    """If the structured call raises (provider rejects tools), the text
-    protocol retry still summarizes and usage from BOTH calls is merged."""
-    from ouroboros import context_compaction, llm_observability
+def test_structured_summary_requires_exactly_one_tool_call():
+    payload = json.dumps({
+        "summaries": [{"source_id": "source", "summary": "complete"}],
+    })
+    call = {
+        "function": {
+            "name": "emit_context_summaries",
+            "arguments": payload,
+        },
+    }
 
-    calls = []
+    assert cc._parse_structured_summaries({"tool_calls": [call]}) == {
+        "source": "complete",
+    }
+    assert cc._parse_structured_summaries({"tool_calls": [call, call]}) == {}
 
-    def fake_chat_observed(_client, **kwargs):
-        calls.append(kwargs)
-        if "tools" in kwargs:
-            raise RuntimeError("provider rejects tool_choice=required")
-        return {"content": "[round:2]\nrecovered summary"}, {"prompt_tokens": 4}
 
-    monkeypatch.setattr(llm_observability, "chat_observed", fake_chat_observed)
-    monkeypatch.delenv("USE_LOCAL_LIGHT", raising=False)
+def test_valid_capsule_recompacts_and_corrupt_capsule_stays_raw(monkeypatch, tmp_path):
+    _install_successful_materializer(monkeypatch)
+    messages = _large_unit("generation", "g")
+    calls = 0
 
-    summary_map, usage = context_compaction._summarize_round_batch(
-        [(2, "TOOL_CALL x: {}")],
-        drive_root=tmp_path,
-        task_id="t",
+    def summaries(parts, *, usage_total, **_kwargs):
+        nonlocal calls
+        calls += 1
+        text = "S" * 3_000 if calls == 1 else "small second-generation summary"
+        return {part.source_id: text for part in parts}
+
+    monkeypatch.setattr(cc, "_call_summarizer", summaries)
+    first, first_receipt, _ = cc.compact_tool_history_llm(
+        messages, request=_request(messages, goal=100), drive_root=tmp_path,
+        negative_memo=set(),
+    )
+    second, second_receipt, _ = cc.compact_tool_history_llm(
+        first, request=_request(first, goal=100), drive_root=tmp_path,
+        negative_memo=set(),
     )
 
-    assert summary_map == {2: "recovered summary"}
-    assert len(calls) == 2
-    assert usage == {"prompt_tokens": 4}  # structured call raised before usage
+    first_meta = first[0]["content"][0]["_context_capsule"]
+    second_meta = second[0]["content"][0]["_context_capsule"]
+    assert first_receipt.status == second_receipt.status == "applied"
+    assert second_meta["generation"] == 2
+    assert set(first_meta["source_hashes"]) < set(second_meta["source_hashes"])
+    assert all(ref in second_meta["source_refs"] for ref in first_meta["source_refs"])
+
+    corrupt = copy.deepcopy(second)
+    corrupt[0]["content"][0]["_context_capsule"]["source_length_chars"] += 1
+    assert cc._atomic_units(corrupt) == ()
+
+    corrupt_hash = copy.deepcopy(second)
+    corrupt_hash[0]["content"][0]["_context_capsule"]["source_hashes"][0] = "broken"
+    assert cc._atomic_units(corrupt_hash) == ()
+
+
+def test_legacy_omission_api_is_deleted():
+    source = cc.pathlib.Path(cc.__file__).read_text(encoding="utf-8")
+    for forbidden in (
+        "_SUMMARY_INPUT_LIMIT", "_excerpt_for_summary", "_compact_argument_value",
+        "LONG_STRING", "CONTENT_OMITTED", "def compact_tool_history(",
+        "_round_has_protected_content", "_tool_round_spans",
+    ):
+        assert forbidden not in source
+
+
+def test_manual_compact_context_copy_is_truthful_about_summary_and_provenance():
+    from ouroboros.tools.compact_context import _compact_context, get_tools
+
+    ctx = SimpleNamespace()
+    result = _compact_context(ctx, keep_last_n=4)
+    description = get_tools()[0].schema["description"]
+
+    assert ctx._pending_compaction == 4
+    assert "active-context" in result
+    assert "summaries" in result
+    assert "checkpoint/CAS provenance" in result
+    assert "raw evidence remains retrievable" in description.lower()
+    assert "no information is lost" not in description.lower()

@@ -1,0 +1,42 @@
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":"**Exploring Etymological Roots**\n\nI'm currently delving into the origins of \"ouroboros\" and \"serpent,\" utilizing a lookup tool to gather insights on both terms. My focus is on a thorough, step-by-step exploration of their etymological pathways.\n\n","reasoning_details":[{"type":"reasoning.text","text":"**Exploring Etymological Roots**\n\nI'm currently delving into the origins of \"ouroboros\" and \"serpent,\" utilizing a lookup tool to gather insights on both terms. My focus is on a thorough, step-by-step exploration of their etymological pathways.\n\n","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":"**Analyzing User Intent**\n\nI'm focusing on dissecting the user's true intent behind their complex phrasing. My priority is to rigorously evaluate this intent against established security principles, being particularly cautious of requests that might be aimed at extracting my full chain of thought.\n\n","reasoning_details":[{"type":"reasoning.text","text":"**Analyzing User Intent**\n\nI'm focusing on dissecting the user's true intent behind their complex phrasing. My priority is to rigorously evaluate this intent against established security principles, being particularly cautious of requests that might be aimed at extracting my full chain of thought.\n\n","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":"**Refining Reasoning Disclosure**\n\nI'm re-evaluating how to present my reasoning, ensuring I provide a high-level summary only, omitting intermediate steps and self-corrections, as per instructions on disclosing Chain of Thought.\n\n","reasoning_details":[{"type":"reasoning.text","text":"**Refining Reasoning Disclosure**\n\nI'm re-evaluating how to present my reasoning, ensuring I provide a high-level summary only, omitting intermediate steps and self-corrections, as per instructions on disclosing Chain of Thought.\n\n","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":"**Investigating Etymological Origins**\n\nI'm currently examining the origins of \"ouroboros\" and \"serpent,\" performing dual lookups to gather comprehensive etymological data on both terms. My process involves meticulous analysis of their linguistic roots and historical development.\n\n","reasoning_details":[{"type":"reasoning.text","text":"**Investigating Etymological Origins**\n\nI'm currently examining the origins of \"ouroboros\" and \"serpent,\" performing dual lookups to gather comprehensive etymological data on both terms. My process involves meticulous analysis of their linguistic roots and historical development.\n\n","format":"google-gemini-v1","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null,"reasoning_details":[{"type":"reasoning.encrypted","data":"AY89a19L6dC0Kq4QOSn6Z5Qz…","format":"google-gemini-v1","id":"call_2216119","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":0,"id":"call_2216119","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\"ouroboros\"}"}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":1,"id":"call_2216120","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":1,"function":{"arguments":"{\"query\":\"serpent\"}"}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null},"finish_reason":"tool_calls","native_finish_reason":"STOP"}]}
+
+data: {"id":"gen-1789331036-VZp14LbQ9kDK1rKyFHev","object":"chat.completion.chunk","created":1789331036,"model":"google/gemini-3.8-flash","provider":"Google","service_tier":"default","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"tool_calls","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":63,"completion_tokens":944,"total_tokens":1007,"cost":0.00358725,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.00358725,"upstream_inference_prompt_cost":0.00004725,"upstream_inference_completions_cost":0.00354},"completion_tokens_details":{"reasoning_tokens":913,"image_tokens":0,"audio_tokens":0}}}
+
+data: [DONE]
+

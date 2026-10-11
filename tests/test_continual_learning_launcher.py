@@ -51,6 +51,11 @@ def test_settings_template_contract():
     assert settings["OUROBOROS_SAFETY_MODE"] == "light"
     assert settings["OUROBOROS_REVIEW_ENFORCEMENT"] == "blocking"
     assert settings["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
+    actors = json.loads(settings["OUROBOROS_SUBAGENTS"])
+    assert actors["enabled"] is True
+    assert [row["route"]["target_id"] for row in actors["items"]] == [
+        settings["OUROBOROS_MODEL"]
+    ]
     assert "claude_code_edit" in settings["CLBENCH_SOLVE_DISABLED_TOOLS"]
     # The declared solve denylist must cover the registry's REAL web-tool set
     # (cumulative review r2: youtube_transcript had drifted out) and must not
@@ -64,6 +69,73 @@ def test_settings_template_contract():
     for key, value in settings.items():
         if any(token in key.upper() for token in ("API_KEY", "TOKEN", "PASSWORD", "SECRET", "CREDENTIALS")):
             assert value == "", f"secret-shaped template key {key} must be blank"
+
+
+def test_context_mode_template_and_child_env_carry_false_tombstone(tmp_path):
+    import argparse
+
+    base = tmp_path / "context-settings.json"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    for marker in (False, "false", "off", 0):
+        base.write_text(json.dumps({
+            "OUROBOROS_CONTEXT_MODE": "low",
+            "OUROBOROS_CONTEXT_MODE_AUTO_LOW": marker,
+        }), encoding="utf-8")
+        rendered = run_clb.render_run_settings(
+            base, run_dir, solve_model="openai/gpt-5.5",
+            evolution=False, total_budget=1.0,
+        )
+        assert rendered["OUROBOROS_CONTEXT_MODE"] == "low"
+        assert rendered["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    # A template mode is an explicit benchmark choice even when the tombstone was
+    # omitted; the renderer adds it before the compatibility normalizer.
+    base.write_text(json.dumps({"OUROBOROS_CONTEXT_MODE": "low"}), encoding="utf-8")
+    rendered = run_clb.render_run_settings(
+        base, run_dir, solve_model="openai/gpt-5.5",
+        evolution=False, total_budget=1.0,
+    )
+    assert rendered["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert rendered["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    # A legacy true marker is never forwarded as true.
+    base.write_text(json.dumps({
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    }), encoding="utf-8")
+    legacy = run_clb.render_run_settings(
+        base, run_dir, solve_model="openai/gpt-5.5",
+        evolution=False, total_budget=1.0,
+    )
+    assert legacy["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+
+    args = argparse.Namespace(
+        ouroboros_clone=str(tmp_path / "clone"),
+        effort="low",
+        or_provider="",
+    )
+    child_env = run_clb._sanitized_child_env(run_dir, {
+        "TOTAL_BUDGET": 1.0,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": False,
+        "OUROBOROS_SUBAGENTS": run_clb.single_model_subagents_setting("openai/gpt-5.5"),
+    }, args)
+    assert child_env["OUROBOROS_CONTEXT_MODE"] == "low"
+    assert child_env["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+    assert json.loads(child_env["OUROBOROS_SUBAGENTS"])["items"][0]["route"][
+        "target_id"
+    ] == "openai/gpt-5.5"
+
+    legacy_child_env = run_clb._sanitized_child_env(run_dir, {
+        "TOTAL_BUDGET": 1.0,
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "true",
+    }, args)
+    assert legacy_child_env["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert legacy_child_env["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
 
 
 def test_help_exits_zero():
@@ -100,6 +172,9 @@ def test_dry_run_writes_manifest_and_blanked_settings(tmp_path, monkeypatch):
     rendered = json.loads((run_dir / "_run_settings.json").read_text(encoding="utf-8"))
     assert rendered["OPENROUTER_API_KEY"] == ""  # secrets blanked on disk
     assert rendered["OUROBOROS_MODEL"] == rendered["OUROBOROS_MODEL_LIGHT"]  # single-model pin
+    assert json.loads(rendered["OUROBOROS_SUBAGENTS"])["items"][0]["route"][
+        "target_id"
+    ] == rendered["OUROBOROS_MODEL"]
 
     manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
     assert manifest["benchmark"] == "continual_learning"
@@ -114,6 +189,9 @@ def test_dry_run_writes_manifest_and_blanked_settings(tmp_path, monkeypatch):
     fidelity = manifest["extra"]["fidelity"]
     assert "OUROBOROS_SAFETY_MODE" in fidelity["declared_only_pinned_adapter_gap"]
     assert "OUROBOROS_REVIEW_ENFORCEMENT" in fidelity["declared_only_pinned_adapter_gap"]
+    assert "OUROBOROS_SUBAGENTS" in fidelity["declared_only_pinned_adapter_gap"]
+    assert manifest["available_subagents"]["items"][0]["route"]["target_id"] == \
+        rendered["OUROBOROS_MODEL"]
     assert "test-not-a-real-key" not in (run_dir / "run_manifest.json").read_text(encoding="utf-8")
 
 
@@ -438,6 +516,7 @@ def test_patch_probe_ignores_bare_env_name_mentions(tmp_path):
     assert probe["patches"] == {
         "clb_docker_runtime_attestation.v6746": False,
         "clb_env_campaign_overrides.v6745": False,
+        "clb_host_available_subagents.phase1d": False,
         "clb_disabled_tools_env.v6745": False,
     }
     assert probe["evidence"] == "static_source_scan"
@@ -499,21 +578,26 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
     adapter = runner / "src" / "systems" / "ouroboros"
     clone = _fake_clone(tmp_path)
 
-    def _fidelity_of():
+    def _fidelity_of(*extra_args: str):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             rc = run_clb.main([
                 "--runner-path", str(runner), "--ouroboros-clone", str(clone),
                 "--path", "bridge", "--allow-dirty-seed", "--dry-run",
+                *extra_args,
             ])
         assert rc == 0
         return json.loads(buf.getvalue())["fidelity"]
 
     unpatched = _fidelity_of()
-    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_SUBAGENTS",
                  "CLBENCH_SOLVE_DISABLED_TOOLS"):
         assert knob in unpatched["declared_only_pinned_adapter_gap"]
         assert knob not in unpatched["enforced_via_operator_patch"]
+
+    host_unpatched = _fidelity_of("--no-docker")
+    assert "OUROBOROS_SUBAGENTS" in host_unpatched["declared_only_pinned_adapter_gap"]
+    assert "OUROBOROS_SAFETY_MODE" in host_unpatched["enforced_via_operator_patch"]
 
     # Now apply the two forwarding patches, as the operator does before a real run. The
     # fixtures carry the patches' OWN tokens (comment tag + the exact expression they
@@ -522,7 +606,7 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
     (adapter / "_docker_launcher.py").write_text(
         "        # Operator env overrides (campaign knobs). Parity defaults stay authoritative\n"
         '        for _k in ("OUROBOROS_RUNTIME_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",\n'
-        '                   "OUROBOROS_SAFETY_MODE"):\n'
+        '                   "OUROBOROS_SAFETY_MODE", "OUROBOROS_SUBAGENTS"):\n'
         "            _v = os.environ.get(_k)\n"
         "            if _v:\n                ov[_k] = _v\n",
         encoding="utf-8")
@@ -535,15 +619,27 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
 
     patched = _fidelity_of()
     assert patched["declared_only_pinned_adapter_gap"] == {}
-    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT",
+    for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_SUBAGENTS",
                  "CLBENCH_SOLVE_DISABLED_TOOLS"):
         assert knob in patched["enforced_via_operator_patch"]
     # The declared values are the ones the patched clone really applies.
     assert patched["enforced_via_operator_patch"]["OUROBOROS_SAFETY_MODE"]["declared"] == "light"
     assert patched["enforced_via_operator_patch"][
         "OUROBOROS_REVIEW_ENFORCEMENT"]["declared"] == "blocking"
+    assert json.loads(patched["enforced_via_operator_patch"][
+        "OUROBOROS_SUBAGENTS"]["declared"])["items"][0]["route"]["target_id"] == \
+        "anthropic/claude-sonnet-4.6"
     assert "claude_code_edit" in patched["enforced_via_operator_patch"][
         "CLBENCH_SOLVE_DISABLED_TOOLS"]["declared"]
+
+    (adapter / "_launcher.py").write_text(
+        "# Canonical benchmark actor bytes are authored by run_clb.py through Phase-1A\n"
+        'OUROBOROS_SUBAGENTS=os.environ.get("OUROBOROS_SUBAGENTS", "")\n',
+        encoding="utf-8",
+    )
+    host_patched = _fidelity_of("--no-docker")
+    assert "OUROBOROS_SUBAGENTS" in host_patched["enforced_via_operator_patch"]
+    assert host_patched["declared_only_pinned_adapter_gap"] == {}
 
 
 def test_seed_gate_binds_to_the_execution_clone_and_records_the_launcher_separately(tmp_path):

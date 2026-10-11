@@ -33,7 +33,9 @@ def _wait_for_lifecycle(drive_root, project_id: str, expected: str) -> dict:
 def isolated_project_queue(tmp_path, monkeypatch):
     import ouroboros.gateway.projects as gateway
     import supervisor.queue as queue
-    import supervisor.task_lifecycle as lifecycle
+    # Project deletion lives in supervisor.queue_transitions since the
+    # module-size split; task_lifecycle only re-exports its entry points.
+    import supervisor.queue_transitions as lifecycle
     import supervisor.workers as workers
 
     pending: list[dict] = []
@@ -58,16 +60,23 @@ def isolated_project_queue(tmp_path, monkeypatch):
     )
 
     def cancel_task(task_id: str, *, cascade: bool = False) -> bool:
+        # GR5-5: the deletion cascades lineage ROOTS only, so the fake must
+        # tear down the whole subtree the real cascade would (root + every
+        # task whose recorded root is the cascaded id).
         assert cascade is True
         cancelled.append(task_id)
-        for index, task in enumerate(list(pending)):
-            if str(task.get("id") or "") == task_id:
-                pending.pop(index)
-                return True
-        if task_id in running:
-            running.pop(task_id)
-            return True
-        return False
+        removed = False
+        for task in list(pending):
+            tid = str(task.get("id") or "")
+            if tid == task_id or str(task.get("root_task_id") or "") == task_id:
+                pending.remove(task)
+                removed = True
+        for tid in list(running):
+            task = running[tid].get("task") if isinstance(running[tid], dict) else {}
+            if tid == task_id or str((task or {}).get("root_task_id") or "") == task_id:
+                running.pop(tid)
+                removed = True
+        return removed
 
     monkeypatch.setattr(queue, "cancel_task_by_id", cancel_task)
     with lifecycle._PROJECT_DELETE_WORKERS_LOCK:
@@ -135,13 +144,12 @@ def test_delete_cancels_bound_root_and_descendants_then_preserves_tombstone(
     assert response_body["project_id"] == "alpha"
     tombstone = _wait_for_lifecycle(tmp_path, "alpha", "tombstoned")
 
-    assert set(isolated_project_queue.cancelled) == {
-        "root-bound",
-        "child-pending",
-        "grandchild-running",
-        "root-stored",
-    }
-    assert isolated_project_queue.cancelled.index("child-pending") < isolated_project_queue.cancelled.index("root-bound")
+    # GR5-5: only the lineage ROOTS get their own cascade — one cascade (and
+    # therefore one summary) per tree; the descendants fall with their root.
+    assert set(isolated_project_queue.cancelled) == {"root-bound", "root-stored"}
+    assert len(isolated_project_queue.cancelled) == 2, (
+        "GR5-5: no redundant per-descendant cascades"
+    )
     assert [task["id"] for task in isolated_project_queue.pending] == ["unrelated"]
     assert isolated_project_queue.running == {}
     assert folder.is_dir() and memory.is_dir()
@@ -159,6 +167,30 @@ def test_delete_cancels_bound_root_and_descendants_then_preserves_tombstone(
     # resurrection; the immutable binding remains available for history routing.
     assert reconcile_projects(tmp_path) == 0
     assert get_reserved_project(tmp_path, "alpha")["lifecycle"] == "tombstoned"
+
+
+def test_delete_cancels_orphan_child_without_a_live_root(tmp_path, isolated_project_queue):
+    """GR5-5 counterpart: a child whose recorded root/parent already settled
+    has no live ancestor in the set, so the roots-only filter keeps it and it
+    gets its own cascade instead of being skipped."""
+    from ouroboros.projects_registry import begin_project_deletion, bind_task_to_project, create_project
+
+    project = create_project(tmp_path, "orph", name="Orphan")
+    bind_task_to_project(tmp_path, "gone-root", "orph", origin={"absent": "system"})
+    isolated_project_queue.pending.append({
+        "id": "orphan-child",
+        "parent_task_id": "gone-root",
+        "root_task_id": "gone-root",
+    })
+
+    begin_project_deletion(tmp_path, "orph")
+    isolated_project_queue.lifecycle.run_project_deletion(
+        tmp_path, "orph", project["chat_id"],
+    )
+
+    assert isolated_project_queue.cancelled == ["orphan-child"]
+    assert isolated_project_queue.pending == []
+    _wait_for_lifecycle(tmp_path, "orph", "tombstoned")
 
 
 def test_delete_failure_stays_fenced_with_visible_error(tmp_path, isolated_project_queue, monkeypatch):

@@ -27,6 +27,32 @@ def test_probe_flags_deleted_artifact_host(tmp_path):
     assert all(e["check_surface"] == "host" for e in lifecycle)
 
 
+def test_probe_executor_branch_records_present_artifact_as_present(tmp_path, monkeypatch):
+    """capinv-447 D7: the executor probe coerced returncode with `or 1`, so rc=0
+    (artifact EXISTS in-container) still read as 1 — every declared artifact on a
+    healthy executor run was recorded exists_after=false and pushed into
+    artifacts_missing_after, reaching the durable receipt and the acceptance
+    reviewer. rc=0 must mean present; rc!=0 must still mean missing."""
+    import ouroboros.workspace_executor as workspace_executor
+
+    class _Res:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    def fake_execute(_ctx, cmd, _cwd, _timeout, **_kwargs):
+        # `test -e "$1"` receives the probed path as the last argv element.
+        return _Res(0 if cmd[-1] == "kept.txt" else 1)
+
+    monkeypatch.setattr(workspace_executor, "execute", fake_execute)
+    ctx, work = _ctx(tmp_path)
+    lifecycle, missing = _probe_artifact_lifecycle(ctx, ["kept.txt", "out.so"], work, use_executor=True)
+    by = {e["path"]: e for e in lifecycle}
+    assert by["kept.txt"]["exists_after"] is True  # was inverted to False before the fix
+    assert by["out.so"]["exists_after"] is False
+    assert missing == ["out.so"]
+    assert all(e["check_surface"] == "executor" for e in lifecycle)
+
+
 def test_probe_traversal_is_unavailable_not_probed(tmp_path):
     ctx, work = _ctx(tmp_path)
     lifecycle, missing = _probe_artifact_lifecycle(ctx, ["../../etc/passwd"], work, use_executor=False)
@@ -234,3 +260,36 @@ def test_acceptance_support_refs_disclose_bounded_claim_text(tmp_path):
     refs = _accept_claim_support_refs(contract, [])
     assert "OMISSION NOTE" in refs[0]["claim"]
     assert "OMISSION NOTE" in refs[0]["support_expected"]
+
+
+# --- submarine unwind (2026-08-08): observable roots derive from the _POLICY matrix
+
+def test_observe_artifacts_accepts_artifact_store_path(tmp_path):
+    """wave3 r24: the agent registered a screenshot into artifact_store and
+    verify_and_record REFUSED the very same path (private root list). The
+    observable roots now derive from the Tool API matrix — anything the profile
+    can already read_file it can also existence-observe."""
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.tools.verify import _observe_artifacts
+
+    ctx, _work = _ctx(tmp_path)
+    art = task_artifact_dir_path(ctx.drive_root, "t", create=True)
+    shot = art / "shot.png"
+    shot.write_bytes(b"png-bytes")
+
+    status, detail = _observe_artifacts(ctx, [str(shot)])
+    assert status == "observed", detail
+
+
+def test_observe_artifacts_still_refuses_control_plane(tmp_path):
+    """The anti-cheat boundary is unchanged: runtime_data/system-repo state files
+    outside the sanctioned observation roots stay refused."""
+    from ouroboros.tools.verify import _observe_artifacts
+
+    ctx, _work = _ctx(tmp_path)
+    secret = ctx.drive_root / "state" / "state.json"
+    secret.parent.mkdir(parents=True, exist_ok=True)
+    secret.write_text("{}", encoding="utf-8")
+
+    status, detail = _observe_artifacts(ctx, [str(secret)])
+    assert status == "refused_out_of_scope", (status, detail)

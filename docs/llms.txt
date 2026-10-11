@@ -1,0 +1,30 @@
+# Ouroboros
+
+> Ouroboros is an open-source AI agent with a continuing identity, durable memory, agent swarms, autonomous evolution, and an implementation it can rewrite.
+
+Canonical site: https://ouroboros-agent.ai/
+Source: https://github.com/razzant/ouroboros
+License: MIT
+
+Ouroboros publishes self-reported benchmark results with status labels and links to available runs, traces, methodology, and submissions. The GAIA result states that its scrubbed trace capsule is pending. Upstream leaderboard acceptance is reported separately when it happens.
+
+## Start here
+
+- [Install](https://ouroboros-agent.ai/install/): Packaged downloads for normal use; clone the source only for development.
+- [Technical report](https://ouroboros-agent.ai/paper/): Paper metadata, authors, citation, code, and public evidence links.
+- [About](https://ouroboros-agent.ai/about/): What Ouroboros is and how it works.
+- [Benchmark evidence](https://ouroboros-agent.ai/benchmarks/): Scores, publication status, runs, traces, and methodology.
+- [Architecture](https://github.com/razzant/ouroboros/blob/ouroboros/docs/ARCHITECTURE.md): Runtime structure, data flow, and operating boundaries.
+- [Constitution](https://github.com/razzant/ouroboros/blob/ouroboros/BIBLE.md): Identity and governing principles.
+- [Releases](https://github.com/razzant/ouroboros/releases): Published versions and assets.
+
+## Related software
+
+- [Claudexor](https://claudexor.ai/): The local execution layer Ouroboros uses for delegated coding and hosted-agent review.
+- [Claudexor source](https://github.com/razzant/claudexor): Routing, execution, and durable evidence for connected coding harnesses.
+
+## Machine-readable resources
+
+- [Install metadata](https://ouroboros-agent.ai/install.json): Stable release discovery, artifact name templates, and verification metadata.
+- [GitHub releases API](https://api.github.com/repos/razzant/ouroboros/releases/latest): Current stable release and asset records.
+- [Sitemap](https://ouroboros-agent.ai/sitemap.xml): Canonical indexable pages.

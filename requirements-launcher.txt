@@ -1,3 +1,0 @@
-pywebview==5.4
-pythonnet==3.0.5; platform_system == "Windows"
-clr_loader==0.2.7.post0; platform_system == "Windows"

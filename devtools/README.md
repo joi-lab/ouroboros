@@ -7,7 +7,8 @@ Rules:
 
 - Generated logs, datasets, run outputs, Docker layers, and secrets do not live
   here.
-- Default benchmark outputs go under `/Users/anton/Ouroboros/bench_runs/`.
+- Choose a benchmark output root outside the source checkout and runtime data;
+  use each runner's documented output option or `OUROBOROS_BENCH_RUNS_ROOT`.
 - Runtime modules must not import `devtools`.
 - This is not an immune-system bypass: touched files are reviewed normally.
 - Promote code out of `devtools` only through a separate reviewed runtime plan.

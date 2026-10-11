@@ -1,0 +1,53 @@
+name: Publish safe test evidence
+description: Upload the public pytest projections, then name each pass's failed, crashed and in-flight tests.
+
+inputs:
+  name:
+    description: Artifact name stem, unique among the jobs of one run (job, OS, shard).
+    required: true
+  passes:
+    description: Space-separated <directory>=<producer step outcome> pairs under runner.temp/ci-evidence.
+    required: true
+
+# Diagnostics only: every step tolerates its own failure and runs whatever the
+# step before it did, so the producer steps alone decide the job result.
+runs:
+  using: composite
+  steps:
+    - name: Upload safe test evidence
+      id: upload
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: ci-evidence-${{ inputs.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/ci-evidence/
+        retention-days: 14
+        if-no-files-found: ignore
+    # bash on every runner: the reporter appends UTF-8 to the summary file itself,
+    # and GitHub shows at most ten error annotations per step — the rest stay in the summary.
+    - name: Summarize and annotate test results
+      if: ${{ !cancelled() }}
+      continue-on-error: true
+      shell: bash
+      env:
+        PASSES: ${{ inputs.passes }}
+        ARTIFACT_OUTCOME: ${{ steps.upload.outcome }}
+        ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        EVIDENCE_ROOT: ${{ runner.temp }}/ci-evidence
+      run: |
+        directories=()
+        for pass in $PASSES; do
+          label="${pass%%=*}"; outcome="${pass#*=}"
+          if [[ "$outcome" != success && "$outcome" != failure ]]; then continue; fi  # skipped: nothing ran
+          python -I -S tests/ci_evidence.py summarize --evidence-dir "$EVIDENCE_ROOT/$label" \
+            --producer-outcome "$outcome" --artifact-outcome "$ARTIFACT_OUTCOME" \
+            --artifact-url "$ARTIFACT_URL" --summary "$GITHUB_STEP_SUMMARY" --label "$label pass" || true
+          directories+=(--evidence-dir "$EVIDENCE_ROOT/$label")
+          if [[ "$outcome" == failure && ! -e "$EVIDENCE_ROOT/$label/results.json" && ! -e "$EVIDENCE_ROOT/$label/events.jsonl" ]]; then
+            echo "::error title=No test evidence::The $label pass failed before any test reported; read that step's log."
+          fi
+        done
+        if (( ${#directories[@]} )); then
+          python -I -S tests/ci_evidence.py annotate "${directories[@]}" --limit 10 || true
+        fi

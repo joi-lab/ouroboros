@@ -243,16 +243,33 @@ def test_every_bounded_list_on_a_changed_review_surface_discloses_its_omissions(
     assert summary["check_exit_masking_reasons_omitted"] == 4
 
 
-def test_agent_supplied_review_prose_is_disclosed_truncated_not_sliced():
+@pytest.mark.parametrize("length", [40, 520, 4000])
+def test_agent_supplied_review_prose_is_disclosed_truncated_not_sliced(length):
     """Same P1 rule on the acceptance-decision surface this phase rewrote: an agent
     rationale / obligation-disposition reason that ends mid-argument must say so."""
-    import pathlib
-
     from ouroboros import loop_tool_execution as LTE
 
-    src = pathlib.Path(LTE.__file__).read_text(encoding="utf-8")
-    assert 'or "")[:500]' not in src, "hand-rolled silent slice on a review surface"
-    assert src.count("truncate_review_artifact(") >= 2
+    rationale, reason = "r" * length, "o" * length
+    payload = {"status": "deferred_to_host_acceptance", "authoritative": False,
+               "agent_decision": {"disposition": "partial", "rationale": rationale,
+                                  "obligation_dispositions": [
+                                      {"id": "ob1", "disposition": "rejected", "reason": reason}]}}
+    raw = json.dumps(payload)
+    trace = {"tool_calls": [], "acceptance_obligations": [{"id": "ob1", "status": "open"}]}
+    assert LTE.process_tool_results(
+        [{"fn_name": "task_acceptance_review", "tool_call_id": "review-1",
+          "is_error": False, "result": raw, "args_for_log": {}}], [], trace, lambda _: None,
+    ) == 0
+    projected = (trace["acceptance_decision"]["agent_rationale"],
+                 trace["acceptance_obligations"][0]["disposition_reason"])
+    for full, preview in zip((rationale, reason), projected):
+        if length <= 520:  # A cut smaller than its omission marker must stay whole.
+            assert preview == full
+        else:
+            assert preview == full[:500] + f"\n⚠️ OMISSION NOTE: truncated at 500 chars; original length {length}"
+    assert trace["acceptance_obligations"][0]["status"] == "agent_disposed"
+    assert trace["acceptance_evidence_calls"] == [payload]  # Full source survives.
+    assert trace["tool_calls"][0]["result"] == raw
 
 
 # --------------------------------------------------------------------------------------
@@ -607,8 +624,11 @@ def test_receipt_check_text_round_trips_so_two_argvs_are_two_verifications(tmp_p
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     home = tmp_path / "home"
-    repo, data = home / "Ouroboros" / "repo", home / "Ouroboros" / "data"
-    for directory in (repo, data):
+    # NEUTRAL layout, not home/Ouroboros/data: the registry gets explicit
+    # roots, and a live-SHAPED path under the (patched) home now trips the
+    # pytest fail-closed guard in append_jsonl (issue #455 class).
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    for directory in (home, repo, data):
         directory.mkdir(parents=True)
     monkeypatch.setattr(pathlib.Path, "home", lambda: home)
     registry = ToolRegistry(repo_dir=repo, drive_root=data)

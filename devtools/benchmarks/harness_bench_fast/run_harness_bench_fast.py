@@ -15,7 +15,14 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run,
+    finalize_run_manifest,
+    write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    fixed_model_actor_snapshot,
+)
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import assert_outside_repo, default_settings_path, repo_root_from_devtools, run_root
 
@@ -240,6 +247,7 @@ def main() -> int:
     # attached to the retained manifest inside the finalization block below. The widened seam
     # meta-test caught this — the subprocess was hidden one level down inside a local helper.
     declared_task_ids = list(args.task)
+    fixed_actor = fixed_model_actor_snapshot(args.model)
     # Built ONCE (the seed gate runs inside it) and PERSISTED BEFORE enforcement can raise, so
     # a refusal leaves a durable record of what was refused; then RETAINED and rewritten with the
     # final typed outcome on every exit path by the shared finalization seam below.
@@ -270,6 +278,12 @@ def main() -> int:
         },
         extra={"outcome": "started"},
     )
+    # The measured model is the CLI's exact value, not an ambient/template slot.
+    # Persist this before task discovery (which may invoke harness-bench itself).
+    manifest["model_slots"] = fixed_actor["model_slots"]
+    manifest["available_subagents"] = fixed_actor["available_subagents"]
+    manifest["harness"]["fixed_model_actor"] = fixed_actor
+    write_json(manifest_output, manifest)
 
     with finalize_run_manifest(manifest_output, manifest) as final:
         task_ids = _read_task_ids(bench_root, args.task, args.task_file)
@@ -319,4 +333,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

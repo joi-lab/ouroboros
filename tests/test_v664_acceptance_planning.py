@@ -12,20 +12,29 @@ from ouroboros.review_substrate import (
     run_review_request,
 )
 from ouroboros import task_pacing
-from ouroboros.tools.plan_review import _planning_evidence_horizon, _resolve_plan_roots
-from ouroboros.tools.registry import ToolContext
 from ouroboros.usage_accounting import _claim_physical_dispatch
 from ouroboros.utils import append_jsonl
 
 
-def test_required_blocking_has_no_implicit_count_cap_but_explicit_cap_always_wins():
+def test_author_response_keeps_only_explicit_local_cap(monkeypatch):
+    # The paid ceiling does not suppress an author response, including Blocking.
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
+    monkeypatch.delenv("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", raising=False)
     snapshot = task_pacing.BudgetSnapshot(has_deadline=False)
     uncapped = normalize_budget_profile({})
     assert task_pacing.improvement_pass_allowed(
+        snapshot, 0, uncapped, required_blocking=True,
+    ) == (True, "")
+    assert task_pacing.improvement_pass_allowed(
+        snapshot, 1, uncapped, required_blocking=True,
+    ) == (True, "")
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
+    assert task_pacing.improvement_pass_allowed(
         snapshot, 999, uncapped, required_blocking=True,
     ) == (True, "")
+    monkeypatch.delenv("OUROBOROS_REVIEW_MAX_CYCLES", raising=False)
 
-    for policy in ("fixed", "adaptive", "until_deadline"):
+    for policy in ("fixed", "adaptive"):
         capped = normalize_budget_profile({
             "improvement_policy": policy,
             "max_improvement_passes": 6,
@@ -35,29 +44,72 @@ def test_required_blocking_has_no_implicit_count_cap_but_explicit_cap_always_win
         ) == (False, "improvement_passes_exhausted")
 
 
-def test_system_prompt_describes_root_acceptance_as_evidence_only():
+def test_system_prompt_describes_one_whole_result_acceptance_operation():
     import pathlib
-
-    system = (
-        pathlib.Path(__file__).resolve().parents[1] / "prompts" / "SYSTEM.md"
-    ).read_text(encoding="utf-8")
-    assert "For a root task in `task_review_mode=auto|required`" in system
-    assert "this call is evidence-only" in system
-    assert "single authoritative host panel" in system
+    system = (pathlib.Path(__file__).resolve().parents[1] / "prompts/SYSTEM.md").read_text(encoding="utf-8")
+    normalized = " ".join(system.split())
+    assert "`task_acceptance_review` can nominate my complete task result for review" in normalized
+    assert "After the whole tool-result block, the host advances the same operation as final delivery" in normalized
+    assert "checking an intermediate artifact is not whole-task acceptance" in normalized
+    assert "acknowledge my human's messages" in normalized
+    assert "A status reply need not replace the retained result or buy another panel" in normalized
     assert "Use `task_acceptance_review` for expensive independent critique" not in system
 
 
-def test_acceptance_review_reserve_uses_existing_event_ewma(tmp_path, monkeypatch):
+def test_review_capacity_is_unavailable_when_task_review_is_off(tmp_path, monkeypatch):
+    from ouroboros import config
+    from ouroboros.task_pacing import project_task_acceptance_review_capacity
+
+    monkeypatch.setattr(config, "get_task_review_mode", lambda: "off")
+    ctx = SimpleNamespace(
+        task_id="root-off", drive_root=tmp_path,
+        task_metadata={"root_task_id": "root-off", "delegation_role": "root"},
+    )
+    projection = project_task_acceptance_review_capacity(ctx)
+    assert projection["state"] == "unavailable"
+    assert projection["reason"] == "task_review_mode_off"
+    assert projection["remaining_cycles"] is None
+
+
+def test_review_capacity_discloses_corrupt_cancellation_projection(tmp_path):
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_pacing import project_task_acceptance_review_capacity
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+
+    contract = build_task_contract({"budget_profile": {"max_improvement_passes": 0}})
+    write_task_result(
+        tmp_path, "root-corrupt-cancel", STATUS_RUNNING,
+        root_task_id="root-corrupt-cancel", delegation_role="root",
+        task_contract=contract,
+    )
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "cancel_intents.json").write_text("{", encoding="utf-8")
+    ctx = SimpleNamespace(
+        task_id="root-corrupt-cancel", drive_root=tmp_path,
+        budget_drive_root=str(tmp_path), task_contract=contract,
+        task_metadata={
+            "root_task_id": "root-corrupt-cancel", "delegation_role": "root",
+            "budget_drive_root": str(tmp_path), "task_contract": contract,
+        },
+    )
+    projection = project_task_acceptance_review_capacity(ctx)
+    assert projection["state"] == "unknown"
+    assert projection["reason"] == (
+        "cancellation_state_unknown:CancelIntentProjectionCorrupt"
+    )
+
+
+def test_acceptance_timing_rows_go_to_the_canonical_split_drive_stream(tmp_path, monkeypatch):
+    """The timing row a paid panel writes belongs to the CANONICAL drive of a
+    split task, not the child's own logs. Its content is telemetry: since owner
+    R52 no gate reads it back."""
     monkeypatch.setenv("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "90")
     canonical = tmp_path / "canonical"
     child = tmp_path / "child"
     events = canonical / "logs" / "events.jsonl"
     append_jsonl(events, {"type": "task_acceptance_review_timing", "duration_sec": 100})
-    append_jsonl(events, {"type": "task_acceptance_review_timing", "duration_sec": 400})
     ctx = SimpleNamespace(drive_root=str(child), budget_drive_root=str(canonical))
-    # EWMA(alpha=.5) = 250; subsequent reserve = 1.5 * 250.
-    assert task_pacing.acceptance_review_estimate_sec(ctx, passes_done=1) == 375.0
-    assert task_pacing.acceptance_review_estimate_sec(ctx, passes_done=0) == 200.0
     assert task_pacing.acceptance_timing_events_path(ctx) == events
     assert not (child / "logs" / "events.jsonl").exists()
 
@@ -66,16 +118,36 @@ def test_acceptance_panel_persists_timing_to_canonical_root(tmp_path, monkeypatc
     import ouroboros.loop as loop
     import ouroboros.review_evidence as evidence_mod
     import ouroboros.review_substrate as substrate
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools import review_helpers
 
     canonical = tmp_path / "canonical"
     child = tmp_path / "child"
+    contract = build_task_contract({})
     tool_ctx = SimpleNamespace(
+        task_id="root-timing",
         drive_root=child,
         budget_drive_root=str(canonical),
-        task_metadata={"budget_drive_root": str(canonical)},
+        task_contract=contract,
+        task_metadata={
+            "root_task_id": "root-timing",
+            "delegation_role": "root",
+            "budget_drive_root": str(canonical),
+            "task_contract": contract,
+        },
+    )
+    write_task_result(
+        canonical, "root-timing", STATUS_RUNNING,
+        root_task_id="root-timing", delegation_role="root",
+        task_contract=contract,
     )
     monkeypatch.setattr(evidence_mod, "build_task_acceptance_evidence", lambda *_a, **_k: {})
-    monkeypatch.setattr(substrate, "reviewer_slots", lambda **_k: [])
+    monkeypatch.setattr(
+        substrate, "triad_delivery_slots",
+        lambda **_k: [SimpleNamespace(model="test-reviewer")],
+    )
+    monkeypatch.setattr(review_helpers, "review_wave_budget_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(
         substrate,
         "run_review_request",
@@ -89,11 +161,14 @@ def test_acceptance_panel_persists_timing_to_canonical_root(tmp_path, monkeypatc
         llm_trace={"tool_calls": []},
         drive_root=child,
         messages=[{"role": "system", "content": "policy"}, {"role": "user", "content": "goal"}],
-        emit_progress=lambda _text: None,
+        emit_progress=lambda _text, *, incident=None: None,
         mode="required",
         subtree_statuses=[],
         budget_profile={},
         passes_done=2,
+        review_binding=substrate.build_review_binding(
+            candidate="deliverable", evidence={}, fence_token_or_state="timing-test",
+        ),
     )
 
     loop._execute_task_acceptance_panel(ctx)
@@ -105,24 +180,368 @@ def test_acceptance_panel_persists_timing_to_canonical_root(tmp_path, monkeypatc
     assert not (child / "logs" / "events.jsonl").exists()
 
 
-def test_normalized_stall_default_does_not_emit_deprecation_noise(tmp_path):
-    quiet = SimpleNamespace(
-        drive_root=tmp_path,
-        task_id="quiet",
-        task_contract={"budget_profile": normalize_budget_profile({})},
-    )
-    task_pacing.resolve_budget_profile(quiet)
-    events = tmp_path / "logs" / "events.jsonl"
-    assert not events.exists()
+def _root_acceptance_context(tmp_path, evidence):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
 
+    contract = build_task_contract({"budget_profile": {"max_improvement_passes": 0}})
+    tool_ctx = SimpleNamespace(
+        task_id="root-wallet-gate",
+        drive_root=tmp_path,
+        budget_drive_root=str(tmp_path),
+        task_contract=contract,
+        task_metadata={
+            "root_task_id": "root-wallet-gate",
+            "delegation_role": "root",
+            "budget_drive_root": str(tmp_path),
+            "task_contract": contract,
+        },
+    )
+    write_task_result(
+        tmp_path,
+        "root-wallet-gate",
+        STATUS_RUNNING,
+        root_task_id="root-wallet-gate",
+        delegation_role="root",
+        task_contract=contract,
+    )
+    return loop._TaskAcceptanceContext(
+        tools=SimpleNamespace(_ctx=tool_ctx),
+        content="deliverable",
+        task_id="root-wallet-gate",
+        task_type="task",
+        llm_trace={"tool_calls": []},
+        drive_root=tmp_path,
+        messages=[
+            {"role": "system", "content": "policy"},
+            {"role": "user", "content": "goal"},
+        ],
+        emit_progress=lambda _text, *, incident=None: None,
+        mode="required",
+        subtree_statuses=[],
+        budget_profile=contract["budget_profile"],
+        passes_done=0,
+        evidence=evidence,
+        review_binding=substrate.build_review_binding(
+            candidate="deliverable",
+            evidence=evidence,
+            fence_token_or_state="wallet-gate",
+        ),
+    )
+
+
+def _allow_acceptance_wave(monkeypatch):
+    import ouroboros.review_substrate as substrate
+    from ouroboros.tools import review_helpers
+
+    monkeypatch.setattr(
+        substrate,
+        "triad_delivery_slots",
+        lambda **_kwargs: [ReviewSlot(slot_id="slot", model="review-model")],
+    )
+    monkeypatch.setattr(
+        review_helpers, "review_wave_budget_gate", lambda *_args, **_kwargs: None,
+    )
+
+
+def test_acceptance_cancellation_recheck_precedes_wallet_claim(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    ctx = _root_acceptance_context(tmp_path, {"evidence": "complete"})
+    request_cancel(tmp_path, ctx.task_id, source="test")
+    _allow_acceptance_wave(monkeypatch)
+    monkeypatch.setattr(
+        substrate,
+        "run_review_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reviewer must not be called")
+        ),
+    )
+
+    result = loop._execute_task_acceptance_panel(ctx)
+
+    assert result.degraded is True
+    assert result.degraded_reasons == [
+        "cancellation_pending (no reviewer was called)"
+    ]
+    state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
+    assert state["claims_by_binding"] == {}
+
+
+def test_the_paid_claim_rechecks_the_wallet_and_never_the_floor(tmp_path, monkeypatch):
+    """Owner R55: the paid claim (`_claim` in the dispatch stamp, which the
+    stub fires exactly where a route does, before its first physical send)
+    rechecks the WALLET and cancellation (the test above); time belongs to the
+    loop gate, so `review_launch_allowed` is armed to fail the test if the
+    claim asks it. The wallet is exhausted for REAL between admission and the
+    send (another binding buys the tree's only cycle); the refusal is FREE —
+    no claim row for this binding, no reviewer call — and typed DEGRADED."""
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros.task_results import claim_task_acceptance_review_cycle, load_task_acceptance_review_state
+
+    ctx = _root_acceptance_context(tmp_path, {"evidence": "complete"})
+    _allow_acceptance_wave(monkeypatch)
+    monkeypatch.setattr(task_pacing, "review_launch_allowed", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("the launch floor is the loop gate's, never the claim's")))
+    other = substrate.build_review_binding(candidate="another", evidence={}, fence_token_or_state="wallet-gate")
+
+    def _exhaust_wallet_then_fire_stamp(_request, *, usage_ctx, **_kwargs):
+        claimed = claim_task_acceptance_review_cycle(tmp_path, ctx.task_id, other, claimed_by_task_id=ctx.task_id)
+        assert claimed["status"] == "claimed"  # the tree's one cycle is now spent
+        usage_ctx._review_paid_stamp()  # the route's write-ahead call: refuses first
+        raise AssertionError("reviewer must not be called")
+
+    monkeypatch.setattr(substrate, "run_review_request", _exhaust_wallet_then_fire_stamp)
+    result = loop._execute_task_acceptance_panel(ctx)
+    assert result.degraded is True and result.degraded_reasons[0].startswith("review_cycles_exhausted")
+    claims = load_task_acceptance_review_state(tmp_path, ctx.task_id)["claims_by_binding"]
+    assert set(claims) == {other["binding_hash"]}  # the other binding's row, never this one's
+
+
+def test_acceptance_corrupt_cancellation_projection_is_unknown_without_claim(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    ctx = _root_acceptance_context(tmp_path, {"evidence": "complete"})
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(exist_ok=True)
+    (state_dir / "cancel_intents.json").write_text("{", encoding="utf-8")
+    _allow_acceptance_wave(monkeypatch)
+    monkeypatch.setattr(
+        substrate,
+        "run_review_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reviewer must not be called")
+        ),
+    )
+
+    result = loop._execute_task_acceptance_panel(ctx)
+
+    assert result.degraded is True
+    assert result.degraded_reasons[0].startswith(
+        "cancellation_state_unknown:CancelIntentProjectionCorrupt"
+    )
+    state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
+    assert state["claims_by_binding"] == {}
+
+
+def test_acceptance_claim_serializes_against_concurrent_cancellation(
+    tmp_path, monkeypatch,
+):
+    import threading
+
+    import ouroboros.task_results as task_results
+    from ouroboros.cancel_intents import request_cancel
+
+    ctx = _root_acceptance_context(tmp_path, {"evidence": "complete"})
+    entered_claim = threading.Event()
+    release_claim = threading.Event()
+    real_cap = task_results._root_task_acceptance_review_cap
+
+    def paused_cap(root_result):
+        entered_claim.set()
+        assert release_claim.wait(timeout=2.0)
+        return real_cap(root_result)
+
+    monkeypatch.setattr(task_results, "_root_task_acceptance_review_cap", paused_cap)
+    claim_result = []
+    claim_thread = threading.Thread(
+        target=lambda: claim_result.append(
+            task_results.claim_task_acceptance_review_cycle(
+                tmp_path, ctx.task_id, ctx.review_binding,
+                claimed_by_task_id=ctx.task_id,
+            )
+        ),
+    )
+    claim_thread.start()
+    assert entered_claim.wait(timeout=2.0)
+
+    cancel_result = []
+    cancel_started = threading.Event()
+
+    def cancel():
+        cancel_started.set()
+        cancel_result.append(
+            request_cancel(tmp_path, ctx.task_id, source="concurrent-test")
+        )
+
+    cancel_thread = threading.Thread(
+        target=cancel,
+    )
+    cancel_thread.start()
+    assert cancel_started.wait(timeout=2.0)
+    cancel_thread.join(timeout=0.05)
+    assert cancel_thread.is_alive(), "cancellation must wait for the in-flight claim"
+
+    release_claim.set()
+    claim_thread.join(timeout=2.0)
+    cancel_thread.join(timeout=2.0)
+    assert not claim_thread.is_alive() and not cancel_thread.is_alive()
+    assert claim_result[0]["status"] == "claimed"
+    assert cancel_result and cancel_result[0]["state"] == "requested"
+
+
+def test_acceptance_zero_physical_refusal_does_not_claim_wallet(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    evidence = {
+        "__unresolved_partial_artifacts__": [{"status": "source_unavailable"}],
+    }
+    ctx = _root_acceptance_context(tmp_path, evidence)
+    _allow_acceptance_wave(monkeypatch)
+
+    result = loop._execute_task_acceptance_panel(ctx)
+
+    assert result.aggregate_signal == "DEGRADED"
+    assert result.actors[0]["status"] == "not_dispatched"
+    state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
+    assert state["claims_by_binding"] == {}
+
+    # Repairing the evidence can still spend the root's sole physical cycle;
+    # the synthetic refusal above did not strand the tree at cap=1.
+    physical_calls = []
+
+    def physical_panel(request, **kwargs):
+        from ouroboros.review_dispatch import stamp_review_paid_on_dispatch
+
+        stamp_review_paid_on_dispatch(kwargs["usage_ctx"])
+        physical_calls.append(request)
+        return SimpleNamespace(aggregate_signal="PASS")
+
+    monkeypatch.setattr(
+        substrate,
+        "run_review_request",
+        physical_panel,
+    )
+    repaired = loop._execute_task_acceptance_panel(
+        _root_acceptance_context(tmp_path, {"evidence": "complete"}),
+    )
+    assert repaired.aggregate_signal == "PASS"
+    assert len(physical_calls) == 1
+    state = load_task_acceptance_review_state(tmp_path, ctx.task_id)
+    assert len(state["claims_by_binding"]) == 1
+
+
+def test_acceptance_route_refusal_before_physical_send_keeps_wallet_retryable(
+    tmp_path, monkeypatch,
+):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros import usage_accounting as usage
+    from ouroboros.task_results import load_task_acceptance_review_state
+
+    class RefusingLLM:
+        def chat(self, **_kwargs):
+            raise RuntimeError("route resolution failed before provider send")
+
+    class AccountedLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, **_kwargs):
+            request = usage.AttemptRequest(
+                model="local-review-test", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="root-wallet-gate",
+                root_task_id="root-wallet-gate",
+            )
+
+            def send():
+                self.calls += 1
+                return {"content": "[]"}, {
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                }
+
+            return usage.execute_physical_attempt(request, send)
+
+    _allow_acceptance_wave(monkeypatch)
+    original_run = substrate.run_review_request
+
+    def run_with(llm):
+        def _run(request, **kwargs):
+            return original_run(request, llm=llm, **kwargs)
+
+        monkeypatch.setattr(substrate, "run_review_request", _run)
+        return loop._execute_task_acceptance_panel(
+            _root_acceptance_context(tmp_path, {"evidence": "complete"}),
+        )
+
+    refused = run_with(RefusingLLM())
+    assert refused.actors[0]["status"] == "error"
+    assert refused.actors[0].get("physical_attempts", 0) == 0
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert state["claims_by_binding"] == {}
+
+    accounted = AccountedLLM()
+    run_with(accounted)
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert accounted.calls == 1
+    assert len(state["claims_by_binding"]) == 1
+
+
+def test_acceptance_dispatch_rechecks_cancel_before_provider_send(tmp_path, monkeypatch):
+    import ouroboros.loop as loop
+    import ouroboros.review_substrate as substrate
+    from ouroboros import usage_accounting as usage
+    from ouroboros.cancel_intents import request_cancel
+    from ouroboros.task_results import load_task_acceptance_review_state
+    class CancellingLLM:
+        calls = 0
+
+        def chat(self, **_kwargs):
+            request_cancel(tmp_path, "root-wallet-gate", source="dispatch-race")
+            request = usage.AttemptRequest(
+                model="local-review-test", provider="local", reservation_usd=0.0,
+                drive_root=tmp_path, task_id="root-wallet-gate",
+                root_task_id="root-wallet-gate",
+            )
+            return usage.execute_physical_attempt(request, self.send)
+        def send(self):
+            self.calls += 1
+            return {"content": "[]"}, {"prompt_tokens": 0, "completion_tokens": 0}
+
+    _allow_acceptance_wave(monkeypatch)
+    original_run, llm = substrate.run_review_request, CancellingLLM()
+    monkeypatch.setattr(substrate, "run_review_request", lambda request, **kwargs:
+                        original_run(request, llm=llm, **kwargs))
+    result = loop._execute_task_acceptance_panel(
+        _root_acceptance_context(tmp_path, {"evidence": "complete"}),
+    )
+    assert result.actors[0]["status"] == "error" and llm.calls == 0
+    state = load_task_acceptance_review_state(tmp_path, "root-wallet-gate")
+    assert state["claims_by_binding"] == {}
+    projection = usage.usage_projection(tmp_path, root_task_id="root-wallet-gate")
+    assert projection["attempt_counts"] == {"released": 1} and projection["non_final_rows"] == 0
+    assert projection["cost_final"] is True
+
+def test_resolve_budget_profile_emits_no_deprecation_events(tmp_path):
+    """ABI 7.0 (Q10=A): the alias deprecation machinery is gone - a profile
+    carrying retired spellings resolves quietly, without the retired keys."""
     legacy = SimpleNamespace(
         drive_root=tmp_path,
         task_id="legacy",
-        task_contract={"budget_profile": normalize_budget_profile({"stall_rounds_threshold": 2})},
+        task_contract={"budget_profile": {
+            "improvement_policy": "until_deadline", "stall_rounds_threshold": 2,
+        }},
     )
-    task_pacing.resolve_budget_profile(legacy)
-    rows = [json.loads(line) for line in events.read_text(encoding="utf-8").splitlines()]
-    assert rows[-1]["aliases"] == ["stall_rounds_threshold"]
+    resolved = task_pacing.resolve_budget_profile(legacy)
+    assert resolved["improvement_policy"] == "fixed"
+    assert "stall_rounds_threshold" not in resolved
+    assert not (tmp_path / "logs" / "events.jsonl").exists()
 
 
 def test_child_task_never_becomes_host_acceptance_authority():
@@ -151,11 +570,14 @@ def test_queue_owned_acceptance_fence_uses_only_optional_ctx_hooks():
         begin_acceptance_fence=begin,
         end_acceptance_fence=end,
     )
-    assert _begin_task_acceptance_fence(ctx, "root") == (True, "fence-1")
-    assert _end_task_acceptance_fence(ctx, outcome="revision") is True
+    opened, token = _begin_task_acceptance_fence(ctx, "root")
+    assert opened and opened.status == "ok" and token == "fence-1"
+    released = _end_task_acceptance_fence(ctx, outcome="revision")
+    assert released and released.status == "ok"
     assert calls == [
         ("begin", {"root_task_id": "root", "task_id": "root"}),
-        ("end", {"token": "fence-1", "outcome": "revision"}),
+        # A bare-token begin still yields a number: ``end`` always carries the generation the queue compares.
+        ("end", {"token": "fence-1", "outcome": "revision", "expected_generation": 0}),
     ]
 
 
@@ -253,45 +675,6 @@ def test_acceptance_quiescence_requires_empty_supervisor_snapshot(tmp_path, monk
         "artifact_status": "",
         "source": "supervisor_queue",
     }
-
-
-def test_acceptance_quiescence_ignores_authoritative_plan_wave_scouts(
-    tmp_path, monkeypatch,
-):
-    from ouroboros.loop import _task_acceptance_subtree_snapshot
-    import ouroboros.task_results as task_results
-    import ouroboros.task_status as task_status
-
-    monkeypatch.setattr(task_results, "load_plan_review_state", lambda *_args: {})
-    monkeypatch.setattr(
-        task_results,
-        "plan_review_audit_only_task_ids",
-        lambda _state: ["planning-scout"],
-    )
-    monkeypatch.setattr(task_status, "find_child_tasks", lambda *_args, **_kwargs: [
-        {
-            "task_id": "planning-scout",
-            "parent_task_id": "root",
-            "status": "running",
-        },
-        {
-            "task_id": "implementation-child",
-            "parent_task_id": "root",
-            "status": "completed",
-        },
-    ])
-    ctx = SimpleNamespace(
-        drive_root=tmp_path,
-        task_metadata={"root_task_id": "root"},
-        _task_acceptance_queue_descendants=[
-            {"task_id": "planning-scout", "status": "running"},
-        ],
-    )
-
-    quiescent, rows = _task_acceptance_subtree_snapshot(ctx, tmp_path, "root")
-
-    assert quiescent is True
-    assert [row["task_id"] for row in rows] == ["implementation-child"]
 
 
 def test_acceptance_immutable_contract_is_never_silently_truncated(tmp_path):
@@ -524,7 +907,7 @@ def test_only_task_acceptance_fail_with_correction_rail_is_a_valid_veto(tmp_path
     )
     assert tier_veto.aggregate_signal == "FAIL"
     assert tier_veto.actors[2]["signal"] == "FAIL"
-    assert "best_effort" in build_improvement_capsule(tier_veto)
+    assert "rated a partial result" in build_improvement_capsule(tier_veto)  # the tier in words, never the identifier
 
     unanimous_minimal_fail = run_review_request(
         request,
@@ -606,57 +989,12 @@ def test_clean_acceptance_requires_per_criterion_evidence(tmp_path):
         drive_root=tmp_path,
         llm=_CriterionLLM(structured=True, status="missing"),
     )
-    assert missing.aggregate_signal == "DEGRADED"
+    assert missing.aggregate_signal == "PASS"
+    from ouroboros.review_substrate import task_acceptance_is_clean
+    assert task_acceptance_is_clean(missing) is False
+    assert all(actor["semantic_verdict"] == "PASS" for actor in missing.actors)
+    assert all(actor["parsed"]["outcome_tier"] == "solved" for actor in missing.actors)
     clean = run_review_request(
         request, slots=slots, drive_root=tmp_path, llm=_CriterionLLM(structured=True),
     )
     assert clean.aggregate_signal == "PASS"
-
-
-def test_plan_subject_root_is_distinct_and_escape_fails_loudly(tmp_path):
-    system = tmp_path / "system"
-    subject = tmp_path / "subject"
-    drive = tmp_path / "drive"
-    system.mkdir()
-    subject.mkdir()
-    ctx = ToolContext(
-        repo_dir=system,
-        system_repo_dir=system,
-        workspace_root=subject,
-        workspace_mode="external",
-        drive_root=drive,
-    )
-    assert _resolve_plan_roots(ctx, ["src/app.py"]) == (
-        system.resolve(), subject.resolve(),
-    )
-    try:
-        _resolve_plan_roots(ctx, [str(system / "BIBLE.md")])
-    except ValueError as exc:
-        assert "escapes active subject root" in str(exc)
-    else:  # pragma: no cover - explicit fail-closed assertion
-        raise AssertionError("mixed-root plan was accepted")
-
-
-def test_planning_horizon_has_one_canonical_contract_and_forensic_refs(tmp_path):
-    system = tmp_path / "system"
-    drive = tmp_path / "drive"
-    system.mkdir()
-    (drive / "task_results" / "artifacts" / "root").mkdir(parents=True)
-    (drive / "task_results" / "root.json").write_text("{}", encoding="utf-8")
-    (drive / "task_results" / "artifacts" / "root" / "plan_task_handoffs.json").write_text(
-        "{}", encoding="utf-8",
-    )
-    ctx = ToolContext(
-        repo_dir=system,
-        system_repo_dir=system,
-        drive_root=drive,
-        task_id="root",
-        task_metadata={"root_task_id": "root", "parent_task_id": ""},
-        task_contract={"objective": "verbatim owner objective"},
-    )
-    horizon = _planning_evidence_horizon(
-        ctx, governance_repo=system, subject_repo=system,
-    )
-    assert horizon.count("verbatim owner objective") == 1
-    assert "plan_task_handoffs.json" in horizon
-    assert '"omissions_manifest": []' in horizon

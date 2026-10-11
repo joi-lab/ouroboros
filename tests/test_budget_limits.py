@@ -1,123 +1,31 @@
-"""Tests for _check_budget_limits (per-task soft reminder + global budget guard)
-and the v6.56.0 cost axis (contract-driven in-task ceiling + latched milestones)."""
+"""Tests for _check_budget_limits (global budget guard + tree-fed in-task ceiling)
+and the cost axis (typed v6.91 ceiling states + latched v6.56.0 milestones):
+the retired soft note, the global guard, local propagation, ceiling resolution
+and the ceiling stop. The tree-fed deciding value, root-accounting telemetry
+and cost milestones continue in ``test_budget_limits_tree``."""
 import os
-import queue
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from ouroboros import task_pacing
 from ouroboros.contracts.task_contract import normalize_budget_profile
-from ouroboros.loop import _RoundLimitContext, _check_budget_limits
+from ouroboros.loop_budget import _check_budget_limits
+from tests._budget_limits_helpers import _make_args
 
 
-def _make_args(**overrides):
-    """Build default kwargs for _check_budget_limits.
+# --- The retired per-task soft reminder (v6.91) ---
 
-    ``cost_ceiling_usd`` defaults to the historical 50%-of-remaining ceiling so
-    the legacy guard tests keep exercising the same semantics the runtime gets
-    from ``task_pacing.resolve_cost_ceiling_usd`` with an absent profile.
-    """
-    llm = MagicMock()
-    llm.chat.return_value = (
-        {"role": "assistant", "content": ""},
-        {"prompt_tokens": 0, "completion_tokens": 0, "cost": 0.0},
-    )
-    defaults = dict(
-        budget_remaining_usd=100.0,
-        accumulated_usage={"cost": 0.0, "prompt_tokens": 0, "completion_tokens": 0},
-        round_idx=0,
-        messages=[],
-        llm=llm,
-        active_model="test-model",
-        active_effort="high",
-        max_retries=1,
-        drive_logs=None,
-        task_id="test-task",
-        event_queue=queue.Queue(),
-        llm_trace={},
-        task_type="task",
-        use_local=False,
-    )
-    defaults.update(overrides)
-    if "cost_ceiling_usd" not in defaults:
-        defaults["cost_ceiling_usd"] = task_pacing.resolve_cost_ceiling_usd(
-            defaults["budget_remaining_usd"], normalize_budget_profile(None),
-        )
-    budget_remaining_usd = defaults.pop("budget_remaining_usd")
-    cost_ceiling_usd = defaults.pop("cost_ceiling_usd")
-    ctx = _RoundLimitContext(
-        messages=defaults["messages"],
-        llm=defaults["llm"],
-        active_model=defaults["active_model"],
-        active_effort=defaults["active_effort"],
-        max_retries=defaults["max_retries"],
-        drive_logs=defaults["drive_logs"],
-        task_id=defaults["task_id"],
-        round_idx=defaults["round_idx"],
-        event_queue=defaults["event_queue"],
-        accumulated_usage=defaults["accumulated_usage"],
-        task_type=defaults["task_type"],
-        active_use_local=defaults["use_local"],
-        max_rounds=100,
-        deadline_ts=defaults.get("deadline_ts"),
-        llm_trace=defaults["llm_trace"],
-    )
-    return {
-        "ctx": ctx,
-        "budget_remaining_usd": budget_remaining_usd,
-        "cost_ceiling_usd": cost_ceiling_usd,
-    }
+class TestPerTaskSoftNoteRetired:
+    """The pre-v6.91 own-cost "[COST NOTE]" keyed to OUROBOROS_PER_TASK_COST_USD
+    is gone: since v6.64.0 the same key hard-fences the whole tree at the
+    ledger, so the note could never fire before the fence (proven live)."""
 
-
-# --- Per-task soft reminder ---
-
-class TestPerTaskSoftReminder:
-    """Per-task cost soft reminder (OUROBOROS_PER_TASK_COST_USD).
-    
-    No hard stop — agent decides whether to continue.
-    """
-
-    def test_under_limit_returns_none(self, tmp_path):
-        """Below threshold → no intervention."""
-        args = _make_args(accumulated_usage={"cost": 3.0}, drive_logs=tmp_path)
-        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "5.0"}):
-            result = _check_budget_limits(**args)
-        assert result is None
-
-    def test_at_limit_no_hard_stop(self, tmp_path):
-        """At or above threshold → NO hard stop, just soft reminder."""
-        messages = []
-        args = _make_args(
-            accumulated_usage={"cost": 5.5},
-            round_idx=10,
-            messages=messages,
-            drive_logs=tmp_path,
-        )
-        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "5.0"}):
-            result = _check_budget_limits(**args)
-        # No hard stop
-        assert result is None
-
-    def test_soft_reminder_injected_every_10_rounds(self, tmp_path):
-        """At threshold + round divisible by 10 → soft note injected."""
+    def test_no_soft_note_at_or_above_key_value(self, tmp_path):
         messages = []
         args = _make_args(
             accumulated_usage={"cost": 6.0},
             round_idx=10,
-            messages=messages,
-            drive_logs=tmp_path,
-        )
-        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "5.0"}):
-            result = _check_budget_limits(**args)
-        assert result is None
-        assert any("[COST NOTE]" in m.get("content", "") for m in messages)
-
-    def test_no_reminder_on_non_10_round(self, tmp_path):
-        """At threshold but round not divisible by 10 → no message."""
-        messages = []
-        args = _make_args(
-            accumulated_usage={"cost": 6.0},
-            round_idx=7,
             messages=messages,
             drive_logs=tmp_path,
         )
@@ -126,27 +34,13 @@ class TestPerTaskSoftReminder:
         assert result is None
         assert not any("[COST NOTE]" in m.get("content", "") for m in messages)
 
-    def test_custom_env_limit(self, tmp_path):
-        """Respect custom per-task threshold from env."""
-        args = _make_args(accumulated_usage={"cost": 9.0}, drive_logs=tmp_path)
-        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "10.0"}):
+    def test_no_stop_from_the_key_alone(self, tmp_path):
+        """The key does not stop the loop here; the ledger fence and the typed
+        ceiling own that axis."""
+        args = _make_args(accumulated_usage={"cost": 20.0}, round_idx=10, drive_logs=tmp_path)
+        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "5.0"}):
             result = _check_budget_limits(**args)
-        # 9.0 < 10.0 → no message at all
         assert result is None
-
-    def test_default_limit_20_no_hard_stop(self, tmp_path):
-        """Without env var, default threshold is 20.0 — but still no hard stop."""
-        messages = []
-        args = _make_args(
-            accumulated_usage={"cost": 20.0},
-            round_idx=10,
-            messages=messages,
-            drive_logs=tmp_path,
-        )
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("OUROBOROS_PER_TASK_COST_USD", None)
-            result = _check_budget_limits(**args)
-        assert result is None  # soft reminder only, no hard stop
 
 
 # --- Global budget guard ---
@@ -154,9 +48,12 @@ class TestPerTaskSoftReminder:
 class TestGlobalBudgetGuard:
     """Existing global budget percentage checks."""
 
-    def test_none_budget_returns_none(self, tmp_path):
-        """No budget → no checks."""
+    def test_no_global_budget_and_no_root_cap_is_silent(self, tmp_path):
+        """Neither axis finite (GAIA shape, no per-task cap) → the whole cost
+        axis stays silent. Note this is decided by the DISABLED ceiling, not by
+        an early return on the global number — see the root-cap test below."""
         args = _make_args(budget_remaining_usd=None, accumulated_usage={"cost": 100.0}, drive_logs=tmp_path)
+        assert args["cost_ceiling"].state == task_pacing.COST_CEILING_DISABLED
         result = _check_budget_limits(**args)
         assert result is None
 
@@ -218,7 +115,7 @@ class TestGlobalBudgetGuard:
 # --- use_local propagation ---
 
 class TestUseLocalPropagation:
-    """Ensure use_local is passed to _call_llm_with_retry on global budget stop."""
+    """Ensure use_local is passed to call_llm_with_retry on global budget stop."""
 
     @patch("ouroboros.loop.call_llm_with_retry")
     def test_global_stop_passes_use_local(self, mock_retry, tmp_path):
@@ -236,27 +133,128 @@ class TestUseLocalPropagation:
         assert kwargs.get("use_local") is True
 
 
-# --- v6.56.0 cost axis: contract-driven ceiling resolution ---
+# --- v6.91 typed cost ceiling resolution ---
 
 class TestCostCeilingResolution:
-    """task_pacing.resolve_cost_ceiling_usd semantics (budget_profile.cost_hard_stop_pct)."""
+    """task_pacing.resolve_cost_ceiling: typed states, global pct component,
+    root-cap-minus-margin component."""
 
     def test_absent_profile_means_historical_50pct(self):
         profile = normalize_budget_profile(None)
-        assert task_pacing.resolve_cost_ceiling_usd(10.0, profile) == 5.0
+        ceiling = task_pacing.resolve_cost_ceiling(10.0, profile)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.ceiling_usd == 5.0
+        assert ceiling.root_cap_usd is None
 
-    def test_zero_pct_means_no_ceiling_never_zero_dollars(self):
+    def test_zero_pct_means_disabled_never_zero_dollars(self):
         profile = normalize_budget_profile({"cost_hard_stop_pct": 0})
-        assert task_pacing.resolve_cost_ceiling_usd(10.0, profile) is None
+        ceiling = task_pacing.resolve_cost_ceiling(10.0, profile)
+        assert ceiling.state == task_pacing.COST_CEILING_DISABLED
+        assert ceiling.ceiling_usd is None
+
+    def test_zero_pct_disabled_even_with_tiny_root_cap(self):
+        """The bench contract (SWE-Pro: pct=0 + a small root cap) keeps the
+        in-task stop fully off — the ledger fence is the only stop."""
+        profile = normalize_budget_profile({"cost_hard_stop_pct": 0})
+        ceiling = task_pacing.resolve_cost_ceiling(10.0, profile, root_cap_usd=0.5)
+        assert ceiling.state == task_pacing.COST_CEILING_DISABLED
+        assert ceiling.ceiling_usd is None
 
     def test_custom_pct(self):
         profile = normalize_budget_profile({"cost_hard_stop_pct": 25})
-        assert task_pacing.resolve_cost_ceiling_usd(10.0, profile) == 2.5
+        ceiling = task_pacing.resolve_cost_ceiling(10.0, profile)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.ceiling_usd == 2.5
 
-    def test_no_finite_budget_means_silent_axis(self):
+    def test_no_finite_budget_means_disabled_axis(self):
         profile = normalize_budget_profile(None)
-        assert task_pacing.resolve_cost_ceiling_usd(None, profile) is None
-        assert task_pacing.resolve_cost_ceiling_usd(0.0, profile) is None
+        assert task_pacing.resolve_cost_ceiling(None, profile).state == task_pacing.COST_CEILING_DISABLED
+        assert task_pacing.resolve_cost_ceiling(0.0, profile).state == task_pacing.COST_CEILING_DISABLED
+
+    def test_root_cap_component_binds_when_smaller(self):
+        """min(pct-of-global, cap − margin): the live wave1/2 shape — a huge
+        global remaining must not hide a $100 tree cap."""
+        profile = normalize_budget_profile(None)
+        ceiling = task_pacing.resolve_cost_ceiling(1900.0, profile, root_cap_usd=100.0)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.root_cap_usd == 100.0
+        assert ceiling.ceiling_usd == 100.0 - task_pacing.COST_PLANNING_MARGIN_USD
+        assert ceiling.planning_margin_usd == task_pacing.COST_PLANNING_MARGIN_USD
+
+    def test_global_pct_component_binds_when_smaller(self):
+        profile = normalize_budget_profile(None)
+        ceiling = task_pacing.resolve_cost_ceiling(10.0, profile, root_cap_usd=100.0)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.ceiling_usd == 5.0
+
+    def test_root_cap_only_no_finite_global(self):
+        """A per-task cap with an unbounded global still yields an active stop."""
+        profile = normalize_budget_profile(None)
+        ceiling = task_pacing.resolve_cost_ceiling(None, profile, root_cap_usd=50.0)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.ceiling_usd == 50.0 - task_pacing.COST_PLANNING_MARGIN_USD
+
+    def test_cap_at_or_below_margin_soft_lands_never_uncapped(self):
+        """A root cap at/below the planning margin must resolve to the typed
+        soft-land state — the pre-typed shape returned the same None as
+        'unlimited' (a $0.50 bench cap would have run uncapped)."""
+        profile = normalize_budget_profile(None)
+        for cap in (0.5, task_pacing.COST_PLANNING_MARGIN_USD):
+            ceiling = task_pacing.resolve_cost_ceiling(100.0, profile, root_cap_usd=cap)
+            assert ceiling.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND, cap
+            assert ceiling.ceiling_usd is None
+            assert ceiling.root_cap_usd == cap
+
+    def test_ceiling_is_never_computed_zero(self):
+        profile = normalize_budget_profile(None)
+        just_above = task_pacing.COST_PLANNING_MARGIN_USD + 0.01
+        ceiling = task_pacing.resolve_cost_ceiling(1000.0, profile, root_cap_usd=just_above)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.ceiling_usd is not None and ceiling.ceiling_usd > 0
+        # The boundary is MEASURED, not implied: `> 0` alone reads as "there is
+        # working room", but the bail is exactly the owner's `room <= 0` rule, so
+        # a cap one cent above the margin buys exactly one cent of ceiling — a
+        # stop-on-the-first-spend ceiling. Widening this into a minimum-room floor
+        # would move caps the owner deliberately allows into immediate soft-land,
+        # which is an owner decision; pinning the number keeps it visible instead.
+        assert round(ceiling.ceiling_usd, 6) == 0.01
+        assert ceiling.root_cap_usd == just_above
+        assert ceiling.planning_margin_usd == task_pacing.COST_PLANNING_MARGIN_USD
+        at_margin = task_pacing.resolve_cost_ceiling(
+            1000.0, profile, root_cap_usd=task_pacing.COST_PLANNING_MARGIN_USD,
+        )
+        assert at_margin.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND
+
+    def test_per_task_cap_setting_note_states_the_immediate_finalization(self):
+        """The owner-facing note must not promise a wrap-up a small cap cannot get.
+
+        The field still accepts a cap below the wrap-up margin (owner power is
+        preserved), but such a cap resolves to `exhausted_soft_land`, which the
+        loop turns into a forced final answer at the TOP of round 0 — zero work
+        rounds. The note said only "a graceful wrap-up fires just before"."""
+        from ouroboros.settings_setup_contract import build_setup_contract
+
+        fields = {
+            str(field.get("settingKey")): field
+            for field in build_setup_contract().get("budgetFields", [])
+        }
+        note = str(fields["OUROBOROS_PER_TASK_COST_USD"]["note"])
+        assert f"${task_pacing.COST_PLANNING_MARGIN_USD:.2f}" in note
+        assert "finalizes the task immediately" in note
+        # A cap at the documented boundary really does behave that way.
+        assert task_pacing.resolve_cost_ceiling(
+            1000.0, normalize_budget_profile(None),
+            root_cap_usd=task_pacing.COST_PLANNING_MARGIN_USD,
+        ).state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND
+
+    def test_planning_margin_is_absolute_not_pct(self):
+        """The margin must not scale with the cap (a pct reserve amputated the
+        tail of long tasks — v6.54.4 r1; the money-axis analogue is pinned)."""
+        profile = normalize_budget_profile(None)
+        small = task_pacing.resolve_cost_ceiling(None, profile, root_cap_usd=10.0)
+        large = task_pacing.resolve_cost_ceiling(None, profile, root_cap_usd=1000.0)
+        assert small.ceiling_usd == 10.0 - task_pacing.COST_PLANNING_MARGIN_USD
+        assert large.ceiling_usd == 1000.0 - task_pacing.COST_PLANNING_MARGIN_USD
 
     def test_malformed_pct_fails_safe_to_default_not_zero(self):
         """A garbage cost_hard_stop_pct must NOT silently become 0 (= no in-task
@@ -265,23 +263,99 @@ class TestCostCeilingResolution:
         for bad in (-5, -0.1, 0.5, "0.5", "abc", [1]):
             profile = normalize_budget_profile({"cost_hard_stop_pct": bad})
             assert profile["cost_hard_stop_pct"] is None, bad
-            assert task_pacing.resolve_cost_ceiling_usd(10.0, profile) == 5.0, bad
+            ceiling = task_pacing.resolve_cost_ceiling(10.0, profile)
+            assert ceiling.state == task_pacing.COST_CEILING_ACTIVE, bad
+            assert ceiling.ceiling_usd == 5.0, bad
         # explicit 0 (and "0") stays a deliberate no-stop; whole percents clamp.
         assert normalize_budget_profile({"cost_hard_stop_pct": 0})["cost_hard_stop_pct"] == 0
         assert normalize_budget_profile({"cost_hard_stop_pct": "0"})["cost_hard_stop_pct"] == 0
         assert normalize_budget_profile({"cost_hard_stop_pct": 250})["cost_hard_stop_pct"] == 100
 
 
-class TestCostCeilingStop:
-    """_check_budget_limits consumes the pre-resolved ceiling as one parameter."""
+# --- В26=A: a wake's tree carries a GRACEFUL ceiling, never a narrowed fence ---
 
-    def test_no_ceiling_means_no_in_task_stop(self, tmp_path):
-        """cost_hard_stop_pct=0 → ceiling None → even a huge task spend does not stop."""
+class TestWakeRootCeiling:
+    """A Background Consciousness wake-up is the ROOT of its own tree and carries what is
+    left of its allowance as `metadata.root_cost_ceiling_usd`. `resolve_cost_ceiling` honors
+    that number for the root itself (members inherit the resolved ceiling as before), while
+    the ledger fence keeps the owner's per-task cap: one Main attempt reserves several
+    dollars up front, and a fence narrowed below that (the earlier `root_limit_usd`
+    narrowing) refused every wake of a nearly spent day before its first call — a
+    `budget_exhausted` bubble in Main at every heartbeat.
+    """
+
+    def _scope(self, tmp_path, monkeypatch, *, metadata=None, per_task_cap="50"):
+        """The scope `handle_task` actually binds for one task."""
+        from ouroboros.agent import OuroborosAgent
+        from ouroboros.usage_accounting import current_usage_scope
+
+        monkeypatch.setattr("ouroboros.subagent_runtime.apply_task_start_settings_or_disclose",
+                            lambda *_a, **_k: None)
+        monkeypatch.setattr("ouroboros.model_wait.task_model_wait_scope", lambda **_k: nullcontext())
+        monkeypatch.setenv("TOTAL_BUDGET", "1000")
+        monkeypatch.setenv("OUROBOROS_PER_TASK_COST_USD", per_task_cap)
+        host = SimpleNamespace(
+            env=SimpleNamespace(drive_root=tmp_path), _emit_live_log=lambda *_a, **_k: None,
+            _event_queue=None, _handle_task_scoped=lambda _task: current_usage_scope(),
+        )
+        task = {"id": "wake-1", "type": "task"}
+        if metadata is not None:
+            task["metadata"] = metadata
+        return OuroborosAgent.handle_task(host, task)
+
+    def test_without_metadata_the_owner_setting_is_the_cap(self, tmp_path, monkeypatch):
+        assert self._scope(tmp_path, monkeypatch).root_limit_usd == 50.0
+
+    def test_the_ceiling_rides_the_scope_and_the_fence_keeps_the_cap(self, tmp_path, monkeypatch):
+        scope = self._scope(tmp_path, monkeypatch, metadata={"root_cost_ceiling_usd": 0.66})
+        assert scope.root_limit_usd == 50.0 and scope.root_cost_ceiling_usd == 0.66
+
+    def test_metadata_never_narrows_the_fence(self, tmp_path, monkeypatch):
+        """No producer narrows the ledger fence through metadata: a fence below one
+        attempt's reservation is a refusal before the first call, not a soft landing."""
+        assert self._scope(tmp_path, monkeypatch, metadata={"root_limit_usd": 0.66}).root_limit_usd == 50.0
+        assert self._scope(tmp_path, monkeypatch, metadata={"root_limit_usd": 0.66}, per_task_cap="0").root_limit_usd is None
+
+    def test_a_thin_root_ceiling_soft_lands_the_root_immediately(self, tmp_path, monkeypatch):
+        """$0.66 left of the allowance is below the planning margin, so the wake gets its
+        one best-effort final answer — which the fence at the full cap still admits."""
+        from ouroboros.usage_accounting import usage_scope
+
+        with usage_scope(self._scope(tmp_path, monkeypatch, metadata={"root_cost_ceiling_usd": 0.66})):
+            ceiling = task_pacing.resolve_task_cost_ceiling(SimpleNamespace(), 1000.0)
+        assert ceiling.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND
+        assert ceiling.root_cap_usd == 50.0 and ceiling.basis == "root_ceiling_at_or_below_planning_margin"
+
+    def test_a_root_ceiling_above_the_margin_is_the_working_ceiling(self, tmp_path, monkeypatch):
+        from ouroboros.usage_accounting import usage_scope
+
+        with usage_scope(self._scope(tmp_path, monkeypatch, metadata={"root_cost_ceiling_usd": 9.0})):
+            ceiling = task_pacing.resolve_task_cost_ceiling(SimpleNamespace(), 1000.0)
+        assert ceiling.state == task_pacing.COST_CEILING_ACTIVE
+        assert ceiling.root_cap_usd == 50.0
+        assert ceiling.ceiling_usd == 9.0 - task_pacing.COST_PLANNING_MARGIN_USD
+        assert "root_ceiling_minus_margin" in ceiling.basis
+
+    def test_a_member_still_inherits_the_resolved_ceiling(self):
+        """The root's number reaches its members as before; a member's own carrier is the
+        inherited resolution, never re-derived from a root-only ceiling."""
+        member = task_pacing.resolve_cost_ceiling(
+            1000.0, normalize_budget_profile({}), root_cap_usd=50.0, non_root_member=True, root_ceiling_usd=6.0)
+        assert member.state == task_pacing.COST_CEILING_ACTIVE and member.ceiling_usd == 6.0
+
+class TestCostCeilingStop:
+    """_check_budget_limits consumes the typed pre-resolved ceiling."""
+
+    def test_no_active_ceiling_means_no_in_task_stop(self, tmp_path):
+        """disabled state → even a huge task spend does not stop here."""
         messages = []
+        disabled = task_pacing.resolve_cost_ceiling(
+            100.0, normalize_budget_profile({"cost_hard_stop_pct": 0}),
+        )
         args = _make_args(
             budget_remaining_usd=100.0,
             accumulated_usage={"cost": 90.0},
-            cost_ceiling_usd=None,
+            cost_ceiling=disabled,
             messages=messages,
             drive_logs=tmp_path,
         )
@@ -290,13 +364,26 @@ class TestCostCeilingStop:
         assert result is None
         assert messages == []
 
+    def test_none_ceiling_object_means_no_in_task_stop(self, tmp_path):
+        args = _make_args(
+            budget_remaining_usd=100.0,
+            accumulated_usage={"cost": 90.0},
+            cost_ceiling=None,
+            drive_logs=tmp_path,
+        )
+        with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "999"}):
+            result = _check_budget_limits(**args)
+        assert result is None
+
     def test_custom_ceiling_stops_when_exceeded(self, tmp_path):
         llm = MagicMock()
         llm.chat.return_value = ({"content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
         args = _make_args(
             budget_remaining_usd=100.0,
             accumulated_usage={"cost": 26.0},
-            cost_ceiling_usd=25.0,
+            cost_ceiling=task_pacing.resolve_cost_ceiling(
+                50.0, normalize_budget_profile(None),
+            ),
             llm=llm,
             drive_logs=tmp_path,
         )
@@ -309,63 +396,11 @@ class TestCostCeilingStop:
         args = _make_args(
             budget_remaining_usd=100.0,
             accumulated_usage={"cost": 25.0},
-            cost_ceiling_usd=25.0,
+            cost_ceiling=task_pacing.resolve_cost_ceiling(
+                50.0, normalize_budget_profile(None),
+            ),
             drive_logs=tmp_path,
         )
         with patch.dict(os.environ, {"OUROBOROS_PER_TASK_COST_USD": "999"}):
             result = _check_budget_limits(**args)
         assert result is None
-
-
-# --- v6.56.0 cost axis: latched milestones + wrap-up (task_pacing content) ---
-
-class TestCostMilestones:
-    def test_milestones_latch_once_and_sequence(self):
-        ctx = SimpleNamespace()
-        kw = dict(start_remaining_usd=20.0, cost_ceiling_usd=10.0)
-        # 50% remaining of the $10 ceiling crossed.
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=5.1, **kw)
-        assert note is not None and "50% remaining" in note.text
-        assert note.checkpoint["checkpoint_kind"] == "cost_budget_milestone"
-        assert note.checkpoint["hard_stop"] is True
-        # Same spend again → latched, silent.
-        assert task_pacing.build_cost_budget_note(ctx, task_cost=5.1, **kw) is None
-        # 25% remaining crossed.
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=7.6, **kw)
-        assert note is not None and "25% remaining" in note.text
-        # ~80% spent → one-shot wrap-up.
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=8.1, **kw)
-        assert note is not None and note.checkpoint["checkpoint_kind"] == "cost_budget_wrapup"
-        assert task_pacing.build_cost_budget_note(ctx, task_cost=8.2, **kw) is None
-        # 10% remaining crossed (wrap-up already latched, no duplicate).
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=9.1, **kw)
-        assert note is not None and "10% remaining" in note.text
-        assert task_pacing.build_cost_budget_note(ctx, task_cost=9.9, **kw) is None
-
-    def test_jump_past_wrapup_with_milestone_suppresses_duplicate_wrapup(self):
-        """A single jump deep past 80% spent fires the tightest milestone and
-        latches wrap-up, so the next round does not double-note."""
-        ctx = SimpleNamespace()
-        kw = dict(start_remaining_usd=20.0, cost_ceiling_usd=10.0)
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=9.5, **kw)
-        assert note is not None and "10% remaining" in note.text
-        assert task_pacing.build_cost_budget_note(ctx, task_cost=9.6, **kw) is None
-
-    def test_no_finite_budget_axis_is_silent(self):
-        ctx = SimpleNamespace()
-        assert task_pacing.build_cost_budget_note(
-            ctx, start_remaining_usd=None, cost_ceiling_usd=None, task_cost=999.0,
-        ) is None
-
-    def test_uncapped_run_uses_start_snapshot_informationally(self):
-        """cost_hard_stop_pct=0: milestones fire against the start snapshot,
-        disclose there is no in-task stop, and clamp remaining at 0%."""
-        ctx = SimpleNamespace()
-        kw = dict(start_remaining_usd=10.0, cost_ceiling_usd=None)
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=5.5, **kw)
-        assert note is not None and "no in-task cost stop" in note.text
-        assert note.checkpoint["hard_stop"] is False
-        # Spend past the whole snapshot: clamped, still just the tightest milestone.
-        note = task_pacing.build_cost_budget_note(ctx, task_cost=25.0, **kw)
-        assert note is not None and "10% remaining" in note.text
-        assert "Remaining: ~$0.00" in note.text

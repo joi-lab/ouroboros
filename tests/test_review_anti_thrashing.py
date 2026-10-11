@@ -15,7 +15,6 @@ from ouroboros.review_state import (
     make_repo_key,
     save_state,
 )
-from ouroboros.tools import scope_review as scope_review_mod
 from ouroboros.tools.review import _build_review_history_section as triad_hist
 from ouroboros.tools.review_helpers import (
     format_obligation_excerpt,
@@ -26,7 +25,6 @@ from ouroboros.tools.review_helpers import (
 from ouroboros.tools.scope_review import (
     _build_review_history_section as scope_hist,
     _build_scope_history_section,
-    _build_scope_prompt,
 )
 
 
@@ -291,6 +289,8 @@ def test_run_unified_review_obligation_loading_uses_drive_root_and_make_repo_key
         review_mod, "run_cmd",
         lambda cmd, *args, **kw: ("M\tfile.py" if "--name-only" in cmd else "+ change"),
     )
+    import ouroboros.tools.review_binary_context as _rbc
+    monkeypatch.setattr(_rbc, "capture_staged_diff", lambda _repo, *, unified=3: "+ change")
     monkeypatch.setattr(review_mod, "build_touched_file_pack", lambda *a, **k: ("(pack)", []))
     monkeypatch.setattr(review_mod, "_load_checklist_section", lambda: "(checklists)")
     monkeypatch.setattr(
@@ -366,14 +366,11 @@ def test_run_unified_review_injects_obligation_ids_with_correct_repo_key(tmp_pat
     assert '"item": "code_quality"' in out
 
 
-def test_scope_build_prompt_loads_obligations_from_drive_root(tmp_path, monkeypatch):
-    """Verify `_build_scope_prompt` with a valid `drive_root` loads obligations
-    from the persisted state and renders them into the prompt.
+def test_scope_brief_loads_obligations_from_drive_root(tmp_path, monkeypatch):
+    """The retrieving scope brief with a valid `drive_root` loads obligations from
+    the persisted state and renders them into the reviewer's history section."""
+    from ouroboros.tools import scope_review_session as session
 
-    We stub the heavy scope-pack builders so the test focuses on the obligation
-    loading wiring introduced by Fix 2. The stubs supply just enough structure
-    for `_compute_touched_status` to return None (success).
-    """
     drive_root = tmp_path / "data"
     drive_root.mkdir()
     repo_dir = tmp_path / "repo"
@@ -391,43 +388,14 @@ def test_scope_build_prompt_loads_obligations_from_drive_root(tmp_path, monkeypa
     )
     _write_obligation_to_state(drive_root, repo_key, persisted)
 
-    # Stub the heavy scope-pack / git I/O helpers so the prompt builder succeeds.
-    monkeypatch.setattr(
-        scope_review_mod,
-        "_parse_staged_name_status",
-        lambda _rd: [("M", "file.py", "file.py")],
-    )
-    monkeypatch.setattr(
-        scope_review_mod,
-        "build_touched_file_pack",
-        lambda _rd, _paths: ("(touched file pack)", []),
-    )
-    monkeypatch.setattr(
-        scope_review_mod,
-        "_inline_deleted_file_pack",
-        lambda pack, _deleted, _rd: pack,
-    )
-    monkeypatch.setattr(
-        scope_review_mod,
-        "_gather_scope_packs",
-        lambda _rd, _paths, fixed_prompt_tokens=0: "(generated scope atlas)",
-    )
-    monkeypatch.setattr(
-        scope_review_mod,
-        "run_cmd",
-        lambda *args, **kwargs: "diff --git a/file.py b/file.py\n",
-    )
-
-    prompt, status = _build_scope_prompt(
-        repo_dir,
+    brief, _manifest = session.build_scope_session_task(repo_dir, session.ScopeBriefInputs(
         commit_message="fix: integration scope test",
         drive_root=drive_root,
-    )
+    ))
 
-    assert status is None, f"expected success, got status={status}"
-    assert prompt is not None
-    assert '"obligation_id": "ob-scope-42"' in prompt
-    assert '"item": "cross_module_bugs"' in prompt
+    assert brief
+    assert '"obligation_id": "ob-scope-42"' in brief
+    assert '"item": "cross_module_bugs"' in brief
 
 
 # ---------------------------------------------------------------------------

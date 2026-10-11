@@ -5,19 +5,55 @@ import { readFileSync } from 'node:fs';
 import {
     summarizeChatLiveEvent,
     summarizeLogEvent,
+    taskCancelPending,
     taskOutcomeSeverity,
     taskTerminalPhase,
 } from '../modules/log_events.js';
-import { cancelRunEligibility, isTerminalTaskPhase } from '../modules/chat.js';
+import { isTerminalTaskPhase } from '../modules/chat.js';
+import { cancelRunEligibility } from '../modules/task_control_menu.js';
 
 // --- cancelled severity reducer (added ONCE, consumed everywhere) ---
 
 test('taskOutcomeSeverity classifies cancelled lifecycle as its own severity', () => {
     assert.equal(taskOutcomeSeverity({ status: 'cancelled' }), 'cancelled');
+    // 'cancel_requested' as a STATUS is legacy replay only (phase A moved intent
+    // to the typed cancel_state projection) — old frames still resolve honestly.
     assert.equal(taskOutcomeSeverity({ status: 'cancel_requested' }), 'cancelled');
     assert.equal(taskOutcomeSeverity({
         outcome_axes: { lifecycle: { status: 'cancelled' }, execution: { status: 'cancelled' } },
     }), 'cancelled');
+});
+
+// --- phase A: typed pending-cancel projection + interim card state ---
+
+test('taskCancelPending reads the typed projection, never the status', () => {
+    assert.equal(taskCancelPending({ status: 'running', cancel_state: 'pending' }), true);
+    assert.equal(taskCancelPending({ status: 'scheduled', cancel_state: 'pending' }), true);
+    // A settled record is settled — the projection cannot resurrect it.
+    assert.equal(taskCancelPending({ status: 'cancelled', cancel_state: 'pending' }), false);
+    assert.equal(taskCancelPending({ status: 'completed', cancel_state: 'pending' }), false);
+    // No projection = no pending cancel.
+    assert.equal(taskCancelPending({ status: 'running' }), false);
+});
+
+test('the cancel click shows the honest interim, not an instant Cancelled', () => {
+    // Pinned at source: the click handler marks the card "Cancelling…" while the
+    // durable intent settles, and the stored-record reconcile branches keep the
+    // interim for a nonterminal record with cancel_state=pending instead of
+    // finishing the card — through the SHARED taskCancelPending helper (AR2-8:
+    // one consumer path for the typed projection, never an inline status peek).
+    // Git's Windows checkout may expose CRLF even though the committed blob is
+    // LF. Normalize the source before asserting the cross-file wiring so the
+    // contract tests check behavior, not the platform's line-ending policy.
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    assert.match(chat, /function markLiveCardCancelPending\(/);
+    assert.match(chat, /markLiveCardCancelPending\(taskId, soft\);\n[\s\S]{0,600}await requestStop\(/);
+    assert.match(chat, /taskCancelPending\(stored\)[\s\S]{0,200}return markLiveCardCancelPending\(taskId[,)]/);
+    assert.doesNotMatch(chat, /cancel_state === 'pending'/);
+    assert.match(chat, /Cancelling…/);
+    // S3 (Q1): the pending SOFT stop shows "Finalizing…" from the same seam.
+    assert.match(chat, /Finalizing…/);
 });
 
 test('cancellation wins over failure-shaped teardown side facts', () => {
@@ -89,14 +125,15 @@ test('Cancel run offered only on live, marker-attested root cards', () => {
     assert.equal(cancelRunEligibility(eligible), true);
     // Subagent cards never offer it (the root cascade covers them).
     assert.equal(cancelRunEligibility({ ...eligible, isSubagent: true }), false);
-    // Reusable slots (background consciousness / legacy active) never offer it.
-    assert.equal(cancelRunEligibility({ ...eligible, groupId: 'bg-consciousness' }), false);
+    // The one remaining reusable slot (the legacy 'active' id) never offers it;
+    // a consciousness wake-up is an ordinary direct turn and does.
     assert.equal(cancelRunEligibility({ ...eligible, groupId: 'active' }), false);
+    assert.equal(cancelRunEligibility({ ...eligible, groupId: 'wake-1' }), true);
     // Finished and converted cards have nothing live to cancel.
     assert.equal(cancelRunEligibility({ ...eligible, finished: true }), false);
     assert.equal(cancelRunEligibility({ ...eligible, converted: true }), false);
-    // Without the host-attested marker (e.g. a direct-chat turn's card, which has
-    // the same shape but no queue entry) the button must not appear.
+    // Without the host-attested marker (e.g. a replayed subagent narration that
+    // lost its lineage, or a card whose turn the supervisor no longer owns):
     assert.equal(cancelRunEligibility({ ...eligible, cancelable: false }), false);
     assert.equal(cancelRunEligibility({ ...eligible, groupId: '' }), false);
 });
@@ -104,10 +141,12 @@ test('Cancel run offered only on live, marker-attested root cards', () => {
 test('both cancel surfaces report a refused cancellation', () => {
     // The endpoint answers only after the teardown, so success needs no extra
     // reporting — but a refusal must never read as a silent no-op click.
+    // S3: both surfaces route through the SHARED requestStop (one endpoint
+    // binding for the dropdown's stop actions).
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
     const activity = readFileSync(new URL('../modules/activity.js', import.meta.url), 'utf8');
     for (const source of [chat, activity]) {
-        assert.match(source, /await cancelTask\(/);
+        assert.match(source, /await requestStop\(/);
     }
     // ...and Activity no longer swallows a refused cancel (503) as a no-op click,
     // while keeping the documented 404 completion race graceful.
@@ -120,7 +159,21 @@ test('a timeout-retry root gains Cancel run: the host marker is the truth', () =
     // structural frameRoot===taskId gate would reject exactly the marker the
     // supervisor attested. Pinned at source: the handler trusts the marker alone.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    assert.match(chat, /msg\?\.cancelable === true && msg\?\.task_id\) markTaskCancelable/);
+    const handler = chat.match(/function updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority = true \} = \{\}\) \{[\s\S]*?\n    \}/)?.[0];
+    assert.ok(handler, 'the progress handler exists');
+    assert.match(handler, /const taskId = msg\?\.task_id \|\| '';/);
+    const guardAt = handler.indexOf('if (!taskId) return false;');
+    const grantAt = handler.indexOf('if (grantCancelAuthority && msg.cancelable === true)');
+    assert.ok(guardAt >= 0 && grantAt > guardAt, 'missing task identity returns before granting authority');
+    // The grant keeps the earlier replayed tool-evidence change instead of overwriting it.
+    assert.match(handler, /if \(grantCancelAuthority && msg\.cancelable === true\) \{\s*changed = markTaskCancelable\(String\(taskId\)\) \|\| changed;\s*\}/);
+    // Project-owned progress is now panel-local; Main only accepts its typed
+    // terminal completion projection, so the old `!isMirror` branch is gone.
+    // The shared thread predicate owns Main/Project routing (server project_thread
+    // stamp + known project set) — behaviour is node-tested in
+    // chat_thread_routing.test.js; here we pin only that Chat routes through it.
+    assert.match(chat, /return chatThreadAccepts\(msg, isMain, chatId, state\.projectChatIds\);/);
+    assert.match(chat, /updateLiveCardFromProgressMessage\(msg, \{ grantCancelAuthority: true \}\)/);
     assert.doesNotMatch(chat, /frameRoot === taskId\) *&&[\s\S]{0,80}markTaskCancelable/);
     // ...and the eligibility reducer still refuses subagent/finished/reusable cards,
     // so trusting the marker does not widen the button beyond live pooled roots.
@@ -137,17 +190,56 @@ test('a 404 cancel reconciles the card from the durable record', () => {
     // "Working" forever. The branch must fetch the durable record and resolve the
     // card through the SAME terminal seam replay uses — not merely hide a button.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    const branch = chat.slice(chat.indexOf('cancelableTaskIds.delete(taskId)'));
-    assert.match(branch.slice(0, 1200), /apiFetch\(`\/api\/tasks\/\$\{encodeURIComponent\(taskId\)\}`\)/);
-    assert.match(branch.slice(0, 1600), /finishLiveCard\(taskId, taskTerminalPhase\(stored\)\)/);
+    const branch = chat.slice(chat.indexOf('exc?.status === 404'));
+    assert.match(branch.slice(0, 600), /revokeManagedTaskCancelAuthority\(taskId\);/);
+    assert.match(branch.slice(0, 1200), /reconcileCancelCardFromDetail\(record, taskId, await fetchTaskDetail\(taskId\)\)/);
 });
 
 test('a successful cancel also reconciles when task_done publication is lost', () => {
     // Durable cancellation precedes fail-soft publication. A 200 with no WS frame
     // must therefore read the stored result before leaving the button disabled.
     const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
-    const success = chat.slice(chat.indexOf('await cancelTask(taskId, { cascade: true })'));
+    const success = chat.slice(chat.indexOf('await requestStop(taskId, action)'));
     const beforeCatch = success.slice(0, success.indexOf('} catch (exc)'));
-    assert.match(beforeCatch, /apiFetch\(`\/api\/tasks\/\$\{encodeURIComponent\(taskId\)\}`\)/);
-    assert.match(beforeCatch, /finishLiveCard\(taskId, taskTerminalPhase\(stored\)\)/);
+    assert.match(beforeCatch, /reconcileCancelCardFromDetail\(record, taskId, await fetchTaskDetail\(taskId\)\)/);
+});
+
+// --- GR2-8: cancel-state honesty (failure restore + pending-before-terminal) ---
+
+test('task-detail reconciliation consults taskCancelPending BEFORE the legacy terminal fallback', () => {
+    // GR2-8b: a live task wedged in the legacy `cancel_requested` STATUS latch is
+    // INTENT, not outcome — it must show as cancel-pending, never resolve as a
+    // terminal "Cancelled" while the supervisor is still tearing it down. Pinned
+    // at source: the shared reconcile helper checks the typed projection first
+    // and only falls through to the terminal list afterwards.
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
+    const helper = chat.slice(chat.indexOf('function reconcileCancelCardFromDetail'));
+    const pendingAt = helper.indexOf('taskCancelPending(stored)');
+    const terminalAt = helper.indexOf("'cancel_requested'");
+    assert.ok(pendingAt > 0 && terminalAt > 0, 'both branches exist in the helper');
+    assert.ok(pendingAt < terminalAt, 'the typed pending check runs before the terminal fallback');
+});
+
+test('a failed cancel reconciles through the shared helper before touching the button', () => {
+    // GR3-10 (supersedes the GR2-8a inline check): the non-404 failure path
+    // must reconcile the fetched durable detail through the SHARED
+    // reconcileCancelCardFromDetail helper — keep the button disabled while
+    // cancel_state=pending, finish the card for a terminal record — and only
+    // a genuinely-live, non-pending task gets its prior phase restored and
+    // the button re-enabled.
+    const chat = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8')
+        .replace(/\r\n/g, '\n');
+    const failure = chat.slice(chat.indexOf('showToast(`Cancel failed:'));
+    const branch = failure.slice(0, 2200);
+    // The shared seam runs BEFORE any button re-enable.
+    const reconcileAt = branch.indexOf('reconcileCancelCardFromDetail(record, taskId, stored)');
+    const reenableAt = branch.indexOf('btn.disabled = false');
+    assert.ok(reconcileAt > 0 && reenableAt > 0, 'both the reconcile and the re-enable exist');
+    assert.ok(reconcileAt < reenableAt, 'reconciliation happens before the button is re-enabled');
+    // Pending or terminal returns the real reconcile delta without touching the button.
+    assert.match(branch, /let changed = reconcileCancelCardFromDetail\(record, taskId, stored\);/);
+    assert.match(branch, /if \(record\.finished \|\| taskCancelPending\(stored\)\) return changed;/);
+    assert.match(branch, /return changed;/);
+    assert.match(branch, /taskCancelPending\(stored\)/);
+    assert.match(branch, /restoreLiveCardPhaseState\(record, priorPhase\)/);
 });

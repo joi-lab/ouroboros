@@ -17,7 +17,11 @@ because one module's local helper was missing the protocol allowlist).
 
 from __future__ import annotations
 
+import re
+
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WEB_MODULES = REPO_ROOT / "web" / "modules"
@@ -87,6 +91,12 @@ def test_render_markdown_safe_strips_dangerous_tags_and_attrs():
         assert f"'{forbidden_tag}'" in block, f"renderMarkdownSafe must FORBID_TAGS {forbidden_tag}"
     for forbidden_attr in ("style", "src", "srcset", "srcdoc"):
         assert f"'{forbidden_attr}'" in block, f"renderMarkdownSafe must FORBID_ATTR {forbidden_attr}"
+    # A same-window navigation out of a widget replaces the whole desktop shell
+    # with no way back, so publisher markdown carries the same link contract the
+    # chat markdown renderer applies.
+    assert "a[href]" in block
+    assert "'target', '_blank'" in block
+    assert "'rel', 'noopener noreferrer'" in block
 
 
 def test_marketplace_does_not_redeclare_shared_helpers():
@@ -116,9 +126,10 @@ def test_skills_does_not_redeclare_shared_helpers():
     assert "source === 'self_authored' || source === 'external'" in renderer
     assert "payloadRoot.startsWith('skills/external/')" in renderer
     assert "skills-delete-local" in renderer
-    assert "apiClient.deleteSkill(name, payloadRoot)" in src
+    assert "apiClient.deleteSkill(name, payloadRoot, current.content_hash)" in src
     assert "/api/skills/${encodeURIComponent(skill)}/delete" in api_client
     assert "payload_root: payloadRoot" in api_client
+    assert "expected_content_hash: expectedContentHash" in api_client
     assert "data/state/skills/${name}" in src
 
 
@@ -136,11 +147,22 @@ def test_ouroboroshub_uses_shared_fetch_json():
     assert "async function fetchJson(" not in src
 
 
-def test_onboarding_wizard_remains_inline_iife_without_imports():
-    """The onboarding wizard is inlined into a classic script, not loaded as an ES module."""
+def test_onboarding_wizard_is_loaded_as_an_es_module():
+    """The wizard is served from /static as a real ES module.
+
+    It used to be inlined into a classic ``<script>`` inside a self-contained
+    document, which is why it could never import ordinary ``web/modules/*``
+    code. Any import it grows must resolve to a real sibling module — the page
+    is served from ``/onboarding``, so a bare relative specifier resolves
+    against the SCRIPT url, not the document.
+    """
+    template = (REPO_ROOT / "web" / "onboarding_template.html").read_text(encoding="utf-8")
+    assert '<script type="module" src="/static/modules/onboarding_wizard.js"></script>' in template
+
     src = _read("onboarding_wizard.js")
-    assert src.startswith("(() => {")
-    assert "\nimport " not in src
+    for specifier in re.findall(r"^\s*import\s.*?from\s+'([^']+)';", src, re.M):
+        assert specifier.startswith("./"), f"non-relative wizard import: {specifier}"
+        assert (REPO_ROOT / "web" / "modules" / specifier[2:]).is_file(), specifier
 
 
 def test_accent_tokens_have_concrete_rgba_values():
@@ -157,29 +179,19 @@ def test_accent_tokens_have_concrete_rgba_values():
     cycle. This guard pins the fix and prevents the same regression
     class from returning silently.
     """
-    import re
-    src = (REPO_ROOT / "web" / "style.css").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "web" / "ui.css").read_text(encoding="utf-8")
     root_match = re.search(r":root\s*\{([^}]+)\}", src, re.S)
-    assert root_match, ":root block not found in web/style.css"
+    assert root_match, ":root block not found in web/ui.css"
     root_body = root_match.group(1)
 
-    expected = (
-        "--accent-dim",
-        "--accent-glow",
-        "--accent-04",
-        "--accent-05",
-        "--accent-08",
-        "--accent-10",
-        "--accent-12",
-        "--accent-18",
-        "--accent-22",
-        "--accent-25",
-        "--accent-55",
-    )
-    for name in expected:
-        decl_match = re.search(rf"{re.escape(name)}\s*:\s*([^;]+);", root_body)
-        assert decl_match, f"{name} not declared in :root"
-        value = decl_match.group(1).strip()
+    # The ladder is read from the file rather than snapshotted here: rungs are
+    # added and removed as the accent's call sites move onto tokens, and a
+    # hardcoded list turns that into an unrelated test failure while silently
+    # exempting any rung added after it was written.
+    ladder = re.findall(r"(--accent-(?:dim|\d{2}))\s*:\s*([^;]+);", root_body)
+    assert len(ladder) >= 8, f"the accent alpha ladder looks truncated: {ladder}"
+    for name, raw_value in ladder:
+        value = raw_value.strip()
         # The value must be a literal rgba(...) anchored on the crimson
         # accent triple; never a ``var(<itself>)`` cycle, never a ``var()``
         # to a different accent token (that pattern works in CSS but
@@ -194,30 +206,203 @@ def test_accent_tokens_have_concrete_rgba_values():
         )
 
 
-def test_onboarding_escape_mirrors_utils():
-    """``onboarding_wizard.js`` is an IIFE bundle and cannot ``import`` from
-    ``utils.js`` without a bootstrap rewrite. Its local ``escapeHtml`` MUST
-    therefore mirror the same chain of HTML-escape ``replace`` calls
-    ``escapeHtmlAttr`` performs so the security contract (replace ``&``
-    first, then the five HTML metas, then backtick) cannot drift between
-    the wizard and the SPA. We compare on the normalized list of
-    ``.replace(<from>, <to>)`` calls — indentation differs (IIFE has one
-    extra wrap level) but the actual escape sequence must be identical.
+@pytest.mark.parametrize("module_name", ["onboarding_wizard.js", "onboarding_overlay.js"])
+def test_onboarding_uses_the_shared_escape_helper(module_name):
+    """Both onboarding modules are real ES modules now, so escaping has ONE
+    authority instead of a copy per module.
+
+    The predecessor of this test compared the two ``replace`` chains character
+    for character and explained the copy by saying the wizard "is an IIFE bundle
+    and cannot import from utils.js". That stopped being true when the wizard
+    became a linked ES module: the comparison then froze a duplicate the code
+    was free to delete. Behaviour of the shared helper itself is pinned by
+    web/tests/onboarding_overlay.test.js.
     """
-    import re
-    onboarding = _read("onboarding_wizard.js")
-    utils = _read("utils.js")
-    wizard_body = onboarding.split("function escapeHtml(value) {", 1)[1].split("}", 1)[0]
-    utils_body = utils.split("export function escapeHtmlAttr(value) {", 1)[1].split("}", 1)[0]
-    pattern = re.compile(r"\.replace\(([^)]+)\)")
-    wizard_replaces = pattern.findall(wizard_body)
-    utils_replaces = pattern.findall(utils_body)
-    assert wizard_replaces == utils_replaces, (
-        "onboarding_wizard.escapeHtml drifted from utils.escapeHtmlAttr "
-        f"— wizard chain: {wizard_replaces}, utils chain: {utils_replaces}"
+    source = _read(module_name)
+
+    assert "escapeHtmlAttr as escapeHtml" in source, (
+        f"{module_name} must import the shared escape helper from utils.js"
     )
-    # Smoke-check that the chain still escapes ampersand FIRST (any other
-    # order would double-encode the entity numbers later in the chain).
-    assert wizard_replaces[0].startswith("/&/g"), (
-        "ampersand replacement must be first in the chain"
+    assert "function escapeHtml(" not in source, (
+        f"{module_name} redefines escapeHtml instead of using the shared helper"
+    )
+
+
+def test_onboarding_wizard_uses_the_shared_gateway_fetch_helper():
+    """Same dedup, same reason: the wizard's private ``apiRequest`` was a second
+    copy of ``api_client.fetchJson`` (identical throw-on-!ok, identical error
+    message), and a second copy is a second place for the gateway error contract
+    to drift."""
+    source = _read("onboarding_wizard.js")
+
+    assert "import { fetchJson } from './api_client.js';" in source
+    assert "async function apiRequest(" not in source
+
+
+def test_status_read_provenance_has_one_reader_across_surfaces():
+    """``claudexor_status_store.facetReadState`` is the ONE place that decides
+    what an empty status collection MEANS (ok / not_read / failed / transport /
+    indeterminate), and no consumer may re-parse the ``reads`` block or the
+    daemon state on its own.
+
+    The predecessor of this test (``test_onboarding_account_truth_mirrors_the_
+    panel_rules``) compared the wizard's IIFE mirrors of these rules against the
+    accounts panel clause by clause — the wizard could not import back then, so
+    a restated copy was the least evil and the pin guarded its drift. The wizard
+    is a linked ES module now and the mirrors are deleted; the pin flips from
+    "the copies must agree" to "there must be no copies". The behaviour of the
+    single reader itself (an unread facet claims nothing; ``unreachable`` is
+    never worded as "not running"; the first render says "Reading…", not a
+    verdict) is pinned in web/tests/claudexor_status_store.test.js.
+    """
+    store = _read("claudexor_status_store.js")
+    assert "export function facetReadState(" in store, (
+        "the store lost the single facet reader; every consumer would grow "
+        "its own definition of what an empty collection means"
+    )
+    assert "export function accountRows(" in store, (
+        "the store lost the single connected-rows projection"
+    )
+    # The native-login rule rides in the shared projection: a native CLI session
+    # counts as a connected row (a native codex login used to read as
+    # "0 accounts connected" when a consumer counted only named profiles).
+    rows_body = store.split("export function accountRows(", 1)[1].split("\nexport ", 1)[0]
+    assert "native_login_detected" in rows_body, (
+        "accountRows no longer projects native logins; a native-only machine "
+        "reads as 0 accounts connected again"
+    )
+    # «Не вини демона, который отвечал»: `unreachable` is the endpoint's global
+    # "the answer did not complete" — a RUNNING daemon refusing one fanned-out
+    # read also lands there, so treating it as stopped would print "the daemon
+    # is not running" about a daemon that answered.
+    stopped = re.search(r"export const DAEMON_STATES_STOPPED = \[([^\]]*)\]", store)
+    assert stopped, "the store no longer declares which daemon states mean stopped"
+    assert "unreachable" not in stopped.group(1), (
+        "`unreachable` classified as stopped: a refused read would be announced "
+        "as 'the daemon is not running' about a daemon that answered"
+    )
+
+    # No consumer redeclares the reader or re-derives a facet from the payload.
+    consumers = (
+        "onboarding_wizard.js",
+        "onboarding_agents_step.js",
+        "harness_accounts.js",
+        "reviewer_slots.js",
+        "subagents_settings.js",
+    )
+    for name in consumers:
+        src = _read(name)
+        assert "function facetReadState(" not in src, (
+            f"{name} redeclares facetReadState instead of using the store's reader"
+        )
+        assert "function accountRows(" not in src, (
+            f"{name} redeclares accountRows — a second definition of 'connected'"
+        )
+
+    # The wizard specifically: its old IIFE mirrors must stay dead, and its only
+    # view of account state is the Agents step riding the shared store.
+    wizard = _read("onboarding_wizard.js")
+    for mirror in ("claudexorAccountsRead", "countConnectedAccounts"):
+        assert mirror not in wizard, (
+            f"the wizard's dead IIFE mirror {mirror} came back; the store is "
+            "the one reader of /api/claudexor/status"
+        )
+    assert "/api/claudexor/status" not in wizard, (
+        "the wizard fetches the status endpoint directly instead of going "
+        "through the shared store"
+    )
+    assert "from './onboarding_agents_step.js';" in wizard
+
+    # The Agents step consumes provenance through the store's own vocabulary:
+    # the shared sentence (unavailableNote) and the accounts-facet licence
+    # (accountsKnown) — never a homegrown re-reading of the payload.
+    step = _read("onboarding_agents_step.js")
+    assert "from './claudexor_status_store.js';" in step
+    assert "accountRows" in step
+    assert "unavailableNote(" in step, (
+        "the Agents step stopped using the store's shared unavailable sentence"
+    )
+    assert "accountsKnown" in step, (
+        "the Agents step no longer gates its claims on the accounts read facet"
+    )
+
+    def code_only(src: str) -> str:
+        """Drop // and block-comment prose — a rule that lives only in prose is
+        not a rule, and a pin that reads prose fails on a comment that merely
+        NAMES the daemon while explaining why the code never touches it."""
+        return "\n".join(
+            line for line in src.splitlines()
+            if not line.strip().startswith(("//", "*", "/*"))
+        )
+
+    assert "daemon" not in code_only(step), (
+        "the Agents step reads the daemon state directly; the store's facets "
+        "are the only licensed view of it"
+    )
+
+
+def test_reviewer_rows_label_each_pin_from_its_own_facet():
+    """The read states are per-facet and INDEPENDENT — the backend pins that
+    explicitly (`test_status_payload_classifies_each_fanned_out_facet_independently`).
+    The row builders therefore have to label a saved ACCOUNT pin from the
+    accounts read and a saved MODEL from the catalog read. Threading the wrong
+    facet is invisible in the helper tests (they take the state as a parameter),
+    and it re-creates the owner-visible lie in miniature: a profile nobody read
+    gets told it is "not in discovery".
+
+    Structural pin: each call site in the module source is inspected. The facet
+    may travel as a read-state string (``accountsRead``) or as the store's
+    boolean licence (``accountsKnown``) — both spellings carry the same
+    provenance; what this pin forbids is one facet standing in for another.
+    """
+    src = _read("reviewer_slots.js")
+
+    def call_sites(name):
+        """Every call of `name` with its full argument list, definitions aside."""
+        found = []
+        for match in re.finditer(re.escape(name) + r"\(", src):
+            if src[:match.start()].rstrip().endswith("function"):
+                continue
+            depth, i = 0, match.end() - 1
+            while i < len(src):
+                if src[i] == "(":
+                    depth += 1
+                elif src[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            found.append(src[match.start():i + 1])
+        return found
+
+    profile_calls = call_sites("profileOptionsFor")
+    # Two builders (the triad/scope row and the advisory row) plus nothing else.
+    assert len(profile_calls) >= 2, "the profile-option call sites moved"
+    for call in profile_calls:
+        assert re.search(r"accounts(Read|Known)", call), (
+            f"a saved account pin is labelled without the accounts read facet: {call!r}"
+        )
+        assert "catalog" not in call, (
+            "the catalog read is standing in for the accounts read; a failed "
+            f"accounts read would then be announced as discovery truth: {call!r}"
+        )
+    model_calls = call_sites("sessionModelOptions")
+    assert len(model_calls) >= 2, "the model-option call sites moved"
+    for call in model_calls:
+        # ...and from the CATALOG read specifically. Asserting only that the
+        # option exists lets the facets be swapped — the very defect this test
+        # was written for, one field over.
+        assert re.search(r"catalog(Read|Known)|modelsRead", call), (
+            "a saved model is labelled without the catalog read state, so an "
+            f"unread catalog says 'not in discovery' about it: {call!r}"
+        )
+        assert "accounts" not in call, (
+            f"the accounts read is standing in for the catalog read: {call!r}"
+        )
+    # An unread facet must never default to the authoritative state on the way
+    # in. (The helpers keep `'ok'` as their own parameter default, which is the
+    # discovery-truth case they were written for and is pinned separately.)
+    assert not re.search(r"state\.\w*Read \|\| 'ok'", src), (
+        "a missing read state falls back to 'ok'; unknown must never be "
+        "authoritative — that is the original bug's shape"
     )

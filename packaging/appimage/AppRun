@@ -1,0 +1,102 @@
+#!/bin/sh
+set -eu
+
+APPDIR=${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}
+PAYLOAD="$APPDIR/usr/lib/ouroboros"
+APPIMAGE_CUSTODY_BASE=
+APPIMAGE_CUSTODY_APPDIR=
+
+# A nested extract-and-run relaunch receives a private TMPDIR so it cannot share
+# ownership of the outer CLI runtime's content-addressed extraction. Restore the
+# caller's TMPDIR before the actual product starts. AppRun keeps custody of the
+# private extraction until that product exits because the pinned musl type-2
+# runtime cannot reliably remove it itself.
+if [ "${OUROBOROS_APPIMAGE_RESTORE_TMPDIR:-}" = "1" ]; then
+    APPIMAGE_CUSTODY_BASE=${TMPDIR-}
+    APPIMAGE_CUSTODY_APPDIR=${APPDIR-}
+    if [ "${OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET:-0}" = "1" ]; then
+        TMPDIR=${OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR-}
+        export TMPDIR
+    else
+        unset TMPDIR
+    fi
+    unset OUROBOROS_APPIMAGE_RESTORE_TMPDIR
+    unset OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET
+    unset OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR
+fi
+
+# The mounted AppImage is immutable. PyInstaller and the launcher already route
+# managed state, settings, logs, repositories, and bytecode to the user's data
+# and cache roots; expose the same explicit bundle root to child processes.
+export OUROBOROS_BUNDLE_DIR="$PAYLOAD/_internal"
+
+if [ "${1:-}" = "--version" ]; then
+    VERSION_FILE="$OUROBOROS_BUNDLE_DIR/VERSION"
+    if [ ! -s "$VERSION_FILE" ]; then
+        echo "Ouroboros version metadata is missing" >&2
+        exit 1
+    fi
+    VERSION=
+    IFS= read -r VERSION < "$VERSION_FILE" || true
+    printf 'Ouroboros %s\n' "$VERSION"
+    exit 0
+fi
+
+if [ "${1:-}" = "--cli" ]; then
+    shift
+    exec "$PAYLOAD/bin/ouroboros" "$@"
+fi
+
+if [ -z "$APPIMAGE_CUSTODY_BASE" ]; then
+    exec "$PAYLOAD/Ouroboros" "$@"
+fi
+
+if [ -z "$APPIMAGE_CUSTODY_APPDIR" ]; then
+    echo "AppImage cleanup custody is missing its private runtime paths" >&2
+    exit 1
+fi
+APPIMAGE_CUSTODY_BASE=$(CDPATH= cd -- "$APPIMAGE_CUSTODY_BASE" && pwd -P) || {
+    echo "AppImage cleanup custody cannot resolve its private runtime root" >&2
+    exit 1
+}
+APPIMAGE_CUSTODY_APPDIR=$(CDPATH= cd -- "$APPIMAGE_CUSTODY_APPDIR" && pwd -P) || {
+    echo "AppImage cleanup custody cannot resolve its extracted payload" >&2
+    exit 1
+}
+case "${APPIMAGE_CUSTODY_BASE##*/}" in
+    ouroboros-appimage-runtime-?*) ;;
+    *)
+        echo "AppImage cleanup custody refused an unexpected private runtime root" >&2
+        exit 1
+        ;;
+esac
+if [ "$(dirname -- "$APPIMAGE_CUSTODY_APPDIR")" != "$APPIMAGE_CUSTODY_BASE" ]; then
+    echo "AppImage cleanup custody refused a payload outside its private runtime root" >&2
+    exit 1
+fi
+case "${APPIMAGE_CUSTODY_APPDIR##*/}" in
+    appimage_extracted_?*) ;;
+    *)
+        echo "AppImage cleanup custody refused an unexpected extracted payload" >&2
+        exit 1
+        ;;
+esac
+
+PAYLOAD_STATUS=0
+"$PAYLOAD/Ouroboros" "$@" || PAYLOAD_STATUS=$?
+CLEANUP_STATUS=0
+rm -rf -- "$APPIMAGE_CUSTODY_APPDIR" || CLEANUP_STATUS=$?
+if [ -e "$APPIMAGE_CUSTODY_APPDIR" ]; then
+    echo "AppImage cleanup custody left its extracted payload behind: $APPIMAGE_CUSTODY_APPDIR" >&2
+    CLEANUP_STATUS=1
+fi
+rmdir -- "$APPIMAGE_CUSTODY_BASE" || CLEANUP_STATUS=$?
+if [ -e "$APPIMAGE_CUSTODY_BASE" ]; then
+    echo "AppImage cleanup custody left its private runtime root behind: $APPIMAGE_CUSTODY_BASE" >&2
+    CLEANUP_STATUS=1
+fi
+if [ "$PAYLOAD_STATUS" -eq 0 ] && [ "$CLEANUP_STATUS" -ne 0 ]; then
+    PAYLOAD_STATUS=$CLEANUP_STATUS
+fi
+
+exit "$PAYLOAD_STATUS"

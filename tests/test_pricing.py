@@ -87,11 +87,11 @@ def test_missing_cache_prices_are_not_invented():
             "provider/model", 1_000, 100, provider="openrouter",
         ) == 0.0013
         assert estimate_cost_optional(
-            "provider/model", 1_000, 100, cached_tokens=10,
+            "provider/model", 1_000, 100, cache_usage={"cached_tokens": 10},
             provider="openrouter", allow_live_fetch=False,
         ) is None
         assert estimate_cost_optional(
-            "provider/model", 1_000, 100, cache_write_tokens=10,
+            "provider/model", 1_000, 100, cache_usage={"cache_write_tokens": 10},
             provider="openrouter", allow_live_fetch=False,
         ) is None
 
@@ -107,11 +107,13 @@ def test_cache_heavy_anthropic_usage_keeps_a_nonzero_fresh_input_component():
     ):
         # Provider row: input_tokens=500, cache_read=9_000, cache_creation=500.
         pre_fix = estimate_cost_optional(
-            "anthropic/claude-x", 500, 100, cached_tokens=9_000, cache_write_tokens=500,
+            "anthropic/claude-x", 500, 100,
+            cache_usage={"cached_tokens": 9_000, "cache_write_tokens": 500},
             provider="openrouter",
         )
         post_fix = estimate_cost_optional(
-            "anthropic/claude-x", 10_000, 100, cached_tokens=9_000, cache_write_tokens=500,
+            "anthropic/claude-x", 10_000, 100,
+            cache_usage={"cached_tokens": 9_000, "cache_write_tokens": 500},
             provider="openrouter",
         )
 
@@ -207,5 +209,172 @@ def test_provider_reported_zero_cost_remains_known_zero():
 def test_inference_helpers_keep_route_identity(monkeypatch):
     assert infer_api_key_type("openai::gpt-x") == "openai"
     assert infer_api_key_type("mistralai/model") == "openrouter"
+    # Direct MiniMax uses the :: spelling; the slash form is a REAL OpenRouter
+    # vendor namespace and must keep routing (and safety-key inference) through
+    # the OpenRouter key, unlike cloudru/gigachat which exist nowhere on OpenRouter.
+    assert infer_api_key_type("minimax::MiniMax-M3") == "minimax"
+    assert infer_api_key_type("minimax/minimax-m2") == "openrouter"
     monkeypatch.setenv("OUROBOROS_MODEL", "mistralai/model")
     assert infer_model_category("mistralai/model") == "main"
+
+
+def _endpoint(tag, prompt="0.000002", completion="0.000008", **pricing):
+    return {"tag": tag, "model_id": "vendor/tier-model", "status": 0,
+            "supported_parameters": ["temperature"],
+            "pricing": {"prompt": prompt, "completion": completion, **pricing}}
+
+
+@pytest.fixture
+def endpoint_catalog():
+    response = MagicMock()
+    response.raise_for_status.return_value = None
+    response.json.return_value = {"data": {"id": "vendor/tier-model", "endpoints": [
+        _endpoint("vendor", "0.000002", "0.000008"),
+        _endpoint("vendor/flex", "0.000001", "0.000003"),
+        _endpoint("vendor/fast", "0.000004", "0.000015"),
+        _endpoint("other/region", "0.000005", "0.000006"),
+    ]}}
+    with patch("requests.get", return_value=response) as request:
+        yield response.json.return_value["data"]["endpoints"], request
+
+
+@pytest.mark.parametrize("mode,expected", [("default", 0.008), ("standard", 0.008),
+    ("priority", 0.0115), ("fast", 0.0115), ("flex", 0.0025)])
+def test_processing_prices_the_complete_eligible_endpoint_pool(endpoint_catalog, mode, expected):
+    rows, request = endpoint_catalog
+    # Endpoint status and supported_parameters are not tariff eligibility:
+    # unhealthy price rows remain covered; service_tier need not be in the list.
+    rows[3]["status"] = -2
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode=mode) == pytest.approx(expected)
+    request.assert_called_once_with("https://openrouter.ai/api/v1/models/vendor/tier-model/endpoints", timeout=5.0)
+
+
+def test_priority_bound_includes_a_more_expensive_standard_fallback(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[3]["pricing"]["completion"] = "0.0001"
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority") == pytest.approx(0.055)
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="flex") == pytest.approx(0.0025)
+
+
+def test_flex_uses_standard_only_when_no_flex_endpoint_exists(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[:] = [row for row in rows if not row["tag"].endswith("/flex")]
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="flex") == pytest.approx(0.008)
+
+
+def test_a_missing_potential_tariff_makes_the_bound_unknown(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[3]["pricing"].pop("completion")
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority") is None
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="default") is None
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="flex") == pytest.approx(0.0025)
+
+
+@pytest.mark.parametrize("mode", ["unknown", "auto", "unsupported"])
+def test_unknown_processing_never_uses_an_ordinary_model_price(endpoint_catalog, mode):
+    _, request = endpoint_catalog
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode=mode) is None
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "claudexor", "openai-compatible", "cloudru"])
+def test_direct_processing_does_not_borrow_openrouter_tariffs(endpoint_catalog, provider):
+    _, request = endpoint_catalog
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, provider=provider, processing_mode="priority") is None
+    request.assert_not_called()
+
+
+def test_endpoint_tiers_keep_literal_cache_prices_and_original_precision(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[:] = [_endpoint("vendor", input_cache_read="0.0000001", input_cache_write="0.000003",
+        input_cache_write_1h="0.000007", discount=0.9,
+        overrides=[{"min_prompt_tokens": 2000, "prompt": "0.000003", "input_cache_write_1h": "0.000009"}])]
+    cache = {"cached_tokens": 100, "cache_write_tokens": 500, "prompt_cache_ttl": "1h",
+             "cache_write_tokens_by_ttl": {"5m": 200, "1h": 300}}
+    assert estimate_cost_optional("vendor/tier-model", 1000, 100, cache_usage=cache,
+                                  processing_mode="default") == pytest.approx(0.00431)
+    assert estimate_cost_optional("vendor/tier-model", 2000, 100, cache_usage=cache,
+                                  processing_mode="default") == pytest.approx(0.00831)
+    schedule = get_pricing(provider="openrouter", model="vendor/tier-model")["vendor"]
+    assert schedule.cache_write_1h == 7 and schedule.tiers[0][1].cache_write_1h == 9
+    assert schedule.source == {"provider": "openrouter", "model": "vendor/tier-model", "endpoint_tag": "vendor",
+        "service_tier": "default", "url": "https://openrouter.ai/api/v1/models/vendor/tier-model/endpoints", "status": 0}
+
+
+def test_missing_exact_hour_cache_rate_does_not_use_the_legacy_multiplier(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[:] = [_endpoint("vendor", input_cache_write="0.000003")]
+    assert estimate_cost_optional("vendor/tier-model", 1000, 100, processing_mode="default",
+                                  cache_usage={"cache_write_tokens": 500, "prompt_cache_ttl": "1h"}) is None
+    assert estimate_cost_optional("vendor/tier-model", 1000, 100, processing_mode="default",
+                                  cache_usage={"cached_tokens": 1}) is None
+
+
+def test_tiny_endpoint_prices_are_not_rounded_into_free_work(endpoint_catalog):
+    rows, _ = endpoint_catalog
+    rows[:] = [_endpoint("vendor", "0.000000000123456789", "0.000000000234567891")]
+    cost = estimate_cost_optional("vendor/tier-model", 1, 1, processing_mode="default")
+    assert cost == pytest.approx(0.000000000358024680, rel=1e-12, abs=0)
+
+
+@pytest.mark.parametrize("value", [True, "nan", "Infinity", "-0.1", "unknown"])
+def test_invalid_endpoint_rates_remain_unknown(endpoint_catalog, value):
+    rows, _ = endpoint_catalog
+    rows[3]["pricing"]["prompt"] = value
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="default") is None
+
+
+def test_endpoint_fetch_reuses_existing_cache_owner_without_fetching_all_models(endpoint_catalog):
+    _, request = endpoint_catalog
+    for mode in ("priority", "flex", "default"):
+        assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode=mode) is not None
+    request.assert_called_once()
+    import ouroboros.pricing as pricing
+    assert set(pricing._cached_pricing) == {("openrouter", "vendor/tier-model")}
+    assert estimate_cost_optional("vendor/other-model", 1000, 500, processing_mode="priority",
+                                  allow_live_fetch=False) is None
+
+
+def test_expired_endpoint_prices_are_unknown_until_the_shared_cache_refreshes(endpoint_catalog, monkeypatch):
+    import ouroboros.pricing as pricing
+    rows, request = endpoint_catalog
+    clock = [100.0]
+    monkeypatch.setattr(pricing.time, "time", lambda: clock[0])
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority") is not None
+    clock[0] += 21601
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority", allow_live_fetch=False) is None
+    rows.clear()
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority") is None
+    assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="priority") is None
+    assert request.call_count == 2
+
+
+def test_concurrent_endpoint_readers_share_one_inflight_fetch(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from ouroboros import llm_pricing
+
+    entered, release = Event(), Event()
+    calls = []
+    schedule = PricingSchedule((2.0, None, None, 8.0), source={"service_tier": "default"})
+    def fetch(model, **kwargs):
+        calls.append(model)
+        entered.set()
+        assert release.wait(2)
+        return {"vendor": schedule}
+    monkeypatch.setattr(llm_pricing, "fetch_openrouter_endpoint_pricing", fetch)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        first = pool.submit(estimate_cost_optional, "vendor/tier-model", 1000, 500, processing_mode="default")
+        try:
+            assert entered.wait(2)
+            assert estimate_cost_optional("vendor/tier-model", 1000, 500, processing_mode="default") is None
+        finally:
+            release.set()
+        assert first.result() == pytest.approx(0.006)
+    assert calls == ["vendor/tier-model"]
+
+
+def test_legacy_empty_mode_preserves_its_model_price_and_cache_ratio():
+    with patch("ouroboros.llm.fetch_openrouter_pricing", return_value={"vendor/model": (2.0, None, 3.0, 8.0)}):
+        assert estimate_cost_optional("vendor/model", 1000, 100,
+            cache_usage={"cache_write_tokens": 500, "prompt_cache_ttl": "1h"}) == 0.0042

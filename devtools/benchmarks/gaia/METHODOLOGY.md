@@ -9,7 +9,10 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
 - **Fixed-model Track A.** `settings_base.json` is the committed base template;
   `run_gaia.py` renders a per-run settings file that pins Ouroboros runtime,
   review, and vision model slots to the solve model and disables post-task
-  evolution. The default validation model is `google/gemini-2.5-pro`; Sonnet 4.5
+  evolution. It also serializes exactly one canonical Available-subagent API row
+  on that solve model. This prevents install defaults from adding a Light scout,
+  a second provider family, or an agent-session substrate to a fixed-model run.
+  The default validation model is `google/gemini-2.5-pro`; Sonnet 4.5
   is documented as the later headline comparator against HAL Generalist, not run
   by default here. GAIA permits web browsing; the fixed-model purity boundary is
   whether a *second reasoning model* enters the scaffold.
@@ -34,6 +37,24 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
   `gpt-5.2`) — pin it to the solve model if the tool is enabled, or a second model
   enters the scaffold. `quality_openrouter_web` sidesteps this by disabling the tool
   and searching through the main-loop native path instead.
+- **Acceptance improvement passes are bounded (2026-08-15).** The owner's shared
+  `OUROBOROS_REVIEW_MAX_CYCLES` (default 2, `unlimited` available) now bounds task
+  acceptance under EVERY policy, including `required`+`blocking`, which was previously
+  unbounded by a local count. Templates here carry no explicit value, so runs use the
+  default of 2 cycles (= 1 improvement pass) and an exhausted cap terminates honestly
+  with the typed `review_cycles_exhausted` reason instead of looping. Numbers from runs
+  before that change are NOT comparable on this axis; set the key explicitly to restore
+  the old protocol.
+- **Acceptance panels follow the configured triad rows (2026-09-02).** Task acceptance
+  no longer runs an API-only projection of the reviewer panel: every
+  `OUROBOROS_REVIEWER_SLOTS.triad` row runs on its own delivery (API packet,
+  configured-subagent native inspection episode, or agent session), with per-row
+  effort and credential pin. Runs here use the comma-list `OUROBOROS_REVIEW_MODELS`
+  (three API packet rows), so their acceptance axis is unchanged and comparable with
+  earlier runs; a run whose triad has a retrieving row is NOT comparable on the
+  acceptance axis (different evidence view, cost class and — for a session — an
+  unobserved read set). Declare the triad rows in the run manifest and never overlay
+  such a run with API-panel runs.
 - **Acceptance review is required.** GAIA Track A measures the full Ouroboros
   scaffold chosen for this sprint: `OUROBOROS_TASK_REVIEW_MODE=required`, empty
   memory, and no post-task evolution. Since v6.55.0 the default worker pool is

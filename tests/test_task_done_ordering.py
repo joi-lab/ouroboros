@@ -60,10 +60,8 @@ class TestTaskDoneOrdering:
 
         # Monkeypatch consolidation to no-op (avoid LLM calls)
         import ouroboros.agent_task_pipeline as atp
-        orig_chat_consol = atp._run_chat_consolidation
         orig_scratchpad_consol = atp._run_scratchpad_consolidation
         orig_post_task = atp._run_post_task_processing_async
-        atp._run_chat_consolidation = lambda *a, **kw: None
         atp._run_scratchpad_consolidation = lambda *a, **kw: None
         atp._run_post_task_processing_async = lambda *a, **kw: None
 
@@ -79,7 +77,6 @@ class TestTaskDoneOrdering:
                 ctx=ctx,
             )
         finally:
-            atp._run_chat_consolidation = orig_chat_consol
             atp._run_scratchpad_consolidation = orig_scratchpad_consol
             atp._run_post_task_processing_async = orig_post_task
 
@@ -112,10 +109,8 @@ class TestTaskDoneOrdering:
         llm_trace = {"tool_calls": [], "reasoning_notes": []}
 
         import ouroboros.agent_task_pipeline as atp
-        orig_chat_consol = atp._run_chat_consolidation
         orig_scratchpad_consol = atp._run_scratchpad_consolidation
         orig_post_task = atp._run_post_task_processing_async
-        atp._run_chat_consolidation = lambda *a, **kw: None
         atp._run_scratchpad_consolidation = lambda *a, **kw: None
         atp._run_post_task_processing_async = lambda *a, **kw: None
 
@@ -131,7 +126,6 @@ class TestTaskDoneOrdering:
                 ctx=ctx,
             )
         finally:
-            atp._run_chat_consolidation = orig_chat_consol
             atp._run_scratchpad_consolidation = orig_scratchpad_consol
             atp._run_post_task_processing_async = orig_post_task
 
@@ -155,7 +149,7 @@ class TestSupervisorTaskDoneAuditTrail:
         # Minimal context mock
         class MockCtx:
             DRIVE_ROOT = tmp_path
-            RUNNING = {"test_td": {"task": {"type": "task"}}}
+            RUNNING = {"test_td": {"task": {"id": "test_td", "type": "task"}}}
             WORKERS = {}
             PENDING = []
 
@@ -192,8 +186,12 @@ class TestSupervisorTaskDoneAuditTrail:
             "ts": "2026-04-02T12:00:00Z",
         }
         ctx = MockCtx()
-        # Need task_results dir for the fallback write
-        (tmp_path / "task_results").mkdir()
+        # A durable SETTLED result precedes every honest task_done (GR2-3: the
+        # supervisor validates the event against the disk unconditionally — a
+        # blank-status event over an absent row is a lifecycle fault, refused).
+        from ouroboros.task_results import write_task_result as _write_result
+
+        _write_result(tmp_path, "test_td", "completed", result="done")
 
         # Seed the physical-attempt authority.  The task_done transport's
         # compatibility cost field must not override ledger truth.
@@ -223,6 +221,12 @@ class TestSupervisorTaskDoneAuditTrail:
             cost_final=True,
         )
 
+        # The real worker prepares files before publishing this same terminal frame.
+        from ouroboros.headless import prepare_terminal_task_files
+
+        task = ctx.RUNNING["test_td"]["task"]
+        assert not prepare_terminal_task_files(tmp_path, task)["error"]
+        evt["_files_prepared_attempt"] = int(task.get("_attempt") or 1)
         _handle_task_done(evt, ctx)
 
         assert events_file.exists(), "events.jsonl should be created by _handle_task_done"
@@ -231,5 +235,5 @@ class TestSupervisorTaskDoneAuditTrail:
         assert len(task_done_entries) == 1
         entry = task_done_entries[0]
         assert entry["task_id"] == "test_td"
-        assert entry["cost_usd"] == 0.05
+        assert entry["accounted_upper_bound_usd"] == 0.05
         assert entry["total_rounds"] == 1

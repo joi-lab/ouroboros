@@ -74,6 +74,19 @@ def test_parse_model_review_results_quorum_and_degraded_reasons():
     assert parsed.degraded_reasons == ["DEGRADED: m3=error (quorum still met)"]
 
 
+def test_responsive_identity_is_the_stable_slot_when_model_label_drifts():
+    good = json.dumps([
+        {"item": "a", "verdict": "PASS", "severity": "critical", "reason": "ok"},
+    ])
+    parsed = parse_model_review_results({"results": [
+        {"model": "model-before", "slot_id": "slot-1", "text": good},
+        {"model": "model-after", "slot_id": "slot-1", "text": good},
+    ]}, required_items=["a"])
+
+    assert parsed.responsive_models == ["model-before [slot-1]"]
+    assert len(parsed.actor_records) == 2  # both chunk records remain forensic evidence
+
+
 def test_emit_review_model_error_events(tmp_path):
     good = json.dumps([{"item": "a", "verdict": "PASS", "severity": "critical", "reason": "ok"}])
     parsed = parse_model_review_results({

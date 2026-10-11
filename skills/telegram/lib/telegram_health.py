@@ -7,28 +7,25 @@ import time
 from typing import Dict
 
 from .telegram_api import _LOCALIZED_TEXTS
+from .telegram_i18n import Index
 from .telegram_state import _data_dir, _jsonl_tail, _read_json_file
 
 
-_HEALTH_T = {
-    "en": {"queue": "Queue", "idle": "idle", "busy": "working", "workers": "Workers",
-           "disk": "Disk", "logs": "logs", "incidents": "Incidents (1h)", "clean": "clean",
-           "free": "free", "tasks_idle": "🟢 idle — nothing running",
-           "tail_none": "none in bounded tail",
-           "tail_limited": "earlier coverage may be incomplete"},
-    "ru": {"queue": "Очередь", "idle": "простаивает", "busy": "работает", "workers": "Воркеры",
-           "disk": "Диск", "logs": "логи", "incidents": "Инциденты (1ч)", "clean": "чисто",
-           "free": "свободно", "tasks_idle": "🟢 простаивает — ничего не выполняется",
-           "tail_none": "в ограниченном хвосте не найдено",
-           "tail_limited": "ранняя часть периода может быть неполной"},
+_HEALTH_EN = {
+    "queue": "Queue", "idle": "idle", "busy": "working", "workers": "Workers",
+    "disk": "Disk", "logs": "logs", "incidents": "Incidents (1h)", "clean": "clean",
+    "free": "free", "tasks_idle": "🟢 idle — nothing running",
+    "tail_none": "none in bounded tail",
+    "tail_limited": "earlier coverage may be incomplete",
+    "gb": "GB", "mb": "MB",
+    # supervisor.jsonl event types worth surfacing as "incidents", by type.
+    "incident_worker_event_handler_error": "handler errors",
+    "incident_orphaned_workers_reaped": "orphans reaped",
+    "incident_zombie_prevention_cleanup": "zombie cleanup",
+    "incident_worker_dead_detected": "worker deaths",
 }
-# supervisor.jsonl event types worth surfacing as "incidents".
-_HEALTH_INCIDENTS = {
-    "worker_event_handler_error": {"en": "handler errors", "ru": "ошибки хендлеров"},
-    "orphaned_workers_reaped": {"en": "orphans reaped", "ru": "сирот подобрано"},
-    "zombie_prevention_cleanup": {"en": "zombie cleanup", "ru": "очистка зомби"},
-    "worker_dead_detected": {"en": "worker deaths", "ru": "смертей воркеров"},
-}
+_HEALTH = Index("health", _HEALTH_EN, "the bridge's health snapshot: queue, workers, incidents, disk")
+_HEALTH_INCIDENTS = tuple(key[len("incident_"):] for key in _HEALTH_EN if key.startswith("incident_"))
 _SUPERVISOR_TAIL_BYTES = 256 * 1024
 
 
@@ -73,7 +70,7 @@ def _recent_incidents(api, window_sec: float = 3600.0) -> tuple[Dict[str, int], 
 
 def _collect_health(api, lang: str = "en") -> str:
     """Health snapshot from durable files — queue, workers, incidents, disk. Read-only."""
-    s = _HEALTH_T.get(lang, _HEALTH_T["en"])
+    s = _HEALTH[lang]
     data = _data_dir(api)
     out = []
     snap = _read_json_file(data / "state" / "queue_snapshot.json")
@@ -87,7 +84,7 @@ def _collect_health(api, lang: str = "en") -> str:
         out.append(f"👷 {s['workers']}: {len(workers)}")
     inc, incidents_limited = _recent_incidents(api)
     if inc:
-        parts = [f"{v} {_HEALTH_INCIDENTS[k].get(lang, _HEALTH_INCIDENTS[k]['en'])}" for k, v in inc.items()]
+        parts = [f"{v} {s[f'incident_{k}']}" for k, v in inc.items()]
         if incidents_limited:
             parts.append(s["tail_limited"])
         out.append(f"⚠️ {s['incidents']}: " + " · ".join(parts))
@@ -98,8 +95,8 @@ def _collect_health(api, lang: str = "en") -> str:
     try:
         free_gb = shutil.disk_usage(data).free / (1024 ** 3)
         logs_mb = _dir_size_mb(data / "logs")
-        unit = "ГБ" if lang == "ru" else "GB"
-        munit = "МБ" if lang == "ru" else "MB"
+        unit = s["gb"]
+        munit = s["mb"]
         out.append(f"💾 {s['disk']}: {s['free']} {free_gb:.0f} {unit} · {s['logs']} {logs_mb:.0f} {munit}")
     except Exception:
         pass
@@ -108,7 +105,7 @@ def _collect_health(api, lang: str = "en") -> str:
 
 def _collect_tasks_text(api, lang: str = "en") -> str:
     """Read-only list of running/pending tasks from queue_snapshot.json."""
-    s = _HEALTH_T.get(lang, _HEALTH_T["en"])
+    s = _HEALTH[lang]
     snap = _read_json_file(_data_dir(api) / "state" / "queue_snapshot.json")
     running = snap.get("running") if isinstance(snap.get("running"), list) else []
     pending = snap.get("pending") if isinstance(snap.get("pending"), list) else []
@@ -133,7 +130,7 @@ def _collect_tasks_text(api, lang: str = "en") -> str:
 def _build_menu_tasks(api, command_mode: str, lang: str = "en") -> tuple[str, list[list[dict]]]:
     """Read-only running/pending task list. No inline mutations (owner inject-minimization policy)."""
     t = _LOCALIZED_TEXTS[lang]
-    title = "📋 Задачи" if lang == "ru" else "📋 Tasks"
+    title = t["tasks_title"]
     header = f"{title}\n\n{_collect_tasks_text(api, lang)}"
     keyboard = [
         [{"text": t["btn_refresh"], "callback_data": "nav:tasks"}],

@@ -1,0 +1,964 @@
+"""Plan spec object, typed findings, host aggregate and the ONE structural path
+fact for ``plan_task`` — pure functions only (no I/O, no ToolContext). The
+evidence manifest lives in the companion ``ouroboros.tools.plan_evidence``,
+the reviewer packet builders in ``ouroboros.tools.plan_packet``.
+
+Design principle (BIBLE P5, owner-approved 2026-08-15): the HOST checks shape,
+identity, membership, bounds and ONE structural path fact (``constitutional``);
+it never interprets the domain. Everything here works identically for a code
+change, a slide deck, a literature review, a GUI flow or a trip plan — a spec
+with ZERO file paths is first-class.
+
+Operative specs are normalized without size cuts: every chosen requirement
+participates in identity and reaches the current reviewer packet. Bounds below
+apply only to findings, reviewer-request memory, and historical/display views;
+those cuts retain their existing disclosures.
+
+"""
+
+from __future__ import annotations
+
+from hashlib import sha256
+import json
+import pathlib
+import re
+from typing import Any, Iterable, Mapping, Optional
+
+from ouroboros.config import adaptive_quorum
+from ouroboros.settings_scales import effort_rank
+from ouroboros.contracts.task_contract import normalize_acceptance_claims
+from ouroboros.tool_access import path_is_relative_to
+from ouroboros.triad_review import empty_array_is_verified_clean, extract_json_array
+from ouroboros.utils import truncate_review_artifact
+
+# Reviewer-request memory/attachment bounds, not limits on an operative spec.
+MAX_LIST_ITEMS = 40
+MAX_ITEM_CHARS = 600
+MAX_FINDINGS_PER_SLOT = 32
+# Per-task `need_evidence` memory: reviewers' requests the host remembers (and, W3, attaches).
+# Bounded so the durable review state stays bounded whatever the panel asks for; a request past
+# the cap stays a typed request but is not remembered, disclosed `need_evidence_memory_full`.
+MAX_NEED_EVIDENCE_MEMORY = 4 * MAX_LIST_ITEMS
+MAX_FINDING_TEXT_CHARS = 2000
+PACKET_PRIOR_FINDING_SUMMARY_CHARS = 400
+PACKET_EXPLORATION_CHARS = 12_000
+PACKET_PRIOR_CYCLES_CHARS = 60_000
+
+FINDING_CLASSES = ("blocking", "note", "need_evidence")
+AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
+
+AUTHOR_DISPOSITION_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "Optional advisory author finish bound to the exact review fingerprint; it never manufactures reviewer PASS or releases a blocking gate.",
+    "properties": {
+        "disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["disposition", "rationale"],
+}
+DISPOSITION_DECISIONS = ("accept", "reject", "defer")
+
+_SPEC_STRING_LISTS = (
+    "in_scope", "non_goals", "invariants", "affected_paths", "affected_resources", "evidence",
+)
+_SPEC_KEYS = frozenset({
+    "goal", "in_scope", "non_goals", "acceptance_claims", "invariants",
+    "decisions", "deferred", "affected_paths", "affected_resources", "evidence",
+})
+_URL_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://")
+_FILE_SCHEME = "file://"
+_TASK_LOCATOR_PREFIX = "task:"
+
+
+# --------------------------------------------------------------------------- spec
+
+
+def bounded_text(value: Any, limit: int) -> str:
+    """Strip + SSOT disclosed truncation (marker visible, anti-waste floor kept)."""
+    return truncate_review_artifact(("" if value is None else str(value)).strip(), limit=limit)
+
+
+MAX_ID_CHARS = 80
+
+
+def _sanitize_id(raw: Any, fallback: str) -> str:
+    text = "".join(ch if ch.isalnum() or ch in "_-" else "_" for ch in str(raw or "").strip())[:MAX_ID_CHARS]
+    return text or fallback
+
+
+def _unique_id(candidate: str, seen: set[str]) -> str:
+    base, suffix, out = candidate, 2, candidate
+    while out in seen:
+        out = f"{base}_{suffix}"
+        suffix += 1
+    seen.add(out)
+    return out
+
+
+def _is_scalar(value: Any) -> bool:
+    """str/int/float are tolerated as text; bool is not (``True`` is not a spec item)."""
+    return isinstance(value, (str, int, float)) and not isinstance(value, bool)
+
+
+def _string_list(raw: Any, label: str, errors: list[str], omissions: list[str]) -> list[str]:
+    """Tolerant complete string list: bare string → one item; blank drops disclosed."""
+    if raw is None:
+        return []
+    items = [raw] if _is_scalar(raw) else raw
+    if not isinstance(items, list):
+        errors.append(f"{label}: must be a list of strings")
+        return []
+    out: list[str] = []
+    blank = 0
+    for index, item in enumerate(items):
+        if item is None:
+            continue
+        if not _is_scalar(item):
+            errors.append(f"{label}[{index}]: must be a string")
+            continue
+        text = str(item).strip()
+        if text:
+            out.append(text)
+        else:
+            # I-20: every cut in this module is disclosed; a blank item is a cut too — as ONE
+            # bounded disclosure per list, so the disclosure list itself cannot outgrow the state.
+            blank += 1
+    if blank:
+        omissions.append(f"{label}: {blank} blank item(s) dropped")
+    return out
+
+
+def _object_list(raw: Any, label: str, text_key: str, errors: list[str]) -> list[dict]:
+    """Tolerant object list: bare string → {text_key: string}; non-object → error."""
+    if raw is None:
+        return []
+    items = [raw] if isinstance(raw, (str, Mapping)) else raw
+    if not isinstance(items, list):
+        errors.append(f"{label}: must be a list of objects")
+        return []
+    out: list[dict] = []
+    for index, item in enumerate(items):
+        if isinstance(item, Mapping):
+            out.append(dict(item))
+        elif isinstance(item, str):
+            out.append({text_key: item})
+        else:
+            errors.append(f"{label}[{index}]: must be an object or a string")
+    return out
+
+
+def _normalize_claims(raw: Any, errors: list[str], omissions: list[str], seen: set[str]) -> list[dict]:
+    if raw is None:
+        raw = []
+    elif isinstance(raw, (str, Mapping)):
+        raw = [raw]
+    if not isinstance(raw, list):
+        errors.append("acceptance_claims: must be a list")
+        return []
+    claims = normalize_acceptance_claims(raw)  # SSOT schema/normalizer (task_contract)
+    dropped = len(raw) - len(claims)
+    if dropped > 0:
+        omissions.append(
+            f"acceptance_claims: {dropped} item(s) dropped as empty/invalid by the "
+            "task_contract acceptance-claims normalizer"
+        )
+    for index, claim in enumerate(claims, start=1):
+        # Ids are HOST-MINTED positionally (claim_1..N) because they are the only valid
+        # `breaks` targets a reviewer may name: a caller-chosen id could shadow another
+        # element's id or move under the reviewer's feet between cycles. A declared id is
+        # kept beside it so nothing is lost and receipts can still be matched by text.
+        declared = str(claim.get("id") or "").strip()
+        minted = _unique_id(f"claim_{index}", seen)
+        if declared and declared != minted:
+            claim["declared_id"] = declared
+        claim["id"] = minted
+    return claims
+
+
+def _normalize_decisions(raw: Any, errors: list[str], omissions: list[str], seen: set[str]) -> list[dict]:
+    out: list[dict] = []
+    items = _object_list(raw, "decisions", "choice", errors)
+    for index, item in enumerate(items, start=1):
+        choice = str(item.get("choice") or "").strip()
+        if not choice:
+            errors.append(f"decisions[{index - 1}]: choice is required")
+            continue
+        out.append({
+            # host-minted, positional: a caller-chosen id could shadow another element's
+            # id or move between cycles, and these ids are what a blocking finding names.
+            "id": _unique_id(f"decision_{index}", seen),
+            "choice": choice,
+            "rejected": _string_list(
+                item.get("rejected"), f"decisions[{index - 1}].rejected", errors, omissions,
+            ),
+            "why": str(item.get("why") or "").strip(),
+        })
+    return out
+
+
+def _normalize_deferred(raw: Any, errors: list[str], omissions: list[str], seen: set[str]) -> list[dict]:
+    out: list[dict] = []
+    items = _object_list(raw, "deferred", "what", errors)
+    for index, item in enumerate(items, start=1):
+        what = str(item.get("what") or "").strip()
+        if not what:
+            errors.append(f"deferred[{index - 1}]: what is required")
+            continue
+        out.append({
+            # host-minted, positional: a caller-chosen id could shadow another element's
+            # id or move between cycles, and these ids are what a blocking finding names.
+            "id": _unique_id(f"deferred_{index}", seen),
+            "what": what,
+            "why_safe_to_defer": str(item.get("why_safe_to_defer") or "").strip(),
+        })
+    return out
+
+
+def normalize_spec(raw: Mapping[str, Any] | None) -> tuple[dict, list[str]]:
+    """Normalize a plan spec (plan §9.2 schema) → ``(spec, errors)``.
+
+    Tolerant of strings-vs-dicts, mints stable ids (claim_N / invariant_N /
+    decision_N / deferred_N; a differing declared claim id stays as `declared_id`),
+    trims edges, and preserves every operative string and list item. Empty/invalid
+    dropped claims and blank list items are disclosed in ``normalization_omissions``. Genuinely
+    malformed input (missing goal, unknown field, wrong container type, decision
+    without choice) yields typed error strings; on any error the returned spec
+    is best-effort and NOT authoritative — the caller must refuse it.
+    Invariant ids are positional (``invariant_1..N``) because the schema keeps
+    ``invariants: [str]``; ``spec_ids``/``spec_with_ids`` derive them; the id
+    ``goal`` is reserved for the intention as a whole (D32).
+    ``affected_paths`` (the files the work will CHANGE) appears in the normalized
+    spec only when the input declared it, so a spec stored before the field existed
+    keeps its recorded identity byte for byte.
+    """
+    errors: list[str] = []
+    omissions: list[str] = []
+    if not isinstance(raw, Mapping):
+        return {}, ["spec: must be an object"]
+    unknown = sorted(str(key) for key in raw if key not in _SPEC_KEYS)
+    if unknown:
+        errors.append("spec: unknown fields: " + ", ".join(unknown))
+    goal = raw["goal"].strip() if isinstance(raw.get("goal"), str) else ""
+    if not goal:
+        errors.append(
+            "goal: must be a string" if raw.get("goal") is not None and not isinstance(raw.get("goal"), str)
+            else "goal: required non-empty string"
+        )
+    spec: dict[str, Any] = {"goal": goal}
+    for key in _SPEC_STRING_LISTS:
+        # `affected_paths` is the ONE key that is never defaulted: a spec RECORDED before the
+        # field existed must normalize to the same bytes as it did then, or its `spec_hash` /
+        # `plan_fingerprint` move and the open wave it belongs to becomes uncollectable. New
+        # submissions always carry the key — `plan_review` refuses the old mixed form before
+        # any paid dispatch, so the absence here only ever means "stored under the old shape".
+        if key == "affected_paths" and key not in raw:
+            continue
+        spec[key] = _string_list(raw.get(key), key, errors, omissions)
+    seen = {GOAL_ID, *(f"invariant_{i}" for i in range(1, len(spec["invariants"]) + 1))}
+    spec["acceptance_claims"] = _normalize_claims(raw.get("acceptance_claims"), errors, omissions, seen)
+    spec["decisions"] = _normalize_decisions(raw.get("decisions"), errors, omissions, seen)
+    spec["deferred"] = _normalize_deferred(raw.get("deferred"), errors, omissions, seen)
+    spec["normalization_omissions"] = omissions
+    ordered = {key: spec[key] for key in (
+        "goal", "in_scope", "non_goals", "acceptance_claims", "invariants", "decisions",
+        "deferred", "affected_paths", "affected_resources", "evidence", "normalization_omissions",
+    ) if key in spec}
+    return ordered, errors
+
+
+GOAL_ID = "goal"  # D32: the intention as a whole is always a valid `breaks` target
+
+
+def spec_ids(spec: Mapping[str, Any]) -> frozenset[str]:
+    """Every id a finding's ``breaks`` may name: ``goal`` (always — owner decision D32,
+    so a claims-less spec can still receive a blocking finding) plus
+    claim_/invariant_/decision_/deferred_ ids."""
+    ids: set[str] = {GOAL_ID}
+    for key in ("acceptance_claims", "decisions", "deferred"):
+        for item in spec.get(key) or []:
+            if isinstance(item, Mapping) and str(item.get("id") or ""):
+                ids.add(str(item["id"]))
+    ids.update(f"invariant_{i}" for i in range(1, len(spec.get("invariants") or []) + 1))
+    return frozenset(ids)
+
+
+def spec_with_ids(spec: Mapping[str, Any]) -> dict:
+    """The spec as the reviewer sees it: positional invariants carry their ids inline."""
+    view = {key: value for key, value in spec.items()}
+    view["goal"] = {"id": GOAL_ID, "text": spec.get("goal") or ""}
+    view["invariants"] = [
+        {"id": f"invariant_{i}", "text": text}
+        for i, text in enumerate(spec.get("invariants") or [], start=1)
+    ]
+    return view
+
+
+def _canonical_hash(payload: Any) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def spec_hash(spec: Mapping[str, Any]) -> str:
+    """sha256 over canonical JSON (sorted keys, compact separators): stable under key order/whitespace."""
+    return _canonical_hash(dict(spec))
+
+
+def _by_id(items: Any) -> dict[str, dict]:
+    return {
+        str(item["id"]): dict(item)
+        for item in (items or []) if isinstance(item, Mapping) and item.get("id")
+    }
+
+
+def _text_by_id(spec: Mapping[str, Any]) -> dict[str, str]:
+    """id → identifying text for every id-bearing element (invariants positional)."""
+    out = {f"invariant_{i}": t for i, t in enumerate(spec.get("invariants") or [], start=1)}
+    for key, text_key in (("acceptance_claims", "claim"), ("decisions", "choice"), ("deferred", "what")):
+        for item in spec.get(key) or []:
+            if isinstance(item, Mapping) and item.get("id"):
+                out[str(item["id"])] = str(item.get(text_key) or "")
+    return out
+
+
+def _renumbered(prev: Mapping[str, Any], spec: Mapping[str, Any]) -> list[dict]:
+    """Same identifying text under a DIFFERENT id between cycles → ``[{from, to, text}]``.
+    Ids are positional/minted, so an agent dropping or reordering one element shifts the
+    later ones; the reviewer must re-target ``breaks`` against the CURRENT ids (B-02)."""
+    before, after = _text_by_id(prev), _text_by_id(spec)
+    after_by_text: dict[str, list[str]] = {}
+    for fid, text in after.items():
+        after_by_text.setdefault(text, []).append(fid)
+    out: list[dict] = []
+    for old_id, text in before.items():
+        if not text or after.get(old_id) == text:
+            continue
+        for new_id in after_by_text.get(text, []):
+            if new_id != old_id and before.get(new_id) != text:
+                out.append({"from": old_id, "to": new_id, "text": text})
+                break
+    return out
+
+
+def spec_delta(prev_spec: Mapping[str, Any] | None, spec: Mapping[str, Any]) -> dict:
+    """What changed between two normalized specs (wave ≥2 packets).
+
+    Id-bearing collections (acceptance_claims, decisions, deferred) diff by id
+    (added / removed / changed content); plain string lists diff by text; the
+    goal is a changed flag; ``renumbered`` lists elements whose text moved to a
+    different id (positional ids shift when an earlier element is dropped or
+    reordered); ``declared_keys_changed`` reports a spec whose set of declared keys
+    itself moved (a spec stored before ``affected_paths`` existed declares no such
+    key at all). ``prev_spec=None`` means everything is added.
+    """
+    prev = dict(prev_spec or {})
+    ids: dict[str, list[str]] = {"added": [], "removed": [], "changed": []}
+    for key in ("acceptance_claims", "decisions", "deferred"):
+        before, after = _by_id(prev.get(key)), _by_id(spec.get(key))
+        ids["added"].extend(sorted(set(after) - set(before)))
+        ids["removed"].extend(sorted(set(before) - set(after)))
+        ids["changed"].extend(sorted(k for k in set(before) & set(after) if before[k] != after[k]))
+    lists: dict[str, dict[str, list[str]]] = {}
+    for key in _SPEC_STRING_LISTS:
+        before_l, after_l = list(prev.get(key) or []), list(spec.get(key) or [])
+        lists[key] = {
+            "added": [t for t in after_l if t not in before_l],
+            "removed": [t for t in before_l if t not in after_l],
+        }
+    goal_changed = str(prev.get("goal") or "") != str(spec.get("goal") or "")
+    # A key that appears or disappears between two normalized specs is a change even when both
+    # sides read as empty: `affected_paths` ABSENT (stored before the field existed) and
+    # `affected_paths: []` ("this work changes no files") are different claims, and the spec
+    # hash already says so — the delta the reviewer reads must not say they are the same.
+    declared_keys_changed = prev_spec is not None and (
+        {key for key in prev if key != "normalization_omissions"}
+        != {key for key in spec if key != "normalization_omissions"}
+    )
+    changed = goal_changed or declared_keys_changed or any(ids.values()) or any(
+        entry["added"] or entry["removed"] for entry in lists.values()
+    )
+    return {
+        "changed": changed,
+        "goal_changed": goal_changed,
+        "declared_keys_changed": declared_keys_changed,
+        "ids": ids,
+        "lists": lists,
+        "renumbered": _renumbered(prev, spec),
+        "prev_hash": spec_hash(prev) if prev_spec is not None else "",
+        "hash": spec_hash(spec),
+    }
+
+
+def _lists_by_size(node: Any, path: str = "") -> list[tuple[str, list]]:
+    """Every list reachable through dict nesting (not through list items), largest first."""
+    found: list[tuple[str, list]] = []
+    if isinstance(node, list):
+        found.append((path or "$", node))
+    elif isinstance(node, dict):
+        for key, value in node.items():
+            found.extend(_lists_by_size(value, f"{path}.{key}" if path else str(key)))
+    return sorted(found, key=lambda entry: -len(_dumps(entry[1])))
+
+
+def _dumps(payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
+
+
+def _set_at(node: Any, path: str, value: list) -> None:
+    keys = path.split(".")
+    for key in keys[:-1]:
+        node = node[key]
+    node[keys[-1]] = value
+
+
+def bounded_json(payload: Any, limit: int) -> tuple[str, list[str]]:
+    """Serialize ``payload`` within ``limit`` chars WITHOUT clipping JSON mid-string
+    (DEVELOPMENT "No silent truncation" for lists): oversize is reduced at the
+    STRUCTURE level — whole items are dropped from the largest list(s), each cut
+    disclosed as ``<path>: kept K of N items; full-set sha256=<h>``. If the payload
+    is still oversized with every list emptied, a typed omission object replaces it
+    (never clipped JSON). Returns ``(json_text, omission_notes)``. Deep-copied via JSON."""
+    work = json.loads(json.dumps(payload, default=str))
+    notes: list[str] = []
+    text = _dumps(work)
+    while len(text) > limit:
+        candidates = [(path, items) for path, items in _lists_by_size(work) if items]
+        if not candidates:
+            full_hash = _canonical_hash(payload)
+            return _dumps({
+                "omitted": True, "reason": "oversized_after_structural_bounding",
+                "chars": len(text), "full_payload_sha256": full_hash,
+            }), notes + [f"payload omitted: {len(text)} chars exceed the {limit}-char bound; sha256={full_hash}"]
+        path, items = candidates[0]
+        need = len(text) - limit
+        kept = list(items)
+        dropped = 0
+        while kept and dropped < need:
+            dropped += len(_dumps(kept.pop())) + 2
+        if path == "$":
+            work = kept
+        else:
+            _set_at(work, path, kept)
+        notes.append(
+            f"{path}: kept {len(kept)} of {len(items)} items; full-set sha256={_canonical_hash(items)}"
+        )
+        text = _dumps(work)
+    return text, notes
+
+
+# ------------------------------------------------------------------ constitutional
+
+
+def _is_url(locator: str) -> bool:
+    return bool(_URL_RE.match(locator)) and not locator.startswith(_FILE_SCHEME)
+
+
+def _is_path_locator(locator: str) -> bool:
+    return bool(locator) and not _is_url(locator) and not locator.startswith((_TASK_LOCATOR_PREFIX, "chat:"))
+
+def _resolve_locator_path(locator: str, root: pathlib.Path) -> tuple[Optional[pathlib.Path], str]:
+    """Relative → under ``root``; absolute (or ``file://`` absolute) as-is. Returns
+    ``(path, "")`` or ``(None, reason)`` — ``symlink_loop`` (RuntimeError from resolve) or
+    ``unsupported_locator`` (NUL bytes, over-long components, …). Never raises."""
+    if locator.startswith(_FILE_SCHEME):
+        locator = locator[len(_FILE_SCHEME):]
+    try:
+        candidate = pathlib.Path(locator)
+        return (candidate if candidate.is_absolute() else root / candidate).resolve(strict=False), ""
+    except RuntimeError:
+        return None, "symlink_loop"
+    except (OSError, ValueError):
+        return None, "unsupported_locator"
+
+
+def _under(path: pathlib.Path, root: pathlib.Path) -> bool:
+    """``tool_access.path_is_relative_to`` guarded against symlink loops on re-resolution."""
+    try:
+        return path_is_relative_to(path, root)
+    except RuntimeError:
+        return False
+
+
+def resolve_constitutional(
+    *,
+    active_root: str | pathlib.Path,
+    system_repo_root: str | pathlib.Path,
+    affected_paths: Iterable[str],
+    evidence: Iterable[str],
+    payload_roots: Iterable[str | pathlib.Path] = (),
+) -> tuple[bool, str]:
+    """ONE structural fact: will this plan CHANGE Ouroboros's own body?
+
+    True iff a declared ``affected_paths`` locator (relative resolved against
+    ``active_root``, absolute or ``file://`` as-is) resolves to or under the
+    system repository — whether or not the file exists yet, because creating
+    ``ouroboros/new_module.py`` IS self-modification. ``affected_resources`` is
+    never read here: treating every non-URL string in it as a path is what turned
+    a Russian sentence about a project into "a file under the repo" and billed the
+    whole constitution to a deck plan (owner decisions 8=A/9=A/16=A).
+    ``evidence`` is what to LOOK AT — reading a repository file is not changing it,
+    so an evidence locator never decides on its own (16=A); when the work will also
+    change that file it is in ``affected_paths`` and decides there. System-repo
+    evidence reads are named in the note so the author can see why the constitutional
+    pack was not bought (P1). The active binding alone does NOT decide (owner
+    decision D29: a plan bound to the system repo that declares no system path is
+    not constitutional). Skill-payload paths under ``payload_roots`` are exempt
+    (data plane, as today). URLs and ``task:``/``chat:`` locators never make it
+    true. Returns ``(constitutional, note)`` — the note names the deciding
+    locator for disclosure.
+    """
+    from ouroboros.tools.plan_evidence import _split_selector
+    system = pathlib.Path(system_repo_root).resolve(strict=False)
+    active = pathlib.Path(active_root).resolve(strict=False)
+    # Payload roots are supplied by the FROZEN skill-payload predicate
+    # (``plan_review_runtime.plan_payload_roots`` -> ``resolve_skill_payload_target``),
+    # never by the plan text, so a caller cannot dress an arbitrary system path as a
+    # payload. They intentionally survive even when they resolve INSIDE the system
+    # repo: a skill task whose active workspace IS the repo still touches only
+    # data-plane payload files (frozen behaviour, task 7881ad77902d4d25). A reviewer
+    # proposal to drop system-repo-nested payload roots (S-B05) was REJECTED for that
+    # reason; the residual it names requires control of the payload predicate itself.
+    payloads = [pathlib.Path(p).resolve(strict=False) for p in payload_roots]
+
+    def _system_locators(locators: Iterable[str]):
+        """Lazily yield the declared locators that are PATHS resolving under the system repo,
+        verbatim — the first one is enough to decide, so nothing further is resolved."""
+        for raw in locators or []:
+            locator = str(raw or "").strip()
+            if not _is_path_locator(locator):
+                continue
+            resolved, _reason = _resolve_locator_path(_split_selector(locator)[0], active)
+            if resolved is None or any(_under(resolved, payload) for payload in payloads):
+                continue
+            if resolved == system or _under(resolved, system):
+                yield locator
+
+    for target in _system_locators(affected_paths):
+        # The locator is quoted VERBATIM (never ``repr``): the note is disclosure a
+        # reviewer copies back, and ``repr`` doubles every backslash of a Windows path.
+        return True, (
+            f"constitutional: affected_paths locator '{target}' resolves under the "
+            "Ouroboros system repository (structural fact)"
+        )
+    reads: list[str] = []
+    for read in _system_locators(evidence):
+        reads.append(read)
+        if len(reads) >= 5:  # the note names them; a sixth adds nothing a reviewer acts on
+            break
+    if reads:
+        listed = ", ".join(f"'{item}'" for item in reads)
+        return False, (
+            "not constitutional: the system-repo locators declared are EVIDENCE reads "
+            f"({listed}), and reading a repository file is not changing it — list a file "
+            "under affected_paths if the work will change it"
+        )
+    return False, (
+        "not constitutional: no declared affected_paths locator resolves under the "
+        "Ouroboros system repository"
+    )
+
+
+# ----------------------------------------------------------------------- findings
+
+PLAN_REVIEW_SESSION_OUTPUT_SCHEMA: dict = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["findings"],
+    "properties": {
+        "findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["id", "class", "summary"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "class": {"type": "string", "enum": ["blocking", "note", "need_evidence"]},
+                    # Optional fields admit null: models legitimately emit null for
+                    # an absent optional value, and a schema that rejects its own
+                    # optionality forces every schema-bearing route into
+                    # outputConformance=failed (v6.110 incident f0a6fb64c92d491f).
+                    "breaks": {"type": ["string", "null"]},
+                    "locator": {"type": ["string", "null"]},
+                    "summary": {"type": "string"},
+                    "recommendation": {"type": ["string", "null"]},
+                },
+            },
+        },
+    },
+}
+
+
+_PLAN_FINDING_ELEMENT_SCHEMA = """\
+{
+  "id": "<short local id, e.g. f1>",
+  "class": "blocking" | "note" | "need_evidence",
+  "breaks": "<spec id — REQUIRED for blocking: goal | claim_N | invariant_N | decision_N | deferred_N>",
+  "locator": "<for a need_evidence DOCUMENT request: an absolute path, or one relative to the subject workspace root; add ::lines=A-B, ::bytes=A-B, ::tail=N or ::symbol=Name (.py only) for one range; task:<id> = a prior task's result; chat:<id> = a room dialogue, chat:<id>@<sha256> = an exact recorded room snapshot; a URL may be named; the host never fetches it. Leave it out for the other form: a need_evidence that asks the AUTHOR a question names the spec id in `breaks` and needs no locator>",
+  "summary": "<what is wrong or missing, concretely>",
+  "recommendation": "<the smallest change to the SPEC that resolves it>"
+}"""
+
+# Same protocol family as triad_review.REVIEW_JSON_ARRAY_CONTRACT: bare array,
+# optional single code fence, NO_FINDINGS sentinel for a verified-clean review.
+PLAN_FINDINGS_ARRAY_CONTRACT = f"""\
+Return ONLY a JSON array of findings, optionally inside one code fence. Each element:
+{_PLAN_FINDING_ELEMENT_SCHEMA}
+If you reviewed everything and found NOTHING to report, return the empty array
+followed by the sentinel word NO_FINDINGS on its own line, and nothing else.
+An EMPTY array surrounded by prose, or the sentinel without the array, is a
+non-response and excluded from quorum. There is no findings quota.
+"""
+
+
+def parse_findings(text: str) -> tuple[list[dict], Optional[str]]:
+    """Reviewer output → ``(raw_findings, parse_error)`` via the repository's
+    findings-array protocol (``triad_review.extract_json_array`` /
+    ``empty_array_is_verified_clean``). ``[]`` + ``NO_FINDINGS`` → clean;
+    prose-only, unparseable, non-object elements, or a bare ``[]`` inside prose
+    (indistinguishable from a refusal) → ``parse_error`` (excluded from quorum).
+    A NON-empty array embedded in prose is accepted (inherited from
+    ``extract_json_array``'s best-effort scan, same as the triad).
+    """
+    raw = str(text or "")
+    if empty_array_is_verified_clean(raw):
+        return [], None
+    parsed = extract_json_array(
+        raw, validate_fn=lambda items: all(isinstance(item, Mapping) for item in items),
+    )
+    if parsed is None:
+        return [], "no findings JSON array found (prose-only or unparseable response)"
+    if not parsed:
+        return [], "empty findings array without the NO_FINDINGS sentinel (or with surrounding prose)"
+    return [dict(item) for item in parsed], None
+
+
+def validate_findings(
+    findings: Iterable[Mapping[str, Any]],
+    *,
+    spec_ids: Iterable[str],
+    seen_locators: Iterable[str],
+    slot: str = "",
+) -> tuple[list[dict], list[str], frozenset[str]]:
+    """Structural validation of one slot's findings → ``(normalized, disclosures, seen_after)``.
+
+    Host checks membership/shape only (P5): ``blocking`` needs ``breaks`` ∈
+    ``spec_ids`` else DEMOTED to ``note`` (``blocking_without_valid_breaks``);
+    ``need_evidence`` needs a non-empty ``locator`` (a document the host attaches)
+    OR a ``breaks`` ∈ ``spec_ids`` (a question to the author) else demoted; an
+    over-long locator on such a question drops only the locator; a missing
+    ``summary`` is filled with ``(missing summary)`` + disclosure (a finding is
+    never dropped — an ok slot must not launder its blocking finding away); a
+    ``need_evidence`` locator already in ``seen_locators`` — the PER-TASK
+    (cross-cycle) memory the caller persists in ``plan_review_state`` — or
+    repeated within this slot remains ``need_evidence`` with a
+    ``need_evidence_repeat`` disclosure: request memory does not grow, and the
+    agent still supplies its free disposition. A full request memory likewise
+    refuses only remembering another locator, not the request's meaning. Ids
+    are minted ``f{slot}_{n}`` when missing.
+    Findings are never capped before aggregation. ``MAX_FINDINGS_PER_SLOT`` is
+    retained as the rendered page size only. ``seen_after`` is the
+    updated locator memory for the caller to persist; the input is not mutated.
+    The engine validates the slots of ONE wave sequentially against the CUMULATIVE
+    memory (it passes the running ``seen_after`` back in), so the per-task memory
+    cap ``MAX_NEED_EVIDENCE_MEMORY`` is exact across slots; a second slot asking
+    for a locator the first already requested does not create a second remembered
+    locator; neither repetition nor a memory bound silently closes the wave.
+    """
+    ids = frozenset(str(s) for s in spec_ids)
+    seen = set(str(s) for s in seen_locators)
+    disclosures: list[str] = []
+    normalized: list[dict] = []
+    local_ids: set[str] = set()
+    items = [item for item in findings]
+    for index, item in enumerate(items, start=1):
+        if not isinstance(item, Mapping):
+            disclosures.append(f"finding_{index}_not_object")
+            continue
+        fid = _unique_id(_sanitize_id(item.get("id"), f"f{slot}_{index}"), local_ids)
+        summary = bounded_text(item.get("summary"), MAX_FINDING_TEXT_CHARS)
+        if not summary:
+            # Never DROP a finding: a blocking finding without a summary still blocks (S-B03).
+            disclosures.append(f"missing_summary:{fid}")
+            summary = "(missing summary)"
+        klass = str(item.get("class") or "").strip().lower()
+        breaks = str(item.get("breaks") or "").strip()[:MAX_ID_CHARS]  # an id, bounded like ids
+        locator = str(item.get("locator") or "").strip()
+        if klass not in FINDING_CLASSES:
+            disclosures.append(f"unknown_class:{fid}:{klass or '<empty>'}")
+            klass = "note"
+        if klass == "blocking" and breaks not in ids:
+            disclosures.append(f"blocking_without_valid_breaks:{fid}")
+            klass = "note"
+        if klass == "need_evidence":
+            # A question to the AUTHOR names the spec id it is about in `breaks` and needs
+            # no locator (the author answers in the disposition); a request for a document
+            # names a locator the host attaches. Neither: optional advice, disclosed.
+            asks_author = breaks in ids
+            if not locator and not asks_author:
+                disclosures.append(f"need_evidence_without_locator:{fid}")
+                klass = "note"
+            elif len(locator) > MAX_ITEM_CHARS:
+                # W3 host attachment is bounded like the agent's own evidence items: an over-long
+                # locator is never remembered (state) nor attached — demoted, disclosed; a
+                # question to the author keeps its class and drops only the locator.
+                disclosures.append(f"need_evidence_locator_too_long:{fid}")
+                if asks_author:
+                    locator = ""
+                else:
+                    klass = "note"
+            elif locator and locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
+                disclosures.append(f"need_evidence_memory_full:{fid}")
+            elif locator and locator in seen:
+                # I-03: request deduplication is not a reviewer withdrawing its
+                # need. Keep the typed request for a free disposition; leaving
+                # seen unchanged preserves the attachment and paid-cycle bounds.
+                disclosures.append(f"need_evidence_repeat:{locator}")
+            elif locator:
+                seen.add(locator)
+        normalized.append({
+            "id": fid, "class": klass, "breaks": breaks,
+            # a stored locator is bounded like every other finding string (visible marker)
+            "locator": bounded_text(locator, MAX_FINDING_TEXT_CHARS),
+            "summary": summary,
+            "recommendation": bounded_text(item.get("recommendation"), MAX_FINDING_TEXT_CHARS),
+        })
+    return normalized, disclosures, frozenset(seen)
+
+
+def aggregate(slot_results: Iterable[Mapping[str, Any]], *, quorum: Optional[int] = None) -> dict:
+    """Host-computed wave aggregate — no reviewer-authored verdict.
+
+    ``slot_results`` = EVERY configured slot as ``{slot, model, ok, findings,
+    error?, carried?}`` (``ok`` = parseable; ``findings`` = ``validate_findings``
+    output; ``carried`` = a seat's still-open findings from the same-spec
+    predecessor when the seat did not answer THIS wave — they join the open set
+    stamped ``carried_absent_answer`` but the row stays unparseable and casts no
+    quorum or blocking-slot vote: silence never manufactures GREEN).
+    ``quorum`` defaults to ``config.adaptive_quorum(len(slot_results))``.
+    parseable slots < quorum → ``DEGRADED``; slots with ≥1 ``blocking`` ≥ quorum
+    → ``REVISE_PLAN``; a non-empty OPEN SET — any ``blocking`` finding below
+    quorum or any ``need_evidence`` (a document request or a question to the
+    author) — → ``REVIEW_REQUIRED`` (a need_evidence-only wave never revises);
+    otherwise ``GREEN``: a quorum parsed and the open set is empty. ``note``
+    findings never change the verdict (they are optional advice, so a note-only
+    wave is GREEN). One configured
+    slot follows ``adaptive_quorum(1) == 1`` (its blocking finding revises) with
+    the loud reason ``single_reviewer_no_diversity``. Returns
+    ``{aggregate, reasons, counts, findings}`` — findings flattened with
+    ``finding_id = "<slot>:<id>"``, ``slot`` and ``model`` stamped.
+    """
+    rows = [dict(row) for row in slot_results]
+    configured = len(rows)
+    q = max(1, int(quorum)) if quorum is not None else adaptive_quorum(configured)
+    reasons: list[str] = []
+    flat: list[dict] = []
+    blocking_slots = 0
+    parseable = 0
+    labels: set[str] = set()
+    for position, row in enumerate(rows, start=1):
+        slot = str(row.get("slot") or "") or str(position)
+        if slot in labels:
+            slot = f"{slot}_{position}"  # duplicate labels must not merge finding_ids
+        labels.add(slot)
+        if not row.get("ok"):
+            reasons.append(f"slot_unparseable:{slot}:{str(row.get('error') or 'no parseable findings')}")
+            carried = [dict(f) for f in (row.get("carried") or []) if isinstance(f, Mapping)]
+            for finding in carried:
+                finding.update({"slot": slot, "carried_absent_answer": True})
+                finding.setdefault("finding_id", f"{slot}:{finding.get('id', '')}")
+                flat.append(finding)
+            if carried:
+                reasons.append(f"findings_carried_absent_answer:{slot}:{len(carried)}")
+            continue
+        parseable += 1
+        slot_findings = [dict(f) for f in (row.get("findings") or []) if isinstance(f, Mapping)]
+        if any(f.get("class") == "blocking" for f in slot_findings):
+            blocking_slots += 1
+        for finding in slot_findings:
+            finding.update({
+                "finding_id": f"{slot}:{finding.get('id', '')}", "slot": slot,
+                "model": str(row.get("model") or ""),
+            })
+            flat.append(finding)
+    counts = {
+        "configured": configured, "parseable": parseable, "quorum": q,
+        "blocking_slots": blocking_slots,
+        **{klass: sum(1 for f in flat if f.get("class") == klass) for klass in FINDING_CLASSES},
+    }
+    if configured == 1:
+        reasons.append("single_reviewer_no_diversity")
+    if configured == 0 or parseable < q:
+        verdict = "DEGRADED"
+        reasons.append(f"parseable_slots_below_quorum:{parseable}/{q}")
+    elif blocking_slots >= q:
+        verdict = "REVISE_PLAN"
+        reasons.append(f"blocking_slots_at_quorum:{blocking_slots}/{q}")
+    elif counts["blocking"] or counts["need_evidence"]:
+        verdict = "REVIEW_REQUIRED"
+        if counts["blocking"]:
+            reasons.append(f"blocking_below_quorum:{blocking_slots}/{q}")
+        else:
+            reasons.append("need_evidence_only")  # only questions/requests hold the wave
+    else:
+        verdict = "GREEN"
+    return {"aggregate": verdict, "reasons": reasons, "counts": counts, "findings": flat}
+
+
+def merge_dispositions(prior, new) -> list[dict]:
+    """One wave's answers after another call: every earlier answer survives unless this
+    call answers the same ``finding_id``, which then supersedes ALL earlier entries for that
+    id. Two entries for one id inside ONE call stay as written — ``closure_after_disposition``
+    refuses that contradiction and the finding stays open. Non-mapping entries are dropped."""
+    fresh = [dict(item) for item in new or [] if isinstance(item, Mapping)]
+    answered = {str(item.get("finding_id") or "").strip() for item in fresh}
+    kept = [dict(item) for item in prior or [] if isinstance(item, Mapping)
+            and str(item.get("finding_id") or "").strip() not in answered]
+    return kept + fresh
+
+
+def closure_after_disposition(
+    aggregate: str,
+    findings: Iterable[Mapping[str, Any]],
+    dispositions: Iterable[Mapping[str, Any]],
+    enforcement: str,
+) -> dict:
+    """The ONE closure table (F7) → ``{closed, aggregate, open_ids, notes}``.
+
+    The open set of a wave is every ``blocking`` finding that is not closed plus
+    every ``need_evidence`` (a document request or a question to the author)
+    without a valid disposition (accept|reject|defer + rationale). Notes never
+    hold a wave. GREEN → closed. REVIEW_REQUIRED → closed iff the open set is
+    empty; a below-quorum ``blocking`` finding closes, per finding, ONLY under
+    advisory enforcement and ONLY by a reasoned ``reject`` (accept or defer keep
+    it open: an accepted blocking finding says the reviewed plan is broken, and
+    closing it would certify that plan GREEN); under blocking enforcement it
+    stays open until a changed spec is reviewed or the reviewer retires it in a
+    later paid cycle. REVISE_PLAN and DEGRADED are never closed by disposition.
+    ``aggregate`` is the verdict to RECORD: a REVIEW_REQUIRED wave whose open set
+    emptied is written as GREEN with the note ``closed_by_disposition``; every
+    other verdict is returned as itself. Enforcement here is the CONFIGURED
+    value (Cyber Pro is action authority, not closure); an open wave under
+    advisory may still proceed under loud disclosure — this function only
+    reports. Control-line invariants (``tools.plan_render
+    ._parse_plan_review_control``): GREEN ⇒ closed, REVISE_PLAN ⇒ not closed.
+    """
+    verdict = str(aggregate or "").strip().upper()
+    mode = str(enforcement or "").strip().lower()
+    items = [dict(f) for f in findings if isinstance(f, Mapping)]
+    valid: dict[str, dict] = {}
+    duplicates: set[str] = set()
+    notes: list[str] = []
+    for item in dispositions or []:
+        if not isinstance(item, Mapping):
+            continue
+        fid = str(item.get("finding_id") or "").strip()
+        decision = str(item.get("decision") or "").strip().lower()
+        if decision not in DISPOSITION_DECISIONS or not str(item.get("rationale") or "").strip():
+            notes.append(f"invalid_disposition:{fid or '<no finding_id>'}")
+            continue
+        if fid in valid:
+            # Two entries for one finding are contradictory intent, not an update: silently
+            # keeping the last would let "accept, then reject" close a wave on whichever the
+            # agent happened to write second. Both are refused; the finding stays open.
+            notes.append(f"duplicate_disposition:{fid}")
+            valid.pop(fid, None)
+            duplicates.add(fid)
+            continue
+        if fid in duplicates:
+            continue
+        valid[fid] = dict(item)
+    known = {str(f.get("finding_id") or f.get("id") or "") for f in items}
+    notes.extend(f"unknown_finding_id:{fid}" for fid in sorted(set(valid) - known))
+    advisory = mode == "advisory"  # the configured value, as the notes below already read it
+    open_ids: list[str] = []
+    for finding in items:
+        fid = str(finding.get("finding_id") or finding.get("id") or "")
+        klass = finding.get("class")
+        if klass == "note":
+            continue  # notes never hold a wave
+        decision = (valid.get(fid) or {}).get("decision")
+        if klass == "blocking":
+            # Under ADVISORY a reasoned reject closes a blocking finding BELOW quorum,
+            # per finding; accept/defer keep it open. Under BLOCKING closure is
+            # unchanged: a changed spec, or the reviewer retiring it in a later paid cycle.
+            closes = advisory and verdict == "REVIEW_REQUIRED" and decision == "reject"
+        else:
+            closes = fid in valid  # need_evidence: accept | reject | defer + rationale
+        if not closes:
+            open_ids.append(fid)
+    if verdict == "GREEN":
+        closed = True
+    elif verdict == "REVIEW_REQUIRED":
+        closed = not open_ids
+        if not items:
+            notes.append("no_findings_recorded: REVIEW_REQUIRED without findings closes vacuously")
+        if not advisory and any(f.get("class") == "blocking" for f in items):
+            notes.append(
+                "blocking_finding_below_quorum_stays_open: blocking findings remain open after disposition"
+            )
+    elif verdict == "REVISE_PLAN":
+        closed = False
+        notes.append(
+            "revise_plan_not_closable_by_disposition: disposition does not close blocking findings"
+        )
+    elif verdict == "DEGRADED":
+        closed = False
+        notes.append("degraded_not_closable_by_disposition: fewer parseable reviewer slots than quorum; disposition does not close the wave")
+    else:
+        closed = False
+        notes.append(f"unknown_aggregate:{verdict or '<empty>'}")
+    if not closed:
+        notes.append(
+            "advisory_enforcement: the caller may proceed with the wave open under loud disclosure"
+            if advisory else
+            "blocking_enforcement: the wave must close before the work starts"
+        )
+    recorded = "GREEN" if verdict == "REVIEW_REQUIRED" and closed else verdict
+    if recorded != verdict:
+        notes.append("closed_by_disposition: REVIEW_REQUIRED → GREEN (open set emptied)")
+    return {"closed": closed, "aggregate": recorded, "open_ids": open_ids, "notes": notes}
+
+
+def plan_ordered_weaker(configured_slots: list, owner_efforts: Optional[dict]) -> dict[str, dict[str, str]]:
+    """``{slot_id: {effort, owner_effort}}`` for every seat whose EFFECTIVE effort ranks
+    below the effort the owner's settings would have run (both ranks known on
+    ``EFFORT_SCALE``); ``{}`` when nothing was ordered weaker. Computed from the
+    request at dispatch and carried through collection, never recomputed from the
+    live owner setting."""
+    weaker: dict[str, dict[str, str]] = {}
+    for slot in configured_slots or []:
+        sid = str(getattr(slot, "slot_id", "") or "")
+        effort = str(getattr(slot, "effort", "") or "")
+        owner = str((owner_efforts or {}).get(sid) or "")
+        if 0 <= effort_rank(effort) < effort_rank(owner):
+            weaker[sid] = {"effort": effort, "owner_effort": owner}
+    return weaker
+
+
+def plan_standing_findings(previous: Optional[dict], spec: dict, enforcement: str) -> dict[str, list[dict]]:
+    """``{slot_id: [findings]}`` still open on ``previous`` when it reviewed the SAME spec
+    (equal ``spec_hash``): keyed by seat, independent of the roster fingerprint, effort or
+    order, so a seat that fails to answer a same-spec cycle keeps its objection listed
+    (``plan_review_runtime.synthesize_plan_review_wave``). A changed spec, a closed predecessor or no
+    predecessor carries nothing."""
+    if not isinstance(previous, dict) or not isinstance(previous.get("spec"), dict) or previous.get("closed"):
+        return {}
+    if str(previous.get("spec_hash") or spec_hash(previous["spec"])) != spec_hash(spec):
+        return {}
+    findings = [f for f in previous.get("findings") or [] if isinstance(f, Mapping)]
+    open_ids = set(closure_after_disposition(
+        str(previous.get("aggregate") or ""), findings, list(previous.get("dispositions") or []), enforcement,
+    )["open_ids"])
+    standing: dict[str, list[dict]] = {}
+    for finding in findings:
+        if str(finding.get("finding_id") or "") in open_ids and finding.get("class") in ("blocking", "need_evidence"):
+            standing.setdefault(str(finding.get("slot") or ""), []).append(dict(finding))
+    return standing
+
+
+
+def plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
+    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
+    the constitutional fact — never the exploration log (it changes no obligation)."""
+    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
+               "constitutional": bool(constitutional)}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()

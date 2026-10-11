@@ -14,21 +14,48 @@ import json
 import pathlib
 import shlex
 import subprocess
+import time
 from typing import Any, List
 
 from ouroboros._outcome_receipts import (
     CHECK_RENDERING_DECLARED_TEXT,
     CHECK_RENDERING_SHLEX_JOIN,
 )
+from ouroboros.outcome_receipt_store import ZERO_RUN_WRITE_DECISIONS
 from ouroboros.outcomes import append_verification_receipt
 from ouroboros.platform_layer import bootstrap_process_path
-from ouroboros.shell_parse import normalize_check_argv
+from ouroboros.process_interpreters import (
+    active_node_resolution,
+    apply_env_path_prepend,
+    interpreter_path_overlay,
+)
+from ouroboros.shell_parse import POSIX_SHELL_HEADS, normalize_check_argv, shell_tokens_typed
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    active_tool_profile,
+    build_resolved_resource_binding,
+    canonical_data_root,
+)
 from ouroboros.tools.registry import ToolContext, ToolEntry, active_repo_dir_for
+from ouroboros.tools.process_facts import process_environment_tool, redact_process_data, record_runtime_selection, selected_process_environment
 from ouroboros.utils import utc_now_iso
 
 # Durable receipt evidence is bounded but the truncation is DISCLOSED (BIBLE P1, never
 # silent); the tool-result preview is bounded separately for transport.
 _RECEIPT_OUTPUT_CAP = 20000
+# The typed process facts a run-kind receipt DISCLOSES (D6/R4). `duration_ms` —
+# always, for every run-kind check: a 9ms SIGKILL and a 5-minute honest red are
+# different facts. `signal` — the POSIX name of the signal that killed the check
+# (returncode < 0), so a killed verification is distinguishable in the store
+# (Windows reports large positive codes and gets no name — declared residual,
+# see process_facts.signal_name_for_returncode). `resolved_runtime` — present
+# ONLY when execution ran something other than the literal recorded check
+# (Stream-A resolver seam); its absence means the recorded argv is exactly what
+# executed. The channel publishes MORE than this (the kill facts belong to the
+# call's result_meta, not to the receipt's stored shape), so the receipt keeps
+# exactly the three keys it has always carried, copied from the one publication
+# instead of derived a second time.
+_RECEIPT_PROCESS_KEYS = ("duration_ms", "signal", "resolved_runtime", "runtime_provenance")
 _TOOL_OUTPUT_CAP = 4000
 # The `no_visible_machine_contract` receipt carries the agent's OWN stated proxy and
 # residual risk — decision-shaping cognitive evidence a reviewer reads, so it goes
@@ -37,10 +64,22 @@ _RECEIPT_DECLARED_SUMMARY_CAP = 1000
 
 
 def _bounded(text: Any, cap: int) -> str:
-    t = str(text or "").strip()
+    # Raw output remains available to expected-match evaluation. Only this
+    # diagnostic copy is masked, before a bound could expose a secret fragment.
+    t = redact_process_data(str(text or "")).strip()
     if len(t) <= cap:
         return t
     return t[:cap] + f"\n…[truncated {len(t) - cap} of {len(t)} chars]"
+
+
+def _receipt_custody_failure(kind: str, detail: str = "") -> str:
+    suffix = f" Observed result: {detail}" if detail else ""
+    return (
+        f"⚠️ TOOL_ERROR (verify_and_record): receipt_custody_failed for {kind}; "
+        "the check/observation may have run, but no durable receipt was recorded. "
+        "Do not treat this verification as attested; retry after receipt custody "
+        f"recovers.{suffix}"
+    )
 
 _CONTRACT_KINDS = (
     "visible_verifier",
@@ -48,8 +87,12 @@ _CONTRACT_KINDS = (
     "explicit_metric",
     "artifact_observation",
     "no_visible_machine_contract",
+    "delegation_zero_run",
 )
 _RUN_KINDS = frozenset({"visible_verifier", "explicit_command", "explicit_metric"})
+# WRITE vocabulary only — hydration reads keep historical "complete" valid
+# through ZERO_RUN_READ_DECISIONS in the same SSOT module.
+_ZERO_RUN_DECISIONS = ZERO_RUN_WRITE_DECISIONS
 # How `expected` is matched against the check output. `substring` is the DEFAULT
 # and keeps the historical behavior byte-identical when the param is omitted.
 # `bytes_equal` (v6.60.0) compares TWO FILES byte-for-byte (artifact_paths[0] vs
@@ -83,7 +126,6 @@ _normalize_check = normalize_check_argv
 # Shell stages that, as the LAST stage of a pipeline, almost always exit 0 even when an earlier
 # real command failed — so the pipeline's exit (POSIX: the last stage's) MASKS the true result.
 _EXIT_MASK_FILTER_CMDS = frozenset({"tail", "head", "grep", "egrep", "fgrep", "sed", "awk", "cat", "tee", "tr", "sort", "uniq", "wc", "true", ":"})
-_SHELL_C_HEADS = frozenset({"sh", "bash", "dash", "ash", "zsh"})
 
 
 def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
@@ -91,56 +133,81 @@ def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
     SHELL-STRING check `["sh"/"bash"/..., "-c", text]`, constructs that launder the real exit code
     so a failing runner reads as exit 0 (the false-green tutanota hit): a trailing pipe into a text
     filter (`... | tail/head/grep/...`; POSIX pipeline exit = the LAST stage), `|| true` / `|| :`,
-    or a `>/dev/null`/`2>/dev/null` swallow. Token-scans via shlex OUTSIDE quotes so a quoted
+    or an explicit successful tail. Token-scans via shlex OUTSIDE quotes so a quoted
     literal (e.g. grep PATTERN '| tail') is not flagged. Mirrors the artifact_lifecycle flag: it
     informs the advisory reviewer + the agent, P5-clean (it decides nothing). Returns (masked, reasons)."""
     if not argv or len(argv) < 3:
         return False, []
-    if pathlib.PurePath(str(argv[0])).name.lower() not in _SHELL_C_HEADS or str(argv[1]) not in ("-c", "-lc"):
+    if pathlib.PurePath(str(argv[0])).name.lower() not in POSIX_SHELL_HEADS or str(argv[1]) not in ("-c", "-lc"):
         return False, []
-    text = str(argv[2])
-    # Operator-aware tokenization (shlex with `punctuation_chars`) so `|`/`||` are split out as
-    # standalone tokens EVEN WHEN glued to words (`pytest -q|tail`, `make test||true`) — plain
-    # shlex.split is whitespace-only and would miss the no-space forms. Quotes are still respected,
-    # so a quoted literal (e.g. a grep pattern `'| tail'`) is NOT flagged.
-    try:
-        lexer = shlex.shlex(text, posix=True, punctuation_chars="|&<>")
-        lexer.whitespace_split = True
-        toks = list(lexer)
-    except ValueError:
+    typed = shell_tokens_typed(str(argv[2]))
+    if typed is None:
         return False, []
+    # Strip only syntactic grouping, including punctuation glued to a pipe
+    # (``)|(``). Quoted/escaped parentheses and operators remain literal data.
+    toks: list[tuple[str, bool]] = []
+    for token, operator in typed:
+        if operator:
+            toks.extend((part, True) for part in token.replace("(", " ").replace(")", " ").split())
+        else:
+            toks.append((token, False))
     reasons: list[str] = []
     for i, tok in enumerate(toks[:-1]):
-        if tok == "||" and toks[i + 1] in ("true", ":"):
+        if tok == ("||", True) and toks[i + 1] in (("true", False), (":", False)):
             reasons.append("|| true")
             break
-    pipe_positions = [i for i, tok in enumerate(toks) if tok == "|"]
+    pipe_positions = [i for i, tok in enumerate(toks) if tok == ("|", True)]
     if pipe_positions:
         nxt = pipe_positions[-1] + 1
-        last_stage = pathlib.PurePath(toks[nxt]).name.lower() if nxt < len(toks) else ""
+        last_stage = pathlib.PurePath(toks[nxt][0]).name.lower() if nxt < len(toks) and not toks[nxt][1] else ""
         if last_stage in _EXIT_MASK_FILTER_CMDS:
             reasons.append(f"pipeline_{last_stage}")
-    if ">/dev/null" in text.replace(" ", ""):
-        reasons.append("dev_null_redirect")
+    if len(toks) >= 2 and toks[-1] in (("true", False), (":", False)) and toks[-2] == (";", True):
+        reasons.append("; true")
+    if len(toks) >= 3 and toks[-2:] == [("exit", False), ("0", False)] and toks[-3] in ((";", True), ("||", True)):
+        reasons.append("exit 0")
     seen: set = set()
     ordered = [r for r in reasons if not (r in seen or seen.add(r))]
     return bool(ordered), ordered
 
 
-def _within_readonly_orchestrator_root(ctx: ToolContext, candidate: pathlib.Path) -> bool:
-    """True when ``candidate`` resolves inside a read-only orchestrator root
-    (``subagent_projects`` = the durable genesis/coop projects tree, or
-    ``deliverables`` = the unnamed-deliverables container). A parent orchestrating
-    child tasks legitimately needs to CONFIRM a child's deliverable EXISTS there —
-    an existence/size observation only, never a content read — so an
-    artifact_observation over those roots is not out-of-scope (v6.57.0). The
-    read-only trust boundary is preserved: this permits observation, never reads."""
-    from ouroboros.tool_access import path_is_relative_to, resource_root_path
+# Public name for the SECOND consumer: run_command/run_script read the same
+# sensor to disclose a masked green in their result envelope.
+check_exit_masking = _check_has_exit_masking
 
-    for root_name in ("subagent_projects", "deliverables"):
-        try:
-            root = pathlib.Path(resource_root_path(ctx, root_name)).resolve(strict=False)
-        except Exception:
+
+_OBSERVABLE_EXTRA_ROOTS = ("subagent_projects", "deliverables", "artifact_store", "task_drive")
+
+
+def _within_readonly_orchestrator_root(ctx: ToolContext, candidate: pathlib.Path) -> bool:
+    """True when ``candidate`` resolves inside an observation-sanctioned resource
+    root beyond the active workspace: the read-only orchestrator roots
+    (``subagent_projects`` = the durable genesis/coop projects tree,
+    ``deliverables`` = the unnamed-deliverables container) plus — derived from the
+    ONE ``_POLICY`` matrix, not a private list (wave3 r24: verify refused the very
+    ``artifact_store`` path the agent had just registered, forcing a Deliverables
+    copy-shuffle) — the task's own ``artifact_store``/``task_drive``. Each root
+    counts ONLY when the active profile can already read it per the matrix
+    (``profile_readable_root_paths``), so this widens observation to nothing the
+    profile cannot already ``read_file``. DISCLOSED NARROWING (capability delta,
+    v6.91 scope S2): the pre-matrix version trusted ``subagent_projects``/
+    ``deliverables`` UNCONDITIONALLY for every profile; the matrix drops them for
+    profiles carrying no read verb on those roots — ``acting_subagent``,
+    ``local_readonly_subagent``, ``skill_repair`` — so a child observing a
+    sibling's coop-tree deliverable now falls through to the user_files guards
+    (the projects tree overlaps the soft-protected workspace parent) and records
+    REFUSED_OUT_OF_SCOPE where it previously recorded OBSERVED. Accepted: the
+    refusal is a non-failure policy receipt, and sibling-deliverable observation
+    rides the ORCHESTRATING parent (workspace_task / external_workspace_task /
+    self_modification / operator_control keep the verbs), not the child.
+    Deliberately NOT widened to
+    ``system_repo``/``runtime_data``: existence-observation of the control plane
+    stays out of scope (anti-cheat boundary). An existence/size observation only,
+    never a content read."""
+    from ouroboros.tool_access import path_is_relative_to, profile_readable_root_paths
+
+    for label, root in profile_readable_root_paths(ctx):
+        if label not in _OBSERVABLE_EXTRA_ROOTS:
             continue
         if candidate == root or path_is_relative_to(candidate, root):
             return True
@@ -252,8 +319,15 @@ def _compare_files_bytes_equal(
         from ouroboros.workspace_executor import execute as _executor_execute
 
         res = _executor_execute(ctx, ["cmp", "--", a_raw, b_raw], pathlib.Path(work_dir), 60)
-        rc = int(getattr(res, "returncode", 2) or 0)
-        out = ((res.stdout or "") + ("\n" + res.stderr if res.stderr else "")).strip()
+        # No `or` coercion on an exit code: `None or 0` would read an unknown
+        # outcome as cmp's success and report the two files byte-equal. Absent or
+        # non-numeric is unknown, which is not equality.
+        rc_raw = getattr(res, "returncode", None)
+        try:
+            rc = int(rc_raw)
+        except (TypeError, ValueError):
+            return False, f"bytes_equal: executor cmp returned no exit status for {a_raw} vs {b_raw}"
+        out = redact_process_data((res.stdout or "") + ("\n" + res.stderr if res.stderr else "")).strip()
         if rc == 0:
             return True, f"bytes_equal: {a_raw} == {b_raw} (executor cmp)"
         if rc > 1:
@@ -343,7 +417,10 @@ def _probe_artifact_lifecycle(
                 else:
                     from ouroboros.workspace_executor import execute as _executor_execute
                     res = _executor_execute(ctx, ["sh", "-c", 'test -e "$1"', "_", text], pathlib.Path(work_dir), 30)
-                    exists = int(getattr(res, "returncode", 1) or 1) == 0
+                    # No `or 1` coercion: returncode 0 is falsy, so it inverted every
+                    # healthy probe into exists_after=false (a None returncode now
+                    # raises into the advisory "unavailable" arm instead of lying).
+                    exists = int(getattr(res, "returncode", 1)) == 0
             else:
                 # HOST branch: resolve a RELATIVE path against the CHECK's cwd (work_dir) — the
                 # check ran there, so its relative deliverable lives there. A relative path MUST
@@ -376,22 +453,161 @@ def _probe_artifact_lifecycle(
     return lifecycle, missing_after
 
 
+def _record_delegation_zero_run(
+    ctx: ToolContext,
+    *,
+    bootstrap: dict[str, Any],
+    task_id: str,
+    criterion_id: str,
+    criterion_basis: Any,
+    check: Any,
+    kwargs: dict[str, Any],
+) -> str:
+    """Record one actor-first no-physical-run decision after custody is clear."""
+
+    if bool(bootstrap.get("physical_started")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is no longer "
+            "available after the selected physical leaf has started."
+        )
+    if bool(bootstrap.get("zero_run_receipt_recorded")):
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+            "has a durable terminal decision for this actor."
+        )
+    decision = str(
+        kwargs.get("zero_run_decision") or kwargs.get("decision") or ""
+    ).strip().lower()
+    if decision not in _ZERO_RUN_DECISIONS:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): zero_run_decision must be one of "
+            f"{', '.join(_ZERO_RUN_DECISIONS)}."
+        )
+    basis = " ".join(str(
+        kwargs.get("zero_run_basis")
+        or kwargs.get("reason")
+        or criterion_basis
+        or check
+        or ""
+    ).split()).strip()
+    if not basis:
+        return (
+            "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run requires a "
+            "non-empty zero_run_basis explaining the host-visible evidence or blocker."
+        )
+    receipt: dict[str, Any] = {
+        "tool": "verify_and_record",
+        "contract_kind": "delegation_zero_run",
+        "status": "declared",
+        "zero_run": True,
+        "zero_run_decision": decision,
+        "zero_run_basis": _bounded(basis, _RECEIPT_DECLARED_SUMMARY_CAP),
+        "physical_run_started": False,
+        "route": str(bootstrap.get("route_id") or ""),
+        "work_order_fingerprint": str(bootstrap.get("work_order_fingerprint") or ""),
+        "ts": utc_now_iso(),
+    }
+    if crit := str(criterion_id or "").strip():
+        receipt["criterion_id"] = crit[:120]
+    try:
+        from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_recovery import unsettled_start_ids
+        from ouroboros.subagent_bootstrap import _durable_zero_run_receipt
+
+        drive_root = custody.custody_root(ctx)
+        with custody.actor_decision_lock(drive_root, task_id):
+            if custody.custody_log_unreadable(drive_root):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+                    "the custody event log exists but cannot be read, so the host "
+                    "cannot prove that no physical start/run remains; no zero-run "
+                    "receipt was written (custody_log_unreadable)."
+                )
+            gaps: set[str] = set()
+            prior = _durable_zero_run_receipt(ctx, gap_reasons=gaps)
+            if prior:
+                return (
+                    "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run already "
+                    "has a durable terminal decision for this actor."
+                )
+            blockers = unsettled_start_ids(drive_root, task_id)
+            if any(blockers.values()):
+                return (
+                    "⚠️ TOOL_ERROR (verify_and_record): zero_run_requires_settlement: "
+                    "this task has an open run, ambiguous start invocation, or "
+                    "undisposed physical result. blockers="
+                    + json.dumps(blockers, ensure_ascii=False, sort_keys=True)
+                )
+            if gaps:
+                # Empty physical custody is the authority needed to re-ground a
+                # damaged zero-run stream.  Preserve the evidence gap on the new
+                # typed receipt instead of turning recovery into a self-deadlock.
+                receipt["regrounds_zero_run_authority"] = True
+                receipt["prior_zero_run_evidence_gaps"] = sorted(gaps)
+            # A zero-run is lifecycle authority for the actor, so keep it on the
+            # canonical budget root rather than an ephemeral child drive.
+            written = append_verification_receipt(
+                canonical_data_root(ctx), task_id, receipt,
+            )
+    except Exception as exc:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): zero_run_custody_unknown: "
+            "the host could not atomically prove empty custody and claim the "
+            f"zero-run decision; no receipt was written ({type(exc).__name__})."
+        )
+    if not written:
+        return (
+            "⚠️ TOOL_ERROR (verify_and_record): the delegation_zero_run receipt "
+            "could not be durably written; no zero-run decision was recorded."
+        )
+    bootstrap["zero_run_decision"] = decision
+    bootstrap["zero_run_basis"] = receipt["zero_run_basis"]
+    bootstrap["zero_run_receipt_recorded"] = True
+    bootstrap["exact_start_pending"] = False
+    bootstrap.pop("zero_run_evidence_status", None)
+    bootstrap.pop("zero_run_evidence_gaps", None)
+    return (
+        "verify_and_record [delegation_zero_run] "
+        f"{decision.upper()}: no physical leaf was started; typed host receipt recorded."
+    )
+
+
+@process_environment_tool
 def _verify_and_record(
     ctx: ToolContext,
     contract_kind: str = "",
     criterion_id: str = "",
     check: Any = None,
     expected: str = "",
-    expected_match: str = "substring",
-    artifact_paths: Any = None,
     cwd: str = "",
-    timeout_sec: int | None = None,
-    criterion_source: str = "",
-    criterion_basis: str = "",
+    _resolved_binding: ResolvedResourceBinding | None = None,
+    **kwargs,
 ) -> str:
+    expected_match = kwargs.get("expected_match", "substring")
+    artifact_paths = kwargs.get("artifact_paths")
+    timeout_sec = kwargs.get("timeout_sec")
+    criterion_source = kwargs.get("criterion_source", "")
+    criterion_basis = kwargs.get("criterion_basis", "")
+    bucket = str(kwargs.get("bucket") or "")
+    skill_name = str(kwargs.get("skill_name") or "")
     kind = str(contract_kind or "").strip()
     if kind not in _CONTRACT_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): contract_kind must be one of {', '.join(_CONTRACT_KINDS)}."
+    if active_tool_profile(ctx) == "local_readonly_subagent":
+        # Read-only actor-first sessions need a host-owned zero-run disclosure,
+        # not the general command/artifact verification surface.  Keep the
+        # profile and lifecycle checks here as defense in depth for stale schemas
+        # or forced dispatches after the physical leaf has started.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if (
+            kind != "delegation_zero_run"
+            or not isinstance(bootstrap, dict)
+            or bool(bootstrap.get("physical_started"))
+        ):
+            return (
+                "⚠️ LOCAL_READONLY_SUBAGENT_BLOCKED: this profile may record only a "
+                "delegation_zero_run receipt before its selected physical leaf starts."
+            )
     match_mode = str(expected_match or "substring").strip().lower() or "substring"
     if match_mode not in _EXPECTED_MATCH_KINDS:
         return f"⚠️ TOOL_ARG_ERROR (verify_and_record): expected_match must be one of {', '.join(_EXPECTED_MATCH_KINDS)}."
@@ -414,6 +630,26 @@ def _verify_and_record(
     task_id = str(getattr(ctx, "task_id", "") or "")
     drive_root = getattr(ctx, "drive_root", None)
     expected_s = str(expected or "").strip()
+    if kind == "delegation_zero_run":
+        # This is a typed actor-first disclosure, not a general-purpose way to
+        # relabel an ordinary task.  The private bootstrap marker is created by
+        # the host before the first model episode and is intentionally the only
+        # authority that can mint this receipt.
+        bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
+        if not isinstance(bootstrap, dict):
+            return (
+                "⚠️ TOOL_ARG_ERROR (verify_and_record): delegation_zero_run is only "
+                "available to a configured actor-first session."
+            )
+        return _record_delegation_zero_run(
+            ctx,
+            bootstrap=bootstrap,
+            task_id=task_id,
+            criterion_id=criterion_id,
+            criterion_basis=criterion_basis,
+            check=check,
+            kwargs=kwargs,
+        )
     receipt: dict[str, Any] = {"tool": "verify_and_record", "contract_kind": kind, "expected": expected_s, "expected_match": match_mode, "ts": utc_now_iso()}
     crit = str(criterion_id or "").strip()
     if crit:
@@ -442,46 +678,114 @@ def _verify_and_record(
                 "artifact_paths=[<file_a>, <file_b>] — exactly two files to compare byte-for-byte "
                 "after the check runs."
             )
+        from ouroboros.tools.process_facts import (
+            active_resolved_runtime as _active_resolved_runtime,
+            publish_process_facts as _publish_process_facts,
+        )
         from ouroboros.tools.shell import (
             _RUN_SHELL_DEFAULT_TIMEOUT_SEC,
             _executor_can_run_cwd,
             _resolve_effective_timeout,
             _shell_env_for_cwd,
             _tracked_subprocess_run,
-            resolve_shell_cwd,
         )
         from ouroboros.workspace_executor import execute as executor_execute
 
         try:
-            work_dir, _cwd_root, _allowed = resolve_shell_cwd(ctx, cwd)
+            binding = _resolved_binding or build_resolved_resource_binding(
+                ctx,
+                operation="shell",
+                process_cwd=cwd,
+                bucket=bucket,
+                skill_name=skill_name,
+            )
+            work_dir = pathlib.Path(binding.target_path)
         except (OSError, ValueError) as exc:
             return f"⚠️ VERIFY_CWD_BLOCKED: check cwd escapes allowed roots: {exc}."
+        receipt["resource_binding"] = {
+            "root": binding.root,
+            "base_path": str(binding.base_path),
+            "target_path": str(binding.target_path),
+            "source": binding.source,
+            "skill_name": binding.skill_name,
+        }
         timeout = _resolve_effective_timeout(_RUN_SHELL_DEFAULT_TIMEOUT_SEC, ctx, override_sec=timeout_sec)
         bootstrap_process_path()  # mirror run_command: ensure the check sees the full PATH
         use_executor = _executor_can_run_cwd(ctx, pathlib.Path(work_dir))
+        # R4: the node resolver never rewrites args["check"] — the ORIGINAL argv
+        # stays the receipt's identity below — so the resolver-chosen runtime
+        # (bundled node when the PATH candidate is missing/probe-dead) reaches
+        # execution through the per-call attestation instead. The emergency
+        # PATH prepend rides the same attestation; both are None/no-op on every
+        # healthy path, keeping argv, env, and receipts byte-identical.
+        node_resolution = active_node_resolution(ctx)
+        exec_argv = list(argv)
+        if (
+            node_resolution is not None
+            and node_resolution.changed
+            and exec_argv
+            and exec_argv[0] == node_resolution.requested_interpreter
+        ):
+            exec_argv[0] = node_resolution.resolved_interpreter
+        # D6 disclosure facts (stream B): how long the check's process lived,
+        # and — when the resolver substituted the physical executable (the
+        # registry bridges the stream-A attestation into
+        # ``ctx._process_resolved_runtime``) — which runtime actually ran.
+        # Disclosure ONLY: receipt identity/reconciliation (`check` text) is
+        # untouched, and the agent-visible result text below is unchanged.
+        _check_started_ts = time.monotonic()
+        _resolved_runtime = _active_resolved_runtime(ctx)
+        from ouroboros.workspace_executor import overlay_env
+        selected_env = selected_process_environment()
+        run_env = apply_env_path_prepend(overlay_env(_shell_env_for_cwd(ctx, pathlib.Path(work_dir)), selected_env), node_resolution)
+        record_runtime_selection(ctx, exec_argv, work_dir, run_env)
         try:
             if use_executor:
                 # Route the check through the host-owned executor backend (e.g. docker_exec
                 # with NetworkMode=none) EXACTLY like run_command, so the verification runs
                 # in the SAME place + isolation as the agent's other commands — not on the
                 # host while the work lives in a container.
-                res = executor_execute(ctx, argv, pathlib.Path(work_dir), timeout)
+                res = executor_execute(
+                    ctx, exec_argv, pathlib.Path(work_dir), timeout,
+                    env_overlay=interpreter_path_overlay(node_resolution),
+                    **({"target_env": selected_env} if selected_env else {}),
+                )
             else:
-                run_env = _shell_env_for_cwd(ctx, pathlib.Path(work_dir))
                 res = _tracked_subprocess_run(
-                    argv, cwd=str(work_dir),
+                    exec_argv, cwd=str(work_dir),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout,
                     **({"env": run_env} if run_env is not None else {}),
                 )
         except subprocess.TimeoutExpired:
+            # The check is a child of THIS call, so its death is published on the
+            # typed process-facts channel exactly like run_command's, and the
+            # receipt discloses the SAME published facts (one derivation).
+            _facts = _publish_process_facts(
+                started_ts=_check_started_ts, resolved_runtime=_resolved_runtime,
+                timed_out=True, killed_by_host=True,
+            )
             # Same renderer as the completed-run receipt below, so it carries the same
             # stamp: a timeout red must be reconcilable by the later green of that argv.
             receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
-            append_verification_receipt(drive_root, task_id, receipt)
-            return f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. Receipt recorded."
+            receipt.update({k: v for k, v in _facts.items() if k in _RECEIPT_PROCESS_KEYS})
+            if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
+                return _receipt_custody_failure(
+                    kind, f"check timed out after {timeout}s",
+                )
+            return (
+                f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. "
+                f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
+            )
         # Full output captured in-handler BEFORE any transport truncation.
         out = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         rc = res.returncode
+        # Same typed publication as the timeout branch: the check's own exit and
+        # (POSIX) signal, measured here where the truth is, not re-read from the
+        # ``exit=`` the result text renders for the agent.
+        _facts = _publish_process_facts(
+            returncode=rc, started_ts=_check_started_ts,
+            resolved_runtime=_resolved_runtime,
+        )
         if match_mode == "bytes_equal":
             # v6.60.0: after the check, the VERDICT is the byte-parity of the two
             # declared files (golden-file shape); the check's own exit still gates.
@@ -504,6 +808,11 @@ def _verify_and_record(
         # old space-joined `echo a b` and a new `shlex.join` of a different argv read the
         # same. The stamp makes the two incomparable instead of falsely equal.
         receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched), "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
+        # D6/D7 disclosure keys (node-runtime sprint stream B), now copied from
+        # the one publication above — see _RECEIPT_PROCESS_KEYS for which keys
+        # and why. Disclosure-only: receipt IDENTITY (`check` text) and
+        # reconciliation read none of them.
+        receipt.update({k: v for k, v in _facts.items() if k in _RECEIPT_PROCESS_KEYS})
         # C: after-only artifact-lifecycle FLAG (status unchanged — flag-only). If the agent
         # declared artifact_paths, record whether each still exists after the check, probed via
         # the SAME surface as the check, so a build-then-delete is visible to the advisory reviewer.
@@ -521,24 +830,34 @@ def _verify_and_record(
         if _masked:
             receipt["check_exit_masking"] = True
             receipt["check_exit_masking_reasons"] = _mask_reasons
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
+            return _receipt_custody_failure(
+                kind, f"verdict={'PASS' if passed else 'FAIL'}, exit={rc}",
+            ) + f"\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
         verdict = "PASS" if passed else "FAIL"
         exp_note = f" expected={expected_s!r}" if expected_s else ""
-        return f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}. Host-attested receipt recorded.\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
+        return (
+            f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}; "
+            f"root={binding.root}, cwd={binding.target_path}. Host-attested receipt recorded.\n\n"
+            f"{_bounded(out, _TOOL_OUTPUT_CAP)}"
+        )
 
     if kind == "artifact_observation":
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
         obs_status, detail = _observe_artifacts(ctx, paths)
         receipt.update({"status": obs_status, "paths": paths[:20], "summary": detail})
-        append_verification_receipt(drive_root, task_id, receipt)
+        if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
+            return _receipt_custody_failure(kind, f"{obs_status}: {detail}")
         # refused_out_of_scope is a POLICY block, not a verification failure — surface it
         # honestly (not a red FAIL) so a deliverable outside the observable roots doesn't
         # force the agent to declare no_visible_machine_contract (v6.57.0).
         if obs_status == "refused_out_of_scope":
             return (
                 "verify_and_record [artifact_observation] REFUSED_OUT_OF_SCOPE: "
-                f"{detail}. Not a failure — the path is outside the observable roots "
-                "(active workspace / subagent_projects / deliverables). Receipt recorded."
+                f"{detail}. Not a failure — the path is outside this profile's "
+                "observable roots (the active workspace plus whichever of "
+                "subagent_projects / deliverables / artifact_store / task_drive "
+                "the active profile can read). Receipt recorded."
             )
         verdict = "OBSERVED" if obs_status == "observed" else "FAIL"
         return f"verify_and_record [artifact_observation] {verdict}: {detail}. Host-attested receipt recorded."
@@ -547,7 +866,8 @@ def _verify_and_record(
     # best proxy + residual risk is recorded as a receipt and judged by a reviewer.
     # The agent's own text, not a render of an argv that ran — its own rendering stamp.
     receipt.update({"status": "declared", "check": str(check or ""), "check_rendering": CHECK_RENDERING_DECLARED_TEXT, "summary": _bounded(expected_s or str(check or ""), _RECEIPT_DECLARED_SUMMARY_CAP)})
-    append_verification_receipt(drive_root, task_id, receipt)
+    if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
+        return _receipt_custody_failure(kind, receipt["summary"])
     return (
         "verify_and_record [no_visible_machine_contract] DECLARED: no host-checkable contract; "
         "your stated proxy + residual risk recorded as a receipt for review."
@@ -565,7 +885,9 @@ def get_tools() -> List[ToolEntry]:
                 "(run `check`, pass on exit 0 and, if given, `expected` substring present) · explicit_metric "
                 "(run `check`, pass when the `expected` metric string appears) · artifact_observation (the host "
                 "confirms the declared artifact_paths exist) · no_visible_machine_contract (honest escape hatch: "
-                "no machine check exists; your best proxy + risk is recorded for review). Recording a receipt "
+                "no machine check exists; your best proxy + risk is recorded for review) · delegation_zero_run "
+                "(configured session actors only: record a typed incomplete/unknown decision when no "
+                "physical leaf was started, with zero_run_decision and zero_run_basis). Recording a receipt "
                 "suppresses the receipt_absent transparency flag on a clean turn. ANTI-CHEAT: verify ONLY against "
                 "PUBLIC task info — the instruction text, examples embedded in it, installed oracles, and your own "
                 "independent checks. NEVER read a hidden /tests/ dir, solution.sh, copied verifier code, or look up "
@@ -576,11 +898,30 @@ def get_tools() -> List[ToolEntry]:
                 "criterion_id": {"type": "string", "default": "", "description": "Optional id of the task_contract acceptance claim this receipt supports. Use ids from task_contract.acceptance_claims when present."},
                 "criterion_source": {"type": "string", "enum": ["task_stated", "agent_defined"], "default": "agent_defined", "description": "Where this success criterion came from: task_stated (the task/instructions state it) or agent_defined (you synthesized it). Flag-only honesty — an agent_defined criterion asks you to double-check it is equivalent to what the task actually requires."},
                 "criterion_basis": {"type": "string", "default": "", "description": "Optional one-line basis for an agent_defined criterion: why this check is sufficient evidence for the task's real requirement."},
+                "zero_run_decision": {"type": "string", "enum": list(_ZERO_RUN_DECISIONS), "description": "For delegation_zero_run only: the actor's typed decision when no selected physical leaf was started."},
+                "zero_run_basis": {"type": "string", "description": "For delegation_zero_run only: concise host-visible evidence or blocker; required and never inferred from final prose."},
                 "check": {"description": "The verification command: an argv list (['pytest','-q']) or a shell one-liner string. Required for visible_verifier/explicit_command/explicit_metric.", "type": ["array", "string"], "items": {"type": "string"}},
                 "expected": {"type": "string", "default": "", "description": "Optional expected substring/metric in the check output (explicit_command/explicit_metric)."},
                 "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "How `expected` is matched: substring (default) · exact (whole stripped output equals expected) · exact_line (expected equals one stripped output line) · json_equals (output and expected parse to equal JSON, key-order tolerant) · bytes_equal (after the check runs, artifact_paths=[a, b] are compared BYTE-FOR-BYTE — golden files, migration parity; the receipt records a bounded hexdump of the first divergence). Use a stricter mode when the task gives a worked example / exact output."},
-                "artifact_paths": {"type": "array", "items": {"type": "string"}, "description": "Deliverable paths. For artifact_observation the host confirms they exist (existence/size only, never content) — observable roots are the active workspace plus the read-only orchestrator roots subagent_projects and deliverables, so a parent CAN confirm a child's deliverable in the projects tree; a path outside these is a non-fatal refused_out_of_scope, not a failure. For run-kind checks (visible_verifier/explicit_command/explicit_metric) the host ALSO probes (after the check) whether each declared path that is RELATIVE to the check's working directory (cwd) still exists and records an advisory artifact_lifecycle flag — catching a check that built then deleted its own deliverable."},
-                "cwd": {"type": "string", "default": "", "description": "Working directory for `check` (same roots as run_command)."},
+                "artifact_paths": {"type": "array", "items": {"type": "string"}, "description": "Deliverable paths. For artifact_observation the host confirms they exist (existence/size only, never content) — observable roots are the active workspace plus every resource root the ACTIVE profile can already read (for orchestrating parents that includes subagent_projects and deliverables, so a parent CAN confirm a child's deliverable in the projects tree; child/readonly profiles lack those roots); a path outside these is a non-fatal refused_out_of_scope, not a failure. For run-kind checks (visible_verifier/explicit_command/explicit_metric) the host ALSO probes (after the check) whether each declared path that is RELATIVE to the check's working directory (cwd) still exists and records an advisory artifact_lifecycle flag — catching a check that built then deleted its own deliverable."},
+                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Run-kind only: explicit environment variable → saved setting key mapping, with existing Settings-selection authority and secret masking."},
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "For run-kind checks, omit for active_workspace; use system_repo[/subdir] "
+                        "for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."
+                    ),
+                },
+                "bucket": {
+                    "type": "string",
+                    "enum": ["external", "clawhub", "ouroboroshub", "user_repo"],
+                    "description": "Physical skill location for a run-kind cwd=skill_payload[/subdir].",
+                },
+                "skill_name": {
+                    "type": "string",
+                    "description": "Exact skill identity for a run-kind cwd=skill_payload[/subdir].",
+                },
                 "timeout_sec": {"type": "integer", "description": "Optional check timeout override."},
             }, "required": ["contract_kind"]},
         }, _verify_and_record, is_code_tool=True, timeout_sec=900, mutates_worktree=True),

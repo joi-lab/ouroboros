@@ -1,19 +1,20 @@
 """Workspace-task admission SSOT (v6.58.0, slice 1).
 
-ONE validator + room-workspace resolver shared by the two surfaces that turn a
+ONE validator + room-workspace resolver shared by the surfaces that turn a
 folder into a task's active workspace:
 
-- ``gateway/tasks.py::api_tasks_create`` (the `/api/tasks` HTTP path), and
+- ``gateway/tasks.py::api_tasks_create`` (the `/api/tasks` HTTP path),
 - ``supervisor/workers.py::promote_chat_to_task`` (the in-agent promote/route
   path — previously a DEGRADED twin that set ``workspace_root`` as a raw string
-  with no validation).
+  with no validation), and
+- owner-selected Presence folders (local configuration and turn admission).
 
 Two invariants this module enforces (BIBLE P3/P5):
 
-1. **One admission path.** Both surfaces call ``validate_workspace_root`` — the
-   SAME git-worktree-root + repo/data-overlap check — so they cannot drift.
+1. **One admission path.** These surfaces call ``validate_workspace_root`` — the
+   SAME folder + Git geometry + repo/data-overlap check — so they cannot drift.
 2. **Loud fail over silent self_modification.** A task born in a project ROOM
-   whose ``working_dir`` is SET-but-unusable (deleted/moved/not a git worktree)
+   whose ``working_dir`` is SET-but-unusable (deleted/moved/invalid Git root)
    must fail LOUDLY at admission, never silently run workspace-less — a
    workspace-less task resolves to the ``self_modification`` tool profile over the
    system repo (``tool_access.active_tool_profile``), which is exactly the danger
@@ -22,20 +23,36 @@ Two invariants this module enforces (BIBLE P3/P5):
 The heavy per-task preflight (git snapshot + toolchain probes) stays on the
 creation surface that can afford it: the async gateway handler runs it inline;
 the promote path runs it under a hard time cap (``resolve_room_workspace`` does
-only the cheap registry read + git-root validation, keeping the supervisor
+only the cheap registry read + folder validation, keeping the supervisor
 event-drain thread responsive).
 """
 from __future__ import annotations
 
+import logging
+import os
 import pathlib
 import subprocess
 from typing import Any, Optional
 
 from ouroboros.platform_layer import bootstrap_process_path
 
+log = logging.getLogger(__name__)
+
 
 class WorkspaceRootError(ValueError):
-    """A workspace_root that is missing, overlapping, or not a git worktree root."""
+    """A workspace_root that is missing, overlapping, or has invalid Git geometry."""
+
+
+def has_git_metadata(root: pathlib.Path) -> bool:
+    """Match Git's ancestor search, including an explicitly selected ceiling."""
+    ceilings = {pathlib.Path(p).resolve() for p in
+                os.environ.get("GIT_CEILING_DIRECTORIES", "").split(os.pathsep) if p}
+    for parent in (root, *root.parents):
+        if parent != root and parent in ceilings:
+            break
+        if (parent / ".git").exists() or (parent / ".git").is_symlink():
+            return True
+    return False
 
 
 def validate_workspace_root(
@@ -44,11 +61,11 @@ def validate_workspace_root(
     system_repo_dir: Any,
     drive_root: Any,
 ) -> Optional[pathlib.Path]:
-    """SSOT workspace-root validator (moved verbatim from gateway/tasks.py so both
-    admission surfaces share it). Returns the resolved root, ``None`` for empty
-    input, or raises ``WorkspaceRootError``: the path must exist, be a directory,
-    NOT overlap the Ouroboros system repo or data drive, and BE the git worktree
-    root (not a subdir of one)."""
+    """Return an existing ordinary folder or Git worktree root, ``None`` for
+    empty input, or raise ``WorkspaceRootError``. Git is optional, but an
+    existing repository must resolve to its worktree root, not a subdirectory.
+    Repo/data overlap and broken addresses never become workspace-less tasks.
+    """
     from ouroboros.tool_access import paths_overlap_casefold
 
     text = str(value or "").strip()
@@ -77,7 +94,7 @@ def validate_workspace_root(
     bootstrap_process_path()
     try:
         res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
+            ["git", "rev-parse", "--is-bare-repository", "--show-toplevel"],
             cwd=str(root),
             capture_output=True,
             text=True,
@@ -85,10 +102,17 @@ def validate_workspace_root(
         )
     except Exception:
         res = None
-    git_root_text = (res.stdout or "").strip() if res is not None and res.returncode == 0 else ""
+    output = (res.stdout or "").strip() if res is not None else ""
+    if output.splitlines()[:1] == ["true"]:
+        raise WorkspaceRootError("workspace_root must be a Git worktree, not a bare repository")
+    git_root_text = output.partition("\n")[2] if res is not None and res.returncode == 0 else ""
     git_root = pathlib.Path(git_root_text).resolve(strict=False) if git_root_text else None
     if git_root is None:
-        raise WorkspaceRootError("workspace_root must be a git worktree root")
+        # A failed probe must not reclassify an existing/broken Git worktree
+        # as an ordinary folder (including linked worktrees with a .git file).
+        if has_git_metadata(root):
+            raise WorkspaceRootError("workspace_root Git worktree could not be resolved")
+        return root
     if git_root != root:
         raise WorkspaceRootError(f"workspace_root must be the git worktree root: {git_root}")
     return root
@@ -106,6 +130,7 @@ def resolve_room_workspace(
     project_id: str,
     explicit_workspace: str = "",
     workspace_sentinel: str = "",
+    project_admission: Optional[dict] = None,
 ) -> tuple[str, str]:
     """Resolve the workspace_root for a task born in a project room (promote/route).
 
@@ -117,10 +142,11 @@ def resolve_room_workspace(
     - else the project's registered ``working_dir`` (if any) → validated and used.
     - else no workspace (a file-less project), returns ("","").
 
-    Returns ``(workspace_root, error)``. ``error`` is non-empty ONLY when a workspace
-    was REQUESTED (explicit path or a set project working_dir) but is unusable — the
-    caller MUST fail the task loudly rather than fall back to a workspace-less
-    self_modification profile (the loud-fail invariant)."""
+    Returns ``(workspace_root, error)``. ``error`` is non-empty when a workspace was
+    REQUESTED (explicit path or a set project working_dir) but is unusable, AND when
+    the project's registry entry cannot be READ at all — the caller MUST fail the task
+    loudly rather than fall back to a workspace-less self_modification profile (the
+    loud-fail invariant)."""
     if str(workspace_sentinel or "").strip().lower() == WORKSPACE_NONE:
         return "", ""
 
@@ -128,13 +154,29 @@ def resolve_room_workspace(
     source = "explicit workspace_root"
     if not requested and str(project_id or "").strip():
         try:
-            from ouroboros.projects_registry import get_project
+            from ouroboros.projects_registry import project_admission_view
 
-            project = get_project(drive_root, project_id) or {}
-            requested = str(project.get("working_dir") or "").strip()
-            source = f"project {project_id!r} working_dir"
-        except Exception:
-            requested = ""
+            view = project_admission if project_admission is not None else project_admission_view(drive_root, project_id)
+            project = view["project"]
+            if project is None:
+                raise ValueError("Registered Project is missing")
+        except Exception as exc:
+            # BIND-OR-LOUD-FAIL. "The registry could not be read" is NOT the same
+            # fact as "this project has no working_dir", and collapsing the two was a
+            # silent re-entry of the very regression this SSOT exists to kill: the
+            # swallowed exception returned ("", "") — indistinguishable from a
+            # file-less project — so admission continued and the task ran
+            # workspace-less on the self_modification profile over the SYSTEM repo.
+            # An unreadable registry is an error; the caller fails the task loudly.
+            log.warning(
+                "resolve_room_workspace: project registry read failed for %r", project_id, exc_info=True
+            )
+            return "", (
+                f"project {project_id!r} registry entry is unreadable "
+                f"({type(exc).__name__}: {exc}) — cannot determine the task's workspace"
+            )
+        requested = str(project.get("working_dir") or "").strip()
+        source = f"project {project_id!r} working_dir"
     if not requested:
         return "", ""  # file-less project (or no working_dir): a non-workspace task
 
@@ -149,38 +191,118 @@ def resolve_room_workspace(
     return (str(resolved) if resolved else ""), ""
 
 
-def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
-    """The project-room folder for the DIRECT-CHAT lens (v6.61.3), or ("", note).
+def workspace_repair_hint(
+    *,
+    ws_error: str,
+    explicit_workspace: str = "",
+    project_id: str = "",
+    project_folder: str = "",
+    presence: bool = False,
+    retired_worktree: bool = False,
+    drive_root: Any = None,
+    system_repo_dir: Any = None,
+) -> str:
+    """The MODEL-facing repair for one refused workspace: the typed cause plus
+    the one move that fixes it, following the SOURCE of the refused folder.
 
-    Chat-lane sibling of ``resolve_room_workspace``: the conversation lane of a
-    folder-room re-points its reads/default-shell-cwd at the room folder so the
-    tool affordance matches the room fact (the robot-room incident: ``.`` resolved
-    to the system repo and the agent narrated the wrong tree). Requirements are
-    LIGHTER than task admission — no git requirement (reading a plain folder in
-    chat is fine); mutations still go through promoted tasks, which keep the full
-    ``validate_workspace_root`` gate. Returns ``(dir, note)``: a set-but-unusable
-    working_dir yields ("", loud note) so the chat context can disclose the
-    breakage instead of silently falling back to the system repo."""
+    ``resolve_room_workspace`` already types the source, so the repair follows
+    it instead of sending the caller to a Projects setting the failure never
+    read: a Presence profile's folder is fixed in the profile; a path the
+    REQUEST named is re-promoted against the project's folder or with
+    ``workspace='none'`` (a subfolder of the Ouroboros repository can never be a
+    workspace, and a delegated-run worktree is gone once its run ends); a
+    project ``working_dir`` — or a failed auto-provision — is fixed in Projects.
+    The project folder is named only when the registry can be read; the
+    worktree/repo facts are derived here unless the caller already knows them.
+    Never raises; this text rides ``detail`` into the typed refusal.
+    """
+    cause = str(ws_error or "").strip().rstrip(".")
+    if presence:
+        return (
+            f"The folder configured in the Presence profile is unusable: {cause}. "
+            "Fix the Presence profile's workspace_root or clear it."
+        )
+    explicit = str(explicit_workspace or "").strip()
+    if not explicit:
+        return (
+            f"{cause}. Fix the project's working folder (Projects → this project) "
+            "or re-promote with workspace='none' for a folder-less task."
+        )
+    requested = pathlib.Path(explicit).expanduser()
+    if system_repo_dir is not None:
+        from ouroboros.tool_access import paths_overlap_casefold
+
+        try:
+            under_repo = paths_overlap_casefold(requested, pathlib.Path(system_repo_dir))
+        except Exception:
+            under_repo = False
+            log.debug("workspace repair hint: repo-overlap check failed for %r", explicit, exc_info=True)
+        if under_repo:
+            return (
+                f"{cause}. workspace_root must be a folder outside the Ouroboros repository, "
+                "or empty (or workspace='none') to work in the repository itself."
+            )
+    if not retired_worktree:
+        try:
+            from ouroboros.config import get_subagent_worktree_root
+            from ouroboros.tool_access_paths import path_is_relative_to
+
+            retired_worktree = path_is_relative_to(requested, pathlib.Path(get_subagent_worktree_root()))
+        except Exception:
+            log.debug("workspace repair hint: worktree-root check failed for %r", explicit, exc_info=True)
+    folder = str(project_folder or "").strip()
+    if not folder and str(project_id or "").strip() and drive_root is not None:
+        try:
+            from ouroboros.projects_registry import get_project
+
+            folder = str((get_project(drive_root, project_id) or {}).get("working_dir") or "").strip()
+        except Exception:
+            log.debug("workspace repair hint: project working_dir unreadable for %s", project_id, exc_info=True)
+    named_folder = f" ({folder})" if folder else ""
+    if retired_worktree:
+        return (
+            f"{cause}. That path is inside a delegated-run worktree, which is removed when "
+            f"its run ends; re-promote with the project's folder{named_folder} or with workspace='none'."
+        )
+    return (
+        f"{cause}. This task asked for {explicit} explicitly; re-promote it against the "
+        f"project folder{named_folder} or with workspace='none' for a folder-less task."
+    )
+
+
+def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
+    """The selected folder for a direct conversation, with an availability note.
+
+    Ordinary folders need no Git admission. A missing folder keeps its selected
+    address so tools cannot fall back to the system repository; an unreadable
+    registry instead returns a note without inventing an address.
+    """
     pid = str(project_id or "").strip()
     if not pid:
         return "", ""
     try:
-        from ouroboros.projects_registry import get_project
+        from ouroboros.projects_registry import get_reserved_project
 
-        project = get_project(drive_root, pid) or {}
+        # Strict: an unreadable registry is a note, never a folderless room (#1315).
+        project = get_reserved_project(drive_root, pid, strict=True) or {}
+        if str(project.get("lifecycle") or "active") != "active":
+            project = {}
         raw = str(project.get("working_dir") or "").strip()
-    except Exception:
-        return "", ""
+    except Exception as exc:
+        return "", (
+            f"project {pid!r} registry entry is unreadable ({type(exc).__name__}: {exc}) — "
+            "cannot determine the room's repository"
+        )
     if not raw:
         return "", ""
     try:
         resolved = pathlib.Path(raw).expanduser().resolve(strict=False)
-    except OSError as exc:
+    except (OSError, ValueError, RuntimeError) as exc:
         return "", f"project {pid!r} working_dir is unusable: {type(exc).__name__}: {exc}"
     if not resolved.is_dir():
-        return "", (
+        return str(resolved), (
             f"project {pid!r} working_dir {raw} is unusable (missing or not a directory) — "
-            "room reads/shell fall back to the system repo; fix or re-attach the folder"
+            "the selected folder remains the active target; fix or re-attach the folder"
         )
     return str(resolved), ""
 
@@ -204,12 +326,13 @@ def compose_workspace_block(
         "Use read_file, write_file, list_files, search_code, vcs_status, vcs_diff, and run_command against this target workspace, not the Ouroboros system repo.\n"
         f"{render_workspace_preflight_summary(workspace_preflight)}\n"
         "Before editing, account for target-repo docs or root-level instructions if present.\n"
-        "Project-local dependency installs are allowed in external workspace tasks; system/global installs are for runtime_mode=pro only and must be noninteractive.\n"
+        "Project-local dependency installs are allowed in external workspace tasks; system/global installs are for runtime_mode=pro or cyber_pro and must be noninteractive.\n"
         "When work naturally splits into independent branches, or while a long build/download/test is running, use schedule_subagent for a focused parallel handoff instead of serializing every branch yourself.\n"
         "Before finalizing, re-read the original task and verify each explicit requirement through the interface/path/format/service the task names; do not treat a weaker surrogate self-test as completion.\n"
         "Final summaries belong in the final answer, not new repo markdown files unless requested.\n"
         "Task-local git is allowed when the task requires it (clone, branch, commit, push to task-local remotes); "
-        "Ouroboros still protects its own repo/data paths. Workspace artifacts are captured against the preflight git base.\n"
+        "Ouroboros still protects its own repo/data paths. Git results use the preflight base; "
+        "ordinary-folder work stays on site with captured output references, without a Git patch or full rollback promise.\n"
     )
 
 

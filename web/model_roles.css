@@ -1,0 +1,84 @@
+/* Shared role rows: one source/model/account line on desktop, natural wrap on
+   narrow screens. Both wizard and Settings load this same component sheet. */
+.model-role-editor {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+.model-role-group {
+    min-width: 0;
+    padding: var(--space-2);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-sm);
+}
+.model-role-head,
+.model-role-controls,
+.model-role-order,
+.model-role-context {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+.model-role-head h4 {
+    flex: 1;
+    margin: 0;
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.model-role-head { margin-bottom: var(--space-1); }
+.model-role-notes { display: flex; flex-wrap: wrap; align-items: baseline; column-gap: var(--space-2); }
+.model-role-notes > .model-role-details { flex-basis: 100%; }
+.model-role-copy,
+.model-role-meta,
+.model-role-details {
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+}
+.model-role-copy { margin: var(--space-1) 0 var(--space-2); }
+.model-role-meta:empty { display: none; }
+.model-role-meta { margin-top: var(--space-1); }
+.model-role-row + .model-role-row { margin-top: var(--space-2); }
+.model-role-controls > input,
+.model-role-controls > .ui-model-chooser { flex: 2 1 220px; min-width: 0; }
+.model-role-controls > select { flex: 1 1 170px; min-width: 0; }
+.model-role-controls > [data-model-role-account] { flex-basis: 220px; }
+.model-role-order { flex: 0 0 auto; }
+.model-role-order .btn { padding-inline: var(--space-2); }
+.model-role-details { margin-top: var(--space-1); }
+/* The context/processing override is a disclosure, not a note. `display`
+   other than list-item drops the native ::marker, so the house ▸/▾ pair is
+   drawn here (settings.css .settings-subsection has it, but the wizard does
+   not load settings.css); the label takes control ink while the value span
+   stays meta. padding-inline cancels the 14px that .wizard-collapse summary
+   leaks onto the nested Available subagents / Reviewers summaries. */
+.model-role-details > summary {
+    display: inline-block;
+    list-style: none;
+    cursor: pointer;
+    padding-block: var(--space-1);
+    padding-inline: 0;
+    color: var(--text-primary);
+}
+.model-role-details > summary::-webkit-details-marker { display: none; }
+.model-role-details > summary::before { content: "▸ "; }
+.model-role-details[open] > summary::before { content: "▾ "; }
+.model-role-details > summary [data-processing-summary] { color: var(--text-meta); }
+.model-role-details > summary:focus-visible,
+.model-role-editor button:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+.model-role-context { flex-wrap: wrap; padding-top: var(--space-1); }
+.model-role-context label { display: flex; align-items: center; gap: var(--space-2); }
+.model-role-context input { width: 150px; }
+.model-role-controls [hidden] { display: none; }
+@media (max-width: 720px) {
+    .model-role-controls { flex-wrap: wrap; }
+    .model-role-controls > input,
+.model-role-controls > .ui-model-chooser { flex-basis: 100%; order: 1; }
+    .model-role-controls > select { flex-basis: 150px; }
+    .model-role-order { order: 2; margin-left: auto; }
+}

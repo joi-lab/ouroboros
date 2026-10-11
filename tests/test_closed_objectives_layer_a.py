@@ -57,3 +57,36 @@ def test_closed_digest_dedups_by_fingerprint(tmp_path):
 
 def test_closed_digest_empty_when_no_ledger(tmp_path):
     assert _closed_objectives_digest(tmp_path) == ""
+
+
+def test_review_cap_stop_is_not_permanent_closure_even_when_cycle_is_no_op(tmp_path):
+    _write_ledger(tmp_path, [
+        {"task_id": "old", "campaign_objective": "Retained correction",
+         "transaction": {"cycle_outcome": "no_op"}},
+        {"task_id": "current", "campaign_objective": "Retained correction",
+         "transaction": {"cycle_outcome": "no_op", "cleanup_stash": "retained-current"},
+         "outcome_axes": {"objective": {"outcome_tier": "blocked_with_evidence",
+                                        "reason": "review_cycles_exhausted"}}},
+        {"task_id": "unavailable", "campaign_objective": "Reviewer unavailable",
+         "transaction": {"cycle_outcome": "no_op"},
+         "outcome_axes": {"review": {"status": "degraded", "acceptance_decision": {
+             "status": "finalized_unaccepted", "reason": "review_degraded"}}}},
+        {"task_id": "plan", "campaign_objective": "Retained plan",
+         "outcome_axes": {"objective": {"outcome_tier": "blocked_with_evidence",
+                                        "reason": "plan_review_quorum_unreachable"}}},
+    ])
+    assert _closed_objectives_digest(tmp_path) == ""
+
+
+def test_actual_absorption_or_abandonment_still_closes_a_review_blocked_cycle(tmp_path):
+    _write_ledger(tmp_path, [
+        {"task_id": "shipped", "campaign_objective": "Shipped objective",
+         "outcome_axes": {"objective": {"reason": "review_cycles_exhausted"}}},
+        {"task_id": "shipped", "kind": "cycle_outcome", "cycle_outcome": "absorbed"},
+        {"task_id": "abandoned", "campaign_objective": "Abandoned objective",
+         "outcome_axes": {"objective": {"reason": "review_cycles_exhausted"}}},
+        {"task_id": "abandoned", "kind": "cycle_outcome", "cycle_outcome": "abandoned"},
+    ])
+    digest = _closed_objectives_digest(tmp_path)
+    assert "Shipped objective" in digest
+    assert "Abandoned objective" in digest

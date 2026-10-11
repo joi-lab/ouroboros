@@ -23,6 +23,29 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
   network-outage hold `OUROBOROS_NET_OUTAGE_HOLD_SEC=21600` (submits wait for connectivity;
   in-flight questions pause their scope clock instead of forfeiting). Together they survive
   short blips and multi-hour outages.
+  Disclosure (net-resilience sprint): `OUROBOROS_TRANSIENT_RETRY_MAX` no longer bounds a
+  REMOTE pre-dispatch transport outage. That class (`transport_unavailable`, $0 released
+  attempts) now waits and redials at the round level. CLB solve tasks carry no
+  `deadline_at` and the waiting itself spends $0, so the rails that can bind here are the
+  OPTIONAL ones you configure, not a window the wait invents. A managed (queued) task's
+  outage episode carries no wait bound of its own: `loop_transport` measures its window from
+  the owner deadline, and with no `deadline_at` there is none — the 6h
+  `OPERATION_WINDOW_FALLBACK_SEC` belongs to other operations (deep self-review, plan
+  review, vision) and is NOT applied to this wait. Set `OUROBOROS_TASK_ABS_CEILING_SEC` if
+  you want a finite per-attempt lifetime (the runtime ships `unlimited`); otherwise the
+  binding rail for a headless CLB solve task is the supervisor's idle reaper
+  (`OUROBOROS_TASK_IDLE_TIMEOUT_SEC`, measured from last real progress), plus Stop/cancel.
+  A dead egress holds the task up to whichever of those is actually set instead of failing
+  it after the burst — and with none of them set it holds indefinitely. The wait is visible
+  as durable `network_wait` events in the isolated server's `events.jsonl`. Note: idle-rail
+  survival via waiting progress notes requires a real chat thread; headless tasks without a
+  `chat_id` keep the idle rail (reaper) as an additional bound on the wait. A transport
+  death AFTER dispatch (the socket dies mid-request) is repeated by the primary dispatch at
+  most twice per round as new physical attempts. One call has one outer attempt budget
+  (`OUROBOROS_TRANSIENT_RETRY_MAX` bounds every attempt of the call, repeats included),
+  within which up to three `llm_api_error` rows can be typed transport-death failures (the
+  first death plus at most two repeats), reserving up to three upper bounds against
+  `OUROBOROS_TOTAL_BUDGET`.
 - `OUROBOROS_TOTAL_BUDGET=200` per domain-seed (measured 1-seed domain costs:
   poker $117 · bsm $60 · cohort $58 · code $33 · sales $26 · db $25 — a $60 cap silently
   truncates poker mid-rollout).

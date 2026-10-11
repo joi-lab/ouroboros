@@ -71,9 +71,8 @@ def validate_attach_path(
     """Validate an owner folder for attach. Checks run on the RESOLVED realpath
     (symlinks followed) so a symlink cannot smuggle the home root or repo/data in:
     must exist, be a directory, not be the home root itself, and not overlap the
-    Ouroboros system repo or data drive. Being a git repo is NOT required at attach
-    time (``init_git`` is the opt-in; task admission separately requires a git
-    worktree root and loud-fails otherwise). Returns (resolved, error)."""
+    Ouroboros system repo or data drive. Ordinary directories need no Git;
+    ``init_git`` remains an explicit optional operation. Returns (resolved, error)."""
     text = str(raw_path or "").strip()
     if not text:
         return None, "path is required"
@@ -99,34 +98,15 @@ def validate_attach_path(
     return resolved, ""
 
 
-def is_git_worktree_root(path: pathlib.Path) -> bool:
-    """True when ``path`` IS a git worktree root (the same fact task admission's
-    validate_workspace_root later requires — checked at attach time so a non-git
-    attach cannot register a project whose room tasks are born dead, triad r5)."""
-    bootstrap_process_path()
-    try:
-        res = subprocess.run(
-            ["git", "rev-parse", "--show-toplevel"],
-            cwd=str(path), capture_output=True, text=True, timeout=5,
-        )
-    except Exception:
-        return False
-    top = (res.stdout or "").strip() if res.returncode == 0 else ""
-    if not top:
-        return False
-    try:
-        return pathlib.Path(top).resolve(strict=False) == pathlib.Path(path).resolve(strict=False)
-    except OSError:
-        return False
-
-
-def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
-    """Unstage credential-shaped files after ``git add -A`` and keep them untracked
+def _unstage_sensitive_paths(path: pathlib.Path, *, warnings=None) -> list[str]:
+    """Unstage credential files after ``git add -A`` and keep them untracked
     via `.git/info/exclude` (local-only — the owner's folder files are never edited).
-    Same `_sensitive_untracked_reason` SSOT the workspace patch and coop checkpoint
-    use (triad r4: an attach snapshot must not bake `.env`/keys into history).
-    Returns the skipped relative paths for disclosure."""
+    Same two checks the workspace patch and the coop checkpoint apply: the exact
+    credential leaves of `_sensitive_untracked_reason` and the private-key content
+    evidence of `pem_private_key_reason`. Effective Cyber keeps PEM findings in
+    ``warnings`` without unstaging those bytes. Returns genuinely skipped paths."""
     from ouroboros.headless import _sensitive_untracked_reason
+    from ouroboros.workspace_patch_capture import pem_capture_refusal
 
     staged = subprocess.run(
         ["git", "diff", "--cached", "--name-only", "-z"],
@@ -134,7 +114,7 @@ def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
     )
     skipped = [
         rel for rel in (staged.stdout or "").split("\0")
-        if rel and _sensitive_untracked_reason(rel)
+        if rel and (_sensitive_untracked_reason(rel) or pem_capture_refusal(path, rel, warnings=warnings))
     ]
     if not skipped:
         return []
@@ -151,12 +131,12 @@ def _unstage_sensitive_paths(path: pathlib.Path) -> list[str]:
     return skipped
 
 
-def attach_snapshot_init(path: pathlib.Path) -> tuple[str, list[str]]:
+def attach_snapshot_init(path: pathlib.Path, *, warnings=None) -> tuple[str, list[str]]:
     """OPT-IN ``init_git``: initialize git in an attached non-git folder and commit an
     attach-snapshot of the CURRENT state with a local identity (no global config
-    touched). Credential-shaped files are EXCLUDED from the snapshot (disclosed via
-    the returned list) — secrets must never be baked into git history (BIBLE
-    prohibition; triad r4). Idempotent for an existing repo. Returns
+    touched). The existing credential policy governs exclusion; PEM findings
+    remain advisory in effective Cyber mode and are returned through ``warnings``.
+    Idempotent for an existing repo. Returns
     ``(error, skipped_sensitive)``: error "" on success."""
     bootstrap_process_path()
     try:
@@ -168,7 +148,7 @@ def attach_snapshot_init(path: pathlib.Path) -> tuple[str, list[str]]:
         add = subprocess.run(["git", "add", "-A"], cwd=str(path), capture_output=True, text=True, timeout=120)
         if add.returncode != 0:
             return (add.stderr or add.stdout or "git add failed").strip()[:300], []
-        skipped = _unstage_sensitive_paths(path)
+        skipped = _unstage_sensitive_paths(path, warnings=warnings)
         commit = subprocess.run(
             [
                 "git", "-c", "user.name=Ouroboros", "-c", "user.email=ouroboros@local",

@@ -27,8 +27,15 @@ runtime core and are not packaged as app runtime code.
   continual-learning runs against a live Ouroboros agent (evolution off).
   Use `run_clb.py`; the runner repo + its `src/systems/ouroboros/` adapter
   are obtained separately (see its README).
+- `cybergym/` — Level-1 CyberGym adapter for the pinned
+  `sunblaze-ucb/cybergym` source.  Use `run_cybergym.py` for the
+  binary-only, private-sidecar protocol; see its README and METHODOLOGY for
+  the exact model, provider, final-PoC, and denominator contract.
 - `harness_bench_fast/` — Ouroboros CLI wrapper and methodology notes for the
   public `ai-forever/harness-bench-fast` runner.
+- `cowork_bench/` — pinned Cowork Bench task-container adapter, persistent MCP
+  sessions, campaign spending and resource limits, plus an offline evidence audit;
+  see [its methodology](cowork_bench/METHODOLOGY.md) for protocol differences.
 - `common/` — shared manifests, result ledgers, safe run roots, secret hygiene,
   and official command builders.
 
@@ -58,14 +65,17 @@ CALL) — NEVER STAY SILENT.**
 - Run manifests record non-secret provenance: requested task ids where the
   benchmark runner exposes them before execution, requested counts/selection
   slots for deterministic first-N runs such as Terminal-Bench, exact argv,
-  official command shape, output paths, model slots, source commit, dirty-state
-  counts, and hashes. Defaults are adapter-specific (`run_manifest.json`,
+  official command shape, output paths, model slots, the canonical Available-subagents
+  projection where the launcher owns it, source commit, dirty-state counts, and hashes.
+  Defaults are adapter-specific (`run_manifest.json`,
   `<predictions>.run_manifest.json`, or `osworld_preflight.run_manifest.json`).
 - Result ledgers are denominator-preserving Ouroboros JSONL files. They record
   every requested instance, including setup failures, timeouts, and empty
   patches, even when the official benchmark prediction/submission format only
   accepts successful rows. Defaults are adapter-specific (`result_index.jsonl`,
-  `<predictions>.ledger.jsonl`, or `osworld_preflight.ledger.jsonl`).
+  `<predictions>.ledger.jsonl`, or `osworld_preflight.ledger.jsonl`). A row's
+  `official_eval_status` is `unreported` unless its adapter states one;
+  `not_run` is an explicit claim that the official evaluator never ran.
 
 These sidecars are audit artifacts, not replacement scoring. Official benchmark
 harnesses and official result files remain the scoring authority.
@@ -77,11 +87,14 @@ All committed bench settings templates share these disclosed defaults:
 - Cost pacing (v6.56.0): tasks with a finite budget receive latched in-task
   COST milestones (50/25/10% remaining + ~80%-spent wrap-up note) from the
   `task_pacing` SSOT; `budget_profile.cost_hard_stop_pct=0` (SWE-Pro/PB
-  profiles) disables the in-task hard stop so deadline/rounds own the bounds.
+  profiles) disables the in-task hard stop AND the wrap-up affordability rail,
+  so deadline/rounds own the bounds.
 
 - `OUROBOROS_MAX_WORKERS=4` — same-model subagent slots for decomposition
   WITHIN one task (the root agent takes one lane). Never independent attempts
-  with selection, so pass@1 claims hold. The core default (10) is untouched.
+  with selection, so pass@1 claims hold. Fixed-model profiles serialize exactly
+  one `api_model` row in `OUROBOROS_SUBAGENTS`; they cannot inherit a default
+  Light scout, second family, or agent-session route. The core default (10) is untouched.
 - `OUROBOROS_SAFETY_MODE=light` — bench containers/rendered data roots are
   disposable jails; deterministic guards stay, the LLM safety pass is kept for
   integration tools only. User defaults are untouched.
@@ -90,8 +103,10 @@ All committed bench settings templates share these disclosed defaults:
   without workspace isolation against a live repo, so pro would grant benchmark
   prompts write authority over the system body.
 - `claude_code_edit` disabled in every bench solve task — benches measure the
-  single-model Ouroboros harness; the embedded Claude-Code delegate is a
-  separate experiment.
+  single-model Ouroboros harness; external agent-session delegates are a separate
+  experiment. (D10 retired the tool itself; the legacy name in these configs
+  stays meaningful because `disabled_tools=["claude_code_edit"]` also withholds
+  the successor `delegate_start`.)
 
 Per-bench METHODOLOGY files carry the full rationale.
 

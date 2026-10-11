@@ -8,16 +8,41 @@ export async function apiFetch(url, init = {}) {
     return fetch(url, init);
 }
 
+/**
+ * Read an owner-visible sentence out of a gateway error body. Several routes
+ * answer with a STRUCTURED error (`{error: {code, message, ...}}`), and
+ * interpolating that object straight into an Error message produced the
+ * literal `[object Object]` in a toast — the owner saw an alarm carrying no
+ * fact at all. Prefer the object's own sentence, then its code, and serialize
+ * only as a last resort so nothing is silently swallowed.
+ */
+function errorText(data) {
+    for (const value of [data?.error, data?.message]) {
+        if (typeof value === 'string' && value.trim()) return value;
+        if (value && typeof value === 'object') {
+            const inner = value.message || value.detail || value.code;
+            if (typeof inner === 'string' && inner.trim()) return inner;
+            try { return JSON.stringify(value); } catch { /* fall through */ }
+        }
+    }
+    return '';
+}
+
 export async function fetchJson(url, init = {}, options = {}) {
     const response = await apiFetch(url, init);
     let data = null;
     try {
         data = await response.json();
-    } catch {
+    } catch (error) {
+        // A body read cut by the caller's own cancellation is a cancellation,
+        // not a reply: swallowing it here once turned a navigation-aborted
+        // Widgets list into a resolved "error object" that a consumer read as
+        // an EMPTY authoritative list and stopped kept-running frames on.
+        if (error?.name === 'AbortError' || init?.signal?.aborted) throw error;
         data = { error: `non-json response (HTTP ${response.status})` };
     }
     if (!response.ok || (options.rejectOkFalse && data && data.ok === false)) {
-        const message = (data && (data.error || data.message)) || `HTTP ${response.status}`;
+        const message = errorText(data) || `HTTP ${response.status}`;
         const error = new Error(message);
         error.status = response.status;
         error.body = data;
@@ -36,17 +61,175 @@ export function jsonPost(url, payload = {}, options = {}) {
 }
 
 /**
+ * Run the read-only publication preflight for one selected skill. Domain
+ * states, including repairable findings, remain successful JSON responses;
+ * only transport/admission refusals reject through fetchJson.
+ * @param {string} skill
+ * @returns {Promise<import('./api_types.js').SkillPublishPreflightResponse>}
+ */
+export function skillPublishPreflight(skill) {
+    return jsonPost(`/api/skills/${encodeURIComponent(skill)}/publish-preflight`, {});
+}
+
+/**
+ * Create one ordinary managed task through the shared task gateway.
+ * @param {import('./api_types.js').TaskCreateRequest} payload
+ * @returns {Promise<import('./api_types.js').TaskCreateResponse>}
+ */
+export function createTask(payload) {
+    return jsonPost('/api/tasks', payload);
+}
+
+/**
  * Cancel a task. With {cascade:true} the server also cancels the task's live
  * subtree and answers only once that teardown has finished; without it the
  * request stays the synchronous single-task cancel (no body — headless compat).
- * Shared by the Chat live-card "Cancel run" action and the Activity tab.
+ * S3 (Q1/Q2): stopPolicy "finalize_then_cancel" requests the soft
+ * finalize-then-stop episode (202 acknowledgement, cancel_state "pending");
+ * "immediate" (or absent) keeps today's hard cancel byte-identical.
+ * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
- * @param {{cascade?: boolean}} [options]
+ * @param {{cascade?: boolean, stopPolicy?: string, stopActionId?: string}} [options]
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
-export function cancelTask(taskId, { cascade = false } = {}) {
+export function cancelTask(taskId, { cascade = false, stopPolicy = '', stopActionId = '' } = {}) {
     const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
-    return cascade ? jsonPost(url, { cascade: true }) : fetchJson(url, { method: 'POST' });
+    const policy = String(stopPolicy || '');
+    /** @type {import('./api_types.js').TaskCancelRequest} */
+    const body = {
+        ...(cascade ? { cascade: true } : {}),
+        ...(policy && policy !== 'immediate' ? { stop_policy: policy } : {}),
+        ...(stopActionId ? { stop_action_id: stopActionId } : {}),
+    };
+    return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
+}
+
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const plainSegments = (text) => typeof text === 'string' && !!text && !text.includes('\\') && !text.includes('\0')
+    && text.split('/').every((part) => part && part !== '.' && part !== '..');
+// Python quote(safe='') spelling of one path segment.
+const encodeSegment = (text) => encodeURIComponent(text).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * Canonical task-file address shared by live delivery, replay and source links. A nested
+ * result file (`relpath` = its store-relative path, ending in `name`) is addressed exactly
+ * with `?relpath=`; the bare name only ever selects a top-level file.
+ */
+export function taskArtifactDownloadUrl(taskId, name, relpath = '') {
+    if (!TASK_ID_RE.test(String(taskId || ''))
+        || typeof name !== 'string' || !name || name.startsWith('.') || /[/\\]/.test(name)) return '';
+    const url = `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}`;
+    if (!relpath || relpath === name) return url;
+    if (!plainSegments(relpath) || relpath.split('/').at(-1) !== name) return '';
+    return `${url}?relpath=${encodeURIComponent(relpath)}`;
+}
+
+/**
+ * Address of the on-demand ZIP of one recorded result directory (store-relative, plain
+ * segments): `{basename}.zip?archive={directory}` on the task-file route; '' for a
+ * directory the route would refuse.
+ */
+export function taskArtifactArchiveUrl(taskId, directory) {
+    if (!TASK_ID_RE.test(String(taskId || '')) || !plainSegments(directory)) return '';
+    const name = `${directory.split('/').at(-1)}.zip`;
+    return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
+}
+
+/** URL for one published immutable source handle (a delegated run's journal range included). */
+export function taskSourceDownloadUrl(taskId, ref) {
+    const path = typeof ref?.path === 'string' ? ref.path : '';
+    if (!taskId || ref?.root !== 'artifact_store' || ref?.kind !== 'task_source'
+        || !/^[0-9a-f]{64}$/.test(ref?.sha256 || '')
+        || !/^source_handles\/(tool_results|context_checkpoints|delegated_activity)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
+        || !Number.isSafeInteger(ref?.size) || ref.size < 0) return '';
+    const name = path.split('/').at(-1);
+    const url = taskArtifactDownloadUrl(taskId, name);
+    if (!url) return '';
+    return `${url}?source=${encodeURIComponent(path)}`;
+}
+
+export async function resumeTask(taskId) {
+    return fetchJson(`/api/tasks/${encodeURIComponent(taskId)}/resume`, { method: 'POST' });
+}
+
+/**
+ * Owner hurry (S3, HQ1): the text-free typed task-local acceleration control.
+ * The body carries ONLY the client-generated stable request_id (reuse the same
+ * id on retry — the acknowledgement is idempotent). This path never creates a
+ * chat message anywhere; the durable facts are the typed owner-mailbox control
+ * and the owner_hurry task-result projection.
+ * @param {string} taskId
+ * @param {string} requestId
+ * @returns {Promise<import('./api_types.js').TaskHurryResponse>}
+ */
+export function hurryTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/hurry`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
+ * ONLY the stable request_id (the same id on retry is idempotent). The answer
+ * arrives after the root's durable fence landed; its `state` is `requested`
+ * while members still settle, `paused` once saved, or `released` on replay
+ * after that action was resumed. A 202 `latch_pending` answer is accepted
+ * (the fence is durable) and the SAME id completes its queue latch. An
+ * intentional new Pause uses a fresh id.
+ * @param {string} taskId
+ * @param {string} requestId
+ */
+export function pauseTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/pause`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Continue of an interrupted root (Batch4): the body is ONLY the action
+ * nonce the caller keeps across retries and reloads, so the same press answers
+ * the same admission; a different nonce is a new press.
+ * @param {string} taskId
+ * @param {string} actionNonce
+ */
+export function continueTask(taskId, actionNonce) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/continue`,
+        { action_nonce: String(actionNonce || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Fetch one task's durable detail record, or null when unreachable — the
+ * shared reconcile read used by the cancel/stop card flows.
+ * @param {string} taskId
+ * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
+ */
+export async function fetchTaskDetail(taskId) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+    return (resp && typeof resp.json === 'function' && resp.ok !== false) ? resp.json() : null;
+}
+
+/**
+ * Strict task-detail read for consumers that must tell a genuinely absent
+ * record (404 → null) apart from a failed read (rejects). The lenient
+ * fetchTaskDetail above keeps its every-failure→null contract for reconcile
+ * flows that treat all misses alike.
+ * @param {string} taskId
+ * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
+ */
+export async function fetchTaskDetailStrict(taskId) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+    if (resp && typeof resp.json === 'function') {
+        if (resp.ok !== false) return resp.json();
+        if (resp.status === 404) return null;
+    }
+    throw new Error(`task detail read failed (HTTP ${resp?.status ?? 'no response'})`);
 }
 
 export function cleanExtensionRoute(value) {
@@ -69,43 +252,113 @@ export function extensionRoutePath(skill, route, params = null) {
     return `${extensionRoutePrefix(skill)}${cleanRoute}${query}`;
 }
 
+export function updateStrategyForPlan(plan = {}) {
+    if (!plan.available) return '';
+    const kind = String(plan.kind || '');
+    if (!['clean', 'conflicting'].includes(kind)) return '';
+    return kind === 'clean' ? 'auto_merge' : 'assisted';
+}
+
 export const apiClient = {
+    /** Read a recent window or replay one opaque, room-bound history page. */
+    chatHistory: ({ chatId = 1, cursor = null, signal } = {}) => {
+        const params = new URLSearchParams();
+        if (chatId !== 1) params.set('chat_id', String(chatId));
+        if (cursor) params.set('cursor', cursor);
+        const query = params.toString();
+        return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
+    },
     /** @returns {Promise<import('./api_types.js').HealthResponse>} */
     health: () => fetchJson('/api/health', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').StateResponse>} */
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
+    /** @param {{key: string}|{mcp_server_id: string}} selector @returns {Promise<{value: string}>} */
+    revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
-    uiPreferences: () => fetchJson('/api/ui/preferences', { cache: 'no-store' }),
+    uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
     saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload),
+    /** @returns {Promise<import('./ui_i18n_types.js').UiI18nResponse>} */
+    uiI18n: () => fetchJson('/api/ui/i18n', { cache: 'no-store' }),
+    /** @param {string|import('./ui_i18n_types.js').UiI18nLanguageRequest} payload */
+    saveUiLanguage: (payload) => jsonPost('/api/ui/i18n/language', typeof payload === 'string' ? { language: payload } : payload),
+    /** @param {import('./ui_i18n_types.js').UiI18nMissingRequest} payload */
+    reportI18nMissing: (payload) => jsonPost('/api/ui/i18n/missing', payload),
+    importI18n: (memoryDocument) => jsonPost('/api/ui/i18n/import', memoryDocument),
+    exportI18nUrl: (language = '') => `/api/ui/i18n/export${language ? `?language=${encodeURIComponent(language)}` : ''}`,
+    regenerateI18n: (payload = {}) => jsonPost('/api/ui/i18n/regenerate', payload),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    desktopAutostart: () => fetchJson('/api/desktop/autostart', { cache: 'no-store' }),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    setDesktopAutostart: (enabled) => jsonPost('/api/desktop/autostart', { enabled: Boolean(enabled) }),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    desktopBackground: () => fetchJson('/api/desktop/background', { cache: 'no-store' }),
+    /** @returns {Promise<import('./api_types.js').DesktopAutostartResponse>} */
+    setDesktopBackground: (enabled) => jsonPost('/api/desktop/background', { enabled: Boolean(enabled) }),
     saveSettings: (payload) => fetchJson('/api/settings', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
     }),
+    /**
+     * Finish first-run onboarding in ONE atomic owner-scoped save (D-8):
+     * settings + runtime mode + safety default + the completion fact land
+     * together, or nothing does. The install-time agent preset and its marker
+     * ride the same write only when the response says `preset.applied` —
+     * `not_requested`, `skipped_by_owner` and `not_install_time` are ordinary
+     * successes that persist no preset.
+     * @param {import('./api_types.js').OnboardingCompleteRequest} payload
+     * @returns {Promise<import('./api_types.js').OnboardingCompleteResponse>}
+     */
+    completeOnboarding: (payload) => jsonPost('/api/onboarding/complete', payload),
+    /**
+     * @param {import('./api_types.js').OnboardingSubagentsPreviewRequest} payload
+     * @returns {Promise<import('./api_types.js').OnboardingSubagentsPreviewResponse>}
+     */
+    previewOnboardingSubagents: (payload) => jsonPost('/api/onboarding/subagents/preview', payload),
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
-    /** @returns {Promise<import('./api_types.js').OwnerScopeReviewFloorResponse>} */
-    // DEPRECATED (v6.80.0): the value is stored but nothing consults it — BIBLE P3
-    // scope-review applicability follows the owner context mode. Kept as a frozen
-    // contract surface; the response carries an explicit deprecation notice.
-    ownerScopeReviewFloor: (floor) => jsonPost('/api/owner/scope-review-floor', { floor }),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
     logsTail: (name, limit = 2000) => fetchJson(`/api/logs/${encodeURIComponent(name)}?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
     ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),
+    /**
+     * @param {import('./api_types.js').ProviderTestRequest} payload
+     * @returns {Promise<import('./api_types.js').ProviderTestResponse>}
+     */
+    providerTest: (payload) => jsonPost('/api/providers/test', payload),
     extensions: () => fetchJson('/api/extensions', { cache: 'no-store' }),
+    /**
+     * Widgets page cards: live extension UI tabs projected from the loader
+     * snapshot (no skill discovery), each stamped with the owning skill's
+     * payload `revision`.
+     * @returns {Promise<import('./api_types.js').WidgetsResponse>}
+     */
+    widgets: (init = {}) => fetchJson('/api/widgets', { cache: 'no-store', ...init }),
+    skillPublishPreflight,
+    createTask,
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').SkillDeleteResponse>} */
-    deleteSkill: (skill, payloadRoot) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/delete`, {
+    deleteSkill: (skill, payloadRoot, expectedContentHash = '') => jsonPost(`/api/skills/${encodeURIComponent(skill)}/delete`, {
         payload_root: payloadRoot,
+        ...(expectedContentHash ? { expected_content_hash: expectedContentHash } : {}),
     }),
-    skillGrants: (skill, items) => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, { items }),
-    chatHistory: (limit = 1000) => fetchJson(`/api/chat/history?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
-    projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
+    skillGrants: (skill, items, expectedContentHash = '') => jsonPost(`/api/skills/${encodeURIComponent(skill)}/grants`, {
+        items, ...(expectedContentHash ? { expected_content_hash: expectedContentHash } : {}),
+    }),
+    /**
+     * @param {string} skill
+     * @param {import('./api_types.js').OwnerSkillPresenceRuntimeRequest} payload
+     * @returns {Promise<import('./api_types.js').OwnerSkillPresenceRuntimeResponse>}
+     */
+    savePresenceRuntime: (skill, payload) => jsonPost(
+        `/api/owner/skills/${encodeURIComponent(skill)}/presence-runtime`,
+        payload,
+    ),
+    projectFromTask: (taskId, id, name) => jsonPost('/api/projects/from-task', { task_id: taskId, id, name }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
     projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),
@@ -114,6 +367,14 @@ export const apiClient = {
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
+    updateCheck: () => jsonPost('/api/update/check', {}),
+    /** @returns {Promise<import('./api_types.js').UpdatePreflightResponse>} */
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
-    updateApply: (strategy) => jsonPost('/api/update/apply', { strategy }),
+    /** @returns {Promise<import('./api_types.js').UpdateApplySuccessResponse>} */
+    updateApply: (strategy, plan = {}, { confirmRecovery = false } = {}) => jsonPost('/api/update/apply', {
+        strategy,
+        expected_base_sha: String(plan.base_sha || ''),
+        expected_target_sha: String(plan.target_sha || ''),
+        ...(confirmRecovery ? { confirm_recovery: true } : {}),
+    }),
 };

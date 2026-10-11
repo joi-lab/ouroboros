@@ -14,9 +14,17 @@ import unittest.mock as mock
 
 import pytest
 
+import ouroboros.tools.claude_advisory_review as advisory
 from ouroboros.tools.claude_advisory_review import (
     _syntax_preflight_staged_py_files,
 )
+
+
+@pytest.fixture(autouse=True)
+def _explicit_enabled_advisory(monkeypatch):
+    """These tests exercise the advisory path, independent of ambient review slots."""
+    monkeypatch.delenv("OUROBOROS_REVIEWER_SLOTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_ADVISORY_REVIEW_ROUTE", raising=False)
 
 
 def _make_agent_repo(tmp_path: pathlib.Path) -> pathlib.Path:
@@ -30,6 +38,32 @@ def _init_git_repo(repo: pathlib.Path) -> None:
     subprocess.run(["git", "init"], cwd=str(repo), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), check=True)
     subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo), check=True)
+
+
+def _stub_preflight_lanes(repo, monkeypatch):
+    """Keep runner/checkout/proof real; stub only lane execution in composition tests."""
+    from ouroboros import preflight_runner as pr
+    from ouroboros.tools import git
+    from tests.test_preflight_test_proof import _suite
+
+    _suite(repo)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
+    monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "2")
+    monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)
+    monkeypatch.delenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", raising=False)
+    monkeypatch.setattr(pr, "_verify_preflight_plugins", lambda *a: [])
+    monkeypatch.setattr(pr, "_observed_worker_ids", lambda *a: {"gw0", "gw1"})
+    monkeypatch.setattr(git, "_consecutive_test_failures", 0)
+    lanes = []
+
+    def green_lane(python, worktree, temp_root, args, timeout):
+        assert worktree != repo and (worktree / "candidate.txt").read_text() == "tested"
+        lanes.append((worktree, tuple(args)))
+        return 0, "green fixture lane", ""
+
+    monkeypatch.setattr(pr, "_execute_pytest_pass", green_lane)
+    return lanes
 
 
 def _write_release_files(repo: pathlib.Path, *, version: str, pyproject_version: str | None = None, minor_rows: int = 1) -> None:
@@ -135,20 +169,10 @@ class TestSyntaxPreflightHelper:
         assert "PREFLIGHT_BLOCKED" in out
 
 
-def _sdk_available() -> bool:
-    """The Claude Agent SDK is an optional dependency — skip SDK-integration
-    tests cleanly when it is not installed (e.g. minimal test venvs)."""
-    try:
-        import claude_agent_sdk  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-@pytest.mark.skipif(not _sdk_available(), reason="claude_agent_sdk not installed")
 class TestPreflightGatesBeforeSDK:
-    """Verify the preflight short-circuit fires BEFORE the Claude SDK call,
-    saving the SDK cost when staged `.py` files cannot compile."""
+    """Verify the preflight short-circuit fires BEFORE the paid critic call
+    (native episode), saving the spend when staged `.py` files cannot compile.
+    (The retired Claude-SDK skipif is gone: the successor path needs no SDK.)"""
 
     def test_syntax_error_returns_before_sdk(self, tmp_path, monkeypatch):
         """End-to-end: a staged syntactically broken .py file returns
@@ -159,7 +183,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "broken.py").write_text("def foo(:\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -169,11 +193,6 @@ class TestPreflightGatesBeforeSDK:
             adv, "_get_changed_file_list",
             lambda repo_dir, paths=None: "M  broken.py",
         )
-        monkeypatch.setattr(
-            adv, "build_advisory_changed_context",
-            lambda repo_dir, changed_files_text, paths=None, exclude_paths=None:
-                (["broken.py"], "(touched pack)", []),
-        )
 
         sdk_called = {"n": 0}
 
@@ -181,18 +200,11 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             raise AssertionError("SDK should NOT be called when preflight blocks")
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model, **_: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()
@@ -220,7 +232,7 @@ class TestPreflightGatesBeforeSDK:
         repo = _make_agent_repo(tmp_path)
         (repo / "good.py").write_text("def foo():\n    return 1\n")
 
-        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-fake")
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-fake")
 
         monkeypatch.setattr(
             adv, "_get_staged_diff",
@@ -229,11 +241,6 @@ class TestPreflightGatesBeforeSDK:
         monkeypatch.setattr(
             adv, "_get_changed_file_list",
             lambda repo_dir, paths=None: "M  good.py",
-        )
-        monkeypatch.setattr(
-            adv, "build_advisory_changed_context",
-            lambda repo_dir, changed_files_text, paths=None, exclude_paths=None:
-                (["good.py"], "(touched pack)", []),
         )
         monkeypatch.setattr(
             adv, "_build_advisory_prompt",
@@ -257,20 +264,13 @@ class TestPreflightGatesBeforeSDK:
             sdk_called["n"] += 1
             return _Result()
 
-        def _fake_resolve_model():
-            return "claude-opus-4-6[1m]"
-
         # run_readonly is imported INSIDE _run_claude_advisory, not at module top,
         # so patch the source symbol.
         monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.run_readonly",
-            _fake_run_readonly,
-            raising=False,
-        )
-        monkeypatch.setattr(
-            "ouroboros.gateways.claude_code.resolve_claude_code_model",
-            _fake_resolve_model,
-            raising=False,
+            advisory, "_run_advisory_native",
+            lambda prompt, repo_dir, ctx_, slot, model, **_: (
+                _fake_run_readonly(), model,
+            ),
         )
 
         fake_ctx = mock.MagicMock()
@@ -340,6 +340,7 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
             adv, "_check_worktree_version_sync_shared",
             lambda *args, **kwargs: "",
         )
+        monkeypatch.setattr(adv, "_release_metadata_preflight", lambda *a, **kw: None)
         monkeypatch.setattr(
             adv, "compute_snapshot_hash", lambda *args, **kwargs: "deadbeef",
         )
@@ -404,6 +405,53 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
         assert result["status"] == "preflight_blocked"
         assert "Version History exceeds" in result["error"]
 
+    def test_release_metadata_preflight_blocks_stale_uv_lock(self, tmp_path):
+        from ouroboros.tools import claude_advisory_review as adv
+
+        repo = _make_agent_repo(tmp_path)
+        _init_git_repo(repo)
+        _write_release_files(repo, version="5.99.0-rc.1")
+        (repo / "uv.lock").write_text(
+            '[[package]]\nname = "ouroboros"\nversion = "5.98.0"\n'
+            'source = { editable = "." }\n',
+            encoding="utf-8",
+        )
+
+        result = adv._release_metadata_preflight(
+            repo,
+            "v5.99.0-rc.1: release",
+            ["VERSION"],
+        )
+
+        assert result is not None
+        assert "uv.lock" in result
+
+    def test_release_metadata_preflight_blocks_stale_web_package_lock(self, tmp_path):
+        """MAJOR-1 (rc.15 review): the lockfile is a release carrier the sync
+        writes; the admission preflight must read it like its siblings, so a
+        root-entry desync is a typed PREFLIGHT_BLOCKED naming the file (this
+        preflight is also the SM1 stand check's carrier gate)."""
+        from ouroboros.tools import claude_advisory_review as adv
+
+        repo = _make_agent_repo(tmp_path)
+        _init_git_repo(repo)
+        _write_release_files(repo, version="5.99.0-rc.1")
+        (repo / "web").mkdir()
+        (repo / "web" / "package.json").write_text(
+            '{\n  "name": "ouroboros-web",\n  "version": "5.99.0-rc.1"\n}\n', encoding="utf-8",
+        )
+        (repo / "web" / "package-lock.json").write_text(
+            '{\n  "name": "ouroboros-web",\n  "version": "5.98.0",\n  "lockfileVersion": 3,\n'
+            '  "packages": {\n    "": {\n      "name": "ouroboros-web",\n      "version": "5.98.0"\n'
+            '    }\n  }\n}\n',
+            encoding="utf-8",
+        )
+
+        result = adv._release_metadata_preflight(repo, "v5.99.0-rc.1: release", ["VERSION"])
+
+        assert result is not None and "PREFLIGHT_BLOCKED" in result
+        assert 'web/package-lock.json (expected both root "version" entries = "5.99.0-rc.1")' in result
+
     def test_changed_diff_without_version_blocks_before_sdk(self, tmp_path, monkeypatch):
         from ouroboros.tools import claude_advisory_review as adv
         import json as _json
@@ -444,6 +492,91 @@ class TestHandleAdvisoryPreReviewSurfacesPreflightBlocked:
         result = _json.loads(result_raw)
         assert result["status"] == "preflight_blocked"
         assert "VERSION is not in scope" in result["error"]
+
+    def test_doc_only_diff_without_version_reaches_the_critic(self, tmp_path, monkeypatch):
+        """Doc-only carve (finding W3A-F1). The commit gate already exempts a
+        doc-only diff from its compensating preflight, while this admission
+        blocked the very same diff — so a doc-only change could never obtain a
+        FRESH advisory verdict on any install and the standard flow degraded to
+        the audited bypass. The critic must now actually be dispatched."""
+        from ouroboros.tools import claude_advisory_review as adv
+        import json as _json
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir(parents=True, exist_ok=True)
+        repo = _make_agent_repo(repo_root)
+        _init_git_repo(repo)
+        (repo / "logs").mkdir(exist_ok=True)
+        _write_release_files(repo, version="5.99.0-rc.1")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=str(repo), check=True)
+        (repo / "docs" / "NOTES.md").write_text("# notes\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/NOTES.md"], cwd=str(repo), check=True)
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake-for-test")
+        monkeypatch.setattr(adv, "check_worktree_readiness", lambda *args, **kwargs: [])
+
+        dispatched: list = []
+
+        def fake_run(repo_dir, commit_message, ctx, **kwargs):
+            dispatched.append(commit_message)
+            return [], "[]", "fake-model", 2
+
+        monkeypatch.setattr(adv, "_run_claude_advisory", fake_run)
+
+        fake_ctx = mock.MagicMock()
+        fake_ctx.repo_dir = repo
+        fake_ctx.drive_root = repo
+        fake_ctx.emit_progress_fn = lambda *a, **kw: None
+        fake_ctx.task_id = "t-doc-only"
+
+        result = _json.loads(adv._handle_advisory_pre_review(
+            fake_ctx,
+            commit_message="docs: notes",
+            paths=["docs/NOTES.md"],
+            skip_tests=True,
+        ))
+        assert result["status"] != "preflight_blocked", result
+        assert dispatched == ["docs: notes"]
+
+    def test_doc_only_carve_is_the_commit_gate_classifier(self, tmp_path):
+        """One detector, not two: the carve is decided by the SAME
+        ``_diff_is_doc_only`` the commit gate applies, so the gates cannot
+        drift. A code file, a mixed diff and a doc under ``tests/`` all keep
+        the block; the carve never touches the carrier-coherence checks, which
+        still run the moment VERSION IS in scope."""
+        from ouroboros.commit_admission import release_metadata_preflight
+        from ouroboros.tools.git_review_cycle import _diff_is_doc_only
+
+        repo = _make_agent_repo(tmp_path)
+        _init_git_repo(repo)
+        _write_release_files(repo, version="5.99.0-rc.1")
+        subprocess.run(["git", "add", "."], cwd=str(repo), check=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=str(repo), check=True)
+        (repo / "docs" / "NOTES.md").write_text("# notes\n", encoding="utf-8")
+        (repo / "ouroboros" / "feature.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / "tests").mkdir(exist_ok=True)
+        (repo / "tests" / "NOTES.md").write_text("# notes\n", encoding="utf-8")
+
+        def _preflight(paths):
+            return release_metadata_preflight(repo, "m", paths)
+
+        assert _preflight(["docs/NOTES.md"]) is None
+        assert _diff_is_doc_only(["docs/NOTES.md"]) is True
+
+        for scope in (["ouroboros/feature.py"],
+                      ["docs/NOTES.md", "ouroboros/feature.py"],
+                      ["tests/NOTES.md"]):
+            assert _diff_is_doc_only(scope) is False, scope
+            blocked = _preflight(scope)
+            assert blocked is not None and "VERSION is not in scope" in blocked, scope
+
+        # VERSION in scope: the carve is out of the way and the coherence
+        # checks own the answer again (stale carrier -> still blocked).
+        (repo / "pyproject.toml").write_text(
+            '[project]\nname = "ouroboros"\nversion = "5.98.0"\n', encoding="utf-8")
+        stale = _preflight(["VERSION", "docs/NOTES.md"])
+        assert stale is not None and "pyproject.toml" in stale
 
     def test_advisory_auto_syncs_release_metadata_when_version_staged(self, tmp_path, monkeypatch):
         from ouroboros.tools import claude_advisory_review as adv
@@ -527,6 +660,7 @@ class TestPreflightBlockedPersistence:
             adv, "_check_worktree_version_sync_shared",
             lambda *args, **kwargs: "",
         )
+        monkeypatch.setattr(adv, "_release_metadata_preflight", lambda *a, **kw: None)
         monkeypatch.setattr(
             adv, "compute_snapshot_hash",
             lambda *args, **kwargs: "preflight-test-hash",
@@ -585,3 +719,53 @@ class TestPreflightBlockedPersistence:
             "A preflight_blocked record must NOT count as fresh — that would "
             "let repo_commit proceed without the SDK ever seeing the code."
         )
+
+
+class TestTestsPreflightProofBinding:
+    """Admission forwards only runner-minted evidence to managed telemetry.
+
+    A successful return without execution (including no suite) is not proof.
+    """
+
+    def _ctx(self, tmp_path):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            task_id="t", task_metadata={}, repo_dir=str(tmp_path),
+            emit_progress_fn=lambda *_a, **_k: None,
+        )
+
+    def test_red_run_returns_error_and_records_no_proof(self, tmp_path):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        ctx = self._ctx(tmp_path)
+        err = run_tests_preflight_with_proof(ctx, runner=lambda c: "FAILED: 2 failed")
+        assert err == "FAILED: 2 failed"
+        assert not getattr(ctx, "_preflight_test_proof", None)
+        assert ctx._preflight_tests_passed is False
+
+    def test_green_run_records_the_managed_proof(self, tmp_path, monkeypatch):
+        from ouroboros.commit_admission import preflight_test_proof_matches, run_tests_preflight_with_proof
+        from ouroboros.tools.review_helpers import _run_review_preflight_tests
+        from tests.test_update_merge_assisted import _init_repo
+        import supervisor.update_merge as um
+
+        repo, _ = _init_repo(tmp_path)
+        lanes = _stub_preflight_lanes(repo, monkeypatch)
+        ctx = self._ctx(repo)
+        recorded = []
+        monkeypatch.setattr(um, "record_managed_tests_proof",
+                            lambda c: recorded.append((c, c._preflight_test_proof)) or c._preflight_test_proof.tree)
+        assert run_tests_preflight_with_proof(ctx, runner=_run_review_preflight_tests) is None
+        assert len(lanes) == 2 and len({worktree for worktree, _ in lanes}) == 1
+        assert recorded == [(ctx, ctx._preflight_test_proof)]
+        assert preflight_test_proof_matches(ctx, repo)
+
+    def test_none_without_runner_receipt_records_no_proof(self, tmp_path, monkeypatch):
+        from ouroboros.commit_admission import run_tests_preflight_with_proof
+
+        ctx = self._ctx(tmp_path)
+        monkeypatch.setattr("supervisor.update_merge.record_managed_tests_proof",
+                            lambda c: pytest.fail("None is not an execution receipt"))
+        assert run_tests_preflight_with_proof(ctx, runner=lambda c: None) is None
+        assert ctx._preflight_test_proof is None
+        assert ctx._preflight_tests_passed is False

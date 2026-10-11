@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from devtools.benchmarks.common.manifests import openrouter_key_remaining, repo_provenance, write_json
+from devtools.benchmarks.common.model_slots import single_model_subagents_setting
 from devtools.benchmarks.common.result_index import RUNTIME_TRUNCATION_REASON_CODES
 
 try:  # Harbor is an optional benchmark dependency.
@@ -54,6 +55,8 @@ _SECRET_ENV_KEYS = frozenset({
     "GIGACHAT_CREDENTIALS",
     "GIGACHAT_PASSWORD",
     "GIGACHAT_USER",
+    "DEEPSEEK_API_KEY",
+    "MINIMAX_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_COMPATIBLE_API_KEY",
     "OPENROUTER_API_KEY",
@@ -199,8 +202,11 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         server_start_timeout_sec = int(kwargs.pop("server_start_timeout_sec", 180))
         task_timeout_sec = kwargs.pop("task_timeout_sec", None)
         openrouter_min_credit_usd = float(kwargs.pop("openrouter_min_credit_usd", os.environ.get("OUROBOROS_BENCH_OPENROUTER_MIN_CREDIT_USD", 5.0)))
-        # plan_task needs >=2 workers (planning scouts run as pooled subagents);
-        # 1 worker forced the capacity-degraded inline fallback on every run.
+        # 3-4 decomposition slots for the agent's own subagents (the root takes one lane).
+        # Historic reason: `plan_task` used to run pooled planning scouts, so 1 worker forced a
+        # capacity-degraded fallback. Since the 2026-08-15 spec-gate redesign plan review runs
+        # NO scouts and needs no pool; the default stays 4 because container memory (a full
+        # python process per worker) is what bounds it.
         max_workers = int(kwargs.pop("max_workers", 4))  # v6.55.0: 3-4 subagent slots (root takes one); 10 would blow container memory (full python proc per worker)
         runtime_mode = str(kwargs.pop("runtime_mode", "pro"))
         review_enforcement = str(kwargs.pop("review_enforcement", "blocking"))
@@ -274,7 +280,9 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
         return version or None
 
     def _host_settings(self) -> dict[str, Any]:
-        return _json_load(self.host_settings_path)
+        from ouroboros.context_mode_compat import normalize_context_mode_compat
+
+        return normalize_context_mode_compat(_json_load(self.host_settings_path))
 
     def _container_secret_injection_allowed(self, settings: dict[str, Any]) -> bool:
         value = os.environ.get(_CONTAINER_SECRET_OPT_IN)
@@ -365,9 +373,15 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "GIGACHAT_BASE_URL",
             "GIGACHAT_VERIFY_SSL_CERTS",
             "GIGACHAT_PROFANITY_CHECK",
+            "MINIMAX_REGION",
             "OUROBOROS_MODEL",
-            "OUROBOROS_MODEL_HEAVY",  # v6.39 slot rename (legacy OUROBOROS_MODEL_CODE -> _HEAVY)
             "OUROBOROS_MODEL_LIGHT",
+            "OUROBOROS_SUBAGENTS",
+            "OUROBOROS_REVIEWER_SLOTS",
+            "USE_LOCAL_MAIN",
+            "USE_LOCAL_LIGHT",
+            "USE_LOCAL_FALLBACK",
+            "USE_LOCAL_CONSCIOUSNESS",
             # OUROBOROS_MODEL_FALLBACK is deliberately NOT forwarded: the
             # benchmark metric must stay single-model (a host-configured
             # fallback would silently contaminate the measurement).
@@ -376,7 +390,6 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_SCOPE_REVIEW_MODELS",
             "OUROBOROS_SCOPE_REVIEW_MODEL",
             "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
-            "CLAUDE_CODE_MODEL",
             "OUROBOROS_EFFORT_TASK",
             "OUROBOROS_EFFORT_REVIEW",
             "OUROBOROS_EFFORT_SCOPE_REVIEW",
@@ -384,16 +397,13 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
             "OUROBOROS_RETURN_REASONING",
             # Working-context mode (low | max) for context-ablation runs: the
             # container has no settings.json, so without this forward the
-            # runtime silently falls back to the default ("max"). The derived
-            # auto-low flag travels with it: get_owner_context_mode resolves an
-            # absent flag fail-closed, so a bare forwarded `low` is not read as an
-            # owner-declared scope-review skip.
+            # runtime silently falls back to the default ("max"). The one-window
+            # false provenance tombstone travels with an explicit persisted Low;
+            # a bare env Low intentionally remains owner Max for P3.
             "OUROBOROS_CONTEXT_MODE",
             "OUROBOROS_CONTEXT_MODE_AUTO_LOW",
             "TOTAL_BUDGET",
             "OUROBOROS_PER_TASK_COST_USD",
-            "OUROBOROS_SOFT_TIMEOUT_SEC",
-            "OUROBOROS_HARD_TIMEOUT_SEC",
             "OUROBOROS_TOOL_TIMEOUT_SEC",
         ]
         if allow_secrets:
@@ -405,10 +415,21 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
                 value = settings.get(key)
             if value not in (None, ""):
                 env[key] = str(value)
+        marker_key = "OUROBOROS_CONTEXT_MODE_AUTO_LOW"
+        mode_from_env = "OUROBOROS_CONTEXT_MODE" in os.environ
+        marker_source = os.environ.get(marker_key) if mode_from_env else settings.get(marker_key)
+        marker = str(marker_source or "").strip().lower()
+        if marker in {"0", "false", "off"}:
+            env[marker_key] = "false"
+        else:
+            # Context intent is one authority pair.  When mode comes from env, an
+            # absent/legacy env marker cannot inherit false owner provenance from disk.
+            # Keep that Low bare (effective Low, owner Max) and never recreate true.
+            env.pop(marker_key, None)
 
         if self.ouroboros_model:
             env["OUROBOROS_MODEL"] = self.ouroboros_model
-            env["OUROBOROS_MODEL_HEAVY"] = self.ouroboros_model
+            env["OUROBOROS_SUBAGENTS"] = single_model_subagents_setting(self.ouroboros_model)
         if self.ouroboros_light_model:
             env["OUROBOROS_MODEL_LIGHT"] = self.ouroboros_light_model
         if self.reasoning_effort:
@@ -450,6 +471,10 @@ class OuroborosTerminalBenchAgent(BaseInstalledAgent):
                 "OUROBOROS_RUNTIME_MODE": self.runtime_mode,
                 "OUROBOROS_REVIEW_ENFORCEMENT": self.review_enforcement,
                 "OUROBOROS_TASK_REVIEW_MODE": self.task_review_mode,
+                # Pin the shared paid review-cycle ceiling off (bench methodology:
+                # historical campaigns ran unbounded acceptance panels; the shipped
+                # default of 2 would silently change comparability).
+                "OUROBOROS_REVIEW_MAX_CYCLES": "unlimited",
                 "OUROBOROS_MAX_WORKERS": str(self.max_workers),
                 # v6.55.0: the container is an isolated jail — the LLM safety layer
                 # adds cost/latency without protecting anything the deterministic
@@ -532,9 +557,9 @@ PY
               export PIP_CACHE_DIR={_CONTAINER_PIP_CACHE}
               mkdir -p "$PIP_CACHE_DIR" 2>/dev/null || true
               python -m pip install --upgrade pip setuptools wheel
-              python -m pip install -r {_CONTAINER_SRC}/requirements.txt || {{
+              python -m pip install -r {_CONTAINER_SRC}/requirements-runtime.lock || {{
                 echo "install: requirements install failed; retrying without optional tree-sitter code-intel deps (lazy runtime import, degrades gracefully)"
-                grep -ivE 'tree[-_]sitter' {_CONTAINER_SRC}/requirements.txt > /tmp/ouro_reqs_no_treesitter.txt
+                grep -ivE 'tree[-_]sitter' {_CONTAINER_SRC}/requirements-runtime.lock > /tmp/ouro_reqs_no_treesitter.txt
                 python -m pip install -r /tmp/ouro_reqs_no_treesitter.txt
               }}
               python -m pip install -e {_CONTAINER_SRC} --no-deps
@@ -679,6 +704,14 @@ PY
         elif env.get("ANTHROPIC_API_KEY"):
             provider_url = "https://api.anthropic.com/v1/models"
             provider_name = "anthropic"
+        elif env.get("MINIMAX_API_KEY"):
+            from ouroboros.provider_models import resolve_minimax_base_url
+            provider_url = resolve_minimax_base_url(str(env.get("MINIMAX_REGION") or "")).rstrip("/") + "/models"
+            provider_name = "minimax"
+        elif env.get("DEEPSEEK_API_KEY"):
+            from ouroboros.provider_models import DEEPSEEK_BASE_URL
+            provider_url = DEEPSEEK_BASE_URL.rstrip("/") + "/models"
+            provider_name = "deepseek"
         elif env.get("CLOUDRU_FOUNDATION_MODELS_API_KEY"):
             provider_url = (env.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "https://foundation-models.api.cloud.ru/v1").rstrip("/") + "/models"
             provider_name = "cloudru"
@@ -744,13 +777,11 @@ PY
         # web gate — benches measure Ouroboros as a single-model harness; the embedded
         # Claude-Code delegate is a separate future experiment.
         # Operator 2026-07-23: schedule_subagent disabled for the no-swarm submittable
-        # campaign. NB (measured on the v6.81.0 runs, correcting an earlier claim here that
-        # this means "subagents=0"): withholding the TOOL stops the agent from DELEGATING the
-        # task, but `plan_task` still runs pooled planning scouts, which surface in traces as
-        # `delegation_role=subagent`. A submission must therefore disclose "no task delegation",
-        # not "no subagents" — the traces contradict the stronger claim. `max_workers` is not
-        # moot for the same reason: the scouts need the pool (1 worker forces the degraded
-        # inline fallback).
+        # campaign. The v6.81.0 runs had to disclose "no task delegation" rather than
+        # "no subagents", because `plan_task` then ran pooled planning scouts that surfaced in
+        # traces as `delegation_role=subagent`. Since the 2026-08-15 spec-gate redesign plan
+        # review runs NO scouts: with this tool withheld a run spawns no subagents at all, and
+        # a submission may say so — check the traces of the run you are actually disclosing.
         disabled = ["claude_code_edit", "schedule_subagent"]
         if getattr(self, "disable_agent_web", True):
             disabled = list(self._WEB_TOOLS_MIRROR) + list(self._DELEGATED_VISION_TOOLS) + disabled

@@ -1,568 +1,461 @@
-"""Focused v6.64 ordinary-task context-fit regressions."""
+"""Ordinary-Main target-versus-capacity fit regressions."""
 
 from __future__ import annotations
 
 import inspect
 import json
-import queue
+import math
 from types import SimpleNamespace
 
 import pytest
 
+from ouroboros.context_budget import RECLAIM_LOW_WATER_DIVISOR
 
-def _env_memory(tmp_path):
-    from ouroboros.agent import Env
-    from ouroboros.memory import Memory
 
-    repo = tmp_path / "repo"
-    drive = tmp_path / "drive"
-    for path in (
-        repo / "prompts",
-        repo / "docs",
-        drive / "state",
-        drive / "memory" / "knowledge",
-        drive / "logs",
-    ):
-        path.mkdir(parents=True, exist_ok=True)
-    (repo / "prompts" / "SYSTEM.md").write_text("stable policy", encoding="utf-8")
-    (repo / "BIBLE.md").write_text("# BIBLE\nconstitution", encoding="utf-8")
-    (repo / "docs" / "ARCHITECTURE.md").write_text(
-        "# Architecture\n\n## One\nFULL_ARCH_SENTINEL\n\n## Two\nbody", encoding="utf-8",
+def _projection(mode: str):
+    from ouroboros.context_fit import ContextFitProjection
+
+    return ContextFitProjection(
+        mode=mode,
+        system_content_json=json.dumps(f"{mode.upper()}_SYSTEM"),
+        estimated_tokens=10,
+        calibrated_tokens=10,
+        calibration_ratio=1.0,
     )
-    (repo / "docs" / "DEVELOPMENT.md").write_text("# Development\nfull dev", encoding="utf-8")
-    (drive / "state" / "state.json").write_text("{}", encoding="utf-8")
-    (drive / "memory" / "identity.md").write_text("identity", encoding="utf-8")
-    (drive / "memory" / "scratchpad.md").write_text("scratch", encoding="utf-8")
-    env = Env(repo_dir=repo, drive_root=drive)
-    return env, Memory(drive_root=drive, repo_dir=repo)
 
 
-def _evidence(*, status="unprobeable", window=0, stale=False, route_fp="route-a"):
-    return SimpleNamespace(
-        status=status,
+def _plan(*, preferred: str = "max", window: int = 0, known: bool = False):
+    from ouroboros.context_fit import ContextFitPlan
+
+    return ContextFitPlan(
+        core_sha256="a" * 64,
+        preferred_mode=preferred,
+        initial_mode=preferred,
+        model="openai/test-model",
+        provider="openai",
+        route_fp="route-a",
+        status="confirmed" if known else "unprobeable",
+        stale=False,
         window_tokens=window,
-        stale=stale,
-        route_fp=route_fp,
+        output_reserve_tokens=65_536,
+        user_content_json=json.dumps("go"),
+        max_projection=_projection("max"),
+        low_projection=_projection("low"),
     )
 
 
-def test_unknown_route_tries_max_and_both_views_share_one_core(tmp_path, monkeypatch):
-    import ouroboros.context as context
+def _measure(monkeypatch, tmp_path, *, plan, profile, mode, messages, used=False, density=1.0):
+    from ouroboros import capability_evidence
+    from ouroboros.context_fit import measure_main_fit
 
-    env, memory = _env_memory(tmp_path)
     monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "openai/gpt-test", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(),
-        ),
+        capability_evidence,
+        "resolve_main_token_density",
+        lambda *_a, **_kw: (density, "fresh_route_usage" if density != 1.0 else "cold_estimate"),
     )
-
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "fit-1", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-
-    assert plan.initial_mode == "max"
-    assert plan.max_projection.fits_known_window is None
-    max_blocks = plan.messages_for("max")[0]["content"]
-    low_blocks = plan.messages_for("low")[0]["content"]
-    assert "FULL_ARCH_SENTINEL" in max_blocks[0]["text"]
-    assert "FULL_ARCH_SENTINEL" not in low_blocks[0]["text"]
-    assert "navigation map" in low_blocks[0]["text"]
-    # Stable memory, dynamic evidence and owner intent were captured once.
-    assert max_blocks[1:] == low_blocks[1:]
-    assert plan.messages_for("max")[1] == plan.messages_for("low")[1]
-    assert len(plan.core_sha256) == 64
-
-
-def test_known_window_uses_family_and_exact_route_calibration(tmp_path, monkeypatch):
-    import ouroboros.context as context
-    from ouroboros.utils import append_jsonl
-
-    env, memory = _env_memory(tmp_path)
-    append_jsonl(
-        env.drive_root / "logs" / "events.jsonl",
-        {
-            "type": "llm_round",
-            "context_route_fp": "route-observed",
-            "estimated_prompt_tokens": 100,
-            "prompt_tokens": 180,
-        },
-    )
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "openai/gpt-test", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=1_000_000, route_fp="route-observed"),
-        ),
-    )
-
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "fit-2", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert plan.max_projection.calibration_ratio == 1.8
-    assert plan.max_projection.calibrated_tokens == int(plan.max_projection.estimated_tokens * 1.8)
-
-    # v6.80.0 (Д7 decoupling): WITHOUT a route sample and WITHOUT a measured density
-    # for that model, the main-loop baseline stays the neutral 1.0 — "unknown routes
-    # deliberately try Max". The conservative cold-start density used for REVIEW packs
-    # is never applied here, because an empty observation store (every fresh install and
-    # every isolated benchmark server) would otherwise demote Max to Low silently.
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "anthropic/claude-fable-5", "provider": "anthropic", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=1_000_000, route_fp="route-claude"),
-        ),
-    )
-    claude = context.build_context_fit_plan(
-        env, memory, {"id": "fit-3", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert claude.max_projection.calibration_ratio == 1.0
-    assert claude.initial_mode == "max"
-
-    # A MEASURED density for that exact model DOES raise the baseline.
-    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
-
-    _DENSITY_MEMO.clear()
-    record_token_density(
-        env.drive_root, "anthropic/claude-fable-5",
-        prompt_chars=4_000_000, prompt_tokens=1_650_000,
-    )
-    measured = context.build_context_fit_plan(
-        env, memory, {"id": "fit-4", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert measured.max_projection.calibration_ratio >= 1.65
-
-
-def test_positive_no_fit_evidence_selects_low_before_dispatch(tmp_path, monkeypatch):
-    import ouroboros.context as context
-
-    env, memory = _env_memory(tmp_path)
-    (env.repo_dir / "docs" / "ARCHITECTURE.md").write_text(
-        "# Architecture\n\n## Huge\n" + ("dense code tokens\n" * 30_000), encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "openai/gpt-test", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=100_000),
-        ),
-    )
-
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "fit-4", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert plan.max_projection.fits_known_window is False
-    assert plan.low_projection.fits_known_window is True
-    assert plan.initial_mode == "low"
-
-
-def test_tool_schemas_join_known_route_projection_before_dispatch(tmp_path, monkeypatch):
-    import ouroboros.context as context
-
-    env, memory = _env_memory(tmp_path)
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "openai/gpt-test", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=100_000),
-        ),
-    )
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "fit-tools", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert plan.initial_mode == "max"
-    giant_tools = [{
-        "type": "function",
-        "function": {
-            "name": "large_schema",
-            "description": "x" * 200_000,
-            "parameters": {"type": "object", "properties": {}},
-        },
-    }]
-    assert plan.initial_mode_with_tools(giant_tools) == "low"
-    assert plan.projected_tokens_with_tools("max", giant_tools) > plan.max_projection.calibrated_tokens
-
-    # A stale retained window is UNKNOWN and must not manufacture a Low decision.
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_a, **_kw: (
-            {"model": "openai/gpt-test", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=100_000, stale=True),
-        ),
-    )
-    stale = context.build_context_fit_plan(
-        env, memory, {"id": "fit-tools-stale", "type": "task", "text": "solve"}, preferred_mode="max",
-    )
-    assert stale.initial_mode_with_tools(giant_tools) == "max"
-
-
-def test_confirmed_overflow_gets_one_same_model_low_retry(tmp_path, monkeypatch):
-    from ouroboros import loop
-    from ouroboros.tools.registry import ToolRegistry
-
-    class _Plan:
-        preferred_mode = "max"
-        initial_mode = "max"
-        model = "same-model"
-        route_fp = "route-a"
-        core_sha256 = "a" * 64
-        window_tokens = 0
-
-        @staticmethod
-        def reproject_transcript(messages, mode):
-            assert mode == "low"
-            rebuilt = list(messages)
-            rebuilt[0] = {"role": "system", "content": "LOW_PROJECTION"}
-            return rebuilt
-
-    class _LLM:
-        @staticmethod
-        def default_model():
-            return "same-model"
-
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.context_fit_plan = _Plan()
-    calls = []
-
-    def fake_call(
-        _llm, messages, model, _tools, _effort, _max_retries, _logs,
-        _task_id, _round_idx, _events, accumulated_usage, _task_type="", **kwargs,
-    ):
-        calls.append({"model": model, "messages": json.loads(json.dumps(messages)), **kwargs})
-        if len(calls) == 1:
-            accumulated_usage["_last_llm_error_kind"] = "context_overflow"
-            accumulated_usage["context_overflow_suggest_low"] = True
-            return None, 0.0
-        return {"role": "assistant", "content": "fits", "tool_calls": []}, 0.0
-
-    monkeypatch.setattr(loop, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop, "_persist_compaction_checkpoint", lambda *_a, **_kw: True)
-    monkeypatch.setattr(loop, "seal_task_transcript", lambda *_a, **_kw: None)
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-
-    result, usage, _trace = loop.run_llm_loop(
-        messages=[{"role": "system", "content": "MAX_PROJECTION"}, {"role": "user", "content": "go"}],
-        tools=registry,
-        llm=_LLM(),
-        drive_logs=tmp_path,
-        emit_progress=lambda _text: None,
-        incoming_messages=queue.Queue(),
-        task_type="task",
-        task_id="fit-retry",
+    return measure_main_fit(
+        plan,
+        messages,
+        [],
         drive_root=tmp_path,
+        profile=profile,
+        rendered_mode=mode,
+        round_id="exec:round:1",
+        automatic_pass_used=used,
     )
 
-    assert result == "fits"
-    assert len(calls) == 2
-    assert calls[0]["model"] == calls[1]["model"] == "same-model"
-    assert calls[1]["attempt_cap"] == 1
-    assert calls[1]["messages"][0]["content"] == "LOW_PROJECTION"
-    assert usage["_context_fit_low_retry_used"] is True
-    assert __import__("os").environ["OUROBOROS_CONTEXT_MODE"] == "max"
 
-
-def test_low_retry_precedes_fallback_and_accepted_route_rebinds(tmp_path, monkeypatch):
-    from ouroboros import config, context, fallback_cooldown, loop
-    from ouroboros.tools.registry import ToolRegistry
-
-    env, memory = _env_memory(tmp_path)
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {
-                "model": "primary-model",
-                "provider": "openai",
-                "base_url": "",
-                "use_local": False,
-            },
-            _evidence(status="unprobeable", window=0, route_fp="route-primary"),
-        ),
+def test_unknown_owner_max_stays_max_and_sends(monkeypatch, tmp_path):
+    plan = _plan()
+    disposition = _measure(
+        monkeypatch,
+        tmp_path,
+        plan=plan,
+        profile="owner_max",
+        mode="max",
+        messages=plan.messages_for("max"),
     )
-    plan = context.build_context_fit_plan(
-        env,
-        memory,
-        {"id": "fallback-fit", "type": "task", "text": "solve"},
-        preferred_mode="max",
+    assert plan.initial_mode == "max"
+    assert disposition.action == "send"
+    assert disposition.measurement.capacity_total_tokens is None
+    assert disposition.measurement.target_total_tokens is None
+
+
+def test_known_owner_max_miss_reclaims_without_predicted_low(monkeypatch, tmp_path):
+    plan = _plan(window=70_000, known=True)
+    disposition = _measure(
+        monkeypatch,
+        tmp_path,
+        plan=plan,
+        profile="owner_max",
+        mode="max",
+        messages=plan.messages_for("max") + [{"role": "user", "content": "x" * 40_000}],
     )
-    messages = plan.messages_for("max")
-    registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
-    registry._ctx.context_fit_plan = plan
-    registry._ctx.task_id = "fallback-fit"
-    registry._ctx.event_queue = None
-    calls = []
+    assert plan.initial_mode == "max"
+    assert disposition.action == "reclaim_once"
+    assert disposition.predicted_capacity_miss is True
+    assert disposition.measurement.capacity_deficit_tokens > 0
+    assert disposition.measurement.target_deficit_tokens is None
 
-    def fake_call(
-        _llm, sent_messages, model, _tools, _effort, _max_retries, _logs,
-        _task_id, _round_idx, _events, accumulated_usage, _task_type="", **kwargs,
-    ):
-        calls.append({
-            "model": model,
-            "system": json.loads(json.dumps(sent_messages[0])),
-            "route_fp": accumulated_usage.get("_context_route_fp"),
-            **kwargs,
-        })
-        if len(calls) == 1:
-            accumulated_usage["_last_llm_error_kind"] = "context_overflow"
-            return None, 0.0
-        if len(calls) == 2:
-            accumulated_usage["_last_llm_error_kind"] = "provider_transient"
-            return None, 0.0
-        return {"role": "assistant", "content": "fallback fits", "tool_calls": []}, 0.0
 
-    monkeypatch.setattr(loop, "call_llm_with_retry", fake_call)
-    monkeypatch.setattr(loop, "_persist_compaction_checkpoint", lambda *_a, **_kw: True)
-    accumulated_usage = {}
-    msg, _cost, mode = loop._call_round_model(
-        loop._RoundModelCallContext(
-            llm=SimpleNamespace(),
-            messages=messages,
-            tools=registry,
-            context_fit_plan=plan,
-            active_model="primary-model",
-            tool_schemas=[],
-            active_effort="high",
-            max_retries=3,
-            drive_logs=env.drive_root / "logs",
-            task_id="fallback-fit",
-            round_idx=1,
-            event_queue=None,
-            accumulated_usage=accumulated_usage,
-            task_type="task",
-            active_use_local=False,
-            active_context_mode="max",
-            drive_root=env.drive_root,
-        )
+def test_owner_low_uses_elastic_target_then_target_miss(monkeypatch, tmp_path):
+    plan = _plan(preferred="low", window=500_000, known=True)
+    messages = plan.messages_for("low") + [{"role": "user", "content": "x" * 900_000}]
+    first = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_low", mode="low", messages=messages,
     )
-    assert msg is None
-    assert mode == "low"
-    assert [call["model"] for call in calls] == ["primary-model", "primary-model"]
-    assert calls[1]["attempt_cap"] == 1
-    assert calls[1]["system"] == plan.low_projection.system_message()
-
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {
-                "model": "fallback-model",
-                "provider": "openrouter",
-                "base_url": "",
-                "use_local": False,
-            },
-            _evidence(status="confirmed", window=1_000_000, route_fp="route-fallback"),
-        ),
+    after = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_low", mode="low", messages=messages,
+        used=True,
     )
-    monkeypatch.setattr(config, "get_fallback_models", lambda _model: ["fallback-model"])
-    monkeypatch.setattr(fallback_cooldown, "attempts_per_model", lambda: 1)
-    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_a: False)
-    monkeypatch.setattr(fallback_cooldown, "mark_cooldown", lambda *_a: None)
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    assert first.action == "reclaim_once"
+    assert first.measurement.target_deficit_tokens > 0
+    assert first.measurement.capacity_deficit_tokens == 0
+    assert after.action == "send_target_miss"
+    assert after.predicted_capacity_miss is False
 
-    msg, model, use_local, rebound, mode = loop._run_cross_model_fallback_chain(
-        llm=SimpleNamespace(),
-        ctx=registry._ctx,
-        tools=registry,
-        messages=messages,
-        active_model="primary-model",
-        active_use_local=False,
-        tool_schemas=[],
-        active_effort="high",
-        max_retries=3,
-        drive_logs=env.drive_root / "logs",
-        task_id="fallback-fit",
-        round_idx=1,
-        event_queue=None,
-        accumulated_usage=accumulated_usage,
-        task_type="task",
-        emit_progress=lambda _text: None,
-        context_fit_plan=plan,
-        active_context_mode=mode,
+
+def test_confirmed_window_below_target_wins_even_when_target_fits(monkeypatch, tmp_path):
+    plan = _plan(preferred="low", window=65_550, known=True)
+    disposition = _measure(
+        monkeypatch,
+        tmp_path,
+        plan=plan,
+        profile="owner_low",
+        mode="low",
+        messages=plan.messages_for("low"),
     )
+    measurement = disposition.measurement
+    assert measurement.target_deficit_tokens == 0
+    assert measurement.capacity_deficit_tokens > 0
+    # Deficit-triggered, low-water-sized: the goal carries an eighth of the BINDING
+    # boundary (the 65,550 window, not the 250K target) above the deficit.
+    assert measurement.low_water_margin_tokens == math.ceil(65_550 / RECLAIM_LOW_WATER_DIVISOR)
+    assert measurement.reclaim_goal_tokens == (
+        measurement.capacity_deficit_tokens + measurement.low_water_margin_tokens
+    )
+    assert disposition.action == "reclaim_once"
 
-    assert msg["content"] == "fallback fits"
-    assert [call["model"] for call in calls] == [
-        "primary-model", "primary-model", "fallback-model",
+
+@pytest.mark.parametrize("profile,preferred,window,known,boundary", [
+    ("owner_max", "max", 70_000, True, 70_000),  # capacity binds a Max route
+    ("owner_low", "low", 500_000, True, 250_000),  # the economy target binds Low
+    ("owner_low", "low", 0, False, 250_000),  # unknown capacity: the target alone binds
+])
+def test_low_water_margin_follows_the_binding_boundary(
+    monkeypatch, tmp_path, profile, preferred, window, known, boundary,
+):
+    plan = _plan(preferred=preferred, window=window, known=known)
+    messages = plan.messages_for(preferred) + [{"role": "user", "content": "x" * 900_000}]
+    disposition = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred, messages=messages,
+    )
+    measurement = disposition.measurement
+    deficit = max(value for value in (
+        measurement.target_deficit_tokens, measurement.capacity_deficit_tokens,
+    ) if value is not None)
+    assert deficit > 0
+    assert measurement.low_water_margin_tokens == math.ceil(boundary / RECLAIM_LOW_WATER_DIVISOR)
+    assert measurement.reclaim_goal_tokens == deficit + measurement.low_water_margin_tokens
+    assert disposition.action == "reclaim_once"
+    # The margin sizes the pass; it never re-arms the route+round latch.
+    after = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred, messages=messages,
+        used=True,
+    )
+    assert after.action != "reclaim_once"
+    assert after.measurement.low_water_margin_tokens == measurement.low_water_margin_tokens
+
+
+@pytest.mark.parametrize("profile,preferred,window,known", [
+    ("owner_max", "max", 0, False),
+    ("owner_max", "max", 500_000, True),
+    ("owner_low", "low", 500_000, True),
+    ("task_local_low", "low", 500_000, True),
+])
+def test_no_deficit_means_no_margin_and_no_goal(monkeypatch, tmp_path, profile, preferred, window, known):
+    plan = _plan(preferred=preferred, window=window, known=known)
+    disposition = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred,
+        messages=plan.messages_for(preferred),
+    )
+    assert disposition.measurement.low_water_margin_tokens == 0
+    assert disposition.measurement.reclaim_goal_tokens == 0
+    assert disposition.action == "send"
+
+
+def test_low_water_divisor_is_the_one_knob_in_both_directions(monkeypatch, tmp_path):
+    from ouroboros import context_budget as cb
+
+    plan = _plan(window=70_000, known=True)
+    messages = plan.messages_for("max") + [{"role": "user", "content": "x" * 40_000}]
+    base = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    deficit = base.capacity_deficit_tokens
+    assert deficit > 0 and base.low_water_margin_tokens == math.ceil(70_000 / 8)
+
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 4)
+    wider = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    assert wider.low_water_margin_tokens == math.ceil(70_000 / 4)
+    assert wider.reclaim_goal_tokens == deficit + wider.low_water_margin_tokens
+
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 10 ** 9)  # the margin removed
+    removed = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    assert removed.low_water_margin_tokens == 1
+    assert removed.reclaim_goal_tokens == deficit + 1
+    assert removed.capacity_deficit_tokens == deficit  # the trigger never moved
+
+
+def test_task_local_low_does_not_inherit_owner_economy_target(monkeypatch, tmp_path):
+    plan = _plan(window=500_000, known=True)
+    disposition = _measure(
+        monkeypatch,
+        tmp_path,
+        plan=plan,
+        profile="task_local_low",
+        mode="low",
+        messages=plan.messages_for("low") + [{"role": "user", "content": "x" * 600_000}],
+    )
+    assert disposition.measurement.target_total_tokens is None
+    assert disposition.measurement.target_deficit_tokens is None
+    assert disposition.measurement.capacity_deficit_tokens == 0
+    assert disposition.action == "send"
+
+
+def test_main_fit_plans_the_reply_allowance_and_keeps_the_capacity_trigger(monkeypatch, tmp_path):
+    """Nano's fit reserves the reply floor (8,192) and plans the window's reply; the capacity
+    trigger stays input + floor - window in every mode (Low/Max keep today's trigger point)."""
+    from dataclasses import replace
+
+    from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS, RECLAIM_LOW_WATER_DIVISOR
+
+    plan = _plan(preferred="nano", window=128_000, known=True)
+    messages = plan.messages_for("max") + [{"role": "user", "content": "x" * 300_000}]  # ~75K raw tokens
+    nano = _measure(monkeypatch, tmp_path, plan=plan, profile="owner_nano", mode="nano", messages=messages,
+                    density=0.9).measurement
+    assert nano.response_reserve_tokens == NANO_MIN_HEADROOM_TOKENS
+    assert nano.raw_input_tokens > 75_000 and nano.estimated_input_tokens == math.ceil(nano.raw_input_tokens * 0.9)
+    assert nano.reply_allowance_tokens == 128_000 - nano.raw_input_tokens - math.ceil(128_000 / RECLAIM_LOW_WATER_DIVISOR)
+    assert nano.capacity_deficit_tokens == max(0, nano.estimated_input_tokens + NANO_MIN_HEADROOM_TOKENS - 128_000)
+    assert nano.target_deficit_tokens == max(0, nano.estimated_input_tokens + NANO_MIN_HEADROOM_TOKENS - 85_000)
+
+    small = replace(plan, output_reserve_tokens=4_096)  # a local lane's quarter window is its own ceiling
+    local = _measure(monkeypatch, tmp_path, plan=small, profile="owner_nano", mode="nano", messages=messages).measurement
+    assert local.response_reserve_tokens == local.reply_allowance_tokens == 4_096
+
+    for profile, mode in (("owner_max", "max"), ("task_local_low", "low")):
+        wide = _measure(monkeypatch, tmp_path, plan=replace(plan, preferred_mode=mode), profile=profile, mode=mode,
+                        messages=messages, density=0.9).measurement
+        assert wide.response_reserve_tokens == wide.reply_allowance_tokens == 65_536
+        assert wide.capacity_deficit_tokens == max(0, wide.estimated_input_tokens + 65_536 - 128_000) > 0
+
+
+def test_density_is_applied_once_on_the_declared_basis(monkeypatch, tmp_path):
+    plan = _plan(preferred="low", window=500_000, known=True)
+    messages = plan.messages_for("low") + [{"role": "assistant", "reasoning": "r" * 20_000}]
+    neutral = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_low", mode="low", messages=messages,
+    )
+    dense = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_low", mode="low", messages=messages,
+        density=2.0,
+    )
+    assert dense.measurement.estimated_input_tokens == 2 * neutral.measurement.estimated_input_tokens
+    assert dense.measurement.measurement_basis == "fresh_route_usage"
+
+
+def test_complete_shape_estimator_counts_reasoning_and_bounds_image_payloads():
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+
+    base = [{"role": "assistant", "content": "ok", "tool_call_id": "call-1"}]
+    rich = [{
+        **base[0],
+        "reasoning": "r" * 40_000,
+        "reasoning_details": [{"type": "reasoning.summary", "summary": "s" * 20_000}],
+        "content": [{"type": "thinking", "thinking": "t" * 20_000}],
+        "response_id": "resp-1",
+    }]
+    assert estimate_context_prompt_tokens(rich) > estimate_context_prompt_tokens(base) + 15_000
+
+    image_small = [{"role": "user", "content": [{
+        "type": "image_url", "image_url": {"url": "data:image/png;base64," + "a" * 10_000},
+    }]}]
+    image_huge = [{"role": "user", "content": [{
+        "type": "image_url", "image_url": {"url": "data:image/png;base64," + "a" * 1_000_000},
+    }]}]
+    assert estimate_context_prompt_tokens(image_small) == estimate_context_prompt_tokens(image_huge)
+
+    visible = [{"role": "assistant", "content": [{"type": "text", "text": "summary"}]}]
+    with_capsule = [{"role": "assistant", "content": [{
+        "type": "text",
+        "text": "summary",
+        "_context_capsule": {"source_hashes": ["x" * 64] * 10_000},
+    }]}]
+    assert estimate_context_prompt_tokens(with_capsule) == estimate_context_prompt_tokens(visible)
+    tool_schema = [{"function": {"parameters": {
+        "type": "object",
+        "properties": {"_context_capsule": {"type": "string", "description": "x" * 20_000}},
+    }}}]
+    assert estimate_context_prompt_tokens(visible, tool_schema) > estimate_context_prompt_tokens(visible)
+
+
+def test_reproject_transcript_replaces_only_system_view():
+    plan = _plan()
+    dialogue = [
+        {"role": "system", "content": "MAX_SYSTEM"},
+        {"role": "user", "content": "owner"},
+        {"role": "assistant", "content": "work"},
     ]
-    # The fallback is exact-route rebound before its first physical dispatch;
-    # it never inherits the failed primary fingerprint/projection.
-    assert calls[2]["route_fp"] == "route-fallback"
-    assert calls[2]["system"] == rebound.max_projection.system_message()
-    assert model == "fallback-model"
-    assert use_local is False
-    assert rebound.core_sha256 == plan.core_sha256
-    assert rebound.route_fp == "route-fallback"
-    assert rebound.model == "fallback-model"
-    assert mode == "max"
-    assert registry._ctx.context_fit_plan is rebound
-    assert registry._ctx.active_context_mode == "max"
-    assert messages[0] == rebound.max_projection.system_message()
-    assert accumulated_usage["_context_route_fp"] == "route-fallback"
-    assert accumulated_usage["_context_fit_mode"] == "max"
+    low = plan.reproject_transcript(dialogue, "low")
+    assert low[0] == plan.low_projection.system_message()
+    assert low[1:] == dialogue[1:]
 
 
-def test_unknown_fallback_overflow_gets_one_same_model_low_retry(tmp_path, monkeypatch):
-    from ouroboros import config, context, fallback_cooldown, loop
-    from ouroboros.tools.registry import ToolRegistry
-
-    env, memory = _env_memory(tmp_path)
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {"model": "primary", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="unprobeable", window=0, route_fp="route-primary"),
-        ),
-    )
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "fallback-low", "type": "task", "text": "solve"},
-        preferred_mode="max",
-    )
-    messages = plan.messages_for("max")
-    registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
-    registry._ctx.context_fit_plan = plan
-    registry._ctx.task_id = "fallback-low"
-    registry._ctx.event_queue = None
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {"model": "fallback", "provider": "openrouter", "base_url": "", "use_local": False},
-            _evidence(status="unprobeable", window=0, route_fp="route-fallback"),
-        ),
-    )
-    monkeypatch.setattr(config, "get_fallback_models", lambda _model: ["fallback"])
-    monkeypatch.setattr(fallback_cooldown, "attempts_per_model", lambda: 1)
-    monkeypatch.setattr(fallback_cooldown, "is_cooling_down", lambda *_a: False)
-    monkeypatch.setattr(fallback_cooldown, "mark_cooldown", lambda *_a: None)
-    monkeypatch.setattr(loop, "_persist_compaction_checkpoint", lambda *_a, **_kw: True)
-    calls = []
-
-    def fake_call(
-        _llm, sent_messages, model, _tools, _effort, _max_retries, _logs,
-        _task_id, _round_idx, _events, usage, _task_type="", **kwargs,
-    ):
-        calls.append((model, json.loads(json.dumps(sent_messages[0])), kwargs.get("attempt_cap")))
-        if len(calls) == 1:
-            usage["_last_llm_error_kind"] = "context_overflow"
-            return None, 0.0
-        return {"role": "assistant", "content": "fits low", "tool_calls": []}, 0.0
-
-    monkeypatch.setattr(loop, "call_llm_with_retry", fake_call)
-    usage = {"_last_llm_error_kind": "provider_transient"}
-
-    msg, model, _local, rebound, mode = loop._run_cross_model_fallback_chain(
-        llm=SimpleNamespace(), ctx=registry._ctx, tools=registry, messages=messages,
-        active_model="primary", active_use_local=False, tool_schemas=[], active_effort="high",
-        max_retries=3, drive_logs=env.drive_root / "logs", task_id="fallback-low", round_idx=1,
-        event_queue=None, accumulated_usage=usage, task_type="task",
-        emit_progress=lambda _text: None, context_fit_plan=plan, active_context_mode="max",
-    )
-
-    assert msg["content"] == "fits low"
-    assert model == "fallback"
-    assert [row[0] for row in calls] == ["fallback", "fallback"]
-    assert calls[0][1] == rebound.max_projection.system_message()
-    assert calls[0][2] == 1 and calls[1][2] == 1
-    assert calls[1][1] == rebound.low_projection.system_message()
-    assert mode == "low"
-    assert usage["_context_fit_low_retry_used"] is True
-
-
-def test_route_switch_rebinds_same_core_to_new_exact_route(tmp_path, monkeypatch):
+def test_route_rebind_keeps_owner_projection_on_small_confirmed_route(monkeypatch, tmp_path):
     from ouroboros import context, loop
     from ouroboros.tools.registry import ToolRegistry
 
-    env, memory = _env_memory(tmp_path)
-    monkeypatch.setattr(
-        context,
-        "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {"model": "initial-model", "provider": "openai", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=1_000_000, route_fp="route-initial"),
-        ),
-    )
-    plan = context.build_context_fit_plan(
-        env, memory, {"id": "switch", "type": "task", "text": "solve"},
-        preferred_mode="max",
-    )
-    core_sha = plan.core_sha256
-    messages = plan.messages_for("max")
-    registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
+    plan = _plan()
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = "switch"
     registry._ctx.event_queue = None
     monkeypatch.setattr(
         context,
         "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {"model": "new-model", "provider": "openrouter", "base_url": "", "use_local": False},
-            _evidence(status="unprobeable", window=0, route_fp="route-new"),
+        lambda *_a, **_kw: (
+            {"model": "small", "provider": "openrouter", "base_url": "", "use_local": False},
+            SimpleNamespace(
+                status="confirmed", stale=False, window_tokens=70_000, route_fp="small-route",
+            ),
         ),
     )
+    messages = plan.messages_for("max") + [{"role": "user", "content": "x" * 100_000}]
+    rebound, mode = loop._rebind_context_fit_plan(
+        plan,
+        registry,
+        messages,
+        model="small",
+        use_local=False,
+        preferred_mode="max",
+        tool_schemas=[],
+    )
+    assert mode == "max"
+    assert messages[0] == rebound.max_projection.system_message()
+    assert rebound.route_fp == "small-route"
+
+
+@pytest.mark.parametrize("window,estimated", [(80_000, 35_000), (500_000, 40_000)])
+def test_route_rebind_preserves_nano_on_model_account_fallback(monkeypatch, tmp_path, window, estimated):
+    from dataclasses import replace
+
+    from ouroboros import context, context_fit, loop
+    from ouroboros.tools.registry import ToolRegistry
+
+    plan = replace(
+        _plan(preferred="nano"),
+        nano_projection=replace(_projection("nano"), estimated_tokens=estimated),
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "nano-fallback"
+    registry._ctx.event_queue = None
+    monkeypatch.setattr(
+        context,
+        "_context_fit_route",
+        lambda task, **_kw: (
+            {"model": task["model"], "provider": "claudexor", "use_local": False},
+            SimpleNamespace(
+                status="confirmed", stale=False, window_tokens=window,
+                route_fp="fallback-account-route", source_id="codex",
+                credential_profile_id="account-b", account_fingerprint="acct-fp",
+            ),
+        ),
+    )
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_a, **_kw: 2.0)
+    messages = plan.messages_for("nano")
 
     rebound, mode = loop._rebind_context_fit_plan(
         plan,
         registry,
         messages,
-        model="new-model",
+        model="claudexor::codex=fallback-model",
         use_local=False,
-        preferred_mode="max",
+        preferred_mode="nano",
         tool_schemas=[],
+        model_role="fallback:0",
+        credential_profile_id="account-b",
     )
 
-    assert rebound.core_sha256 == core_sha
-    assert rebound.model == "new-model"
-    assert rebound.route_fp == "route-new"
-    assert rebound.evidence_status == "unprobeable"
-    assert mode == "max"
-    assert messages[0] == rebound.max_projection.system_message()
-    assert registry._ctx.context_fit_plan is rebound
+    assert mode == "nano"
+    assert rebound.preferred_mode == rebound.initial_mode == "nano"
+    assert rebound.nano_projection is not None
+    assert rebound.nano_projection.calibrated_tokens == estimated * 2
+    assert rebound.window_tokens == window
+    assert messages[0] == rebound.nano_projection.system_message()
+    assert rebound.model == "claudexor::codex=fallback-model"
+    assert rebound.model_route["credentialProfileId"] == "account-b"
 
+
+def test_route_rebind_a_b_a_forgets_the_old_a_cache_split(monkeypatch, tmp_path):
+    from ouroboros import context, loop, usage_accounting
+    from ouroboros.tools.registry import ToolRegistry
+
+    plan = _plan()
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "switch-back"
+    registry._ctx.event_queue = None
     monkeypatch.setattr(
         context,
         "_context_fit_route",
-        lambda *_args, **_kwargs: (
-            {"model": "small-model", "provider": "openrouter", "base_url": "", "use_local": False},
-            _evidence(status="confirmed", window=100_000, route_fp="route-small"),
+        lambda task, **_kw: (
+            {"model": task["model"], "provider": "openrouter", "use_local": False},
+            SimpleNamespace(
+                status="confirmed", stale=False, window_tokens=500_000,
+                route_fp=f"route-{task['model']}",
+            ),
         ),
     )
-    # The immutable core itself fits, but accumulated dialogue must also join the
-    # exact-route projection before dispatch.
-    messages.append({"role": "user", "content": "x" * 300_000})
-    small, small_mode = loop._rebind_context_fit_plan(
-        rebound,
-        registry,
-        messages,
-        model="small-model",
-        use_local=False,
-        preferred_mode="max",
-        tool_schemas=[],
+    monkeypatch.setattr(
+        usage_accounting,
+        "estimate_cost_optional",
+        lambda _model, _prompt, _completion, *, cache_usage, **_kw: float(
+            cache_usage["cache_write_tokens"]
+        ),
     )
-    assert small.core_sha256 == core_sha
-    assert small.route_fp == "route-small"
-    assert small.max_projection.fits_known_window is True
-    assert small_mode == "low"
-    assert messages[0] == small.low_projection.system_message()
+    request = usage_accounting.AttemptRequest(
+        model="anthropic/model-a", provider="openrouter", task_id="switch-back",
+        prompt_tokens_estimate=1_000,
+    )
+    usage_accounting.stash_task_cache_split(
+        "switch-back", request.model, 800, provider=request.provider, ttl_seconds=300,
+    )
+    assert usage_accounting._reservation_cost(request) == 200
+
+    messages = plan.messages_for("max")
+    plan, _ = loop._rebind_context_fit_plan(
+        plan, registry, messages, model="anthropic/model-b", use_local=False,
+        preferred_mode="max", tool_schemas=[],
+    )
+    loop._rebind_context_fit_plan(
+        plan, registry, messages, model=request.model, use_local=False,
+        preferred_mode="max", tool_schemas=[],
+    )
+
+    assert usage_accounting._reservation_cost(request) == 1_000
 
 
 def test_route_switch_without_immutable_core_fails_loudly(tmp_path):
     from ouroboros import loop
     from ouroboros.tools.registry import ToolRegistry
 
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     with pytest.raises(RuntimeError, match="CONTEXT_FIT_REBUILD_FAILED"):
         loop._rebind_context_fit_plan(
             None,
-            registry,
+            ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path),
             [{"role": "user", "content": "go"}],
             model="new-model",
             use_local=False,
@@ -572,14 +465,13 @@ def test_route_switch_without_immutable_core_fails_loudly(tmp_path):
 
 
 def test_p3_commit_and_scope_review_do_not_use_task_context_fit():
-    """P3 stays on its one-pass ReviewCoordinator path, outside run_llm_loop."""
     from ouroboros import review_substrate
     from ouroboros.tools import review, scope_review
 
-    substrate_source = inspect.getsource(review_substrate.ReviewCoordinator._run_slot)
-    commit_source = inspect.getsource(review._run_unified_review)
-    scope_source = inspect.getsource(scope_review._call_scope_llm)
-    assert "run_llm_loop" not in substrate_source + commit_source + scope_source
-    assert "ContextFitPlan" not in substrate_source + commit_source + scope_source
-    assert "run_review_request" in inspect.getsource(review)
-    assert "run_review_request" in scope_source
+    source = (
+        inspect.getsource(review_substrate.ReviewCoordinator._run_slot)
+        + inspect.getsource(review._run_unified_review)
+        + inspect.getsource(scope_review._call_scope_llm)
+    )
+    assert "run_llm_loop" not in source
+    assert "ContextFitPlan" not in source

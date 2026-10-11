@@ -1,9 +1,13 @@
-"""Client-only MCP integration for external HTTP/SSE tool servers.
+"""Client-only MCP integration for external HTTP/SSE/stdio tool servers.
 
 Configured servers are hot-reloaded from settings, listed tools are exposed
 through ToolRegistry as provider-safe ``mcp_<server>__<tool>`` names, and each
 call opens a fresh session. Secrets, server descriptions/results, and obvious
 metadata SSRF targets are handled defensively because MCP servers are external.
+
+For ``stdio``, ``command`` is an executable and ``args`` is passed as an exact
+list without a shell. Optional cwd, literal and settings-backed environment selections
+apply to both discovery and calls; omitted fields retain SDK defaults.
 """
 
 from __future__ import annotations
@@ -14,19 +18,37 @@ import ipaddress
 import json
 import logging
 import re
+import tempfile
 import threading
 import urllib.parse
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+from ouroboros.secret_masking import (
+    looks_masked_secret as looks_masked_secret,
+)
+from ouroboros.secret_masking import (
+    MCP_RESPONSE_ONLY_FIELDS,
+    mask_prefixed_secret,
+    redact_known_values,
+)
+from ouroboros.tools.tool_result import ToolResult
+from ouroboros.platform_layer import IS_WINDOWS
+from ouroboros.config import get_runtime_mode
+from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+from ouroboros.workspace_executor import resolve_process_env, validate_process_env
 
 log = logging.getLogger(__name__)
 
 
 try:  # pragma: no cover - import guard exercised by tests via monkeypatch
     from mcp import ClientSession  # type: ignore
-    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
     from mcp.client.sse import sse_client  # type: ignore
+    from mcp.client.stdio import StdioServerParameters, stdio_client  # type: ignore
+    from mcp.client.streamable_http import streamablehttp_client  # type: ignore
 
     _MCP_SDK_AVAILABLE = True
     _MCP_SDK_IMPORT_ERROR: Optional[str] = None
@@ -34,11 +56,13 @@ except Exception as _import_exc:  # pragma: no cover - defensive
     ClientSession = None  # type: ignore[assignment]
     streamablehttp_client = None  # type: ignore[assignment]
     sse_client = None  # type: ignore[assignment]
+    stdio_client = None  # type: ignore[assignment]
+    StdioServerParameters = None  # type: ignore[assignment]
     _MCP_SDK_AVAILABLE = False
     _MCP_SDK_IMPORT_ERROR = f"{type(_import_exc).__name__}: {_import_exc}"
 
 
-SUPPORTED_TRANSPORTS = ("streamable_http", "sse")
+SUPPORTED_TRANSPORTS = ("streamable_http", "sse", "stdio")
 TOOL_NAME_PREFIX = "mcp_"
 _TOOL_NAME_PATTERN = re.compile(r"^mcp_[A-Za-z0-9_]+__[A-Za-z0-9_]+$")
 _MAX_TOOL_NAME_LEN = 64
@@ -46,6 +70,9 @@ _MAX_SERVER_SLUG = 24
 _MAX_TOOL_SLUG = 32
 _HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+_STDIO_DIAGNOSTIC_CONFIG = ContextVar("mcp_stdio_diagnostic_config", default=None)
+# The task whose discovery this listing is (``refresh_server``); None for Settings.
+_DISCOVERY_AUTHORITY = ContextVar("mcp_discovery_authority", default=None)
 
 # Block obvious metadata SSRF targets, but allow localhost/private LAN MCP servers.
 _DENIED_HOSTS = frozenset(
@@ -67,15 +94,19 @@ class MCPServerConfig:
     enabled: bool
     transport: str
     url: str
+    command: str
+    args: List[str]
     auth_header: str
     auth_token: str
     allowed_tools: List[str]
+    cwd: str = ""
+    env_from_settings: Dict[str, str] = field(default_factory=dict)
+    env: Dict[str, str] = field(default_factory=dict, repr=False)
+    secret_values: tuple[str, ...] = field(default=(), repr=False)
+    configuration_warnings: tuple[str, ...] = ()
 
     def has_auth(self) -> bool:
         return bool(self.auth_token.strip())
-
-    def sanitized_id(self) -> str:
-        return self.id
 
 
 @dataclass
@@ -95,23 +126,41 @@ class MCPServerRuntime:
 
     config: MCPServerConfig
     tools: List[MCPTool] = field(default_factory=list)
+    tool_name_collisions: List[Dict[str, str]] = field(default_factory=list)
     last_error: str = ""
     last_refreshed: str = ""
     last_attempted: str = ""
 
 
-def _slugify(value: str, *, max_len: int) -> str:
-    """Return a provider-safe slug, hashing truncated tails to avoid collisions."""
+def _normalized_stem(value: str) -> str:
+    """The character-class normalization every slug starts from (before any cap or digest)."""
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", str(value or "").strip())
+    return re.sub(r"_+", "_", safe).strip("_").lower()
+
+
+def _name_digest(value: str) -> str:
+    return hashlib.sha1(str(value or "").strip().encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _slugify(value: str, *, max_len: int, injective: bool = False) -> str:
+    """Return a provider-safe slug, hashing truncated tails to avoid collisions.
+
+    ``injective=True`` (E5, capinv-447) also appends the hash tail whenever the
+    character-class normalization was LOSSY (case folding, ``-``/``.`` → ``_``),
+    so distinct legal MCP tool names like ``get-user`` / ``get_user`` /
+    ``get.User`` can no longer collide into one slug and silently drop tools.
+    Server ids stay non-injective: their slugs are persisted settings/UI keys.
+    """
     text = str(value or "").strip()
     if not text:
         return ""
-    safe = re.sub(r"[^A-Za-z0-9_]", "_", text)
-    safe = re.sub(r"_+", "_", safe).strip("_").lower()
+    safe = _normalized_stem(text)
     if not safe:
         return ""
-    if len(safe) <= max_len:
+    lossy = injective and safe != text
+    if len(safe) <= max_len and not lossy:
         return safe
-    digest = hashlib.sha1(text.encode("utf-8", errors="replace")).hexdigest()[:6]
+    digest = _name_digest(text)
     keep = max_len - len(digest) - 1
     if keep <= 0:
         return digest
@@ -119,14 +168,28 @@ def _slugify(value: str, *, max_len: int) -> str:
 
 
 def canonical_server_id(value: str) -> str:
-    """Canonicalize the id shared by settings, UI routes, and MCPManager."""
-    return _slugify(value, max_len=_MAX_SERVER_SLUG)
+    """Canonicalize the id shared by settings, UI routes, Presence and MCPManager.
+
+    A fixed point (#1328): one ``_slugify`` pass can join a cut stem ending in
+    ``_`` to its digest as ``__``, which ``parse_tool_name`` then splits early.
+    The second pass collapses that join; it is exactly the slug every advertised
+    ``mcp_<server>__<tool>`` name already carried, so wire names are unchanged
+    and ``parse_tool_name(make_tool_name(cfg.id, t))["server_slug"] == cfg.id``.
+    """
+    return _slugify(_slugify(value, max_len=_MAX_SERVER_SLUG), max_len=_MAX_SERVER_SLUG)
+
+
+def raw_server_id(entry: Any) -> str:
+    """The canonical identity one raw ``MCP_SERVERS`` entry claims (loader expression)."""
+    if not isinstance(entry, dict):
+        return ""
+    return canonical_server_id(entry.get("id") or entry.get("slug") or entry.get("name"))
 
 
 def make_tool_name(server_id: str, tool_name: str) -> str:
     """Return provider-safe ``mcp_<server>__<tool>``."""
     server_slug = canonical_server_id(server_id)
-    tool_slug = _slugify(tool_name, max_len=_MAX_TOOL_SLUG)
+    tool_slug = _slugify(tool_name, max_len=_MAX_TOOL_SLUG, injective=True)
     if not server_slug or not tool_slug:
         return ""
     candidate = f"{TOOL_NAME_PREFIX}{server_slug}__{tool_slug}"
@@ -138,7 +201,11 @@ def make_tool_name(server_id: str, tool_name: str) -> str:
 
 
 def parse_tool_name(name: str) -> Optional[Dict[str, str]]:
-    """Reverse :func:`make_tool_name`, or return ``None`` for non-MCP names."""
+    """Split an ``mcp_<server>__<tool>``-shaped name, or return ``None``.
+
+    Syntactic only: it proves neither catalog membership nor a raw name (a
+    digest is not reversible); :meth:`MCPManager.resolve_tool_name` answers those.
+    """
     text = str(name or "")
     if not text.startswith(TOOL_NAME_PREFIX):
         return None
@@ -152,12 +219,80 @@ def parse_tool_name(name: str) -> Optional[Dict[str, str]]:
 
 
 def is_mcp_tool_name(name: str) -> bool:
-    """Return whether ``name`` is a manager-issued MCP tool name."""
+    """Return whether ``name`` has the MCP wire-name shape (not whether it is listed)."""
     return parse_tool_name(name) is not None
 
 
+_DIGEST_TAIL_RE = re.compile(r"_([0-9a-f]{12})$")
+
+
+def naming_rule_matches(requested_tool: str, tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Rows of ONE server that the naming rule relates exactly to a missed name.
+
+    ``requested_tool`` is the part after ``mcp_<server>__``; ``tools`` are that
+    server's callable rows (``name`` + ``raw_name``). A row matches when the
+    requested part normalizes like the row's raw name, equals the row's
+    registered stem without its digest, or ends in the row's digest (sha1 of
+    the raw name). These are identities of ``make_tool_name``, not similarity:
+    nothing is ranked, and several matches are an ambiguity the caller resolves.
+    """
+    text = str(requested_tool or "").strip()
+    wanted = _normalized_stem(text)
+    tail = _DIGEST_TAIL_RE.search(text)
+    matches: List[Dict[str, Any]] = []
+    for tool in tools:
+        raw = str(tool.get("raw_name") or "")
+        digest = _name_digest(raw)
+        slug = str(tool.get("name") or "").partition("__")[2]
+        stem = slug[:-len(digest) - 1] if slug.endswith("_" + digest) else ""
+        related = bool(wanted) and wanted in {_normalized_stem(raw), stem}
+        if raw and (related or (tail is not None and tail.group(1) == digest)):
+            matches.append(tool)
+    return matches
+
+
+@dataclass(frozen=True)
+class MCPNameResolution:
+    """What this process's current MCP catalog says about one requested name.
+
+    A pure lookup under the manager lock: no transport, refresh or settings
+    write. Only ``callable`` may proceed to the paid safety check and the call;
+    every other status is its own typed fact, kept distinct from a catalog miss.
+    """
+
+    status: str  # callable | not_found | disallowed | server_disabled | catalog_unavailable | mcp_disabled
+    server_id: str = ""
+    raw_name: str = ""
+    detail: str = ""
+
+    def refusal(self, requested: str) -> ToolResult:
+        """The reason alone; the registry composes the caller's callable view beside it."""
+        name, server = str(requested or ""), self.server_id
+        if self.status == "disallowed":
+            text = (
+                f"⚠️ MCP_TOOL_DISALLOWED: {self.raw_name!r} is not on the "
+                f"allowed_tools list for server {server!r}."
+            )
+            return ToolResult(status="blocked", code="ACCESS_BLOCKED", text=text)
+        if self.status == "not_found":
+            where = (f"the current tool catalog of MCP server {server!r}" if server
+                     else "the tool catalog of any configured MCP server")
+            text = f"⚠️ MCP_TOOL_NOT_FOUND: {name!r} is not in {where}. Nothing was executed."
+            return ToolResult(status="error", code="UNKNOWN_TOOL", text=text)
+        if self.status == "mcp_disabled":
+            text = "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool."
+        elif self.status == "server_disabled":
+            text = (f"⚠️ MCP_DISABLED: MCP server {server!r} is disabled in Settings → "
+                    f"Advanced; {name!r} was not executed.")
+        else:
+            text = (f"⚠️ MCP_CATALOG_UNAVAILABLE: MCP server {server!r} has no current tool "
+                    f"catalog in this process ({self.detail}); whether {name!r} exists is "
+                    "unknown. Nothing was executed.")
+        return ToolResult(status="unavailable", code="MCP_UNAVAILABLE", text=text)
+
+
 def _validate_url(url: str) -> str:
-    """Normalize HTTP(S) URLs while refusing obvious metadata SSRF hosts."""
+    """Normalize HTTP(S) URLs, applying metadata policy outside Cyber."""
     text = str(url or "").strip()
     if not text:
         raise ValueError("url is required")
@@ -171,6 +306,23 @@ def _validate_url(url: str) -> str:
     host = host.rstrip(".")
     if not host:
         raise ValueError("MCP server url is missing a hostname")
+    # Python 3.10.11 accepts malformed bracketed hosts while newer urllib
+    # releases reject them during parsing. Keep URL admission consistent on
+    # the older CI runtimes by applying the RFC 3986 bracket-host check here.
+    if "[" in parsed.netloc:
+        if host.startswith("v"):
+            if not re.fullmatch(r"v[0-9a-f]+\..+", host):
+                raise ValueError("MCP server url contains an invalid IPvFuture host")
+        else:
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError as exc:
+                raise ValueError("MCP server url contains an invalid bracketed host") from exc
+            if isinstance(address, ipaddress.IPv4Address):
+                raise ValueError("MCP server url cannot bracket an IPv4 host")
+    parsed.port  # Raises for a malformed or out-of-range port.
+    if mode_has_unrestricted_agency(get_runtime_mode()):
+        return text
     if parsed.username or parsed.password:
         raise ValueError("MCP server url must not include username/password credentials")
     if host in _DENIED_HOSTS:
@@ -206,6 +358,27 @@ def _validate_auth_token(value: str) -> str:
     return text
 
 
+def _validate_stdio_command(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("MCP stdio command must be a string")
+    command = value.strip()
+    if not command:
+        raise ValueError("MCP stdio command is required")
+    if _CONTROL_CHARS_RE.search(command):
+        raise ValueError("MCP stdio command must not contain control characters")
+    return command
+
+
+def _validate_stdio_args(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("MCP stdio args must be a list of strings")
+    if any("\x00" in item for item in value):
+        raise ValueError("MCP stdio args must not contain NUL characters")
+    return list(value)
+
+
 def _coerce_str_list(value: Any) -> List[str]:
     if value in (None, "", [], ()):
         return []
@@ -216,27 +389,60 @@ def _coerce_str_list(value: Any) -> List[str]:
     return []
 
 
-def normalize_server_config(raw: Dict[str, Any]) -> Optional[MCPServerConfig]:
+def normalize_server_config(
+    raw: Dict[str, Any], *, settings: Optional[Dict[str, Any]] = None,
+    errors: Optional[List[str]] = None,
+) -> Optional[MCPServerConfig]:
     """Validate one ``MCP_SERVERS`` entry; return ``None`` if unsalvageable."""
-    if not isinstance(raw, dict):
-        return None
+    def invalid(message: str) -> None:
+        if errors is not None:
+            errors.append(f"MCP_CONFIG_ERROR: {message}")
+        log.warning("Invalid MCP server config: %s", message)
 
-    raw_id = raw.get("id") or raw.get("slug") or raw.get("name")
-    server_slug = canonical_server_id(raw_id)
+    if not isinstance(raw, dict):
+        return invalid("server must be an object")
+    raw = {key: value for key, value in raw.items() if key not in MCP_RESPONSE_ONLY_FIELDS}
+
+    server_slug = raw_server_id(raw)
     if not server_slug:
-        return None
+        return invalid("server id or name is required")
 
     transport = str(raw.get("transport") or "streamable_http").strip().lower()
     if transport not in SUPPORTED_TRANSPORTS:
-        return None
+        return invalid("unsupported transport; use streamable_http, sse, or stdio")
 
     try:
-        url = _validate_url(raw.get("url") or "")
-        auth_header = _validate_auth_header(raw.get("auth_header") or "Authorization")
-        auth_token = _validate_auth_token(raw.get("auth_token") or "")
+        known = {"id", "slug", "name", "label", "enabled", "transport", "url", "command",
+                 "args", "auth_header", "auth_token", "allowed_tools", "cwd", "env", "env_from_settings"}
+        unknown = set(raw) - known
+        warnings = ("Fields retained but not applied: " + ", ".join(sorted(map(str, unknown))),) if unknown else ()
+        cwd = raw.get("cwd", "")
+        if not isinstance(cwd, str) or "\x00" in cwd:
+            raise ValueError("cwd must be a string without NUL")
+        refs = validate_process_env(raw.get("env_from_settings"))
+        env, secret_values = resolve_process_env(raw.get("env"), refs, settings=settings)
+        unused = ("url", "auth_token") if transport == "stdio" else ("command", "args", "cwd", "env", "env_from_settings")
+        if any(raw.get(key) for key in unused):
+            raise ValueError("fields unsupported by this transport: " + ", ".join(key for key in unused if raw.get(key)))
+        if transport == "stdio" and raw.get("auth_header", "Authorization") not in (None, "", "Authorization"):
+            raise ValueError("auth_header is unsupported for stdio")
+        if transport == "stdio":
+            url = ""
+            command = _validate_stdio_command(raw.get("command"))
+            args = _validate_stdio_args(raw.get("args"))
+            auth_header = "Authorization"
+            auth_token = ""
+        else:
+            url = _validate_url(raw.get("url") or "")
+            parsed_url = urllib.parse.urlparse(url)
+            url_secrets = tuple(value for value in (parsed_url.username, parsed_url.password) if value)
+            secret_values = (*secret_values, *url_secrets, *(urllib.parse.unquote(value) for value in url_secrets))
+            command = ""
+            args = []
+            auth_header = _validate_auth_header(raw.get("auth_header") or "Authorization")
+            auth_token = _validate_auth_token(raw.get("auth_token") or "")
     except ValueError as exc:
-        log.warning("Dropping invalid MCP server config %r: %s", raw_id, exc)
-        return None
+        return invalid(str(exc))
 
     name = str(raw.get("name") or raw.get("label") or server_slug).strip() or server_slug
     enabled_raw = raw.get("enabled", False)
@@ -253,28 +459,60 @@ def normalize_server_config(raw: Dict[str, Any]) -> Optional[MCPServerConfig]:
         enabled=enabled,
         transport=transport,
         url=url,
+        command=command,
+        args=args,
         auth_header=auth_header,
         auth_token=auth_token,
         allowed_tools=allowed_tools,
+        cwd=cwd,
+        env_from_settings=refs,
+        env=env,
+        secret_values=secret_values,
+        configuration_warnings=warnings,
     )
 
 
-def parse_servers(raw_list: Any) -> List[MCPServerConfig]:
-    """Normalize a raw ``MCP_SERVERS`` list. Invalid entries are warned and skipped."""
+def parse_servers(
+    raw_list: Any, *, settings: Optional[Dict[str, Any]] = None,
+    errors: Optional[List[Dict[str, Any]]] = None,
+) -> List[MCPServerConfig]:
+    """Normalize a raw ``MCP_SERVERS`` list. Invalid entries are warned and skipped.
+
+    Identity is judged on the FULL raw list before anything is dropped: when
+    several entries claim one canonical id, none of them is used — keeping the
+    first would silently retarget its tools, Presence grants and saved secrets
+    to whichever entry happens to come first. That id gets one typed
+    ``MCP_ID_AMBIGUOUS`` row; every other server keeps working.
+    """
     if not isinstance(raw_list, list):
         return []
-    out: List[MCPServerConfig] = []
-    seen: set = set()
+    claimants: Dict[str, List[Dict[str, Any]]] = {}
     for entry in raw_list:
-        cfg = normalize_server_config(entry)
+        server_id = raw_server_id(entry)
+        if server_id:
+            claimants.setdefault(server_id, []).append(entry)
+    ambiguous = {server_id: entries for server_id, entries in claimants.items() if len(entries) > 1}
+    out: List[MCPServerConfig] = []
+    for entry in raw_list:
+        if raw_server_id(entry) in ambiguous:
+            continue
+        entry_errors: List[str] = []
+        cfg = normalize_server_config(entry, settings=settings, errors=entry_errors)
         if cfg is None:
-            log.warning("Skipping invalid MCP server entry")
+            if errors is not None:
+                source = entry if isinstance(entry, dict) else {}
+                errors.append({"id": raw_server_id(source),
+                               "enabled": source.get("enabled", False), "tool_count": 0,
+                               "last_error": "; ".join(entry_errors), "code": "MCP_CONFIG_ERROR"})
             continue
-        if cfg.id in seen:
-            # Duplicate ids would share tool prefixes; keep the first config.
-            continue
-        seen.add(cfg.id)
         out.append(cfg)
+    for server_id, entries in ambiguous.items():
+        message = (f"MCP_ID_AMBIGUOUS: {len(entries)} configured servers resolve to server id "
+                   f"{server_id!r}; none of them is used until their ids are made distinct.")
+        log.warning("Invalid MCP server config: %s", message)
+        if errors is not None:
+            errors.append({"id": server_id, "enabled": any(e.get("enabled", False) for e in entries),
+                           "tool_count": 0, "last_error": message, "code": "MCP_ID_AMBIGUOUS"})
     return out
 
 
@@ -288,27 +526,16 @@ def redact_servers_for_status(configs: List[MCPServerConfig]) -> List[Dict[str, 
                 "name": cfg.name,
                 "enabled": cfg.enabled,
                 "transport": cfg.transport,
-                "url": cfg.url,
+                "url": _redact_error_text(cfg.url, cfg),
                 "auth_header": cfg.auth_header,
-                "auth_token": _mask_token(cfg.auth_token),
+                "auth_token": mask_prefixed_secret(cfg.auth_token, visible_chars=4),
                 "auth_configured": cfg.has_auth(),
                 "allowed_tools": list(cfg.allowed_tools),
+                "cwd": cfg.cwd,
+                "env_from_settings": dict(cfg.env_from_settings),
             }
         )
     return out
-
-
-def _mask_token(value: str) -> str:
-    text = str(value or "")
-    if not text:
-        return ""
-    return text[:4] + "..." if len(text) > 4 else "***"
-
-
-def looks_masked_secret(value: Any) -> bool:
-    text = str(value or "").strip()
-    return text in ("***", "***set***") or text.endswith("...")
-
 
 def _redact_error_text(text: Any, cfg: Optional[MCPServerConfig] = None) -> str:
     """Redact MCP secrets before surfacing transport errors to UI/LLM/logs."""
@@ -324,6 +551,7 @@ def _redact_error_text(text: Any, cfg: Optional[MCPServerConfig] = None) -> str:
                 safe_netloc = f"{safe_netloc}:{parsed.port}"
             safe_url = urllib.parse.urlunparse(parsed._replace(netloc=safe_netloc))
             out = out.replace(cfg.url, safe_url)
+        out = redact_known_values(out, cfg.secret_values)
     return out
 
 
@@ -352,21 +580,73 @@ def _untrusted_schema_text(value: str) -> str:
     return f"{prefix} {text[:512]}" if text else prefix
 
 
-def _wrap_schema_text_fields(value: Any) -> Any:
+def _wrap_schema_text_fields(value: Any, cfg: Optional[MCPServerConfig] = None) -> Any:
     if isinstance(value, dict):
         out: Dict[str, Any] = {}
         for key, item in value.items():
             if key in {"description", "title"} and isinstance(item, str):
-                out[key] = _untrusted_schema_text(item)
+                out[key] = _untrusted_schema_text(_redact_error_text(item, cfg))
             else:
-                out[key] = _wrap_schema_text_fields(item)
+                out[key] = _wrap_schema_text_fields(item, cfg)
         return out
     if isinstance(value, list):
-        return [_wrap_schema_text_fields(item) for item in value]
+        return [_wrap_schema_text_fields(item, cfg) for item in value]
     return value
 
 
 # Async transport.
+
+
+@asynccontextmanager
+async def _stdio_with_diagnostics(params: Any, cfg: MCPServerConfig):
+    # SDK stderr otherwise goes straight to the host console, outside masking.
+    # Invalid JSON also makes the SDK log a validation traceback with raw input.
+    # Its tasks inherit this context; concurrent servers never share selections.
+    sdk_log = logging.getLogger("mcp.client.stdio")
+    def project_log(record: logging.LogRecord) -> bool:
+        if _STDIO_DIAGNOSTIC_CONFIG.get() is cfg:
+            message = record.getMessage()
+            if record.exc_info:
+                message += "\n" + logging.Formatter().formatException(record.exc_info)
+                record.exc_info = record.exc_text = None
+            record.msg, record.args = _redact_error_text(message, cfg), ()
+        return True
+    token = _STDIO_DIAGNOSTIC_CONFIG.set(cfg)
+    sdk_log.addFilter(project_log)
+    try:
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr:
+            try:
+                async with stdio_client(params, errlog=stderr) as streams:
+                    yield streams
+            finally:
+                stderr.seek(0)
+                diagnostic = _redact_error_text(stderr.read(), cfg)
+                if diagnostic:
+                    log.warning("MCP stdio stderr (%s): %s", cfg.id, diagnostic)
+    finally:
+        sdk_log.removeFilter(project_log)
+        _STDIO_DIAGNOSTIC_CONFIG.reset(token)
+
+
+def _transport_factory(cfg: MCPServerConfig):
+    if cfg.transport == "streamable_http":
+        headers = {cfg.auth_header: cfg.auth_token} if cfg.has_auth() else {}
+        return streamablehttp_client(cfg.url, headers=headers)
+    if cfg.transport == "sse":
+        headers = {cfg.auth_header: cfg.auth_token} if cfg.has_auth() else {}
+        return sse_client(cfg.url, headers=headers)
+    if cfg.transport == "stdio":
+        # Leaving env/cwd unset uses the SDK's small cross-platform default
+        # environment and its context-managed process shutdown sequence.
+        # The SDK merges a plain dict onto its defaults. Windows env names are
+        # case-insensitive: canonical names prevent a second Path/PATH entry.
+        env = {key.upper() if IS_WINDOWS else key: value for key, value in cfg.env.items()}
+        selected = {"env": env} if cfg.env else {}
+        if cfg.cwd:
+            selected["cwd"] = cfg.cwd
+        params = StdioServerParameters(command=cfg.command, args=list(cfg.args), **selected)
+        return _stdio_with_diagnostics(params, cfg) if cfg.env else stdio_client(params)
+    raise RuntimeError(f"Unsupported transport: {cfg.transport!r}")
 
 
 async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[Dict[str, Any]]:
@@ -375,12 +655,10 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    headers = {}
-    if cfg.has_auth():
-        headers[cfg.auth_header] = cfg.auth_token
+    from ouroboros.owner_pause import submit_async_preparation
 
-    async def _do_with_session(session_factory) -> List[Dict[str, Any]]:
-        async with session_factory as transport_ctx:
+    async def _do_with_session() -> List[Dict[str, Any]]:
+        async with _transport_factory(cfg) as transport_ctx:
             # Both transports yield read/write streams.
             streams = transport_ctx
             if isinstance(streams, tuple):
@@ -389,46 +667,59 @@ async def _list_tools_async(cfg: MCPServerConfig, *, timeout_sec: int) -> List[D
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.list_tools()
+                # Follow nextCursor (E5, capinv-447): the MCP listing is paginated
+                # and a single call silently loses every tool after page one. The
+                # page bound only guards against a cursor loop from a broken server.
                 tools_raw: List[Dict[str, Any]] = []
-                for tool in result.tools or []:
-                    tools_raw.append(
-                        {
-                            "name": getattr(tool, "name", ""),
-                            "description": getattr(tool, "description", "") or "",
-                            "input_schema": getattr(tool, "inputSchema", {}) or {},
-                        }
+                cursor: Any = None
+                for _page in range(50):
+                    result = await (
+                        session.list_tools(cursor=cursor) if cursor else session.list_tools()
                     )
+                    for tool in result.tools or []:
+                        tools_raw.append(
+                            {
+                                "name": getattr(tool, "name", ""),
+                                "description": getattr(tool, "description", "") or "",
+                                "input_schema": getattr(tool, "inputSchema", {}) or {},
+                            }
+                        )
+                    cursor = getattr(result, "nextCursor", None)
+                    if not cursor:
+                        break
+                else:
+                    if cursor:
+                        # Cap exhausted with pages remaining: a partial catalog
+                        # must not read as the complete one (#447 P1).
+                        tools_raw.append({
+                            "name": "",
+                            "_pagination_truncated": True,
+                        })
+                        log.warning(
+                            "MCP tool listing stopped at the 50-page bound with "
+                            "nextCursor still present; catalog is PARTIAL",
+                        )
                 return tools_raw
 
-    if cfg.transport == "streamable_http":
-        factory = streamablehttp_client(cfg.url, headers=headers)
-    elif cfg.transport == "sse":
-        factory = sse_client(cfg.url, headers=headers)
-    else:  # pragma: no cover - guarded by parse_servers
-        raise RuntimeError(f"Unsupported transport: {cfg.transport!r}")
-
-    return await asyncio.wait_for(_do_with_session(factory), timeout=timeout_sec)
+    # A task's discovery passes that task's launch admission before each
+    # transport entry (a stdio server starts there); Settings probes name none.
+    return await asyncio.wait_for(
+        submit_async_preparation(_do_with_session, source=_DISCOVERY_AUTHORITY.get()), timeout=timeout_sec
+    )
 
 
 async def _call_tool_async(
     cfg: MCPServerConfig, tool_name: str, arguments: Dict[str, Any], *, timeout_sec: int
-) -> str:
-    """Open a fresh session, call one tool, and return a stringified result."""
+) -> ToolResult:
+    """Open a fresh session and preserve the SDK-owned error bit."""
     if not _MCP_SDK_AVAILABLE:
         raise RuntimeError(
             "MCP client SDK not installed. Add `mcp>=1.6` to the runtime."
         )
-    headers = {}
-    if cfg.has_auth():
-        headers[cfg.auth_header] = cfg.auth_token
+    from ouroboros.owner_pause import submit_async_operation, submit_async_preparation
 
-    async def _do() -> str:
-        if cfg.transport == "streamable_http":
-            factory = streamablehttp_client(cfg.url, headers=headers)
-        else:
-            factory = sse_client(cfg.url, headers=headers)
-        async with factory as transport_ctx:
+    async def _do() -> ToolResult:
+        async with _transport_factory(cfg) as transport_ctx:
             streams = transport_ctx
             if isinstance(streams, tuple):
                 read, write = streams[0], streams[1]
@@ -436,10 +727,11 @@ async def _call_tool_async(
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                result = await session.call_tool(tool_name, arguments)
-                return _stringify_call_result(result)
+                result = await submit_async_operation(None, session.call_tool, tool_name, arguments)
+                return _tool_result_from_call_result(result)
 
-    return await asyncio.wait_for(_do(), timeout=timeout_sec)
+    # Launch admission precedes transport entry: a stdio server starts there.
+    return await asyncio.wait_for(submit_async_preparation(_do), timeout=timeout_sec)
 
 
 def _stringify_call_result(result: Any) -> str:
@@ -456,15 +748,34 @@ def _stringify_call_result(result: Any) -> str:
             parts.append(json.dumps(_serialize_content_part(item), ensure_ascii=False))
         except Exception:
             parts.append(repr(item))
-    if not parts and getattr(result, "structuredContent", None):
+    # structuredContent is protocol data in its own right (E5, capinv-447):
+    # carry it even when text/content parts exist, unless it duplicates one.
+    structured = getattr(result, "structuredContent", None)
+    if structured is not None:
         try:
-            parts.append(json.dumps(result.structuredContent, ensure_ascii=False))
+            dumped = json.dumps(structured, ensure_ascii=False)
         except Exception:
-            parts.append(repr(result.structuredContent))
+            dumped = repr(structured)
+        if dumped not in parts:
+            parts.append(f"structuredContent: {dumped}" if parts else dumped)
     body = "\n\n".join(parts).strip() or "(empty result)"
     if is_error:
         return f"⚠️ MCP_TOOL_ERROR: {body}"
     return body
+
+
+def _tool_result_from_call_result(result: Any) -> ToolResult:
+    """Preserve the SDK error bit without trusting result-body markers."""
+    is_error = bool(
+        getattr(result, "isError", False)
+        or getattr(result, "is_error", False)
+    )
+    return ToolResult(
+        status="error" if is_error else "ok",
+        code="MCP_ERROR" if is_error else "OK",
+        text=_stringify_call_result(result),
+        meta={"mcp_is_error": is_error},
+    )
 
 
 def _serialize_content_part(item: Any) -> Dict[str, Any]:
@@ -474,6 +785,19 @@ def _serialize_content_part(item: Any) -> Dict[str, Any]:
         value = getattr(item, attr, None)
         if value is not None and not callable(value):
             out[attr] = value
+    # EmbeddedResource carries its payload in a NESTED resource object (E5,
+    # capinv-447): omitting it dropped the text/blob of every embedded resource.
+    resource = getattr(item, "resource", None)
+    if resource is not None and not callable(resource):
+        nested: Dict[str, Any] = {}
+        for attr in ("uri", "mimeType", "text", "blob"):
+            value = getattr(resource, attr, None)
+            if value is not None and not callable(value):
+                nested[attr] = str(value) if attr == "uri" else value
+        if nested:
+            out["resource"] = nested
+    if "uri" in out:
+        out["uri"] = str(out["uri"])  # AnyUrl is not JSON-serializable
     return out
 
 
@@ -496,7 +820,10 @@ def _run_async(coro_factory: Callable[[], Awaitable[Any]], *, join_timeout: Opti
         except BaseException as exc:
             holder["error"] = exc
 
-    thread = threading.Thread(target=_runner, name="mcp-sync-runner", daemon=True)
+    import contextvars
+
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(_runner), name="mcp-sync-runner", daemon=True)
     thread.start()
     thread.join(timeout=join_timeout)
     if thread.is_alive():
@@ -517,6 +844,7 @@ class MCPManager:
         self._enabled = False
         self._tool_timeout_sec = 60
         self._servers: Dict[str, MCPServerRuntime] = {}
+        self._configuration_errors: List[Dict[str, Any]] = []
         self._configured = False
         self._settings_fingerprint = ""
         self._settings_mtime_ns: Optional[int] = None
@@ -526,7 +854,7 @@ class MCPManager:
             lambda cfg, timeout: _list_tools_async(cfg, timeout_sec=timeout)
         )
         self._async_call_tool: Callable[
-            [MCPServerConfig, str, Dict[str, Any], int], Awaitable[str]
+            [MCPServerConfig, str, Dict[str, Any], int], Awaitable[ToolResult]
         ] = (
             lambda cfg, name, args, timeout: _call_tool_async(
                 cfg, name, args, timeout_sec=timeout
@@ -541,8 +869,16 @@ class MCPManager:
             "MCP_ENABLED": settings.get("MCP_ENABLED"),
             "MCP_TOOL_TIMEOUT_SEC": settings.get("MCP_TOOL_TIMEOUT_SEC"),
             "MCP_SERVERS": settings.get("MCP_SERVERS"),
+            "effective_runtime_mode": get_runtime_mode(),
         }
-        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+        references = set()
+        servers = settings.get("MCP_SERVERS")
+        for server in servers if isinstance(servers, list) else []:
+            refs = server.get("env_from_settings") if isinstance(server, dict) else None
+            if isinstance(refs, dict):
+                references.update(ref for ref in refs.values() if isinstance(ref, str))
+        payload["selected_settings"] = {ref: settings.get(ref) for ref in references}
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
     def reconfigure(self, settings: Dict[str, Any], *, settings_mtime_ns: Optional[int] = None) -> bool:
         """Rebuild servers, preserving tools for unchanged configs."""
@@ -560,7 +896,8 @@ class MCPManager:
                 self._tool_timeout_sec = max(1, int(settings.get("MCP_TOOL_TIMEOUT_SEC") or 60))
             except (TypeError, ValueError):
                 self._tool_timeout_sec = 60
-            new_configs = parse_servers(settings.get("MCP_SERVERS"))
+            self._configuration_errors = []
+            new_configs = parse_servers(settings.get("MCP_SERVERS"), settings=settings, errors=self._configuration_errors)
             new_servers: Dict[str, MCPServerRuntime] = {}
             for cfg in new_configs:
                 old = self._servers.get(cfg.id)
@@ -607,7 +944,8 @@ class MCPManager:
         with self._lock:
             if not self._enabled:
                 return []
-            out: List[Dict[str, str]] = []
+            out = [{"id": item["id"], "last_error": item["last_error"]}
+                   for item in self._configuration_errors if item["enabled"]]
             for runtime in self._servers.values():
                 cfg = runtime.config
                 if not cfg.enabled:
@@ -626,7 +964,7 @@ class MCPManager:
                 cfg = runtime.config
                 if not cfg.enabled:
                     continue
-                allowed = set(cfg.allowed_tools)
+                allowed = set() if mode_has_unrestricted_agency(get_runtime_mode()) else set(cfg.allowed_tools)
                 for tool in runtime.tools:
                     if allowed and tool.raw_name not in allowed:
                         continue
@@ -637,9 +975,29 @@ class MCPManager:
                             "schema": tool.schema,
                             "server_id": tool.server_id,
                             "raw_name": tool.raw_name,
+                            "raw_description": _redact_error_text(tool.description, cfg),
                         }
                     )
             return results
+
+    def tool_name_collisions(self) -> List[Dict[str, str]]:
+        """Return provider-name collisions omitted by first-wins normalization."""
+
+        with self._lock:
+            if not self._enabled:
+                return []
+            return [
+                dict(item, server_id=runtime.config.id)
+                for runtime in self._servers.values()
+                if runtime.config.enabled
+                for item in runtime.tool_name_collisions
+                if (
+                    mode_has_unrestricted_agency(get_runtime_mode())
+                    or not runtime.config.allowed_tools
+                    or item.get("kept_raw_name") in runtime.config.allowed_tools
+                    or item.get("dropped_raw_name") in runtime.config.allowed_tools
+                )
+            ]
 
     def get_tool(self, prefixed_name: str) -> Optional[Dict[str, Any]]:
         for tool in self.list_tools_for_registry():
@@ -650,7 +1008,7 @@ class MCPManager:
     def status_payload(self) -> Dict[str, Any]:
         """Return a redacted status snapshot for ``/api/mcp/status``."""
         with self._lock:
-            servers: List[Dict[str, Any]] = []
+            servers: List[Dict[str, Any]] = [dict(item) for item in self._configuration_errors]
             for runtime in self._servers.values():
                 cfg = runtime.config
                 servers.append(
@@ -659,10 +1017,13 @@ class MCPManager:
                         "name": cfg.name,
                         "enabled": cfg.enabled,
                         "transport": cfg.transport,
-                        "url": cfg.url,
+                        "url": _redact_error_text(cfg.url, cfg),
                         "auth_header": cfg.auth_header,
                         "auth_configured": cfg.has_auth(),
                         "allowed_tools": list(cfg.allowed_tools),
+                        "cwd": cfg.cwd,
+                        "env_from_settings": dict(cfg.env_from_settings),
+                        "configuration_warnings": list(cfg.configuration_warnings),
                         "tool_count": len(runtime.tools),
                         "tools": [
                             {
@@ -671,6 +1032,9 @@ class MCPManager:
                                 "description": _redact_error_text(tool.description, cfg),
                             }
                             for tool in runtime.tools
+                        ],
+                        "tool_name_collisions": [
+                            dict(item) for item in runtime.tool_name_collisions
                         ],
                         "last_error": runtime.last_error,
                         "last_refreshed": runtime.last_refreshed,
@@ -685,13 +1049,20 @@ class MCPManager:
                 "servers": servers,
             }
 
-    def refresh_server(self, server_id: str) -> Dict[str, Any]:
-        """Re-list tools for one server."""
+    def refresh_server(self, server_id: str, *, authority: Any = None) -> Dict[str, Any]:
+        """Re-list tools for one server; ``authority`` is the discovering task.
+
+        A listing that task's launch admission refuses (an accepted owner
+        Pause) opened nothing: the runtime keeps its tools and stays unlisted.
+        """
         with self._lock:
             if not self._enabled:
                 return {"ok": False, "error": "MCP client is disabled."}
             runtime = self._servers.get(server_id)
             if runtime is None:
+                for error in self._configuration_errors:
+                    if error["id"] == server_id:
+                        return {"ok": False, "code": error["code"], "error": error["last_error"]}
                 return {
                     "ok": False,
                     "error": f"unknown server id: {server_id!r}",
@@ -701,9 +1072,14 @@ class MCPManager:
                 return {"ok": False, "error": f"MCP server {server_id!r} is disabled."}
             timeout = self._tool_timeout_sec
 
+        from ouroboros.owner_pause import OwnerPauseRefused
+
         attempted_at = datetime.now(timezone.utc).isoformat()
+        token = _DISCOVERY_AUTHORITY.set(authority)
         try:
             tools_raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
+        except OwnerPauseRefused as exc:
+            return {"ok": False, "not_started": True, "error": f"MCP listing NOT STARTED: {exc}"}
         except BaseException as exc:  # noqa: BLE001 - surface any failure
             err_text = f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"
             with self._lock:
@@ -712,28 +1088,64 @@ class MCPManager:
                     target.last_error = err_text
                     target.last_attempted = attempted_at
                     target.tools = []
+                    target.tool_name_collisions = []
             return {"ok": False, "error": err_text}
+        finally:
+            _DISCOVERY_AUTHORITY.reset(token)
 
+        pagination_truncated = any(
+            isinstance(item, dict) and item.get("_pagination_truncated")
+            for item in tools_raw
+        )
+        tools_raw = [
+            item for item in tools_raw
+            if not (isinstance(item, dict) and item.get("_pagination_truncated"))
+        ]
         normalized = [
             MCPTool(
                 server_id=cfg.id,
                 raw_name=str(item.get("name") or "").strip(),
                 prefixed_name=make_tool_name(cfg.id, item.get("name") or ""),
-                description=_redact_error_text(str(item.get("description") or "")[:1024], cfg),
-                schema=_normalize_input_schema(item.get("input_schema")),
+                description=_redact_error_text(str(item.get("description") or ""), cfg)[:1024],
+                schema=_normalize_input_schema(item.get("input_schema"), cfg),
             )
             for item in tools_raw
             if str(item.get("name") or "").strip()
         ]
         normalized = [tool for tool in normalized if tool.prefixed_name]
-        # Drop duplicates caused by slug collisions.
-        seen: set = set()
+        # Drop duplicates caused by slug collisions. A residual collision (the
+        # 12-hex tail makes it astronomically rare) DROPS a tool — a capability
+        # omission that must be disclosed, not silently swallowed (#447 P1).
+        seen: Dict[str, MCPTool] = {}
         deduped: List[MCPTool] = []
+        collisions: List[Dict[str, str]] = []
         for tool in normalized:
             if tool.prefixed_name in seen:
+                kept = seen[tool.prefixed_name]
+                collisions.append({
+                    "prefixed_name": tool.prefixed_name,
+                    "kept_raw_name": kept.raw_name,
+                    "dropped_raw_name": tool.raw_name,
+                })
                 continue
-            seen.add(tool.prefixed_name)
+            seen[tool.prefixed_name] = tool
             deduped.append(tool)
+        omission_notes: List[str] = []
+        if collisions:
+            log.error(
+                "MCP tool name collision on server %s; first descriptor wins: %s",
+                cfg.id,
+                ", ".join(sorted({item["prefixed_name"] for item in collisions})),
+            )
+            omission_notes.append(
+                f"{len(collisions)} tool(s) unavailable due to slug collision: "
+                + ", ".join(item["dropped_raw_name"] for item in collisions[:5])
+            )
+        if pagination_truncated:
+            omission_notes.append(
+                "tool catalog is PARTIAL: listing stopped at the 50-page bound "
+                "with more pages remaining"
+            )
 
         finished_at = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -745,13 +1157,19 @@ class MCPManager:
                 }
             if target is not None:
                 target.tools = deduped
-                target.last_error = ""
+                target.tool_name_collisions = collisions
+                # A successful refresh with omissions keeps the omission note
+                # visible (#447 P1): a partial catalog or a collided tool must
+                # not read as a clean complete listing.
+                target.last_error = "; ".join(omission_notes)
                 target.last_attempted = attempted_at
                 target.last_refreshed = finished_at
         return {
             "ok": True,
             "server_id": cfg.id,
             "tool_count": len(deduped),
+            "configuration_warnings": list(cfg.configuration_warnings),
+            "tool_name_collisions": [dict(item) for item in collisions],
             "tools": [
                 {
                     "name": tool.raw_name,
@@ -762,15 +1180,16 @@ class MCPManager:
             ],
         }
 
-    def refresh_all(self) -> Dict[str, Any]:
-        """Refresh every enabled server."""
+    def refresh_all(self, *, authority: Any = None, unlisted_only: bool = False) -> Dict[str, Any]:
+        """Refresh every enabled server (or only those never attempted)."""
         outcomes: Dict[str, Any] = {}
         with self._lock:
             if not self._enabled:
                 return {"refreshed": {}, "error": "MCP client is disabled."}
-            ids = [cfg_id for cfg_id, rt in self._servers.items() if rt.config.enabled]
+            ids = [cfg_id for cfg_id, rt in self._servers.items()
+                   if rt.config.enabled and not (unlisted_only and rt.last_attempted)]
         for server_id in ids:
-            outcomes[server_id] = self.refresh_server(server_id)
+            outcomes[server_id] = self.refresh_server(server_id, authority=authority)
         return {"refreshed": outcomes}
 
     def refresh_all_background(self, *, reason: str = "settings") -> None:
@@ -792,79 +1211,136 @@ class MCPManager:
 
         threading.Thread(target=_runner, name=f"mcp-refresh-{reason}", daemon=True).start()
 
-    def test_server(self, raw_config: Dict[str, Any]) -> Dict[str, Any]:
+    def test_server(self, raw_config: Dict[str, Any], *, settings: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Probe a candidate config without persisting it."""
-        cfg = normalize_server_config(raw_config)
+        errors: List[str] = []
+        cfg = normalize_server_config(raw_config, settings=settings, errors=errors)
         if cfg is None:
             return {
                 "ok": False,
-                "error": "Invalid MCP server config (missing id/url, unsupported transport, or denied URL).",
+                "code": "MCP_CONFIG_ERROR",
+                "error": "Invalid MCP server config: " + "; ".join(errors),
             }
         timeout = self._tool_timeout_sec
         try:
             tools_raw = _run_async(lambda: self._async_list_tools(cfg, timeout), join_timeout=timeout + 3)
         except BaseException as exc:  # noqa: BLE001
             return {"ok": False, "error": f"{type(exc).__name__}: {_redact_error_text(exc, cfg)}"}
+        truncated = any(
+            isinstance(t, dict) and t.get("_pagination_truncated") for t in tools_raw
+        )
+        tools_raw = [
+            t for t in tools_raw
+            if not (isinstance(t, dict) and t.get("_pagination_truncated"))
+        ]
         return {
             "ok": True,
             "server_id": cfg.id,
             "tool_count": len(tools_raw),
+            "configuration_warnings": list(cfg.configuration_warnings),
+            **({"pagination_truncated": True} if truncated else {}),
             "tools": [
                 {
                     "name": str(t.get("name") or ""),
-                    "description": _redact_error_text(str(t.get("description") or "")[:512], cfg),
+                    "description": _redact_error_text(str(t.get("description") or ""), cfg)[:512],
                 }
                 for t in tools_raw
             ],
         }
 
-    def call_tool(self, prefixed_name: str, arguments: Dict[str, Any]) -> str:
-        """Synchronously invoke an MCP tool and return a model-facing string."""
-        if not self.is_enabled():
-            return "⚠️ MCP_DISABLED: enable MCP in Settings → Advanced to use this tool."
+    def _resolve_locked(self, prefixed_name: str) -> tuple[MCPNameResolution, Any, Any]:
+        """Exact catalog lookup (caller holds ``self._lock``): (fact, config, tool)."""
+        if not self._enabled:
+            return MCPNameResolution("mcp_disabled"), None, None
+        parsed = parse_tool_name(prefixed_name)
+        server = parsed["server_slug"] if parsed else ""
+        runtime = self._servers.get(server)
+        if runtime is None:
+            broken = next((item for item in self._configuration_errors
+                           if server and item["id"] == server and item["enabled"]), None)
+            if broken is not None:
+                detail = f"its configuration is invalid: {broken['last_error']}"
+                return MCPNameResolution("catalog_unavailable", server, detail=detail), None, None
+            return MCPNameResolution("not_found"), None, None
+        cfg = runtime.config
+        if not cfg.enabled:
+            return MCPNameResolution("server_disabled", cfg.id), cfg, None
+        allowed = set() if mode_has_unrestricted_agency(get_runtime_mode()) else set(cfg.allowed_tools)
+        for tool in runtime.tools:
+            if tool.prefixed_name == prefixed_name:
+                status = "disallowed" if allowed and tool.raw_name not in allowed else "callable"
+                return MCPNameResolution(status, cfg.id, tool.raw_name), cfg, tool
+        if not runtime.tools and (runtime.last_error or not runtime.last_refreshed):
+            # No listing to judge the name against: health is unknown, not a miss.
+            detail = (f"its last listing failed: {_redact_error_text(runtime.last_error, cfg)}"
+                      if runtime.last_error else "it has not been listed yet")
+            return MCPNameResolution("catalog_unavailable", cfg.id, detail=detail), cfg, None
+        return MCPNameResolution("not_found", cfg.id), cfg, None
+
+    def resolve_tool_name(self, prefixed_name: str) -> MCPNameResolution:
+        """The current catalog's fact for one name; performs no transport or refresh."""
         with self._lock:
-            tool_descriptor = None
-            for runtime in self._servers.values():
-                cfg = runtime.config
-                if not cfg.enabled:
-                    continue
-                allowed = set(cfg.allowed_tools)
-                for tool in runtime.tools:
-                    if tool.prefixed_name == prefixed_name:
-                        if allowed and tool.raw_name not in allowed:
-                            return (
-                                f"⚠️ MCP_TOOL_DISALLOWED: {tool.raw_name!r} is not on the "
-                                f"allowed_tools list for server {cfg.id!r}."
-                            )
-                        tool_descriptor = (cfg, tool)
-                        break
-                if tool_descriptor:
-                    break
-            if not tool_descriptor:
-                return (
-                    f"⚠️ MCP_TOOL_NOT_FOUND: {prefixed_name!r}. Refresh the server in "
-                    "Settings → Advanced or check the allowed_tools allowlist."
-                )
-            cfg, tool = tool_descriptor
+            return self._resolve_locked(prefixed_name)[0]
+
+    def _call_tool_result(
+        self, prefixed_name: str, arguments: Dict[str, Any]
+    ) -> ToolResult:
+        """Invoke one MCP tool while retaining host-attested provider facts."""
+        with self._lock:
+            resolution, cfg, tool = self._resolve_locked(prefixed_name)
             timeout = self._tool_timeout_sec
+        if resolution.status != "callable":
+            return resolution.refusal(prefixed_name)
         try:
-            text = _run_async(
+            result = _run_async(
                 lambda: self._async_call_tool(cfg, tool.raw_name, arguments or {}, timeout),
                 join_timeout=timeout + 3,
             )
+            if not isinstance(result, ToolResult):
+                raise TypeError("MCP transport returned a non-ToolResult outcome")
         except asyncio.TimeoutError:
-            return f"⚠️ MCP_TOOL_TIMEOUT: server {cfg.id!r} did not respond in {timeout}s"
+            text = (
+                f"⚠️ MCP_TOOL_TIMEOUT: server {cfg.id!r} did not respond in {timeout}s. "
+                "The remote outcome is unknown: side effects may already have happened, "
+                "and remote cancellation is not confirmed. Use the server-specific status/read "
+                "tool, if available, to reconcile the operation before retrying."
+            )
+            return ToolResult(status="timeout", code="MCP_TIMEOUT", text=text)
         except BaseException as exc:  # noqa: BLE001 - any failure is reported
             body = f"⚠️ MCP_TOOL_ERROR: {type(exc).__name__}: {_redact_error_text(exc, cfg)}"
-            return _model_facing_result(cfg, tool.raw_name, body)
-        return _model_facing_result(cfg, tool.raw_name, _redact_error_text(text, cfg))
+            text = _model_facing_result(cfg, tool.raw_name, body)
+            return ToolResult(
+                status="error",
+                code="MCP_ERROR",
+                text=text,
+                meta={"dynamic_provider": True},
+            )
+        # Joined normal return (either SDK error bit): this invocation's call is over.
+        from ouroboros.owner_pause import record_mcp_call_returned
+
+        record_mcp_call_returned(prefixed_name)
+        text = _model_facing_result(
+            cfg,
+            tool.raw_name,
+            _redact_error_text(result.text, cfg),
+        )
+        return ToolResult(
+            status=result.status,
+            code=result.code,
+            text=text,
+            meta={**dict(result.meta), "dynamic_provider": True},
+        )
+
+    def call_tool(self, prefixed_name: str, arguments: Dict[str, Any]) -> str:
+        """Synchronously invoke an MCP tool and return its text projection."""
+        return self._call_tool_result(prefixed_name, arguments).text
 
 
-def _normalize_input_schema(value: Any) -> Dict[str, Any]:
+def _normalize_input_schema(value: Any, cfg: Optional[MCPServerConfig] = None) -> Dict[str, Any]:
     """Coerce external input_schema into the provider tool-schema minimum."""
     if not isinstance(value, dict):
         return {"type": "object", "properties": {}}
-    out = _wrap_schema_text_fields(dict(value))
+    out = _wrap_schema_text_fields(dict(value), cfg)
     if out.get("type") != "object":
         out["type"] = "object"
     if "properties" not in out or not isinstance(out["properties"], dict):
@@ -896,8 +1372,12 @@ def reconfigure_from_settings(settings: Dict[str, Any]) -> None:
     get_manager().reconfigure(settings)
 
 
-def ensure_configured_from_settings(*, refresh: bool = False) -> None:
-    """Configure this process's manager; workers have separate Python heaps."""
+def ensure_configured_from_settings(*, refresh: bool = False, authority: Any = None) -> None:
+    """Configure this process's manager; workers have separate Python heaps.
+
+    A refreshing read lists changed settings, and any server a refused
+    ``authority`` (see ``refresh_server``) left never attempted.
+    """
     from ouroboros.config import SETTINGS_PATH, load_settings
 
     manager = get_manager()
@@ -907,11 +1387,11 @@ def ensure_configured_from_settings(*, refresh: bool = False) -> None:
         mtime_ns = None
     if manager.is_configured() and manager.settings_mtime_ns() is None:
         return
-    if manager.is_configured() and manager.settings_mtime_ns() == mtime_ns:
-        return
-    changed = manager.reconfigure(load_settings(), settings_mtime_ns=mtime_ns)
-    if refresh and changed:
-        manager.refresh_all()
+    changed = False
+    if not (manager.is_configured() and manager.settings_mtime_ns() == mtime_ns):
+        changed = manager.reconfigure(load_settings(), settings_mtime_ns=mtime_ns)
+    if refresh:
+        manager.refresh_all(authority=authority, unlisted_only=not changed)
 
 
 def refresh_all_background(*, reason: str = "settings") -> None:
@@ -921,3 +1401,8 @@ def refresh_all_background(*, reason: str = "settings") -> None:
 def call_mcp_tool(name: str, arguments: Dict[str, Any]) -> str:
     """ToolRegistry sync call helper."""
     return get_manager().call_tool(name, arguments or {})
+
+
+def _call_mcp_tool_result(name: str, arguments: Dict[str, Any]) -> ToolResult:
+    """Internal typed ToolRegistry call helper."""
+    return get_manager()._call_tool_result(name, arguments or {})

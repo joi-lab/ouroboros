@@ -1,0 +1,469 @@
+{
+  "_comment": "One table, two implementations: ouroboros.configured_subagents (subagent_handle, roster_handles, validate_unique_engines) and web/modules/route_editor_primitives.js (subagentHandle, rosterHandles, sameEngineAs). 'global_processing' is the inherited OUROBOROS_PROCESSING_PREFERENCE the roster is read under ('' when absent); 'handle' is a pure function of ONE row's EFFECTIVE facts with baselines (full access, standard processing) omitted; 'roster' is the label the live roster shows (twins get ~<stored id>); 'same_engine_as' is the index of the earlier row a save refuses this row against (null = accepted). 'snapshots' are frozen task snapshots and history identities (Python only: the browser never reads one) - a record is named from its OWN facts, so a pre-access snapshot is named by the workspace_write it actually ran with.",
+  "rosters": [
+    {
+      "case": "one bare API row: the handle is the target as stored",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "fast-scout",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "google/gemini-3.8-flash"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "handle": "google/gemini-3.8-flash",
+          "roster": "google/gemini-3.8-flash",
+          "same_engine_as": null
+        }
+      ]
+    },
+    {
+      "case": "each facet of THIS row, in fixed order: effort, non-default access, pin, processing",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "primary-builder",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "codex=gpt-6-astra"
+          },
+          "effort": "xhigh"
+        },
+        {
+          "subagent_id": "a",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "cursor=kimi-k3-high"
+          },
+          "access": "full"
+        },
+        {
+          "subagent_id": "b",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "claude=claude-opus-5",
+            "credential_profile_id": "mironov"
+          },
+          "effort": "high",
+          "access": "workspace_write",
+          "processing_preference": "fast"
+        },
+        {
+          "subagent_id": "c",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "effort": "max",
+          "processing_preference": "economy"
+        }
+      ],
+      "expected": [
+        {
+          "handle": "codex=gpt-6-astra/xhigh",
+          "roster": "codex=gpt-6-astra/xhigh",
+          "same_engine_as": null
+        },
+        {
+          "handle": "cursor=kimi-k3-high",
+          "roster": "cursor=kimi-k3-high",
+          "same_engine_as": null
+        },
+        {
+          "handle": "claude=claude-opus-5/high/workspace_write/@mironov/fast",
+          "roster": "claude=claude-opus-5/high/workspace_write/@mironov/fast",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6/max/economy",
+          "roster": "x-ai/grok-4.6/max/economy",
+          "same_engine_as": null
+        }
+      ]
+    },
+    {
+      "case": "a sibling that differs in ONE facet is accepted and never renames its neighbour",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "one",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "two",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "effort": "low"
+        },
+        {
+          "subagent_id": "three",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "fast"
+        },
+        {
+          "subagent_id": "s1",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "codex=gpt-6-astra"
+          }
+        },
+        {
+          "subagent_id": "s2",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "codex=gpt-6-astra"
+          },
+          "access": "workspace_write"
+        },
+        {
+          "subagent_id": "s3",
+          "recommended_use": "",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "codex=gpt-6-astra",
+            "credential_profile_id": "koshak"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6/low",
+          "roster": "x-ai/grok-4.6/low",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6/fast",
+          "roster": "x-ai/grok-4.6/fast",
+          "same_engine_as": null
+        },
+        {
+          "handle": "codex=gpt-6-astra",
+          "roster": "codex=gpt-6-astra",
+          "same_engine_as": null
+        },
+        {
+          "handle": "codex=gpt-6-astra/workspace_write",
+          "roster": "codex=gpt-6-astra/workspace_write",
+          "same_engine_as": null
+        },
+        {
+          "handle": "codex=gpt-6-astra/@koshak",
+          "roster": "codex=gpt-6-astra/@koshak",
+          "same_engine_as": null
+        }
+      ]
+    },
+    {
+      "case": "identical engines (effective defaults: omitted session access IS full; the description is not part of the engine) are told apart by the stored key and refused on save",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "fast-scout",
+          "recommended_use": "first",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "cursor=grok-4.6"
+          },
+          "effort": "high"
+        },
+        {
+          "subagent_id": "fast-scout_copy_pls35j",
+          "recommended_use": "second, other words",
+          "route": {
+            "kind": "agent_session",
+            "target_id": "cursor=grok-4.6"
+          },
+          "effort": "high",
+          "access": "full"
+        },
+        {
+          "subagent_id": "other",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "moonshotai/kimi-k3"
+          }
+        }
+      ],
+      "expected": [
+        {
+          "handle": "cursor=grok-4.6/high",
+          "roster": "cursor=grok-4.6/high~fast-scout",
+          "same_engine_as": null
+        },
+        {
+          "handle": "cursor=grok-4.6/high",
+          "roster": "cursor=grok-4.6/high~fast-scout_copy_pls35j",
+          "same_engine_as": 0
+        },
+        {
+          "handle": "moonshotai/kimi-k3",
+          "roster": "moonshotai/kimi-k3",
+          "same_engine_as": null
+        }
+      ]
+    },
+    {
+      "case": "an unset row under a global standard is the baseline: no processing facet, and an explicit standard row is the SAME engine",
+      "global_processing": "standard",
+      "items": [
+        {
+          "subagent_id": "unset",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "explicit",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "standard"
+        },
+        {
+          "subagent_id": "economy",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "economy"
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~unset",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~explicit",
+          "same_engine_as": 0
+        },
+        {
+          "handle": "x-ai/grok-4.6/economy",
+          "roster": "x-ai/grok-4.6/economy",
+          "same_engine_as": null
+        }
+      ]
+    },
+    {
+      "case": "an unset row under a global fast runs fast and says so; an explicit standard row beside it is the baseline",
+      "global_processing": "fast",
+      "items": [
+        {
+          "subagent_id": "unset",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "explicit-standard",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "standard"
+        },
+        {
+          "subagent_id": "explicit-fast",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "fast"
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6/fast",
+          "roster": "x-ai/grok-4.6/fast~unset",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6/fast",
+          "roster": "x-ai/grok-4.6/fast~explicit-fast",
+          "same_engine_as": 0
+        }
+      ]
+    },
+    {
+      "case": "with no global preference an unset row and an explicit standard row share the baseline name, so they are one engine",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "unset",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "explicit",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "processing_preference": "standard"
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~unset",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~explicit",
+          "same_engine_as": 0
+        }
+      ]
+    },
+    {
+      "case": "the row switch is not an engine facet: an off row keeps its name and its seat, so an off twin is still a twin",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "on",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "off-twin",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "enabled": false
+        },
+        {
+          "subagent_id": "off-other",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "moonshotai/kimi-k3"
+          },
+          "enabled": false
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~on",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~off-twin",
+          "same_engine_as": 0
+        },
+        {
+          "handle": "moonshotai/kimi-k3",
+          "roster": "moonshotai/kimi-k3",
+          "same_engine_as": null
+        }
+      ]
+    }
+  ],
+  "snapshots": [
+    {
+      "case": "a real session snapshot: resolved standard processing and explicit full access are baselines",
+      "snapshot": {
+        "route": {
+          "kind": "agent_session",
+          "target_id": "claude=claude-opus-5",
+          "credential_profile_id": ""
+        },
+        "effort": "xhigh",
+        "processing_preference": "standard",
+        "access": "full"
+      },
+      "handle": "claude=claude-opus-5/xhigh"
+    },
+    {
+      "case": "a snapshot frozen under an inherited fast preference",
+      "snapshot": {
+        "route": {
+          "kind": "api_model",
+          "target_id": "x-ai/grok-4.6"
+        },
+        "effort": "low",
+        "processing_preference": "fast"
+      },
+      "handle": "x-ai/grok-4.6/low/fast"
+    },
+    {
+      "case": "an explicit economy row",
+      "snapshot": {
+        "route": {
+          "kind": "api_model",
+          "target_id": "x-ai/grok-4.6"
+        },
+        "effort": "",
+        "processing_preference": "economy"
+      },
+      "handle": "x-ai/grok-4.6/economy"
+    },
+    {
+      "case": "an old session snapshot lacking access ran as workspace_write, and is named so",
+      "snapshot": {
+        "route": {
+          "kind": "agent_session",
+          "target_id": "codex=gpt-5.6-sol",
+          "credential_profile_id": "koshak"
+        },
+        "effort": "high",
+        "processing_preference": ""
+      },
+      "handle": "codex=gpt-5.6-sol/high/workspace_write/@koshak"
+    }
+  ]
+}

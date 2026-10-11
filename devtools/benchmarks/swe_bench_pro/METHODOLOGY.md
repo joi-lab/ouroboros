@@ -60,7 +60,7 @@ data are private (commercial *results* are published). Our 70-task subset
 **Integrity rules we enforce locally (not official defaults).** (a) Public Pro Docker
 images have leaked future git history (official **issue #93**); we strip it before
 solve (`strip_gold_history.sh`) — a *local* defense, not an official guarantee.
-(b) We run with `web_search` (and the browser/vision tools) OFF via the adapter's
+(b) We run with `web_search` (and the browser/vision/transcript tools) OFF via the adapter's
 `--disable-tools` policy — that tool policy, not the network, is what actually keeps the
 solver off the upstream fix. Treat it as *our* legitimacy choice: nothing official
 requires it.
@@ -226,8 +226,14 @@ within one instance, aligned with the TB/GAIA templates; NOT independent
 attempts with selection), and `OUROBOROS_SAFETY_MODE=light` (the LLM safety
 pass adds cost/latency inside an isolated jail while the deterministic guards
 do the protecting; the LLM check stays for integration tools).
-`claude_code_edit` stays in the default `--disable-tools` list: benches measure
-the single-model Ouroboros harness.
+Every committed and derived fixed-model profile carries exactly one canonical
+`api_model` row in `OUROBOROS_SUBAGENTS`, on the solve model. Thus decomposition
+cannot inherit a default Light scout, second provider family, or agent-session
+substrate even after the product's install defaults evolve.
+`claude_code_edit` and `switch_model` stay in the default `--disable-tools` list:
+benches measure the single-model Ouroboros harness. The retired edit name keeps
+withholding its delegated coding successor through the task-contract compatibility
+mapping; ordinary same-model `schedule_subagent` decomposition remains available.
 
 E1v2 contract:
 
@@ -242,8 +248,10 @@ E1v2 contract:
   Global improvement-backlog/promotion signals still flow from workspace tasks
   (v6.44.0), so native post-task evolution keeps working. Export
   `OBO_SOLVE_WORKSPACE_ROOT=""` for the legacy rootless `dig-direct` mode.
-- (v6.56.0) Budget/pacing disclosure: the solve task carries
-  `budget_profile = {improvement_policy: until_deadline, max_improvement_passes: 6, cost_hard_stop_pct: 0}`
+- (v6.56.0; policy spelling updated for ABI 7.0 — the `until_deadline` alias
+  was removed, and the explicit pass cap was always the binding count axis)
+  Budget/pacing disclosure: the solve task carries
+  `budget_profile = {improvement_policy: fixed, max_improvement_passes: 6, cost_hard_stop_pct: 0}`
   — NO in-task cost stop (cost milestones are informational against the start
   snapshot); the bounds are the task deadline (`OBO_SOLVE_TIMEOUT`), the round
   ceiling (`OUROBOROS_MAX_ROUNDS=200`, below the leaderboard-relevant 250-step
@@ -337,6 +345,14 @@ the retry policy, `--max-retries`, and how many instances were resampled. The
 secret-opt-in gate: a task refused for missing opt-in is classified by the same
 `ok` gate; treat a refused/empty run as not-resolved when reporting, not as a
 successful sample.
+
+`api_errors` counts real physical failures: a transport death inside one
+request (the socket died after dispatch) produces one `llm_api_error` per
+physical attempt. One call has one outer attempt budget
+(`OUROBOROS_TRANSIENT_RETRY_MAX`), within which up to three rows can be typed
+transport-death failures (the first death plus at most two repeats by the
+primary dispatch) — so a flaky uplink can cross the `< 3` threshold on its
+own and legitimately trigger a resample.
 
 ### 3.2 Seed provenance
 

@@ -35,6 +35,27 @@ def test_iter_jsonl_objects_supports_tail_and_max_entries(tmp_path):
     assert list(iter_jsonl_objects(path, tail_bytes=0)) == []
 
 
+def test_iter_jsonl_objects_reports_raw_tail_truncation(tmp_path):
+    from ouroboros.utils import iter_jsonl_objects
+
+    path = tmp_path / "events.jsonl"
+    path.write_text(
+        "\n".join([
+            json.dumps({"i": 0}),
+            "",
+            json.dumps({"i": 1}),
+            json.dumps({"i": 2}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    gaps = set()
+
+    rows = list(iter_jsonl_objects(path, max_entries=3, gap_reasons=gaps))
+
+    assert [row["i"] for row in rows] == [1, 2]
+    assert gaps == {"max_entries_truncated"}
+
+
 def test_iter_jsonl_objects_tail_keeps_line_boundary_start(tmp_path):
     from ouroboros.utils import iter_jsonl_objects
 

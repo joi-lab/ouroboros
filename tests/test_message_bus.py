@@ -1,3 +1,5 @@
+import pytest
+
 import supervisor.message_bus as message_bus
 import ouroboros.event_bus as event_bus
 
@@ -16,10 +18,12 @@ def test_configure_from_settings_without_legacy_field(monkeypatch):
     assert bridge.get_updates(offset=0, timeout=0) == []
 
 
-def test_ui_send_enqueues_structured_message_and_broadcasts(monkeypatch):
+def test_ui_send_enqueues_structured_message_and_broadcasts(monkeypatch, tmp_path):
     bridge = _make_bridge(monkeypatch)
     broadcasts = []
     bridge._broadcast_fn = broadcasts.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
 
     bridge.ui_send("hello", sender_session_id="sess-1", client_message_id="c-1")
     updates = bridge.get_updates(offset=0, timeout=1)
@@ -27,10 +31,58 @@ def test_ui_send_enqueues_structured_message_and_broadcasts(monkeypatch):
     assert broadcasts[0]["role"] == "user"
     assert broadcasts[0]["sender_session_id"] == "sess-1"
     assert broadcasts[0]["client_message_id"] == "c-1"
+    assert broadcasts[0]["ingress_accepted"] is True
     assert updates[0]["message"]["text"] == "hello"
     assert updates[0]["message"]["source"] == "web"
     assert updates[0]["message"]["sender_session_id"] == "sess-1"
     assert updates[0]["message"]["client_message_id"] == "c-1"
+    assert updates[0]["message"]["accepted_source_ref"]["client_message_id"] == "c-1"
+    assert updates[0]["message"]["accepted_source_row"]["text"] == "hello"
+    assert updates[0]["message"]["accepted_source_row"]["ingress_accepted"] is True
+    assert (tmp_path / "logs" / "chat.jsonl").exists()
+    from supervisor.message_bus import record_inbound_message
+    ref = record_inbound_message(
+        bridge, updates[0]["message"], chat_id=1, user_id=1,
+        client_message_id="c-1", text="hello", ts="ignored",
+    )
+    assert ref == updates[0]["message"]["accepted_source_ref"]
+    assert len((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_web_ingress_write_failure_never_echoes_or_enqueues(monkeypatch, tmp_path):
+    bridge = _make_bridge(monkeypatch)
+    broadcasts = []
+    bridge._broadcast_fn = broadcasts.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "log_chat", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk refused")))
+    with pytest.raises(OSError, match="disk refused"):
+        bridge.ui_send("not accepted", client_message_id="c-2")
+    assert broadcasts == []
+    assert bridge.get_updates(offset=0, timeout=0) == []
+
+
+def test_saved_web_ingress_replays_from_canonical_history(monkeypatch, tmp_path):
+    """The live echo and reload agree about a saved input, not task admission."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    from ouroboros.gateway.history import make_chat_history_endpoint
+
+    bridge = _make_bridge(monkeypatch)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    bridge.ui_send("queued text", sender_session_id="session-1", client_message_id="saved-1")
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
+    rows = json.loads(response.body)["messages"]
+    saved = next(row for row in rows if row.get("client_message_id") == "saved-1")
+    assert saved["role"] == "user"
+    assert saved["ingress_accepted"] is True
+    assert saved["sender_session_id"] == "session-1"
+    # A legacy row lacking the typed proof must not acquire it by being readable.
+    message_bus.log_chat("in", 1, 1, "legacy", source="web", client_message_id="legacy-1")
+    rows = json.loads(asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(
+        query_params={"limit": "10"}))).body)["messages"]
+    assert "ingress_accepted" not in next(row for row in rows if row.get("client_message_id") == "legacy-1")
 
 
 def test_ui_send_preserves_suppress_chat_log_flag(monkeypatch):
@@ -41,6 +93,200 @@ def test_ui_send_preserves_suppress_chat_log_flag(monkeypatch):
 
     assert updates[0]["message"]["text"] == "FULL_PROMPT"
     assert updates[0]["message"]["suppress_chat_log"] is True
+
+
+def test_get_updates_drains_only_a_finite_queued_snapshot(monkeypatch):
+    bridge = _make_bridge(monkeypatch)
+    bridge.enqueue_local_message("first", chat_id=77, transport={"conversation_id": "first"})
+    bridge.enqueue_local_message("second", chat_id=77, transport={"conversation_id": "second"})
+    original = bridge.activate_update_transport
+
+    def append_while_draining(msg):
+        if msg.get("text") == "first":
+            bridge.enqueue_local_message("later", chat_id=77)
+        original(msg)
+
+    monkeypatch.setattr(bridge, "activate_update_transport", append_while_draining)
+    updates = bridge.get_updates(offset=20, timeout=0)
+    assert [u["message"]["text"] for u in updates] == ["first", "second"]
+    assert [u["update_id"] for u in updates] == [20, 21]
+    # The supervisor restores each update's route before its own reply rather
+    # than letting the second queued message steal the first's transport.
+    for update, expected in zip(updates, ("first", "second")):
+        original(update["message"])
+        assert bridge._chat_transports[77]["conversation_id"] == expected
+    remaining = bridge.get_updates(offset=22, timeout=0)
+    assert [u["message"]["text"] for u in remaining] == ["later"]
+    assert remaining[0]["update_id"] == 22
+
+
+def test_get_updates_keeps_dequeued_peers_when_one_queued_item_cannot_be_built(monkeypatch, caplog):
+    """TZ-1 batch ingress: the batch reader dequeues several items at once. One
+    item that cannot become an update is dropped on its own (logged): the peers
+    dequeued ahead of it are still returned, the ones behind it too, and the
+    queue behind the snapshot is untouched."""
+    import logging
+
+    bridge = _make_bridge(monkeypatch)
+    for text in ("first", "poison", "third"):
+        bridge.enqueue_local_message(text, chat_id=5, user_id=5, source="skill:bridge",
+                                     client_message_id=f"input-{text}")
+    original = bridge.activate_update_transport
+
+    def refuse_poison(msg):
+        if msg.get("text") == "poison":
+            raise RuntimeError("transport refused")
+        original(msg)
+
+    monkeypatch.setattr(bridge, "activate_update_transport", refuse_poison)
+    with caplog.at_level(logging.ERROR, logger="supervisor.message_bus"):
+        updates = bridge.get_updates(offset=0, timeout=0)
+    assert [u["message"]["text"] for u in updates] == ["first", "third"]
+    assert [u["update_id"] for u in updates] == [1, 2]
+    assert any("Dropping one undecodable queued chat message" in r.getMessage()
+               and "source=skill:bridge chat_id=5 client_message_id=input-poison" in r.getMessage()
+               for r in caplog.records)
+    assert bridge.get_updates(offset=3, timeout=0) == []
+
+    # A foreign object in the queue (not a str, not a mapping) is the same case.
+    bridge._inbox.put(42)
+    bridge.enqueue_local_message("after", chat_id=5, user_id=5, source="skill:bridge")
+    updates = bridge.get_updates(offset=3, timeout=0)
+    assert [(u["update_id"], u["message"]["text"]) for u in updates] == [(3, "after")]
+
+
+def test_requeue_updates_replays_the_tail_before_new_arrivals_with_ids_intact(monkeypatch):
+    """A consumer that stops mid-batch (crash, /panic, /restart) hands the
+    unprocessed tail back; the next read serves it first, in order, with the
+    original update ids, and only then the newer arrivals."""
+    bridge = _make_bridge(monkeypatch)
+    for text in ("a", "b", "c"):
+        bridge.enqueue_local_message(text, chat_id=9, user_id=9, source="skill:bridge",
+                                     transport={"conversation_id": text})
+    batch = bridge.get_updates(offset=10, timeout=0)
+    assert [u["update_id"] for u in batch] == [10, 11, 12]
+    bridge.enqueue_local_message("d", chat_id=9, user_id=9, source="skill:bridge")
+    assert bridge.requeue_updates([]) == 0
+    assert bridge.requeue_updates(batch[1:]) == 2
+    replay = bridge.get_updates(offset=13, timeout=0)
+    assert [(u["update_id"], u["message"]["text"]) for u in replay] == [(11, "b"), (12, "c")]
+    assert replay[0]["message"]["transport"] == {"conversation_id": "b"}, "the route travels with the update"
+    later = bridge.get_updates(offset=13, timeout=0)
+    assert [(u["update_id"], u["message"]["text"]) for u in later] == [(13, "d")]
+    assert bridge.get_updates(offset=14, timeout=0) == []
+    # Two hand-backs without a read in between keep their order: older first.
+    assert bridge.requeue_updates(replay[1:]) == 1
+    assert bridge.requeue_updates(later) == 1
+    assert [u["message"]["text"] for u in bridge.get_updates(offset=14, timeout=0)] == ["c", "d"]
+
+
+def test_project_completion_summary_keeps_event_time_label_live_and_on_reload(
+    monkeypatch, tmp_path,
+):
+    """The message bus is the one live/durable transport for Main's host row."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(
+        message_bus, "load_state",
+        lambda: {"session_id": "session-1", "owner_id": 7},
+    )
+    monkeypatch.setattr(
+        message_bus, "_advance_project_visible_revision", lambda _chat_id: None,
+    )
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
+
+    message_bus.send_with_budget(
+        1,
+        "Launch 🚀 › Ship release · Completed",
+        task_id="opaque-root-id",
+        role="system",
+        system_type="project_completion_summary",
+        progress_meta={
+            "project_id": "opaque-project-id",
+            "project_name": "Launch 🚀",
+            "target_label": "Launch 🚀 › Ship release",
+            "status": "completed",
+        },
+    )
+
+    live = next(frame for frame in frames if frame.get("type") == "chat")
+    assert live["task_id"] == "opaque-root-id"
+    assert live["target_label"] == "Launch 🚀 › Ship release"
+    assert live["system_type"] == "project_completion_summary"
+
+    from ouroboros.gateway.history import make_chat_history_endpoint
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(
+        query_params={"chat_id": "1", "limit": "20"},
+    )))
+    messages = json.loads(response.body.decode("utf-8"))["messages"]
+    replayed = next(
+        row for row in messages
+        if row.get("system_type") == "project_completion_summary"
+    )
+    assert replayed["task_id"] == live["task_id"]
+    assert replayed["target_label"] == live["target_label"]
+    assert replayed["project_id"] == live["project_id"]
+    assert replayed["project_name"] == live["project_name"]
+    assert replayed["status"] == live["status"]
+
+
+def test_terminal_incident_persists_and_replays_as_system_without_raw_salvage(
+    monkeypatch, tmp_path,
+):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from supervisor.terminal_delivery import project_terminal_result_event
+
+    raw = "RAW SALVAGE " * 1000
+    projected = project_terminal_result_event(
+        tmp_path, {"chat_id": 1}, "terminal-task",
+        result_text=raw, terminal_origin="host_salvage",
+        base_event={"chat_id": 1, "task_id": "terminal-task", "text": raw},
+    )
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: bridge)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
+
+    message_bus.send_with_budget(
+        1, projected["text"], task_id=projected["task_id"],
+        role=projected["role"], system_type=projected["system_type"],
+    )
+
+    live = next(frame for frame in frames if frame.get("type") == "chat")
+    assert live["role"] == "system"
+    assert live["system_type"] == "terminal_incident"
+    assert raw not in live["content"]
+    durable = json.loads(
+        (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1]
+    )
+    assert durable["direction"] == "system"
+    assert durable["type"] == "terminal_incident"
+    assert raw not in durable["text"]
+
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(
+        query_params={"chat_id": "1", "limit": "20"},
+    )))
+    replayed = json.loads(response.body.decode("utf-8"))["messages"][-1]
+    assert replayed["role"] == "system"
+    assert replayed["system_type"] == "terminal_incident"
+    assert raw not in replayed["text"]
 
 
 def test_send_photo_publishes_transport_event_with_payload(monkeypatch):
@@ -96,13 +342,171 @@ def test_send_document_publishes_transport_event_with_payload(monkeypatch):
     assert payload["download_url"] == "/api/files/download?path=Desktop/report.csv"
 
 
+def test_send_links_broadcasts_publishes_and_persists_compact_row(monkeypatch, tmp_path):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+    prefix = "https://example.com/"
+    url = prefix + "a" * (2048 - len(prefix))
+    actions = [{"label": "Report", "url": url}]
+
+    ok, error = bridge.send_links(123, actions, title="Results", task_id="task-links")
+
+    assert (ok, error) == (True, "ok")
+    live = next(frame for frame in frames if frame.get("type") == "links")
+    assert live["actions"] == actions
+    assert live["title"] == "Results"
+    assert live["task_id"] == "task-links"
+    topic, payload = events[-1]
+    assert topic == event_bus.CHAT_LINKS
+    assert set(payload) == {"chat_id", "transport", "title", "actions", "ts"}
+    assert payload["actions"] == actions
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["type"] == "links"
+    assert row["actions"] == actions
+    assert row["title"] == "Results"
+    assert row["task_id"] == "task-links"
+    assert "file_base64" not in row
+
+
+def test_send_links_caps_title_across_broadcast_event_and_persistence(monkeypatch, tmp_path):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+
+    ok, error = bridge.send_links(
+        123,
+        [{"label": "Docs", "url": "https://example.com/docs"}],
+        title="X" * 300,
+    )
+
+    assert (ok, error) == (True, "ok")
+    live = next(frame for frame in frames if frame.get("type") == "links")
+    assert len(live["title"]) == 240
+    topic, payload = events[-1]
+    assert topic == event_bus.CHAT_LINKS
+    assert len(payload["title"]) == 240
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert len(row["title"]) == 240
+
+
+@pytest.mark.parametrize(
+    ("label", "url"),
+    [
+        ("Valid", "https://[::1]:8080/x"),
+        ("Valid", "https://example.com:8443/x"),
+        ("Valid", "https://example.com/a%20b"),
+        ("Docs and specs", "https://example.com/x"),
+        ("Valid", "https://例え.jp/x"),
+        ("Valid", "https://my_server.example.com/docs"),
+        ("Valid", "https://host~tilde.example.com/x"),
+    ],
+    ids=[
+        "ipv6-port", "hostname-port", "encoded-path", "label-space",
+        "unicode-host", "underscore-host", "tilde-host",
+    ],
+)
+def test_send_links_accepts_valid_link_actions(monkeypatch, tmp_path, label, url):
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+    actions = [{"label": label, "url": url}]
+
+    ok, error = bridge.send_links(123, actions)
+
+    assert (ok, error) == (True, "ok")
+    assert frames[-1]["actions"] == actions
+    assert events[-1][1]["actions"] == actions
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["actions"] == actions
+
+
+@pytest.mark.parametrize(
+    ("label", "url"),
+    [
+        ("Report", "https://exa mple.com/report"),
+        ("Report", "https://example.com/re\nport"),
+        ("Report", "https://example.com/re\0port"),
+        ("Report", "https://example.com/" + "a" * 2029),
+        ("Report", "https://[::1"),
+        ("Report", "https://example.com:99999/path"),
+        ("Report", "https://example.com:bad/path"),
+        ("Report", "https://:443/path"),
+        ("Report", "https://@/path"),
+        ("Report", "https://exa%20mple.com/x"),
+        ("Report", "https://%zz/x"),
+        ("Report", "https://[v1.foo]/x"),
+        ("Report", "https://[v1.fe80::1]/p"),
+        ("Report", "https://exa\u00a0mple.com/x"),
+        ("Report", "https://example.com/a\u2028b"),
+        ("Report", "https://example.com\\@evil.com/"),
+        ("Bad\nLabel", "https://example.com"),
+        ("Bad\u2028Label", "https://example.com"),
+    ],
+    ids=[
+        "space", "newline", "nul", "over-2048", "malformed-ipv6",
+        "port-out-of-range", "non-numeric-port", "empty-host-port", "userinfo-only",
+        "encoded-host", "invalid-percent-host", "ipvfuture", "ipvfuture-colons",
+        "no-break-space", "line-separator", "backslash-authority", "label-newline",
+        "label-line-separator",
+    ],
+)
+def test_send_links_refuses_dirty_action_without_side_effects(
+    monkeypatch, tmp_path, label, url,
+):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    events = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
+    monkeypatch.setattr(
+        message_bus, "publish_event", lambda topic, data: events.append((topic, data)),
+    )
+
+    ok, _error = bridge.send_links(123, [{"label": label, "url": url}])
+
+    assert ok is False
+    assert frames == []
+    assert events == []
+    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+
+
 def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
     """A delivered document persists a base64-free chat.jsonl row so it can be
     rebuilt on reload (the durable download_url carries the bytes)."""
     import json
 
     bridge = _make_bridge(monkeypatch)
-    bridge._broadcast_fn = lambda *_a, **_k: None
+    frames = []
+    bridge._broadcast_fn = frames.append
     monkeypatch.setattr(event_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
@@ -113,8 +517,11 @@ def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
         download_url="/api/files/download?path=Desktop/report.csv", task_id="t-1",
     )
     assert ok is True
+    live = next(frame for frame in frames if frame.get("type") == "document")
+    assert live["task_id"] == "t-1"
+    assert live["size_bytes"] == len(b"filebytes")
 
-    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     doc_rows = [r for r in rows if r.get("type") == "document"]
     assert len(doc_rows) == 1
     row = doc_rows[0]
@@ -126,6 +533,7 @@ def test_send_document_persists_compact_chat_row(monkeypatch, tmp_path):
     assert row["task_id"] == "t-1"
     assert row["text"] == "q3"
     assert row["caption"] == "q3"  # explicit caption survives reload
+    assert row["size_bytes"] == len(b"filebytes")
     assert "file_base64" not in row  # no base64 bloat in chat.jsonl
 
 
@@ -134,7 +542,8 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
     import json
 
     bridge = _make_bridge(monkeypatch)
-    bridge._broadcast_fn = lambda *_a, **_k: None
+    frames = []
+    bridge._broadcast_fn = frames.append
     monkeypatch.setattr(event_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
@@ -142,12 +551,25 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
     revisions = []
     monkeypatch.setattr(message_bus, "_advance_project_visible_revision", revisions.append)
 
-    bridge.send_photo(123, b"image", caption="shot", mime="image/png")
-    bridge.send_video(123, b"video", caption="clip", mime="video/mp4")
+    bridge.send_photo(123, b"image", caption="shot", mime="image/png", task_id="media-task")
+    bridge.send_video(123, b"video", caption="clip", mime="video/mp4", task_id="media-task")
+
+    media_frames = [frame for frame in frames if frame.get("type") in {"photo", "video"}]
+    assert [frame["task_id"] for frame in media_frames] == ["media-task", "media-task"]
+    # The LIVE frame carries both durable addresses: a packaged desktop shell
+    # cannot hand its file bridge a data: URI, so without these the media is
+    # only saveable after a history reload.
+    for frame in media_frames:
+        assert frame["download_url"].startswith("/api/tasks/media-task/artifacts/chat-media-")
+        # compat resolves only under the configured file-browser root; this
+        # fixture's DATA_DIR lives in /tmp (outside it), so absence is honest —
+        # presence must still carry the launcher-gate-compatible form.
+        compat = frame.get("download_url_compat")
+        assert compat is None or compat.startswith("/api/files/download?path=")
 
     rows = [
         json.loads(line)
-        for line in (tmp_path / "logs" / "chat.jsonl").read_text().splitlines()
+        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     assert [(row["type"], row["text"], row["mime"]) for row in rows] == [
@@ -155,7 +577,31 @@ def test_send_photo_and_video_persist_compact_rows_before_unread_revision(monkey
         ("video", "clip", "video/mp4"),
     ]
     assert all("image_base64" not in row and "video_base64" not in row for row in rows)
+    assert all(row["task_id"] == "media-task" for row in rows)
+    assert all(row["download_url"].startswith("/api/tasks/media-task/artifacts/chat-media-") for row in rows)
+    stored = list((tmp_path / "task_results" / "artifacts" / "media-task" / "chat_media").iterdir())
+    assert {path.read_bytes() for path in stored} == {b"image", b"video"}
     assert revisions == [123, 123]
+
+
+def test_send_photo_keeps_live_delivery_when_media_persistence_fails(monkeypatch, tmp_path):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(
+        message_bus, "store_chat_media_bytes",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
+
+    ok, _ = bridge.send_photo(123, b"image", caption="shot", task_id="media-task")
+
+    assert ok is True
+    assert next(frame for frame in frames if frame.get("type") == "photo")["image_base64"]
+    import json
+    row = json.loads((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row.get("download_url", "") == ""
 
 
 def test_push_log_broadcast_surfaces_chat_id(monkeypatch):
@@ -173,6 +619,16 @@ def test_push_log_broadcast_surfaces_chat_id(monkeypatch):
     assert logs[0]["chat_id"] == 1234
     assert logs[0]["data"]["task_id"] == "t1"
     assert logs[1]["chat_id"] == 0
+
+
+def test_push_log_suppresses_negative_a2a_chat_from_browser_broadcast(monkeypatch):
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.push_log({"type": "task_started", "task_id": "a2a", "chat_id": -1001})
+
+    assert frames == []
 
 
 def test_budget_line_replays_unresolved_attempt_not_stale_state(monkeypatch, tmp_path):
@@ -284,3 +740,210 @@ def test_budget_line_marks_quarantined_tail_nonfinal(monkeypatch, tmp_path):
 
     assert "cost_final no" in line
     assert "ledger_integrity DEGRADED (quarantined ledger tail)" in line
+
+
+def _registry_with_project(tmp_path):
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "happy-farm", name="Happy Farm")
+    return int(project["chat_id"])
+
+
+def test_broadcast_stamps_project_thread_for_registry_chat_only(monkeypatch, tmp_path):
+    """The broadcast choke stamps ``project_thread`` when the final chat_id is a
+    reserved Project thread, so Main can reject a project it has not learned
+    yet; main (1), legacy (0) and transport-shaped ids stay unstamped."""
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_message(project_chat, "in project", task_id="t-proj", is_progress=True)
+    bridge.send_message(1, "in main", task_id="t-main", is_progress=True)
+    bridge.send_message(197422551, "via telegram", task_id="t-tg", is_progress=True)
+    bridge.push_log({"type": "tool_call", "task_id": "t-proj", "chat_id": project_chat})
+    bridge.push_log({"type": "tool_call", "task_id": "t-main"})
+
+    chats = [f for f in frames if f.get("type") == "chat"]
+    assert chats[0]["chat_id"] == project_chat and chats[0]["project_thread"] is True
+    assert "project_thread" not in chats[1]
+    assert "project_thread" not in chats[2]
+    logs = [f for f in frames if f.get("type") == "log"]
+    assert logs[0]["project_thread"] is True
+    assert "project_thread" not in logs[1]
+
+
+def test_media_broadcasts_stamp_project_thread(monkeypatch, tmp_path):
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "store_chat_media_bytes", lambda *a, **k: "")
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_photo(project_chat, b"\x89PNG", caption="p")
+    bridge.send_video(project_chat, b"\x00\x00", caption="v")
+    bridge.send_document(project_chat, b"%PDF", filename="a.pdf", caption="d")
+    bridge.send_links(project_chat, [{"label": "L", "url": "https://example.com"}])
+    bridge.send_photo(1, b"\x89PNG", caption="main")
+
+    media = [f for f in frames if f.get("type") in ("photo", "video", "document", "links")]
+    assert [f.get("project_thread") for f in media] == [True, True, True, True, None]
+
+
+def test_project_thread_lens_follows_registry_file(monkeypatch, tmp_path):
+    """The lens is mtime-cached: a project created after the first lookup is
+    visible without a process restart."""
+    from ouroboros.projects_registry import create_project, project_thread_chat_ids
+
+    assert project_thread_chat_ids(tmp_path) == frozenset()
+    first = int(create_project(tmp_path, "one")["chat_id"])
+    assert first in project_thread_chat_ids(tmp_path)
+
+
+def test_project_thread_stamp_survives_meta_and_covers_typing_and_echo(monkeypatch, tmp_path):
+    """The marker is the LAST writer keyed on the FINAL chat_id (progress meta can
+    neither spoof nor erase it), and the typing + user-echo seams carry it too."""
+    project_chat = _registry_with_project(tmp_path)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.send_message(project_chat, "p", task_id="t1", is_progress=True,
+                        progress_meta={"project_thread": False})
+    bridge.send_message(1, "m", task_id="t2", is_progress=True,
+                        progress_meta={"project_thread": True})
+    bridge.send_chat_action(project_chat, "typing", activity_id="a1")
+    bridge.send_chat_action(1, "typing", activity_id="a2")
+    bridge.handle_web_message("hi", chat_id=project_chat)
+    bridge.handle_web_message("hi main", chat_id=1)
+
+    bridge.send_message(1, "rehomed", task_id="t3", is_progress=True,
+                        progress_meta={"chat_id": project_chat})
+
+    chats = [f for f in frames if f.get("type") == "chat" and f.get("role") != "user"]
+    assert chats[0]["project_thread"] is True      # meta cannot erase
+    assert "project_thread" not in chats[1]        # meta cannot spoof
+    assert chats[2]["project_thread"] is True      # stamp keys on the FINAL chat_id
+    typing = [f for f in frames if f.get("type") == "typing"]
+    assert typing[0]["project_thread"] is True
+    assert "project_thread" not in typing[1]
+    echoes = [f for f in frames if f.get("role") == "user"]
+    assert echoes[0]["project_thread"] is True
+    assert "project_thread" not in echoes[1]
+
+
+def test_send_routing_ack_carries_the_cause_only_when_present(monkeypatch):
+    """Q3=A: the host's owner-facing sentence rides the live routing_ack frame
+    and the outbound transport copy; a landed act carries no cause at all."""
+    bridge = _make_bridge(monkeypatch)
+    frames, events = [], []
+    bridge._broadcast_fn = frames.append
+    monkeypatch.setattr(message_bus, "publish_event", lambda topic, data: events.append((topic, data)))
+
+    bridge.send_routing_ack(
+        1, client_message_id="cm-1", action="promote_chat_to_task", target="t1",
+        status="needs_manual_target", routing_token="tok-1",
+        cause="Not started: the working folder can't be used",
+    )
+    bridge.send_routing_ack(
+        1, client_message_id="cm-2", action="promote_chat_to_task", target="t2",
+        status="scheduled", routing_token="tok-2",
+    )
+
+    assert frames[0]["cause"] == "Not started: the working folder can't be used"
+    assert events[0][1]["cause"] == frames[0]["cause"]
+    assert "cause" not in frames[1] and "cause" not in events[1][1]
+
+
+def test_named_ingress_hands_its_accepted_row_to_the_queue_as_the_web_witness(monkeypatch, tmp_path):
+    """``accept_local_message`` with a web source (the late quiz answer) queues the
+    SAME in-process witness the socket ingress queues: the dequeuing writer
+    validates a web item against that row, and the queue's empty default is not
+    one. Without the row the supervisor tick raised and the answer was lost."""
+    bridge = _make_bridge(monkeypatch)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    row, rejoined = message_bus.accept_local_message(
+        bridge, tmp_path, "late answer", chat_id=1, user_id=1, source="web", client_message_id="late-1",
+    )
+    assert rejoined is False and row["client_message_id"] == "late-1"
+    [update] = bridge.get_updates(offset=0, timeout=0)
+    msg = update["message"]
+    assert msg["accepted_source_row"] == row
+    ref = message_bus.record_inbound_message(
+        bridge, msg, chat_id=1, user_id=1, client_message_id="late-1", text="late answer", ts="ignored",
+    )
+    assert ref == msg["accepted_source_ref"] and ref["ts"] == row["ts"]
+    assert len((tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()) == 1
+
+
+def test_dequeue_reads_the_retained_row_when_a_web_item_carries_no_witness(monkeypatch, tmp_path):
+    """The queue's default ``accepted_source_row`` is ``{}``: absent, not a witness.
+    A web item with a valid ref and no row is validated against the retained disk
+    row (the skill path) instead of failing the supervisor tick; a ref the disk
+    does not corroborate is still refused."""
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    bridge = _make_bridge(monkeypatch)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    row = message_bus.log_chat(
+        "in", 1, 1, "no witness", ts="2026-01-01T00:00:00+00:00", source="web",
+        client_message_id="bare-1", require_write=True,
+    )
+    ref = build_owner_message_ref(chat_id=1, client_message_id="bare-1", ts=row["ts"], text="no witness")
+    bridge.enqueue_local_message(
+        "no witness", chat_id=1, user_id=1, source="web", client_message_id="bare-1", accepted_source_ref=ref,
+    )
+    [update] = bridge.get_updates(offset=0, timeout=0)
+    assert update["message"].get("accepted_source_row", {}) == {}
+    assert message_bus.record_inbound_message(
+        bridge, update["message"], chat_id=1, user_id=1, client_message_id="bare-1",
+        text="no witness", ts="ignored",
+    ) == ref
+    forged = dict(update["message"], accepted_source_ref={**ref, "text_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="accepted source does not match"):
+        message_bus.record_inbound_message(
+            bridge, forged, chat_id=1, user_id=1, client_message_id="bare-1", text="no witness", ts="ignored",
+        )
+
+
+def test_owner_acceptance_rows_start_a_clean_record_after_a_torn_tail(monkeypatch, tmp_path):
+    """A crashed append can leave ``chat.jsonl`` without its final newline. Both
+    acceptance writers (socket ingress and the named ingress) start a clean record
+    there, so the accepted row stays parseable: history replays its
+    ``ingress_accepted`` fact, the dequeue re-read finds a skill row, and a retry of
+    the same id rejoins instead of enqueueing a second owner turn."""
+    import json
+
+    bridge = _make_bridge(monkeypatch)
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {})
+    chat = tmp_path / "logs" / "chat.jsonl"
+    chat.parent.mkdir(parents=True)
+    chat.write_bytes(b'{"direction": "out", "text": "torn')
+    bridge.ui_send("typed", client_message_id="web-torn")
+    chat.write_bytes(chat.read_bytes() + b'{"direction": "out", "text": "torn again')
+    row, rejoined = message_bus.accept_local_message(
+        bridge, tmp_path, "relayed", chat_id=7, user_id=7, source="skill:telegram", client_message_id="skill-torn",
+    )
+    assert rejoined is False
+    parsed = {}
+    for line in chat.read_text(encoding="utf-8").splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue  # the torn fragments stay preserved, unparsed
+        parsed[entry["client_message_id"]] = entry
+    assert parsed["web-torn"]["ingress_accepted"] is True and parsed["skill-torn"] == row
+    assert message_bus.accept_local_message(
+        bridge, tmp_path, "relayed", chat_id=7, user_id=7, source="skill:telegram", client_message_id="skill-torn",
+    ) == (row, True)
+    web, skill = (u["message"] for u in bridge.get_updates(offset=0, timeout=0))
+    assert message_bus.record_inbound_message(
+        bridge, skill, chat_id=7, user_id=7, client_message_id="skill-torn", text="relayed", ts="ignored",
+    ) == skill["accepted_source_ref"]
+    assert web["client_message_id"] == "web-torn"

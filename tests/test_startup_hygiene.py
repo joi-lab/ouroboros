@@ -149,6 +149,29 @@ def test_check_budget_reports_corrupt_state_json(tmp_path, monkeypatch):
     assert "state.json" in result["error"]
 
 
+def test_check_budget_absence_uses_shipped_default(tmp_path, monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    (tmp_path / "state").mkdir(parents=True)
+    (tmp_path / "state" / "state.json").write_text("{}\n", encoding="utf-8")
+    env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel)
+    monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+
+    result, issues = startup_mod.check_budget(env)
+
+    assert issues == 0
+    assert result["total_usd"] == float(SETTINGS_DEFAULTS["TOTAL_BUDGET"])
+
+
+def test_check_budget_explicit_zero_remains_unconfigured(tmp_path, monkeypatch):
+    (tmp_path / "state").mkdir(parents=True)
+    (tmp_path / "state" / "state.json").write_text("{}\n", encoding="utf-8")
+    env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel)
+    monkeypatch.setenv("TOTAL_BUDGET", "0")
+
+    assert startup_mod.check_budget(env) == ({"status": "unconfigured"}, 0)
+
+
 def test_check_budget_uses_unresolved_ledger_upper_bound(tmp_path, monkeypatch):
     from ouroboros import usage_accounting as ua
 
@@ -233,11 +256,25 @@ def test_verify_restart_reports_corrupt_claim_json(tmp_path):
     assert events[-1]["error"] == "pending_restart_verify_invalid"
 
 
+def _known_evolution_controls(tmp_path):
+    """Seed a positively initialized, owner-authorized campaign fixture.
+
+    Missing state after #1307 is unknown, not proof the owner did not Stop.
+    Call this before any transaction/claim history is written.
+    """
+    from supervisor import state
+
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1, "evolution_mode_enabled": True,
+                      "evolution_owner_stopped": False})
+
+
 def test_verify_restart_closes_promoted_backlog_only_on_absorb(tmp_path):
     import ouroboros.improvement_backlog as ib
 
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     ib.append_backlog_items(tmp_path, [{
         "summary": "promoted fix", "category": "c", "source": "post_task",
         "evidence": "e", "fingerprint": "fp-x", "id": "ibl-x",
@@ -270,6 +307,7 @@ def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path)
     """
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "pending_restart_verify.json").write_text(
         json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
     (tmp_path / "state" / "evolution_campaign.json").write_text(json.dumps({
@@ -296,6 +334,7 @@ def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path)
 def test_verify_restart_rejects_stale_claim_against_active_evolution_transaction(tmp_path):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "pending_restart_verify.json").write_text(
         json.dumps({"expected_sha": "oldsha"}),
         encoding="utf-8",
@@ -331,6 +370,7 @@ def test_verify_restart_rejects_stale_claim_against_active_evolution_transaction
 def test_verify_restart_reconciles_reachable_dangling_evolution_transaction(tmp_path, monkeypatch):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "evolution_campaign.json").write_text(
         json.dumps({
             "status": "active",
@@ -374,6 +414,7 @@ def test_verify_restart_reconciles_reachable_dangling_evolution_transaction(tmp_
 def test_verify_restart_abandons_unreachable_dangling_evolution_transaction(tmp_path, monkeypatch):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "evolution_campaign.json").write_text(
         json.dumps({
             "status": "active",

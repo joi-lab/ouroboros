@@ -1,0 +1,62 @@
+.model-waits { margin: var(--space-2); }
+.model-wait-row {
+    margin-bottom: var(--space-2);
+    padding: var(--space-2);
+    border: 1px solid var(--status-warn-border);
+    border-radius: var(--radius-sm);
+    background: var(--status-warn-bg);
+}
+.model-wait-heading,
+.model-wait-actions,
+.model-wait-auto { display: flex; align-items: center; flex-wrap: wrap; gap: var(--space-2); }
+.model-wait-heading { justify-content: space-between; }
+.model-wait-heading strong {
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+}
+.model-wait-meta,
+.model-wait-footnote,
+.model-wait-notice,
+.model-wait-auto {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+.model-wait-meta { overflow-wrap: anywhere; }
+.model-wait-actions,
+.model-wait-auto,
+.model-wait-notice,
+.model-wait-picker { margin-top: var(--space-2); }
+.model-wait-notice:empty { display: none; }
+.model-wait-row [hidden] { display: none; }
+.model-wait-auto input { margin: 0; accent-color: var(--accent); }
+.model-wait-row button:focus-visible,
+.model-wait-auto input:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+.chat-live-phase.waiting { color: var(--status-warn-fg); background: var(--status-warn-bg); }
+.chat-live-card[data-model-waiting="1"]:not([data-finished="1"]) .chat-live-phase { animation: none; }
+.chat-live-card[data-model-waiting="1"] > .chat-live-summary-button .chat-live-typing { display: none; }
+/* The recovery rows carry the current activity. Preserve any real narration,
+   but fold the otherwise empty running-card reserve during a wait. */
+.chat-live-card[data-model-waiting="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity:empty,
+.chat-live-card[data-model-waiting="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta:empty { display: none; }
+
+/* track-migration:begin — Existing wait editor until B role adapters land. */
+.model-wait-picker .model-role-controls input:not(.ui-control),
+.model-wait-picker .model-role-controls select:not(.ui-control) {
+    background: var(--bg-secondary);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-sm);
+    padding: var(--space-1) var(--space-2);
+}
+.model-wait-picker .model-role-controls input:not(.ui-control):focus {
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+    outline: none;
+}
+
+.model-wait-picker .model-role-controls :is(input, select):not(.ui-control) { font-size: var(--type-body); color: var(--text-primary); }
+/* track-migration:end */

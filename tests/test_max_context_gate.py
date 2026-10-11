@@ -1,78 +1,99 @@
-"""WS4: max context mode is hard-blocked unless the active route has confirmed/
-acked >=1M Capability Evidence (fail-closed), with a route-scoped owner-ack escape."""
+"""Owner context intent is independent of Main-route context-window evidence."""
 
 from __future__ import annotations
 
+import json
+import os
 
-import pytest
-
-import ouroboros.capability_evidence as ce
-from ouroboros import config as cfg
-from ouroboros.gateway import settings as gw
-
-
-@pytest.fixture(autouse=True)
-def _isolate_evidence_store(tmp_path, monkeypatch):
-    """_max_context_block / record_owner_ack persist Capability Evidence under
-    config.DATA_DIR; isolate it to a tmp dir so a bare local pytest run never
-    writes data/state/capability_evidence.json under the live Ouroboros data root
-    (triad finding). _max_context_block does `from ouroboros.config import DATA_DIR`
-    at call time, so patching the module attribute is read by it."""
-    store = tmp_path / "evidence-store"
-    store.mkdir()
-    monkeypatch.setattr(cfg, "DATA_DIR", store)
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.testclient import TestClient
 
 
-def test_max_gate_blocks_when_route_unprobeable(monkeypatch):
-    # Force offline: no provider metadata -> unprobeable -> fail-closed.
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
-    block = gw._max_context_block({"OUROBOROS_MODEL": "anthropic/claude-opus-4-8"})
-    assert block is not None
-    assert "needs_ack" in block
-    assert block["needs_ack"].get("model") == "anthropic/claude-opus-4-8"
+def test_owner_can_enable_max_without_main_route_capability_ack(tmp_path, monkeypatch):
+    """Max is an owner projection preference; exact-route fitting happens at dispatch."""
+    import ouroboros.capability_evidence as ce
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as gateway_settings
+
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({
+        "OUROBOROS_CONTEXT_MODE": "low",
+        "OUROBOROS_CONTEXT_MODE_AUTO_LOW": "false",
+        "OUROBOROS_MODEL": "openai/gpt-4o-mini",
+    }), encoding="utf-8")
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
+    os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
+
+    def unexpected_probe(*_args, **_kwargs):
+        raise AssertionError("owner Max must not perform a Main-route capability probe")
+
+    monkeypatch.setattr(ce, "probe", unexpected_probe)
+    monkeypatch.setattr(gateway_settings, "_has_running_agent_tasks", lambda: False)
+
+    app = Starlette(routes=[
+        Route(
+            "/api/owner/context-mode",
+            endpoint=gateway_settings.api_owner_context_mode,
+            methods=["POST"],
+        ),
+    ])
+    app.state.drive_root = tmp_path
+    response = TestClient(app).post("/api/owner/context-mode", json={"mode": "max"})
+
+    assert response.status_code == 200, response.text
+    assert response.json() == {"ok": True, "context_mode": "max"}
+    stored = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert stored["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert stored["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
+    assert os.environ["OUROBOROS_CONTEXT_MODE"] == "max"
+    assert os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
 
 
-def test_max_gate_allows_after_route_scoped_ack(monkeypatch):
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
-    settings = {"OUROBOROS_MODEL": "anthropic/claude-opus-4-8"}
-    route = gw._active_main_route(settings)
-    ce.record_owner_ack(
-        cfg.DATA_DIR, provider=route["provider"], model=route["model"],
-        base_url=route["base_url"], window_tokens=1_000_000,
-    )
-    assert gw._max_context_block(settings) is None
-    # A DIFFERENT model is still blocked (ack is route-scoped, not repo-wide).
-    other = gw._max_context_block({"OUROBOROS_MODEL": "anthropic/claude-opus-4-7"})
-    assert other is not None
+def test_bare_env_low_cannot_author_owner_low_while_busy(tmp_path, monkeypatch):
+    """Sizing-only env Low must not bypass the owner-intent idle guard."""
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as gateway_settings
+
+    settings_path = tmp_path / "settings.json"
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
+    os.environ.pop("OUROBOROS_CONTEXT_MODE_AUTO_LOW", None)
+    monkeypatch.setattr(gateway_settings, "_has_running_agent_tasks", lambda: True)
+
+    assert cfg.get_context_mode() == "low"
+    assert cfg.get_owner_context_mode() == "max"
+
+    app = Starlette(routes=[
+        Route(
+            "/api/owner/context-mode",
+            endpoint=gateway_settings.api_owner_context_mode,
+            methods=["POST"],
+        ),
+    ])
+    app.state.drive_root = tmp_path
+    response = TestClient(app).post("/api/owner/context-mode", json={"mode": "low"})
+
+    assert response.status_code == 409, response.text
+    assert not settings_path.exists()
+    assert cfg.get_owner_context_mode() == "max"
 
 
-def test_max_gate_allows_when_metadata_confirms_1m(monkeypatch):
-    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_000_000)
-    assert gw._max_context_block({"OUROBOROS_MODEL": "openai/gpt-5.5"}) is None
+def test_main_route_resolution_remains_available_to_dispatch_fit():
+    """Removing settings-time gating must not remove context_fit's route resolver."""
+    from ouroboros.gateway import settings as gateway_settings
 
+    route = gateway_settings._active_main_route({
+        "OUROBOROS_MODEL": "minimax::MiniMax-M3",
+        "MINIMAX_REGION": "cn_zh",
+    })
 
-def test_max_gate_threads_compatible_key_only_for_compatible_route(monkeypatch):
-    """The in-flight OPENAI_COMPATIBLE_API_KEY is threaded into the probe ONLY when the
-    active route is openai-compatible. For any other provider the key must NOT reach the
-    probe (else probe_oversized_context would overwrite that provider's resolved key with
-    the compatible one on the generative probe path — cross-provider key bleed)."""
-    seen = {}
-
-    def _cap(provider, model, base_url, allow_fetch=True, api_key=None):
-        seen["key"] = api_key
-        return 1_000_000  # confirm >=1M so the gate returns cleanly, no generative/network
-
-    monkeypatch.setattr(ce, "_provider_metadata_window", _cap)
-
-    # openai-compatible route: the in-flight key IS threaded.
-    assert gw._max_context_block(
-        {"OUROBOROS_MODEL": "openai-compatible::llama-3", "OPENAI_COMPATIBLE_API_KEY": "THEKEY"}
-    ) is None
-    assert seen["key"] == "THEKEY"
-
-    # A different-provider route carrying the SAME leftover key: NOT threaded.
-    seen.clear()
-    assert gw._max_context_block(
-        {"OUROBOROS_MODEL": "openai/gpt-5.5", "OPENAI_COMPATIBLE_API_KEY": "THEKEY"}
-    ) is None
-    assert seen["key"] is None
+    assert route == {
+        "provider": "minimax",
+        "model": "minimax::MiniMax-M3",
+        "base_url": "https://api.minimaxi.com/v1",
+        "use_local": False,
+    }

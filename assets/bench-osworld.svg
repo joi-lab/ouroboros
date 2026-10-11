@@ -1,4 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000">
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1000" viewBox="0 0 1800 1000" role="img" aria-labelledby="title desc">
+<title id="title">Self-reported OSWorld-Verified results for Ouroboros</title>
+<desc id="desc">Ouroboros scores 90.69 percent with Claude Opus-5 and publishes full traces for the result.</desc>
     <defs>
       <filter id="glow" x="-60%" y="-120%" width="220%" height="340%">
         <feGaussianBlur stdDeviation="10" result="b"/>
@@ -35,8 +37,8 @@
 <line x1="72" y1="228" x2="1728" y2="228" stroke="#2A2F38" stroke-width="2"/>
 <rect x="72" y="270" width="1656" height="600" rx="18" fill="#0F1115" stroke="#2A2F38" stroke-width="2" />
 <text x="104" y="320" fill="#FF5961" font-family="Menlo" font-size="23" font-weight="760" text-anchor="start" letter-spacing="2" >OVERALL LEADERBOARD</text>
-<rect x="1412" y="291" width="284" height="42" rx="21" fill="#2B1114" stroke="#E13B43" stroke-width="2" filter="url(#softglow)"/>
-<text x="1554" y="320" fill="#F3F4F6" font-family="Menlo" font-size="20" font-weight="700" text-anchor="middle" letter-spacing="1" >OUROBOROS · RANK #1</text>
+<rect x="1342" y="291" width="354" height="42" rx="21" fill="#2B1114" stroke="#E13B43" stroke-width="2" filter="url(#softglow)"/>
+<text x="1519" y="320" fill="#F3F4F6" font-family="Menlo" font-size="20" font-weight="700" text-anchor="middle" letter-spacing="1" >SELF-REPORTED · RANK #1</text>
 <text x="500" y="356" fill="#6F7682" font-family="Menlo" font-size="15" font-weight="500" text-anchor="start">50%</text>
 <text x="1010" y="356" fill="#6F7682" font-family="Menlo" font-size="15" font-weight="500" text-anchor="middle">75%</text>
 <text x="1520" y="356" fill="#6F7682" font-family="Menlo" font-size="15" font-weight="500" text-anchor="end">100%</text>

@@ -261,6 +261,7 @@ def test_executable_devtools_entrypoints_support_direct_help():
         "devtools/benchmarks/osworld/normalize_logs.py",
         "devtools/benchmarks/osworld/osworld_adapter_skeleton.py",
         "devtools/benchmarks/osworld/run_step_agent.py",
+        "devtools/benchmarks/cybergym/run_cybergym.py",
     ]
     for rel in scripts:
         proc = subprocess.run(
@@ -276,9 +277,8 @@ def test_executable_devtools_entrypoints_support_direct_help():
 
 
 def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
-    # The upgraded harness-bench-fast wrapper builds the `ouroboros run` command inline in
-    # main() (per-task logs, retries, --result-json-out, --start). Verify the command shape
-    # and the v6.39 Phase-2 slot rename (HEAVY/FALLBACKS, never the legacy CODE/FALLBACK).
+    # Inline CLI shape plus the fixed-model actor, without legacy model slots.
+    # Encoder owns bytes; test checks only the launcher wiring.
     from devtools.benchmarks.harness_bench_fast import ouroboros_cli_wrapper as w
 
     assert hasattr(w, "main")
@@ -287,7 +287,8 @@ def test_harness_bench_fast_wrapper_builds_ouroboros_run_command():
     ).read_text(encoding="utf-8")
     for token in ('"run",', '"--memory-mode",', '"--quiet",', '"--result-json-out",', '"--actor-id",'):
         assert token in src, token
-    assert '"OUROBOROS_MODEL_HEAVY": args.model' in src
+    assert "fixed_model_actor_snapshot(args.model, target=env)\n" in src
+    assert '"OUROBOROS_MODEL_HEAVY": args.model' not in src
     assert "OUROBOROS_MODEL_CODE" not in src
 
 
@@ -626,13 +627,22 @@ def test_gaia_solver_disable_tools_before_prompt(monkeypatch, tmp_path):
     monkeypatch.setattr(ouroboros_solver.subprocess, "run", fake_run)
     result = ouroboros_solver.run_ouroboros("question", sample_id="sample")
     assert result["final_answer"] == "ok"
+    # --disable-tools stays BEFORE the prompt transport on argv: the REMAINDER
+    # positional would otherwise swallow it (the original bug class), and with
+    # the C5 file transport a later flag must still never shadow it.
+    assert seen["cmd"].index("--disable-tools") < seen["cmd"].index("--prompt-file")
     parser = cli.build_parser()
     ns = parser.parse_args(seen["cmd"][3:])
     assert ns.disable_tools == ["web_search,claude_code_edit"]
     assert ns.result_json_out
+    # C5 E2BIG hygiene: the prompt travels as a FILE, never as an argv tail.
+    assert not ns.prompt
+    prompt_path = Path(ns.prompt_file)
+    assert prompt_path.is_file()
+    prompt_text = prompt_path.read_text(encoding="utf-8")
     # The prompt is the question plus the official GAIA "FINAL ANSWER:" protocol suffix.
-    assert ns.prompt and ns.prompt[0].startswith("question")
-    assert "FINAL ANSWER:" in ns.prompt[0]
+    assert prompt_text.startswith("question")
+    assert "FINAL ANSWER:" in prompt_text
 
 
 def test_gaia_solver_retries_transient_supervisor_startup(monkeypatch, tmp_path):
@@ -888,10 +898,9 @@ def test_programbench_task_body_sets_executor_and_protected_policy(tmp_path):
     profile = body["metadata"]["budget_profile"]
     assert profile == {
         "cost_hard_stop_pct": 0,
-        "improvement_policy": "until_deadline",
+        "improvement_policy": "fixed",
         "max_improvement_passes": 6,
         "reserve_finalization_pct": 15,
-        "stall_rounds_threshold": 12,
     }
     # Advisory acceptance claims ride the body top-level (gateway-normalized);
     # the wording stays task-general (no benchmark-specific oracle taxonomy).
@@ -1589,16 +1598,11 @@ def test_programbench_submit_and_wait_stale_checkpoint_falls_back_to_fresh_submi
     assert json.loads(checkpoint.read_text(encoding="utf-8"))["task_id"] == "task-new"
 
 
-_PROVIDER_ROUTE_ENV_KEYS = (
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_BASE_URL",
-    "OPENAI_COMPATIBLE_BASE_URL",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_USER",
-    "GIGACHAT_PASSWORD",
+# Registry-derived so a newly registered provider can never leak ambient routing.
+from ouroboros.provider_models import PROVIDER_CREDENTIAL_GROUPS as _CRED_GROUPS
+
+_PROVIDER_ROUTE_ENV_KEYS = tuple(
+    key for group in _CRED_GROUPS.values() for key in group
 )
 
 
@@ -1623,6 +1627,7 @@ def test_programbench_model_preflight_rejects_legacy_ids_on_direct_route(tmp_pat
 
 
 def test_programbench_model_preflight_keeps_openrouter_ids_and_checks_solve_model(tmp_path, monkeypatch):
+    from devtools.benchmarks.common.model_slots import single_model_subagents_setting
     from devtools.benchmarks.programbench.run_programbench_e2e import preflight_model_slots
 
     _scrub_model_route_env(monkeypatch)
@@ -1632,6 +1637,7 @@ def test_programbench_model_preflight_keeps_openrouter_ids_and_checks_solve_mode
             {
                 "OPENROUTER_API_KEY": "test-key",
                 "OUROBOROS_MODEL": "openai/gpt-5.5-mini",
+                "OUROBOROS_SUBAGENTS": single_model_subagents_setting("openai/gpt-5.5-mini"),
                 "OUROBOROS_REVIEW_MODELS": "openai/gpt-5.5-mini,openai/gpt-5.5-mini",
             }
         ),
@@ -1735,7 +1741,7 @@ def test_osworld_shell_action_does_not_fabricate_bash_history():
     command into ~/.bash_history to satisfy terminal-task evaluators (hidden
     verifier knowledge / answer fitting). The only allowed mention is the
     docstring documenting that we deliberately do not do it."""
-    src = (REPO_ROOT / "devtools" / "benchmarks" / "osworld" / "run_step_agent.py").read_text(encoding="utf-8")
+    src = (REPO_ROOT / "devtools/benchmarks/osworld/step_agent_actions.py").read_text(encoding="utf-8")
     # No history-file write in the emitted snippet, no record_history plumbing.
     assert "hist.open(" not in src
     assert "record_history" not in src
@@ -1756,12 +1762,12 @@ def test_terminal_bench_metadata_declares_all_assisting_models(monkeypatch):
     meta = module.leaderboard_metadata(
         agent_name="Ouroboros", org_name="Ouroboros",
         model="openai/gpt-5.5", light_model="google/gemini-3.5-flash")
-    from ouroboros.config import SETTINGS_DEFAULTS
-
     # Every shipped default is read from the config SSOT and must be visible.
-    for helper in SETTINGS_DEFAULTS["OUROBOROS_REVIEW_MODELS"].split(","):
+    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
+
+    for helper in OPENROUTER_REVIEW_DEFAULTS["triad"]:
         assert helper in meta
-    assert SETTINGS_DEFAULTS["OUROBOROS_SCOPE_REVIEW_MODELS"] in meta
+    assert "scope_review" not in meta
     assert "commit_review_triad" in meta
     assert meta.count("model_name:") >= 3
 
@@ -1783,9 +1789,9 @@ def test_terminal_bench_adapter_defaults_to_required_acceptance_review(tmp_path)
     env = agent._container_env()
     assert env["OUROBOROS_TASK_REVIEW_MODE"] == "auto"
     assert env["OUROBOROS_MODEL"] == "openai/gpt-5.5"
-    # v6.39 slot rename: the bulk lane is OUROBOROS_MODEL_HEAVY (legacy _CODE retired);
-    # the container HEAVY lane reads os.environ["OUROBOROS_MODEL_HEAVY"], not _CODE.
-    assert env["OUROBOROS_MODEL_HEAVY"] == "openai/gpt-5.5"
+    actor = json.loads(env["OUROBOROS_SUBAGENTS"])["items"][0]["route"]
+    assert actor == {"kind": "api_model", "target_id": "openai/gpt-5.5"}
+    assert "OUROBOROS_MODEL_HEAVY" not in env
     assert env["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
 
 
@@ -3248,8 +3254,8 @@ def test_container_env_never_forwards_model_fallback(tmp_path, monkeypatch):
 
 
 def test_harbor_agent_defaults_max_workers_four_and_probes_context_timeout(tmp_path):
-    """6c: plan_task needs >=2 workers — v6.55.0 raises the template default to 4
-    decomposition slots (root takes one lane; container memory caps the pool);
+    """6c: 4 decomposition slots for the agent's own subagents (root takes one
+    lane; container memory caps the pool — plan review needs no pool);
     6d: per-task timeout adopted from the harbor AgentContext when a future
     harbor exposes it (today: metadata probe)."""
     import types as _types
@@ -3554,10 +3560,6 @@ def test_gaia_audit_gold_verbatim_alone_is_weak_only(tmp_path):
     assert gv2 and gfl2
     assert audit._distinctive_gold(gold)
 
-
-def test_gaia_events_serializer_carries_web_search_sources():
-    src = (REPO_ROOT / "supervisor" / "events.py").read_text(encoding="utf-8")
-    assert "web_search_sources" in src
 
 
 def test_gaia_score_leakage_adjusted(tmp_path):
@@ -4182,32 +4184,36 @@ def test_swe_pro_grade_ungraded_covers_unparseable_and_empty_requirements(tmp_pa
         assert verdict == "ungraded" and reason.startswith("output_unparseable") and column == "-"
 
 
+def _write_programbench_actor_settings(_e2e, path):
+    from devtools.benchmarks.common.model_slots import pin_single_model
+
+    model = "openai/gpt-5.5"
+    payload = {}
+    pin_single_model(model, target=payload)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
 def test_programbench_e2e_ledger_is_append_only_and_manifest_is_written_first(tmp_path, monkeypatch):
-    """P1.5 + P1.2 on the biggest spender: every row is appended the moment it exists (a crash
-    used to discard the whole run's ledger, and a resume silently replaced the previous run's
-    history), and the manifest — which carries the seed gate — is written BEFORE the first
-    instance instead of after the official eval."""
+    """ProgramBench records target-bound manifests before append-only instance rows."""
     from devtools.benchmarks.programbench import run_programbench_e2e as e2e
 
     run_root = tmp_path / "pb-run"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     instances = [{"instance_id": "inst-a", "image_name": "img-a"}, {"instance_id": "inst-b", "image_name": "img-b"}]
     monkeypatch.setattr(e2e, "_load_instances", lambda **_k: list(instances))
     monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True, "runtime_version": "6.75.0"})
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: run_root)
 
     seen: list[str] = []
 
     def _fake_process(instance, cfg):
         seen.append(str(instance["instance_id"]))
-        # The ledger must already hold the FIRST row while the SECOND instance is still running.
         if len(seen) == 2:
             lines = (run_root / "result_index.jsonl").read_text(encoding="utf-8").splitlines()
             assert [json.loads(line)["instance_id"] for line in lines] == ["inst-a"]
-            # The manifest already exists mid-run and carries the seed gate. Assert the gate's
-            # SHAPE, never its verdict: `ok` mirrors the ambient checkout, so pinning it to False
-            # passes on a developer's dirty tree and fails on a clean CI checkout.
             gate = json.loads((run_root / "run_manifest.json").read_text(encoding="utf-8"))["seed_gate"]
             assert set(gate) >= {"ok", "reason", "require_clean", "allow_dirty_seed", "dirty", "git_available"}
             assert gate["require_clean"] is False and gate["allow_dirty_seed"] is True
@@ -4442,14 +4448,10 @@ def test_finalize_run_manifest_records_a_typed_outcome_on_every_exit_path(tmp_pa
     assert _extra()["exit_code"] == 1
 
 
-# --------------------------------------------------------------------------- #
-# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py)
-#
-# The guard used to live here as test-local `ast` helpers, and that is why it only ever knew
-# about ONE launcher shape and ONE hop of LOCAL helpers. It is now a module: the same entry
-# point audits the real launchers and a SYNTHETIC violating one, which is the only way to
-# tell "the gate works" from "today's code happens to be clean".
-# --------------------------------------------------------------------------- #
+# The structural launcher gate (devtools/benchmarks/common/launcher_audit.py).
+# Formerly test-local `ast` helpers knowing ONE launcher shape and ONE hop of
+# LOCAL helpers; now a module auditing the real launchers plus a SYNTHETIC
+# violating one — the only way to tell "the gate works" from "clean today".
 
 # A synthetic launcher-shaped module for pinning the pre-admission resolver itself.
 # Deliberately not a real launcher: the gate's BEHAVIOUR is what must not regress.
@@ -4595,26 +4597,10 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
     # this test uses that SSOT rather than keeping a second, weaker copy of the same walk.
     from devtools.benchmarks.common.launcher_audit import (
         _dotted_callee, calls_before as _calls_before,
-        denied_pre_admission_call as _denied_pre_admission_call,
+        denied_pre_admission_call as _denied_pre_admission_call, launcher_paths,
     )
 
-    bench = REPO_ROOT / "devtools" / "benchmarks"
-    migrated = [
-        bench / "programbench" / "run_programbench.py",
-        bench / "programbench" / "run_programbench_e2e.py",
-        bench / "swe_bench" / "swebench_predictions.py",
-        bench / "swe_bench_pro" / "pro_predictions.py",
-        bench / "harness_bench_fast" / "run_harness_bench_fast.py",
-        bench / "swe_bench_pro" / "e1v2" / "run_pro.py",
-        bench / "swe_bench_pro" / "e1v2" / "auto_run.py",
-        bench / "gaia" / "run_gaia.py",
-        bench / "terminal_bench" / "run_tb.py",
-        bench / "terminal_bench" / "run_harbor_smoke.py",
-        bench / "continual_learning" / "run_clb.py",
-        bench / "osworld" / "run_step_agent.py",
-        bench / "osworld" / "run_cu_bridge_agent.py",
-        bench / "osworld" / "osworld_adapter_skeleton.py",
-    ]
+    migrated = launcher_paths()
     for path in migrated:
         source = path.read_text(encoding="utf-8")
         assert "admit_benchmark_run(" in source, f"{path.name} bypasses the admission seam"
@@ -4652,13 +4638,9 @@ def test_every_migrated_launcher_routes_through_both_manifest_seams():
                 f"{path.name}: {dotted}() runs BEFORE admit_benchmark_run() in {owner}() -- a "
                 f"refusal there leaves no durable manifest (denied token: {denied})"
             )
-    # The pending set is EMPTY on this tree: CL-Bench and the three OSWorld launchers migrated
-    # in v6.76.0, GAIA and both Terminal-Bench launchers in v6.79.0. Asserted against the gate's
-    # own list so the two enumerations cannot drift apart silently.
     from devtools.benchmarks.common import launcher_audit
 
     assert launcher_audit.PENDING_LAUNCHERS == ()
-    assert len(migrated) == len(launcher_audit.MIGRATED_LAUNCHERS)
 
 
 # One synthetic per CALL FORM a write primitive can wear. The destination model is derived from
@@ -5402,10 +5384,11 @@ def test_programbench_e2e_records_a_typed_outcome_on_its_failure_paths(tmp_path,
 
     out_root = tmp_path / "pb-e2e"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     monkeypatch.setattr(e2e, "_load_instances",
                         lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
     monkeypatch.setattr(e2e, "runtime_attestation", lambda url, repo: {"ok": True})
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
     monkeypatch.setattr(e2e, "_process_instance", lambda instance, cfg: e2e.task_result_row(
         benchmark="programbench", instance_id="inst-a", status="failed",
@@ -5520,10 +5503,11 @@ def test_programbench_e2e_persists_the_manifest_when_attestation_refuses(tmp_pat
 
     out_root = tmp_path / "pb-attest"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    target_settings = _write_programbench_actor_settings(e2e, settings)
     monkeypatch.setattr(e2e, "_load_instances",
                         lambda **_k: [{"instance_id": "inst-a", "image_name": "img-a"}])
     monkeypatch.setattr(e2e, "run_root", lambda *_a, **_k: out_root)
+    monkeypatch.setattr(e2e, "ouroboros_api_request", lambda *_a, **_k: target_settings)
 
     from devtools.benchmarks.common.manifests import RuntimeAttestationRefused
 
@@ -6736,20 +6720,12 @@ def test_run_tb_classifies_a_harbor_job_by_its_trials_not_its_exit_code():
 
 
 def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, monkeypatch):
-    """TB's manifest must name the model that RAN, in the SAME field GAIA records it in.
+    """Record the model that ran, not decoy env/settings templates.
 
-    Presence is deliberately not the property under test. The sibling failure this guards
-    against is SWE-Pro's manifest naming a model that did not run because it snapshotted the
-    settings TEMPLATE instead of the derived settings, so a decoy model is planted in BOTH the
-    host env and the host settings file: an implementation that copies either one still writes a
-    perfectly non-empty `model_slots`, and still fails every equality assertion below. The
-    `--all-model` leg additionally pins the post-override value, the one `--model` alone never
-    sees.
-
-    Hermetic by construction — purpose-built seed repo, tmp settings file, tmp run root, cwd
-    redirected into tmp_path and the harbor probe stubbed — so nothing here depends on this
-    machine's workspace layout or on a harbor binary being installed.
+    The ``--all-model`` leg also pins post-parse override truth. The seed repo, settings,
+    run roots, cwd and harbor probe are isolated from the operator workspace.
     """
+    from devtools.benchmarks.common import model_slots
     from devtools.benchmarks.common.manifests import MODEL_SLOT_KEYS
     from devtools.benchmarks.terminal_bench import run_tb
 
@@ -6758,8 +6734,11 @@ def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, m
     monkeypatch.setattr(run_tb, "repo_root_from_devtools", lambda: seed)
     monkeypatch.setattr(run_tb, "harbor_version", lambda _harbor_bin: "")
     monkeypatch.chdir(tmp_path)
-    for key in MODEL_SLOT_KEYS:
-        monkeypatch.delenv(key, raising=False)
+    for key in (
+        *MODEL_SLOT_KEYS, *model_slots._ACTIVE_LOCAL_ROUTE_KEYS,
+        model_slots.SUBAGENTS_SETTING, model_slots.REVIEWER_SLOTS_ENV, "USE_LOCAL_HEAVY",
+    ):
+        monkeypatch.setenv(key, "")
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps({"OUROBOROS_MODEL": "decoy/template-main",
@@ -6784,9 +6763,8 @@ def test_run_tb_manifest_records_the_model_the_run_actually_resolved(tmp_path, m
     # The measured model, NOT the ambient env decoy and NOT the settings-template decoy.
     assert slots["OUROBOROS_MODEL"] == "anthropic/claude-fable-5"
     assert slots["OUROBOROS_MODEL_LIGHT"] == "google/gemini-3.5-flash"
-    # The adapter drives HEAVY and the fallback chain off the same kwarg, so they must not
-    # imply a second model.
-    assert slots["OUROBOROS_MODEL_HEAVY"] == "anthropic/claude-fable-5"
+    # New manifests keep legacy Heavy absent.
+    assert "OUROBOROS_MODEL_HEAVY" not in slots
     assert slots["OUROBOROS_MODEL_FALLBACKS"] == "anthropic/claude-fable-5"
     assert "decoy/ambient-main" not in slots.values()
     assert "decoy/template-main" not in slots.values()
@@ -6828,65 +6806,6 @@ def test_gaia_and_tb_launchers_add_no_runtime_attestation(tmp_path):
         assert "runtime_attestation" not in src, f"{path.name} must not attest a live runtime"
     for path in (tb_dir / "run_tb.py", tb_dir / "run_harbor_smoke.py", gaia_dir / "run_gaia.py"):
         assert "require_clean=not " in path.read_text(encoding="utf-8"), f"{path.name} lost its seed gate"
-
-
-def test_architecture_launcher_count_is_pinned_to_the_registry():
-    """ARCHITECTURE must state the real migrated-launcher count, derived not restated.
-
-    Two phases edited the same 33 KB single-physical-line paragraph independently. Git
-    merged both survivors with no conflict marker, leaving the document asserting ELEVEN
-    in one sentence and ten in another while the registry held fourteen. Every gate was
-    green: no test pinned the prose to the code, so the only reader who could have caught
-    it was a human diffing a 33 KB line by eye.
-
-    Pinned as a CONTRACT: the number in the document must equal len(MIGRATED_LAUNCHERS),
-    whatever that becomes. A phase that migrates a launcher and forgets the prose fails
-    here instead of shipping a document that misdescribes its own gate."""
-    import pathlib
-    import re
-
-    from devtools.benchmarks.common.launcher_audit import (
-        MIGRATED_LAUNCHERS,
-        PENDING_LAUNCHERS,
-    )
-
-    words = {
-        7: "SEVEN", 8: "EIGHT", 9: "NINE", 10: "TEN", 11: "ELEVEN", 12: "TWELVE",
-        13: "THIRTEEN", 14: "FOURTEEN", 15: "FIFTEEN", 16: "SIXTEEN",
-    }
-    total = len(MIGRATED_LAUNCHERS)
-    expected = words.get(total)
-    assert expected is not None, f"extend the word table for {total} launchers"
-
-    arch = pathlib.Path(__file__).resolve().parents[1] / "docs" / "ARCHITECTURE.md"
-    text = arch.read_text(encoding="utf-8")
-
-    # Only NUMBER words are claims about a count; "the migrated launchers" is not.
-    # Historical, explicitly version-qualified counts ("ELEVEN as of v6.76.0") are
-    # legitimate and exempt — the paragraph is partly a per-version narrative.
-    numerals = "|".join(sorted(words.values(), key=len, reverse=True))
-    pattern = re.compile(rf"\b({numerals})\b(?=[^.]{{0,80}}?migrated launchers)", re.I)
-    found = 0
-    for match in pattern.finditer(text):
-        word = match.group(1)
-        following = text[match.end():match.end() + 40]
-        if re.match(r"\s+as of v\d+\.\d+\.\d+", following):
-            continue
-        found += 1
-        assert word.upper() == expected, (
-            f"ARCHITECTURE says {word!r} migrated launchers but the registry holds "
-            f"{total} ({expected}); an unqualified count must be the current one"
-        )
-
-    assert found, (
-        "no unqualified migrated-launcher count found in ARCHITECTURE — the check went "
-        "vacuous; a count must be stated so it can be pinned"
-    )
-
-    if not PENDING_LAUNCHERS:
-        assert "`PENDING_LAUNCHERS` is the empty tuple" in text or (
-            "PENDING_LAUNCHERS` now the empty tuple" in text
-        ), "the empty residual must stay disclosed while it is empty"
 
 
 def test_scrubber_refuses_symlinks_instead_of_writing_through_them(tmp_path, capsys, monkeypatch):

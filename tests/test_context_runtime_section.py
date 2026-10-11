@@ -1,0 +1,631 @@
+"""The runtime section and the user content the context builder emits.
+
+Split verbatim out of ``tests/test_context.py`` by theme. This module owns the
+force-plan notice that must not rewrite the user's text, the light-mode rule and filesystem affordances the runtime section states,
+the workspace rules that preserve system review/commit authority, the host routing
+manifest and manual contract, the improvement backlog digest, and the runtime_env
+block.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+
+import pytest
+
+from ouroboros.context import build_runtime_section, build_user_content
+
+from tests._context_shared import _make_health_env
+
+def test_build_llm_messages_has_no_recorder_only_soft_cap_chain():
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+
+    assert "soft_cap_tokens" not in inspect.signature(build_llm_messages).parameters
+    assert not hasattr(context_module, "apply_message_token_soft_cap")
+    source = inspect.getsource(build_llm_messages)
+    assert "estimated_tokens_before" not in source
+    assert "trimmed_sections" not in source
+    assert "context_fit" in source
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
+    monkeypatch, enforcement,
+):
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    content = build_user_content(
+        {
+            "text": "Fix the marketplace retry flow.",
+            "metadata": {"force_plan": True, "force_plan_source": "swarm"},
+        }
+    )
+
+    assert content.startswith("[SWARM_INITIATIVE]")
+    assert "Source: swarm." in content
+    assert f"Resolved review enforcement: {enforcement}." in content
+    # The obligation is constitutional (BIBLE P3) and the gate is structural
+    # (owner_hurry.force_plan_decision); the ORDER of asking, exploring and
+    # planning belongs to the mind (BIBLE P5/P13), never to a prompt choreography.
+    assert "First call plan_task" not in content
+    assert "whether to ask, explore or plan first is your judgment" in content
+    assert "Under blocking" in content
+    assert "non-mutating preparation" in content
+    assert "begin implementation only after review closes" in content
+    # Fan-out integration mechanics (owner-approved, 2026-08-05): parallel
+    # children cannot see each other's edits, so a plan gives them disjoint
+    # write regions or plans the parent synthesis for the expected overlap.
+    assert "cannot see each other's edits" in content
+    assert "disjoint write regions" in content
+    # Owner intent as prose, not schema (rc-phaseC, P5): the plan must name its
+    # execution shape so reviewers can judge a silent zero-fan-out.
+    assert "State the chosen execution shape explicitly" in content
+    assert "delegation required, optional, or intentionally not used" in content
+    assert content.rstrip().endswith("Fix the marketplace retry flow.")
+
+
+@pytest.mark.parametrize("obsolete_marker", [False, True])
+def test_managed_force_plan_has_only_the_initiative_context(obsolete_marker):
+    text = "  Investigate the alternatives.\nAsk about the actual constraints.\n"
+    content = build_user_content({
+        "text": text, "id": "managed-root", "root_task_id": "managed-root",
+        "_ephemeral_turn": obsolete_marker,
+        "metadata": {"force_plan": True, "force_plan_source": "swarm"},
+    })
+    assert content.startswith("[SWARM_INITIATIVE]")
+    assert content.count("[SWARM_INITIATIVE]") == 1
+    assert "SWARM_ROUTING_INTENT" not in content
+    assert content.endswith(text)
+
+
+
+def test_runtime_section_includes_light_runtime_mode_rule(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+
+    assert payload["runtime_mode"] == "light"
+    assert "forbids Ouroboros repo mutation" in payload["runtime_mode_rule"]
+    assert "user_files" in payload["runtime_mode_rule"]
+    assert "artifact_store" in payload["runtime_mode_rule"]
+    assert "explicit scoped skill-payload work/repair" in payload["runtime_mode_rule"]
+    assert "runtime_data/uploads" in payload["runtime_mode_rule"]
+
+
+@pytest.mark.parametrize("trigger", ["once", "cron"])
+def test_runtime_keeps_the_admitted_occurrences_due_time_after_schedule_advances(tmp_path, trigger):
+    env = _make_health_env(tmp_path)
+    due = "2026-09-29T00:30:00+00:00"
+    claimed = "2026-09-30T03:00:00+00:00"
+    (tmp_path / "state" / "scheduled_tasks.json").write_text(json.dumps({"tasks": [{
+        "id": "follow-up", "enabled": trigger == "cron", "name": "Review results",
+        "trigger": {"type": trigger, "run_at": due, "expr": "30 0 * * *"},
+        "next_run_at": "2026-10-01T00:30:00+00:00",
+    }]}), encoding="utf-8")
+    task = {"id": "late-run", "type": "task", "metadata": {"schedule_occurrence": {
+        "schedule_id": "follow-up", "token": "occurrence-token", "due_at": due, "claimed_at": claimed,
+    }}}
+    runtime = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert runtime["task"]["schedule_occurrence"] == {
+        "schedule_id": "follow-up", "due_at": due, "claimed_at": claimed,
+    }
+    if trigger == "once":
+        assert "scheduled_tasks" not in runtime  # consumed one-shot no longer appears in the digest
+    else:
+        assert runtime["scheduled_tasks"]["active"][0]["next_run_at"] != due
+
+
+def test_runtime_does_not_invent_a_due_time_for_legacy_or_ordinary_work(tmp_path):
+    env = _make_health_env(tmp_path)
+    task = {"id": "legacy", "metadata": {"schedule_occurrence": {"schedule_id": "old", "token": "t"}}}
+    legacy = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert legacy["task"]["schedule_occurrence"] == {"schedule_id": "old", "due_at": None, "claimed_at": None}
+    ordinary = json.loads(build_runtime_section(env, {"id": "ordinary"}).split("\n\n", 1)[1])
+    assert "schedule_occurrence" not in ordinary["task"]
+
+
+def test_runtime_section_includes_filesystem_affordances_with_ctx(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
+    ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path)
+
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"}, ctx=ctx)
+    payload = json.loads(section.split("\n\n", 1)[1])
+    fs = payload["capabilities"]["filesystem"]
+
+    assert fs["profile"] == "self_modification"
+    assert "runtime_data" in fs["searchable_roots"]
+    assert "task_drive" in fs["searchable_roots"]  # read⇒search closure (TZ-1 E)
+    assert "task_drive" in fs["allowed_shell_cwd_roots"]
+    assert "status" in fs["git_readonly_subcommands"]
+    assert "active_workspace" in fs["light_gated_roots"]
+
+
+def test_runtime_section_external_workspace_includes_user_files_shell_affordance(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    drive = tmp_path / "data"
+    repo = tmp_path / "repo"
+    workspace = tmp_path / "workspace"
+    drive.mkdir()
+    repo.mkdir(exist_ok=True)
+    workspace.mkdir(exist_ok=True)
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=drive,
+        workspace_root=workspace,
+        workspace_mode="external",
+    )
+
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"}, ctx=ctx)
+    payload = json.loads(section.split("\n\n", 1)[1])
+    fs = payload["capabilities"]["filesystem"]
+
+    assert fs["profile"] == "external_workspace_task"
+    assert "user_files" in fs["allowed_shell_cwd_roots"]
+
+
+def test_runtime_section_workspace_rule_preserves_system_review_commit_authority(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    section = build_runtime_section(
+        env,
+        {
+            "id": "task-1",
+            "type": "task",
+            "workspace_root": str(workspace),
+            "workspace_mode": "external",
+            "memory_mode": "forked",
+        },
+    )
+    rule = json.loads(section.split("\n\n", 1)[1])["active_workspace"]["rule"]
+
+    assert "default to the active workspace" in rule
+    assert "explicit typed root/cwd" in rule
+    assert "self-review/commit tools remain available" in rule
+    assert "self-review/commit tools are unavailable" not in rule
+
+
+def test_runtime_section_omits_light_rule_for_advanced(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+
+    assert payload["runtime_mode"] == "advanced"
+    assert "runtime_mode_rule" not in payload
+
+
+def test_runtime_section_includes_non_workspace_memory_boundary(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    section = build_runtime_section(
+        env,
+        {
+            "id": "task-1",
+            "type": "task",
+            "memory_mode": "forked",
+            "drive_root": str(tmp_path / "child"),
+            "child_drive_root": str(tmp_path / "child"),
+            "budget_drive_root": str(tmp_path / "data"),
+        },
+    )
+    payload = json.loads(section.split("\n\n", 1)[1])
+    assert payload["task"]["memory_mode"] == "forked"
+    assert payload["task"]["child_drive_root"].endswith("child")
+    assert payload["task"]["budget_drive_root"].endswith("data")
+
+
+def test_runtime_section_exposes_host_routing_manifest_and_manual_contract(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    task = {
+        "id": "decision-1",
+        "type": "task",
+        "metadata": {
+            "current_chat": {
+                "chat_id": 1,
+                "running_tasks": [],
+                "addressable_root_tasks": [{"task_id": "pending-1", "status": "pending"}],
+            },
+            "main_routing_manifest": {
+                "projects": [{"project_id": "racer", "name": "Racer"}],
+                "root_tasks": [{"task_id": "pending-1", "status": "pending"}],
+            },
+            "routing_contract": {
+                "source_lane": "main",
+                "on_uncertain_or_invalid_target": "needs_manual_target",
+                "manual_options": [{"task_id": "pending-1"}],
+            },
+        },
+    }
+
+    payload = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+
+    assert payload["current_chat"]["addressable_root_tasks"][0]["task_id"] == "pending-1"
+    assert payload["main_routing_manifest"]["projects"][0]["project_id"] == "racer"
+    assert payload["routing_contract"]["on_uncertain_or_invalid_target"] == "needs_manual_target"
+
+
+def test_runtime_section_offers_the_rooms_own_continuation_hint(tmp_path, monkeypatch):
+    """A project room's routing manifest has to REACH the decision turn.
+
+    While only the pointer row travelled, a room saw exactly ONE continuation
+    candidate; when a child had stamped that pointer the room could not name its
+    own interrupted root at all and promoted again, minting a duplicate root.
+    """
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    room = {
+        "final_results": [{"task_id": "racer-old", "status": "completed"}],
+        "active_roots": [{"task_id": "racer-live", "status": "running",
+                          "cancel_state": "pending"}],
+        "omissions": {"final_results": 3, "children": 2, "active_roots": 0},
+    }
+    task = {
+        "id": "decision-room",
+        "type": "task",
+        "metadata": {
+            "current_chat": {
+                "chat_id": 7,
+                "running_tasks": [],
+                "addressable_root_tasks": [{"task_id": "racer-live", "status": "running"}],
+            },
+            "project_routing_manifest": room,
+            "project_last_task_result": {"task_id": "racer-old", "status": "completed"},
+        },
+    }
+
+    payload = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert payload["project_routing_manifest"] == room
+    assert payload["project_last_task_result"]["task_id"] == "racer-old"
+
+    # The quiet direction: a lane with nothing to offer states no empty hint.
+    task["metadata"]["project_routing_manifest"] = {}
+    quiet = json.loads(build_runtime_section(env, task).split("\n\n", 1)[1])
+    assert "project_routing_manifest" not in quiet
+    assert quiet["project_last_task_result"]["task_id"] == "racer-old"
+
+
+def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+
+    class FakeEnv:
+        def drive_path(self, p):
+            return tmp_path / p
+
+        def repo_path(self, p):
+            return tmp_path / "repo" / p
+
+        @property
+        def repo_dir(self):
+            return tmp_path / "repo"
+
+        @property
+        def drive_root(self):
+            return tmp_path
+
+    (tmp_path / "repo" / "prompts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "repo" / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+
+    (tmp_path / "repo" / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
+    (tmp_path / "repo" / "BIBLE.md").write_text("Bible", encoding="utf-8")
+    (tmp_path / "repo" / "README.md").write_text("README", encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "ARCHITECTURE.md").write_text('# Ouroboros v1.2.3', encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "DEVELOPMENT.md").write_text('# Dev', encoding="utf-8")
+    (tmp_path / "repo" / "docs" / "CHECKLISTS.md").write_text('Checklist', encoding="utf-8")
+    (tmp_path / "repo" / "VERSION").write_text("1.2.3", encoding="utf-8")
+    (tmp_path / "repo" / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
+    (tmp_path / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
+    (tmp_path / "memory" / "identity.md").write_text("I am Ouroboros", encoding="utf-8")
+    (tmp_path / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
+    (tmp_path / "memory" / "knowledge" / "improvement-backlog.md").write_text(
+        "# Improvement Backlog\n\n### ibl-1\n- status: open\n- created_at: 2026-04-14T09:00:00+00:00\n- source: execution_reflection\n- category: process\n- task_id: task-1\n- requires_plan_review: yes\n- fingerprint: fp-1\n- summary: Reduce recurring task friction around REVIEW_BLOCKED\n",
+        encoding="utf-8",
+    )
+
+    ordinary = ({"id": "main", "type": "task", "_is_direct_chat": True},
+                {"id": "project", "type": "task", "project_id": "p1"},
+                {"id": "managed", "type": "task"},
+                {"id": "child", "type": "task", "delegation_role": "subagent"})
+    for task in ordinary:
+        task["text"] = "hello"
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path), task=task,
+        )
+        assert "## Improvement Backlog" not in messages[0]["content"][2]["text"]
+
+    for task_type in ("evolution", "deep_self_review"):
+        messages, _ = build_llm_messages(
+            env=FakeEnv(), memory=Memory(drive_root=tmp_path),
+            task={"id": task_type, "type": task_type, "text": "improve"})
+        dynamic_text = messages[0]["content"][2]["text"]
+        assert "## Improvement Backlog" in dynamic_text
+        assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
+
+
+class TestRuntimeEnvSection:
+    """build_runtime_section: runtime_env carries presentation + platform, and
+    the per-message owner_client fact renders beside it (is_desktop retired)."""
+
+    def _make_env(self, tmp_path):
+        class FakeEnv:
+            repo_dir = tmp_path / "repo"
+            drive_root = tmp_path
+
+            def drive_path(self, p):
+                return tmp_path / p
+
+        (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "state" / "state.json").write_text(
+            '{"spent_usd": 0}', encoding="utf-8"
+        )
+        return FakeEnv()
+
+    def test_runtime_env_presentation_absent_means_web(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
+        env = self._make_env(tmp_path)
+        section = build_runtime_section(env, {"id": "t1", "type": "task"})
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "runtime_env" in data
+        assert "platform" in data["runtime_env"]
+        assert isinstance(data["runtime_env"]["platform"], str)
+        assert data["runtime_env"]["presentation"] == "web"
+        # The dead is_desktop flag is retired; presentation replaced it.
+        assert "is_desktop" not in data["runtime_env"]
+
+    def test_runtime_env_presentation_from_launcher_export(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        for value in ("desktop_window", "browser_fallback"):
+            monkeypatch.setenv("OUROBOROS_PRESENTATION", value)
+            env = self._make_env(tmp_path)
+            section = build_runtime_section(env, {"id": "t2", "type": "task"})
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert data["runtime_env"]["presentation"] == value
+
+    def test_owner_client_rendered_from_metadata(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        monkeypatch.delenv("OUROBOROS_PRESENTATION", raising=False)
+        env = self._make_env(tmp_path)
+        fact = {"pywebview": True, "ua": "TestShell/1.0", "viewport": {"w": 1200, "h": 800}}
+        section = build_runtime_section(
+            env, {"id": "t3", "type": "task", "metadata": {"client_surface": fact}}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert data["owner_client"] == fact
+        assert "SENT" in data["owner_client_note"]
+
+    def test_owner_client_absent_is_a_gap_not_a_default(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        section = build_runtime_section(env, {"id": "t4", "type": "task"})
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
+        assert "owner_client_note" not in data
+
+    def test_ui_language_fact_names_the_tag_and_whether_it_was_chosen(self, tmp_path, monkeypatch):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "")
+        data = json.loads(build_runtime_section(env, {"id": "t5", "type": "task"}).split("## Runtime context\n\n", 1)[1])
+        assert data["ui_language"] == {"tag": "en", "chosen": False}
+        monkeypatch.setenv("OUROBOROS_UI_LANGUAGE", "ru")
+        data = json.loads(build_runtime_section(env, {"id": "t6", "type": "task"}).split("## Runtime context\n\n", 1)[1])
+        assert data["ui_language"] == {"tag": "ru", "chosen": True}
+
+    def test_owner_client_channel_fact_stamped_by_external_admission(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # /api/tasks and CLI STAMP the channel fact at admission; the renderer
+        # reads only the producer-assembled fact.
+        section = build_runtime_section(
+            env, {"id": "t5", "type": "task", "metadata": {"client_surface": {"channel": "cli"}}}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert data["owner_client"] == {"channel": "cli"}
+
+    def test_owner_client_never_inferred_from_metadata_source(self, tmp_path):
+        from ouroboros.context import build_runtime_section
+
+        env = self._make_env(tmp_path)
+        # metadata.source is OVERLOADED (scheduler writes scheduled_task /
+        # skill_scheduled_task): the renderer must never dress it up as an
+        # owner surface — no producer stamp, no fact (codex scope round 2 N1).
+        for source in ("cli", "scheduled_task", "skill_scheduled_task", "web"):
+            section = build_runtime_section(
+                env, {"id": "t6", "type": "task", "metadata": {"source": source}}
+            )
+            data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+            assert "owner_client" not in data, f"source={source!r} must not render"
+        # Internal producers use top-level task["source"], never rendered.
+        section = build_runtime_section(
+            env, {"id": "t7", "type": "task", "source": "promote_chat_to_task"}
+        )
+        data = json.loads(section.split("## Runtime context\n\n", 1)[1])
+        assert "owner_client" not in data
+
+
+def _delegation_data_root(tmp_path, monkeypatch):
+    root = tmp_path / "delegation_data_root"
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", root)
+    return root
+
+
+def _delegation_fact(tmp_path, monkeypatch):
+    env = _make_health_env(tmp_path)
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "advanced")
+    section = build_runtime_section(env, {"id": "task-1", "type": "task"})
+    payload = json.loads(section.split("\n\n", 1)[1])
+    return payload["capabilities"]
+
+
+def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "claudexor=opus-5:high")
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "triad_1": {
+            "ts": "2026-08-18T01:02:03+00:00",
+            "surface": "triad",
+            "status": "ok",
+            "requested": {"profile_id": "requested-review-profile"},
+            "effective": {
+                "route": "agent_session:claudexor",
+                "model": "opus-5",
+                "profile_id": "applied-review-profile",
+            },
+        },
+        "triad_2": {
+            "ts": "2026-08-18T01:02:04+00:00",
+            "surface": "triad",
+            "status": "error",
+            # B1 typed facts: a dated window carries reset_at, an undated one
+            # only the code — both must surface independently.
+            "failure_code": "subscription_window_exhausted",
+            "reset_at": "2026-08-18T09:20:00+00:00",
+        },
+    }), encoding="utf-8")
+    (root / "state" / "subagent_last_delegation.json").write_text(json.dumps({
+        "ts": "2026-08-18T02:00:00+00:00",
+        "route": "claudexor",
+        "requested_model": "opus-5",
+        "applied_model": "claude-opus-5",
+        "requested_profile": "requested-delegate-profile",
+        "applied_profile": "applied-delegate-profile",
+        "selected_subagent_id": "builder",
+        "run_id": "run-1",
+    }), encoding="utf-8")
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+    delegation = capabilities["delegation"]
+
+    assert "configured_route" not in delegation
+    rows = {row["slot"]: row for row in delegation["reviewer_slots_last"]}
+    assert rows["triad_1"]["outcome"] == "ok"
+    assert rows["triad_1"]["requested_profile"] == "requested-review-profile"
+    assert rows["triad_1"]["applied_profile"] == "applied-review-profile"
+    assert "failure_code" not in rows["triad_1"]
+    assert rows["triad_2"]["outcome"] == "failed"
+    assert rows["triad_2"]["failure_code"] == "subscription_window_exhausted"
+    assert rows["triad_2"]["reset_at"] == "2026-08-18T09:20:00+00:00"
+    # Per-row label is the timestamp only; the verbatim historical disclaimer
+    # lives ONCE in the note (review fix 12), never repeated per row.
+    assert rows["triad_1"]["observed"] == "last observed at 2026-08-18T01:02:03+00:00"
+    last = delegation["subagent_last_delegation"]
+    assert last["route"] == "claudexor"
+    assert last["applied_model"] == "claude-opus-5"
+    assert last["requested_profile"] == "requested-delegate-profile"
+    assert last["applied_profile"] == "applied-delegate-profile"
+    # Named from the record's own facts (no typed identity here: its route target).
+    assert last["selected_subagent_id"] == "claudexor=opus-5"
+    assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
+    assert "historical" not in rows["triad_1"]["observed"]
+    # The prompt-visible note teaches the semantics ONCE: rows are history, live
+    # facts come from plan-review waves and typed delegate refusals.
+    assert "historical, not live health" in delegation["note"]
+    assert "plan-review wave rows" in delegation["note"]
+    assert "typed" in delegation["note"] and "refusal" in delegation["note"]
+    assert "never healthy" in delegation["note"]
+
+
+def test_delegation_fact_undated_window_code_surfaces_without_reset(tmp_path, monkeypatch):
+    root = _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+    (root / "state" / "reviewer_slot_last_execution.json").write_text(json.dumps({
+        "scope": {
+            "ts": "2026-08-18T03:00:00+00:00",
+            "status": "error",
+            "failure_code": "credential_pool_exhausted",
+        },
+    }), encoding="utf-8")
+
+    delegation = _delegation_fact(tmp_path, monkeypatch)["delegation"]
+
+    (row,) = delegation["reviewer_slots_last"]
+    assert row["failure_code"] == "credential_pool_exhausted"
+    assert "reset_at" not in row
+    assert row["outcome"] == "failed"
+
+
+def test_delegation_fact_absent_files_mean_absent_observations_not_health(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+    monkeypatch.delenv("OUROBOROS_SUBAGENT_HARNESS", raising=False)
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+
+    assert "delegation" not in capabilities
+
+
+def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeypatch):
+    _delegation_data_root(tmp_path, monkeypatch)
+
+    def _boom():
+        raise RuntimeError("reader exploded")
+
+    monkeypatch.setattr(
+        "ouroboros.reviewer_slot_config.reviewer_slot_last_executions", _boom)
+
+    capabilities = _delegation_fact(tmp_path, monkeypatch)
+
+    assert "delegation" not in capabilities
+    # The surrounding digest survives intact.
+    assert "allow_mutative_subagents" in capabilities
+    assert "write_surfaces" in capabilities
+
+
+def test_runtime_names_its_capture_instant_and_how_this_run_learns_the_time(tmp_path):
+    """#1320: the runtime block is captured once; it says so instead of calling itself "now"."""
+    env = _make_health_env(tmp_path)
+    main = json.loads(build_runtime_section(env, {"id": "t1", "type": "task"}, captured_at="2027-01-15T12:00:00+00:00")
+                      .split("\n\n", 1)[1])
+    assert "utc_now" not in main and main["context_captured_at"] == "2027-01-15T12:00:00+00:00"
+    assert "not the current time" in main["clock_note"] and "host clock line" in main["clock_note"]
+    child = json.loads(build_runtime_section(env, {"id": "t2", "type": "task", "delegation_role": "subagent"})
+                       .split("\n\n", 1)[1])
+    assert "does not advance during this run" in child["clock_note"] and child["context_captured_at"]
+
+
+def test_captured_recent_and_drive_sections_carry_one_capture_label(tmp_path, monkeypatch):
+    """Recent*/Drive state are labelled with the core's single capture instant, below their headings,
+    and are not refreshed: two projections of one core carry byte-identical labels."""
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    monkeypatch.setattr(context_module, "utc_now_iso", lambda: "2027-01-15T12:00:00+00:00")
+    env, memory = _make_env_and_memory(tmp_path)
+    logs = memory.drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(json.dumps({
+        "ts": "2027-01-15T11:00:00+00:00", "direction": "in", "chat_id": 1, "text": "hello"}) + "\n",
+        encoding="utf-8")
+    messages, _info = build_llm_messages(env=env, memory=memory, task={
+        "id": "t-labels", "type": "task", "text": "hi", "_is_direct_chat": True, "chat_id": 1, "metadata": {}})
+    dynamic = messages[0]["content"][2]["text"]
+    label = "_Snapshot captured at 2027-01-15T12:00:00+00:00 when this context was built; not refreshed during this run._"
+    assert "## Drive state\n" + label in dynamic
+    # The chat row is the memory view's (the open conversation): no capture-labelled chat tail.
+    assert "## Recent chat" not in dynamic and "] hello" in dynamic.split("## This room (Main)", 1)[1]
+    assert '"context_captured_at": "2027-01-15T12:00:00+00:00"' in dynamic
+    headings = [line for line in dynamic.splitlines() if line.startswith(("## Recent ", "## Drive state"))]
+    assert headings and all(dynamic.split(heading + "\n", 1)[1].startswith(label) for heading in headings)
+    assert "## Runtime context\n" + label not in dynamic  # labels are for the captured snapshots only

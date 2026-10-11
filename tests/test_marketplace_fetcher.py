@@ -9,6 +9,7 @@ breaks one of the gates fails CI loudly.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import textwrap
 import zipfile
@@ -171,7 +172,6 @@ def test_stage_rejects_symlink_member():
         "id_rsa",
         "aws-credentials.json",
         ".npmrc",
-        "config.pem",
     ],
 )
 def test_stage_rejects_sensitive_filenames(name):
@@ -183,12 +183,64 @@ def test_stage_rejects_sensitive_filenames(name):
         stage(archive, slug="x", version="1.0.0")
 
 
+def test_stage_accepts_a_certificate_and_a_release_signature():
+    """Owner answer 4=A: a certificate and an .asc release signature are the
+    motivating case, so a hub archive carrying them stages instead of being
+    rejected whole. Both are text the reviewer reads."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ("sig.asc", b"-----BEGIN PGP SIGNATURE-----\nAAAA\n-----END PGP SIGNATURE-----\n"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / "config.pem").is_file()
+        assert (staged.staging_dir / "sig.asc").is_file()
+    finally:
+        staged.cleanup()
+
+
+def test_stage_accepts_a_certificate_and_a_binary_key_container():
+    """Owner answer 4=A: a suffix never refuses an archive, so a hub payload
+    carrying a certificate and a Keynote deck named `deck.key` stages whole.
+    Key containers are inert data alongside images, audio, fonts and templates;
+    loadable binaries stay refused."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        ("config.pem", b"-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+        ("assets/deck.key", b"PK\x03\x04binary deck"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / "config.pem").is_file()
+        assert (staged.staging_dir / "assets" / "deck.key").is_file()
+    finally:
+        staged.cleanup()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["vault.p12", "vault.pfx", "store.jks", "store.keystore", "vault.kdbx", "sig.gpg"],
+)
+def test_stage_accepts_the_remaining_key_container_suffixes(name):
+    """The rest of the owner-approved suffix list stages the same way."""
+    archive = _zip_with([
+        ("SKILL.md", SKILL_MD_BYTES),
+        (name, b"\x00binary container"),
+    ])
+    staged = stage(archive, slug="owner/x", version="1.0.0")
+    try:
+        assert (staged.staging_dir / name).is_file()
+    finally:
+        staged.cleanup()
+
+
 @pytest.mark.parametrize(
     "name",
     [
         "evil.so", "evil.dll", "evil.dylib",
         "evil.pyc", "evil.pyo", "evil.node",
-        "evil.wasm", "evil.exe", "evil.bin",
+        "evil.exe", "evil.bin",
     ],
 )
 def test_stage_rejects_loadable_binaries(name):
@@ -200,13 +252,109 @@ def test_stage_rejects_loadable_binaries(name):
         stage(archive, slug="x", version="1.0.0")
 
 
-def test_stage_rejects_disallowed_extension():
+def test_stage_admits_widget_assets_and_wasm():
+    """Q13/Q15=A: fonts, audio/video, and WebAssembly are ordinary hub payload
+    (the widget frame consumes them; review sees each as a content-hash-bound
+    descriptor). The lexical gate stays coarse: a native loadable binary is
+    still refused by name (``test_stage_rejects_loadable_binaries``) and, if
+    disguised, by content magic at review."""
+    assets = [
+        ("fonts/ui.woff2", b"wOF2\x00\x01\xff\xfe"),
+        ("fonts/ui.ttf", b"\x00\x01\x00\x00\xff"),
+        ("audio/click.mp3", b"ID3\x03\x00\xff\xfb"),
+        ("audio/loop.ogg", b"OggS\x00\xff"),
+        ("video/intro.webm", b"\x1a\x45\xdf\xa3"),
+        ("video/intro.mp4", b"\x00\x00\x00\x18ftyp"),
+        ("wasm/core.wasm", b"\x00asm\x01\x00\x00\x00\xff"),
+    ]
+    archive = _zip_with([("SKILL.md", SKILL_MD_BYTES), *assets])
+    staged = stage(archive, slug="x", version="1.0.0")
+    try:
+        assert staged.file_list == sorted(["SKILL.md", *(name for name, _ in assets)])
+        assert (staged.staging_dir / "wasm" / "core.wasm").read_bytes() == assets[-1][1]
+    finally:
+        staged.cleanup()
+
+
+def test_stage_per_file_cap_is_inclusive():
+    """Exactly 8 MiB is admitted; the byte above it is refused (see the
+    oversize test below). Sparse zero bytes keep the fixture fast."""
+    exact = b"\x00" * (8 * 1024 * 1024)
+    archive = _zip_with([("SKILL.md", SKILL_MD_BYTES), ("video/intro.mp4", exact)])
+    staged = stage(archive, slug="x", version="1.0.0")
+    try:
+        assert staged.total_bytes == len(exact) + len(SKILL_MD_BYTES)
+    finally:
+        staged.cleanup()
+
+
+@pytest.mark.serial
+def test_stage_preserves_arbitrary_data_through_loading_and_review(tmp_path):
+    from ouroboros.skill_loader import load_skill
+    from ouroboros.skill_review_packs import _build_skill_file_packs
+
+    presentation = _zip_with([
+        ("[Content_Types].xml", b"<Types/>"),
+        ("ppt/presentation.xml", b"<presentation/>"),
+    ])
+    files = [
+        ("references/report.pdf", b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n%%EOF\n"),
+        ("templates/deck.pptx", presentation),
+        ("templates/page.custom-template", b"Hello, {{name}}!\n"),
+        ("data.dat", b"\x80\xffopaque data"),
+        ("data/fixture", b"ordinary extensionless data\n"),
+    ]
     archive = _zip_with([
         ("SKILL.md", SKILL_MD_BYTES),
-        ("data.dat", b"opaque"),
+        *files,
     ])
-    with pytest.raises(FetchError, match="disallowed extension"):
-        stage(archive, slug="x", version="1.0.0")
+    staged = stage(archive, slug="x", expected_sha256=hashlib.sha256(archive).hexdigest())
+    try:
+        for name, payload in files:
+            assert (staged.staging_dir / name).read_bytes() == payload
+        loaded = load_skill(staged.staging_dir, tmp_path / "data")
+        assert loaded is not None and not loaded.load_error
+        packs = "\n".join(_build_skill_file_packs(
+            staged.staging_dir, expected_content_hash=loaded.content_hash,
+        ))
+        for name, payload in files:
+            assert name in packs
+            if name.endswith((".pdf", ".pptx", ".dat")):
+                assert hashlib.sha256(payload).hexdigest() in packs
+    finally:
+        staged.cleanup()
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("mode", ["advanced", "cyber_pro"])
+@pytest.mark.parametrize("name", ["credentials.json", "program.so", "node_modules/lib/index.js"])
+def test_cyber_stages_archive_findings_as_advice(monkeypatch, caplog, mode, name):
+    from ouroboros.marketplace import fetcher
+
+    monkeypatch.setattr(fetcher, "get_runtime_mode", lambda: mode)
+    archive = _zip_with([("SKILL.md", SKILL_MD_BYTES), (name, b"fixture bytes")])
+    if mode != "cyber_pro":
+        with pytest.raises(FetchError, match="Archive contains"):
+            stage(archive, slug="advice")
+        return
+    staged = stage(archive, slug="advice")
+    try:
+        assert (staged.staging_dir / name).read_bytes() == b"fixture bytes"
+        assert "Cyber Pro archive advice" in caplog.text and name in caplog.text
+    finally:
+        staged.cleanup()
+
+
+@pytest.mark.serial
+def test_cyber_archive_advice_preserves_exact_bytes_and_extraction_root(monkeypatch):
+    from ouroboros.marketplace import fetcher
+
+    monkeypatch.setattr(fetcher, "get_runtime_mode", lambda: "cyber_pro")
+    archive = _zip_with([("SKILL.md", SKILL_MD_BYTES)])
+    with pytest.raises(FetchError, match="sha256 mismatch"):
+        stage(archive, slug="checksum", expected_sha256="0" * 64)
+    with pytest.raises(FetchError, match="absolute path"):
+        stage(_zip_with([("SKILL.md", SKILL_MD_BYTES), ("/escaped.txt", b"x")]), slug="root")
 
 
 @pytest.mark.parametrize("name", ["node_modules/dep/index.js", ".ouroboros_env/bin/tool.js"])

@@ -2,11 +2,11 @@
 
 Covers three issues:
 
-  * Bug 1 (polish) — the background-consciousness live card lingered in a
-    "thinking" phase forever because it has no task_result to mark it terminal.
-    The global status is already guarded upstream (isBackgroundTaskId); this adds
-    a structured end-of-cycle marker + history replay annotation so the card
-    itself finalizes to "done".
+  * Bug 1 (polish) — the retired background-consciousness loop had no
+    task_result, so replay used to stamp its last progress row "done" by hand.
+    A wake-up is now an ordinary direct turn with its own durable result, and
+    the loop's legacy rows replay with NO fabricated terminal status: the
+    client's task-detail read settles them as "Outcome unavailable".
   * Bug 3 — conversational text (user + assistant bubbles) disappeared after a
     soft WebSocket reconnect because syncHistory skipped user messages and the
     persistent dedupe set was never cleared.
@@ -32,23 +32,16 @@ def _read(rel: str) -> str:
     return (REPO / rel).read_text(encoding="utf-8")
 
 
-# ───────────────── Bug 1 (polish): background card finalizes ─────────────────
-
-def test_consciousness_emits_structured_idle_marker_not_text_matched():
-    src = _read("ouroboros/consciousness.py")
-    assert "_emit_cycle_idle" in src
-    assert "consciousness_state" in src
-    # The marker is structured, never a regex on log text (BIBLE P5).
-    assert "Going back to sleep" not in src
+# ────────── Bug 1 (polish): the retired loop's rows replay honestly ──────────
 
 
-def test_log_events_derives_bg_card_phase_from_marker():
+def test_log_events_has_no_background_loop_projector():
     src = _read("web/modules/log_events.js")
-    assert "consciousness_state" in src
-    assert "bgTerminal" in src
+    assert "consciousness_state" not in src
+    assert "bg-consciousness" not in src
 
 
-def test_history_marks_bg_consciousness_terminal_on_replay(tmp_path):
+def test_history_never_fabricates_a_terminal_status_for_legacy_bg_rows(tmp_path):
     from ouroboros.gateway.history import make_chat_history_endpoint
 
     logs = tmp_path / "logs"
@@ -68,40 +61,58 @@ def test_history_marks_bg_consciousness_terminal_on_replay(tmp_path):
     resp = asyncio.run(endpoint(SimpleNamespace(query_params={})))
     messages = json.loads(resp.body)["messages"]
     bg = [m for m in messages if m.get("task_id") == "bg-consciousness"]
-    assert bg, "bg-consciousness progress should replay"
-    latest = max(bg, key=lambda m: m["ts"])
-    assert latest.get("task_terminal_status") == "done"
-    # Earlier entries stay non-terminal so the card animates while a cycle runs.
-    assert not bg[0].get("task_terminal_status")
+    assert bg, "the retired loop's progress should still replay"
+    # No task_result exists for the pseudo id, so no row may claim an outcome.
+    assert not any(m.get("task_terminal_status") for m in bg)
+    assert not any(m.get("system_type") == "task_model_wait" for m in messages)
 
 
-def test_reusable_live_card_preserves_explicit_expansion_across_cycles():
+def test_live_card_disclosure_is_explicit_user_owned_state():
     src = _read("web/modules/chat.js")
-    assert "const stickyExpandedSlots = new Set();" in src
-    assert "stickyExpandedSlots.has(normalizedGroupId)" in src
-    assert "stickyExpandedSlots.add(record.groupId)" in src
-    assert "stickyExpandedSlots.delete(record.groupId)" in src
-    assert "if (!stickyExpandedSlots.has(record.groupId))" in src
+    assert "const explicitCardExpansion = new Map();" in src  # a room opens at its newest, with no carried disclosure
+    assert "explicitCardExpansion.set(record.groupId, nowExpanded);" in src
+    assert "explicitCardExpansion.has(normalizedGroupId)" in src
+    assert "explicitCardExpansion.get(normalizedGroupId)" in src
+    assert "if (existing && !explicitCardExpansion.has(childId))" in src
+    assert "setLiveCardExpanded(record, nestedSubagentsExpanded);" in src
+    assert "stickyExpandedSlots" not in src
 
 
 def test_live_card_timeline_only_follows_when_pinned():
+    src = _read("web/modules/chat_render_batch.js")
+    renderer = src[
+        src.index("export function createLiveCardTimelineRenderer"):
+        src.index("export function createTimelineAnchors")
+    ]
+    assert renderer.count("const pinned =") == 2
+    assert "const prevTop = el.scrollTop, newest = el.lastElementChild;" in renderer
+    # Only a new newest line follows; a disclosure or late full output keeps its place.
+    assert "el.scrollTop = pinned && el.lastElementChild !== newest ? el.scrollHeight : prevTop;" in renderer
+    assert "record.root.dataset.expanded === '1' && pinned" in renderer
+
+
+# ───────────────────── Bug 3: reconnect dialogue recovery ───────────────────
+
+def test_reconnect_merges_user_rows_without_clearing_visible_history():
     src = _read("web/modules/chat.js")
-    assert "function isTimelinePinnedToBottom(record)" in src
-    assert "const prevTop = el.scrollTop;" in src
-    assert "el.scrollTop = pinned ? el.scrollHeight : prevTop;" in src
-    assert "record.root.dataset.expanded === '1' && pinned" in src
-
-
-# ───────────────────── Bug 3: reconnect feed rebuild ─────────────────────────
-
-def test_reconnect_rebuilds_feed_and_clears_dedupe():
-    src = _read("web/modules/chat.js")
-    assert "const renderUser = includeUser || fromReconnect;" in src
-    assert "seenMessageKeys.clear();" in src
-    assert "messageKeyOrder.length = 0;" in src
-    assert "querySelectorAll('.chat-bubble')" in src
-    # User messages are restored on reconnect (not skipped).
-    assert "if (!renderUser && msg.role === 'user') continue;" in src
+    sync = src[src.index("async function syncHistory"):src.index("const readReceipt = createProjectReadReceipt(")]
+    replay = src[src.index("function applyHistoryMessages"):src.index("async function syncHistory")]
+    add = src[src.index("function addMessage"):src.index("function updateMessageAnnotation")]
+    # Reconnect still fetches the canonical source and includes owner dialogue.
+    assert "await fetchHistory(null)" in sync
+    assert "apiClient.chatHistory({ chatId, cursor, ...options })" in src
+    assert "historyPager.acceptRecent(data)" in sync
+    assert "if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });" in sync
+    assert "includeUser = true, archived = false" in replay
+    assert "if (!includeUser && msg.role === 'user') continue;" in replay
+    # Keyed reconciliation replaces the former clear-and-rebuild requirement:
+    # physical rows dedupe and an offline/local echo is adopted in place.
+    assert "opts.historyId ? `history:${opts.historyId}` : legacyKey" in add
+    assert "if (messageKey && seenMessageKeys.has(messageKey))" in add
+    assert "node.dataset.clientMessageId === clientMessageId" in add
+    assert "stampHistoryNode(prior, opts.historyId, opts.historyPosition);" in add
+    assert "seenMessageKeys.clear();" not in sync + replay
+    assert "messageKeyOrder.length = 0;" not in sync + replay
 
 
 # ──────────────────── Bug 4a: progress widget host race ──────────────────────

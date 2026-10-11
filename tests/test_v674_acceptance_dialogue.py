@@ -16,10 +16,14 @@ from types import SimpleNamespace as NS
 import pytest
 
 import ouroboros.loop as loop_mod
+from ouroboros import task_pacing
 from ouroboros.review_substrate import (
     DIALOGUE_CONTINUE,
+    DIALOGUE_INCONCLUSIVE,
     DIALOGUE_STABLE_DISAGREEMENT,
     DIALOGUE_UNREACHABLE,
+    DIALOGUE_VOTE_ABSTAIN_INVALID,
+    DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS,
     ReviewRequest,
     ReviewSlot,
     _render_prompt_parts,
@@ -54,23 +58,30 @@ def _result(actors, aggregate="FAIL", findings=None, degraded_reasons=None):
 # ── A5: dialogue-status reducer ─────────────────────────────────────────────
 
 
-def test_dialogue_default_is_continue_when_field_absent():
-    # Backward-compatible fail-safe: no reviewer emits the field -> continue.
+def test_dialogue_absent_field_abstains_instead_of_defaulting_to_continue():
+    # CHANGED (A-material, 2026-08-30): the old fail-safe made a MISSING field mean
+    # "keep going", so a panel where nobody voted bought another paid round forever.
+    # A missing vote now abstains, is disclosed as `abstain_invalid`, and the panel
+    # reduces to `inconclusive` -> the caller's non-dialogue terminals decide.
     res = _result([
         _actor("s1", "FAIL", {"verdict": "FAIL"}),
         _actor("s2", "FAIL", {"verdict": "FAIL"}),
     ])
     out = aggregate_dialogue_status(res, quorum=2)
-    assert out["status"] == DIALOGUE_CONTINUE
-    assert out["votes"] == {DIALOGUE_CONTINUE: ["s1", "s2"]}
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert out["votes"] == {DIALOGUE_VOTE_ABSTAIN_INVALID: ["s1", "s2"]}
 
 
-def test_dialogue_malformed_vote_defaults_to_continue():
+def test_dialogue_malformed_vote_abstains_and_is_disclosed():
+    # CHANGED (A-material): an unknown token / non-string was silently rewritten to
+    # `continue_actionable`. It now abstains and stays visible in the distribution.
     res = _result([
         _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "give_up_now"}),
         _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": 42}),
     ])
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert sorted(out["votes"][DIALOGUE_VOTE_ABSTAIN_INVALID]) == ["s1", "s2"]
 
 
 def test_dialogue_quorum_of_terminal_votes_terminates():
@@ -84,37 +95,77 @@ def test_dialogue_quorum_of_terminal_votes_terminates():
     assert set(out["votes"][DIALOGUE_UNREACHABLE]) == {"s1", "s2"}
 
 
-def test_dialogue_contributing_continue_beats_terminal_votes():
-    # Precedence: any continue vote from a QUORUM-CONTRIBUTING actor keeps the loop.
+def test_dialogue_contributing_well_formed_continue_beats_terminal_votes():
+    # Precedence, unchanged: ONE contributing continue keeps the loop even against
+    # two terminal votes. CHANGED (A-material Rule 1): that continue must now carry
+    # material — a finding or a completion_coach — for the reducer to count it.
     res = _result([
-        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable"}),
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable",
+                              "completion_coach": "add the missing regression test"}),
         _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
         _actor("s3", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
     ])
     assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
 
 
-def test_dialogue_degraded_slot_vote_counts_toward_terminal_quorum():
-    # sol finding #3: a DEGRADED (non-contributing) slot's deliberate terminal
-    # vote must count — the reducer runs over ALL contract-valid actors.
+def test_dialogue_junk_continue_without_material_abstains():
+    # Rule 1 (A-material): a bare "keep going" with neither findings nor a coach is
+    # not an actionable judgement. It abstains (disclosed), so the single terminal
+    # vote decides — this is the exact vote that pumped 21 paid panels.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable"}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
+    ])
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["votes"][DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS] == ["s1"]
+    assert out["status"] == DIALOGUE_UNREACHABLE
+
+
+def test_dialogue_empty_finding_rows_do_not_make_a_continue_well_formed():
+    # Rule 1 boundary: a `findings` list with no item/recommendation text is not
+    # material either — the well-formed predicate reads content, not the key.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "continue_actionable",
+                              "findings": [{"severity": "high"}, "junk"]}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
+    ])
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["votes"][DIALOGUE_VOTE_CONTINUE_WITHOUT_FINDINGS] == ["s1"]
+    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT
+
+
+def test_dialogue_degraded_slot_is_not_contributing_and_does_not_vote():
+    # CHANGED (owner ratification 2026-08-30, replacing sol #3): votes are counted
+    # over `_contributing_actors`, so a DEGRADED slot that did not reach the
+    # aggregate verdict no longer steers the loop. Here only s2 (FAIL, matching the
+    # FAIL aggregate) contributes, and its single terminal vote decides.
     res = _result(
         [
             _actor("s1", "DEGRADED", {"verdict": "DEGRADED", "dialogue_status": "unreachable_here"}),
             _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
-            # transport-dead slot: no parsed object -> no vote at all
+            # transport-dead slot: no parsed object -> not contributing either
             _actor("s3", "", None, parse_status="malformed"),
         ],
         aggregate="FAIL",
     )
     out = aggregate_dialogue_status(res, quorum=2)
-    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT or out["status"] == DIALOGUE_UNREACHABLE
-    # tie 1:1 resolves to unreachable_here (>= comparison)
-    assert out["status"] == DIALOGUE_UNREACHABLE
+    assert out["votes"] == {DIALOGUE_STABLE_DISAGREEMENT: ["s2"]}
+    assert out["status"] == DIALOGUE_STABLE_DISAGREEMENT
+
+
+def test_dialogue_tie_between_terminal_kinds_resolves_to_unreachable():
+    # The unreachable-vs-disagreement tie-break survives A-material unchanged.
+    res = _result([
+        _actor("s1", "FAIL", {"verdict": "FAIL", "dialogue_status": "unreachable_here"}),
+        _actor("s2", "FAIL", {"verdict": "FAIL", "dialogue_status": "stable_disagreement"}),
+    ])
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_UNREACHABLE
 
 
 def test_dialogue_garbage_dict_without_verdict_cannot_vote_terminal():
     # ext review r2: a dict-shaped parsed object WITHOUT a recognizable verdict
     # is not a deliberate reviewer act — its terminal "vote" must not count.
+    # CHANGED: with no vote left the panel is `inconclusive`, not `continue`.
     res = _result(
         [
             _actor("s1", "", {"dialogue_status": "unreachable_here"}, parse_status="malformed"),
@@ -122,12 +173,14 @@ def test_dialogue_garbage_dict_without_verdict_cannot_vote_terminal():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_INCONCLUSIVE
 
 
-def test_dialogue_transport_dead_panel_stays_continue():
-    # Pure transport failure (no parsed objects anywhere) must NOT terminate:
-    # no contract-valid votes exist, so the fail-safe default keeps the loop.
+def test_dialogue_transport_dead_panel_is_inconclusive_not_continue():
+    # CHANGED (A-material Rule 2): a pure transport failure produces ZERO
+    # well-formed votes. It must not terminate — and it must not mint another paid
+    # round either. `inconclusive` grants the dialogue no authority, so the
+    # existing DEGRADED terminal in the caller decides.
     res = _result(
         [
             _actor("s1", "", None, parse_status="malformed"),
@@ -135,7 +188,9 @@ def test_dialogue_transport_dead_panel_stays_continue():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    out = aggregate_dialogue_status(res, quorum=2)
+    assert out["status"] == DIALOGUE_INCONCLUSIVE
+    assert out["votes"] == {}
 
 
 # ── A3: reviewer-authored obligation identity ───────────────────────────────
@@ -273,7 +328,7 @@ def test_reused_panel_application_leaves_obligation_rows_byte_identical(monkeypa
     ctx = loop_mod._TaskAcceptanceContext(
         tools=NS(_ctx=tool_ctx), content="candidate", task_id="t-reuse",
         task_type="task", llm_trace=trace, drive_root=None, messages=[],
-        emit_progress=lambda _m: None, mode="required", subtree_statuses=[],
+        emit_progress=lambda _m, *, incident=None: None, mode="required", subtree_statuses=[],
         budget_profile={}, passes_done=0,
     )
     loop_mod._apply_task_acceptance_result(ctx, result)
@@ -338,10 +393,16 @@ def test_capsule_leads_with_verdict_blocker_rails_and_three_moves():
     result = _fail_result_with([_finding()])
     capsule = build_improvement_capsule(
         result,
-        rails_line="money: $1.00 spent; time: 10 min left; review passes: 1 done",
+        rails_line="money: $1.00 spent; time: 10 min left; author passes: 1 done",
         open_obligations=[{"id": "ob-1"}, {"id": "ob-2"}],
     )
-    assert "Review verdict: FAIL (tier: best_effort)" in capsule
+    # The note the model READS says the assessment in words: a ledger token in
+    # this stream is text the model parrots back to its human (v6.61.4).
+    assert "Review verdict: FAIL — rated a partial result" in capsule
+    assert "(tier: best_effort)" not in capsule
+    # The whole header is identifier-free: panel_reason used to restate `tier=…`.
+    header = capsule.splitlines()[0]
+    assert "tier=" not in header and "best_effort" not in header and "blocked_with_evidence" not in header, header
     assert "Open blocking obligation(s) (2): ob-1, ob-2." in capsule
     assert "Remaining headroom — money: $1.00 spent" in capsule
     assert "FIX" in capsule and "REBUT" in capsule and "DECLARE UNREACHABLE" in capsule
@@ -411,7 +472,7 @@ def _apply_harness(monkeypatch, result, *, obligations=None, tmp_path=None):
         llm_trace=trace,
         drive_root=None,
         messages=[],
-        emit_progress=lambda _m: None,
+        emit_progress=lambda _m, *, incident=None: None,
         mode="required",
         subtree_statuses=[],
         budget_profile={},
@@ -422,7 +483,7 @@ def _apply_harness(monkeypatch, result, *, obligations=None, tmp_path=None):
     return another, trace, tool_ctx, fences
 
 
-def test_dialogue_terminal_finalizes_honestly_with_both_positions(monkeypatch, tmp_path):
+def test_critic_terminal_assessment_still_reaches_author(monkeypatch, tmp_path):
     findings = [_finding()]
     actors = [
         _actor("s1", "FAIL", {"verdict": "FAIL", "outcome_tier": "best_effort",
@@ -436,17 +497,13 @@ def test_dialogue_terminal_finalizes_honestly_with_both_positions(monkeypatch, t
         request={"policy": {"min_successful_slots": 2}},
     )
     another, trace, tool_ctx, fences = _apply_harness(monkeypatch, result, tmp_path=tmp_path)
-    assert another is False  # NOT re-driven: the reviewers ended the dialogue
+    assert another is True
     decision = trace["acceptance_decision"]
-    # v6.78.0: one canonical terminal status; the with/without-obligations
-    # distinction lives on the `open_obligations` list asserted below.
-    assert decision["status"] == "finalized_unaccepted"  # never a clean accept
-    assert decision["reason"] == "dialogue_terminal"
-    assert decision["dialogue_status"] == DIALOGUE_STABLE_DISAGREEMENT
-    assert decision["dialogue_votes"][DIALOGUE_STABLE_DISAGREEMENT] == ["s1", "s2"]
-    assert decision["open_obligations"]  # the obligations stay recorded, not wiped
-    assert tool_ctx._task_acceptance_reviewed is True
-    assert fences == ["terminal"]
+    assert decision["status"] == "revision_requested"
+    assert decision["reason"] == "improvement_capsule"
+    assert trace["acceptance_obligations"]
+    assert not getattr(tool_ctx, "_task_acceptance_reviewed", False)
+    assert fences == ["revision"]
     # both positions persisted: reviewer votes on the run record
     host_runs = [r for r in trace["review_runs"] if r.get("authority") == "host_root"]
     assert host_runs and host_runs[-1]["dialogue"]["status"] == DIALOGUE_STABLE_DISAGREEMENT
@@ -611,7 +668,8 @@ def test_dialogue_quorum_fallback_uses_adaptive_quorum():
 
 def test_contract_demoted_actor_cannot_vote_terminal():
     # commit triad sol #1: parse_status="malformed" (contract-demoted or garbage
-    # with a verdict-shaped dict) must not satisfy terminal quorum.
+    # with a verdict-shaped dict) must not vote terminal. CHANGED: with no vote
+    # left the panel is `inconclusive`, which is also not a terminal verdict.
     res = _result(
         [
             _actor("s1", "DEGRADED", {"verdict": "FAIL", "dialogue_status": "unreachable_here"},
@@ -621,7 +679,7 @@ def test_contract_demoted_actor_cannot_vote_terminal():
         ],
         aggregate="DEGRADED",
     )
-    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_CONTINUE
+    assert aggregate_dialogue_status(res, quorum=2)["status"] == DIALOGUE_INCONCLUSIVE
 
 
 def test_typed_findings_cannot_resurrect_settled_row_via_content_match():
@@ -655,7 +713,7 @@ def test_typed_findings_cannot_resurrect_settled_row_via_content_match():
 def _rails(passes_done, *, cap=6, workspace=False, required_blocking=False):
     snap = NS(has_deadline=False)
     profile = {"max_improvement_passes": cap} if cap is not None else {}
-    return loop_mod._build_acceptance_rails_line_inner(
+    return task_pacing._acceptance_rails_line_inner(
         snap, profile, passes_done, None,
         required_blocking=required_blocking, workspace=workspace,
     )
@@ -667,7 +725,7 @@ def test_rails_final_pass_freeze_directive_workspace():
     # rides EVERY workspace rails line (commit triad r1, sol: a deadline/cost
     # rail can end the loop between capsules), and never a non-workspace one.
     line = _rails(5, cap=6, workspace=True)
-    assert "review passes: 5/6" in line
+    assert "author passes: 5/6" in line
     assert "FINAL improvement pass, no further passes will run" in line
     assert "working tree as it stands" in line and "VERIFIED state" in line
     # Non-workspace: factual finality only, no tree directive.
@@ -676,20 +734,22 @@ def test_rails_final_pass_freeze_directive_workspace():
     assert "working tree" not in plain
 
 
-def test_rails_freeze_directive_absent_off_final_and_edge_caps():
+def test_rails_freeze_directive_absent_off_final_and_edge_caps(monkeypatch):
     # Non-final pass: no FINAL marker, but the workspace tree directive is
     # always present for workspace deliveries.
     mid = _rails(3, cap=6, workspace=True)
-    assert "FINAL" not in mid and "review passes: 3/6" in mid
+    assert "FINAL" not in mid and "author passes: 3/6" in mid
     assert "working tree as it stands" in mid
     assert "working tree" not in _rails(3, cap=6, workspace=False)
     # cap == 0 never feeds a capsule back — no misleading FINAL rail.
     zero = _rails(0, cap=0, workspace=True)
-    assert "review passes: 0/0" in zero and "FINAL" not in zero
+    assert "author passes: 0/0" in zero and "FINAL" not in zero
     # Passes already exhausted (supersede-reset re-review): not a launch.
     spent = _rails(6, cap=6, workspace=True)
-    assert "review passes: 6/6" in spent and "FINAL" not in spent
-    # No local cap (required+blocking) — no count-axis clause at all.
+    assert "author passes: 6/6" in spent and "FINAL" not in spent
+    # No local cap (required+blocking with the shared review-cycle cap set to
+    # unlimited — D10/D20: otherwise the shared cap binds) — no count-axis clause.
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
     unbounded = _rails(4, cap=None, workspace=True, required_blocking=True)
     assert "no local count cap" in unbounded and "FINAL" not in unbounded
 

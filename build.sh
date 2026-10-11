@@ -24,6 +24,12 @@ DMG_PATH="dist/$DMG_NAME"
 
 echo "=== Building Ouroboros.app ==="
 
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv is required for locked dependency installation."
+    echo "Install uv 0.12.1: curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh"
+    exit 1
+fi
+
 if [ ! -f "python-standalone/bin/python3" ]; then
     echo "ERROR: python-standalone/ not found."
     echo "Run first: bash scripts/download_python_standalone.sh"
@@ -43,11 +49,22 @@ if [ ! -f "ripgrep-standalone/bin/rg" ]; then
     bash scripts/download_ripgrep_standalone.sh
 fi
 
+echo "--- Verifying bundled Betterleaks runtime ---"
+python-standalone/bin/python3 -m ouroboros.betterleaks_runtime install \
+    --build-output betterleaks-standalone
+
 echo "--- Installing launcher dependencies ---"
-pip install -q -r requirements-launcher.txt
+BUILD_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-build-requirements.XXXXXX")"
+trap 'rm -f "$BUILD_REQUIREMENTS"' EXIT
+uv export --locked --no-dev --extra browser --extra desktop --extra build \
+    --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
+uv pip install --python python3 -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
-python-standalone/bin/pip3 install -q -r requirements.txt
+uv pip install --python python-standalone/bin/python3 -q -r requirements-runtime.lock
+
+echo "--- Fetching exact Claudexor runtime seed ---"
+python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
 
 echo "--- Installing Chromium for browser tools (bundled into python-standalone) ---"
 # Full Chromium app bundle breaks nested-bundle codesign on arm64 runners.
@@ -137,7 +154,7 @@ chmod +x "$CLI_BIN_DIR/ouroboros" "$CLI_BIN_DIR/install-ouroboros-cli"
 # .pyc EXIST and get SEALED inside the signature; nothing is left for the runtime to
 # write. --invalidation-mode unchecked-hash means a read-only bundle never rewrites
 # them (no source-mtime check at import). The env-level PYTHONDONTWRITEBYTECODE guards
-# (launcher.py / python_bytecode_env) remain as defense-in-depth.
+# (launcher.py / embedded_python_env) remain as defense-in-depth.
 echo "--- Precompiling Python bytecode inside app bundle (sealed before signing) ---"
 # Find the bundled embedded interpreter inside the .app so the .pyc magic matches the
 # interpreter that runs at launch; fall back to the build-host copy (same standalone build).
@@ -159,6 +176,14 @@ if [ "${#COMPILE_TARGETS[@]}" -gt 0 ]; then
     # prefix, and the seal would seal nothing.
     env -u PYTHONDONTWRITEBYTECODE -u PYTHONPYCACHEPREFIX \
         "$APP_EMBEDDED_PY" -m compileall -q -f --invalidation-mode unchecked-hash "${COMPILE_TARGETS[@]}" || true
+    # Python console-script sources under python-standalone/bin are launchers,
+    # not importable runtime modules. compileall still descends into that folder
+    # (for example bottle.py -> bin/__pycache__/bottle.*.pyc), but macOS treats a
+    # nested `bin` directory as code-bearing and codesign then refuses the data
+    # bytecode as an unsigned code object. Keep sealed bytecode in stdlib and
+    # site-packages, while removing only these non-imported launcher caches.
+    find "$APP_PATH" -type d -path '*/python-standalone/bin/__pycache__' \
+        -prune -exec rm -rf {} + 2>/dev/null || true
     # Post-condition: the seal is only meaningful if .pyc actually landed in-tree.
     if [ -z "$(find "$APP_PATH" -name '*.pyc' -type f -print -quit 2>/dev/null)" ]; then
         echo "ERROR: precompile produced no in-bundle .pyc — the codesign seal would not cover bytecode." >&2
@@ -186,15 +211,24 @@ if [ "$SIGN_MODE" != "0" ]; then
                 --entitlements "$ENTITLEMENTS" "$f" 2>&1 || true
         fi
     done
+    # A failed best-effort nested sign can leave an atomic-replace scratch file.
+    # `--deep` treats that stale .cstemp as a missing code object and refuses the
+    # bundle, so prune only codesign's own temporary artifacts before the seal.
+    find "$APP_PATH" -name '*.cstemp' -type f -delete 2>/dev/null || true
     echo "Signed embedded binaries"
 
     echo "--- Signing the app bundle ---"
-    codesign -s "$SIGN_IDENTITY" --timestamp --force --options runtime \
+    # PyInstaller places the standalone Python tree under Contents/Frameworks.
+    # macOS therefore classifies its sealed .pyc files as nested code objects;
+    # outer signing without --deep refuses them as unsigned. Mach-O children
+    # already carry their explicit signatures above; deep signing seals the
+    # remaining bytecode objects into the final app hierarchy.
+    codesign -s "$SIGN_IDENTITY" --timestamp --force --options runtime --deep \
         --entitlements "$ENTITLEMENTS" "$APP_PATH"
 
     echo "--- Verifying signature ---"
     codesign -dvv "$APP_PATH"
-    codesign --verify --strict "$APP_PATH"
+    codesign --verify --strict --deep "$APP_PATH"
     echo "Signature OK"
 else
     echo ""
@@ -208,6 +242,7 @@ DMG_STAGE_DIR="dist/dmg-stage"
 rm -rf "$DMG_STAGE_DIR"
 mkdir -p "$DMG_STAGE_DIR"
 cp -R "$APP_PATH" "$DMG_STAGE_DIR/Ouroboros.app"
+ln -s /Applications "$DMG_STAGE_DIR/Applications"
 cp packaging/cli/install-ouroboros-cli-macos.command "$DMG_STAGE_DIR/Install CLI.command"
 chmod +x "$DMG_STAGE_DIR/Install CLI.command"
 for attempt in 1 2 3; do

@@ -41,6 +41,31 @@ def test_chat_history_preserves_subagent_lane_group_metadata(tmp_path):
     assert rec["task_group_id"] == "group1"
 
 
+def test_chat_history_replays_typed_direct_error_terminal_status(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-27T00:00:00Z",
+            "direction": "out",
+            "chat_id": 1,
+            "user_id": 7,
+            "text": "error",
+            "task_id": "failed-task",
+            "task_terminal_status": "failed",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "failed-task")
+    assert rec["task_terminal_status"] == "failed"
+
+
 def test_chat_history_replays_delivered_document_row(tmp_path):
     """A persisted document chat row is replayed as a msg_type=document record so
     the frontend rebuilds the file bubble on reload from the durable URL."""
@@ -60,6 +85,7 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
                 "download_url": "/api/files/download?path=Desktop/report.pdf",
                 "caption": "quarterly numbers",
                 "task_id": "t-doc",
+                "size_bytes": 4096,
             }
         )
         + "\n",
@@ -77,6 +103,85 @@ def test_chat_history_replays_delivered_document_row(tmp_path):
     assert rec["mime"] == "application/pdf"
     assert rec["download_url"] == "/api/files/download?path=Desktop/report.pdf"
     assert rec["caption"] == "quarterly numbers"
+    assert rec["task_id"] == "t-doc"
+    assert rec["size_bytes"] == 4096
+
+
+def test_chat_history_replays_links_with_task_grouping_fields(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    actions = [
+        {"label": "Report", "url": "https://example.com/report"},
+        {"label": "Dashboard", "url": "http://example.com/dashboard"},
+    ]
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-30T00:00:00Z",
+            "direction": "out",
+            "chat_id": 1,
+            "user_id": 7,
+            "text": "References",
+            "type": "links",
+            "title": "References",
+            "actions": actions,
+            "task_id": "task-links",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(
+        query_params={"limit": "10"},
+    )))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("msg_type") == "links")
+    assert rec["role"] == "assistant"
+    assert rec["title"] == "References"
+    assert rec["actions"] == actions
+    assert rec["task_id"] == "task-links"
+
+
+def test_chat_history_replays_durable_photo_and_keeps_legacy_row_as_text(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        {
+            "ts": "2026-08-21T00:00:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable shot", "type": "photo",
+            "mime": "image/png", "caption": "durable shot", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "a" * 64 + ".png",
+        },
+        {
+            "ts": "2026-08-21T00:01:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "durable clip", "type": "video",
+            "mime": "video/mp4", "caption": "durable clip", "task_id": "media-task",
+            "download_url": "/api/tasks/media-task/artifacts/chat-media-" + "b" * 64 + ".mp4",
+        },
+        {
+            "ts": "2026-08-21T00:02:00Z", "direction": "out", "chat_id": 1,
+            "user_id": 7, "text": "legacy shot", "type": "photo", "mime": "image/png",
+            "task_id": "still-running",
+        },
+    ]
+    (logs / "chat.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    durable = next(item for item in payload if item["text"] == "durable shot")
+    video = next(item for item in payload if item["text"] == "durable clip")
+    legacy = next(item for item in payload if item["text"] == "legacy shot")
+    assert durable["msg_type"] == "photo"
+    assert durable["download_url"].endswith(".png")
+    assert durable["task_id"] == "media-task"
+    assert video["msg_type"] == "video"
+    assert video["download_url"].endswith(".mp4")
+    assert video["task_id"] == "media-task"
+    assert "msg_type" not in legacy
+    assert legacy["task_id"] == "still-running"
 
 
 def test_chat_history_backfills_from_rotated_archive(tmp_path):
@@ -149,6 +254,242 @@ def test_chat_history_backfills_from_rotated_archive(tmp_path):
     assert doc["download_url"] == "/api/files/download?path=Desktop/archived_report.pdf"
     # Chronological reassembly: archived rows precede the newer live row.
     assert texts.index("older message before the rotation") < texts.index("newest live message")
+
+
+def test_chat_history_marks_malformed_rows_incomplete(tmp_path):
+    """A skipped JSONL row must not make the bounded window claim completeness."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_bytes(
+        json.dumps({
+            "ts": "2026-08-21T18:00:00Z",
+            "direction": "in",
+            "chat_id": 1,
+            "text": "surviving row",
+        }).encode("utf-8")
+        + b"\n{malformed row\n"
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert any(item.get("text") == "surviving row" for item in payload["messages"])
+    assert payload["window"]["complete"] is False
+    assert "chat_malformed_jsonl" in payload["window"]["truncated_by"]
+
+
+def test_history_gap_metadata_keeps_reader_failures_fail_soft(tmp_path, monkeypatch):
+    """Adding gap metadata must not turn the existing best-effort reader into a 500."""
+    from ouroboros.gateway import history
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("synthetic reader failure")
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", fail)
+    rows, quota, gaps = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+        include_gaps=True,
+    )
+
+    assert rows == []
+    assert quota == 0
+    assert gaps == {"projection_failed"}, "fail-soft, yet disclosed: the missing rows are no clean window"
+
+
+def test_history_gap_metadata_keeps_legacy_reader_call_shape(tmp_path, monkeypatch):
+    """The opt-in metadata path must not change existing private helper callers."""
+    from ouroboros.gateway import history
+
+    row = {
+        "direction": "in",
+        "chat_id": 1,
+        "text": "legacy helper row",
+        "ts": "2026-08-21T18:01:00Z",
+    }
+
+    def legacy(_live, _archive, _want, _predicate):
+        return [row]
+
+    monkeypatch.setattr(history, "_read_chat_history_entries", legacy)
+    rows, quota = history._collect_chat_rows(
+        tmp_path / "chat.jsonl",
+        tmp_path / "archive",
+        10,
+        lambda *_args: True,
+        {},
+    )
+
+    assert rows[0]["text"] == "legacy helper row"
+    assert quota == 1
+
+
+def test_rotated_reader_legacy_mode_keeps_parser_call_shape(tmp_path, monkeypatch):
+    """Non-metadata callers retain the old iterator signature and cost path."""
+    from ouroboros.gateway import _helpers
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    live = logs / "chat.jsonl"
+    live.write_text("{}\n", encoding="utf-8")
+
+    def legacy(path, *, tail_bytes=None):
+        assert tail_bytes is None or isinstance(tail_bytes, int)
+        return iter([{"text": str(path), "direction": "in"}])
+
+    monkeypatch.setattr(_helpers, "iter_jsonl_objects", legacy)
+    entries = _helpers.read_rotated_jsonl_entries(
+        live,
+        tmp_path / "archive",
+        "chat",
+        10,
+        lambda _entry: True,
+    )
+
+    assert isinstance(entries, list)
+    assert entries[0]["direction"] == "in"
+
+
+def test_progress_history_backfills_from_rotated_archive(tmp_path):
+    """progress.jsonl now rotates to archive/progress_<ts>.jsonl like chat. History
+    replay must backfill rotated progress rows (newest-first, until the n_progress
+    quota) so a rotation does not silently erase live task cards (BIBLE P1)."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+
+    (archive / "progress_20260808T010000.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T00:30:00Z",
+            "content": "archived step",
+            "task_id": "rotated-task",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T01:30:00Z",
+            "content": "live step",
+            "task_id": "live-task",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    texts = [item.get("text", "") for item in payload]
+    assert "archived step" in texts
+    assert "live step" in texts
+    # Chronological reassembly: archived rows precede the newer live row.
+    assert texts.index("archived step") < texts.index("live step")
+
+
+def test_progress_archive_not_read_when_live_satisfies_quota(tmp_path):
+    """Archive backfill stops once the live window already satisfies the filtered
+    quota — the rotated segments are not touched on the common path."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    (archive / "progress_20260808T010000.jsonl").write_text(
+        json.dumps({"ts": "2026-08-08T00:30:00Z", "content": "old archived", "task_id": "t-old"}) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        "\n".join(
+            json.dumps({"ts": f"2026-08-08T01:00:{i:02d}Z", "content": f"live-{i}", "task_id": "t1"})
+            for i in range(5)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"n_progress": "3"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    texts = [item.get("text", "") for item in payload]
+    assert "old archived" not in texts  # quota satisfied by the live window
+    assert texts == ["live-2", "live-3", "live-4"]
+
+
+def test_history_annotation_after_quota_resolves_in_window_card(tmp_path):
+    """Post-quota annotation behavior change (v6.90.x P2): a terminal task whose
+    truth-anchor rows fell OUTSIDE the emitted window (here: its task_summary chat
+    row evicted by the n_human quota) still resolves its surviving in-window
+    progress card with the full terminal truth. Pre-change, the summary row seen
+    during the full parse suppressed the progress-row anchor and the truth was
+    applied only to rows the quota then dropped."""
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    chat_rows = [
+        json.dumps({
+            "ts": "2026-08-08T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "windowed",
+            "chat_id": 1,
+            "text": "Task windowed finished.",
+            "tool_calls": 1,
+            "rounds": 1,
+        })
+    ]
+    # Newer human rows push the summary row out of a small n_human window.
+    chat_rows += [
+        json.dumps({
+            "ts": f"2026-08-08T00:10:{i:02d}Z",
+            "direction": "in" if i % 2 else "out",
+            "chat_id": 1,
+            "text": f"newer human {i}",
+        })
+        for i in range(4)
+    ]
+    (logs / "chat.jsonl").write_text("\n".join(chat_rows) + "\n", encoding="utf-8")
+    (logs / "progress.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-08-08T00:05:00Z",
+            "content": "still visible progress",
+            "task_id": "windowed",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "windowed.json").write_text(
+        json.dumps({
+            "_schema_version": 1,
+            "task_id": "windowed",
+            "status": "completed",
+            "cost_usd": 0.42,
+            "cost_final": True,
+            "reason_code": "",
+        }),
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(
+        endpoint(SimpleNamespace(query_params={"n_human": "2", "n_progress": "10"}))
+    )
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    assert not any(item.get("system_type") == "task_summary" for item in payload)
+    rec = next(item for item in payload if item.get("task_id") == "windowed")
+    assert rec["task_terminal_status"] == "completed"
+    # Full terminal truth (cost) landed on the in-window progress anchor —
+    # ABI-3: the stored legacy spelling replays under the honest name only.
+    assert rec["accounted_upper_bound_usd"] == 0.42
+    assert "cost_usd" not in rec
+    assert rec["cost_final"] is True
 
 
 def test_chat_history_backfill_quota_is_thread_aware(tmp_path):
@@ -288,6 +629,8 @@ def test_chat_history_task_summary_row_passes_flat_cost_fields_through(tmp_path)
     through so a reload still shows the card's cost (no result file present)."""
     logs = tmp_path / "logs"
     logs.mkdir()
+    # A STORED legacy snapshot (retired with-children spelling): ABI-3 replay
+    # converts it to the honest name instead of copying the alias out.
     row_cost = {
         "cost_accounting_status": "available",
         "cost_final": False,
@@ -318,15 +661,84 @@ def test_chat_history_task_summary_row_passes_flat_cost_fields_through(tmp_path)
     payload = json.loads(response.body.decode("utf-8"))["messages"]
 
     rec = next(item for item in payload if item.get("task_id") == "cost-summary")
-    for field, expected in row_cost.items():
-        assert rec.get(field) == expected
-    # The snapshot honestly lacks cost_usd — replay must not fabricate it.
-    assert "cost_usd" not in rec
+    # openness fields pass through; the legacy pair converts (deprecated-wins)
+    for field in ("cost_accounting_status", "cost_final",
+                  "cost_with_children_partial", "reserved_usd",
+                  "unresolved_upper_bound_usd", "unknown_unmetered"):
+        assert rec.get(field) == row_cost[field]
+    assert rec["accounted_upper_bound_usd_with_children"] == 1.234567
+    assert "cost_usd_with_children" not in rec
+    # The snapshot honestly lacks an own-cost amount — replay must not
+    # fabricate one under either spelling.
+    assert "cost_usd" not in rec and "accounted_upper_bound_usd" not in rec
+
+
+def test_chat_history_replays_task_summary_finality_without_task_result(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-03T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "open-summary",
+            "chat_id": 1,
+            "text": "Narrative written before finalization.",
+            "outcome_phase": "warn",
+            "outcome_final": False,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "open-summary")
+    assert rec["outcome_phase"] == "warn"
+    assert rec["outcome_final"] is False
+    assert "task_terminal_status" not in rec
+
+
+def test_chat_history_settled_result_overrides_pre_final_summary_finality(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-03T00:00:00Z",
+            "direction": "system",
+            "type": "task_summary",
+            "task_id": "settled-summary",
+            "chat_id": 1,
+            "text": "Narrative written before finalization.",
+            "outcome_phase": "working",
+            "outcome_final": False,
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "settled-summary.json").write_text(
+        json.dumps({"_schema_version": 1, "task_id": "settled-summary", "status": "completed"}),
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "settled-summary")
+    assert rec["outcome_phase"] == "done"
+    assert rec["outcome_final"] is True
 
 
 def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
     """v6.82 P1: a terminal task_results/<id>.json carries the final cost truth;
-    it is attached to the surviving progress anchor on replay."""
+    it is attached to the surviving progress anchor on replay. ABI-3
+    (fix-round-2 conversion of this OLD-ABI contract test): the stored row is
+    LEGACY-spelled, and the outbound frame carries the honest names only."""
     logs = tmp_path / "logs"
     logs.mkdir()
     (logs / "chat.jsonl").write_text("", encoding="utf-8")
@@ -343,6 +755,7 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
     results.mkdir()
     (results / "cost-terminal.json").write_text(
         json.dumps({
+            "_schema_version": 1,
             "task_id": "cost-terminal",
             "status": "completed",
             "cost_usd": 1.5,
@@ -360,11 +773,12 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
 
     rec = next(item for item in payload if item.get("task_id") == "cost-terminal")
     assert rec["task_terminal_status"] == "completed"
-    assert rec["cost_usd"] == 1.5
+    assert rec["accounted_upper_bound_usd"] == 1.5
     assert rec["cost_final"] is True
-    assert rec["cost_usd_with_children"] == 2.75
+    assert rec["accounted_upper_bound_usd_with_children"] == 2.75
     assert rec["cost_with_children_partial"] is False
     assert rec["cost_accounting_status"] == "available"
+    assert "cost_usd" not in rec and "cost_usd_with_children" not in rec
 
 
 def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_path):
@@ -394,6 +808,7 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
     results.mkdir()
     (results / "cost-override.json").write_text(
         json.dumps({
+            "_schema_version": 1,
             "task_id": "cost-override",
             "status": "completed",
             "cost_usd": 0.9,
@@ -410,10 +825,13 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
     payload = json.loads(response.body.decode("utf-8"))["messages"]
 
     rec = next(item for item in payload if item.get("task_id") == "cost-override")
+    # ABI-3: both the row-embedded snapshot and the stored result are
+    # legacy-spelled; the override lands under the honest names only.
     assert rec["cost_final"] is True
-    assert rec["cost_usd_with_children"] == 2.5
+    assert rec["accounted_upper_bound_usd_with_children"] == 2.5
     assert rec["cost_with_children_partial"] is False
-    assert rec["cost_usd"] == 0.9
+    assert rec["accounted_upper_bound_usd"] == 0.9
+    assert "cost_usd" not in rec and "cost_usd_with_children" not in rec
 
 
 def test_chat_history_preserves_nullable_cost_status_and_bounds(tmp_path):
@@ -446,7 +864,14 @@ def test_chat_history_preserves_nullable_cost_status_and_bounds(tmp_path):
     payload = json.loads(response.body.decode("utf-8"))["messages"]
 
     rec = next(item for item in payload if item.get("task_id") == "cost-unavailable")
+    # ABI-3: the legacy null pair converts to the honest names (still null —
+    # never fabricated into $0); every openness marker survives verbatim.
+    assert rec["accounted_upper_bound_usd"] is None
+    assert rec["accounted_upper_bound_usd_with_children"] is None
+    assert "cost_usd" not in rec and "cost_usd_with_children" not in rec
     for field, expected in cost_meta.items():
+        if field in ("cost_usd", "cost_usd_with_children"):
+            continue
         assert field in rec
         assert rec[field] == expected
 
@@ -478,3 +903,293 @@ def test_chat_history_preserves_cancelable_marker(tmp_path):
 
     rec = next(item for item in payload if item.get("task_id") == "root1")
     assert rec["cancelable"] is True
+
+
+def test_main_history_keeps_only_host_project_root_completion_while_project_keeps_detail(
+    tmp_path,
+):
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    project_chat = int(project["chat_id"])
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "ts": "2026-08-21T00:00:02Z",
+                    "direction": "system",
+                    "chat_id": project_chat,
+                    "type": "task_summary",
+                    "task_id": "root-project",
+                    "text": "Detailed Project summary",
+                    "tool_calls": 3,
+                    "rounds": 4,
+                },
+                {
+                    "ts": "2026-08-21T00:00:03Z",
+                    "direction": "system",
+                    "chat_id": 1,
+                    "type": "project_completion_summary",
+                    "task_id": "root-project",
+                    "project_id": "launch",
+                    "project_name": "Launch 🚀",
+                    "target_label": "Launch 🚀 › Ship release",
+                    "status": "completed",
+                    "text": "Launch 🚀 › Ship release · Completed",
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text(
+        json.dumps(
+            {
+                "ts": "2026-08-21T00:00:01Z",
+                "chat_id": project_chat,
+                "content": "Project-only progress",
+                "task_id": "root-project",
+                "is_progress": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    main = json.loads(
+        asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"}))).body
+    )["messages"]
+    project_rows = json.loads(
+        asyncio.run(
+            endpoint(SimpleNamespace(query_params={"chat_id": str(project_chat)}))
+        ).body
+    )["messages"]
+
+    assert [row["system_type"] for row in main if row.get("system_type")] == [
+        "project_completion_summary"
+    ]
+    completion = main[0]
+    assert completion["task_id"] == "root-project"
+    assert completion["project_id"] == "launch"
+    assert completion["project_name"] == "Launch 🚀"
+    assert completion["target_label"] == "Launch 🚀 › Ship release"
+    assert completion["status"] == "completed"
+    assert any(row.get("is_progress") for row in project_rows)
+    assert any(row.get("system_type") == "task_summary" for row in project_rows)
+
+
+def test_main_history_admits_project_started_row_and_project_thread_excludes_it(
+    tmp_path,
+):
+    """B1 admission: the durable `project_started` row is Main-only — admitted
+    to the Main view with its event-time metadata passthrough (same keys as the
+    completion row), excluded from the Project's own thread view, and stable
+    across a replayed read."""
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    project = create_project(tmp_path, "launch", name="Launch 🚀")
+    project_chat = int(project["chat_id"])
+    bind_task_to_project(
+        tmp_path, "root-project", project["id"], project_chat,
+        origin={"absent": "system"},
+    )
+    logs = tmp_path / "logs"
+    logs.mkdir(exist_ok=True)
+    (logs / "chat.jsonl").write_text(
+        "\n".join(
+            json.dumps(row, ensure_ascii=False)
+            for row in (
+                {
+                    "ts": "2026-08-21T00:00:01Z",
+                    "direction": "system",
+                    "chat_id": 1,
+                    "type": "project_started",
+                    "task_id": "root-project",
+                    "project_id": "launch",
+                    "project_name": "Launch 🚀",
+                    "target_label": "Launch 🚀 › Ship release",
+                    "text": "Launch 🚀 › Ship release · Started",
+                },
+                {
+                    "ts": "2026-08-21T00:00:02Z",
+                    "direction": "system",
+                    "chat_id": project_chat,
+                    "type": "task_summary",
+                    "task_id": "root-project",
+                    "text": "Detailed Project summary",
+                    "tool_calls": 3,
+                    "rounds": 4,
+                },
+            )
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+
+    def _messages(chat_id):
+        return json.loads(
+            asyncio.run(
+                endpoint(SimpleNamespace(query_params={"chat_id": str(chat_id)}))
+            ).body
+        )["messages"]
+
+    main = _messages(1)
+    assert [row["system_type"] for row in main if row.get("system_type")] == [
+        "project_started"
+    ]
+    started = next(row for row in main if row["system_type"] == "project_started")
+    assert started["role"] == "system"
+    assert started["task_id"] == "root-project"
+    assert started["project_id"] == "launch"
+    assert started["project_name"] == "Launch 🚀"
+    assert started["target_label"] == "Launch 🚀 › Ship release"
+    assert "status" not in started  # the started row carries no outcome yet
+
+    project_rows = _messages(project_chat)
+    assert all(
+        row.get("system_type") != "project_started" for row in project_rows
+    )
+    assert any(row.get("system_type") == "task_summary" for row in project_rows)
+
+    # Replay-safe: a second read of the same durable stream is identical.
+    assert _messages(1) == main
+
+
+def test_chat_history_replays_the_live_subtree_ceiling_for_a_running_root(tmp_path, monkeypatch):
+    """#469: a root still running replays the SAME non-final subtree ceiling its
+    heartbeat pushes live (one cost owner, `live_root_cost_projection`), stamped
+    on its latest in-window progress row; a child never carries it and a root
+    whose ledger has no attributable rows stays absent — unknown is never zero
+    and never final."""
+    from ouroboros import usage_accounting
+
+    seen_roots = []
+
+    def _projection(_drive, *, root_task_id="", allow_stale=False):
+        seen_roots.append(root_task_id)
+        if root_task_id == "root-empty":
+            return {"attempt_counts": {"metadata_only": 1}, "subscription_sessions": 0}
+        return {
+            "accounted_usd": 3.5, "reserved_usd": 0.25, "unresolved_upper_bound_usd": 0.5,
+            "unknown_unmetered": 1, "non_final_rows": 2, "integrity_degraded": False,
+            "attempt_counts": {"resolved": 4}, "subscription_sessions": 0,
+        }
+
+    monkeypatch.setattr(usage_accounting, "usage_projection", _projection)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text("", encoding="utf-8")
+    rows = [
+        {"ts": "2026-09-06T00:00:01Z", "content": "root working", "task_id": "root-live"},
+        {"ts": "2026-09-06T00:00:02Z", "content": "root still working", "task_id": "root-live"},
+        {"ts": "2026-09-06T00:00:03Z", "content": "child working", "task_id": "child-live",
+         "delegation_role": "subagent", "parent_task_id": "root-live", "root_task_id": "root-live",
+         "subagent_task_id": "child-live", "subagent_event": "running"},
+        {"ts": "2026-09-06T00:00:04Z", "content": "quiet root", "task_id": "root-empty"},
+        {"ts": "2026-09-06T00:00:05Z", "content": "done root", "task_id": "root-done"},
+    ]
+    (logs / "progress.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+    results = tmp_path / "task_results"
+    results.mkdir()
+    for task_id, status, extra in (
+        ("root-live", "running", {}),
+        ("child-live", "running", {"delegation_role": "subagent", "parent_task_id": "root-live",
+                                   "root_task_id": "root-live"}),
+        ("root-empty", "running", {}),
+        ("root-done", "completed", {"accounted_upper_bound_usd": 0.42, "cost_final": True}),
+    ):
+        (results / f"{task_id}.json").write_text(json.dumps({
+            "_schema_version": 1, "task_id": task_id, "status": status, "metadata": {}, **extra,
+        }), encoding="utf-8")
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "50"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    live_rows = [m for m in payload if m.get("task_id") == "root-live"]
+    assert len(live_rows) == 2
+    first, latest = sorted(live_rows, key=lambda m: m["ts"])
+    assert "accounted_upper_bound_usd_with_children" not in first
+    # honest_accounted_amount: the projection's accounted upper bound (which
+    # already folds settled + reserved + unresolved), never re-summed here.
+    assert latest["accounted_upper_bound_usd_with_children"] == 3.5
+    assert latest["cost_final"] is False
+    assert latest["cost_with_children_partial"] is True
+    assert latest["cost_accounting_status"] == "available"
+    assert (latest["reserved_usd"], latest["unresolved_upper_bound_usd"]) == (0.25, 0.5)
+    assert "task_terminal_status" not in latest  # still running, never finalized by replay
+    child = next(m for m in payload if m.get("task_id") == "child-live")
+    assert "accounted_upper_bound_usd_with_children" not in child
+    empty = next(m for m in payload if m.get("task_id") == "root-empty")
+    assert "accounted_upper_bound_usd_with_children" not in empty
+    assert "cost_final" not in empty
+    done = next(m for m in payload if m.get("task_id") == "root-done")
+    assert done["task_terminal_status"] == "completed"
+    assert done["accounted_upper_bound_usd"] == 0.42 and done["cost_final"] is True
+    # Only ROOT lineage reaches the ledger; the finished root is served by its
+    # durable terminal truth, not by a live read.
+    assert sorted(seen_roots) == ["root-empty", "root-live"]
+
+
+def test_user_annotation_projects_the_host_cause_sentence():
+    """Q3=A: the owner-facing sentence for a refused routing act replays with the
+    owner message; the reason code stays a model artefact off the live frame."""
+    from ouroboros.gateway.history import _user_annotation
+
+    projected = _user_annotation("user", "cm-1", {"cm-1": {
+        "action": "promote_chat_to_task", "status": "needs_manual_target",
+        "reason": "workspace_unusable", "cause": "Not started: the working folder can't be used",
+        "detail": "explicit workspace_root is unusable: …",
+    }})
+
+    assert projected["cause"] == "Not started: the working folder can't be used"
+    assert projected["status"] == "needs_manual_target"
+    assert "reason" not in projected
+
+
+def test_chat_history_replays_an_admission_notice_without_terminal_truth(tmp_path):
+    """A host-issued promote that was refused leaves a `task_not_started` System
+    row in the owner's chat AND a failed task result for the never-started id. On
+    replay the row comes back in Main as a plain typed system row: no
+    `task_terminal_status`, no `outcome_final` — a keyed typed row is neither a
+    terminal fact nor a plain untyped final, so the client neither mints nor
+    finishes a card for it (03-web-ui «admission-notice row»)."""
+    from ouroboros.task_results import STATUS_FAILED, write_task_result
+
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "chat.jsonl").write_text(
+        json.dumps({
+            "ts": "2026-09-16T01:00:00Z",
+            "direction": "system",
+            "type": "task_not_started",
+            "task_id": "never-started",
+            "chat_id": 1,
+            "text": "Аудит · Not started: the working folder can't be used",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (logs / "progress.jsonl").write_text("", encoding="utf-8")
+    write_task_result(
+        tmp_path, "never-started", STATUS_FAILED, reason_code="workspace_unusable",
+        result="Promotion was not scheduled: workspace_unusable. explicit workspace_root is unusable.",
+        description="Аудит", chat_id=1,
+    )
+
+    endpoint = make_chat_history_endpoint(tmp_path)
+    response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body.decode("utf-8"))["messages"]
+
+    rec = next(item for item in payload if item.get("task_id") == "never-started")
+    assert rec.get("system_type") == "task_not_started"
+    assert rec["text"] == "Аудит · Not started: the working folder can't be used"
+    assert "task_terminal_status" not in rec
+    assert "outcome_final" not in rec

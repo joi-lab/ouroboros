@@ -1,0 +1,388 @@
+"""The local llama.cpp lane and its context budget.
+
+A local model has no vision, a small window, and no cost. Fitting a transcript
+into that window is a policy decision — compact the sections a local run can
+lose, keep the ones it cannot, and refuse rather than silently truncate — so the
+compaction rules live beside the send that depends on them.
+"""
+
+
+from __future__ import annotations
+
+import copy
+import logging
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+from ouroboros.context_budget import (  # the typed overflow lives with the overflow vocabulary
+    LocalContextTooLargeError,
+    context_overflow_message,
+    estimate_message_chars as _estimate_message_chars,  # beside its proxy constant; the historical private name
+)
+from ouroboros.llm_attempt import (
+    _attempt_request,
+    _candidate_before_dispatch,
+    _execute_candidate,
+    _finalized_physical_candidate,
+    _is_structured_context_overflow_exception,
+)
+from ouroboros.usage_accounting import PhysicalAttemptCapture, UsageAccountingError, current_physical_attempt_context
+
+# The moved warnings keep the logger identity they were emitted under.
+log = logging.getLogger("ouroboros.llm")
+
+
+def _split_markdown_sections(text: str) -> Tuple[str, List[Tuple[str, str]]]:
+    lines = str(text or "").splitlines()
+    preamble: List[str] = []
+    sections: List[Tuple[str, str]] = []
+    current_title: Optional[str] = None
+    current_lines: List[str] = []
+
+    for line in lines:
+        if line.startswith("## "):
+            if current_title is None:
+                preamble = current_lines[:]
+            else:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            current_title = line[3:].strip()
+            current_lines = [line]
+        else:
+            current_lines.append(line)
+
+    if current_title is None:
+        return "\n".join(lines).strip(), []
+
+    sections.append((current_title, "\n".join(current_lines).strip()))
+    return "\n".join(preamble).strip(), sections
+
+
+def _compact_markdown_sections(
+    text: str,
+    preserve_titles: Set[str],
+    reason: str,
+) -> str:
+    preamble, sections = _split_markdown_sections(text)
+    if not sections:
+        return text
+
+    parts: List[str] = []
+    if preamble:
+        parts.append(preamble)
+
+    for title, section in sections:
+        # Production headings carry a provenance suffix the preserve sets do not spell
+        # out ("## Identity (from `memory/identity.md` — ...)"), so an exact-only match
+        # silently compacts the very sections this mode exists to keep.
+        if title in preserve_titles or title.split("(")[0].strip() in preserve_titles:
+            parts.append(section)
+            continue
+        omitted_chars = max(0, len(section))
+        parts.append(
+            f"## {title}\n\n"
+            f"[Compacted for local-model context: omitted {omitted_chars} chars. {reason}]"
+        )
+
+    return "\n\n".join(p for p in parts if p).strip()
+
+
+_LOCAL_COMPACTION_MODES = {
+    "static": (
+        {"BIBLE.md"},
+        "Use a larger-context model or read the source file directly if this section becomes necessary.",
+    ),
+    "semi_stable": (
+        {"Identity", "My story", "My story — unavailable now", "Shared understanding"},
+        "Identity, my story and the shared understanding were preserved; non-core stable memory "
+        "sections were compacted for local execution.",
+    ),
+    "dynamic": (
+        {
+            "Shared understanding",
+            "Words of my human that caused this work",
+            "Marks I keep in view",
+            "This room",
+            "Scratchpad",
+            "Memory Registry (what I know / don't know)",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+        },
+        "Working-memory, room and runtime sections were preserved; non-core recent/history sections were compacted for local execution.",
+    ),
+    "system": (
+        {
+            "BIBLE.md",
+            "Scratchpad",
+            "Identity",
+            "Drive state",
+            "Runtime context",
+            "Health Invariants",
+            "Recent observations",
+        },
+        "Non-core sections were compacted for local execution.",
+    ),
+}
+
+
+def _compact_local_text(text: str, mode: str) -> str:
+    preserve_titles, reason = _LOCAL_COMPACTION_MODES[mode]
+    return _compact_markdown_sections(text, preserve_titles=preserve_titles, reason=reason)
+
+
+def local_context_limits(max_tokens: int) -> Tuple[int, int]:
+    """Confirmed serving window (0 if unknown) and output cap for caller preflight."""
+    ctx_len = 0
+    local_max = min(max_tokens, 2048)
+    try:
+        from ouroboros.local_model import get_manager
+        evidence = get_manager().serving_context_evidence() or {}
+        if evidence.get("confirmed") is True:
+            ctx_len = max(0, int(evidence.get("context_window") or 0))
+        if ctx_len > 0:
+            local_max = min(max_tokens, max(256, ctx_len // 4))
+    except Exception:
+        pass
+    return ctx_len, local_max
+
+
+class _LocalLaneMixin:
+    """Local-context compaction and the local chat request."""
+
+    def _prepare_messages_for_local_context(
+        self,
+        messages: List[Dict[str, Any]],
+        ctx_len: int,
+        max_tokens: int,
+    ) -> List[Dict[str, Any]]:
+        available_tokens = max(256, ctx_len - max_tokens - 64)
+        target_chars = available_tokens * 3
+        total_chars = _estimate_message_chars(messages)
+        if total_chars <= target_chars:
+            return messages
+
+        compacted = copy.deepcopy(messages)
+        for msg in compacted:
+            if msg.get("role") != "system":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                for idx, block in enumerate(content):
+                    if not isinstance(block, dict) or block.get("type") != "text":
+                        continue
+                    block_text = str(block.get("text", ""))
+                    if idx == 0:
+                        block["text"] = _compact_local_text(block_text, "static")
+                    elif idx == 1:
+                        block["text"] = _compact_local_text(block_text, "semi_stable")
+                    else:
+                        block["text"] = _compact_local_text(block_text, "dynamic")
+            elif isinstance(content, str):
+                msg["content"] = _compact_local_text(content, "system")
+            break
+
+        compacted_chars = _estimate_message_chars(compacted)
+        if compacted_chars <= target_chars:
+            return compacted
+
+        raise LocalContextTooLargeError(
+            f"Local model context too large after safe compaction "
+            f"({compacted_chars} chars > target {target_chars})."
+        )
+
+    def _build_local_candidate(
+        self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int, tool_choice: str, timeout: Optional[float] = None,
+        processing_preference: Optional[str] = None, *, compact: bool = True,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Prepare the complete local payload for sizing and actual dispatch.
+
+        ``compact=False`` leaves the approximate markdown compactor out: a rendered Nano
+        measures the whole candidate on the serving instance first (``_chat_local``).
+        """
+        messages = self._normalize_system_message_placement(messages)
+        clean_messages = self._strip_openrouter_roundtrip_metadata(
+            self._copy_messages_with_cache_policy(
+                messages, allow_message_cache_control=False, flatten_tool_content_blocks=True,
+            )
+        )
+        # Local llama.cpp has no vision; avoid flattening base64 into the prompt.
+        for msg in clean_messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                continue
+            for idx, block in enumerate(content):
+                if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
+                    content[idx] = {"type": "text", "text": "[image omitted: model has no vision]"}
+        ctx_len, local_max = local_context_limits(max_tokens)
+        if ctx_len > 0 and compact:
+            clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
+        for msg in clean_messages:
+            content = msg.get("content")
+            if content is None and msg.get("role") == "assistant":
+                msg["content"] = ""
+            if isinstance(content, list):
+                msg["content"] = "\n\n".join(
+                    b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text"
+                )
+        clean_tools = None
+        if tools:
+            clean_tools = [{k: v for k, v in t.items() if k != "cache_control"} for t in tools]
+        kwargs: Dict[str, Any] = {"model": "local-model", "messages": clean_messages, "max_tokens": local_max}
+        if clean_tools:
+            kwargs["tools"] = clean_tools
+            kwargs["tool_choice"] = tool_choice
+        if timeout and timeout > 0:
+            kwargs["timeout"] = float(timeout)
+
+        from ouroboros.model_slots import resolve_processing_preference
+        from ouroboros.local_model import get_manager
+        evidence = get_manager().serving_context_evidence() or {}
+        preference = resolve_processing_preference(override=processing_preference)
+        target = {"provider": "local", "resolved_model": "local-model", "usage_model": "local-model",
+                  "processing_preference": preference, "context_window_tokens": evidence.get("context_window"),
+                  "context_window_confirmed": evidence.get("confirmed") is True}
+        return target, kwargs
+
+    def _finalize_local_candidate(
+        self, target: Dict[str, Any], payload: Dict[str, Any], *, compactor: Optional[Callable[[], Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Measure on the serving instance, then bind the output allowance before send.
+
+        This explicit stage may perform bounded, non-generating loopback I/O. The payload
+        builder and shared context arithmetic remain pure. ``compactor`` (a rendered Nano
+        whose ``payload`` skipped the approximate compactor) builds today's compacted
+        candidate on demand, measured once as today: when the instance cannot count the
+        whole candidate, or after an exact shortfall; a second shortfall is the typed
+        refusal. Low, Max and an exact fit never reach it.
+        """
+        from ouroboros.local_model import get_manager
+
+        measure = getattr(get_manager(), "measure_prepared_input", None)
+        # Bind the provider-clean physical payload before measuring. Host-only
+        # metadata must not affect the measured input or candidate hash.
+        candidate = _finalized_physical_candidate(target, payload, "chat.completions")
+        evidence = measure(candidate) if callable(measure) else None
+        if not (isinstance(evidence, dict) and evidence.get("supported")):
+            return candidate if compactor is None else self._finalize_local_candidate(target, compactor())
+        target["local_input_measurement"] = evidence
+        try:
+            # Rebuild from the original prepared source so the exact measured
+            # input and output cap are sealed together.
+            return _finalized_physical_candidate(target, payload, "chat.completions")
+        except LocalContextTooLargeError as error:
+            if compactor is None:
+                raise
+            shortfall = error
+        try:
+            compacted = compactor()
+        except LocalContextTooLargeError as error:  # nothing left to compact: the exact refusal's own facts stand
+            error.refused_candidate = shortfall.refused_candidate
+            raise error from shortfall
+        return self._finalize_local_candidate(target, compacted)
+
+    def _chat_local(
+        self, messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]],
+        max_tokens: int, tool_choice: str, timeout: Optional[float] = None,
+        processing_preference: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Send exactly the previously prepared complete local candidate."""
+        client = self._get_local_client()
+        # A rendered Nano (the bound Main context) is measured exactly BEFORE the
+        # approximate compactor when the serving instance can count; Low, Max and
+        # an instance without that support take today's compacted path unchanged.
+        exact_first = getattr(current_physical_attempt_context(), "rendered_mode", None) == "nano"
+
+        def build(compact: bool) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+            return self._build_local_candidate(
+                messages, tools, max_tokens, tool_choice, timeout, processing_preference, compact=compact)
+
+        local_target, candidate = build(compact=not exact_first)
+        # The shared finalizer removes SDK transport options from the measured
+        # and sealed payload. Preserve the builder's positive caller override
+        # separately for the actual send, including chat_async's local thread.
+        transport_kwargs = {"timeout": candidate["timeout"]} if "timeout" in candidate else {}
+        local_target["requested_reasoning_effort"] = reasoning_effort
+        from ouroboros.send_clock import split_clock_note, stamp_clock_note
+
+        # ONE clock line per call, sampled before both finalizations: the serving
+        # instance measures exactly the bytes that are then sealed and sent.
+        candidate = stamp_clock_note(candidate)
+
+        def compacted() -> Dict[str, Any]:  # today's compacted candidate, carrying this call's one clock line
+            note, _rest = split_clock_note(candidate)
+            built = build(compact=True)[1]
+            return {**built, "messages": [*built["messages"], *([{"role": "user", "content": note}] if note else [])]}
+
+        candidate = self._finalize_local_candidate(local_target, candidate, compactor=compacted if exact_first else None)
+        clean_tools = candidate.get("tools")
+        # ONE physical attempt per call. Re-sending here spent the caller's
+        # physical-attempt budget without the caller authorising it, so a
+        # transient local failure now surfaces to the single retry policy that
+        # owns the decision (``loop_llm_call.call_llm_with_retry``), which counts
+        # the attempts it authorises.
+        try:
+            request = _attempt_request(local_target, candidate, source="llm.local")
+            before = _candidate_before_dispatch(candidate, request)
+
+            def check_instance(reservation):
+                measured = local_target.get("local_input_measurement") or {}
+                if measured.get("supported"):
+                    from ouroboros.local_model import get_manager
+                    from ouroboros.usage_accounting import PhysicalAttemptPreparationFailed
+
+                    current = get_manager().serving_context_evidence()
+                    if (current.get("process_id") != measured.get("process_id") or not current.get("confirmed")
+                            or current.get("context_window") != measured.get("context_window")):
+                        raise PhysicalAttemptPreparationFailed("The measured local model instance changed before dispatch")
+                return before(reservation)
+
+            resp = _execute_candidate(
+                request,
+                lambda: client.chat.completions.create(**candidate, **transport_kwargs),
+                check_instance,
+            )
+        except UsageAccountingError:
+            raise
+        except Exception as exc:
+            err = str(exc)
+            if (_is_structured_context_overflow_exception(exc)
+                    or context_overflow_message(err)):
+                raise LocalContextTooLargeError(err) from exc
+            # Exception-owned capture proves this attempt; prior ContextVar may be unrelated.
+            capture = getattr(exc, "physical_attempt_capture", None)
+            if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
+                raise  # Outer custody owns an unknown physical outcome.
+            log.warning("Local model request failed: %s", exc)
+            raise
+
+        resp_dict = resp.model_dump()
+        usage = resp_dict.get("usage") or {}
+        choices = resp_dict.get("choices") or [{}]
+        msg = (choices[0] if choices else {}).get("message") or {}
+
+        if not msg.get("tool_calls") and msg.get("content") and clean_tools:
+            allowed_tool_names = {
+                str(t.get("function", {}).get("name", "")).strip()
+                for t in clean_tools
+                if isinstance(t, dict)
+            }
+            msg = self._parse_tool_calls_from_content(msg, allowed_tool_names)
+
+        usage["cost"] = 0.0
+        usage["cost_final"] = True
+        # CPL6-F1: the same usage provenance every remote lane stamps — the
+        # ledger row already carried provider=local, but a consumer reading the
+        # returned usage alone could not attribute the call.
+        usage["provider"] = "local"
+        usage["resolved_model"] = "local-model"
+        # The provider's own cut marker: consolidation refuses a truncated
+        # summary by usage.response_finish_reason on every lane, this one too.
+        first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
+        finish_reason = first_choice.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason.strip():
+            usage["response_finish_reason"] = finish_reason.strip()[:64]
+        from ouroboros.llm_attempt import attach_processing_receipt
+
+        attach_processing_receipt(local_target, usage)
+        return msg, usage

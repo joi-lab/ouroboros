@@ -1,0 +1,331 @@
+"""Structural contracts for the semantic-no-op settings-configuration extraction."""
+
+from __future__ import annotations
+
+import ast
+import pathlib
+
+from ouroboros import (
+    config,
+    model_slots,
+    provider_models,
+    review_model_routes,
+    runtime_limits,
+    settings_defaults,
+    settings_scales,
+)
+
+REPO = pathlib.Path(__file__).parents[1]
+PACKAGE = REPO / "ouroboros"
+
+_LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes, runtime_limits)
+
+# New subscription capabilities belong to the same leaves, but did not exist on
+# the historical extraction's facade and need not add compatibility re-exports.
+_ADDED_OWNERS = {
+    # Compatible-only review routing belongs to the existing model-route leaf.
+    "compatible_only_review_model": review_model_routes,
+    "_compatible_only_models": review_model_routes,
+    "WORKER_READY_CEILING_SEC": runtime_limits,
+    # The supervisor loop's bounded events pass and the budget-projection retry interval.
+    "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,
+    "SUPERVISOR_EVENT_BATCH_MAX_SEC": runtime_limits,
+    "BUDGET_PROJECTION_RETRY_SEC": runtime_limits,
+    # The two bounds of the usage ledger's display (stale-while-revalidate) read path.
+    "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    "USAGE_DISPLAY_REVALIDATE_AFTER_SEC": runtime_limits,
+    "IMMEDIATE_SETTINGS": settings_scales,
+    "RESTART_REQUIRED_SETTINGS": settings_scales,
+    "get_finalization_grace_sec": runtime_limits,
+    "PROMOTE_CONFIRM_WAIT_SEC": runtime_limits,
+    "get_promote_confirm_wait_sec": runtime_limits,
+    "ROUTING_MANIFEST_RESULT_ROWS": runtime_limits,
+    "get_routing_manifest_result_rows": runtime_limits,
+    "get_model_substitution_redos": runtime_limits,
+    "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
+    "MODEL_ACCOUNTS_KEY": model_slots,
+    "MODEL_CONTEXT_WINDOWS_KEY": model_slots,
+    "MODEL_PROCESSING_PREFERENCES_KEY": model_slots,
+    "PROCESSING_PREFERENCE_KEY": model_slots,
+    "PROCESSING_PREFERENCES": model_slots,
+    "task_processing_preference": model_slots,
+    "normalize_processing_preference": model_slots,
+    "resolve_processing_preference": model_slots,
+    "MODEL_ROLE_SETTINGS": model_slots,
+    "normalize_model_role_options": model_slots,
+    "model_role_option": model_slots,
+    "task_model_binding": model_slots,
+    "route_binding": model_slots,
+    "apply_model_role_override": model_slots,
+    "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
+    "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
+    "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
+    # The native platform build envelope is owned by the common runtime-limits leaf.
+    "EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC": runtime_limits,
+    # Consciousness settings scaffolding: the alarm's SSOT default interval, the closed
+    # autonomy enum and the readers for the three consciousness keys.
+    "WAKE_DEFAULT_SEC": runtime_limits,
+    "USAGE_LEDGER_FOLD_MIN_AGE_SEC": runtime_limits,
+    "CONSCIOUSNESS_AUTONOMY_LEVELS": runtime_limits,
+    "get_consciousness_autonomy": runtime_limits,
+    "get_consciousness_daily_usd": runtime_limits,
+    "get_consciousness_max_tasks": runtime_limits,
+    "get_bg_wakeup_min_sec": runtime_limits,
+    "get_bg_wakeup_max_sec": runtime_limits,
+    # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
+    "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
+    # The pooled worker's short acceptance-fence ack wait (one wait, one re-send, then a typed unknown).
+    "ACCEPTANCE_FENCE_ACK_WAIT_SEC": runtime_limits,
+    "get_acceptance_fence_ack_wait_sec": runtime_limits,
+    # #1196 optional bounds: the shared positive-or-unlimited vocabulary (also the review-cycle
+    # cap's), the legacy finite values of documents that predate it, and their readers.
+    "UNLIMITED": settings_scales,
+    "UNLIMITED_ALIASES": settings_scales,
+    "parse_positive_or_unlimited": settings_scales,
+    "OPTIONAL_BOUND_LEGACY": settings_scales,
+    "_WARNED_OPTIONAL_BOUNDS": settings_scales,
+    "optional_bound_value": settings_scales,
+    "defaults_for_settings_document": settings_scales,
+    "_optional_bound_setting": runtime_limits,
+    "get_max_rounds": runtime_limits,
+    "OPERATION_WINDOW_FALLBACK_SEC": runtime_limits,
+    "operation_window_sec": runtime_limits,
+}
+
+_MOVED_OWNERS = {
+    "WORKER_SPAWN_GRACE_SEC": runtime_limits,
+    "WORKER_READY_WINDOW_SEC": runtime_limits,
+    "WORKER_READY_MAX_ATTEMPTS": runtime_limits,
+    "EXTENSION_STREAM_CHUNK_BYTES": runtime_limits,
+    "EXTENSION_CHILD_CLEANUP_GRACE_SEC": runtime_limits,
+    "LAUNCHER_STOP_GRACE_SEC": runtime_limits,
+    "SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC": runtime_limits,
+    "NESTED_SETTLEMENT_MARGIN_SEC": runtime_limits,
+    "NETWORK_WAIT_NOTE_INTERVAL_SEC": runtime_limits,
+    "NETWORK_WAIT_BACKOFF_START_SEC": runtime_limits,
+    "TCP_KEEPALIVE_IDLE_SEC": runtime_limits,
+    "TCP_KEEPALIVE_INTERVAL_SEC": runtime_limits,
+    "TCP_KEEPALIVE_PROBE_COUNT": runtime_limits,
+    "EXTENSION_STREAM_METADATA_BYTES": runtime_limits,
+    "WS_RELAY_BURST": runtime_limits,
+    "WS_RELAY_REFILL_PER_SEC": runtime_limits,
+    "CLAUDEXOR_STARTUP_WAIT_SEC": settings_defaults,
+    "CLAUDEXOR_STARTUP_POLL_SEC": settings_defaults,
+    "CLAUDEXOR_ADMISSION_WAIT_SEC": settings_defaults,
+    "CLAUDEXOR_ADMISSION_POLL_SEC": settings_defaults,
+    "ENDPOINT_AUTHORED_SETTINGS": settings_defaults,
+    "ENDPOINT_WRITTEN_SETTINGS": settings_defaults,
+    "ENDPOINT_WRITERS": settings_defaults,
+    # v6.104.0 upstream: the OpenRouter shipped-model defaults arrive in the
+    # vocabulary leaf the v7 split created for exactly this class of fact.
+    "OPENROUTER_DEFAULTS": settings_defaults,
+    "OPENROUTER_REVIEW_DEFAULTS": settings_defaults,
+    "FINALIZATION_GRACE_DEFAULT_SEC": settings_defaults,
+    "OWNER_STOP_OUTER_CAP_SEC": settings_defaults,
+    "PACING_INTERVAL_DEFAULT_SEC": settings_defaults,
+    "RETIRED_SETTING_KEYS": settings_defaults,
+    # ABI 7.0 (ABI-7b): the comma-list classification INSIDE the retirement
+    # SSOT, born in this leaf (not an extraction) for the RC auditor to snap.
+    "RETIRED_COMMA_LIST_SETTING_KEYS": settings_defaults,
+    # The stage-2 close-out's second classification inside that same SSOT: the
+    # retired keys whose successor SETTING the table states, so the first-boot
+    # notice can name it instead of claiming there is none.
+    "RETIRED_SETTING_SUCCESSORS": settings_defaults,
+    # D-07: the ONE sentence both the read seam's log line and the boot-time
+    # owner chat notice say about retired keys, next to the tables it reads.
+    "retired_setting_keys_notice": settings_defaults,
+    "SETTINGS_DEFAULTS": settings_defaults,
+    "SETTINGS_KEYS_NOT_EXPORTED_TO_ENV": settings_defaults,
+    "SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC": settings_defaults,
+    "_DISK_AUTHORED_SETTINGS": settings_defaults,
+    "settings_env_keys": settings_defaults,
+    "EFFORT_SCALE": settings_scales,
+    "PROMPT_CACHE_TTL_SCALE": settings_scales,
+    "VALID_RUNTIME_MODES": settings_scales,
+    "VALID_SAFETY_MODES": settings_scales,
+    "_RUNTIME_MODE_RANK": settings_scales,
+    "_SAFETY_MODE_RANK": settings_scales,
+    "clamp_effort_to": settings_scales,
+    "effort_one_step_down": settings_scales,
+    "effort_rank": settings_scales,
+    "normalize_runtime_mode": settings_scales,
+    "normalize_safety_mode": settings_scales,
+    "resolve_effort": settings_scales,
+    "resolve_prompt_cache_ttl": settings_scales,
+    "_LEGACY_SLOT_RENAMES": model_slots,
+    # ABI-4 (F3.2): the typed resolved-model destination lives with the slot
+    # vocabulary leaf (D02-owner seam) and is re-exported by the facade.
+    "ResolvedModelTarget": model_slots,
+    "_main_model": model_slots,
+    "_parse_model_list": model_slots,
+    "get_consciousness_model": model_slots,
+    "get_deep_self_review_model": model_slots,
+    "get_fallback_models": model_slots,
+    "get_heavy_model": model_slots,
+    "get_image_input_mode": model_slots,
+    "get_light_model": model_slots,
+    "get_vision_model": model_slots,
+    "migrate_legacy_slot_keys": model_slots,
+    "parse_fallback_chain": model_slots,
+    "_DIRECT_PROVIDER_REVIEW_RUNS": review_model_routes,
+    "_exclusive_direct_remote_provider_env": review_model_routes,
+    "adaptive_quorum": review_model_routes,
+    "direct_provider_review_models_fallback": review_model_routes,
+    "get_review_enforcement": review_model_routes,
+    "get_review_models": review_model_routes,
+    "get_scope_review_models": review_model_routes,
+    # ABI-4 (F3.2): typed views over the effective reviewer model lists.
+    "get_review_targets": review_model_routes,
+    "get_scope_review_targets": review_model_routes,
+    "resolved_review_model_target": review_model_routes,
+    "DELEGATE_WAIT_CEILING_SEC": runtime_limits,
+    "DELEGATE_WAIT_WINDOW_MAX_SEC": runtime_limits,
+    "MAX_ACTIVE_SUBAGENTS_HARD_CAP": runtime_limits,
+    # Upstream reshaped the hard-cap assignment into a tuple that also binds the
+    # nesting ceiling (`MAX_ACTIVE_..., MAX_SUBAGENT_DEPTH_... = 500, 10`), so the
+    # unrowed twin rides the rowed statement into the same owner leaf.
+    "MAX_SUBAGENT_DEPTH_HARD_CAP": runtime_limits,
+    "_bounded_positive_int_setting": runtime_limits,
+    "_clamped_number_setting": runtime_limits,
+    "get_acceptance_reserve_pct": runtime_limits,
+    "get_acceptance_review_est_sec": runtime_limits,
+    "get_delegate_wait_max_sec": runtime_limits,
+    "get_delegate_wait_sec": runtime_limits,
+    "get_llm_transport_read_timeout_sec": runtime_limits,
+    "get_claudexor_quota_refresh_timeout_sec": runtime_limits,
+    "get_claudexor_harness_install_timeout_sec": runtime_limits,
+    "get_onboarding_snapshot_timeout_sec": runtime_limits,
+    "get_settings_document_lock_timeout_sec": runtime_limits,
+    "get_direct_turn_stop_wait_sec": runtime_limits,
+    "get_max_active_subagents_per_root": runtime_limits,
+    "get_max_subagent_depth": runtime_limits,
+    "get_max_workers": runtime_limits,
+    "get_pacing_interval_sec": runtime_limits,
+    "get_per_call_timeout_ceiling_sec": runtime_limits,
+    "get_plan_task_deadline_min_sec": runtime_limits,
+    "get_post_task_evolution_budget_usd": runtime_limits,
+    "get_restart_drain_max_sec": runtime_limits,
+    "get_safety_call_timeout_sec": runtime_limits,
+    "get_safety_max_tokens": runtime_limits,
+    "get_search_code_wall_sec": runtime_limits,
+    "get_supervisor_liveness_deadline_sec": runtime_limits,
+    "get_task_abs_ceiling_sec": runtime_limits,
+    "get_task_idle_timeout_sec": runtime_limits,
+    "get_vision_caption_timeout_sec": runtime_limits,
+    "get_update_letter_timeout_sec": runtime_limits,
+    "get_ui_translation_timeout_sec": runtime_limits,
+    "get_websearch_timeout_sec": runtime_limits,
+}
+
+# The settings-file lifecycle, the path roots and the owner-only ratchets stay with the
+# parent: every one of them reads or writes ``config.SETTINGS_PATH``/``config.DATA_DIR``,
+# or the in-process boot runtime-mode pin, which a leaf could only see through a
+# back-edge into its own parent.
+_PARENT_RETAINED = (
+    "SETTINGS_PATH", "DATA_DIR", "APP_ROOT", "REPO_DIR", "PID_FILE", "PORT_FILE", "HOME",
+    "_BOOT_RUNTIME_MODE", "_guard_live_settings_write", "_settings_file_value",
+    "_settings_flag_enabled", "_settings_lock_path", "_acquire_settings_lock",
+    "_release_settings_lock", "_coerce_setting_value", "load_settings",
+    "load_settings_lock_held", "save_settings", "prepare_settings_for_persist",
+    "apply_settings_to_env", "get_runtime_mode", "get_safety_mode", "get_context_mode",
+    "get_owner_context_mode", "initialize_runtime_mode_baseline",
+    "_guard_context_mode_lowering", "_guard_safety_mode_lowering",
+)
+
+
+def _top_level_names(path: pathlib.Path) -> set[str]:
+    names: set[str] = set()
+    for node in ast.parse(path.read_text(encoding="utf-8")).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+            # Upstream binds the two subagent hard caps in one tuple statement.
+            for target in node.targets:
+                if isinstance(target, ast.Tuple):
+                    names.update(e.id for e in target.elts if isinstance(e, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return names
+
+
+def test_settings_leaves_never_import_their_parent():
+    for module in _LEAVES:
+        tree = ast.parse(pathlib.Path(module.__file__).read_text(encoding="utf-8"))
+        assert not any(
+            isinstance(node, ast.ImportFrom) and node.module == "ouroboros.config"
+            for node in ast.walk(tree)
+        ), module.__name__
+        assert not any(
+            isinstance(node, ast.Import)
+            and any(alias.name == "ouroboros.config" for alias in node.names)
+            for node in ast.walk(tree)
+        ), module.__name__
+
+
+def test_provider_models_reads_the_shared_leaves_instead_of_importing_config():
+    """The former config <-> provider_models tangle: ``provider_models`` needed the
+    fallback chain and the shipped defaults, and could only reach them by importing
+    its own importer at call time. Both now live in leaves both sides import."""
+    tree = ast.parse(pathlib.Path(provider_models.__file__).read_text(encoding="utf-8"))
+    assert not any(
+        isinstance(node, ast.ImportFrom) and node.module == "ouroboros.config"
+        for node in ast.walk(tree)
+    )
+    top_level = {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert {"ouroboros.model_slots", "ouroboros.settings_defaults"} <= top_level
+    assert provider_models.parse_fallback_chain is model_slots.parse_fallback_chain
+    assert provider_models.SETTINGS_DEFAULTS is settings_defaults.SETTINGS_DEFAULTS
+    assert provider_models.OPENROUTER_DEFAULTS is settings_defaults.OPENROUTER_DEFAULTS
+    assert (provider_models.OPENROUTER_REVIEW_DEFAULTS
+            is settings_defaults.OPENROUTER_REVIEW_DEFAULTS)
+
+
+def test_config_facade_reexports_every_moved_identity():
+    """``config`` keeps the exact objects, so every existing importer and every
+    ``monkeypatch.setattr(config, ...)`` consumer sees no identity change."""
+    for name, owner in _MOVED_OWNERS.items():
+        assert hasattr(config, name), name
+        assert getattr(config, name) is getattr(owner, name), name
+    owned = {name for module in _LEAVES for name in vars(module)}
+    assert set(_MOVED_OWNERS) <= owned
+    assert config.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC is runtime_limits.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC
+
+
+def test_settings_file_lifecycle_and_path_roots_stay_with_the_parent():
+    parent_names = _top_level_names(pathlib.Path(config.__file__))
+    assert set(_PARENT_RETAINED) <= parent_names
+    for module in _LEAVES:
+        leaf_names = _top_level_names(pathlib.Path(module.__file__))
+        assert not (leaf_names & set(_PARENT_RETAINED)), module.__name__
+
+
+def test_settings_extraction_owner_inventory_is_exact():
+    """Every extracted or explicitly added name has exactly one declared owner."""
+    owners = {**_MOVED_OWNERS, **_ADDED_OWNERS}
+    seen: dict[str, str] = {}
+    for module in _LEAVES:
+        for name in _top_level_names(pathlib.Path(module.__file__)):
+            assert name not in seen, f"{name} owned by {seen.get(name)} and {module.__name__}"
+            seen[name] = module.__name__
+            assert owners.get(name) is module, f"{module.__name__} owns an unmapped name: {name}"
+    assert set(seen) == set(owners)
+
+
+def test_settings_extraction_size_bounds_have_meaningful_headroom():
+    counts = {
+        module.__name__: len(
+            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
+        )
+        for module in (config, *_LEAVES)
+    }
+    assert counts["ouroboros.config"] <= 1000
+    assert all(count <= 1000 for count in counts.values())
+    # 500 -> 520: the Z.ai direct provider adds its key and plan rows to the leaf (PR #1207).
+    # 520 -> 521: the desktop keep-running consent key's default row (PR #1404; its disk-authored entry adds none).
+    assert counts["ouroboros.settings_defaults"] <= 521
+    assert (PACKAGE / "config.py").is_file()

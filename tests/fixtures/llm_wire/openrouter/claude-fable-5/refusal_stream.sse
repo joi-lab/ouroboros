@@ -1,0 +1,12 @@
+data: {"id":"gen-1789331310-Aj0OmGm032GaJooiXgRp","object":"chat.completion.chunk","created":1789331310,"model":"anthropic/claude-fable-5","provider":"Anthropic","choices":[{"index":0,"delta":{"content":"Let","role":"assistant"},"finish_reason":null,"native_finish_reason":null}]}
+
+: OPENROUTER PROCESSING
+
+data: {"id":"gen-1789331310-Aj0OmGm032GaJooiXgRp","object":"chat.completion.chunk","created":1789331310,"model":"anthropic/claude-fable-5","provider":"Anthropic","choices":[{"index":0,"delta":{"content":"","role":"assistant","refusal":"This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs. To learn more, visit https://www.anthropic.com/legal/commercial-terms. API integrators: you can reduce refusals for your users by configuring a fallback model — see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331310-Aj0OmGm032GaJooiXgRp","object":"chat.completion.chunk","created":1789331310,"model":"anthropic/claude-fable-5","provider":"Anthropic","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"content_filter","native_finish_reason":"refusal"}]}
+
+data: {"id":"gen-1789331310-Aj0OmGm032GaJooiXgRp","object":"chat.completion.chunk","created":1789331310,"model":"anthropic/claude-fable-5","provider":"Anthropic","service_tier":"default","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"content_filter","native_finish_reason":"refusal"}],"usage":{"prompt_tokens":408,"completion_tokens":2,"total_tokens":410,"cost":0.00418,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.00418,"upstream_inference_prompt_cost":0.00408,"upstream_inference_completions_cost":0.0001},"completion_tokens_details":{"reasoning_tokens":0,"image_tokens":0,"audio_tokens":0}}}
+
+data: [DONE]
+

@@ -16,6 +16,11 @@ class _FakeOpenAI:
         type(self).created.append(self)
 
 
+class _FakeDefaultHttpxClient:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 class TestLlmClientRefresh(unittest.TestCase):
     def setUp(self):
         _FakeOpenAI.created.clear()
@@ -23,7 +28,9 @@ class TestLlmClientRefresh(unittest.TestCase):
     def test_runtime_client_refreshes_when_env_key_changes(self):
         from ouroboros.llm import LLMClient
 
-        fake_openai = types.SimpleNamespace(OpenAI=_FakeOpenAI)
+        fake_openai = types.SimpleNamespace(
+            OpenAI=_FakeOpenAI, DefaultHttpxClient=_FakeDefaultHttpxClient,
+        )
         with patch.dict(sys.modules, {"openai": fake_openai}):
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}, clear=False):
                 client = LLMClient()
@@ -40,7 +47,9 @@ class TestLlmClientRefresh(unittest.TestCase):
     def test_explicit_api_key_does_not_track_env_changes(self):
         from ouroboros.llm import LLMClient
 
-        fake_openai = types.SimpleNamespace(OpenAI=_FakeOpenAI)
+        fake_openai = types.SimpleNamespace(
+            OpenAI=_FakeOpenAI, DefaultHttpxClient=_FakeDefaultHttpxClient,
+        )
         with patch.dict(sys.modules, {"openai": fake_openai}):
             with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}, clear=False):
                 client = LLMClient(api_key="explicit-key")

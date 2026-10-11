@@ -10,7 +10,6 @@ Tests core invariants:
 
 Run: python -m pytest tests/test_smoke.py -v
 """
-import ast
 import os
 import pathlib
 import re
@@ -55,7 +54,6 @@ TOOL_MODULES = [
     "ouroboros.tools.git_rollback",
     "ouroboros.tools.git_pr",
     "ouroboros.tools.github",
-    "ouroboros.tools.ci",
     "ouroboros.tools.verify",
 ]
 
@@ -100,34 +98,45 @@ def test_tool_set_matches(registry):
 
 EXPECTED_TOOLS = [
     "browse_page", "browser_action",
-    "run_ci_tests",
-    "advisory_review", "review_status",
+    "preflight_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches", "cancel_task",
+    "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
+    "configure_presence", "initiate_presence",
+    "integrate_subagent_patch", "compare_subagent_patches",
+    # C1: the explicit acceptance seam for a delegated run's captured patch —
+    # a first-class tool, so the registry contract must name it.
+    "integrate_delegated_patch", "cancel_task", "resume_child_task",
     "peek_task", "discard_child_result", "override_delegation_constraint",
     "request_deep_self_review", "chat_history", "update_scratchpad",
     "send_user_message", "update_identity", "toggle_evolution",
-    "toggle_consciousness", "switch_model", "get_task_result",
-    "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "toggle_consciousness",
+    "set_next_wakeup", "switch_model", "get_task_result",
+    "wait_task", "wait_tasks", "await_messages", "tree_note", "tree_read",
+    "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+    "delegate_message",
     "read_file", "list_files", "write_file", "edit_text",
-    "send_photo", "send_video", "send_file", "search_code", "query_code", "forward_to_worker",
+    "apply_patch", "edit_batch",
+    "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "escalate",
+        "forward_to_worker",
     "generate_evolution_stats",
     "commit_reviewed", "vcs_commit_reviewed", "vcs_status", "vcs_diff",
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge", "vcs_rollback",
-    "list_github_prs", "get_github_pr", "comment_on_pr",
+    "list_github_prs", "get_github_pr", "get_github_checks", "comment_on_pr", "pr_merge",
     "list_github_issues", "get_github_issue", "comment_on_issue",
     "close_github_issue", "create_github_issue",
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
+    "chronicle_write", "memory_read", "memory_mark",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
     "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
-    "ensure_project_scope",
+    "ensure_project_scope", "schedule_followup",
     "memory_map", "memory_update_registry",
-    "plan_task", "recent_tasks", "task_acceptance_review", "verify_and_record", "web_search",
+    "plan_task", "recent_tasks", "live_roots", "update_focus",
+    "task_acceptance_review", "finish_task", "verify_and_record", "web_search",
     "start_service", "service_status", "service_logs", "stop_service",
-    "run_command", "claude_code_edit", "run_script",
-    "list_skills", "skill_review", "skill_exec", "toggle_skill",
+    "run_command", "run_script",
+    "list_skills", "skill_review", "skill_exec", "toggle_skill", "skill_owner_action",
     "skill_preflight", "submit_skill_to_hub",
     "list_available_tools", "enable_tools",
     "analyze_screenshot", "vlm_query", "view_image",
@@ -215,14 +224,14 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
     expected_subset = {
         "memory_map",
         "memory_update_registry",
-        "advisory_review",
+        "preflight_review",
         "review_status",
         "plan_task",
         "vcs_rollback",
-        "run_ci_tests",
         # github.py is in _FROZEN_TOOL_MODULES — PR inspection tools must work in frozen builds
         "list_github_prs",
         "get_github_pr",
+        "get_github_checks",
         "comment_on_pr",
         "query_code",
     }
@@ -380,10 +389,10 @@ def test_version_in_readme():
 
 
 def test_bible_exists_and_has_principles():
-    """BIBLE.md exists and contains the current principle set (0-12)."""
+    """BIBLE.md exists and contains the current principle set (0-13)."""
     bible = (REPO / "BIBLE.md").read_text(encoding="utf-8")
     principles = re.findall(r"^## Principle (\d+):", bible, flags=re.MULTILINE)
-    assert principles == [str(i) for i in range(13)], f"Unexpected BIBLE principles: {principles}"
+    assert principles == [str(i) for i in range(14)], f"Unexpected BIBLE principles: {principles}"
 
 
 # ── Code quality invariants ──────────────────────────────────────
@@ -412,25 +421,82 @@ def test_no_env_dumping():
     assert len(violations) == 0, "Dangerous env dumping:\n" + "\n".join(violations)
 
 
+# The `size_ratchet` lane below BLOCKS only in official-repository CI (a
+# dedicated `pytest tests/ -m size_ratchet` step in quick-test and full-test);
+# default local runs exclude the marker and surface the same validator
+# findings as warnings via check_worktree_readiness and codebase_health.
+# Canonical lane description: docs/DEVELOPMENT.md "Pytest marker lanes".
+
+
+@pytest.mark.size_ratchet
 def test_no_oversized_modules():
-    """Principle 7: no non-grandfathered module exceeds the hard gate."""
-    from ouroboros.review import MAX_MODULE_LINES, module_is_grandfathered
+    """Principle 7: exact-path debt is the only exception to the hard gate."""
+    from ouroboros.review import GIANT_PATHS, MAX_MODULE_LINES, iter_gated_modules
 
     max_lines = MAX_MODULE_LINES
-    violations = []
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-        for f in files:
-            if not f.endswith(".py"):
-                continue
-            path = pathlib.Path(root) / f
-            lines = len(path.read_text(encoding="utf-8").splitlines())
-            # Shared matcher (basename OR repo-relative path) — the same one
-            # codebase_health uses, so the two consumers never diverge.
-            rel = path.relative_to(REPO).as_posix()
-            if lines > max_lines and not module_is_grandfathered(rel):
-                violations.append(f"{rel}: {lines} lines")
+    violations = [
+        f"{module.path}: {module.line_count} lines"
+        for module in iter_gated_modules(REPO)
+        if module.line_count > max_lines and module.path not in GIANT_PATHS
+    ]
     assert len(violations) == 0, f"Oversized modules (>{max_lines} lines):\n" + "\n".join(violations)
+
+
+@pytest.mark.size_ratchet
+def test_size_ratchet_manifest_matches_live_tree():
+    """Module/function/band/byte debt matches the untruncated candidate tree (a band entry may stay at 1501-1600 lines)."""
+    from ouroboros.review import validate_size_ratchet
+
+    errors = validate_size_ratchet(REPO)
+    assert not errors, "Size-ratchet manifest violations:\n" + "\n".join(errors)
+
+
+@pytest.mark.size_ratchet
+def test_size_ratchet_transition_against_explicit_base():
+    """Official CI enforces the pairwise base-vs-tip shrink-only transition.
+
+    CI exports ``OURO_SIZE_RATCHET_BASE_REF`` (PR base SHA / push
+    ``event.before``); without it the check degrades to the tip's parent
+    manifest — the merge-aware local semantics. An all-zeros base (new-branch /
+    tag push) degrades the same way (never a skip), while the manifest matching
+    the tree stays enforced by ``test_size_ratchet_manifest_matches_live_tree``.
+    """
+    from ouroboros.review import validate_size_ratchet_transition_against_base
+
+    base_ref = os.environ.get("OURO_SIZE_RATCHET_BASE_REF") or None
+    errors = validate_size_ratchet_transition_against_base(REPO, base_ref)
+    assert not errors, (
+        f"Size-ratchet pairwise transition violations (base={base_ref or 'HEAD-parent'}):\n" + "\n".join(errors)
+    )
+
+
+def test_js_module_gate_buckets_and_grandfathering():
+    """The JS size gate sees web/tests and exempts debt by exact rel-path only."""
+    from ouroboros.review import compute_complexity_metrics, module_is_grandfathered
+
+    sections = [
+        ("repo/web/app.js", "x\n" * 2000),                   # gated, over hard gate, not grandfathered
+        ("repo/web/modules/chat.js", "x\n" * 4000),          # gated, grandfathered by rel-path
+        ("repo/web/vendor/chart.umd.min.js", "x\n" * 9000),  # vendored/minified — excluded
+        ("repo/web/tests/foo.test.js", "x\n" * 9000),        # web/tests/ — gated
+        ("repo/ouroboros/small.py", "x\n" * 10),
+    ]
+    metrics = compute_complexity_metrics(sections)
+
+    assert metrics["js_files"] == 3  # app.js + chat.js + web/tests; vendored excluded
+    oversized = {p for p, _n in metrics["oversized_modules"]}
+    grandfathered = {p for p, _n in metrics["grandfathered_modules"]}
+    assert "web/app.js" in oversized
+    assert "web/modules/chat.js" in grandfathered
+    assert "web/modules/chat.js" not in oversized
+    assert "web/tests/foo.test.js" in oversized
+    assert "web/vendor/chart.umd.min.js" not in oversized
+    assert "web/vendor/chart.umd.min.js" not in grandfathered
+
+    # Grandfather entry is rel-path-keyed: a chat.js anywhere else stays gated.
+    assert module_is_grandfathered("web/modules/chat.js")
+    assert not module_is_grandfathered("repo/web/modules/chat.js")
+    assert not module_is_grandfathered("web/other/chat.js")
 
 
 def test_no_bare_except_pass():
@@ -462,61 +528,33 @@ def test_no_bare_except_pass():
 
 # ── AST-based function size check ───────────────────────────────
 
-_SKIP_DIRS = {'.git', '__pycache__', 'tests', 'python-standalone', 'build', 'dist',
-              'venv', '.venv', 'node_modules', 'assets', 'devtools', '.pytest_cache'}
-
 
 def _get_function_sizes():
-    """Return list of (file, func_name, lines) for all functions."""
-    from ouroboros.review import FUNCTION_COUNT_EXCLUDED_FILES
+    """Return exact path/qualname tuples from the production iterator."""
+    from ouroboros.review import iter_gated_functions
 
-    results = []
-    for root, dirs, files in os.walk(REPO):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
-        for f in files:
-            if not f.endswith(".py"):
-                continue
-            if f in ("app.py", "demo_app.py"):
-                continue
-            if f in FUNCTION_COUNT_EXCLUDED_FILES:
-                continue
-            path = pathlib.Path(root) / f
-            try:
-                tree = ast.parse(path.read_text(encoding="utf-8"))
-            except SyntaxError:
-                continue
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    size = node.end_lineno - node.lineno + 1
-                    results.append((f, node.name, size))
-    return results
+    return [(item.path, item.qualname, item.line_count) for item in iter_gated_functions(REPO)]
 
 
+@pytest.mark.size_ratchet
 def test_no_extremely_oversized_functions():
     """No function exceeds the hard gate."""
-    from ouroboros.review import GRANDFATHERED_OVERSIZED_FUNCTIONS, MAX_FUNCTION_LINES
+    from ouroboros.review import FUNCTION_DEBT, MAX_FUNCTION_LINES
 
     violations = []
-    for fname, func_name, size in _get_function_sizes():
-        if (fname, func_name) in GRANDFATHERED_OVERSIZED_FUNCTIONS:
+    for path, qualname, size in _get_function_sizes():
+        if (path, qualname) in FUNCTION_DEBT:
             continue
         if size > MAX_FUNCTION_LINES:
-            violations.append(f"{fname}:{func_name} = {size} lines")
+            violations.append(f"{path}:{qualname} = {size} lines")
     assert len(violations) == 0, \
         f"Functions exceeding {MAX_FUNCTION_LINES} lines:\n" + "\n".join(violations)
 
 
-def test_function_count_reasonable():
-    """Codebase doesn't have too few or too many functions.
-
-    The hard gate value is imported from ouroboros/review.py::MAX_TOTAL_FUNCTIONS;
-    there is no hardcoded assertion number here.
-    """
-    from ouroboros.review import MAX_TOTAL_FUNCTIONS
-
+def test_function_count_has_sanity_floor():
+    """The production inventory still discovers a plausible codebase."""
     sizes = _get_function_sizes()
     assert len(sizes) >= 100, f"Only {len(sizes)} functions — too few?"
-    assert len(sizes) <= MAX_TOTAL_FUNCTIONS, f"{len(sizes)} functions — too many?"
 
 
 # ── Pre-push gate tests ──────────────────────────────────────────────
@@ -564,13 +602,15 @@ class TestPrePushGate:
         assert callable(_git_commit_with_tests)
 
     def test_pre_push_tests_timeout_is_sufficient(self):
-        """The pre-push/post-commit pytest timeout must be >= 180s.
+        """The pre-push/post-commit pytest budget must be >= 180s.
 
-        The full test suite (~2100+ tests) takes ~2 minutes; a shorter cap
-        produces false TESTS_FAILED on every successful commit. The timeout is
-        owned by ``run_hermetic_pytest`` (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC``
-        env) so callers do not re-pin a stale literal — this guard now anchors on
-        that single source of truth.
+        Since v6.88.0 this is the TOTAL budget across the node test lane AND
+        both preflight passes (parallel ``not serial``, then ``serial``, which
+        gets the remainder) — not a per-pass one. A full suite takes MINUTES,
+        and one loaded-host run measured 1077s, so a cap sized for an idle host
+        reports a healthy suite as a timeout. The budget is owned by ``run_hermetic_pytest``
+        (default + ``OUROBOROS_PREFLIGHT_TIMEOUT_SEC`` env) so callers do not
+        re-pin a stale literal — this guard anchors on that single source of truth.
         """
         from ouroboros.preflight_runner import (
             _DEFAULT_PREFLIGHT_TIMEOUT_SEC,
@@ -578,9 +618,9 @@ class TestPrePushGate:
         )
 
         assert _DEFAULT_PREFLIGHT_TIMEOUT_SEC >= 180, (
-            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — must be "
-            ">= 180s; the full suite takes ~2 minutes and a shorter cap reports "
-            "spurious TESTS_FAILED on successful commits."
+            f"preflight default timeout is {_DEFAULT_PREFLIGHT_TIMEOUT_SEC}s — 180s is a "
+            "FLOOR against a caller re-pinning a tiny literal, never a claim about how "
+            "long the suite takes; the real budget must cover a whole loaded-host run."
         )
         # The env override is honoured so operators can raise it on slow hosts.
         import os as _os
@@ -595,3 +635,44 @@ class TestPrePushGate:
                 _os.environ["OUROBOROS_PREFLIGHT_TIMEOUT_SEC"] = prev
 
 
+
+
+def test_no_module_defines_the_same_top_level_name_twice():
+    """A redefinition is invisible at import: the later one silently wins.
+
+    This is the shape a clean git merge produces when two branches independently add
+    the same concept — no conflict markers, no import error, no failing test, just one
+    definition quietly shadowing another. It happened in this very series: two branches
+    each added `SUBAGENT_EXECUTORS` and `normalize_subagent_executor` to subagents.py,
+    one a frozenset and one a tuple, and the merge picked a winner by position. That
+    pair happened to be equivalent; the next one will not be.
+    """
+    import ast
+    import collections
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        parts = set(path.parts)
+        if parts & {".git", "node_modules", "venv", ".venv", "build", "dist"}:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+        seen = collections.Counter()
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                seen[node.name] += 1
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                seen[node.target.id] += 1
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        seen[target.id] += 1
+        for name, count in seen.items():
+            # Dunders and TYPE_CHECKING/try-except import shims legitimately rebind.
+            if count > 1 and not name.startswith("__"):
+                offenders.append(f"{path.relative_to(root)}: {name} defined {count}x")
+    assert not offenders, "Top-level names defined more than once:\n" + "\n".join(offenders)

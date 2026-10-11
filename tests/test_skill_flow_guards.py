@@ -1,21 +1,29 @@
 """Regression tests for skill authoring / repair guardrails."""
 
-import json
+import hashlib
 from types import SimpleNamespace
 import queue
 
 from ouroboros import loop as loop_mod
 from ouroboros.contracts.task_constraint import TaskConstraint, normalize_task_constraint
-from ouroboros.skill_review_runner import _heal_mode
+from ouroboros.tool_access import active_tool_profile
 from ouroboros.utils import sanitize_tool_args_for_log
+from tests.test_completion_selection import finish
 
 
-def test_task_constraint_controls_heal_mode_not_prompt_text():
+def _completion_schema():
+    from ouroboros.tools.control import get_tools
+    entry = next(tool for tool in get_tools() if tool.name == "finish_task")
+    return {"type": "function", "function": entry.schema}
+
+
+def test_selected_skill_is_resource_context_not_a_reduced_profile():
     messages = [{"role": "user", "content": "Please run tests for task_constraint handling"}]
-    assert not _heal_mode(SimpleNamespace(messages=messages, task_constraint=None))
+    plain = SimpleNamespace(messages=messages, task_constraint=None)
 
     constraint = TaskConstraint(mode="skill_repair", skill_name="target", payload_root="skills/external/target")
-    assert _heal_mode(SimpleNamespace(messages=messages, task_constraint=constraint))
+    assert constraint.has_selected_skill
+    assert active_tool_profile(SimpleNamespace(messages=messages, task_constraint=constraint)) == active_tool_profile(plain)
 
 
 def test_normalize_task_constraint_from_command_payload():
@@ -70,14 +78,8 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
     calls = iter([
         ({"content": "done", "tool_calls": []}, {}),
         ({"content": "", "tool_calls": [{"id": "c1", "function": {"name": "noop", "arguments": "{}"}}]}, {}),
-        ({"content": json.dumps({
-            "delivery_control": "replace",
-            "full_answer": "done again",
-        }), "tool_calls": []}, {}),
-        ({"content": json.dumps({
-            "delivery_control": "replace",
-            "full_answer": "final",
-        }), "tool_calls": []}, {}),
+        (finish("done again"), {}),
+        (finish("final"), {}),
     ])
     progress = []
     seen_message_tails = []
@@ -89,6 +91,7 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
         def __init__(self):
             self._ctx = SimpleNamespace(
                 event_queue=None,
+                drive_root=tmp_path,
                 task_id="task",
                 messages=[],
                 active_model_override=None,
@@ -98,13 +101,23 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
             )
 
         def schemas(self):
-            return [{"type": "function", "function": {"name": "noop", "description": "", "parameters": {}}}]
+            return [{"type": "function", "function": {"name": "noop", "description": "", "parameters": {}}}, _completion_schema()]
 
         def get_timeout(self, _name):
             return 1
 
-        def execute(self, _name, _args):
+        def execute(self, name, args):
+            if name == "finish_task":
+                from ouroboros.tools.control_runtime import _finish_task
+                return _finish_task(self._ctx, **args)
+            assert name == "noop"
             return "OK"
+
+        def execute_result(self, name, args):
+            # Typed dispatch seam (D02): adapt like the real registry.
+            from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+            return LegacyTextResultAdapter.from_text(name, self.execute(name, args))
 
         def override_handler(self, _name, _handler):
             return None
@@ -127,7 +140,7 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
         _Tools(),
         _LLM(),
         tmp_path,
-        progress.append,
+        lambda text, *, incident=None: progress.append(text),
         queue.Queue(),
         task_id="task",
         drive_root=tmp_path,
@@ -138,13 +151,19 @@ def test_skill_finalization_rearms_after_tool_round(monkeypatch, tmp_path):
     assert progress.count("SKILL_NOT_FINALIZED") == 2
     assert trace["reasoning_notes"].count("SKILL_NOT_FINALIZED") == 2
     assert trace["delivery_candidate"]["revision"] == 3
-    assert trace["delivery_candidate"]["finalization_control"] == "replace"
-    assert any(
-        "[DELIVERY_FINALIZATION_CONTROL]" in str(message.get("content") or "")
-        for request in seen_messages
-        for message in request
-    )
-    assert any(tail[-2:] == ["assistant", "user"] for tail in seen_message_tails)
+    assert trace["delivery_candidate"]["finalization_control"] == "candidate"
+    assert [row["tool"] for row in trace["tool_calls"]] == ["noop", "finish_task", "finish_task"]
+    assert all(row["completion_control"] for row in trace["tool_calls"][1:])
+    # Multiple host notices can follow one held response; the old last-two-role
+    # assertion accidentally depended on the duplicated assistant row.
+    for held, text in ((seen_messages[1], "done"), (seen_messages[3], "done again")):
+        indices = [index for index, row in enumerate(held)
+                   if row.get("role") == "assistant" and row.get("content") == text]
+        assert len(indices) == 1
+        notices = held[indices[0] + 1:]
+        assert notices and all(row.get("role") == "user" for row in notices)
+        assert any("latest whole held response answer_sha256=" + hashlib.sha256(text.encode()).hexdigest()
+                   in str(row.get("content")) for row in notices)
     assert all(tail[-2:] != ["assistant", "system"] for tail in seen_message_tails)
 
 
@@ -157,7 +176,7 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
             "function": {"name": "finalize_skill", "arguments": "{}"},
         }]}, {}),
         ({"content": "Skill review completed.", "tool_calls": []}, {}),
-        ({"content": "Everything is done now.", "tool_calls": []}, {}),
+        (finish(answer_sha256=hashlib.sha256(original.encode("utf-8")).hexdigest()), {}),
     ])
     finalized = {"value": False}
     seen_messages = []
@@ -168,6 +187,7 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
         def __init__(self):
             self._ctx = SimpleNamespace(
                 event_queue=None,
+                drive_root=tmp_path,
                 task_id="task",
                 messages=[],
                 active_model_override=None,
@@ -184,15 +204,24 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
                     "description": "",
                     "parameters": {},
                 },
-            }]
+            }, _completion_schema()]
 
         def get_timeout(self, _name):
             return 1
 
-        def execute(self, name, _args):
+        def execute(self, name, args):
+            if name == "finish_task":
+                from ouroboros.tools.control_runtime import _finish_task
+                return _finish_task(self._ctx, **args)
             assert name == "finalize_skill"
             finalized["value"] = True
             return "OK"
+
+        def execute_result(self, name, args):
+            # Typed dispatch seam (D02): adapt like the real registry.
+            from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+            return LegacyTextResultAdapter.from_text(name, self.execute(name, args))
 
         def override_handler(self, _name, _handler):
             return None
@@ -219,7 +248,7 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
         _Tools(),
         _LLM(),
         tmp_path,
-        lambda _msg: None,
+        lambda _msg, *, incident=None, narration=False: None,
         queue.Queue(),
         task_id="task",
         drive_root=tmp_path,
@@ -229,26 +258,26 @@ def test_skill_action_and_effect_round_cannot_erase_complete_candidate(monkeypat
     assert result == original
     assert len(seen_messages) == 4
     assert trace["delivery_candidate"]["revision"] == 1
-    assert trace["delivery_candidate"]["finalization_control"] == "degraded_preserve"
-    assert trace["delivery_candidate"]["degraded_reason"] == (
-        "invalid_delivery_control_after_repair"
-    )
+    assert trace["delivery_candidate"]["content_sha256"] == hashlib.sha256(original.encode("utf-8")).hexdigest()
+    assert trace["delivery_candidate"]["degraded"] is False
+    assert trace["delivery_candidate"]["acceptance_binding"]["authoritative"] is False
     assert all(
         "[DELIVERY_FINALIZATION_CONTROL]" not in str(message.get("content") or "")
         for message in seen_messages[1]
     )
-    assert any(
-        "keep is NOT allowed" in str(message.get("content") or "")
-        for message in seen_messages[2]
-    )
+    assert any(row.get("role") == "tool" and row.get("content") == "OK" for row in seen_messages[2])
+    assert seen_messages[3][:len(seen_messages[2])] == seen_messages[2]
+    assert seen_messages[3][-2] == {"role": "assistant", "content": "Skill review completed."}
+    assert seen_messages[3][-1]["role"] == "user"
+    assert "No completion selection" in seen_messages[3][-1]["content"]
 
 
-def test_skill_finalization_empty_text_does_not_append_empty_assistant(monkeypatch, tmp_path):
+def test_skill_finalization_empty_text_preserves_canonical_response_and_user_tail(monkeypatch, tmp_path):
     calls = iter([
         ({"content": "", "tool_calls": []}, {}),
         ({"content": "final", "tool_calls": []}, {}),
     ])
-    seen_message_tails = []
+    seen_messages = []
 
     class _Tools:
         CODE_TOOLS = set()
@@ -256,6 +285,7 @@ def test_skill_finalization_empty_text_does_not_append_empty_assistant(monkeypat
         def __init__(self):
             self._ctx = SimpleNamespace(
                 event_queue=None,
+                drive_root=tmp_path,
                 task_id="task",
                 messages=[],
                 active_model_override=None,
@@ -275,7 +305,7 @@ def test_skill_finalization_empty_text_does_not_append_empty_assistant(monkeypat
             return "test-model"
 
     def fake_call(_llm, messages, *_args, **_kwargs):
-        seen_message_tails.append([m.get("role") for m in messages[-3:]])
+        seen_messages.append([dict(message) for message in messages])
         return next(calls)
 
     monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "3")
@@ -287,12 +317,16 @@ def test_skill_finalization_empty_text_does_not_append_empty_assistant(monkeypat
         _Tools(),
         _LLM(),
         tmp_path,
-        lambda _msg: None,
+        lambda _msg, *, incident=None, narration=False: None,
         queue.Queue(),
         task_id="task",
         drive_root=tmp_path,
     )
 
     assert result == "final"
-    assert any(tail[-1:] == ["user"] and "assistant" not in tail[-2:] for tail in seen_message_tails)
-    assert all(tail[-2:] != ["user", "user"] for tail in seen_message_tails)
+    assert len(seen_messages) == 2
+    assert seen_messages[1][-1]["role"] == "user"
+    assert seen_messages[1][:len(seen_messages[0])] == seen_messages[0]
+    assert seen_messages[1][-2] == {"role": "assistant", "content": ""}
+    assert "No completion selection" in seen_messages[1][-1]["content"]
+    assert hashlib.sha256(b"").hexdigest() in seen_messages[1][-1]["content"]

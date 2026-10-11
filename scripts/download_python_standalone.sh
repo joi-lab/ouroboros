@@ -69,7 +69,11 @@ rm -rf _python_tmp
 
 echo ""
 echo "=== Installing agent dependencies ==="
-"${DEST}/bin/pip3" install --quiet -r requirements.txt
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv is required for locked dependency installation."
+    exit 1
+fi
+uv pip install --python "${DEST}/bin/python3" --quiet -r requirements-runtime.lock
 
 echo ""
 echo "=== Done ==="

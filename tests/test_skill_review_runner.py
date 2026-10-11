@@ -10,10 +10,13 @@ from ouroboros.skill_loader import (
     load_enabled,
     load_review_state,
     load_skill_grants,
+    save_skill_grants,
     save_review_state,
 )
 from ouroboros.skill_review import SkillReviewOutcome
 from ouroboros.skill_review_runner import _review_result_message, run_skill_review_lifecycle_blocking
+
+from tests._shared import reconcile_receipt
 
 
 def _reset_queue() -> None:
@@ -68,6 +71,34 @@ def _mark_self_authored(skill_dir: pathlib.Path) -> None:
     (state / "self_authored.json").write_text(__import__("json").dumps(payload) + "\n", encoding="utf-8")
 
 
+def test_review_lifecycle_rejects_identity_collision_before_state_write(tmp_path):
+    _reset_queue()
+    drive_root = tmp_path / "drive"
+    repo_dir = tmp_path / "repo"
+    checkout = tmp_path / "checkout"
+    repo_dir.mkdir()
+    _build_extension(drive_root / "skills" / "external", "alpha")
+    _build_extension(checkout, "alpha")
+    ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
+
+    def unexpected_review(_ctx, _skill_name):
+        raise AssertionError("ambiguous skill reached the review implementation")
+
+    payload = run_skill_review_lifecycle_blocking(
+        ctx,
+        "alpha",
+        source="test",
+        review_impl=unexpected_review,
+        repo_path=str(checkout),
+    )
+
+    assert payload["status"] == "pending"
+    assert payload["executable_review"] is False
+    assert "collision" in payload["error"].lower()
+    assert payload["deps_status"] == "not_run"
+    assert not (drive_root / "state" / "skills" / "alpha").exists()
+
+
 def test_blocking_review_lifecycle_uses_single_progress_card(tmp_path, monkeypatch):
     _reset_queue()
     sent = []
@@ -97,7 +128,7 @@ def test_blocking_review_lifecycle_uses_single_progress_card(tmp_path, monkeypat
 
     def fake_reconcile(_ctx, skill_name, **_kwargs):
         reconcile_calls.append(lifecycle_queue.queue_snapshot()["active"]["target"])
-        return "extension_loaded", "review_passed"
+        return reconcile_receipt("extension_loaded", "review_passed")
 
     monkeypatch.setattr("supervisor.message_bus.send_with_budget", fake_send)
     monkeypatch.setattr("ouroboros.skill_review_runner._reconcile_deps_after_pass_review", lambda *_a, **_k: ("installed", ""))
@@ -158,7 +189,7 @@ def test_review_lifecycle_installs_deps_after_warnings(tmp_path, monkeypatch):
 
     monkeypatch.setattr("supervisor.message_bus.send_with_budget", lambda *a, **kw: None)
     monkeypatch.setattr("ouroboros.skill_review_runner._reconcile_deps_after_pass_review", fake_deps)
-    monkeypatch.setattr("ouroboros.skill_review_runner._reconcile_extension_payload", lambda *_a, **_k: (None, None))
+    monkeypatch.setattr("ouroboros.skill_review_runner._reconcile_extension_payload", lambda *_a, **_k: reconcile_receipt())
 
     payload = run_skill_review_lifecycle_blocking(
         ctx,
@@ -261,7 +292,7 @@ def test_self_authored_review_lifecycle_uses_triad(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("extension_loaded", "ready"),
+        lambda *_a, **_k: reconcile_receipt("extension_loaded", "ready"),
     )
 
     def fake_review(_ctx, _skill_name):
@@ -312,6 +343,10 @@ def test_review_lifecycle_payload_surfaces_auto_flow_grants(tmp_path, monkeypatc
     repo_dir.mkdir()
     skills_root.mkdir(parents=True)
     skill_dir = _build_keyed_extension(skills_root, "alpha")
+    manifest_path = skill_dir / "SKILL.md"
+    manifest_path.write_text(manifest_path.read_text().replace(
+        "permissions: [read_settings]", "permissions: [read_settings, inject_chat]",
+    ), encoding="utf-8")
     _mark_self_authored(skill_dir)
     content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
     ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
@@ -323,10 +358,16 @@ def test_review_lifecycle_payload_surfaces_auto_flow_grants(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("extension_loaded", "ready"),
+        lambda *_a, **_k: reconcile_receipt("extension_loaded", "ready"),
     )
 
     def fake_review(_ctx, _skill_name):
+        save_review_state(drive_root, "alpha", SkillReviewState(status="clean", content_hash=content_hash))
+        save_skill_grants(
+            drive_root, "alpha", ["OPENROUTER_API_KEY"], content_hash=content_hash,
+            requested_keys=["OPENROUTER_API_KEY"], granted_permissions=["inject_chat"],
+            requested_permissions=["inject_chat"],
+        )
         return SkillReviewOutcome(
             skill_name="alpha",
             status="pass",
@@ -379,6 +420,7 @@ def test_self_authored_review_does_not_enable_when_deps_fail(tmp_path, monkeypat
             reviewer_models=["reviewer"],
         )
         outcome.auto_flow = True
+        save_review_state(drive_root, "alpha", SkillReviewState(status="clean", content_hash=outcome.content_hash))
         return outcome
 
     payload = run_skill_review_lifecycle_blocking(
@@ -389,7 +431,9 @@ def test_self_authored_review_does_not_enable_when_deps_fail(tmp_path, monkeypat
         repo_path=str(drive_root / "skills"),
     )
 
-    assert payload["status"] == "pending"
+    assert payload["status"] == "clean"
+    assert load_review_state(drive_root, "alpha").status == "clean"
+    assert payload["error"] == ""
     assert payload["deps_status"] == "failed"
     assert "pip exploded" in payload["deps_error"]
     assert load_enabled(drive_root, "alpha") is False
@@ -460,7 +504,7 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
     )
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("noop", "review_failed"),
+        lambda *_a, **_k: reconcile_receipt("noop", "review_failed"),
     )
 
     run_skill_review_lifecycle_blocking(
@@ -487,6 +531,10 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
     assert row["snapshot_attempt"] == 1
     assert row["task_id"] == "child-task"
     assert row["root_task_id"] == "root-task"
+    assert row["origin_task_id"] == "child-task"
+    assert row["origin_root_task_id"] == "root-task"
+    assert row["presentation_owner_task_id"] == "root-task"
+    assert row["group_id"] == "task:root-task:alpha"
     assert row["chat_id"] == 17
     assert row["source"] == "test"
     assert "Skill review round 1" in row["text"]
@@ -500,6 +548,7 @@ def test_lifecycle_finish_writes_compact_provenance_to_chat_jsonl(tmp_path, monk
     ]
     assert len(history) == 1
     assert history[0]["job_id"] == row["job_id"]
+    assert history[0]["presentation_owner_task_id"] == "root-task"
     assert history[0]["raw_actor_records"][0]["raw_text"] == raw_failure
 
 
@@ -536,7 +585,7 @@ def test_lifecycle_finish_keeps_raw_only_review_private(tmp_path, monkeypatch):
     monkeypatch.setattr("supervisor.message_bus.send_with_budget", lambda *a, **k: None)
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("noop", "review_pending"),
+        lambda *_a, **_k: reconcile_receipt("noop", "review_pending"),
     )
     run_skill_review_lifecycle_blocking(
         ctx, "alpha", source="test", review_impl=fake_review, repo_path=str(skills_root),
@@ -555,6 +604,58 @@ def test_lifecycle_finish_keeps_raw_only_review_private(tmp_path, monkeypatch):
     ]
     assert len(history) == 1
     assert history[0]["raw_actor_records"][0]["raw_text"] == raw_text
+
+
+def test_lifecycle_history_redacts_secret_shaped_reviewer_prose(tmp_path, monkeypatch):
+    import json
+
+    _reset_queue()
+    drive_root = tmp_path / "drive"
+    repo_dir = tmp_path / "repo"
+    skills_root = tmp_path / "skills"
+    drive_root.mkdir()
+    repo_dir.mkdir()
+    skills_root.mkdir()
+    skill_dir = _build_extension(skills_root, "alpha")
+    content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+    candidate = "sk-" + "A1" * 20
+    ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
+
+    def fake_review(_ctx, skill_name):
+        return SkillReviewOutcome(
+            skill_name=skill_name,
+            status="fail",
+            content_hash=content_hash,
+            reviewer_models=["fake/reviewer"],
+            findings=[{
+                "item": "secret_handling",
+                "verdict": "FAIL",
+                "severity": "critical",
+                "reason": f"Remove {candidate} from the fixture.",
+                "model": "fake/reviewer",
+            }],
+            raw_actor_records=[{
+                "model_id": "fake/reviewer",
+                "status": "ok",
+                "raw_text": f"The candidate is {candidate}.",
+            }],
+        )
+
+    monkeypatch.setattr("supervisor.message_bus.send_with_budget", lambda *a, **k: None)
+    monkeypatch.setattr(
+        "ouroboros.skill_review_runner._reconcile_extension_payload",
+        lambda *_a, **_k: reconcile_receipt("noop", "review_failed"),
+    )
+    run_skill_review_lifecycle_blocking(
+        ctx, "alpha", source="test", review_impl=fake_review, repo_path=str(skills_root),
+    )
+
+    history_path = drive_root / "state" / "skills" / "alpha" / "review_history.jsonl"
+    raw_history = history_path.read_text(encoding="utf-8")
+    history = [json.loads(line) for line in raw_history.splitlines()]
+    assert candidate not in raw_history
+    assert "***REDACTED***" in history[0]["fail_findings"][0]["reason_excerpt"]
+    assert "***REDACTED***" in history[0]["raw_actor_records"][0]["raw_text"]
 
 
 def test_self_authored_review_requires_configured_requested_keys(tmp_path, monkeypatch):
@@ -605,7 +706,7 @@ def test_review_round_and_snapshot_attempt_are_group_scoped(tmp_path, monkeypatc
     )
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("noop", "test"),
+        lambda *_a, **_k: reconcile_receipt("noop", "test"),
     )
 
     def fake_review(_ctx, skill_name):
@@ -688,7 +789,7 @@ def test_review_rebinds_snapshot_hash_after_waiting_for_lifecycle_lock(tmp_path,
     )
     monkeypatch.setattr(
         "ouroboros.skill_review_runner._reconcile_extension_payload",
-        lambda *_a, **_k: ("noop", "test"),
+        lambda *_a, **_k: reconcile_receipt("noop", "test"),
     )
     ctx = SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[])
 
@@ -844,6 +945,9 @@ def test_skill_review_ui_projection_is_group_scoped_bounded_and_sanitized(tmp_pa
     assert projection["history"][0]["review_round"] == 3
     assert all(row["group_id"] == "manual:alpha" for row in projection["history"])
     assert all("raw_actor_records" not in row for row in projection["history"])
+    # The ten-row window is a disclosed bound: 12 group rows minus 10 shown.
+    # The foreign-group row must not count into the omitted number.
+    assert projection["history_omitted"] == 2
 
 
 def test_cancel_and_timeout_each_write_one_idempotent_terminal_row(tmp_path):
@@ -898,3 +1002,55 @@ def test_cancel_and_timeout_each_write_one_idempotent_terminal_row(tmp_path):
         assert len(rows) == 1
         assert rows[0]["status"] == expected_status
         assert rows[0]["job_id"] == expected_job
+
+
+def test_success_without_typed_verdict_stays_pending_in_history(tmp_path):
+    """Lifecycle success is not a review verdict when the result omits one."""
+    import json
+
+    from ouroboros.skill_lifecycle_queue import LifecycleJob
+    from ouroboros.skill_review_runner import (
+        _on_finished,
+        _on_started,
+        review_job_state_path,
+    )
+
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    started = {}
+    provenance = {
+        "group_id": "manual:alpha", "source": "skills", "task_id": "",
+        "root_task_id": "", "chat_id": 0,
+    }
+    job = LifecycleJob(id="success-job", kind="review", target="alpha")
+    job.status = "running"
+    _on_started(drive_root, "alpha", "hash-a", started, provenance)(job)
+    job.status = "succeeded"
+    _on_finished(drive_root, "alpha", "hash-a", started)(job, None, None)
+
+    state = json.loads(review_job_state_path(drive_root, "alpha").read_text())
+    assert state["status"] == "completed"
+    assert state["review_status"] == "pending"
+    history = [
+        json.loads(line)
+        for line in (drive_root / "state/skills/alpha/review_history.jsonl").read_text().splitlines()
+    ]
+    assert history[0]["status"] == "pending"
+    assert history[0]["job_status"] == "succeeded"
+
+
+def test_skill_review_response_typedef_carries_qualified_reconcile_fields():
+    api_types = (
+        pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "api_types.js"
+    ).read_text(encoding="utf-8")
+    review_declaration = api_types.split("@typedef {Object} SkillReviewResponse", 1)[1].split(
+        "*/", 1
+    )[0]
+    grant_declaration = api_types.split("@typedef {Object} SkillGrantResponse", 1)[1].split(
+        "*/", 1
+    )[0]
+
+    assert "@property {string=} extension_process" in review_declaration
+    assert "@property {string=} extension_server_reconcile" in review_declaration
+    assert "extension_process" not in grant_declaration
+    assert "extension_server_reconcile" not in grant_declaration

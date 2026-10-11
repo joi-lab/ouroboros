@@ -1,0 +1,144 @@
+[
+ {
+  "case": "asked, no wait record yet",
+  "block": {
+   "state": "open",
+   "wait_for_answer": true
+  },
+  "owner_wait": null,
+  "row": {
+   "quiz_state": "open",
+   "wait_for_answer": true
+  },
+  "status": "Waiting for your answer"
+ },
+ {
+  "case": "live wait record",
+  "block": {
+   "state": "open",
+   "wait_for_answer": true
+  },
+  "owner_wait": {
+   "state": "waiting"
+  },
+  "row": {
+   "quiz_state": "open",
+   "owner_wait_state": "waiting",
+   "wait_for_answer": true
+  },
+  "status": "Waiting for your answer"
+ },
+ {
+  "case": "resumed by ordinary owner input",
+  "block": {
+   "state": "open",
+   "wait_for_answer": true
+  },
+  "owner_wait": {
+   "state": "resumed"
+  },
+  "row": {
+   "quiz_state": "open",
+   "owner_wait_state": "resumed",
+   "wait_for_answer": true
+  },
+  "status": "Unanswered · the task continued; an answer is still accepted"
+ },
+ {
+  "case": "resumed on its own bound",
+  "block": {
+   "state": "open",
+   "wait_ended_at": "2026-09-16T00:01:00Z"
+  },
+  "owner_wait": {
+   "state": "resumed",
+   "resume_reason": "timeout"
+  },
+  "row": {
+   "quiz_state": "open",
+   "owner_wait_state": "resumed",
+   "owner_wait_resume_reason": "timeout",
+   "wait_ended_at": "2026-09-16T00:01:00Z"
+  },
+  "status": "Unanswered · the task continued; an answer is still accepted"
+ },
+ {
+  "case": "the task moved on to a newer wait",
+  "block": {
+   "state": "open",
+   "wait_for_answer": true
+  },
+  "owner_wait": {
+   "quiz_id": "another",
+   "state": "waiting"
+  },
+  "row": {
+   "quiz_state": "open",
+   "owner_wait_state": "resumed",
+   "wait_for_answer": true
+  },
+  "status": "Unanswered · the task continued; an answer is still accepted"
+ },
+ {
+  "case": "open without any wait evidence",
+  "block": {
+   "state": "open"
+  },
+  "owner_wait": null,
+  "row": {
+   "quiz_state": "open"
+  },
+  "status": "Unanswered · an answer is still accepted"
+ },
+ {
+  "case": "answered while the record still says waiting",
+  "block": {
+   "state": "answered",
+   "answered_index": 0,
+   "comment": "Keep it."
+  },
+  "owner_wait": {
+   "state": "waiting"
+  },
+  "row": {
+   "quiz_state": "answered",
+   "owner_wait_state": "waiting",
+   "answered_index": 0,
+   "comment": "Keep it."
+  },
+  "status": "You answered"
+ },
+ {
+  "case": "task finished, card still answerable",
+  "block": {
+   "state": "expired_terminal"
+  },
+  "owner_wait": null,
+  "row": {
+   "quiz_state": "expired_terminal"
+  },
+  "status": "Unanswered · the task finished; a late answer is accepted as your message"
+ },
+ {
+  "case": "replaced",
+  "block": {
+   "state": "superseded"
+  },
+  "owner_wait": null,
+  "row": {
+   "quiz_state": "superseded"
+  },
+  "status": "Replaced by a newer question"
+ },
+ {
+  "case": "source unavailable",
+  "block": null,
+  "owner_wait": null,
+  "row": {
+   "quiz_state": "unknown",
+   "source_status": "unavailable",
+   "wait_for_answer": true
+  },
+  "status": "Status unavailable"
+ }
+]

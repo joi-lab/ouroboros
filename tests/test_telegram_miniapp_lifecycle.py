@@ -4,11 +4,26 @@ import asyncio
 import os
 import subprocess
 import sys
+import tempfile
 import types
+import uuid
 from pathlib import Path
 from typing import Any
 
 import pytest
+
+
+def _nonexistent_state_dir() -> Path:
+    """A state_dir that provably does not exist, unique per call.
+
+    A FIXED literal (/tmp/nonexistent-telegram-test) broke on a shared host:
+    another user's run had squatted the exact name with mode 700, so stat()
+    raised PermissionError where the scenario needs FileNotFoundError. A
+    per-call unique name under the system tmp dir cannot be squatted and
+    creates nothing.
+    """
+    return Path(tempfile.gettempdir()) / f"nonexistent-telegram-test-{uuid.uuid4().hex}"
+
 
 
 SCRIPTS_DIR = Path(__file__).parents[1] / "skills" / "telegram" / "scripts"
@@ -147,7 +162,7 @@ def test_public_observer_outage_keeps_same_tunnel(monkeypatch: pytest.MonkeyPatc
             "Bridge",
             (),
             {
-                "state_dir": Path("/tmp/nonexistent-telegram-test"),
+                "state_dir": _nonexistent_state_dir(),
                 "owner_chat_id": lambda self: 12345,
                 "safe_for_exposure": lambda self, _owner=None: True,
             },
@@ -184,7 +199,7 @@ def test_three_confirmed_bad_markers_rotate(monkeypatch: pytest.MonkeyPatch) -> 
             "Bridge",
             (),
             {
-                "state_dir": Path("/tmp/nonexistent-telegram-test"),
+                "state_dir": _nonexistent_state_dir(),
                 "owner_chat_id": lambda self: 12345,
                 "safe_for_exposure": lambda self, _owner=None: True,
             },
@@ -209,7 +224,7 @@ def test_public_verification_fails_closed_when_owner_binding_is_unreadable(
 ) -> None:
     async def scenario() -> None:
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             def owner_chat_id(self) -> int:
                 raise companion.TelegramSettingsError("owner unreadable")
 
@@ -236,7 +251,7 @@ def test_owner_unobservable_fails_closed_before_menu_install(
 ) -> None:
     async def scenario() -> None:
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             def owner_chat_id(self) -> int:
                 raise companion.TelegramSettingsError("unreadable")
 
@@ -744,7 +759,7 @@ def test_cold_start_reconciles_durable_old_owner_before_new_owner(
         monkeypatch.setattr(companion, "TelegramMenuManager", Menu)
 
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             @staticmethod
             def owned_owner_chat_id() -> int:
                 return 111
@@ -791,7 +806,7 @@ def test_shutdown_during_prior_owner_reconcile_cleans_up_prior_manager(
                 return None
 
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             @staticmethod
             def owned_owner_chat_id() -> int:
                 return 111
@@ -1007,7 +1022,7 @@ def test_sidecar_start_retries_beyond_host_restart_limit(
                 assert timeout == 0.5
 
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             @staticmethod
             def owned_owner_chat_id() -> int:
                 return 0
@@ -1098,7 +1113,7 @@ def test_sidecar_runtime_crash_retries_beyond_host_restart_limit(
                 assert timeout == 0.5
 
         class Bridge:
-            state_dir = Path("/tmp/nonexistent-telegram-test")
+            state_dir = _nonexistent_state_dir()
             @staticmethod
             def owned_owner_chat_id() -> int:
                 return 0

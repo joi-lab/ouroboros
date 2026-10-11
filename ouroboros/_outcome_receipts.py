@@ -103,14 +103,27 @@ def select_current_review_runs(
         and "FAIL" not in superseded_signals
         and "DEGRADED" not in superseded_signals
     )
-    selected = [] if acceptance_gap else (current_runs if current_runs else all_runs)
+    # A host decision that names a panel by id AND binding applied THAT panel's
+    # verdict (an earlier revision accepted on the reviewers' word): when no run
+    # is current, the named run speaks alone and an older superseded FAIL stays
+    # audit evidence instead of outvoting the applied PASS. With no named panel
+    # the conservative rule stands: every stale run is retained.
+    named = [
+        run for run in all_runs
+        if decision.get("panel_id") and decision.get("binding_hash")
+        and str(run.get("panel_id") or "") == str(decision.get("panel_id"))
+        and str(run.get("binding_hash") or "") == str(decision.get("binding_hash"))
+    ]
+    selected = [] if acceptance_gap else (current_runs if current_runs else (named or all_runs))
     return ReviewRunSelection(
         all_runs=all_runs,
         current_runs=selected,
         superseded_only_acceptance_gap=acceptance_gap,
         superseded_aggregate_signals=superseded_signals,
         current_candidate_unaccepted=candidate_unaccepted,
-        has_replacement=bool(current_runs),
+        # A decision-named panel replaces the stale runs for the ledger as well:
+        # an older FAIL reads as superseded, not as live failure evidence.
+        has_replacement=bool(current_runs) or bool(named),
     )
 
 
@@ -125,7 +138,53 @@ def review_run_ledger_status(
         or (selection.current_candidate_unaccepted and signal == "PASS")
     )
     failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
+    if failed and not superseded and review_runs_only_awaited([run]):
+        return "not_evaluated", False  # reviewers had not answered yet: a gap, never a failed verification
     return ("superseded" if superseded else ("failed" if failed else "ok")), superseded
+
+
+def plan_review_awaiting(*records: Any) -> bool:
+    """Whether a task record carries the typed fact of a clean finish over a plan review
+    that was only awaited (``outcome_axes.execution.plan_review``)."""
+    from ouroboros.review_projection import AWAITING_PROJECTION
+
+    for record in records:
+        axes = record.get("outcome_axes") if isinstance(record, dict) else None
+        execution = axes.get("execution") if isinstance(axes, dict) else None
+        if isinstance(execution, dict) and execution.get("plan_review") == AWAITING_PROJECTION:
+            return True
+    return False
+
+
+def review_runs_only_awaited(runs: List[Dict[str, Any]]) -> bool:
+    """Whether the runs lack a verdict ONLY because reviewers had not answered yet.
+
+    Typed rows alone: every run without a PASS holds at least one slot released at the
+    dispatch barrier that carries no answer, and nothing else beside it — every other
+    slot answered a PASS whose tier, if any, is ``solved``. A recorded FAIL, a PASS that
+    judged the work blocked or best-effort, or a failed, refused, unresolved or
+    parse-degraded slot, is a real outcome and keeps its own word; an answer that has
+    not arrived is a gap, never a degradation of the task."""
+    from ouroboros.review_records import review_slot_awaiting
+
+    unsettled = [run for run in runs
+                 if str(run.get("aggregate_signal") or "").upper() != "PASS" or run.get("degraded")]
+    for run in unsettled:
+        awaited = 0
+        for row in run.get("actors") or []:
+            if not isinstance(row, dict):
+                return False
+            parsed = row.get("parsed")
+            if review_slot_awaiting(row):
+                if row.get("status") == "ok" or parsed is not None or str(row.get("raw_text") or "").strip():
+                    return False  # a pending row that carries an answer is judged by its answer
+                awaited += 1
+            elif (row.get("status") != "ok" or str(row.get("signal") or "").upper() != "PASS"
+                  or (isinstance(parsed, dict) and str(parsed.get("outcome_tier") or "solved") != "solved")):
+                return False
+        if not awaited or str(run.get("aggregate_signal") or "").upper() == "FAIL":
+            return False
+    return bool(unsettled)
 
 
 def canonical_path_set(paths: Any) -> tuple[str, ...]:
@@ -211,12 +270,6 @@ class ReceiptIdentity:
             if value:
                 return (kind, value)
         return (IDENTITY_KIND_NONE, "")
-
-    @property
-    def has_any(self) -> bool:
-        """Whether the receipt names a verification at all (see ``_reconciles`` for
-        what an identity-LESS receipt falls back to)."""
-        return self.key[0] != IDENTITY_KIND_NONE
 
     @property
     def criterion_key(self) -> tuple[str, str]:
@@ -626,6 +679,18 @@ def verification_receipt_ledger_row(receipt: Dict[str, Any]) -> Dict[str, Any]:
         "expected_match": str(receipt.get("expected_match") or "substring"),
         "matched": receipt.get("matched"),
         "returncode": receipt.get("returncode"),
+        # Disclosure keys (node-runtime sprint, D6/R4) — carried ONLY when the
+        # receipt has them, so historical rows and non-run kinds stay
+        # byte-identical. `duration_ms`: how long the check's process lived.
+        # `signal`: POSIX signal name of a killed check (returncode < 0) —
+        # a 9ms SIGKILL is distinguishable from an honest red. `resolved_runtime`:
+        # the physical executable that ran when the interpreter resolver
+        # substituted one; ABSENT means the recorded `check` argv executed as
+        # written. Disclosure only — receipt identity/reconciliation (the shared
+        # `receipt_identity_projection` above) reads none of these.
+        **({"duration_ms": receipt.get("duration_ms")} if receipt.get("duration_ms") is not None else {}),
+        **({"signal": str(receipt.get("signal") or "")} if receipt.get("signal") else {}),
+        **({"resolved_runtime": truncate_review_artifact(receipt.get("resolved_runtime"), limit=300)} if receipt.get("resolved_runtime") else {}),
         "summary": truncate_review_artifact(receipt.get("summary"), limit=300),
         # C: after-only artifact-lifecycle flag (a check that built then deleted a
         # declared deliverable). Bounded through the SHARED disclosed-list projection —
@@ -805,3 +870,76 @@ def latest_agent_defined(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, A
             return None
         return receipt
     return None
+
+
+def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pure core: the most recent RED receipt (``status=="fail"``) with NO later genuine
+    grounding receipt for the SAME verification (a passing run-kind check or an observed
+    artifact — see ``RED_RECONCILING_STATUSES`` above; a later ``declared`` does NOT
+    reconcile). Returns the failing receipt, or ``None``. Structural: the typed receipt
+    status decides pass/fail, and identity is ONE typed key: the ``criterion_id`` when
+    present, else the canonical ``check`` text, else the observed ``paths`` set (owner
+    Q28=B, content-ADDRESSING — never a semantic keyword gate). Kind AND value must match,
+    so a green of another check — or one that omits the id — no longer clears a red; a red
+    with NO key at all keeps the older any-later-green rule. Advisory, never a gate.
+    The NEWEST element of the OUTSTANDING SET (``unreconciled_failed``)
+    — never a single latest-pointer, which a newer red would let erase an older still-red
+    one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
+    reconciliation rule lives in one place."""
+    return latest_unreconciled_failed(receipts, RED_RECONCILING_STATUSES)
+
+
+def latest_unreconciled_failed_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Disk-backed wrapper of ``latest_unreconciled_failed_receipt`` — reads the task's
+    durable receipts. Feeds the one-shot red-verification finalization nudge: finalizing over
+    your own host-attested red is a self-contradiction (Bible P3/P12), distinct from the
+    receipt_absent case."""
+    from ouroboros.outcome_receipt_store import read_verification_receipts
+
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return latest_unreconciled_failed_receipt(rows)
+
+
+def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pure core (v6.52.2): the most recent PASS receipt whose check can MASK the real exit code
+    (``check_exit_masking`` flag from the verify sensor — e.g. ``... | tail``, ``|| true``), with
+    NO later CLEAN (non-masked) grounding receipt (a pass/observed whose check is not masked).
+    Returns the masked passing receipt, or ``None``. Identity is the ``criterion_id`` key when
+    the masked receipt carries one, else ANY clean grounding reconciles: its own text
+    identity is the MASKED command, which the remediation necessarily changes, so the red
+    path's check-text rule would be unclearable (``_reconciles_masked``).
+    The NEWEST element of the OUTSTANDING SET (``unreconciled_masked``),
+    so a cleanly reconciled newer masked check no longer takes an older one with it.
+    FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
+    the acceptance verification_summary."""
+    return latest_unreconciled_masked(receipts, RED_RECONCILING_STATUSES)
+
+
+def latest_unreconciled_masked_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Disk-backed wrapper of ``latest_unreconciled_masked_pass`` — feeds the one-shot ADVISORY
+    masked-check finalization nudge (the agent may still finalize). Distinct from the red nudge:
+    that fires on a RED check; this fires on a green check whose exit code may be laundered."""
+    from ouroboros.outcome_receipt_store import read_verification_receipts
+
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return latest_unreconciled_masked_pass(rows)
+
+
+def latest_agent_defined_verification(
+    drive_root: Any, task_id: str,
+    *, receipts: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Newest verify receipt whose criterion was AGENT-DEFINED without a stated basis
+    (v6.54.4) — feeds the one-shot advisory criterion-provenance nudge: the check
+    passed, but the success criterion was synthesized by the agent, so the agent is
+    asked once to confirm it is equivalent to what the task actually requires."""
+    from ouroboros.outcome_receipt_store import read_verification_receipts
+
+    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
+    return latest_agent_defined(rows)

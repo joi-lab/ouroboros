@@ -91,8 +91,10 @@ the agent reaches data only through counted QUERY actions).
   opt-out only for the independent stateless baseline arm). Recorded in the
   manifest under `strict_sequential`.
 - **Safety mode `light`** (bench-template decision; see §6 fidelity).
-- **Single-model:** every model slot (main/heavy/light/fallback/review/scope)
-  pinned to the solve model — no silent spend on stronger reviewers.
+- **Single-model:** every active model slot (main/light/fallback/review/scope)
+  is pinned to the solve model, and the rendered settings carry exactly one
+  canonical `api_model` Available-subagent row on that model. No default scout,
+  second family, session substrate, or stronger reviewer can enter silently.
 - **Effort `low`, uniform** across all effort knobs — parity with the Claude
   Code reference, which runs a single low-effort knob. (Known confound: models
   whose native default is high effort, e.g. Sonnet 5, are under-served at
@@ -246,7 +248,7 @@ is where the operator patches below are applied and probed. Patching the seed
 instead of the adapter checkout does nothing — the report will honestly say
 "unpatched".
 
-Three knobs have **no forward channel in the pinned adapter (56764d6)** and
+Four knobs have **no forward channel in the pinned adapter (56764d6)** and
 depend on tracked operator patches being applied in the ADAPTER CHECKOUT:
 
 - `OUROBOROS_SAFETY_MODE=light` — effective on the host engine path (env
@@ -255,8 +257,13 @@ depend on tracked operator patches being applied in the ADAPTER CHECKOUT:
   exported value win over the engine's parity defaults in `_overrides`.
 - `OUROBOROS_REVIEW_ENFORCEMENT=blocking` — same channel, same gap, same
   patch, **same hunk** (one `for _k in (...)` loop, which is why a single
-  marker legitimately covers all three env knobs including
-  `OUROBOROS_RUNTIME_MODE`).
+  marker legitimately covers the env knobs including `OUROBOROS_RUNTIME_MODE`).
+- `OUROBOROS_SUBAGENTS` — the rendered profile's canonical one-actor value is
+  transported through that same loop on the docker path and materialized by
+  `_launcher.v6560.patch` on the host path (where `IsolatedServer` strips
+  inherited runtime env). Both probes require exact patch-unique markers, so
+  an older applied copy is reported as a gap rather than falsely claiming
+  fixed-model actor purity.
 - `CLBENCH_SOLVE_DISABLED_TOOLS` (incl. `claude_code_edit`) — the pinned
   bridge hardcodes `DISABLED_TOOLS = []`. Read from env by
   `clb_disabled_tools_env.v6745.patch`, so every declared tool reaches the
@@ -289,11 +296,12 @@ so it says the hook is present in the checkout that will execute, not that
 attestation has already run.
 
 On an **unpatched** adapter checkout, docker-path runs execute with safety
-`full`, advisory review enforcement, and without the `claude_code_edit`
-exclusion; any published number must say so. On a **patched** checkout the two
-env knobs are applied, and the manifest says that instead — reading the gap off
-the flags understated runs that were in fact stricter than declared. The
-disabled-tools knob additionally requires `--path bridge` (above).
+`full`, advisory review enforcement, without the explicit Available-subagents
+profile, and without the `claude_code_edit` exclusion; any published number
+must say so. On a **patched** checkout the env knobs are applied, and the
+manifest says that instead — reading the gap off the flags understated runs
+that were in fact stricter than declared. The disabled-tools knob additionally
+requires `--path bridge` (above).
 
 ## 7. Honest limits
 

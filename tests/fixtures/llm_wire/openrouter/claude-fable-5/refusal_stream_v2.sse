@@ -1,0 +1,6 @@
+data: {"id":"gen-1789331357-5zX2Fe0iLRuF09mW2963","object":"chat.completion.chunk","created":1789331357,"model":"anthropic/claude-fable-5","provider":"Anthropic","choices":[{"index":0,"delta":{"content":"","role":"assistant","refusal":"This request was blocked as it seems to violate Anthropic's Terms of Service restrictions on reverse engineering or duplicating model outputs. To learn more, visit https://www.anthropic.com/legal/commercial-terms. API integrators: you can reduce refusals for your users by configuring a fallback model — see https://platform.claude.com/docs/en/build-with-claude/refusals-and-fallback"},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789331357-5zX2Fe0iLRuF09mW2963","object":"chat.completion.chunk","created":1789331357,"model":"anthropic/claude-fable-5","provider":"Anthropic","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"content_filter","native_finish_reason":"refusal"}]}
+
+data: [DONE]
+

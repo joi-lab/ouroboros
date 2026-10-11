@@ -1,8 +1,10 @@
 import asyncio
+from copy import deepcopy
 import inspect
 import json
 
 import httpx
+import pytest
 import ouroboros.gateway.models as model_catalog_api
 
 
@@ -26,11 +28,14 @@ def test_model_catalog_tags_provider_values(monkeypatch):
         "OPENAI_COMPATIBLE_BASE_URL": "https://compat.example/v1",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-key",
         "GIGACHAT_CREDENTIALS": "giga-creds",
+        "MINIMAX_API_KEY": "minimax-key",
+        "DEEPSEEK_API_KEY": "deepseek-key",
     })
 
     async def fake_openrouter(_client, _api_key):
         return [model_catalog_api._build_model_catalog_entry(
-            "openrouter", "Anthropic", "anthropic/claude-opus", "Claude Opus", source="OpenRouter"
+            "openrouter", "Anthropic", "anthropic/claude-sonnet-4-6", "Claude Sonnet 4.6",
+            source="OpenRouter",
         )]
 
     async def fake_anthropic(_client, _api_key):
@@ -43,6 +48,8 @@ def test_model_catalog_tags_provider_values(monkeypatch):
             "openai": "gpt-4.1",
             "openai-compatible": "compatible-pro",
             "cloudru": "cloudru-pro",
+            "minimax": "MiniMax-M3",
+            "deepseek": "deepseek-v4-pro",
         }[provider_id]
         return [model_catalog_api._build_model_catalog_entry(provider_id, provider_label, model_id, model_id)]
 
@@ -56,15 +63,33 @@ def test_model_catalog_tags_provider_values(monkeypatch):
 
     response = asyncio.run(model_catalog_api.api_model_catalog(None))
     payload = json.loads(response.body.decode("utf-8"))
-    values = {item["value"] for item in payload["items"]}
+    items_by_value = {item["value"]: item for item in payload["items"]}
+    values = set(items_by_value)
 
-    assert "anthropic/claude-opus" in values
+    assert "anthropic/claude-sonnet-4-6" in values
     assert "openai::gpt-4.1" in values
     assert "anthropic::claude-sonnet-4-6" in values
     assert "openai-compatible::compatible-pro" in values
     assert "cloudru::cloudru-pro" in values
     assert "gigachat::giga-pro" in values
+    # MiniMax and DeepSeek ride the shared OpenAI-compatible live fetcher
+    # (GET /v1/models on their fixed hosts), so the fake returns one model each.
+    assert "minimax::MiniMax-M3" in values
+    assert "deepseek::deepseek-v4-pro" in values
     assert payload["errors"] == []
+
+    openrouter_item = items_by_value["anthropic/claude-sonnet-4-6"]
+    direct_item = items_by_value["anthropic::claude-sonnet-4-6"]
+    assert openrouter_item["source"] == "OpenRouter"
+    assert openrouter_item["label"] == "OpenRouter · Claude Sonnet 4.6"
+    assert direct_item["source"] == "Anthropic"
+    assert direct_item["label"] == "Anthropic · Claude Sonnet 4.6"
+    assert openrouter_item["label"] != direct_item["label"]
+    assert all(item["label"] == f'{item["source"]} · {item["name"]}' for item in payload["items"])
+    assert [
+        item["value"] for item in payload["items"]
+        if item["provider"] == "Anthropic" and item["name"] == "Claude Sonnet 4.6"
+    ] == ["anthropic/claude-sonnet-4-6", "anthropic::claude-sonnet-4-6"]
 
 
 def test_model_catalog_returns_errors_nonfatally(monkeypatch):
@@ -187,14 +212,162 @@ def test_model_catalog_classifies_httpx_error_stage(monkeypatch):
     assert payload["errors"][0]["stage"] == "connect"
 
 
-def test_model_catalog_no_longer_uses_requests_or_to_thread():
+def test_direct_api_catalog_loaders_keep_the_native_async_transport():
+    # The owned Claudexor gateway is synchronous and is explicitly offloaded
+    # at the endpoint boundary. Direct API fetchers must remain natively async.
     source = "\n".join(
         inspect.getsource(obj)
         for obj in (
-            model_catalog_api.api_model_catalog,
             model_catalog_api._provider_specs,
             model_catalog_api._load_provider,
+            model_catalog_api._fetch_openai_compatible_model_catalog,
+            model_catalog_api._fetch_openrouter_model_catalog,
         )
     )
     assert "import requests" not in source
     assert "asyncio.to_thread" not in source
+
+
+def _account_operation(path):
+    return {"method": "GET", "path": path,
+            "parameters": [{"name": "view", "location": "query", "enum": ["accounts"]}]}
+
+
+@pytest.fixture
+def account_engine(monkeypatch):
+    from ouroboros import claudexor_daemon as owned
+
+    problem = {"code": "subscription_window_exhausted", "message": "Window is spent", "context": {}}
+    accounts = []
+    for profile, window, effort, modes, availability in (
+        ("a", 272000, "medium", ["standard"], "available"),
+        ("b", 1000000, "high", ["standard", "fast"], "unavailable"),
+    ):
+        catalog = {"source": "codex", "credentialProfileId": profile, "accountFingerprint": "fixture-" + profile,
+            "observedAt": "2026-09-12T00:00:00Z" if profile == "a" else None, "provenance": "fixture_per_account",
+            "models": [{"id": "shared", "contextWindow": window, "maxContextWindow": window,
+                "reasoningEfforts": [effort], "supportedOptions": ["processingPreference"],
+                "processing": {"modes": modes, "eligible": None, "source": "fixture_per_account", "observedAt": None}},
+                {"id": "only-" + profile}]}
+        accounts.append({"credentialProfileId": profile, "availability": availability,
+                         "problem": problem if profile == "b" else None, "catalog": catalog})
+    accounts.append({"credentialProfileId": "c", "availability": "unknown", "catalog": None,
+        "problem": {"code": "model_catalog_unavailable", "message": "Could not read account", "context": {}}})
+
+    class Gateway:
+        view = True
+        operations_error = False
+        calls = []
+        sources = [{"id": "codex", "label": "Codex", "credentialHarness": "codex"}]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def operations(self):
+            if self.operations_error:
+                raise RuntimeError("operation catalog unavailable")
+            return [_account_operation(path) for path in ("/v2/model-sources", "/v2/model-sources/:id/models")] if self.view else []
+
+        def list_model_sources(self, **kwargs):
+            assert kwargs == ({"view": "accounts"} if self.view and not self.operations_error else {})
+            sources = deepcopy(self.sources)
+            if kwargs:
+                sources = [{**row, "processingPreferences": ["standard", "fast"], "accountCatalog": True} for row in sources]
+            return {"sources": sources}
+
+        def list_source_models(self, source, credential_profile_id=None, **kwargs):
+            self.calls.append((source, credential_profile_id, kwargs))
+            assert kwargs == ({"view": "accounts"} if self.view and not self.operations_error else {})
+            if source == "broken":
+                raise RuntimeError("source catalog unavailable")
+            if not kwargs:
+                return deepcopy(accounts[0]["catalog"])
+            selected = [row for row in accounts if not credential_profile_id or row["credentialProfileId"] == credential_profile_id]
+            return {"source": source, "accounts": deepcopy(selected), "partial": any(row["catalog"] is None for row in selected)}
+
+    gateway = Gateway()
+    monkeypatch.setattr(owned, "owned_daemon_provisioned", lambda: True)
+    monkeypatch.setattr(owned, "read_owned_gateway", lambda: gateway)
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {})
+    return gateway, accounts
+
+
+def test_auto_catalog_keeps_every_account_and_independent_capabilities(account_engine):
+    gateway, accounts = account_engine
+    payload = json.loads(asyncio.run(model_catalog_api.api_model_catalog(None)).body)
+    shared = [row for row in payload["items"] if row["id"] == "shared"]
+    assert [(row["credential_profile_id"], row["context_window"], row["reasoning_efforts"], row["processing"]["modes"])
+            for row in shared] == [("a", 272000, ["medium"], ["standard"]), ("b", 1000000, ["high"], ["standard", "fast"])]
+    assert {row["id"] for row in payload["items"]} == {"shared", "only-a", "only-b"}
+    assert shared[1]["availability"] == "unavailable" and shared[1]["observed_at"] is None
+    assert shared[1]["problem"]["code"] == "subscription_window_exhausted"
+    assert shared[1]["processing"]["eligible"] is None
+    assert payload["account_catalogs"] == [{"source": "codex", "accounts": accounts, "partial": True}]
+    assert payload["account_catalogs"][0]["accounts"][1]["problem"]["code"] == "subscription_window_exhausted"
+    assert payload["partial"] is True
+    assert payload["model_sources"][0]["processingPreferences"] == ["standard", "fast"]
+    # A spent window on a READABLE account is account state, not a catalog read failure.
+    assert [(row["credential_profile_id"], row["code"]) for row in payload["errors"]] == [
+        ("c", "model_catalog_unavailable")]
+    assert gateway.calls == [("codex", None, {"view": "accounts"})]
+
+
+@pytest.mark.parametrize("profile", ["a", "b", "c"])
+def test_pinned_account_catalog_does_not_include_sibling_models(account_engine, profile):
+    gateway, _ = account_engine
+    payload = model_catalog_api._subscription_model_catalog("codex", profile)
+    assert {row["credential_profile_id"] for row in payload["items"]} == ({profile} if profile != "c" else set())
+    assert [row["credentialProfileId"] for row in payload["account_catalogs"][0]["accounts"]] == [profile]
+    assert gateway.calls == [("codex", profile, {"view": "accounts"})]
+
+
+@pytest.mark.parametrize("operations_error", [False, True])
+def test_legacy_or_unreadable_operation_catalog_keeps_strict_old_queries(account_engine, operations_error):
+    gateway, _ = account_engine
+    gateway.view = operations_error
+    gateway.operations_error = operations_error
+    payload = model_catalog_api._subscription_model_catalog("codex")
+    assert payload["errors"] == [] and len(payload["items"]) == 2
+    assert set(payload) == {"items", "errors", "model_sources"}
+    assert gateway.calls == [("codex", None, {})]
+
+
+def test_one_failed_source_preserves_other_account_catalogs(account_engine):
+    gateway, _ = account_engine
+    gateway.sources.insert(0, {"id": "broken"})
+    payload = model_catalog_api._subscription_model_catalog()
+    assert len(payload["items"]) == 4 and payload["partial"] is True
+    assert payload["errors"][0]["source_id"] == "broken"
+    assert payload["account_catalogs"][0]["source"] == "codex"
+
+
+@pytest.mark.parametrize("change", [{"method": "POST"}, {"path": "/wrong"},
+    {"parameters": [{"name": "view", "location": "header", "enum": ["accounts"]}]},
+    {"parameters": [{"name": "view", "location": "query", "enum": ["selected"]}]}])
+def test_account_view_requires_the_exact_declared_query(change):
+    path = "/v2/model-sources/:id/models"
+    assert not model_catalog_api.account_catalog_supported([{**_account_operation(path), **change}], path)
+
+
+def test_model_catalog_reports_a_bad_extra_ca_bundle_instead_of_a_bare_500(monkeypatch):
+    """An unreadable OUROBOROS_EXTRA_CA_BUNDLE is named in the catalog errors; the engine
+    catalog still loads and the endpoint answers 200."""
+    from ouroboros.net_transport import ExtraCaBundleError
+
+    monkeypatch.setattr(model_catalog_api, "load_settings", lambda: {"OPENAI_API_KEY": "openai-key"})
+    monkeypatch.setattr(model_catalog_api, "_subscription_model_catalog",
+                        lambda source_id, profile_id: {"items": [{"value": "engine-model"}], "errors": []})
+
+    def _boom():
+        raise ExtraCaBundleError("OUROBOROS_EXTRA_CA_BUNDLE is not readable: /nope.pem")
+
+    monkeypatch.setattr(model_catalog_api, "verify_kwargs", _boom)
+    response = asyncio.run(model_catalog_api.api_model_catalog(None))
+    assert response.status_code == 200
+    payload = json.loads(response.body.decode("utf-8"))
+    assert [item["value"] for item in payload["items"]] == ["engine-model"]
+    trust = [row for row in payload["errors"] if row.get("provider_id") == "extra_ca_bundle"]
+    assert trust and "not readable" in trust[0]["error"] and trust[0]["stage"] == "trust"

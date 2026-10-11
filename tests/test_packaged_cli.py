@@ -22,6 +22,11 @@ def _make_bundle_root(tmp_path: pathlib.Path, root: pathlib.Path | None = None) 
     return root
 
 
+def _set_test_home(monkeypatch, home: pathlib.Path) -> None:
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+
+
 def test_packaged_cli_resolves_bundle_from_nested_bin(tmp_path):
     from ouroboros import packaged_cli
 
@@ -53,6 +58,134 @@ def test_packaged_cli_run_start_launches_desktop_and_strips_start(tmp_path, monk
     assert packaged_cli.main(["run", "--start", "2+2?"]) == 0
     assert launched == [root]
     assert inner["args"] == ["run", "2+2?"]
+
+
+def test_packaged_cli_linux_relaunches_outer_appimage(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    bundle_root = tmp_path / "mount" / "usr" / "lib" / "ouroboros" / "_internal"
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+
+    assert packaged_cli._desktop_app_path(bundle_root) == appimage
+
+
+def test_packaged_cli_linux_extract_relaunch_uses_private_temp_base(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    private_tmp = tmp_path / "private-runtime"
+    original_tmp = tmp_path / "caller-tmp"
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=tmp_path / "mount/usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    monkeypatch.setenv("APPIMAGE_EXTRACT_AND_RUN", "1")
+    monkeypatch.setenv("TMPDIR", str(original_tmp))
+    monkeypatch.setattr(packaged_cli.tempfile, "mkdtemp", lambda **_kwargs: str(private_tmp))
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    child_env = launched["kwargs"]["env"]
+    assert launched["args"] == [str(appimage)]
+    assert child_env["TMPDIR"] == str(private_tmp)
+    assert child_env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_RESTORE_TMPDIR"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR_SET"] == "1"
+    assert child_env["OUROBOROS_APPIMAGE_ORIGINAL_TMPDIR"] == str(original_tmp)
+    assert os.environ["TMPDIR"] == str(original_tmp)
+
+
+def test_packaged_cli_explicit_extract_flag_is_carried_to_relaunch(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    extracted_appdir = tmp_path / "appimage-extracted"
+    extracted_appdir.mkdir()
+    private_tmp = tmp_path / "private-runtime"
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=extracted_appdir / "usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    monkeypatch.setenv("APPDIR", str(extracted_appdir))
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
+    monkeypatch.setattr(packaged_cli.os.path, "ismount", lambda _path: False)
+    monkeypatch.setattr(packaged_cli.tempfile, "mkdtemp", lambda **_kwargs: str(private_tmp))
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    child_env = launched["kwargs"]["env"]
+    assert child_env["APPIMAGE_EXTRACT_AND_RUN"] == "1"
+    assert child_env["TMPDIR"] == str(private_tmp)
+
+
+def test_packaged_cli_normal_linux_relaunch_keeps_process_environment(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    appimage = tmp_path / "Ouroboros.AppImage"
+    appimage.write_bytes(b"appimage")
+    runtime = packaged_cli.PackagedRuntime(
+        bundle_root=tmp_path / "mount/usr/lib/ouroboros/_internal",
+        embedded_python=tmp_path / "python",
+        app_root=tmp_path / "home/Ouroboros",
+        repo_dir=tmp_path / "home/Ouroboros/repo",
+        data_dir=tmp_path / "home/Ouroboros/data",
+        app_version="6.97.0",
+    )
+    launched = {}
+
+    monkeypatch.setattr(packaged_cli, "IS_MACOS", False)
+    monkeypatch.setattr(packaged_cli, "IS_WINDOWS", False)
+    monkeypatch.setenv("APPIMAGE", str(appimage))
+    mounted_appdir = tmp_path / "mount"
+    mounted_appdir.mkdir()
+    monkeypatch.setenv("APPDIR", str(mounted_appdir))
+    monkeypatch.delenv("APPIMAGE_EXTRACT_AND_RUN", raising=False)
+    monkeypatch.setattr(packaged_cli.os.path, "ismount", lambda _path: True)
+    monkeypatch.setattr(
+        packaged_cli.subprocess,
+        "Popen",
+        lambda args, **kwargs: launched.update(args=args, kwargs=kwargs),
+    )
+
+    packaged_cli._launch_desktop_app(runtime)
+
+    assert launched["args"] == [str(appimage)]
+    assert "env" not in launched["kwargs"]
 
 
 def test_packaged_cli_does_not_treat_prompt_start_text_as_option(tmp_path, monkeypatch):
@@ -140,13 +273,162 @@ def test_installer_plan_chooses_user_local_path_dir(tmp_path, monkeypatch):
     home = tmp_path / "home"
     target_dir = home / ".local" / "bin"
     target_dir.mkdir(parents=True)
-    monkeypatch.setenv("HOME", str(home))
+    _set_test_home(monkeypatch, home)
     monkeypatch.setenv("PATH", str(target_dir))
 
     plan = plan_posix_install(root)
 
     assert plan.target == target_dir / "ouroboros"
     assert plan.source == root / "bin" / "ouroboros"
+
+
+def test_installer_plan_ignores_ambient_path_dirs(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import plan_posix_install
+
+    root = _make_bundle_root(tmp_path)
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    system_dir = tmp_path / "system-bin"
+    system_dir.mkdir()
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(system_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.target == home / ".local" / "bin" / "ouroboros"
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == ()
+
+
+def test_installer_default_migrates_owned_shadowing_shim(tmp_path, monkeypatch, capsys):
+    from ouroboros.packaged_cli_install import _print_plan, install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.chmod(root / "bin" / "ouroboros", 0o755)
+    os.chmod(old_root / "bin" / "ouroboros", 0o755)
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.target == target_dir / "ouroboros"
+    assert plan.obsolete_shims == (old_shim,)
+    assert plan.shadowing_commands == ()
+
+    _print_plan(plan, dry_run=True)
+    assert f"Would remove older Ouroboros CLI shim: {old_shim}" in capsys.readouterr().out
+
+    install_posix(plan)
+
+    assert not old_shim.is_symlink()
+    assert plan.target.resolve() == (root / "bin" / "ouroboros").resolve()
+    if os.name != "nt":
+        assert shutil.which("ouroboros", path=os.environ["PATH"]) == str(plan.target)
+
+    reinstall = plan_posix_install(root)
+    assert reinstall.action == "refresh"
+    assert reinstall.obsolete_shims == ()
+    install_posix(reinstall)
+
+
+def test_installer_keeps_unowned_shadowing_command(tmp_path, monkeypatch, capsys):
+    from ouroboros.packaged_cli_install import _print_plan, install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path)
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    earlier_command = harness_dir / "ouroboros"
+    earlier_command.write_text("#!/bin/sh\necho foreign\n", encoding="utf-8")
+    os.chmod(earlier_command, 0o755)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+
+    plan = plan_posix_install(root)
+
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == (earlier_command,)
+
+    install_posix(plan)
+    _print_plan(plan, dry_run=False)
+
+    captured = capsys.readouterr()
+    assert earlier_command.read_text(encoding="utf-8") == "#!/bin/sh\necho foreign\n"
+    assert f"earlier PATH command may shadow the installed CLI: {earlier_command}" in captured.err
+    assert f"Put {target_dir} before {harness_dir} in PATH" in captured.out
+
+
+def test_installer_explicit_target_does_not_migrate_owned_shadow(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    explicit_dir = home / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(explicit_dir)]))
+
+    plan = plan_posix_install(root, target_dir=explicit_dir)
+
+    assert plan.obsolete_shims == ()
+    assert plan.shadowing_commands == (old_shim,)
+
+    install_posix(plan)
+
+    assert old_shim.is_symlink()
+    assert plan.target.resolve() == (root / "bin" / "ouroboros").resolve()
+
+
+def test_installer_removes_old_shim_only_after_new_install_succeeds(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli_install
+    from ouroboros.packaged_cli_install import install_posix, plan_posix_install
+
+    root = _make_bundle_root(tmp_path, root=tmp_path / "new-bundle")
+    old_root = _make_bundle_root(tmp_path, root=tmp_path / "old-bundle")
+    home = tmp_path / "home"
+    harness_dir = home / ".kimi-code" / "bin"
+    harness_dir.mkdir(parents=True)
+    target_dir = home / ".local" / "bin"
+    old_shim = harness_dir / "ouroboros"
+    os.symlink(old_root / "bin" / "ouroboros", old_shim)
+    _set_test_home(monkeypatch, home)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(harness_dir), str(target_dir)]))
+    plan = plan_posix_install(root)
+
+    def fail_install(_source, _target):
+        raise OSError("simulated install failure")
+
+    monkeypatch.setattr(packaged_cli_install.os, "symlink", fail_install)
+
+    with pytest.raises(OSError, match="simulated install failure"):
+        install_posix(plan)
+
+    assert old_shim.is_symlink()
+
+
+def test_posix_path_hint_prepends_target(tmp_path, monkeypatch):
+    from ouroboros.packaged_cli_install import _posix_path_hint
+
+    target_dir = tmp_path / "home" / ".local" / "bin"
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("SHELL", "/bin/zsh")
+
+    assert _posix_path_hint(target_dir) == (
+        f'Add this to ~/.zprofile if needed: export PATH="{target_dir}:$PATH"'
+    )
 
 
 def test_installer_plan_accepts_expected_wrapper_in_sibling_resources_dir(tmp_path, monkeypatch):

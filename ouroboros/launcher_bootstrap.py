@@ -1,12 +1,14 @@
-"""Managed git bootstrap helpers for the desktop launcher."""
+"""Managed source and native-host bootstrap helpers for the common launcher."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
 import pathlib
 import shutil
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass
@@ -37,16 +39,46 @@ class BootstrapContext:
     log: Any
 
 
-def python_bytecode_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
-    """Return env values that keep bytecode caches outside packaged bundles."""
+def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
+    """Env for running the EMBEDDED interpreter without writing into the bundle.
+
+    The packaged interpreter lives INSIDE the signed application bundle, which is
+    read-only in principle (and whose signature any write invalidates). Python
+    has exactly two default write targets there and BOTH are redirected under the
+    data dir, in one place, so a new caller cannot pick up one and miss the other:
+
+    - bytecode caches -> ``PYTHONPYCACHEPREFIX``;
+    - ``pip install`` -> the user site under ``PYTHONUSERBASE`` (paired with the
+      ``--user`` flag at the pip call sites; ``site`` puts that directory on
+      ``sys.path`` automatically, so every child launched through this env
+      IMPORTS what was installed through it).
+
+    ``PYTHONNOUSERSITE`` is cleared for the same reason: an inherited value would
+    install to the user site and then refuse to import from it.
+
+    DISCLOSED, not fixed: ``site`` puts the user site AHEAD of the bundle's own
+    site-packages, and nothing prunes it. So a package installed here by an older
+    version keeps OUTRANKING the signed bundle's copy for as long as the data dir
+    survives — an upgrade can ship a newer dependency and still import the old one.
+    Making that impossible means either pruning logic or versioning this directory,
+    and versioning it silently abandons every dependency an existing install already
+    paid to download. Both are product decisions with real cost, so the behaviour is
+    stated here rather than changed unilaterally. Recovery is manual and total:
+    delete ``<data>/state/python-userbase`` and relaunch.
+    """
     env = dict(os.environ if base is None else base)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    pycache_dir = pathlib.Path(data_dir) / "state" / "pycache"
-    try:
-        pycache_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        pass
+    state_dir = pathlib.Path(data_dir) / "state"
+    pycache_dir = state_dir / "pycache"
+    user_base = state_dir / "python-userbase"
+    for directory in (pycache_dir, user_base):
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
     env["PYTHONPYCACHEPREFIX"] = str(pycache_dir)
+    env["PYTHONUSERBASE"] = str(user_base)
+    env.pop("PYTHONNOUSERSITE", None)
     return env
 
 
@@ -366,101 +398,63 @@ def sync_existing_repo_from_bundle(context: BootstrapContext) -> None:
     context.log.info("Managed repo sync outcome: %s", outcome)
 
 
-def install_deps(context: BootstrapContext) -> None:
-    """Install/update Python deps inside the embedded interpreter."""
+def _pip_output_tail(result: Any, limit: int = 800) -> str:
+    """Last chars of a captured pip run, whether it captured bytes or text."""
+    parts = []
+    for stream in (getattr(result, "stdout", None), getattr(result, "stderr", None)):
+        if isinstance(stream, bytes):
+            stream = stream.decode("utf-8", errors="replace")
+        if isinstance(stream, str) and stream.strip():
+            parts.append(stream.strip())
+    return ("\n".join(parts))[-limit:]
+
+
+def install_deps(context: BootstrapContext) -> bool:
+    """Install/update Python deps for the embedded interpreter.
+
+    ``pip_install_target_args`` keeps a packaged install OUT of the signed bundle
+    the embedded interpreter lives in; the return value reports whether pip
+    actually succeeded.
+    """
     try:
-        requirements = context.repo_dir / "requirements.txt"
-        if requirements.exists():
-            context.hidden_run(
-                [context.embedded_python, "-m", "pip", "install", "-r", str(requirements)],
-                env=python_bytecode_env(context.data_dir),
-                timeout=240,
-                capture_output=True,
-            )
-    except Exception as exc:
-        context.log.warning("Dependency install/update failed: %s", exc)
+        requirements = context.repo_dir / "requirements-runtime.lock"
+        if not requirements.exists():
+            # Managed repositories from before the uv migration may still use
+            # the legacy filename during an in-place upgrade.
+            requirements = context.repo_dir / "requirements.txt"
+        if not requirements.exists():
+            return True
+        from ouroboros.platform_layer import pip_install_target_args
 
-
-_CLAUDE_SDK_BASELINE = "claude-agent-sdk>=0.1.60"
-_CLAUDE_SDK_MIN_VERSION = "0.1.60"
-
-
-def _version_tuple(v: str) -> tuple:
-    """Parse the numeric prefix of a PEP 440-ish version for comparison."""
-    if not v:
-        return (0,)
-    parts: list[int] = []
-    for p in v.split("."):
-        digits = ""
-        for ch in p:
-            if ch.isdigit():
-                digits += ch
-            else:
-                break
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts) if parts else (0,)
-
-
-def verify_claude_runtime(context: BootstrapContext) -> bool:
-    """Ensure the app-managed Claude SDK/CLI meets the baseline, repairing if needed."""
-    import sys as _sys
-    cli_name = "claude.exe" if _sys.platform == "win32" else "claude"
-    try:
         result = context.hidden_run(
-            [context.embedded_python, "-c",
-             "import claude_agent_sdk; "
-             "import importlib.metadata as _m; "
-             "from pathlib import Path; "
-             f"cli = Path(claude_agent_sdk.__file__).parent / '_bundled' / '{cli_name}'; "
-             "ver = _m.version('claude-agent-sdk'); "
-             "print('ok|' + ver if cli.exists() else 'no_cli|' + ver)"],
-            env=python_bytecode_env(context.data_dir),
-            capture_output=True, text=True, timeout=30,
-        )
-        stdout = (result.stdout or "").strip()
-        if result.returncode == 0 and stdout.startswith("ok|"):
-            installed = stdout.split("|", 1)[1]
-            if _version_tuple(installed) >= _version_tuple(_CLAUDE_SDK_MIN_VERSION):
-                context.log.info(
-                    "Claude runtime verified: SDK %s >= %s, bundled CLI present.",
-                    installed, _CLAUDE_SDK_MIN_VERSION,
-                )
-                return True
-            context.log.warning(
-                "Claude runtime SDK %s is below baseline %s — repairing.",
-                installed, _CLAUDE_SDK_MIN_VERSION,
-            )
-        else:
-            context.log.warning("Claude runtime check: %s (exit %d)", stdout, result.returncode)
-    except Exception as exc:
-        context.log.warning("Claude runtime probe failed: %s", exc)
-
-    context.log.info("Repairing Claude runtime baseline...")
-    try:
-        repair = context.hidden_run(
-            [context.embedded_python, "-m", "pip", "install", "--upgrade", _CLAUDE_SDK_BASELINE],
-            env=python_bytecode_env(context.data_dir),
-            timeout=120,
+            [context.embedded_python, "-m", "pip", "install",
+             *pip_install_target_args(context.embedded_python), "-r", str(requirements)],
+            env=embedded_python_env(context.data_dir),
+            timeout=240,
             capture_output=True,
         )
-        if repair.returncode != 0:
-            context.log.warning("Claude runtime repair pip returned exit %d", repair.returncode)
-            return False
-        context.log.info("Claude runtime repair install complete.")
-        return True
     except Exception as exc:
-        context.log.warning("Claude runtime repair failed: %s", exc)
+        context.log.warning("Dependency install/update failed: %s", exc)
         return False
+    # A non-zero pip exit is a real, actionable failure (unreachable index, an
+    # unbuildable wheel, a read-only target): silently discarding it leaves the
+    # app to fail much later with an unexplained ImportError.
+    returncode = int(getattr(result, "returncode", 0) or 0)
+    if returncode != 0:
+        context.log.warning(
+            "Dependency install/update pip exited %d; the runtime may be missing packages:\n%s",
+            returncode, _pip_output_tail(result),
+        )
+        return False
+    return True
 
 
 _SEED_COMPLETE_MARKER = ".bootstrap-seed-complete"
 _POST_BOOTSTRAP_NEW_NATIVE_SEEDS = frozenset({"telegram", "unix_computer_use"})
 
 
-def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
-    """Return a seed skill manifest version via the shared parser, or ``""``."""
+def _read_skill_manifest(skill_dir: pathlib.Path):
+    """Read a seed manifest with the shared parser, or return None."""
     for candidate in ("SKILL.md", "skill.json"):
         path = skill_dir / candidate
         if not path.is_file():
@@ -473,9 +467,15 @@ def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
             from ouroboros.contracts.skill_manifest import parse_skill_manifest_text
             manifest = parse_skill_manifest_text(text)
         except Exception:
-            return ""
-        return str(manifest.version or "").strip()
-    return ""
+            return None
+        return manifest
+    return None
+
+
+def _read_skill_manifest_version(skill_dir: pathlib.Path) -> str:
+    """Return the parsed seed version, or an empty string when unavailable."""
+    manifest = _read_skill_manifest(skill_dir)
+    return str(manifest.version or "").strip() if manifest is not None else ""
 
 
 def _reseed_native_skill_in_place(
@@ -507,6 +507,7 @@ def _reseed_native_skill_in_place(
             # The launcher just wrote repo-reviewed bytes: refresh the
             # hash-pinned native-trust verdict for the new payload.
             _stamp_native_seed_trust(pathlib.Path(drive_root), target_skill, log_obj)
+            _carry_grants_across_reseed(pathlib.Path(drive_root), target_skill, log_obj)
         return True
     except OSError as exc:
         log_obj.warning(
@@ -539,11 +540,37 @@ def _per_skill_version_resync(
         if not (target / ".seed-origin").is_file():
             # User-managed skill in native/: never touch.
             continue
-        seed_version = _read_skill_manifest_version(entry)
-        target_version = _read_skill_manifest_version(target)
+        seed_manifest = _read_skill_manifest(entry)
+        target_manifest = _read_skill_manifest(target)
+        if seed_manifest is None or target_manifest is None:
+            continue
+        seed_version = str(seed_manifest.version or "").strip()
+        target_version = str(target_manifest.version or "").strip()
         if not seed_version or not target_version:
             continue
         if seed_version == target_version:
+            try:
+                from ouroboros.skill_loader import compute_content_hash
+                seed_hash = compute_content_hash(
+                    entry, manifest_entry=seed_manifest.entry,
+                    manifest_scripts=seed_manifest.scripts,
+                )
+                target_hash = compute_content_hash(
+                    target, manifest_entry=target_manifest.entry,
+                    manifest_scripts=target_manifest.scripts,
+                )
+            except Exception as exc:
+                log_obj.warning(
+                    "Native skill %s version %s payload comparison unavailable (%s)",
+                    entry.name, seed_version, type(exc).__name__,
+                )
+            else:
+                if seed_hash != target_hash:
+                    log_obj.warning(
+                        "Native skill %s version %s payload differs (seed=%s, installed=%s); "
+                        "installed files retained because the manifest version is unchanged",
+                        entry.name, seed_version, seed_hash, target_hash,
+                    )
             continue
         log_obj.info(
             "Native skill %s version drift (seed=%s, installed=%s) — re-seeding",
@@ -605,6 +632,18 @@ def _stamp_native_seed_trust(
                 (skill.load_error if skill else "no manifest"),
             )
             return
+        # ABI-1: native_seed is a PASS-minting path and shares the NEW-PASS
+        # admission predicate — a seeded extension without the plugin_api
+        # field gets NO trust verdict (bundled skills ship the field).
+        from ouroboros.contracts.plugin_api import extension_new_pass_admission_error
+
+        admission_error = extension_new_pass_admission_error(skill.manifest)
+        if admission_error:
+            log_obj.warning(
+                "Native-trust stamp refused for %s (PluginAPI 2.0 admission): %s",
+                skill.name, admission_error,
+            )
+            return
         save_review_state(
             drive_root,
             skill.name,
@@ -643,6 +682,62 @@ def _stamp_native_seed_trust(
         )
     except Exception:
         log_obj.warning("Native-trust stamp failed for %s", skill_dir, exc_info=True)
+
+
+def _carry_grants_across_reseed(
+    drive_root: pathlib.Path,
+    skill_dir: pathlib.Path,
+    log_obj: Any,
+) -> None:
+    """Carry owner grants across a native re-seed when the requested sets are
+    unchanged (owner «A», v7next §6.1-Δ). Grants are content-hash-bound, so a
+    version resync used to orphan them (the telegram precedent) even though
+    the skill requests EXACTLY the same keys/permissions; a changed requested
+    set keeps the ordinary re-grant flow. Never raises."""
+    try:
+        from ouroboros.skill_loader import (
+            load_skill,
+            load_skill_grants,
+            requested_core_setting_keys,
+            requested_skill_permissions,
+            save_skill_grants,
+        )
+
+        skill = load_skill(skill_dir, drive_root)
+        if skill is None or skill.load_error or not skill.content_hash:
+            return
+        grants = load_skill_grants(drive_root, skill.name)
+        old_hash = str(grants.get("content_hash") or "")
+        if not old_hash or old_hash == skill.content_hash:
+            return
+        granted_keys = list(grants.get("granted_keys") or [])
+        granted_permissions = list(grants.get("granted_permissions") or [])
+        if not granted_keys and not granted_permissions:
+            return
+        new_keys = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
+        new_permissions = requested_skill_permissions(
+            list(skill.manifest.permissions or []),
+            list(skill.manifest.subscribe_events or []),
+        )
+        if sorted(grants.get("requested_keys") or []) != sorted(new_keys):
+            return
+        if sorted(grants.get("requested_permissions") or []) != sorted(new_permissions):
+            return
+        save_skill_grants(
+            drive_root,
+            skill.name,
+            granted_keys,
+            content_hash=skill.content_hash,
+            requested_keys=new_keys,
+            granted_permissions=granted_permissions,
+            requested_permissions=new_permissions,
+        )
+        log_obj.info(
+            "Carried owner grants across native re-seed for %s (requested sets unchanged)",
+            skill.name,
+        )
+    except Exception:
+        log_obj.warning("Grant carry across re-seed failed for %s", skill_dir, exc_info=True)
 
 
 def _migrate_control_file_hashes(target_root: pathlib.Path, log_obj: Any) -> None:
@@ -888,8 +983,14 @@ def bootstrap_native_skills(context: BootstrapContext) -> None:
     )
 
 
-def bootstrap_repo(context: BootstrapContext) -> None:
-    """Ensure the launcher-managed git repo exists and matches the embedded bundle."""
+def bootstrap_repo(context: BootstrapContext) -> bool:
+    """Ensure the launcher-managed git repo exists and matches the embedded bundle.
+
+    Returns whether the dependency install (when one was needed) succeeded —
+    a freshly created/synced checkout that could not land its requirements is
+    a fact the caller must be able to disclose, not a silently swallowed pip
+    exit code that resurfaces later as an unexplained ImportError.
+    """
     context.data_dir.mkdir(parents=True, exist_ok=True)
     outcome = ensure_managed_repo(context)
     context.log.info("Bootstrapping managed repository to %s (outcome=%s)", context.repo_dir, outcome)
@@ -909,7 +1010,7 @@ def bootstrap_repo(context: BootstrapContext) -> None:
                     f"from ouroboros.world_profiler import generate_world_profile; "
                     f"generate_world_profile('{world_path}')",
                 ],
-                env=python_bytecode_env(context.data_dir, env),
+                env=embedded_python_env(context.data_dir, env),
                 timeout=30,
                 capture_output=True,
             )
@@ -917,7 +1018,143 @@ def bootstrap_repo(context: BootstrapContext) -> None:
         context.log.warning("World profile generation failed: %s", exc)
 
     bootstrap_native_skills(context)
+    deps_ok = True
     if outcome != "unchanged":
-        install_deps(context)
-    verify_claude_runtime(context)
+        deps_ok = install_deps(context)
+        if not deps_ok:
+            context.log.warning(
+                "Bootstrap finished with a FAILED dependency install (repo outcome=%s): "
+                "the checkout changed but its requirements did not land, so the server "
+                "may be missing packages. See the pip output above for the cause.",
+                outcome,
+            )
     context.log.info("Bootstrap complete.")
+    return deps_ok
+
+
+def update_external_host(hook: pathlib.Path | None, python: str, log: Any, abort_event=None) -> dict:
+    """Synchronize a selected native host while preserving the available core."""
+    if hook is None:
+        return {}
+    from ouroboros.process_containment import ProcessContainer
+    from ouroboros.config import EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC
+
+    container = ProcessContainer()
+    proc = None
+    returncode = None
+    detail = ""
+    cancelled = False
+    try:
+        proc = container.spawn(
+            [python, str(hook)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.monotonic() + EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC
+        while True:
+            if abort_event is not None and abort_event.is_set():
+                cancelled = True
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(proc.args, EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC)
+            try:
+                # communicate retains partial pipe output across timeout retries.
+                # This is a shutdown observation interval, not a shorter build budget.
+                stdout, stderr = proc.communicate(timeout=min(remaining, 0.2) if abort_event is not None
+                                                  else EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC)
+                returncode = proc.returncode
+                detail = stdout.strip() or stderr.strip()
+                break
+            except subprocess.TimeoutExpired:
+                if abort_event is None:
+                    raise
+    except (OSError, subprocess.SubprocessError) as error:
+        detail = str(error)
+    finally:
+        try:
+            reap_error = container.reap()
+        except Exception as error:
+            reap_error = str(error)
+        finally:
+            container.close()
+        if proc is not None:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                reap_error = reap_error or "Native update process termination was not confirmed."
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    stream.close()
+    if cancelled:
+        log.info("Native host preparation cancelled by launcher shutdown.")
+        if reap_error:
+            log.error("Native host preparation cleanup was not confirmed: %s", reap_error)
+        return {"status": "cancelled"}
+    if returncode == 0 and not reap_error:
+        try:
+            payload = json.loads(detail)
+            installed = payload.get("installed") or {}
+            proof = {"source_commit": payload.get("source_commit"),
+                     "input_sha256": payload.get("input_sha256"),
+                     "apk_sha256": payload.get("apk_sha256") or installed.get("sha256"),
+                     "signer_sha256": payload.get("signer_sha256")}
+            if (payload.get("status") in {"current", "installed"}
+                    and all(isinstance(value, str) and len(value) == (40 if key == "source_commit" else 64)
+                            and all(char in "0123456789abcdef" for char in value)
+                            for key, value in proof.items())):
+                log.info("External host update verified: %s", json.dumps(proof))
+                return {"status": "verified", **proof}
+            detail = "Native installer did not return a complete artifact proof."
+        except (ValueError, TypeError, AttributeError):
+            detail = "Native installer did not return a valid artifact proof."
+    if reap_error:
+        detail += "; " + reap_error
+    # Core health remains independent; managed-update boot verification checks
+    # the desired host artifact before reporting that the full update landed.
+    log.error("native_update_failed: %s; continuing with the available core", detail)
+    return {"status": "failed"}
+
+
+def appimage_extracts_and_runs() -> bool:
+    """Whether this AppImage process runs from an extracted tree instead of a FUSE mount."""
+    if "APPIMAGE_EXTRACT_AND_RUN" in os.environ:
+        return True
+    # The type-2 runtime removes the explicit --appimage-extract-and-run
+    # argument before execing AppRun. Its APPDIR is then a regular directory;
+    # a normal FUSE-backed APPDIR is a mount point.
+    appdir = os.environ.get("APPDIR", "").strip()
+    return bool(appdir) and not os.path.ismount(appdir)
+
+
+def parse_launch_options(argv):
+    """Parse presentation/seed inputs while tolerating ordinary platform launch arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-ui", action="store_true", help="Use an external UI host.")
+    parser.add_argument("--launch-intent", choices=("owner", "automatic"), default="owner",
+                        help="Automatic boot entry preserves an explicit Panic stop.")
+    parser.add_argument("--host-update", type=pathlib.Path,
+                        help="External host Python installer; also supports read-only --check.")
+    parser.add_argument("--seed-bundle", type=pathlib.Path, help="Keep immutable seed provenance while running an external host from source.")
+    # Desktop launchers may supply platform arguments (for example Finder's
+    # process serial number). Retain their previously ignored behavior.
+    options, _ = parser.parse_known_args(argv)
+    if (options.host_update is not None or options.seed_bundle is not None) and not options.no_ui:
+        parser.error("--host-update and --seed-bundle require --no-ui")
+    return options
+
+
+def automatic_launch_allowed(intent: str, data_dir: pathlib.Path, log: Any) -> bool:
+    if intent == "automatic":
+        # The server consumes this existing marker on an explicit owner start.
+        # A boot entry must not start it and accidentally erase the owner's Stop.
+        # The same file also carries owner_restart_no_resume: that is a restart,
+        # not Panic, and must remain launchable. No second stop-state store.
+        try:
+            stopped = (data_dir / "state" / "panic_stop.flag").read_text(encoding="utf-8").strip() == "panic"
+        except FileNotFoundError:
+            stopped = False
+        if stopped:
+            log.info("Automatic start skipped: Ouroboros was stopped with Panic.")
+            print("Ouroboros is stopped. Use Start to resume.", flush=True)
+            return False
+    return True

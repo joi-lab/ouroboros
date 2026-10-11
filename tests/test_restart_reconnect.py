@@ -1,5 +1,6 @@
 """Regression checks for restart/reconnect client behavior."""
 
+import inspect
 import os
 import pathlib
 
@@ -37,11 +38,26 @@ def test_chat_marks_pending_messages_until_reconnect():
     assert "result?.status === 'queued'" in source
 
 
+def test_history_replay_does_not_overwrite_recent_session_fallback():
+    source = _read("web/modules/chat.js")
+    assert "if (!isProgress && !ephemeral && !_historyAppending)" in source
+
+
 def test_chat_resyncs_history_after_reconnect():
     source = _read("web/modules/chat.js")
     assert "async function syncHistory" in source
-    assert "/api/chat/history?limit=1000" in source
-    assert "cache: 'no-store'" in source
+    # perf2 P3: the default history request sends NO quota params — the server's
+    # window constants govern; the dead `?limit=1000` placebo is gone.
+    client = _read("web/modules/api_client.js")
+    history = client[client.index("chatHistory:"):client.index("health:")]
+    assert "await fetchHistory(null)" in source
+    assert "apiClient.chatHistory({ chatId, cursor, ...options })" in source
+    assert "if (chatId !== 1) params.set('chat_id', String(chatId));" in history
+    assert "const query = params.toString();" in history
+    assert "fetchJson(`/api/chat/history${query ? `?${query}` : ''}`" in history
+    assert not any(quota in history for quota in ("n_human", "n_progress", "limit"))
+    assert "limit=1000" not in source
+    assert "cache: 'no-store'" in history
     assert "syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })" in source
     assert "const expectedDisconnect = socketState !== WebSocket.OPEN" in source
     assert "if (expectedDisconnect && err instanceof TypeError)" in source
@@ -53,7 +69,7 @@ def test_final_answer_marker_uses_ordinary_message_presentation():
 
     assert "renderAssistantWithAnswerChip" not in source
     assert "final-answer-chip" not in css
-    assert ": renderMarkdown(text));" in source
+    assert ": renderChatMarkdown(text);" in source
     # Both live and history assistant/system paths feed the same addMessage renderer;
     # reconnect notices do too, so marker-shaped text never gets a separate capsule.
     assert "addMessage(msg.content, msg.role" in source
@@ -196,7 +212,10 @@ def test_chat_shows_reconnect_banner_after_reconnect_and_reload():
     source = _read("web/modules/chat.js")
     assert "wsHasConnectedOnce" in source, "Missing reconnect-once tracking flag"
     assert "Reconnected" in source, "Missing reconnect banner text"
-    assert "Restart complete" in source, "Missing restart-complete banner text"
+    # reconnectBannerText moved verbatim to chat_activity.js (chat.js byte ceiling).
+    assert "Restart complete" in _read("web/modules/chat_activity.js"), (
+        "Missing restart-complete banner text"
+    )
     assert "_ouro_reason" in source, "Missing restart reload reason handling"
     assert "history.replaceState" in source, "Reconnect params should be cleared after showing banner"
     # Ensure banner is ephemeral (not persisted to history)
@@ -207,7 +226,12 @@ def test_progress_bubbles_have_subdued_styling():
     """Progress/reasoning bubbles should be visually muted compared to regular ones."""
     css = _read("web/style.css")
     assert ".chat-bubble.progress .message" in css, "Missing progress-specific message style"
-    assert "font-size: 13px" in css, "Progress font should be smaller than default 15.5px"
+    progress_block = css.split(".chat-bubble.progress .message", 1)[1]
+    progress_block = progress_block[: progress_block.index("}")]
+    assert "font-size: var(--type-body)" in progress_block, (
+        "Progress font should be the 14px body token, smaller than the "
+        "16px --type-section chat default"
+    )
 
 
 def test_working_live_cards_are_subdued_and_expandable():
@@ -220,12 +244,19 @@ def test_working_live_cards_are_subdued_and_expandable():
 
 
 def test_live_card_blocks_can_expand_to_full_text():
-    """chat.js should preserve expansion state and render per-block toggles."""
+    """Chat keeps expansion state while its activity renderer owns the toggle."""
     source = _read("web/modules/chat.js")
+    activity = _read("web/modules/chat_activity.js")
     assert "expandedLineKeys" in source, "Missing per-line expansion state"
-    assert "data-live-line-toggle" in source, "Missing per-block toggle markup"
-    assert "fullHeadline" in source, "Missing full headline preservation"
-    assert "fullBody" in source, "Missing full body preservation"
+    assert "bindLiveCardTimeline(record.timelineEl," in source
+    assert "record.expandedLineKeys.add(lineKey)" in source
+    assert "renderLiveCardTimeline(record);" in source
+    assert "data-live-line-toggle" in activity, "Missing per-block toggle markup"
+    assert "record.expandedLineKeys.has(item.lineKey)" in activity
+    for field in ("fullHeadline", "fullBody"):
+        assert f"item.{field}" in activity, f"Missing full-text rendering: {field}"
+        assert field in _read("web/modules/chat_render_batch.js"), f"Missing live preservation: {field}"
+        assert field in _read("web/modules/chat_history_replay.js"), f"Missing history preservation: {field}"
 
 
 def test_live_event_summaries_preserve_full_text_for_expansion():
@@ -239,7 +270,7 @@ def test_live_event_summaries_preserve_full_text_for_expansion():
 def test_task_done_live_summary_distinguishes_typed_failure():
     source = _read("web/modules/log_events.js")
     assert "export function taskOutcomeSeverity" in source
-    assert "function taskDoneFailure" in source
+    assert "export function taskPresentation" in source
     assert "outcome_axes?.execution?.status" in source
     assert "['degraded', 'best_effort'].includes(execution)" in source
     assert "['degraded', 'best_effort'].includes(objective)" in source
@@ -252,33 +283,63 @@ def test_task_done_live_summary_distinguishes_typed_failure():
     assert "if (severity === 'error') return 'error';" in source
     assert "if (severity === 'warn') return 'warn';" in source
     assert source.count("taskTerminalPhase(evt)") >= 2
+    assert "const terminal = taskDoneIsTerminal(evt);" in source
+    assert "const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');" in source
+    assert "headline: presentation.headline" in source
 
 
-def test_chat_warning_task_summaries_force_visible_cards():
+def test_no_severity_keyed_visibility_writer_survives_restart_paths():
+    """A warn/error/cancelled task keeps its block WITHOUT any writer forcing it.
+
+    Card presence used to be a sticky flag written from two places for exactly
+    this case: the live terminal frame (`summary.terminal && summary.phase ===
+    'warn'`) and the history replay's `needsVisibleTerminal` branch. Two
+    writers for one fact is how a cancelled root could come back from a reload
+    as Done, so both are gone and the ONE predicate decides from the record's
+    own facts. The predicate's clauses are pinned in the static contract
+    fixture, and the BEHAVIOUR (a zero-tool failed turn keeps its block live
+    and after a reload, a done one does not) in
+    `web/tests/chat_activity_block.test.js`; this guards only that no
+    severity-keyed visibility writer comes back on either restart path.
+    """
     source = _read("web/modules/chat.js")
-    assert "summary.terminal && summary.phase === 'warn'" in source
-    assert (
-        "const needsVisibleTerminal = severity === 'error' || severity === 'warn'"
-        " || severity === 'cancelled';"
-    ) in source
+    assert "needsVisibleTerminal" not in source
+    assert "summary.phase === 'warn'" not in source
 
 
 def test_chat_scrolls_to_bottom_after_first_history_load():
-    """syncHistory must scroll to bottom on first load (restart/open) but
-    respect user scroll position on subsequent reconnect syncs."""
+    """Fresh first load follows latest; saved reading intent and reconnect
+    use the shared position owner rather than unconditional first-load pinning."""
     source = _read("web/modules/chat.js")
+    media_source = _read("web/modules/chat_media.js")
     # First-load guard: wasFirstLoad captures pre-call state
     assert "wasFirstLoad = !historyLoaded" in source, \
         "Missing first-load detection before setting historyLoaded"
-    # Conditional scroll: first load always scrolls, reconnect only when near bottom
-    assert "if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom()))" in source, \
-        "Missing conditional scroll-to-bottom after history sync"
-    assert "anchor: captureVisibleTimelineAnchor()" in source
-    assert "restoreVisibleTimelineAnchor(scrollBeforeSync.anchor)" in source, \
+    # Pending data-aware restore wins over first-load/latest following.
+    assert "if (reading.pending)" in source and "reading.position();" in source
+    assert "else if (wasFirstLoad && reading.stick)" in source
+    assert "reading.followAfterLayout();" in source
+    position = _read("web/modules/chat_reading_position.js")
+    assert "const follow = forceFollow || (state.stick && state.nearBottom());" in position
+    assert "const anchor = follow ? null : anchors.capture(excludeAnchorNode);" in position
+    assert "else anchors.restore(anchor);" in position, \
         "Reconnect must restore a visible DOM anchor, not apply total height growth"
-    assert "item.dataset?.taskId === anchor.taskId" in source, \
-        "A rebuilt live card whose earliest timestamp changed needs stable task identity"
-    assert "reorderExisting: anchorMovedEarlier" in source, \
+    # The anchor pair lives in chat_render_batch.js (extracted verbatim from
+    # chat.js at the byte ratchet); the identity contract is unchanged.
+    anchor_source = _read("web/modules/chat_render_batch.js")
+    assert "taskId: card.dataset?.taskId || ''" in anchor_source, \
+        "Nested viewport anchors must retain stable task identity"
+    assert "createTimelineAnchors({ messagesDiv, liveCardRecords })" in source, \
+        "The anchors factory must receive the live-card registry it reads"
+    assert "liveCardRecords.get(entry.taskId)" in anchor_source, \
+        "A rebuilt live card whose earliest timestamp changed needs canonical task lookup"
+    # One reanchor owner: a card is re-sorted only when its own anchor actually
+    # moved earlier (or its history position did), never on every mutation.
+    assert "const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });" in source, \
+        "The reanchor owner must read the node's own anchor move"
+    assert "if (!movedEarlier && !positionChanged) return false;" in source, \
+        "An unmoved anchor must not re-sort a mounted card"
+    assert "ensureLiveCardVisible(record, { reorderExisting: true });" in source, \
         "A mounted task card must be re-sorted if a later event lowers its anchor"
     assert "record._anchorOrderDirty = true;" in source
     assert "reorderDirtyCardIfNeeded(rec);" in source, \
@@ -286,15 +347,25 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
         "Nested subagent timestamps must propagate to the top-level ancestor safely"
-    assert "messagesDiv.scrollTop = messagesDiv.scrollHeight" in source
-    # Pin the chronological insertion call-site: a revert to plain append would
-    # keep JS unit tests green (they exercise the exported helper directly).
-    assert "insertTimelineNode(messagesDiv, node, typing" in source, \
-        "insertMessageNode must route through chronological insertTimelineNode"
-    # Media producers (photo, video, document) must each stamp sortable
-    # data-ts from the raw source timestamp; text bubbles stamp msg.ts.
-    assert source.count("stampNodeTimestamp(bubble, rawTs);") >= 3, \
-        "photo/video/document bubbles must carry raw-timestamp data-ts"
+    assert "stick: true," in position and "initial" not in position, \
+        "Every room opens following its newest message (owner decision 2026-10-05)"
+    # The shared photo/video builder and the separate document builder must
+    # each stamp sortable data-ts from the raw source timestamp.
+    bubble_frame = media_source.split("function bubbleFrame", 1)[1].split(
+        "function mediaSource", 1
+    )[0]
+    media_builder = media_source.split("function buildMediaBubble", 1)[1].split(
+        "function buildDocumentBubble", 1
+    )[0]
+    document_builder = media_source.split("function buildDocumentBubble", 1)[1].split(
+        "function buildLinksMessage", 1
+    )[0]
+    assert "const rawTs = msg.ts ||" in bubble_frame
+    assert "stampNodeTimestamp(bubble, rawTs);" in bubble_frame
+    assert "bubbleFrame(msg" in media_builder, \
+        "shared photo/video bubbles must use the raw-timestamp-stamped frame"
+    assert "bubbleFrame(msg" in document_builder, \
+        "document bubbles must use the raw-timestamp-stamped frame"
     assert "stampNodeTimestamp(bubble, ts);" in source, \
         "chat text bubbles must carry raw-timestamp data-ts"
 
@@ -306,17 +377,88 @@ def test_restart_watchdog_waits_for_uvicorn_exit():
     assert "_uvicorn_exited.set()" in source
 
 
-def test_owner_restart_copy_is_explicit_about_stopped_task():
-    source = _read("server.py")
-    assert 'ctx.send_with_budget(chat_id, "♻️ Restarting.")' in source
+def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import server
+
+    from ouroboros import server_restart
+
+    source = _read("ouroboros/server_restart.py")
     assert "Stopping active task. New settings apply to the next message." in source
     assert "owner_restart_no_resume.flag" in source
     assert "owner_restart_no_resume" in source
     assert "panic_stop.flag" in source
     assert "owner_restart_flag.unlink(missing_ok=True)" in source
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
-    assert source.index("safe_restart(reason=\"owner_restart\"") < source.index("Stopping active task. New settings apply to the next message.")
-    assert source.index("owner_restart_no_resume.flag") < source.index("Stopping active task. New settings apply to the next message.")
+    # Checkout gate first (a refusal leaves the server intact), then the durable
+    # no-resume intent, then the owned-work stop, then the owner's stop notice.
+    owner_restart = _read("server.py").split('lowered.startswith("/restart"):', 1)[1].split(
+        'elif lowered == "/review"', 1
+    )[0]
+    assert "_perform_owner_restart(ctx, reply)" in owner_restart
+    flags = tmp_path / "state"
+    calls = []
+    ctx = SimpleNamespace(safe_restart=object())
+
+    def checked(function, **kwargs):
+        assert function is ctx.safe_restart and not flags.exists()
+        assert kwargs == {"reason": "owner_restart", "unsynced_policy": "rescue_and_reset"}
+        calls.append("checked")
+        return True, "ok"
+
+    def stopped(actual):
+        assert actual is ctx
+        assert (flags / "owner_restart_no_resume.flag").read_text(encoding="utf-8") == "owner_restart"
+        assert (flags / "panic_stop.flag").read_text(encoding="utf-8") == "owner_restart_no_resume"
+        calls.append("stopped")
+        return ["active-task"]
+
+    def notice(text, _suffix):
+        assert calls == ["checked", "stopped"]
+        assert text == "Stopping active task. New settings apply to the next message."
+        calls.append("notice")
+
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "_safe_restart_serialized", checked)
+    monkeypatch.setattr(server_restart, "_stop_owned_work", stopped)
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner: calls.append(("exit", owner)))
+    assert server._perform_owner_restart(ctx, notice) == (True, "")
+    assert calls == ["checked", "stopped", "notice", ("exit", True)]
+    stop = _read("ouroboros/server_restart.py").split("def _stop_owned_work", 1)[1]
+    assert (stop.index("request_cancel(") < stop.index("ctx.kill_workers(")
+            < stop.index("reconcile_orphaned_runs(") < stop.index("stop_outcome()"))
+
+
+def test_owner_restart_cleanup_disables_second_custody_reconcile(monkeypatch):
+    import server
+    import threading
+
+    owner, restart = threading.Event(), threading.Event()
+    monkeypatch.setattr(server, "_owner_restart_requested", owner)
+    monkeypatch.setattr(server, "_restart_requested", restart)
+    monkeypatch.setattr(server._historical_audit, "stop", lambda: None)
+    monkeypatch.setattr(server, "_managed_update_pending_kwargs", lambda: {})
+    monkeypatch.setattr(server, "_stop_owned_daemon_for_new_pin", lambda: None)
+    monkeypatch.setattr(server, "_stop_owned_local_processes", lambda *a, **k: None)
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
+    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
+    calls = []
+    monkeypatch.setattr("supervisor.workers.kill_workers", lambda **kwargs: calls.append(kwargs))
+    for owner_requested in (False, True):
+        owner.set() if owner_requested else owner.clear()
+        for restarting in (False, True):
+            restart.set() if restarting else restart.clear()
+            calls.clear()
+            server._emergency_process_cleanup(port_sweep=False)
+            expected = {"force": True, "archive_service_logs": False}
+            if owner_requested:
+                expected["reconcile_delegate_custody"] = False
+            if restarting:
+                status, reason = server._shutdown_task_cleanup_args(True)
+                expected.update(terminal_status=status, result_reason=reason, stop_source="server_shutdown")
+            assert calls == [expected]
+    lifespan = inspect.getsource(server.lifespan)
+    assert "**_restart_cleanup_kwargs()" in lifespan
 
 
 def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
@@ -343,11 +485,17 @@ def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
     assert not compat_flag.exists()
 
 
-def test_owner_restart_cleans_flags_when_worker_shutdown_fails(tmp_path, monkeypatch):
+def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch):
+    """A worker shutdown that raises is a diagnostic, not a veto: the no-resume
+    intent stays, the owner is told what the restart changes, and the process
+    exits. Nothing is owned here, so the notice claims no stopped task: the
+    owned-work branch is pinned in tests/test_manual_restart_execution.py."""
     import server
     import supervisor.message_bus as message_bus
+    from ouroboros import config, server_restart
 
     messages = []
+    exits = []
 
     class Bridge:
         def get_updates(self, offset=0, timeout=1):
@@ -358,6 +506,110 @@ def test_owner_restart_cleans_flags_when_worker_shutdown_fails(tmp_path, monkeyp
                     "from": {"id": 1},
                     "text": "/restart",
                 },
+            }]
+
+    class Ctx:
+        consciousness = None
+        RUNNING = {}
+
+        def load_state(self):
+            return {}
+
+        def save_state(self, _state):
+            return None
+
+        def update_state(self, mutator):
+            live = {}
+            mutator(live)
+            return live
+
+        def send_with_budget(self, _chat_id, text, **kwargs):
+            messages.append(text)
+
+        def safe_restart(self, **_kwargs):
+            return True, "OK"
+
+        def kill_workers(self, force=True, **kwargs):
+            assert kwargs["terminal_status"] == "cancelled"
+            assert kwargs["result_reason"] == "Owner restart stopped this task before process restart."
+            raise RuntimeError("shutdown failed")
+
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner=False: exits.append(owner))
+
+    server._process_bridge_updates(Bridge(), 0, Ctx())
+
+    assert (tmp_path / "state" / "owner_restart_no_resume.flag").exists()
+    assert (tmp_path / "state" / "panic_stop.flag").exists()
+    assert "New settings apply to the next message." in messages
+    assert not any("Stopping active task" in text for text in messages)
+    assert not any("cancelled" in text or "deferred" in text for text in messages)
+    assert exits == [True]
+
+
+def test_ws_sha_reload_decision_is_single_sourced():
+    """Both the post-open refresh and the recovery probe must route through the
+    one exported SHA decision helper (keep / reload_changed / reload_unknown).
+
+    The behavioral contract — same/changed/missing/empty/malformed SHA, the
+    first-ever connection, the probe-vs-open race bail, the healthy-probe fuse,
+    and outbound-queue survival — is executable in
+    web/tests/ws_recovery.test.js (node --test). These are wiring pins only.
+    """
+    source = _read("web/modules/ws.js")
+    assert "export function decide(" in source
+    assert "RECOVERY_HEALTHY_PROBE_LIMIT = 4" in source
+    recovery_body = source.split("_scheduleUiRecovery(reason, delay = 15000) {", 1)[1].split(
+        "_startWatchdog(socket) {", 1
+    )[0]
+    assert "_applyShaDecision(servedSha, this._wasConnected, false)" in recovery_body, (
+        "the recovery probe must consult the shared SHA decision WITHOUT "
+        "remembering the served SHA (a pre-connect probe adopting a restarted "
+        "server's SHA would leave stale assets unhealed)"
+    )
+    assert "this._uiRecoveryProbeInFlight" in recovery_body, (
+        "arming recovery must be gated on the in-flight probe flag so hung "
+        "probes cannot pile up and multi-count the healthy fuse"
+    )
+    refresh_body = source.split("\n    _refreshStateAfterOpen(", 1)[1].split(
+        "_flushPendingMessages() {", 1
+    )[0]
+    assert "_applyShaDecision(servedSha, previouslyConnected, true)" in refresh_body, (
+        "the post-open refresh must consult the shared SHA decision and is the "
+        "ONLY path that remembers the served SHA"
+    )
+    apply_body = source.split(
+        "_applyShaDecision(servedSha, previouslyConnected, storeServedSha) {", 1
+    )[1].split("_reloadForShaDecision(decision) {", 1)[0]
+    assert "decide(this._lastSha, servedSha, previouslyConnected)" in apply_body, (
+        "the shared applier must delegate to the exported SSOT decide()"
+    )
+
+
+def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path, monkeypatch):
+    """The owner raises the mode in Settings, presses Restart, and the mode never changes.
+
+    ``restart_current_process`` re-execs with ``os.environ.copy()``, so the ratchet
+    pin ``OUROBOROS_BOOT_RUNTIME_MODE`` rode into the replacement and the child
+    re-pinned the OLD baseline from it — verified live: the process held
+    ``OUROBOROS_RUNTIME_MODE=advanced`` under ``OUROBOROS_BOOT_RUNTIME_MODE=light``
+    and ``/api/state`` kept reporting light, on that restart and every later one.
+
+    One fact decides it, and the two directions are pinned here: the owner's
+    ``/restart`` marks the restart owner-initiated, the agent's restart request
+    (via the supervisor) does not.
+    """
+    import server
+    import supervisor.message_bus as message_bus
+
+    class Bridge:
+        def get_updates(self, offset=0, timeout=1):
+            return [{
+                "update_id": offset,
+                "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "/restart"},
             }]
 
     class Ctx:
@@ -374,46 +626,36 @@ def test_owner_restart_cleans_flags_when_worker_shutdown_fails(tmp_path, monkeyp
             mutator(live)
             return live
 
-        def send_with_budget(self, _chat_id, text):
-            messages.append(text)
+        def send_with_budget(self, _chat_id, _text, **kwargs):
+            return None
 
         def safe_restart(self, **_kwargs):
             return True, "OK"
 
-        def kill_workers(self, force=True, **kwargs):
-            assert kwargs["terminal_status"] == "cancelled"
-            assert kwargs["result_reason"] == "Owner restart stopped this task before process restart."
-            raise RuntimeError("shutdown failed")
+        def kill_workers(self, force=True, **_kwargs):
+            return None
 
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(
-        server,
-        "_request_restart_exit",
-        lambda: (_ for _ in ()).throw(AssertionError("restart exit should not be requested")),
-    )
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    # The owned-work stop has its own suite; this pin is about the owner flag alone.
+    monkeypatch.setattr(server_restart, "_stop_owned_work", lambda ctx: None)
 
-    server._process_bridge_updates(Bridge(), 0, Ctx())
+    server._owner_restart_requested.clear()
+    server._restart_requested.clear()
+    try:
+        server._process_bridge_updates(Bridge(), 0, Ctx())
+        assert server._owner_restart_requested.is_set(), \
+            "the owner's Restart button must mark the restart owner-initiated"
 
-    assert not (tmp_path / "state" / "owner_restart_no_resume.flag").exists()
-    assert not (tmp_path / "state" / "panic_stop.flag").exists()
-    assert "Stopping active task. New settings apply to the next message." not in messages
-    assert "⚠️ Restart cancelled: failed to stop workers." in messages
-
-
-def test_ws_reloads_when_sha_unknown_after_reconnect():
-    """ws.js must reload the page when _lastSha is null after reconnect (PyWebView loses JS state).
-
-    Previously the guard was: `previouslyConnected && this._lastSha && d.sha && d.sha !== this._lastSha`
-    which silently skipped the reload when _lastSha was null.
-    Now: any reconnect with previouslyConnected=true where SHA is unknown or changed triggers reload.
-    """
-    source = _read("web/modules/ws.js")
-    # New guard: reload if lastSha unknown OR sha changed
-    assert "!this._lastSha || this._lastSha !== newSha" in source, (
-        "_refreshStateAfterOpen must reload when _lastSha is null or SHA changed"
-    )
-    # Must still be guarded by previouslyConnected to avoid spurious reload on first connect
-    assert "previouslyConnected && newSha" in source, (
-        "Reload must only fire when previouslyConnected=true and server returns a non-empty SHA"
-    )
+        # The agent's own restart request goes through the same exit signal and
+        # must NOT claim owner intent: its baseline stays pinned.
+        server._owner_restart_requested.clear()
+        server._restart_requested.clear()
+        server._request_restart_exit()
+        assert server._restart_requested.is_set()
+        assert not server._owner_restart_requested.is_set()
+    finally:
+        server._owner_restart_requested.clear()
+        server._restart_requested.clear()

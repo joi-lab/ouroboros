@@ -1,4 +1,4 @@
-import { renderPageHeader, renderTabStrip } from './page_header.js';
+import { bindTabStrip, renderPageHeader, renderTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 
 const DASHBOARD_TABS = [
@@ -23,7 +23,11 @@ export function initDashboard({ state }) {
             icon: PAGE_ICONS.dashboard,
             description: 'Monitor logs, evolution, costs, activity, and update state from one view.',
             tabsHtml: renderTabStrip({
-                items: DASHBOARD_TABS,
+                items: DASHBOARD_TABS.map((tab) => ({
+                    ...tab,
+                    tabId: `dashboard-tab-${tab.value}`,
+                    panelId: `dashboard-panel-${tab.value}`,
+                })),
                 active: state.dashboardActiveSubtab || 'logs',
                 dataAttr: 'data-dashboard-tab',
                 ariaLabel: 'Dashboard views',
@@ -33,34 +37,38 @@ export function initDashboard({ state }) {
         })}
         <div class="dashboard-shell">
             <div class="dashboard-panels">
-                <section class="dashboard-panel active" data-dashboard-panel="logs" id="dashboard-panel-logs"></section>
-                <section class="dashboard-panel" data-dashboard-panel="evolution" id="dashboard-panel-evolution"></section>
-                <section class="dashboard-panel" data-dashboard-panel="costs" id="dashboard-panel-costs"></section>
-                <section class="dashboard-panel" data-dashboard-panel="updates" id="dashboard-panel-updates"></section>
-                <section class="dashboard-panel" data-dashboard-panel="activity" id="dashboard-panel-activity"></section>
+                ${DASHBOARD_TABS.map((tab) => `<section class="dashboard-panel"
+                    data-dashboard-panel="${tab.value}" id="dashboard-panel-${tab.value}"
+                    role="tabpanel" aria-labelledby="dashboard-tab-${tab.value}" hidden></section>`).join('')}
             </div>
         </div>
     `;
     document.getElementById('content').appendChild(page);
 
-    const tabs = Array.from(page.querySelectorAll('.dashboard-tab'));
     const panels = Array.from(page.querySelectorAll('.dashboard-panel'));
+    const tabStrip = bindTabStrip(page.querySelector('.dashboard-tabs'), {
+        dataAttr: 'data-dashboard-tab',
+        onChange: activateTab,
+    });
 
     function activateTab(tabName) {
         const name = tabName || 'logs';
-        tabs.forEach((tab) => tab.classList.toggle('active', tab.dataset.dashboardTab === name));
-        panels.forEach((panel) => panel.classList.toggle('active', panel.dataset.dashboardPanel === name));
+        if (!tabStrip.select(name)) return;
+        panels.forEach((panel) => {
+            const active = panel.dataset.dashboardPanel === name;
+            panel.classList.toggle('active', active);
+            panel.hidden = !active;
+        });
         state.dashboardActiveSubtab = name;
         window.dispatchEvent(new CustomEvent('ouro:dashboard-subtab-shown', { detail: { tab: name } }));
     }
 
-    tabs.forEach((tab) => {
-        tab.addEventListener('click', () => activateTab(tab.dataset.dashboardTab));
-    });
-    state.dashboardActiveSubtab = state.dashboardActiveSubtab || 'logs';
+    activateTab(DASHBOARD_TABS.some((tab) => tab.value === state.dashboardActiveSubtab)
+        ? state.dashboardActiveSubtab : 'logs');
     page.activateDashboardTab = activateTab;
     return {
         page,
         activateTab,
+        destroy: tabStrip.destroy,
     };
 }

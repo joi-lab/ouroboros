@@ -73,7 +73,7 @@ if [ "${OBO_INSTALL_IN_IMAGE:-0}" = "1" ]; then
       echo "install-in-image: python after apk:  ${PY_AFTER:-unknown}" >&2
       "$PYBIN" -c "import xml.parsers.expat, pyexpat" || { echo "SOLVE_INFRA_SUSPECT reason=pyexpat_abi_mismatch" >&2; exit 87; }
       "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
-      grep -ivE '^(playwright|playwright-stealth)([<=>[:space:]].*)?$' /opt/ouroboros-ro/requirements.txt > /tmp/reqs_musl.txt
+      grep -ivE '^(playwright|playwright-stealth)([<=>[:space:]].*)?$' /opt/ouroboros-ro/requirements-runtime.lock > /tmp/reqs_musl.txt
       if ! "$PYBIN" -m pip install --break-system-packages -r /tmp/reqs_musl.txt; then
         echo "install-in-image: musl requirements failed; retrying without tree-sitter" >&2
         "$PYBIN" -m pip --version || { echo "SOLVE_INFRA_SUSPECT reason=pip_bootstrap_failed" >&2; exit 87; }
@@ -417,8 +417,9 @@ else
   echo "[pro] ROOT-RUN $IID (self_modification; /app as active external workspace; post-task evolution=disabled baseline)" >&2
 fi
 # Tool denylist + per-task memory mode are passthrough knobs (run_pro --disable-tools / --memory-mode).
-# Defaults preserve the original tool behavior (full web/browser/vision + claude_code_edit disabled).
-OBO_DISABLE_TOOLS="${OBO_DISABLE_TOOLS:-web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit}"
+# Methodology default: web/browser/vision/transcript lookup, the external coding
+# gateway, and model switching are disabled explicitly by the task contract.
+OBO_DISABLE_TOOLS="${OBO_DISABLE_TOOLS:-web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,youtube_transcript,claude_code_edit,switch_model}"
 # Benchmark default is a FRESH child memory drive (v6.56.0): the measured artifact
 # is the harness on this task, not memory accreted across tasks. Explicitly export
 # OBO_MEMORY_MODE=shared/forked to opt back into carried memory.
@@ -432,7 +433,7 @@ SOLVE_ARGS=(
   --jsonl --result-json-out /out/solve_result.json --timeout "${OBO_SOLVE_TIMEOUT:-3000}"
   --disable-tools "$OBO_DISABLE_TOOLS"
   --memory-mode "$OBO_MEMORY_MODE"
-  --task-metadata-json '{"budget_profile": {"improvement_policy": "until_deadline", "max_improvement_passes": 6, "cost_hard_stop_pct": 0}}'
+  --task-metadata-json '{"budget_profile": {"improvement_policy": "fixed", "max_improvement_passes": 6, "cost_hard_stop_pct": 0}}'
 )
 [ -n "$OBO_SOLVE_WORKSPACE_ROOT" ] && SOLVE_ARGS+=(--workspace "$OBO_SOLVE_WORKSPACE_ROOT")
 echo "[pro] solve tools-disabled=[$OBO_DISABLE_TOOLS] memory=[$OBO_MEMORY_MODE] workspace=[${OBO_SOLVE_WORKSPACE_ROOT:-none}]" >&2

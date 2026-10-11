@@ -43,7 +43,7 @@ def _probe_client(monkeypatch, *, failure: BaseException | None = None):
 
 
 def test_unscoped_capability_probe_uses_stable_system_usage_scope(monkeypatch):
-    from ouroboros import llm
+    from ouroboros import llm_attempt
     from ouroboros.usage_accounting import current_usage_scope
 
     client, provider_calls = _probe_client(monkeypatch)
@@ -53,7 +53,7 @@ def test_unscoped_capability_probe_uses_stable_system_usage_scope(monkeypatch):
         observed.append((request, current_usage_scope()))
         return send()
 
-    monkeypatch.setattr(llm, "execute_physical_attempt", fake_execute)
+    monkeypatch.setattr(llm_attempt, "execute_physical_attempt", fake_execute)
 
     result = client.probe_oversized_context("openai/gpt-test", "oversized")
 
@@ -70,7 +70,7 @@ def test_unscoped_capability_probe_uses_stable_system_usage_scope(monkeypatch):
 
 
 def test_task_bound_capability_probe_inherits_task_and_budget_scope(monkeypatch, tmp_path):
-    from ouroboros import llm
+    from ouroboros import llm_attempt
     from ouroboros.usage_accounting import UsageScope, current_usage_scope, usage_scope
 
     client, provider_calls = _probe_client(monkeypatch, failure=RuntimeError("HTTP 400 context overflow"))
@@ -80,7 +80,7 @@ def test_task_bound_capability_probe_inherits_task_and_budget_scope(monkeypatch,
         observed.append((request, current_usage_scope()))
         return send()
 
-    monkeypatch.setattr(llm, "execute_physical_attempt", fake_execute)
+    monkeypatch.setattr(llm_attempt, "execute_physical_attempt", fake_execute)
     task_scope = UsageScope(
         drive_root=tmp_path,
         task_id="probe-task",
@@ -146,6 +146,10 @@ def test_local_model_capability_checks_are_accounted_and_inherit_task_scope(
     assert system_result["success"] is True
     assert len(provider_calls) == 2
 
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, 'local-probe-root', 'running', billing_group={
+        'billing_group_id': 'local-probe-root', 'billing_group_limit_usd': 2.0,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     task_scope = UsageScope(
         drive_root=tmp_path,
         task_id="local-probe-task",

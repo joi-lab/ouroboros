@@ -488,13 +488,16 @@ from `--dataset`. Frontier-Bench runs on the pinned 0.18.0 (measured — see MET
 
 Ledgered smoke runs should go through the wrapper so `run_manifest.json` and
 the denominator-preserving `result_index.jsonl` are written beside the Harbor
-official output:
+official output. Its manifest derives Main/Light/fallback and the one API actor
+from the exact `--model` CLI value (plus an explicit Light override), never from
+ambient Heavy or a settings-template model:
 
 ```bash
 PYTHONPATH=/Users/anton/Ouroboros/repo \
 python devtools/benchmarks/terminal_bench/run_harbor_smoke.py \
   --run-root /Users/anton/Ouroboros/bench_runs/terminal_bench/smoke \
   --task terminal-bench/regex-log \
+  --model openai/gpt-5.5 \
   --n-concurrent 1 \
   --execute
 ```
@@ -588,10 +591,12 @@ The adapter sets:
 
 ```text
 OUROBOROS_MODEL
-OUROBOROS_MODEL_CODE
+OUROBOROS_SUBAGENTS = one api_model row on OUROBOROS_MODEL
 ```
 
-to the measured model inside the container. `OUROBOROS_MODEL_LIGHT` defaults to
+inside the container. The explicit actor row prevents Available-subagent defaults
+from introducing a Light scout, second family, or session-backed delegate into a
+fixed-model trial. `OUROBOROS_MODEL_LIGHT` defaults to
 `google/gemini-3.5-flash` and can be overridden with
 `--agent-kwarg ouroboros_light_model=<provider/model>` or `run_tb.py
 --light-model ...`. This avoids accidentally running safety checks and
@@ -625,7 +630,7 @@ The adapter template pins, and the methodology discloses:
   was 34% of all LLM calls in the k=5 run while the deterministic guards do
   the actual protecting. Light keeps the LLM check for integration tools only.
 - `claude_code_edit` disabled in every trial — benches measure the
-  single-model Ouroboros harness; the embedded Claude-Code delegate is a
+  single-model Ouroboros harness; an external agent-session delegate is a
   separate experiment.
 - `_DEADLINE_SAFETY_SEC=105` (was 30) — measured finalization overhead plus a
   provider-recovery margin, so trials finalize before Harbor's hard deadline

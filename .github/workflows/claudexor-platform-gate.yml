@@ -1,0 +1,386 @@
+# Claudexor delegated-run gate on ubuntu / windows / macos.
+#
+# WHY THIS WORKFLOW IS NAMED THE WAY IT IS. A green check here says: on this
+# operating system, Ouroboros can drive one small MUTATING task through Claudexor
+# end to end — the delegated run shape itself rides the live lane only (see the
+# fixture lane's named divergences below). It does NOT say that a SUBSCRIPTION
+# harness works on that platform — no subscription can be authenticated in CI (the vendor logins are
+# interactive and machine-bound, and a live OAuth token does not go into a
+# repository secret). That limit is the owner's own open question beside D20, and it
+# is carried in the workflow name, in every job name, and in each job's step summary
+# so that nobody reads this badge as more coverage than it has.
+#
+# TWO LANES, AND WHY.
+#
+#   fixture — Claudexor's `fake-*` harnesses: deterministic, no model, no
+#             credentials, no vendor CLI. Its only network fetches are the exact runtime
+#             and Node archives pinned by this checkout. Costs $0 and a couple of runner minutes, so
+#             it runs on ordinary pushes and PRs. It is a GATEWAY/PLATFORM SMOKE on this
+#             platform — daemon discovery, protocol handshake, project registration,
+#             the delegated-marker version floor, polling to terminal, reading the
+#             primary artifact to EOF, the child's edit landing on disk, and the
+#             applied-containment facts being read back — driven through the gateway
+#             module directly. The request PINS its route (`harnesses` +
+#             `primaryHarness`): the engine's auto-pool excludes `fake-*` routes by
+#             design, so an unpinned request would never start this lane at all. It
+#             does NOT exercise the production delegation path: the nanny verbs, run
+#             custody, cost settlement, the ledger cut and the capability-delta
+#             disclosures never run here, and the plain EOF read is not the
+#             production custody acknowledgement. The `execution.delegated` marker is
+#             NOT sent on this lane — a delegated mutating run needs
+#             `external_sandbox_full` wherever the host has a kernel boundary, and no
+#             `fake-*` adapter maps that profile, so the delegated run shape rides
+#             the live lane only. Because a `fake-*` adapter runs IN PROCESS, no
+#             child is spawned either. Those gaps are what the live lane and the
+#             local pre-release run are for.
+#
+#   live    — a real harness on an explicit API key, editing a README at low effort on
+#             a weak model (the owner's own test rule, plan §4.10 answer 84). If a
+#             successful run's artifact reaches EOF but the README remains exactly
+#             unchanged, the same request gets ONE second model attempt with a fresh
+#             idempotency key; a second no-edit result stays red. No routing, auth,
+#             engine, process, artifact, or timeout failure is retried. Token cost is
+#             pennies; the real price is minutes and flakiness — vendor CLI installs
+#             across three OSes, cold daemons, and someone else's rate limits. Paying
+#             that on every push would make PR feedback on the seam hostage to vendor
+#             availability, which is the same trade this repository already made for
+#             `skill-smoke` in ci.yml. So it runs where that paid lane runs:
+#             ouroboros-stable, manual dispatch, and tags.
+#
+# A THIRD, NARROWER JOB: toolchain. The fixture lane installs the runtime for the daemon
+# but never runs npm, and the live lane pre-installs its harness with setup-node's npm.
+# Neither proves the managed Node/npm toolchain that `install_missing_harness_cli` hands
+# to the engine. The toolchain job does, credential-free and on pushes/PRs: with no
+# node/npm on PATH, no ambient npm config, no CLAUDEXOR_*_BIN override and a disposable
+# home, the production `ensure_cli_command()` installs Node + npm from the pinned
+# official archive, and the managed Node runs the CLI and `npm-cli.js` directly (never
+# an npm .cmd shim) for an offline local-tarball install, a reselect and a repair
+# (scripts/claudexor_toolchain_smoke.py). It never runs `harness install`, so no harness
+# install is claimed by it.
+#
+# A FOURTH, WINDOWS-ONLY JOB: consumer. The same witness, same isolation, then
+# `--harness-install codex`: the production `install_missing_harness_cli` performs a
+# REAL local install of the engine-pinned Codex from the npm registry into the
+# disposable home, and the receipt must name the release-verified package-native
+# `codex.exe`, which must answer `--version` with the pin directly and by bare name
+# through a shell-less Node spawn, and to which both the harness rows of the daemon
+# Ouroboros starts itself and `claudexor doctor` must resolve; that daemon is always
+# stopped. No login, OAuth, account or model task is attempted. An engine without
+# Windows native Codex install (3.14.0 and older) refuses the dry-run disclosure with
+# its own typed code, so this job stays red until the runtime pin carries that
+# release — there is no skip.
+#
+# WHAT MAKES IT RED, ON PURPOSE. There is no "harness unavailable, skipping" branch
+# anywhere below. An absent seam, an engine below the delegated-marker floor, an
+# unreachable daemon, a run that never terminates, a primary artifact that cannot
+# be read to EOF and tied to the run's own claim, or a child that produced no edit
+# after the one narrowly eligible live retry are all hard failures with a named reason.
+# Polling tolerates only the Windows Git atomic-object race where a `.git/objects/*/
+# tmp_obj_*` scratch name disappears between readdir/lstat (at most three reads);
+# every other control-plane error remains immediately red.
+#
+# A HOST WITH NO OS BOUNDARY IS NOT A FAILURE. Only macOS has a kernel mechanism;
+# the owner has ruled out kernel boundaries elsewhere. Off macOS a delegated run gets
+# a scoped HOME, records no confinement mechanism, discloses that absence as a typed
+# fact, and completes normally (D21). The gate therefore never asserts a boundary and
+# never branches on the platform to decide whether one was expected — it prints the
+# `containment` block whatever it says, so both outcomes are legible.
+
+name: Claudexor platform gate (API keys — subscription auth NOT covered)
+
+on:
+  push:
+    branches: [ouroboros, ouroboros-stable]
+    paths:
+      - 'ouroboros/gateways/**'
+      - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/claudexor_runtime.py'
+      - 'ouroboros/claudexor_runtime_pin.json'
+      - 'ouroboros/platform_layer.py'
+      - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/tools/delegate_integration.py'
+      - 'ouroboros/tools/subagent_integration.py'
+      - 'ouroboros/subagent_worktrees.py'
+      - 'ouroboros/delegate_custody.py'
+      - 'ouroboros/review_execution.py'
+      - 'ouroboros/subagents.py'
+      - 'ouroboros/config.py'
+      - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/claudexor_toolchain_smoke.py'
+      - 'scripts/fetch_claudexor_runtime.py'
+      - 'Ouroboros.spec'
+      - 'build.sh'
+      - 'build_linux.sh'
+      - 'build_windows.ps1'
+      - '.github/actions/setup-python-env/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'requirements-runtime.lock'
+      - '.github/workflows/claudexor-platform-gate.yml'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [ouroboros]
+    paths:
+      - 'ouroboros/gateways/**'
+      - 'ouroboros/claudexor_daemon.py'
+      - 'ouroboros/claudexor_runtime.py'
+      - 'ouroboros/claudexor_runtime_pin.json'
+      - 'ouroboros/platform_layer.py'
+      - 'ouroboros/tools/delegate.py'
+      - 'ouroboros/tools/delegate_integration.py'
+      - 'ouroboros/tools/subagent_integration.py'
+      - 'ouroboros/subagent_worktrees.py'
+      - 'ouroboros/delegate_custody.py'
+      - 'ouroboros/review_execution.py'
+      - 'ouroboros/subagents.py'
+      - 'ouroboros/config.py'
+      - 'scripts/claudexor_platform_smoke.py'
+      - 'scripts/claudexor_toolchain_smoke.py'
+      - 'scripts/fetch_claudexor_runtime.py'
+      - 'Ouroboros.spec'
+      - 'build.sh'
+      - 'build_linux.sh'
+      - 'build_windows.ps1'
+      - '.github/actions/setup-python-env/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'requirements-runtime.lock'
+      - '.github/workflows/claudexor-platform-gate.yml'
+  workflow_dispatch:
+    inputs:
+      run_live_lane:
+        description: 'Also run the paid live lane (real API keys, real harness)'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: claudexor-gate-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # One dialect on all three runners. Windows runners ship Git Bash, so the same
+    # script text is executed everywhere and a platform-specific step is an explicit
+    # `if:`, never an accident of the default shell.
+    shell: bash
+
+env:
+  # Windows runners default subprocess/stdout decoding to cp1252; a UnicodeEncodeError
+  # in a diagnostic path would mask the real failure.
+  PYTHONUTF8: '1'
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Fixture lane — free, deterministic. Exact public runtime + wiring.
+  # ────────────────────────────────────────────────────────────────────────────
+  fixture:
+    # The job name is a check name, and a check name is read by people who never open
+    # the summary. It carries the caveat itself, not just the workflow title above it.
+    name: fixture · ${{ matrix.os }} · exact managed runtime, fake harness, no model
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job starts a daemon that spawns children; do not leave GITHUB_TOKEN
+          # in .git/config where one of them could read it.
+          persist-credentials: false
+      - name: Point the Ouroboros data root at the runner temp
+        # The `runner` context is not available in job-level `env` — GitHub rejects
+        # the whole workflow file at parse time. RUNNER_TEMP is, via the shell.
+        run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-python-env
+      - name: Install, probe, start, and drive one fake task through the managed runtime
+        run: python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
+      - name: Daemon log on failure
+        if: failure()
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "claudexor" / "daemon.log"
+          if path.is_file(): print(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+          PY
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Toolchain lane — free, credential-free. Real managed Node/npm for the CLI.
+  # ────────────────────────────────────────────────────────────────────────────
+  toolchain:
+    name: toolchain · ${{ matrix.os }} · real managed Node/npm, no ambient Node, no harness install
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Install the pinned CLI toolchain from official archives and exercise it without ambient Node/npm
+        # Isolate Python *at startup* before the script scrubs PATH, npm/Node
+        # config, harness overrides and Ouroboros roots; no setup-node here.
+        run: python -I scripts/claudexor_toolchain_smoke.py --root "$RUNNER_TEMP/cx-toolchain"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Consumer lane — free, credential-free. Real pinned Codex install on Windows.
+  # ────────────────────────────────────────────────────────────────────────────
+  consumer:
+    name: consumer · windows-latest · real pinned Codex local install + doctor, no login, no model task
+    runs-on: windows-latest
+    # Bounds the registry fetches beyond the production install timeout the witness applies.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-python-env
+      - name: Install the pinned toolchain, then the pinned Codex through the production installer seam
+        # Same isolated start as the toolchain job; no setup-node, no npm, no harness override.
+        run: python -I scripts/claudexor_toolchain_smoke.py --root "$RUNNER_TEMP/cx-consumer" --harness-install codex
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Live lane — real harness, explicit API key, one README edit. Costs money.
+  # ────────────────────────────────────────────────────────────────────────────
+  live:
+    name: live · ${{ matrix.os }} · ${{ matrix.harness }} · API key only, subscription NOT covered
+    if: |
+      github.ref == 'refs/heads/ouroboros-stable'
+      || (github.event_name == 'workflow_dispatch' && inputs.run_live_lane)
+      || startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Claude runs on all three hosts. Codex workspace-write is currently
+        # vendor-broken on native Windows (effectively read-only) and Ubuntu
+        # 24.04 GitHub runners (vendored bwrap/AppArmor RTM_NEWADDR refusal),
+        # so Codex's honest live mutation proof remains macOS-only. The fixture
+        # lane still proves the managed runtime on all three platforms.
+        # `harness` MUST be an axis rather than an `include`-only key: an include whose
+        # keys are absent from the base matrix is merged into every combination, so two
+        # such entries would collapse into one harness (the last one) instead of
+        # crossing. Being an axis, each include below matches the combinations that
+        # already carry that harness and only attaches the model to them.
+        harness: [claude, codex]
+        include:
+          # Weak model + low effort, per the owner's test rule (plan §4.10, answer 84).
+          - harness: claude
+            model: claude-haiku-4-5
+            effort: low
+            secret_name: anthropic
+            secret_env: ANTHROPIC_API_KEY
+          - harness: codex
+            # The mini lane twice returned a clean successful answer without
+            # performing the one-word edit, even after the bounded retry.
+            # Use the full tool-capable model for a strict mutation gate.
+            model: gpt-5.4
+            # Two successful low-effort runs returned prose without the edit;
+            # medium is still cheap but reliable enough for a strict tool gate.
+            effort: medium
+            secret_name: openai
+            secret_env: OPENAI_API_KEY
+        exclude:
+          - os: ubuntu-latest
+            harness: codex
+          - os: windows-latest
+            harness: codex
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Point the Ouroboros data root at the runner temp
+        # Same parse-time restriction as the fixture lane: `runner` is not a valid
+        # context for job-level `env`; RUNNER_TEMP is available to the shell.
+        run: echo "OUROBOROS_DATA_DIR=$RUNNER_TEMP/ouroboros-data" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/setup-python-env
+      - uses: actions/setup-node@v4
+        with:
+          # Lockstep pair: must equal pin.node_version in ouroboros/claudexor_runtime_pin.json.
+          node-version: '24.16.0'
+      - name: Stage the host-owned bundled Node layout
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os, pathlib, shutil, subprocess
+          source = pathlib.Path(subprocess.check_output(
+              ["node", "-p", "process.execPath"], text=True, encoding="utf-8").strip())
+          target = pathlib.Path("node-standalone") / ("node.exe" if os.name == "nt" else "bin/node")
+          target.parent.mkdir(parents=True, exist_ok=True)
+          shutil.copy2(source, target)
+          target.chmod(0o755)
+          print(f"staged Node {subprocess.check_output([str(target), '--version'], text=True, encoding='utf-8').strip()} at {target}")
+          PY
+      - name: Install only the selected harness CLI
+        run: |
+          set -euo pipefail
+          case "${{ matrix.harness }}" in
+            claude) npm install -g @anthropic-ai/claude-code ;;
+            codex)  npm install -g @openai/codex ;;
+            *) echo "unknown harness ${{ matrix.harness }}" >&2; exit 1 ;;
+          esac
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            global_root="$(cygpath -u "$(npm root -g)")"
+            case "${{ matrix.harness }}" in
+              claude)
+                native_bin="$(find "$global_root/@anthropic-ai/claude-code/bin" \
+                  -maxdepth 1 -type f -iname 'claude.exe' -print -quit)"
+                override=CLAUDEXOR_CLAUDE_BIN
+                ;;
+              codex)
+                native_bin="$(find "$global_root/@openai/codex" \
+                  -type f -iname 'codex.exe' -print -quit)"
+                override=CLAUDEXOR_CODEX_BIN
+                ;;
+            esac
+            test -n "$native_bin" && test -f "$native_bin"
+            "$native_bin" --version
+            # Modern Node deliberately refuses .cmd through spawn without a
+            # shell. Pin the package-native executable instead of an npm shim.
+            echo "$override=$(cygpath -w "$native_bin")" >> "$GITHUB_ENV"
+          fi
+      - name: Require the API key
+        # A missing secret is a hard red, not a skip: a lane that quietly passes
+        # without credentials is the dishonest green this gate exists to avoid.
+        env:
+          ANTHROPIC_API_KEY: ${{ matrix.harness == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.harness == 'codex' && secrets.OPENAI_API_KEY || '' }}
+        run: |
+          set -euo pipefail
+          case "${{ matrix.harness }}" in
+            claude) test -n "${ANTHROPIC_API_KEY:-}" || { echo "ANTHROPIC_API_KEY secret is not set" >&2; exit 1; } ;;
+            codex)  test -n "${OPENAI_API_KEY:-}"    || { echo "OPENAI_API_KEY secret is not set" >&2; exit 1; } ;;
+          esac
+      - name: Install, probe, start, and drive one live task through the managed runtime
+        env:
+          ANTHROPIC_API_KEY: ${{ matrix.harness == 'claude' && secrets.ANTHROPIC_API_KEY || '' }}
+          OPENAI_API_KEY: ${{ matrix.harness == 'codex' && secrets.OPENAI_API_KEY || '' }}
+        run: |
+          python scripts/claudexor_platform_smoke.py \
+            --managed-runtime \
+            --lane live \
+            --harness "${{ matrix.harness }}" \
+            --model "${{ matrix.model }}" \
+            --effort "${{ matrix.effort }}" \
+            --secret-name "${{ matrix.secret_name }}" \
+            --secret-env "${{ matrix.secret_env }}" \
+            --max-seconds 900
+      - name: Daemon log on failure
+        if: failure()
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          path = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]) / "claudexor" / "daemon.log"
+          if path.is_file(): print(path.read_text(encoding="utf-8", errors="replace")[-20000:])
+          PY

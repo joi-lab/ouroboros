@@ -6,6 +6,8 @@ import subprocess
 import sys
 import types
 
+import pytest
+
 import ouroboros.launcher_bootstrap as bootstrap_module
 
 
@@ -301,9 +303,11 @@ def test_agent_lifecycle_preflight_cleans_host_service_port(monkeypatch):
     launcher._shutdown_event.clear()
     monkeypatch.setattr(launcher, "_host_service_port", lambda: 9876)
     monkeypatch.setattr(launcher, "_kill_stale_on_port", lambda port: killed.append(port))
+    # The per-generation stray sweep must never signal a real process from a test.
+    monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
     monkeypatch.setattr(launcher, "start_agent", lambda port: FakeProcess())
-    monkeypatch.setattr(launcher, "_poll_port_file", lambda timeout=30: 8765)
-    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=30.0: True)
+    monkeypatch.setattr(launcher, "_poll_port_file", lambda timeout=30, abort_event=None: 8765)
+    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=30.0, abort_event=None: True)
     monkeypatch.setattr(launcher, "_agent_job", None)
     monkeypatch.setattr(launcher, "log", types.SimpleNamespace(info=lambda *args, **kwargs: None))
 
@@ -315,7 +319,60 @@ def test_agent_lifecycle_preflight_cleans_host_service_port(monkeypatch):
     assert killed[:2] == [8765, 9876]
 
 
-def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatch, tmp_path):
+def test_start_agent_exports_presentation_posture(monkeypatch, tmp_path):
+    """Producer contract (Owner Surface Fact): the launcher's OWN env assembly
+    must export OUROBOROS_PRESENTATION — a monkeypatched reader test cannot
+    catch a dead wire (the retired is_desktop lesson)."""
+    import launcher
+
+    data_dir = tmp_path / "data"
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    (repo_dir / "server.py").write_text("print('server')\n", encoding="utf-8")
+    captured = {}
+
+    class FakeStdout:
+        def readline(self):
+            return b""
+
+    class FakeProcess:
+        pid = 4242
+        stdout = FakeStdout()
+
+    def fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env") or {}
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher, "IS_WINDOWS", False)
+    monkeypatch.setattr(launcher, "DATA_DIR", data_dir)
+    monkeypatch.setattr(launcher, "REPO_DIR", repo_dir)
+    monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
+    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
+    monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
+    monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", lambda: {"start_new_session": True})
+    monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
+    monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 4242)
+
+    monkeypatch.setattr(launcher, "_headless", False)
+    launcher.start_agent(port=9871)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "desktop_window"
+
+    monkeypatch.setattr(launcher, "_headless", True)
+    launcher.start_agent(port=9872)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "browser_fallback"
+
+    monkeypatch.setattr(launcher, "_external_ui", True)
+    monkeypatch.setenv("OUROBOROS_PRESENTATION", "android_app")
+    launcher.start_agent(port=9873)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "android_app"
+
+    monkeypatch.delenv("OUROBOROS_PRESENTATION")
+    launcher.start_agent(port=9874)
+    assert captured["env"]["OUROBOROS_PRESENTATION"] == "web"
+
+
+@pytest.mark.parametrize("parent_host", [None, "", "0.0.0.0"])
+def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatch, tmp_path, parent_host):
     import launcher
 
     data_dir = tmp_path / "data"
@@ -341,7 +398,12 @@ def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatc
     monkeypatch.setattr(launcher, "DATA_DIR", data_dir)
     monkeypatch.setattr(launcher, "REPO_DIR", repo_dir)
     monkeypatch.setattr(launcher, "EMBEDDED_PYTHON", sys.executable)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {})
+    saved = {"OUROBOROS_SERVER_HOST": "127.0.0.1"}
+    monkeypatch.setattr(launcher, "_load_settings", lambda: saved)
+    if parent_host is None:
+        monkeypatch.delenv("OUROBOROS_SERVER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("OUROBOROS_SERVER_HOST", parent_host)
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
     monkeypatch.setattr(launcher, "subprocess_new_group_kwargs", lambda: {"start_new_session": True})
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
@@ -360,6 +422,13 @@ def test_start_agent_unix_uses_process_group_and_writes_server_record(monkeypatc
     assert record["server_path"] == str((repo_dir / "server.py").resolve())
     assert record["argv"] == [sys.executable, str((repo_dir / "server.py").resolve())]
     assert record["created_at"]
+    assert record["server_host_source"] == ("environment" if parent_host else "settings")
+    assert captured["kwargs"]["env"]["OUROBOROS_SERVER_HOST"] == (
+        saved["OUROBOROS_SERVER_HOST"] if parent_host is None else parent_host)
+    saved["OUROBOROS_SERVER_HOST"] = "127.0.0.2"
+    launcher.start_agent(port=9876)
+    assert captured["kwargs"]["env"]["OUROBOROS_SERVER_HOST"] == (
+        saved["OUROBOROS_SERVER_HOST"] if parent_host is None else parent_host)
 
 
 def test_recorded_server_cleanup_ignores_unrelated_pid(monkeypatch, tmp_path):
@@ -388,9 +457,9 @@ def test_recorded_server_cleanup_ignores_unrelated_pid(monkeypatch, tmp_path):
     monkeypatch.setattr(launcher, "pid_is_alive", lambda _pid: True)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 22222)
     monkeypatch.setattr(launcher, "process_command", lambda _pid: "/usr/bin/python unrelated.py")
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("pgid", pgid)))
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("pgid", pgid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -426,9 +495,9 @@ def test_recorded_server_cleanup_kills_verified_process_group(monkeypatch, tmp_p
     monkeypatch.setattr(launcher, "process_command", lambda _pid: f"{sys.executable} {server_py}")
     monkeypatch.setattr(launcher, "current_process_group_id", lambda: 99999)
     monkeypatch.setattr(launcher, "time", types.SimpleNamespace(sleep=lambda *_a, **_k: None))
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("killpg", pgid)))
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("killpg", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -465,9 +534,9 @@ def test_recorded_server_cleanup_ignores_mismatched_process_group(monkeypatch, t
     monkeypatch.setattr(launcher, "pid_is_alive", lambda _pid: True)
     monkeypatch.setattr(launcher, "process_group_id", lambda _pid: 44444)
     monkeypatch.setattr(launcher, "process_command", lambda _pid: f"{sys.executable} {server_py}")
-    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid: killed.append(("term", pgid)))
-    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid: killed.append(("killpg", pgid)))
-    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid: killed.append(("pid", pid)))
+    monkeypatch.setattr(launcher, "terminate_process_group_id", lambda pgid, **kw: killed.append(("term", pgid)))
+    monkeypatch.setattr(launcher, "kill_process_group_id", lambda pgid, **kw: killed.append(("killpg", pgid)))
+    monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: killed.append(("pid", pid)))
 
     launcher._cleanup_recorded_server_process("test")
 
@@ -537,7 +606,7 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     monkeypatch.setattr(launcher, "_load_settings", lambda: {})
     monkeypatch.setattr(launcher, "_apply_settings_to_env", lambda _settings: None)
     monkeypatch.setattr(launcher, "_hidden_popen", fake_popen)
-    monkeypatch.setattr(launcher, "create_kill_on_close_job", lambda: calls.append(("create_job", None)) or "job")
+    monkeypatch.setattr(launcher, "create_kill_on_close_job", lambda **kw: calls.append(("create_job", kw)) or "job")
     monkeypatch.setattr(launcher, "assign_pid_to_job", lambda job, pid: calls.append(("assign", (job, pid))) or True)
     monkeypatch.setattr(launcher, "resume_process", lambda pid: calls.append(("resume", pid)) or True)
 
@@ -550,10 +619,108 @@ def test_start_agent_windows_assigns_job_before_resume_and_records(monkeypatch, 
     lifecycle_calls = [call for call in calls if call[0] != "popen_env"]
     assert lifecycle_calls[:4] == [
         ("popen_flags", 0x204),
-        ("create_job", None),
+        ("create_job", {"allow_breakaway": True}),
         ("assign", ("job", 54321)),
         ("resume", 54321),
     ]
     record = json.loads((data_dir / "state" / "server_process.json").read_text(encoding="utf-8"))
     assert record["pid"] == 54321
     assert record["port"] == 8765
+
+
+def test_launcher_reexports_the_windows_runtime_leaf():
+    """The Windows pythonnet/pywebview preparation left launcher.py whole.
+
+    Upstream's final cutoff grew launcher.py past this branch's 1500-line module
+    ceiling, so the Windows-only runtime preparation moved to its own leaf. It is
+    an extraction, not a rewrite: launcher.py re-exports the SAME objects under the
+    SAME names, so every prior importer, every monkeypatch target and the packaging
+    hook checks that read launcher.py's source see no change at all.
+    """
+    import launcher
+    from ouroboros import launcher_windows_runtime
+
+    assert (
+        launcher._prepare_windows_webview_runtime
+        is launcher_windows_runtime._prepare_windows_webview_runtime
+    )
+    assert launcher._show_windows_message is launcher_windows_runtime._show_windows_message
+    # The DLL-directory handle list moved WITH its only reader and was never part of
+    # launcher.py's surface, so it is deliberately not re-exported.
+    assert not hasattr(launcher, "_windows_dll_dir_handles")
+    assert isinstance(launcher_windows_runtime._windows_dll_dir_handles, list)
+
+
+def test_external_source_launcher_keeps_older_seed_version_and_local_head(tmp_path, monkeypatch):
+    import launcher
+
+    bootstrap = _reload_bootstrap()
+    src = _make_bundle_source(tmp_path)
+    seed, repo = tmp_path / 'seed', tmp_path / 'repo'
+    _write_bundle(src, seed)
+    (seed / 'VERSION').write_text('4.50.0-rc.2\n')
+    original_manifest = (seed / 'repo_bundle_manifest.json').read_bytes()
+    assert bootstrap.ensure_managed_repo(_make_context(seed, repo)) == 'created'
+    (repo / 'VERSION').write_text('4.50.1\n')
+    (repo / 'server.py').write_text("print('personal body')\n")
+    _run(['git', 'add', '-A'], cwd=repo)
+    _run(['git', 'commit', '-m', 'personal source update'], cwd=repo)
+    personal_head = _git_output(repo, 'rev-parse', 'HEAD')
+    monkeypatch.setattr(launcher, '_external_seed_bundle', seed)
+    monkeypatch.setattr(launcher, 'APP_VERSION', '4.50.1')
+    monkeypatch.setattr(launcher, 'REPO_DIR', repo)
+    monkeypatch.setattr(launcher, 'DATA_DIR', tmp_path / 'data')
+    monkeypatch.setattr(launcher, 'SETTINGS_PATH', tmp_path / 'data' / 'settings.json')
+    context = launcher._bootstrap_context()
+    assert context.app_version == '4.50.0-rc.2'
+    assert context.bundle_dir == seed
+    assert bootstrap.ensure_managed_repo(context) == 'unchanged'
+    assert _git_output(repo, 'rev-parse', 'HEAD') == personal_head
+    assert (repo / 'VERSION').read_text(encoding="utf-8").strip() == '4.50.1'
+    assert (seed / 'repo_bundle_manifest.json').read_bytes() == original_manifest
+
+
+def test_external_restart_reexecs_current_source_after_sync_in_same_process(tmp_path, monkeypatch):
+    import launcher
+
+    class ReexecReached(BaseException):
+        pass
+
+    calls = []
+    process = types.SimpleNamespace(pid=12345, returncode=launcher.RESTART_EXIT_CODE,
+                                    wait=lambda: None)
+    monkeypatch.setattr(launcher, '_external_seed_bundle', tmp_path / 'seed')
+    monkeypatch.setattr(launcher, 'REPO_DIR', tmp_path / 'repo')
+    monkeypatch.setattr(launcher, '_launch_argv', ['--no-ui', '--seed-bundle', str(tmp_path / 'seed')])
+    monkeypatch.setattr(launcher, '_pre_generation_cleanup', lambda port: [])
+    monkeypatch.setattr(launcher, 'update_external_host', lambda *a: calls.append('native') or {})
+    monkeypatch.setattr(launcher, 'start_agent', lambda port: calls.append('core') or process)
+    monkeypatch.setattr(launcher, '_poll_port_file', lambda **kw: 8765)
+    monkeypatch.setattr(launcher, '_update_server_process_record_port', lambda *a: None)
+    monkeypatch.setattr(launcher, '_wait_for_server', lambda *a, **kw: True)
+    monkeypatch.setattr(launcher, '_cleanup_recorded_server_group_for_pid', lambda *a: None)
+    monkeypatch.setattr(launcher, '_sync_existing_repo_from_bundle', lambda: calls.append('source'))
+    monkeypatch.setattr(launcher, '_install_deps', lambda: calls.append('deps') or True)
+    monkeypatch.setattr(launcher, 'release_pid_lock', lambda: calls.append('release'))
+    monkeypatch.setattr(launcher.time, 'sleep', lambda *a: None)
+
+    def reexec(executable, argv):
+        calls.append(('exec', executable, argv))
+        raise ReexecReached()
+
+    monkeypatch.setattr(launcher.os, 'execv', reexec)
+    launcher._shutdown_event.clear()
+    launcher._agent_restart_requested.clear()
+    try:
+        try:
+            launcher.agent_lifecycle_loop()
+        except ReexecReached:
+            pass
+        else:
+            raise AssertionError('The same process did not re-exec the source launcher')
+    finally:
+        launcher._shutdown_event.clear()
+    assert calls[:5] == ['native', 'core', 'source', 'deps', 'release']
+    assert calls[5] == ('exec', launcher.EMBEDDED_PYTHON,
+                        [launcher.EMBEDDED_PYTHON, str(tmp_path / 'repo' / 'launcher.py'),
+                         '--no-ui', '--seed-bundle', str(tmp_path / 'seed')])

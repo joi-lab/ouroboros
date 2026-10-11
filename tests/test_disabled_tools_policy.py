@@ -136,6 +136,7 @@ def test_registry_hides_and_blocks_disabled_tools(tmp_path, monkeypatch):
 
 
 def test_registry_hides_missing_credential_tools(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.tools.github.github_cli_configured", lambda: False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
@@ -148,23 +149,20 @@ def test_registry_hides_missing_credential_tools(tmp_path, monkeypatch):
     reg = ToolRegistry(repo_dir=repo, drive_root=data)
     reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_id="task-missing-creds"))
 
-    assert "claude_code_edit" not in reg.available_tools()
-    assert reg.get_schema_by_name("claude_code_edit") is None
-    blocked = reg.execute("claude_code_edit", {"prompt": "edit"})
-    assert "CAPABILITY_UNAVAILABLE" in blocked
-    assert "ANTHROPIC_API_KEY" in blocked
-
+    assert "create_github_issue" not in reg.available_tools()
     assert reg.get_schema_by_name("create_github_issue") is None
     assert reg.get_schema_by_name("submit_skill_to_hub") is None
     assert reg.get_schema_by_name("generate_evolution_stats") is None
-    assert "CAPABILITY_UNAVAILABLE" in reg.execute("submit_skill_to_hub", {"skill": "x"})
+    blocked = reg.execute("submit_skill_to_hub", {"skill": "x"})
+    assert "CAPABILITY_UNAVAILABLE" in blocked
+    assert "GITHUB_TOKEN" in blocked
     assert "CAPABILITY_UNAVAILABLE" in reg.execute("generate_evolution_stats", {})
     reg.schemas()
     omissions = reg.capability_omissions()
     assert any(
         item.get("surface") == "tools"
         and item.get("reason") == "missing_credential"
-        and "claude_code_edit" in item.get("tools", [])
+        and "submit_skill_to_hub" in item.get("tools", [])
         for item in omissions
     )
 
@@ -178,23 +176,30 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
 
     seen = {}
 
-    def _private_search_code(ctx, query="", max_results=0, **_kwargs):
+    def _private_search_code(
+        ctx, query="", max_results=0, _resolved_binding=None, **_kwargs
+    ):
         seen["query"] = query
         seen["max_results"] = max_results
+        seen["binding"] = _resolved_binding
         return "ok"
 
     reg.override_handler("search_code", _private_search_code)
     assert reg.execute("search_code", {"query": "needle", "max_entries": 2}) == "ok"
     assert seen["query"] == "needle"
     assert seen["max_results"] == 2
+    assert seen["binding"] is not None
 
-    def _private_vcs_status(ctx, path="", max_chars=0):
-        seen["vcs_status"] = (path, max_chars)
+    def _private_vcs_status(
+        ctx, path="", max_chars=0, root="system_repo", _resolved_binding=None,
+    ):
+        seen["vcs_status"] = (path, max_chars, root, _resolved_binding)
         return "status-ok"
 
     reg.override_handler("vcs_status", _private_vcs_status)
     assert reg.execute("vcs_status", {"root": "system_repo", "path": "."}) == "status-ok"
-    assert seen["vcs_status"] == (".", 0)
+    assert seen["vcs_status"][:3] == (".", 0, "system_repo")
+    assert seen["vcs_status"][3].root == "system_repo"
 
     result = reg.execute("search_code", {"dir": "."})
     assert "TOOL_ARG_ERROR (search_code)" in result
@@ -202,7 +207,7 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
     assert "_private_search_code" not in result
     assert "unexpected keyword" not in result
 
-    def _internal_type_error(ctx, query=""):
+    def _internal_type_error(ctx, query="", _resolved_binding=None):
         raise TypeError("internal math failed")
 
     reg.override_handler("search_code", _internal_type_error)
@@ -213,12 +218,85 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
     result = reg.execute("commit_reviewed", {"commit_message": "x", "skip_advisory_pre_review": True})
     assert "TOOL_ARG_ERROR (commit_reviewed)" in result
     assert "skip_advisory_review" in result
-    assert "skip_advisory_pre_review" not in result
+    assert "unsupported argument(s): skip_advisory_pre_review" in result
 
     result = reg.execute("list_skills", {"foo": "bar"})
     assert "TOOL_ARG_ERROR (list_skills)" in result
     assert "Accepted parameters: none" in result
     assert "_kwargs" not in result
+
+
+def test_legacy_claude_code_edit_contract_also_disables_delegate_start(tmp_path, monkeypatch):
+    """D10 compatibility shim (registry `_disabled_tools`): a saved contract that
+    carried disabled_tools=["claude_code_edit"] — the retired external coding
+    gateway — must keep withholding the SUCCESSOR delegated-coding verb
+    `delegate_start`. The dead name itself stays in the disabled set too, so old
+    contracts round-trip and the dead name is blocked as disabled, not surfaced
+    as an unknown-tool surprise."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    repo = tmp_path / "repo"
+    data = tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    # sanity: the successor exists by default
+    assert "delegate_start" in reg.available_tools()
+
+    contract = build_task_contract({"description": "x", "disabled_tools": ["claude_code_edit"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+
+    avail = set(reg.available_tools())
+    schema_names = {s["function"]["name"] for s in reg.schemas()}
+    assert "delegate_start" not in avail
+    assert "delegate_start" not in schema_names
+    assert reg.get_schema_by_name("delegate_start") is None
+    blocked = reg.execute("delegate_start", {"prompt": "x"})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in blocked and "disabled_tools" in blocked
+    # The legacy name is inert but still reported as withheld-by-contract.
+    dead = reg.execute("claude_code_edit", {"prompt": "x"})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in dead and "disabled_tools" in dead
+
+    # A contract that does NOT name claude_code_edit leaves delegate_start alone.
+    contract2 = build_task_contract({"description": "x", "disabled_tools": ["web_search"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract2}))
+    assert "delegate_start" in set(reg.available_tools())
+
+
+def test_retired_run_ci_tests_has_no_shim_and_no_table_row(tmp_path, monkeypatch):
+    """`run_ci_tests` pushed a branch and dispatched a workflow; its successor
+    `get_github_checks` only reads. A saved contract that withheld the retired
+    tool therefore withholds nothing of the successor, and the dead name stays
+    inert: blocked as disabled where a contract names it, unknown elsewhere."""
+    import importlib.util
+
+    from ouroboros.safety import TOOL_POLICY
+    from ouroboros.tool_capabilities import OBSERVE_WORLD_MUTATION_TOOLS
+    from ouroboros.tools import github
+    from ouroboros.tools.registry_guards import _GITHUB_TOKEN_TOOLS
+
+    monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: "fixture-token")
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    reg = ToolRegistry(repo_dir=repo, drive_root=data)
+    assert importlib.util.find_spec("ouroboros.tools.ci") is None
+    assert "ci" not in ToolRegistry._FROZEN_TOOL_MODULES and "github" in ToolRegistry._FROZEN_TOOL_MODULES
+    for table in (TOOL_POLICY, OBSERVE_WORLD_MUTATION_TOOLS, _GITHUB_TOKEN_TOOLS):
+        assert "run_ci_tests" not in table
+    assert "get_github_checks" in TOOL_POLICY and "get_github_checks" in _GITHUB_TOKEN_TOOLS
+
+    contract = build_task_contract({"description": "x", "disabled_tools": ["run_ci_tests"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+    dead = reg.execute("run_ci_tests", {})
+    assert "RESOURCE_CONSTRAINT_BLOCKED" in dead and "disabled_tools" in dead
+    assert "get_github_checks" in set(reg.available_tools())
+    assert reg.get_schema_by_name("get_github_checks") is not None
+
+    # A contract that names the successor does withhold it; without one the dead name is unknown.
+    contract = build_task_contract({"description": "x", "disabled_tools": ["get_github_checks"]})
+    reg.set_context(ToolContext(repo_dir=repo, drive_root=data, task_metadata={"task_contract": contract}))
+    assert "get_github_checks" not in set(reg.available_tools())
+    assert reg.execute("run_ci_tests", {}).startswith("⚠️ Unknown tool")
 
 
 def test_subagent_inherits_disabled_tools():

@@ -5,6 +5,8 @@ import json
 import time
 from types import SimpleNamespace
 
+import pytest
+
 
 def _patch_queue(queue_module, workers_module, monkeypatch, tmp_path, workers):
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
@@ -212,7 +214,7 @@ def test_tree_tools_available_to_subagents_but_writes_stay_blocked():
         assert name in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
         assert name in ACTING_SUBAGENT_TOOL_NAMES
     # a read-only subagent that can tree_note must STILL NOT escalate to real writes
-    for blocked in ("write_file", "edit_text", "run_command", "commit_reviewed", "knowledge_write"):
+    for blocked in ("write_file", "edit_text", "run_command", "commit_reviewed", "update_identity"):
         assert blocked not in LOCAL_READONLY_SUBAGENT_TOOL_NAMES
 
 
@@ -245,6 +247,72 @@ def test_tree_ledger_scope_and_attention(monkeypatch, tmp_path):
     assert L.tree_ledger_rows("bad/scope") == []
     digest = L.tree_ledger_tail_digest("rootA")
     assert "contract" in digest and "needs_parent_attention" in digest
+
+
+def test_review_requested_preserves_typed_concerns_and_exact_hash(monkeypatch, tmp_path):
+    import ouroboros.task_tree_ledger as L
+    from ouroboros.tools.control import _wait_attention_poll
+
+    monkeypatch.setattr(L, "DATA_DIR", str(tmp_path))
+    payload = {"evidence_ref": "artifact:research-notes", "evidence_sha256": "a" * 64}
+    first = L.tree_ledger_append(
+        "rootA", "review_requested", "Challenge the source coverage.",
+        task_id="childA", role="researcher", payload=payload,
+    )
+    assert first.startswith("OK:")
+    second = L.tree_ledger_append(
+        "rootA", "review_requested", "Same bytes, different security concern.",
+        task_id="childB", role="critic", payload={**payload, "evidence_ref": "artifact:copy"},
+    )
+    assert second.startswith("OK:")
+    rows = [row for row in L.tree_ledger_rows("rootA") if row["kind"] == "review_requested"]
+    assert len(rows) == 2
+    assert all(row["needs_parent_attention"] is True for row in rows)
+    assert rows[0]["payload"] == payload
+    # Recovery/context projections retain the exact 64-character binding, not
+    # merely a prefix that cannot identify the evidence after wake acknowledgement.
+    assert "a" * 64 in L.tree_ledger_page("rootA", data_root=tmp_path)
+    assert "a" * 64 in L.tree_ledger_tail_digest("rootA", data_root=tmp_path)
+
+    # Ordinary sliced waits are branch-local: waiting for childA must not surface
+    # childB's request merely because both share the same tree ledger.
+    ctx = SimpleNamespace(task_id="parentA", task_metadata={"root_task_id": "rootA"})
+    early = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert early is not None
+    assert [row["task_id"] for row in early["beacons"]] == ["childA"]
+    assert "TOOL_ARG_ERROR" in L.tree_ledger_append(
+        "rootA", "review_requested", "missing hash", task_id="childA",
+        payload={"evidence_ref": "artifact:x"},
+    )
+
+
+def test_wait_attention_cursor_delivers_preexisting_same_timestamp_rows_fifo(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.task_tree_ledger as L
+    from ouroboros.tools.control import _wait_attention_poll
+
+    monkeypatch.setattr(L, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(L, "utc_now_iso", lambda: "2026-08-24T12:00:00Z")
+    for index in range(7):
+        assert L.tree_ledger_append(
+            "rootA", "question", f"question-{index}", task_id="childA",
+        ).startswith("OK:")
+
+    # All rows predate entry into the wait.  The response stays bounded, but
+    # advances only across rows it actually delivered, including a timestamp
+    # shared by more rows than the five-item response bound.
+    ctx = SimpleNamespace(task_id="parentA", task_metadata={"root_task_id": "rootA"})
+    first = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in first["beacons"]] == [
+        f"question-{index}" for index in range(5)
+    ]
+    assert first["beacons_remaining"] == 2
+
+    second = _wait_attention_poll(ctx, "", ["childA"])({}, {})
+    assert [row["text"] for row in second["beacons"]] == ["question-5", "question-6"]
+    assert second["beacons_remaining"] == 0
+    assert _wait_attention_poll(ctx, "", ["childA"])({}, {}) is None
 
 
 def test_delegation_constraint_payload_and_override(monkeypatch, tmp_path):
@@ -308,21 +376,30 @@ def test_effective_delegation_budget_honors_require_lane_and_scope():
     ignored = effective_delegation_budget({}, unresolved_constraints=[row], role="researcher", requested_lane="light")
     assert ignored.ok is True
 
+    # The INTENDED lane decides, not the literal request (v6.87.28: this gate runs at
+    # ADMISSION, before the child is dispatched, so no effective lane exists yet —
+    # `subagents.intended_lane` is what a request MEANS, and its one owner).
     requested_does_not_count = effective_delegation_budget(
         {},
         unresolved_constraints=[row],
         role="critic",
-        requested_lane="heavy",
-        effective_lane="light",
+        requested_lane="auto",
+        intended_lane="light",
     )
     assert requested_does_not_count.ok is False
 
-    blocked = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="light", effective_lane="light")
+    blocked = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="light", intended_lane="light")
     assert blocked.ok is False
     assert blocked.reason_code == "delegation_constraint_require_lane"
 
-    allowed = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="heavy", effective_lane="heavy")
+    allowed = effective_delegation_budget({}, unresolved_constraints=[row], role="critic", requested_lane="heavy", intended_lane="heavy")
     assert allowed.ok is True
+    # F9 (sol #1): a PASSING admission under an applicable require_lane carries
+    # the verified lane out, so the scheduler can stamp it onto the child record
+    # and the dispatch-time policy default cannot override it.
+    assert allowed.required_lane == "heavy"
+    # A non-applicable constraint (role mismatch) contributes no required lane.
+    assert ignored.required_lane == ""
 
 
 def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monkeypatch):
@@ -340,16 +417,29 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     workers = {4: SimpleNamespace(busy_task_id=None, proc=_FakeProc(), reaping=True)}
     _patch_queue(q, w, monkeypatch, tmp_path, workers)
     monkeypatch.setattr(q, "_kept_service_pids", lambda: set(), raising=False)
+    # A prior server lifespan can legitimately close the process-global bus.
+    # This fixture owns its publication collector, not a new supervisor bus.
+    monkeypatch.setattr(w, "_EVENT_Q_SHUTDOWN", True)
+    with pytest.raises(RuntimeError, match="supervisor event bus is shutting down"):
+        w.get_event_q()
+    emitted = []
+    monkeypatch.setattr(w, "get_event_q", lambda: SimpleNamespace(put=emitted.append))
 
     calls = []
-    monkeypatch.setattr(headless, "finalize_task_artifacts",
-                        lambda root, task: (calls.append(str(task.get("id"))), [])[1])
+    def finalize(root, task):
+        calls.append(str(task["id"]))
+        write_task_result(root, task["id"], "completed", artifact_status="ready",
+                          artifact_finalized_at="fixture")
+        return []
+    monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
 
     def _run(task, artifact_status):
         # Pre-write the worker's own terminal result so the reaper's post-kill re-check honors
         # it (self_status set) instead of clobbering it — the branch crit#2 lives in.
         write_task_result(tmp_path, str(task["id"]), "completed", artifact_status=artifact_status)
-        q._reap_timed_out_task({"worker_id": 4, "proc": None, "task_id": task["id"],
+        task["workspace_root"] = str(tmp_path / "workspace")
+        q._reap_timed_out_task({"worker_id": 4, "proc": workers[4].proc, "worker": workers[4],
+                                "drive_root": str(tmp_path), "task_id": task["id"],
                                 "task": task, "task_type": "task",
                                 "terminal_reason": "idle_timeout", "attempt": 1})
 
@@ -367,6 +457,10 @@ def test_reaper_finalizes_stuck_artifact_on_self_finalized_result(tmp_path, monk
     _run({"id": "wt3", "type": "task", "delegation_role": "subagent",
           "task_constraint": {"mode": "local_readonly_subagent"}}, "finalizing")
     assert calls == [], "a readonly subagent has no durable artifacts to finalize"
+    terminals = [event for event in emitted if event.get("type") == "task_done"]
+    assert [event["task_id"] for event in terminals] == ["wt1", "wt2", "wt3"]
+    assert all(event["status"] == "completed" and event["chat_id"] == 0 for event in terminals)
+    assert all(event["_files_prepared_attempt"] == 1 and event["worker_id"] == 4 for event in terminals)
 
 
 def test_task_is_readonly_subagent_gate():
@@ -424,7 +518,7 @@ def test_reaper_fails_closed_when_worker_not_confirmed_dead(tmp_path, monkeypatc
     write_task_result(tmp_path, "wedged1", STATUS_RUNNING, result="in progress")
 
     q._reap_timed_out_task({
-        "worker_id": 5, "proc": _AliveProc(), "task_id": "wedged1",
+        "worker_id": 5, "proc": slot.proc, "worker": slot, "drive_root": str(tmp_path), "task_id": "wedged1",
         "task": {"id": "wedged1", "type": "task", "chat_id": 7}, "task_type": "task",
         "terminal_reason": "idle_timeout", "attempt": 1,
         "owner_chat_id": 7,

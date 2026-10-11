@@ -13,26 +13,15 @@ import zipfile
 from dataclasses import dataclass, field
 from typing import List, Optional
 
+from ouroboros.config import get_runtime_mode
+from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
 log = logging.getLogger(__name__)
 
 
 _MAX_TOTAL_BYTES = 50 * 1024 * 1024  # 50 MB total uncompressed
 _MAX_FILE_COUNT = 200
 _MAX_PER_FILE_BYTES = 8 * 1024 * 1024  # 8 MB per individual file
-
-# Mirrors ClawHub text allowlist plus inert assets; loadable binaries stay denied.
-_ALLOWED_EXTENSIONS = frozenset({
-    ".md", ".markdown", ".txt", ".rst", ".org", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
-    ".py", ".sh", ".bash", ".zsh", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
-    ".html", ".htm", ".css", ".scss", ".sass", ".svg", ".csv", ".tsv", ".sql", ".graphql", ".gql",
-    ".lock", ".license", ".png", ".jpg", ".jpeg", ".gif", ".webp",
-})
-
-_ALLOWED_BARE_BASENAMES = frozenset({
-    "LICENSE", "COPYING", "NOTICE", "README", "CHANGELOG", "AUTHORS", "CONTRIBUTORS", "AGENTS",
-    ".gitignore", ".npmignore", ".editorconfig", ".gitattributes", ".eslintrc", ".prettierrc", ".nvmrc",
-})
-
 
 class FetchError(RuntimeError):
     """Archive validation failed closed."""
@@ -98,7 +87,7 @@ def _has_review_opaque_dir(path: pathlib.PurePosixPath) -> bool:
 
 def _validate_member_path(name: str) -> pathlib.PurePosixPath:
     """Normalize and reject absolute/traversal zip members before extraction."""
-    cleaned = name.replace("\\", "/").lstrip("/")
+    cleaned = name.replace("\\", "/")
     _reject_if(not cleaned, f"Archive member has empty path: {name!r}")
     posix = pathlib.PurePosixPath(cleaned)
     _reject_if(bool(posix.is_absolute() or posix.anchor), f"Archive member uses absolute path: {name!r}")
@@ -124,16 +113,6 @@ def _classify_member(member: zipfile.ZipInfo) -> str:
     return "file"
 
 
-def _extension_allowed(path: pathlib.PurePosixPath) -> bool:
-    name_lower = path.name.lower()
-    if path.name in _ALLOWED_BARE_BASENAMES or name_lower in {
-        bn.lower() for bn in _ALLOWED_BARE_BASENAMES
-    }:
-        return True
-    suffix = path.suffix.lower()
-    return suffix in _ALLOWED_EXTENSIONS
-
-
 def stage(
     archive_bytes: bytes,
     *,
@@ -143,6 +122,7 @@ def stage(
     staging_root: Optional[pathlib.Path] = None,
 ) -> StagedSkill:
     """Validate and extract into a private staging dir, cleaning up on failure."""
+    advisory = mode_has_unrestricted_agency(get_runtime_mode())
     _reject_if(
         not isinstance(archive_bytes, (bytes, bytearray)),
         f"archive_bytes must be bytes, got {type(archive_bytes).__name__}",
@@ -200,13 +180,16 @@ def stage(
                             rel_path = pathlib.PurePosixPath(*parts[1:])
                             if not rel_path.parts:
                                 continue
-                    _reject_if(_is_sensitive(rel_path), f"Archive contains sensitive-shape filename {rel_path}")
-                    _reject_if(_has_review_opaque_dir(rel_path), f"Archive contains review-opaque dependency directory {rel_path}")
-                    _reject_if(
-                        _is_loadable_binary(rel_path),
-                        f"Archive contains loadable-binary file {rel_path} (.so/.dll/.wasm/.pyc/.exe etc. are not permitted)",
-                    )
-                    _reject_if(not _extension_allowed(rel_path), f"Archive contains disallowed extension: {rel_path}")
+                    for finding, reason in (
+                        (_is_sensitive(rel_path), f"Archive contains sensitive-shape filename {rel_path}"),
+                        (_has_review_opaque_dir(rel_path), f"Archive contains review-opaque dependency directory {rel_path}"),
+                        (_is_loadable_binary(rel_path), f"Archive contains loadable-binary file {rel_path}"),
+                    ):
+                        if finding:
+                            if advisory:
+                                log.warning("Cyber Pro archive advice: %s", reason)
+                            else:
+                                raise FetchError(reason)
                     _reject_if(
                         member.file_size > _MAX_PER_FILE_BYTES,
                         f"Archive member {rel_path} is {member.file_size} bytes (cap {_MAX_PER_FILE_BYTES})",

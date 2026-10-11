@@ -80,6 +80,29 @@ def test_upload_spaces_in_filename(client, tmp_path):
     assert " " not in resp.json()["display_name"]
 
 
+@pytest.mark.parametrize("name", ["a" * 196 + ".txt", "ж" * 100 + ".txt"], ids=["ascii200", "utf8"])
+def test_valid_long_upload_names_keep_exact_bytes_on_both_ingresses(client, tmp_path, name):
+    from hashlib import sha256
+    from typing import get_type_hints
+    from ouroboros.gateway.contracts import UploadResponse
+    from ouroboros.gateway.files import store_chat_upload
+
+    payload = b"complete uploaded content"
+    source = tmp_path / name
+    source.write_bytes(payload)
+    host_copy = store_chat_upload(source, data_dir=tmp_path / "host")
+    assert host_copy.name.endswith("_" + name)
+    assert host_copy.read_bytes() == payload
+    response = client.post("/api/chat/upload", files={"file": (name, io.BytesIO(payload), "text/plain")})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["display_name"] == name
+    assert body["sha256"] == sha256(payload).hexdigest()
+    assert set(body) == set(get_type_hints(UploadResponse))
+    assert (tmp_path / "uploads" / body["filename"]).read_bytes() == payload
+    assert not list((tmp_path / "uploads").glob(".*.tmp"))
+
+
 def test_upload_invalid_content_length(client):
     """Non-numeric Content-Length should not cause a 500; treated as 0 (unknown)."""
     import io
@@ -121,26 +144,30 @@ def test_upload_lifecycle_delete_removes_file(client, tmp_path):
     assert not dest.exists(), "Deleted file must be gone"
 
 
-def test_upload_size_limit(client, tmp_path):
-    """Files over 50MB must be rejected with 413 and no file should be created."""
-    upload_dir = tmp_path / "uploads"
-    # Snapshot before: directory may not exist yet
-    before = set(upload_dir.iterdir()) if upload_dir.exists() else set()
+def test_upload_large_file_uses_disk_custody(client, tmp_path):
+    """The former50MiB transport cap must not reject ordinary task inputs."""
+    from hashlib import sha256
 
-    limit = 50 * 1024 * 1024
-    oversized = b"x" * (limit + 1)
-    resp = client.post("/api/chat/upload", files={"file": ("big.bin", io.BytesIO(oversized), "application/octet-stream")})
-    assert resp.status_code == 413
-    assert resp.json()["ok"] is False
-
-    # No new files (including UUID-prefixed ones) should remain after a 413
-    after = set(upload_dir.iterdir()) if upload_dir.exists() else set()
-    new_files = after - before
-    assert not new_files, f"Unexpected files left after 413: {new_files}"
-
-    # No temp uploading files should remain either
-    temp_files = [f for f in after if f.name.endswith(".uploading")]
-    assert not temp_files, f"Temp files not cleaned up: {temp_files}"
+    source = tmp_path / "large.bin"
+    block = b"x" * (1024 * 1024)
+    expected = sha256()
+    with source.open("wb") as handle:
+        for _ in range(51):
+            handle.write(block)
+            expected.update(block)
+    with source.open("rb") as handle:
+        resp = client.post("/api/chat/upload", files={"file": ("big.bin", handle, "application/octet-stream")})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["size"] == 51 * 1024 * 1024
+    assert body["sha256"] == expected.hexdigest()
+    destination = tmp_path / "uploads" / body["filename"]
+    with destination.open("rb") as handle:
+        actual = sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            actual.update(chunk)
+    assert actual.hexdigest() == expected.hexdigest()
+    assert not list(destination.parent.glob("*.uploading"))
 
 
 def _delete(client, payload):
@@ -247,3 +274,71 @@ def test_upload_parse_error_returns_400(client, monkeypatch):
     assert resp.status_code == 400
     assert resp.json()["ok"] is False
     assert "Unexpected disconnect" in resp.json()["error"]
+
+
+@pytest.mark.parametrize("copy_fails", [False, True])
+@pytest.mark.parametrize("cancel_mode", ["asyncio", "anyio"])
+def test_cancelled_upload_waits_for_its_copy_before_closing_spool(tmp_path, monkeypatch, copy_fails, cancel_mode):
+    import anyio
+    import asyncio
+    import tempfile
+    import threading
+    from types import SimpleNamespace
+    from starlette.datastructures import UploadFile
+    from ouroboros.gateway import files
+
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
+    spool = tempfile.SpooledTemporaryFile(max_size=10)
+    spool.write(b"complete file")
+    upload = UploadFile(spool, filename="cancelled.bin")
+    original = files._store_chat_upload
+    def held_copy(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        try:
+            if copy_fails:
+                raise OSError("controlled disk copy failure")
+            return original(*args, **kwargs)
+        finally:
+            finished.set()
+    monkeypatch.setattr(files, "_store_chat_upload", held_copy)
+    async def form():
+        return {"file": upload}
+    scopes = []
+    cancelled = []
+    async def request():
+        with anyio.CancelScope() as scope:
+            scopes.append(scope)
+            try:
+                await files.api_chat_upload(SimpleNamespace(form=form))
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+    async def run():
+        copying = asyncio.create_task(request())
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            scopes[0].cancel() if cancel_mode == "anyio" else copying.cancel()
+            await asyncio.sleep(0)
+            if cancel_mode == "asyncio":
+                copying.cancel()
+            await asyncio.sleep(0)
+            assert not copying.done() and not spool.closed
+        finally:
+            release.set()
+            try:
+                await copying
+            except asyncio.CancelledError:
+                assert cancel_mode == "asyncio"
+        assert cancelled == [True] and finished.is_set() and spool.closed
+        saved = list((tmp_path / "uploads").glob("*"))
+        assert len(saved) == (0 if copy_fails else 1)
+        if saved:
+            assert saved[0].name.endswith("_cancelled.bin")
+            assert saved[0].read_bytes() == b"complete file"
+        assert not list((tmp_path / "uploads").glob(".*.tmp"))
+    try:
+        asyncio.run(run())
+    finally:
+        spool.close()

@@ -32,11 +32,14 @@ htmlcov/
 dist/
 build/
 site/node_modules/
+web/node_modules/
 site/public/assets/
 *.dmg
 python-standalone/
 node-standalone/
 ripgrep-standalone/
+/betterleaks-standalone/
+/claudexor-runtime/
 
 # OS
 .DS_Store
@@ -57,7 +60,6 @@ MagicMock/
 .final_combined_review.py
 .review_*.py
 /.review-drive/
-/.adversarial-review/
 
 # Accidentally vendored site-packages fragments — guard against recurrence of the
 # pre-rc.7 "dump site-packages into the source tree" bug (see Version History
@@ -91,3 +93,16 @@ MagicMock/
 # test writing here must never dirty the tree or enter a release (v6.61.1).
 # Anchored: only the repo-root dir, never nested legitimate logs/ folders.
 /logs/
+
+# Sprint-local convergence census pins (private SHAs; never tracked)
+.convergence-parents
+
+# editbench v2 fixtures are GENERATED from the current working tree by
+# make_fixtures_v2.py; committing them would pin a snapshot the benchmark
+# deliberately does not measure, and leaving them untracked dirties the seed gate.
+devtools/benchmarks/editbench/fixtures_v2/
+
+# Other
+# Anchored to the repo root, like /logs/ and /ocr_pages/ above.
+/.devcontainer
+/graphify-out

@@ -7,7 +7,10 @@ top of the bundle copy inside the external continual-learning-bench checkout
 (`patch -p0 < <file>` from the checkout root, adjusting paths):
 
 1. `_launcher.v6560.patch` — write the declared `OUROBOROS_SAFETY_MODE=light`
-   into the isolated settings at creation. v6.56.0 added an owner-guard that
+   and the canonical `OUROBOROS_SUBAGENTS` bytes into isolated settings at
+   creation. `IsolatedServer` strips inherited runtime env; this makes the
+   benchmark's explicit one-actor profile authoritative there too. v6.56.0
+   added an owner-guard that
    refuses env-side `full -> light` lowering at server boot
    (`_guard_safety_mode_lowering`), which killed every isolated server with
    uvicorn rc=3; the reference v6.52.2 run had no guard and was effectively
@@ -80,8 +83,9 @@ itself) is the supported path for v6.56.0 bridge runs.
    `OUROBOROS_EFFORT_REVIEW`, `OUROBOROS_EFFORT_SCOPE_REVIEW`,
    `OUROBOROS_REVIEW_ENFORCEMENT`, `OUROBOROS_SAFETY_MODE`,
    `OUROBOROS_MAX_SUBAGENT_DEPTH`, `OUROBOROS_MAX_WORKERS`,
-   `OUROBOROS_CONTEXT_MODE` — explicit host exports win over the hardcoded
-   CC-parity defaults (runtime=advanced, 3× reviewer list, uniform effort).
+   `OUROBOROS_CONTEXT_MODE`, `OUROBOROS_SUBAGENTS` — explicit host exports
+   win over the hardcoded CC-parity defaults (runtime=advanced, 3× reviewer
+   list, uniform effort).
    Launcher side: `run_clb.py` forwards these knobs from the settings template
    (and fixes CLBENCH_SOLVE_DISABLED_TOOLS string-vs-list join). Without the
    patch pair a campaign asking runtime=pro / single low-effort reviewer /
@@ -199,6 +203,10 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
    remain for archaeology. Working tree: /mnt/data/a.razzhigaev/clb_official_v681/bench,
    branch `ouroboros-submission`.
 
+   Current Ouroboros launchers also pass the canonical one-actor
+   `OUROBOROS_SUBAGENTS` bytes through this adapter. The patch no longer authors
+   legacy Heavy; it transports the value produced by the Phase-1A encoder.
+
 ## Addendum (luna ablation campaign, 2026-07-31)
 
 10. `adapter_luna_ablation.v6870.patch` — delta on top of `adapter_official_submission.v681`
@@ -229,3 +237,118 @@ the external checkout root (a clean clone at `549998d` plus the patches above).
     Public implementation for the ablation run: branch `ouroboros-luna-ablation` of
     `razzant/continual-learning-bench`. PR #10's `ouroboros-submission` branch is left
     untouched so the sonnet-4.6 submission keeps matching the code that produced it.
+
+## Addendum (6.113.5 evolution campaign, 2026-09-06)
+
+12. `adapter_evolution_campaign.v61135.patch`: the adapter as it stood after the
+    evolution-arm pilots of 2026-08-27 to 2026-09-06 on Ouroboros 6.113.5, as one delta
+    against PR #10 head `a691cf3` (branch `ouroboros-submission` of
+    `razzant/continual-learning-bench`). Apply with `git apply` onto a clean checkout of
+    `a691cf3`. It already contains the one-line `_rb` import fix of
+    `adapter_luna_ablation.v6870.patch` and does not touch `src/systems/codex/system.py`,
+    so do not also apply the luna patch's `_live_bridge.py` hunk.
+
+    This delta diverges from the current code and is published for its methodology, not
+    as a drop-in adapter. It branched before the regeneration of
+    `adapter_official_submission.v681.patch` that added the `OUROBOROS_SUBAGENTS` transport
+    from `run_clb.py` and removed the legacy HEAVY/CODE pins: it does not apply on top of
+    that patch (conflict in `_docker_launcher.py`), keeps the old pins, and writes its own
+    one-row roster instead of forwarding the launcher's. Its restart-refusal handling
+    targets an admission fence that exists only in the local engine build it ran on, and
+    it treats more than that fence's receipt as a restart refusal: any HTTP 503 whose body
+    mentions `restart` or `retryable` (`"retryable": false` included), or cannot be read,
+    re-enters the restart wait (up to 1800 s) instead of spending one of the six 5 s
+    submit retries; no test pins a 503 that keeps the fast-retry path. The delta
+    was never run on a 7.x engine, and the 7.4.5 code shows two breaks: the injected
+    `remote_work` manifest lacks `plugin_api: "2.0"`, so the engine refuses its native-seed
+    trust and the live loop has no tools; and the task record no longer carries `cost_usd`
+    or `cost_usd_with_children`, so engine-task UsageEvents lose their cost. On 6.113.5 as
+    on 7.4.5 a fresh image build is expected to fail, because the engine's
+    `requirements.txt` has been a pointer to a lock file the Dockerfile does not copy since
+    v6.97.0; the 2026-09-03 run used a previously built image.
+
+    The methodological changes, which are what this delta is for:
+    - The next question waits for the evolution round. The boundary wait used to end while
+      a cycle was still running (over the 12 completed cycles of the 2026-09-03
+      treatment run, 464 s at the median and 920 s at most; the pilots capped the wait at
+      300 s), and 14 of 22 questions in the 2026-09-03 treatment
+      run were submitted into a running cycle, where the restart that cycle requests can
+      kill them. The engine starts an evolution task only when its queue is idle, so the
+      overlap came entirely from the adapter. `on_instance_boundary` now waits until a
+      host-visible predicate says the engine is quiet: no promotion request, evolution
+      disarmed, no queued or running task, no active direct-chat activity (the post-restart
+      auto-resume task runs as one), no pending or claimed restart marker, and no
+      unresolved restart obligation. It normally needs two consecutive quiet samples; its legacy-telemetry fallback
+      may proceed after an observed completed cycle with no known blockers. It has one
+      1800 s budget per boundary, and on expiry logs the blockers and submits anyway.
+    - On the forced arm, evolution cycles come only from the benchmark boundary: the adapter
+      sets `OUROBOROS_POST_TASK_EVOLUTION_CADENCE=off` there. Under the adapter's default
+      `every_n:1` (the engine's own default is `llm`) every finished task, including the engine's own post-restart auto-resume task, files
+      the next promotion, so cycles chained between questions (13 evolution tasks against
+      11 boundaries in the 2026-09-03 treatment run).
+    - A restart no longer silently costs a question: the drain deadline is raised to
+      1800 s (engine default 120 s), a question cancelled by a restart is retried once, and
+      submits wait out a pending restart. The earlier form of this gate held 8 submits in
+      the 2026-09-03 treatment run.
+    - The answer locator reuses `_json_candidates` and `_parse_action_text`, copied
+      verbatim from the official adapters and pinned by a test. Its live transcript walk
+      additionally skips an echo of the previous delivery and returns no result rather
+      than raising; the format-repair path uses `_parse_action_text`. This preserves a
+      complete answer followed by a delivery-control envelope.
+    - The sales sandbox outlives the 2 h library default (`container_timeout` raised to
+      24 h at import), which every stateful Ouroboros sales rollout of the submitted run
+      exceeded; pgasawa/continual-learning-bench#22 proposes the bench-side fix.
+    - Reviewer slots are pinned to the solve model (`OUROBOROS_REVIEWER_SLOTS`: the triad as
+      `api_chat` rows, scope and advisory through a same-model scout row). Without the pin
+      the isolated settings inherit the host's structured slots, which override the flat
+      single-model review keys.
+    - Turn-1 responses record eleven `OUROBOROS_*` settings in `Response.metadata`
+      (`config_attestation`). The values are the bench process's environment strings, not
+      the engine's resolved configuration: an unset key is recorded as an empty string
+      even where the Docker launcher passes the engine a default
+      (`OUROBOROS_TASK_REVIEW_MODE` becomes `auto`).
+
+    Contributor-reported last end-to-end run: 2026-09-03, CL-Bench `run-all` groups
+    `2026-09-03T05-22-33.505496Z` (control) and `2026-09-03T05-22-33.505495Z` (treatment),
+    `sales_prediction`, `openrouter/anthropic/claude-sonnet-4.6`,
+    on Ouroboros 6.113.5 built from a local engine-fix branch (head `1ffa14d5`, not
+    published; public ancestor `8d13373b`), runtime attestation
+    `clone_version=6.113.5 head=5fd3157e`. Active in that run: the earlier restart gate and
+    retry, the 1800 s drain, the reviewer-slot pin, the sandbox lifetime override and the
+    config attestation. Added afterwards and exercised by unit tests only: the
+    official-parser answer locator, the boundary readiness wait, the cadence `off`, the
+    current restart gate, the fail-closed forced request (a missing, unreadable or
+    non-object `state.json` now withholds the request instead of reading as empty) and the
+    handling of 503 restart refusals. The patch also rewrites the post-submission section
+    of the adapter's `METHODOLOGY.md` with the full account.
+    Contributor-reported historical verification: the patch reproduces its source tree
+    byte for byte on `a691cf3`;
+    `tests/test_ouroboros_submission_ports.py` 140 passed and
+    `tests/test_ouroboros_live_parity.py` 76 passed in the bench venv.
+
+### Limited startup smoke (2026-09-30)
+
+The archived delta was applied unchanged to CL-Bench
+`a691cf3553f5475e45e4769b270fb26fdbec23e3` in a minimal, separate source copy
+(31 files fetched by their Git blob IDs, rather than a complete checkout). A short
+offline smoke passed on Python 3.13.13: adapter and bridge-entrypoint imports, the
+entrypoint's `--help`, and construction / `respond` / `observe` / `reset` using the
+adapter's `engine="llm"` plumbing mode and one fixture provider response. Neither
+the live bridge nor the Docker engine was started. These two original patched
+tests also passed:
+
+- `test_task_assistant_text_is_oldest_first_and_parser_prefers_latest_valid`
+- `test_format_repair_locates_answer_with_the_official_parser`
+
+The smoke completed in about four seconds with exit 0; both tests passed.
+External socket connections were disabled during the smoke and no model call
+was made. The environment used five selected direct pins from that commit
+(`pydantic==2.12.5`, `litellm==1.81.6`, `openai==2.16.0`,
+`python-dotenv==1.2.1`, `pytest==9.0.2`), with newly resolved transitive versions;
+it was not a reconstruction of the September 3 environment.
+
+This checks adapter startup and local plumbing only. The Ouroboros 6.113.5
+engine, Docker image, restart/evolution flow, benchmark score and compatibility
+with current Ouroboros were not tested. The historical verification counts
+above remain the contributor's results; this smoke does not replace them or
+remove the reproducibility gaps described in this addendum.

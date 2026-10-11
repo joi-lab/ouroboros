@@ -7,7 +7,6 @@ Verifies:
 - consolidate_scratchpad calls _rebuild_knowledge_index
 """
 import importlib
-import inspect
 import os
 import pathlib
 import tempfile
@@ -76,17 +75,18 @@ def test_rebuild_knowledge_index_creates_index():
         assert "topic-two" in index_text
 
 
-def test_rebuild_knowledge_index_skips_underscore_files():
-    """Files starting with _ should be excluded from the index."""
+def test_rebuild_knowledge_index_preserves_useful_names_and_skips_generated_index():
+    """A filename is not a knowledge taxonomy; only the generated index is excluded."""
     mod = _get_consolidator()
     with tempfile.TemporaryDirectory() as tmpdir:
         kb_dir = pathlib.Path(tmpdir)
-        (kb_dir / "_private.md").write_text("# Private\n\nHidden.\n", encoding="utf-8")
+        (kb_dir / "_draft.md").write_text("# Draft\n\nA useful provisional note.\n", encoding="utf-8")
         (kb_dir / "visible.md").write_text("# Visible\n\nShown.\n", encoding="utf-8")
         mod._rebuild_knowledge_index(kb_dir)
         index_text = (kb_dir / "index-full.md").read_text()
-        assert "_private" not in index_text
+        assert "_draft" in index_text
         assert "visible" in index_text
+        assert "**index-full**" not in index_text
 
 
 def test_flat_scratchpad_consolidation_is_retired():
@@ -114,11 +114,14 @@ def test_consolidate_scratchpad_does_not_rewrite_flat_scratchpad(tmp_path):
     assert mem.scratchpad_path().read_text(encoding="utf-8") == legacy
 
 
-def test_consolidate_scratchpad_blocks_calls_index_rebuild():
-    """Block-aware scratchpad consolidation must also call _rebuild_knowledge_index."""
+def test_consolidator_entries_use_the_common_writer_index_and_history(tmp_path):
+    """The resulting files prove the shared publication, not a helper-name match."""
     mod = _get_consolidator()
-    source = inspect.getsource(mod._consolidate_scratchpad_blocks)
-    assert "_rebuild_knowledge_index" in source
+    knowledge = tmp_path / "memory" / "knowledge"
+    outcomes = mod._write_knowledge_entries(knowledge, [{"topic": "notes/lesson", "content": "A useful lesson."}])
+    assert outcomes[0]["ok"]
+    assert "notes/lesson" in (knowledge / "index-full.md").read_text()
+    assert "A useful lesson." in (knowledge.parent / "knowledge_history.jsonl").read_text()
 
 
 def test_consolidation_route_preserves_explicit_local_light(monkeypatch):

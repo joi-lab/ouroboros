@@ -20,7 +20,9 @@ ouroboros run --memory-mode empty --quiet <prompt>
 
 Use a fresh/isolated `OUROBOROS_DATA_DIR` for benchmark runs unless you
 explicitly want carryover memory. The wrapper does not inject benchmark answers,
-grader hints, or task-specific shortcuts.
+grader hints, or task-specific shortcuts. The wrapper requires `--model` and writes
+both its model-slot summary and canonical one-row `OUROBOROS_SUBAGENTS` value from
+that exact CLI model, so ambient settings cannot mislabel the fixed-model run.
 
 Example:
 
@@ -28,6 +30,7 @@ Example:
 python devtools/benchmarks/harness_bench_fast/ouroboros_cli_wrapper.py \
   --prompt-file /path/to/task_prompt.txt \
   --ouroboros-bin /Users/anton/Ouroboros/.venv/bin/ouroboros \
+  --model openai/gpt-5.5 \
   --repo-dir /Users/anton/Ouroboros/repo
 ```
 

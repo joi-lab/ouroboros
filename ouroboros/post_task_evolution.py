@@ -23,11 +23,12 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import pathlib
 from typing import Any, Dict, Optional
 
+from ouroboros.consciousness_authority import consciousness_origin_metadata, task_disabled_tools
 from ouroboros.evolution_fingerprint import _PLAN_REVIEW_SUFFIX
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +70,11 @@ def _eligible(task: Dict[str, Any]) -> bool:
     if str(task.get("type") or "") in _SKIP_TYPES:
         return False
     if str(task.get("delegation_role") or "") == "subagent":
+        return False
+    # ONE fact: a task whose contract withholds toggle_evolution (a consciousness
+    # wake-up below Full, and every root it started) may not propose evolution
+    # either — otherwise Act would reach a campaign through one indirection.
+    if "toggle_evolution" in task_disabled_tools(task):
         return False
     return True
 
@@ -143,33 +149,42 @@ Return ONLY a JSON object:
 Rules: set promote=true ONLY when there is a concrete, high-value, self-contained code/process improvement worth a reviewed cycle right now. Prefer items already in the backlog, and weigh the solve-capability history: objective classes that historically got ABSORBED are better bets than classes that kept ending no_op/abandoned. Bias toward SMALL, TARGETED objectives that directly improve the ability to solve tasks (a sharper tool, a fixed failure mode, a removed bottleneck) over broad refactors or speculative platform work — small reviewed wins absorb; sprawling objectives historically die as no_op. Do NOT propose anything in the CLOSED / DROPPED list, or a restatement of the ACTIVE CAMPAIGN OBJECTIVE — those are already handled; if the only candidates are closed/active, return promote=false. If nothing is clearly worthwhile, return promote=false. {force_note}"""
 
 
-def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_entries: int = 200) -> str:
+def _closed_objectives_digest(drive_root: pathlib.Path) -> Optional[str]:
     """BUG3 Layer A: the objectives the chooser must NOT re-propose.
 
     Built from the STRUCTURED ledger (state/evolution_checkpoints.jsonl), not patterns.md prose,
     so it cannot rot when prose formatting changes. An objective is closed when its latest cycle
     outcome is absorbed (already shipped), abandoned/no_op (attempted and dropped), or the
     objective/review axis recorded outcome_tier == "blocked_with_evidence" (hard-blocked).
+    A typed review-cap/unavailable stop is only this attempt's limit, not a
+    permanently closed objective. Its retained task source remains discoverable;
+    this readout neither schedules a retry nor resets campaign counters.
     Deduped by the SSOT fingerprint so the same base objective appears once. "" when nothing.
     """
     import json as _json
 
     from ouroboros.evolution_fingerprint import canonical_objective_fingerprint
+    from ouroboros.outcomes import (
+        ACCEPTANCE_FINALIZED_UNACCEPTED, REASON_REVIEW_CYCLES_EXHAUSTED,
+        REASON_REVIEW_QUORUM_UNREACHABLE,
+    )
 
     path = pathlib.Path(drive_root) / "state" / "evolution_checkpoints.jsonl"
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()[-max_entries:]
-    except Exception:
+    if not path.exists():
         return ""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return None
     by_task: Dict[str, Dict[str, Any]] = {}
     order: list = []
     for line in lines:
         try:
             row = _json.loads(line)
         except Exception:
-            continue
+            return None
         if not isinstance(row, dict):
-            continue
+            return None
         task_id = str(row.get("task_id") or "")
         if not task_id:
             continue
@@ -185,6 +200,13 @@ def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_
             tx = row.get("transaction") if isinstance(row.get("transaction"), dict) else {}
             merged.setdefault("cycle_outcome", str(tx.get("cycle_outcome") or ""))
         axes = row.get("outcome_axes") if isinstance(row.get("outcome_axes"), dict) else {}
+        objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else {}
+        review = axes.get("review") if isinstance(axes.get("review"), dict) else {}
+        decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
+        if (objective.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, REASON_REVIEW_QUORUM_UNREACHABLE}
+                or (decision.get("status") == ACCEPTANCE_FINALIZED_UNACCEPTED
+                    and decision.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, "review_degraded"})):
+            merged["waiting_for_review"] = True
         for axis in ("objective", "review"):
             axis_obj = axes.get(axis) if isinstance(axes.get(axis), dict) else {}
             if str(axis_obj.get("outcome_tier") or "") == "blocked_with_evidence":
@@ -194,7 +216,9 @@ def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_
     for task_id in reversed(order):  # newest first
         info = by_task.get(task_id) or {}
         blocked = bool(info.get("blocked"))
-        if str(info.get("cycle_outcome") or "") not in {"absorbed", "abandoned", "no_op"} and not blocked:
+        outcome = str(info.get("cycle_outcome") or "")
+        waiting = info.get("waiting_for_review") and outcome not in {"absorbed", "abandoned"}
+        if not waiting and outcome not in {"absorbed", "abandoned", "no_op"} and not blocked:
             continue
         objective = str(info.get("objective") or "").strip().replace("\n", " ")
         if not objective:
@@ -203,12 +227,13 @@ def _closed_objectives_digest(drive_root: pathlib.Path, *, limit: int = 12, max_
         if not fp or fp in seen:
             continue
         seen.add(fp)
+        if waiting:
+            # The current independently initiated attempt supersedes an older
+            # dropped attempt of this objective; its history is still in the
+            # solve-capability digest, without a permanent "do not reconsider".
+            continue
         tag = "BLOCKED" if blocked else (str(info.get("cycle_outcome") or "DROPPED").upper())
-        if len(objective) > 110:
-            objective = objective[:110] + " …[truncated; full objective in the ledger]"
         out.append(f"- [{tag}] {objective}")
-        if len(out) >= limit:
-            break
     return "\n".join(out)
 
 
@@ -238,7 +263,10 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
     # BUG3 Layer A: give the chooser the objectives it must NOT re-propose (the missing input
     # that let a CLOSED objective be re-suggested 4-5x). Sourced from the structured ledger
     # (not patterns.md prose) plus the campaign-local dropped set, deduped by fingerprint.
-    closed = truncate_review_artifact(_closed_objectives_digest(drive_root), 1500)
+    closed = _closed_objectives_digest(drive_root)
+    if closed is None:
+        log.warning("post_task_evolution: closed-objective history unavailable; abstaining")
+        return None
     active_objective = _active_campaign_objective()
     force_note = (
         "The cadence already decided WHEN to evolve; choose the single most valuable "
@@ -251,47 +279,45 @@ def _decide_promotion(env: Any, task: Dict[str, Any], reflection_entry: Optional
         closed=closed or "(none)", active_objective=active_objective or "(no active campaign)",
         force_note=force_note,
     )
-    try:
-        from ouroboros.config import SETTINGS_DEFAULTS
-        from ouroboros.llm import LLMClient
-        from ouroboros.llm_observability import chat_observed
+    # Failures raise to the post-task stage: only an abstention returns None.
+    from ouroboros.config import SETTINGS_DEFAULTS
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_observability import chat_observed
 
-        client = llm_client or LLMClient()
-        # Main-slot chooser (plan 5C): picking the next evolution objective is a
-        # high-leverage cognitive decision, not a cheap-lane formatting call.
-        chooser_model = str(
-            os.environ.get("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
-        ).strip()
-        resp, usage = chat_observed(
-            client,
-            drive_root=drive_root,
-            task_id=str(task.get("id") or "post_task_evolution"),
-            call_type="post_task_evolution_decision",
-            messages=[{"role": "user", "content": prompt}],
-            model=chooser_model,
-            reasoning_effort="medium",
-            max_tokens=8192,
-        )
-        if usage:
-            try:
-                from supervisor.state import update_budget_from_usage
+    client = llm_client or LLMClient()
+    # Main-slot chooser (plan 5C): picking the next evolution objective is a
+    # high-leverage cognitive decision, not a cheap-lane formatting call.
+    chooser_model = str(
+        runtime_setting("OUROBOROS_MODEL", "") or SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+    ).strip()
+    resp, usage = chat_observed(
+        client,
+        drive_root=drive_root,
+        task_id=str(task.get("id") or "post_task_evolution"),
+        call_type="post_task_evolution_decision",
+        model_role="main",
+        messages=[{"role": "user", "content": prompt}],
+        model=chooser_model,
+        reasoning_effort="medium",
+        max_tokens=8192,
+    )
+    if usage:
+        try:
+            from supervisor.state import update_budget_from_usage
 
-                update_budget_from_usage(usage)
-            except Exception:
-                pass
-        obj = _loose_json((resp.get("content") or "").strip())
-        if not obj:
-            return None
-        return {
-            "promote": bool(obj.get("promote")),
-            "objective": str(obj.get("objective") or "").strip(),
-            # Default to requiring plan review (preserve the advisory->reviewed boundary).
-            "requires_plan_review": bool(obj.get("requires_plan_review", True)),
-            "backlog_id": str(obj.get("backlog_id") or "").strip(),
-        }
-    except Exception:
-        log.debug("post_task_evolution: decision LLM call failed", exc_info=True)
+            update_budget_from_usage(usage)
+        except Exception:
+            pass
+    obj = _loose_json((resp.get("content") or "").strip())
+    if not obj:
         return None
+    return {
+        "promote": bool(obj.get("promote")),
+        "objective": str(obj.get("objective") or "").strip(),
+        # Default to requiring plan review (preserve the advisory->reviewed boundary).
+        "requires_plan_review": bool(obj.get("requires_plan_review", True)),
+        "backlog_id": str(obj.get("backlog_id") or "").strip(),
+    }
 
 
 def _write_request(drive_root: pathlib.Path, decision: Dict[str, Any], task: Dict[str, Any]) -> None:
@@ -305,6 +331,9 @@ def _write_request(drive_root: pathlib.Path, decision: Dict[str, Any], task: Dic
         "backlog_id": decision.get("backlog_id") or "",
         "source": "post_task",
         "origin_task_id": str(task.get("id") or ""),
+        # A Full-level consciousness tree proposing evolution keeps its origin, so
+        # the campaign and its cycle tasks stay inside the consciousness allowance.
+        **consciousness_origin_metadata(task.get("metadata")),
     }
     path = drive_root / _REQUEST_REL
     # Atomic publish: the supervisor polls every tick, so a partial write must
@@ -318,43 +347,41 @@ def maybe_promote(env: Any, task: Dict[str, Any], reflection_entry: Optional[Dic
                   llm_client: Any = None) -> Optional[Dict[str, Any]]:
     """Worker-side: write a durable promotion signal if the envelope is on and a
     qualifying task surfaced a worthwhile self-improvement. Returns the decision
-    or None. NEVER enqueues/enables evolution (that is the supervisor's job)."""
-    try:
-        from ouroboros.config import (
-            get_post_task_evolution_cadence,
-            get_post_task_evolution_enabled,
-            get_runtime_mode,
-        )
+    or None. NEVER enqueues/enables evolution (that is the supervisor's job).
+    A failure raises to the post-task promotion stage (TZ-2 C3): None is only
+    a genuine no-op, never a swallowed chooser failure."""
+    from ouroboros.config import (
+        get_post_task_evolution_cadence,
+        get_post_task_evolution_enabled,
+        get_runtime_mode,
+    )
 
-        if not get_post_task_evolution_enabled():
-            return None
-        if get_runtime_mode() == "light":
-            return None
-        if not _eligible(task) or not _is_canonical_run(env, task):
-            return None
-        # A project-scoped task never triggers GLOBAL self-evolution (defense in
-        # depth; the post-task pipeline also gates this). Project work stays isolated.
-        from ouroboros.project_facts import resolve_project_id
-
-        if resolve_project_id(task):
-            return None
-        cadence = get_post_task_evolution_cadence()
-        if cadence == "off":
-            return None
-        drive_root = pathlib.Path(str(env.drive_root))
-        force = not cadence.startswith("llm")
-        if cadence.startswith("every_n") and not _counter_due(drive_root, _parse_every_n(cadence)):
-            return None
-        decision = _decide_promotion(env, task, reflection_entry, llm_client, force=force)
-        if not decision or not decision.get("promote") or not decision.get("objective"):
-            return None
-        _write_request(drive_root, decision, task)
-        log.info("post_task_evolution: durable promotion signal written (origin task=%s)",
-                 str(task.get("id") or ""))
-        return decision
-    except Exception:
-        log.debug("post_task_evolution.maybe_promote failed", exc_info=True)
+    if not get_post_task_evolution_enabled():
         return None
+    if get_runtime_mode() == "light":
+        return None
+    if not _eligible(task) or not _is_canonical_run(env, task):
+        return None
+    # A project-scoped task never triggers GLOBAL self-evolution (defense in
+    # depth; the post-task pipeline also gates this). Project work stays isolated.
+    from ouroboros.project_facts import resolve_project_id
+
+    if resolve_project_id(task):
+        return None
+    cadence = get_post_task_evolution_cadence()
+    if cadence == "off":
+        return None
+    drive_root = pathlib.Path(str(env.drive_root))
+    force = not cadence.startswith("llm")
+    if cadence.startswith("every_n") and not _counter_due(drive_root, _parse_every_n(cadence)):
+        return None
+    decision = _decide_promotion(env, task, reflection_entry, llm_client, force=force)
+    if not decision or not decision.get("promote") or not decision.get("objective"):
+        return None
+    _write_request(drive_root, decision, task)
+    log.info("post_task_evolution: durable promotion signal written (origin task=%s)",
+             str(task.get("id") or ""))
+    return decision
 
 
 def _safe_unlink(path: pathlib.Path) -> None:
@@ -389,13 +416,19 @@ def apply_pending_request(drive_root: Any) -> bool:
             _safe_unlink(path)
             return False
 
-        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
-        from supervisor.state import load_state
+        from supervisor.evolution_lifecycle import evolution_block_reason, evolution_stop_reason, start_evolution_campaign
+        from supervisor.state import control_value, load_state
 
         if evolution_block_reason():  # light runtime mode, etc.
             _safe_unlink(path)
             return False
         st = load_state()
+        if not all(control_value(st, key)[0] for key in (
+                "evolution_owner_stopped", "evolution_mode_enabled", "owner_chat_id")) or evolution_stop_reason():
+            # An autonomous re-arm needs KNOWN current controls and no received Stop/Panic
+            # (#1307): unknown is neither "not stopped" nor "not enabled". The durable
+            # request stays for a later tick; only a known stop drops it (below).
+            return False
         if not st.get("owner_chat_id"):
             # Evolution requires an owner-bound chat; without it the cycle could
             # never run. Drop the stale request rather than leaking it.
@@ -435,7 +468,9 @@ def apply_pending_request(drive_root: Any) -> bool:
                 return False
         if bool(req.get("requires_plan_review", True)):
             objective += _PLAN_REVIEW_SUFFIX
-        start_evolution_campaign(objective, source="post_task")
+        origin = consciousness_origin_metadata(req)
+        if not start_evolution_campaign(objective, source="post_task", **({"origin": origin} if origin else {})):
+            return False
         # Link the promoted backlog id to the campaign so close-on-commit (Phase 2 C)
         # can mark it done when the cycle is absorbed. Validate it against the OPEN
         # backlog first: never link (and later close) a hallucinated or stale id.
@@ -471,15 +506,22 @@ def apply_pending_request(drive_root: Any) -> bool:
             # are already serialized ahead of this on the supervisor loop). Honor the
             # LIVE flag inside the atomic update so evolution is never enabled against a
             # fresh owner stop, even in that window.
-            if bool(live.get("evolution_owner_stopped")):
+            known, stopped = control_value(live, "evolution_owner_stopped")
+            if not known or stopped:
                 return
             live["evolution_mode_enabled"] = True
             live["evolution_consecutive_failures"] = 0
             live["post_task_autostop"] = True
 
-        st_after = update_state(_activate_one_shot)
-        _safe_unlink(path)
-        if not bool(st_after.get("evolution_mode_enabled")):
+        from supervisor.state import StateUnavailable
+
+        try:
+            st_after = update_state(_activate_one_shot)
+        except StateUnavailable:
+            st_after = None  # the request stays durable for a later tick; the minted campaign closes below
+        else:
+            _safe_unlink(path)
+        if st_after is None or not bool(st_after.get("evolution_mode_enabled")):
             # Owner stop won the race: the atomic re-check refused the enable. Terminal-
             # close the campaign this now-stale path minted so no dangling active campaign
             # survives, and do NOT audit a self-enable that did not happen. The durable

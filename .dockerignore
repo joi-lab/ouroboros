@@ -1,0 +1,47 @@
+# Build context for `docker build -t ouroboros-web .` (Dockerfile: COPY . .).
+# Keep secrets, host environments and local runtime/operator state out of image
+# layers. Do NOT exclude .git, tests/ or sources: CI builds this image and
+# runs pytest inside it, and the agent needs its own Git history.
+# tests/test_build_scripts.py::TestDockerignore pins both halves.
+
+# Secrets (mirrors .gitignore)
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+
+# Host environments, IDE state and caches
+.venv/
+venv/
+env/
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cursor/
+.vscode/
+.idea/
+
+# Local runtime, review and operator state (never tracked; see .gitignore)
+/data/
+/logs/
+/.tmp-data-*/
+/.review-drive/
+/.claudexor/
+/.adversarial-review/
+/.review-evidence-iter2/
+
+# Build output and bundled runtimes
+/dist/
+/build/
+/python-standalone/
+/node-standalone/
+/ripgrep-standalone/
+/betterleaks-standalone/
+/claudexor-runtime/
+
+# Other
+/.devcontainer
+/graphify-out

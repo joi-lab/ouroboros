@@ -1,0 +1,1122 @@
+"""Resolution of a task's terminal event into durable truth and delivery.
+
+Owns the authoritative terminal cost projection, the lifecycle-fault lane for a
+terminal that arrived without a usable result, the durable-write fault lane,
+and the single dispatch that delivers the final answer and releases the slot.
+"""
+
+from __future__ import annotations
+
+import logging
+import pathlib
+from typing import Any, Dict
+
+from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID
+from ouroboros.cost_projection import carry_cost_meta, with_cost_aliases
+from ouroboros.outcomes import (
+    EXECUTION_DEGRADED,
+    EXECUTION_INFRA_FAILED,
+    infra_failed_axes,
+    normalize_outcome_axes,
+)
+from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+from ouroboros.task_finalization import send_provider_death_notice
+from ouroboros.task_results import (
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_REJECTED_DUPLICATE,
+    load_task_result,
+    write_task_result,
+)
+from ouroboros.utils import append_jsonl, truncate_for_log, utc_now_iso
+from supervisor.message_bus import notification_chat_route, row_chat_identity
+
+
+def _events():
+    """The parent module, read at call time.
+
+    The parent owns the rebindable module state and the members tests
+    monkeypatch there; reading them through the module at each call keeps
+    one binding, where a from-import would freeze the value this leaf saw
+    at import time (the owner-approved D18/D33 mechanical exception).
+    """
+    from supervisor import events
+
+    return events
+
+
+log = logging.getLogger(__name__)
+
+# A configured actor that finished without its physical leaf: the lifecycle is
+# `completed`, the execution axis is degraded. The axis is the SSOT
+# (`outcomes._apply_actor_first_terminal_projection` stamps it from these same
+# reason codes); the codes are carried here only so a terminal that reports the
+# reason without axes still reads honestly.
+_DEGRADED_TERMINAL_REASONS = frozenset({"configured_actor_incomplete", "configured_actor_unknown"})
+
+
+def _finished_with_warnings(
+    task_done_event: Dict[str, Any], result: Dict[str, Any] | None = None,
+) -> bool:
+    """True when a `completed` lifecycle actually ended with warnings.
+
+    The chat line used to take its icon and verb from the lifecycle alone, so a
+    child that never ran its leaf still read as "✅ … completed" while the web
+    card showed a warning. Mirroring only the EXECUTION axis fixed half of that
+    (#1087): a child degraded on its objective, its review or its artifacts — the
+    other axes the card folds — still read as a clean completion. The shared
+    normalized projection (`project_dialogue.outcome_phase`, the host twin of
+    `taskOutcomeSeverity` that web/tests/fixtures/outcome_phase_parity.json pins)
+    answers the whole question instead, over the result AND the event.
+
+    PRECEDENCE IS THE CALLER'S: this only says "warnings", never which lifecycle
+    word the row uses — a cancelled or failed child keeps its own status display.
+    The axis/reason fallbacks below stay for a frame the shared projection cannot
+    settle (an open post-task checkpoint reads as still working, not as an
+    outcome), so a degraded frame never silently loses its warning.
+    """
+    from ouroboros.project_dialogue import outcome_phase
+
+    record = result if isinstance(result, dict) else {}
+    phase = outcome_phase(record, task_done_event)
+    if phase == "warn":
+        return True
+    if phase in {"error", "cancelled"}:
+        return False
+    axes = task_done_event.get("outcome_axes")
+    execution = axes.get("execution") if isinstance(axes, dict) else None
+    if isinstance(execution, dict) and str(execution.get("status") or "") == EXECUTION_DEGRADED:
+        return True
+    return str(task_done_event.get("reason_code") or "") in _DEGRADED_TERMINAL_REASONS
+
+
+def _completed_lifecycle_display(
+    task_done_event: Dict[str, Any], result: Dict[str, Any] | None = None,
+) -> tuple[str, str] | None:
+    """Icon and verb for a `completed` lifecycle whose OUTCOME is not clean.
+
+    #1087: the card and Telegram fold the axes into one phase; the chat line
+    must speak the same word. A completed lifecycle can still end `error` (a
+    failed review, objective or artifacts), and `_finished_with_warnings`
+    deliberately answers False for that phase — so answering only "warnings"
+    let such a child read "✅ … completed". Returns None for a clean outcome.
+    Lifecycle-keyed fields (`subagent_event`, progress_meta `status`) are never
+    touched: only what the human line SAYS follows the phase.
+    """
+    from ouroboros.project_dialogue import outcome_phase
+
+    record = result if isinstance(result, dict) else {}
+    phase = outcome_phase(record, task_done_event)
+    if phase == "error":
+        return "❌", "finished with a failed outcome"
+    if _finished_with_warnings(task_done_event, record):
+        return "⚠️", "finished with warnings"
+    return None
+
+
+def _terminal_cost_lineage(task_id: str, task: dict, result: dict, evt: dict) -> dict:
+    """The result-derived scopes used by both projection and its equality memo."""
+    from ouroboros.task_results import resolve_task_lineage
+
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    root_id = str(result.get("root_task_id") or task.get("root_task_id") or evt.get("root_task_id") or "")
+    parent_id = str(result.get("parent_task_id") or task.get("parent_task_id") or evt.get("parent_task_id") or "")
+    return resolve_task_lineage(
+        task_id,
+        metadata=metadata,
+        root_task_id=root_id,
+        parent_task_id=parent_id,
+        delegation_role=(
+            result.get("delegation_role")
+            or task.get("delegation_role")
+            or evt.get("delegation_role")
+        ),
+        original_task_id=(
+            result.get("original_task_id")
+            or task.get("original_task_id")
+            or evt.get("original_task_id")
+        ),
+        timeout_retry_from=(
+            result.get("timeout_retry_from")
+            or task.get("timeout_retry_from")
+            or evt.get("timeout_retry_from")
+        ),
+    )
+
+
+def _authoritative_terminal_cost(
+    task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
+    *, breakdown: Dict[str, Any] | None = None, canonical_only: bool = False,
+) -> Dict[str, Any]:
+    """Project terminal cost; canonical_only forbids import/read fallback from a probe."""
+    from ouroboros.cost_projection import (
+        COST_SCOPE_ROOT_TREE,
+        build_cost_presentation,
+        honest_accounted_amount,
+    )
+    from supervisor.state import reconstruct_task_cost
+
+    authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    if (breakdown is not None or canonical_only) and authority_root.resolve() != pathlib.Path(drive_root).resolve():
+        if canonical_only:
+            raise ValueError("Cost probe lost canonical monetary authority")
+        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
+    if canonical_only and breakdown is None:
+        raise ValueError("Cost probe requires a prefetched canonical breakdown")
+    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
+                                       **({"breakdown": breakdown} if breakdown is not None else {}))
+    lineage = _terminal_cost_lineage(task_id, task, result, evt)
+    is_root = bool(lineage["is_root_task"])
+    if is_root and projection.get("cost_accounting_status") == "available":
+        try:
+            from ouroboros.usage_accounting import usage_breakdown
+
+            root_id = str(lineage["root_task_id"] or task_id)
+            if breakdown is None:
+                subtree = usage_breakdown(authority_root, root_task_id=root_id)
+            else:
+                from ouroboros._usage_rows import _breakdown_bucket, _with_integrity
+
+                subtree = breakdown["by_root"].get(root_id)
+                if subtree is None:
+                    subtree = _with_integrity(_breakdown_bucket(()), bool(breakdown.get("integrity_degraded")))
+            subtree_final = bool(subtree.get("cost_final"))
+            subtree_amount = honest_accounted_amount(subtree)
+            projection.update({
+                "accounted_upper_bound_usd_with_children": (
+                    round(subtree_amount, 6) if subtree_amount is not None else None
+                ),
+                "cost_with_children_partial": not subtree_final,
+                "cost_final": bool(projection.get("cost_final") and subtree_final),
+                # THIRD site of the same class: `non_final_rows` is `cost_final`'s
+                # DISCLOSED CAUSE and rides with it by contract (task_results.py), but
+                # the root branch narrowed `cost_final` against the SUBTREE and then
+                # left the row count describing this task alone — so a root turned
+                # non-final purely by a child's open row reported a cause of 0, a flag
+                # no reader could reconstruct.
+                "non_final_rows": int(subtree.get("non_final_rows") or 0),
+                "cost_presentation": build_cost_presentation(subtree, scope=COST_SCOPE_ROOT_TREE),
+            })
+        except Exception:
+            log.error("Root subtree cost authority unavailable for %s", task_id, exc_info=True)
+            projection.update({
+                "cost_accounting_status": "unavailable", "cost_final": False,
+                "cost_accounting_error": "ledger_unavailable",
+                "accounted_upper_bound_usd": None,
+                "accounted_upper_bound_usd_with_children": None,
+                "cost_with_children_partial": True,
+                "cost_presentation": None,
+            })
+    elif not is_root:
+        from ouroboros.cost_projection import resolve_cost_pair
+
+        present, rollup = resolve_cost_pair(
+            result, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
+        if not present:
+            present, rollup = resolve_cost_pair(
+                evt, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
+        if present:
+            projection["accounted_upper_bound_usd_with_children"] = rollup
+            # A child pipeline mirrors its OWN bound into the rollup key (it never
+            # walks descendants), so for a leaf that mirror carries no second
+            # scope and the own facts stand. A child that ran descendants, or a
+            # rollup that differs from the own bound, is a subtree without
+            # same-scope row facts: an own carrier must not replace it.
+            swarm = result.get("swarm_efficiency")
+            fanned_out = isinstance(swarm, dict) and int(swarm.get("subagent_count") or 0) > 0
+            own_bound = projection.get("accounted_upper_bound_usd")
+            if fanned_out or (rollup is not None and rollup != own_bound):
+                projection["cost_presentation"] = None
+        projection["cost_with_children_partial"] = bool(
+            result.get("cost_with_children_partial", evt.get("cost_with_children_partial", True))
+        )
+    checkpoint = result.get("root_phase_checkpoint")
+    post_status = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
+    if is_root and post_task_synthesis_is_open(post_status):
+        projection["cost_final"] = False
+        projection["cost_with_children_partial"] = True
+    # SSOT cost naming (C2/ABI-3): every branch above writes the honest names
+    # directly (Ф3.1 fix-round: producers no longer touch the retired
+    # spellings), and this outer seam stays as the idempotent invariant guard
+    # — it re-normalizes amounts and would strip any retired key a future
+    # mutation leaked. This is deliberately the LAST statement.
+    return with_cost_aliases(projection)
+
+
+def _terminal_cost_probe(
+    drive_root: pathlib.Path, task_id: str, current: dict, *,
+    breakdown: Dict[str, Any] | None = None, canonical_only: bool = False,
+) -> tuple[str, dict, tuple[bool, str] | None]:
+    """Classify the ordinary refresh's inputs, not permission to write.
+
+    Maintenance uses canonical_only with its indexed snapshot: foreign authority
+    is reported BEFORE accounting, which can import legacy rows on fallback.
+    """
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if current.get("status") not in SETTLED_STATUSES:
+        return "ineligible", {}, None
+    checkpoint = current.get("root_phase_checkpoint") or {}
+    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
+        return "ineligible", {}, None
+    if canonical_only and pathlib.Path(current.get("budget_drive_root") or drive_root).resolve() != drive_root.resolve():
+        return "foreign", {}, None
+    fields = _authoritative_terminal_cost(
+        task_id, current, current, {}, drive_root, breakdown=breakdown, canonical_only=canonical_only)
+    lineage = _terminal_cost_lineage(task_id, current, current, {})
+    scopes = bool(lineage["is_root_task"]), str(lineage["root_task_id"])
+    if fields.get("cost_accounting_status") != "available":
+        return "unavailable", fields, scopes
+    return ("equal" if all(current.get(key) == value for key, value in fields.items()) else "differs"), fields, scopes
+
+
+def _refresh_terminal_task_cost(
+    drive_root: pathlib.Path, task_id: str, *, breakdown: Dict[str, Any] | None = None,
+) -> bool:
+    """Refresh bookkeeping only; a supplied breakdown is bound to drive_root."""
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    current = load_task_result(drive_root, task_id, strict=True) or {}
+    outcome, fields, _ = _terminal_cost_probe(pathlib.Path(drive_root), task_id, current, breakdown=breakdown)
+    if outcome != "differs":
+        return False
+
+    def project(latest, patch):
+        post = (latest.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
+        if latest.get("status") not in SETTLED_STATUSES or post_task_synthesis_is_open(post):
+            raise ValueError("Cost refresh lost terminal task ownership")
+        return {**patch, "status": latest["status"]}
+
+    stored = write_task_result(
+        drive_root, task_id, current["status"], strict_existing_dict=True,
+        _field_projector=project, **fields,
+    )
+    event = {"type": "task_cost_finalized", "ts": utc_now_iso(), "task_id": task_id,
+             "root_task_id": str(stored.get("root_task_id") or task_id), **carry_cost_meta(stored)}
+    if append_jsonl(drive_root / "logs" / "events.jsonl", event):
+        from supervisor.log_addressing import address_handler_push
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.push_log(address_handler_push(drive_root, event))
+    return True
+
+
+def _task_done_review_projection(
+    result: Dict[str, Any], event: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Select the compact persisted reviewer view for one terminal event."""
+    value = result.get("review_projection")
+    if not isinstance(value, dict):
+        value = event.get("review_projection")
+    return value if isinstance(value, dict) and value.get("panels") else {}
+
+
+# Single-shot registry for the provider-death owner notification. The old gate
+# (`and task`, a live RUNNING row) also swallowed every reaper-delivered terminal:
+# the reaper loop pops RUNNING before its task_done dispatches (regression tests:
+# test_supervisor_reaper_notification.py). Process-local: after a restart the
+# worst case is one repeated notification, never a lost one.
+_PROVIDER_DEATH_NOTIFIED: set[str] = set()
+
+
+def _maybe_notify_provider_death(
+    ctx: Any,
+    task_id: Any,
+    task: Dict[str, Any],
+    final_task_result: Dict[str, Any],
+    task_done_event: Dict[str, Any],
+) -> None:
+    """Provider-death honesty (P1): tell the owner a root task terminalized by a
+    provider outage was NOT completed — the historical shape was 95 minutes of
+    silence behind a result claiming "completed". Runs AFTER the task-done
+    bookkeeping (cleanup never depends on chat delivery) and registers the id in
+    the single-shot registry only after a SUCCESSFUL send, so a raising send is
+    retried by a later dispatch instead of being lost. Never raises."""
+    if not (
+        task_id
+        and str(task_id) not in _events()._PROVIDER_DEATH_NOTIFIED
+        and str(
+            task.get("delegation_role") or final_task_result.get("delegation_role") or ""
+        ) != "subagent"
+        and str(task_done_event.get("reason_code") or "") == "provider_unavailable"
+        and str(task_done_event.get("status") or "") == STATUS_FAILED
+    ):
+        return
+    # Membership, not truthiness: an outage notice for a hidden-partition root
+    # used to be dropped here, so the incident left no owner-visible trace at all.
+    notify_chat = notification_chat_route(task_done_event.get("chat_id"))
+    if notify_chat is None:
+        return
+    try:
+        # Promise only what works: the resume endpoint serves budget-paused
+        # PENDING tasks (task_lifecycle.resume_budget_paused_task), never a
+        # failed terminal — "resume" here was a false owner promise.
+        if not send_provider_death_notice(
+            ctx, notify_chat, task_id, final_task_result,
+        ):
+            return
+    except Exception:
+        log.warning(
+            "Provider-death owner notification failed for %s", task_id, exc_info=True,
+        )
+        return
+    _events()._PROVIDER_DEATH_NOTIFIED.add(str(task_id))
+
+
+def _finish_task_done_dispatch(
+    evt: Dict[str, Any],
+    ctx: Any,
+    *,
+    task_id: Any,
+    worker_id: Any,
+    task: Dict[str, Any],
+    final_task_result: Dict[str, Any],
+    task_done_event: Dict[str, Any],
+) -> None:
+    """Notify lineage, release queue state, and preserve terminal compatibility."""
+
+    from ouroboros.post_task_checkpoint import settle_terminal_projection
+    from ouroboros.project_dialogue import append_terminal_task_projection
+
+    # This seam is shared by the normal task_done path AND the lifecycle-fault
+    # resolver, so open owner-quiz/hurry projections settle on EVERY dispatched
+    # terminal transition (ingress lazy-heal covers producers that bypass it,
+    # e.g. orphaned-RUNNING reconciliation).
+    try:
+        from supervisor.queue_transitions import reconcile_terminal_task_projections
+
+        reconcile_terminal_task_projections(ctx.DRIVE_ROOT, str(task_id))
+    except Exception:
+        log.debug("terminal projection reconcile failed for %s", task_id, exc_info=True)
+
+    append_terminal_task_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task, final_task_result, task_done_event,
+    )
+
+    # #1154: ONE continuation owns both halves of a root's owed terminal
+    # projection — the canonical Project row and Main's single mirror. It defers
+    # while post-task synthesis is still open, so the early answer stays in the
+    # Project thread and Main hears once, after the run has really finished; the
+    # post-task callback re-enters the same continuation. A run that owes nothing
+    # (a child, or a root already settled) returns immediately.
+    settle_terminal_projection(
+        ctx.DRIVE_ROOT, str(task_id or ""), task=task,
+        event={**(evt if isinstance(evt, dict) else {}), **task_done_event},
+    )
+
+    if task_id and str(task.get("delegation_role") or "") == "subagent":
+        effective_result = (
+            final_task_result
+            or load_task_result(ctx.DRIVE_ROOT, str(task_id or ""))
+            or {}
+        )
+        from supervisor.subagent_task_truth import enrich_task_done_event
+
+        _envelope = enrich_task_done_event(task_done_event, effective_result)
+        # Membership, not truthiness (C4): chat 0 real, negative A2A.
+        chat_id = notification_chat_route(
+            _events()._bound_project_chat_id(
+                ctx, task_id, task.get("parent_task_id"), task.get("root_task_id")
+            ) or None,
+            task.get("chat_id"),
+        )
+        if chat_id is not None:
+            status = str(
+                effective_result.get("status")
+                or evt.get("status")
+                or STATUS_COMPLETED
+            )
+            status_display = {
+                STATUS_COMPLETED: ("✅", "completed", "completed"),
+                STATUS_FAILED: ("❌", "failed", "failed"),
+                STATUS_REJECTED_DUPLICATE: ("⚠️", "rejected", "rejected"),
+                STATUS_CANCELLED: ("⏹️", STATUS_CANCELLED, STATUS_CANCELLED),
+                STATUS_INTERRUPTED: ("⏹️", STATUS_INTERRUPTED, STATUS_INTERRUPTED),
+            }.get(status, ("ℹ️", status or "done", status or "finished"))
+            icon, subagent_event, verb = status_display
+            if status == STATUS_COMPLETED:
+                # Icon and verb only: `subagent_event` and progress_meta `status`
+                # stay the lifecycle values every card and Telegram consumer keys on.
+                display = _completed_lifecycle_display(task_done_event, effective_result)
+                if display:
+                    icon, verb = display
+            result_text = str(effective_result.get("result") or "")
+            trace_text = str(effective_result.get("trace_summary") or "")
+            constraint = effective_result.get("task_constraint")
+            constraint = constraint if isinstance(constraint, dict) else {}
+            # The seed keeps the frame's long-standing shape (the honest name
+            # always present, null when unknown) even for a terminal event that
+            # carried no cost field at all.
+            _cost_meta = carry_cost_meta(
+                {"accounted_upper_bound_usd": None, **task_done_event})
+            progress_meta = {
+                "subagent_event": subagent_event,
+                "subagent_task_id": str(task_id or ""),
+                "root_task_id": str(task.get("root_task_id") or ""),
+                "parent_task_id": str(task.get("parent_task_id") or ""),
+                "delegation_role": "subagent",
+                "subagent_role": str(task.get("role") or ""),
+                "write_surface": str(constraint.get("surface") or ""),
+                "status": status,
+                # C2/C12 (ABI-3): the honest cost names plus EVERY openness/
+                # integrity marker accounting recorded. The VALUES come from the
+                # cost SSOT (`_cost_meta` above) so a marker added there arrives
+                # here too; the KEYS stay literal because a ChatOutbound frame's
+                # key set must be statically checkable (tests/test_contracts.py)
+                # — and `tests/test_cost_projection.py` fails if this literal
+                # ever stops covering the SSOT.
+                "accounted_upper_bound_usd": _cost_meta.get("accounted_upper_bound_usd"),
+                "cost_with_children_partial": _cost_meta.get("cost_with_children_partial"),
+                "unknown_unmetered": _cost_meta.get("unknown_unmetered"),
+                "non_final_rows": _cost_meta.get("non_final_rows"),
+                "reserved_usd": _cost_meta.get("reserved_usd"),
+                "unresolved_upper_bound_usd": _cost_meta.get("unresolved_upper_bound_usd"),
+                "ledger_integrity_degraded": _cost_meta.get("ledger_integrity_degraded"),
+                # #498: the scoped carrier travels with the amount it explains.
+                "cost_presentation": _cost_meta.get("cost_presentation"),
+                "cost_accounting_error": _cost_meta.get("cost_accounting_error"),
+                "cost_accounting_status": str(
+                    task_done_event.get("cost_accounting_status") or "unavailable"
+                ),
+                "cost_final": bool(task_done_event.get("cost_final", False)),
+                "result": truncate_for_log(result_text, 4000),
+                "result_truncated": len(result_text) > 4000,
+                "trace_summary": truncate_for_log(trace_text, 4000),
+                "trace_summary_truncated": len(trace_text) > 4000,
+                "error": truncate_for_log(str(effective_result.get("error") or ""), 1000),
+                "artifact_status": str(effective_result.get("artifact_status") or ""),
+                # The terminal frame carries the route so the finished card's chip can be
+                # rebuilt on replay, and the completion-seam EVIDENCE (below) so the chip
+                # upgrades from the neutral "dispatched" decision to what actually ran.
+                "executor_route": str(effective_result.get("executor_route") or ""),
+            }
+            if isinstance(_envelope.get("execution_evidence"), dict):
+                progress_meta["execution_evidence"] = _envelope["execution_evidence"]
+            if _envelope.get("actual_substrate"):
+                progress_meta["actual_substrate"] = str(_envelope["actual_substrate"])
+            if isinstance(task_done_event.get("outcome_axes"), dict):
+                progress_meta["outcome_axes"] = task_done_event["outcome_axes"]
+            if task_done_event.get("reason_code"):
+                progress_meta["reason_code"] = str(task_done_event["reason_code"])
+            if "review_projection" in task_done_event:
+                progress_meta["review_projection"] = task_done_event["review_projection"]
+            if "model_execution" in task_done_event:
+                progress_meta["model_execution"] = task_done_event["model_execution"]
+            ctx.send_with_budget(
+                chat_id,
+                f"{icon} Subagent {task_id} {verb} ({task.get('role') or 'researcher'}).",
+                is_progress=True,
+                task_id=str(task_id or ""),
+                progress_meta=progress_meta,
+                role="system", system_type="subagent_terminal_notice")
+
+    from supervisor.queue import _queue_lock, clear_acceptance_fence_for_root
+
+    with _queue_lock:
+        if task_id:
+            ctx.RUNNING.pop(str(task_id), None)
+            # A child's settled result is the parent's cue to START integrating,
+            # so settlement counts as the PARENT's own progress. Without this
+            # stamp a coordinator blocked in wait_tasks was idle-killed exactly
+            # when its last child delivered (the completed child instantly left
+            # RUNNING, so _subtree_progressing went dark and only the grace
+            # window remained). Own progress also lets the existing spare
+            # machinery (resolve_grace_episode_for_spared_task) withdraw an
+            # outstanding finalization-grace episode on the next enforce tick.
+            # A one-shot event per child terminal — unlike subtree narration,
+            # it cannot re-arm/flicker episodes. `task` is {} for reaper-delivered
+            # terminals (RUNNING popped before dispatch), so fall back to the
+            # durable result for the parent id — same shape the notification
+            # gate handles.
+            parent_meta = ctx.RUNNING.get(str(
+                task.get("parent_task_id")
+                or final_task_result.get("parent_task_id") or ""
+            ))
+            if isinstance(parent_meta, dict):
+                parent_meta["last_progress_at"] = _events().time.time()
+        if worker_id in ctx.WORKERS and ctx.WORKERS[worker_id].busy_task_id == task_id:
+            # A `reaping` slot is OWNED — by the reaper or by an in-flight
+            # cancellation custody. Its owner confirms process death and then
+            # respawns or releases; freeing the slot from here would hand a
+            # mid-kill process back to assignment.
+            if not getattr(ctx.WORKERS[worker_id], "reaping", False):
+                ctx.WORKERS[worker_id].busy_task_id = None
+    if task_id:
+        try:
+            clear_acceptance_fence_for_root(str(task_id))
+        except Exception:
+            log.warning(
+                "Failed to clear terminal task acceptance fence for %s",
+                task_id,
+                exc_info=True,
+            )
+        tree_root = ""
+        try:
+            from supervisor.queue_transitions import clear_budget_root_fence_for_settled_tree
+
+            # Pending-cancel and reaper task_done arrive AFTER the row left
+            # PENDING/RUNNING, so `task` is {} here: the tree identity falls
+            # back to the event stamp, then the durable result.
+            tree_root = str(
+                (task if isinstance(task, dict) else {}).get("root_task_id")
+                or (task_done_event or {}).get("root_task_id")
+                or (final_task_result or {}).get("root_task_id")
+                or ""
+            )
+            clear_budget_root_fence_for_settled_tree({"id": str(task_id or ""), "root_task_id": tree_root})
+        except Exception:
+            log.warning("Failed to release budget root fence for %s", task_id, exc_info=True)
+        if tree_root:
+            try:
+                from supervisor.owner_pause_control import refresh_owner_pause_tree
+
+                # A member that finished while its tree was pausing may be the
+                # last one the owner's Pause was waiting for — or the last writer
+                # an owner's Continue of that tree was held behind. The root's own
+                # terminal counts too: its late phase parked or ended (D10).
+                refresh_owner_pause_tree(tree_root)
+                from supervisor.continuation_admission import release_settled_continuations
+
+                release_settled_continuations(tree_root)
+            except Exception:
+                log.warning("Owner pause/continue settlement check failed for %s", tree_root, exc_info=True)
+    ctx.persist_queue_snapshot(reason="task_done")
+    # The early answer may already be receipted when split-drive copyback
+    # finishes. Normal and recovered publication converge here after releasing
+    # author custody; the existing ReviewOperation owns preparation and payment.
+    debt = final_task_result.get("acceptance_debt") or {}
+    delivery_id = (debt.get("delivery") or {}).get("delivery_id")
+    if task_id and delivery_id:
+        from supervisor.events_chat_delivery import _handoff_delivered_review
+
+        _handoff_delivered_review(ctx, str(task_id), str(delivery_id))
+    try:
+        ctx.bridge.push_log(task_done_event)
+    except Exception:
+        log.warning(
+            "Failed to forward task_done to live logs (card may not finalize)",
+            exc_info=True,
+        )
+
+    _events()._maybe_notify_provider_death(ctx, task_id, task, final_task_result, task_done_event)
+    try:
+        results_dir = pathlib.Path(ctx.DRIVE_ROOT) / "task_results"
+        results_dir.mkdir(parents=True, exist_ok=True)
+        result_file = results_dir / f"{task_id}.json"
+        if not result_file.exists():
+            write_task_result(
+                ctx.DRIVE_ROOT,
+                str(task_id or ""),
+                STATUS_FAILED,
+                reason_code="missing_task_result",
+                outcome_axes=infra_failed_axes(
+                    "missing_task_result", review_trigger="supervisor_fallback"
+                ),
+                result="",
+                **({
+                    key: task_done_event[key]
+                    for key in ("total_rounds", "prompt_tokens", "completion_tokens")
+                    if key in task_done_event
+                }),
+                # C12: the accounting fields come from the cost SSOT, so a marker
+                # added there (reserved/unresolved/ledger integrity) reaches this
+                # fallback result too instead of being dropped by a stale list.
+                **carry_cost_meta(task_done_event),
+                ts=evt.get("ts", ""),
+            )
+    except Exception as exc:
+        log.warning("Failed to store task result in events: %s", exc)
+    if task_id:
+        try:
+            from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+
+            # The loop thread copies and hashes nothing: a mailbox with unread inputs to carry
+            # waits for the off-loop mailbox sweep or the drive settlement.
+            cleanup_settled_owner_mailbox(ctx.DRIVE_ROOT, str(task_id), task, carry_inputs=False)
+        except Exception:
+            log.warning("Failed to cleanup terminal owner mailbox for %s", task_id, exc_info=True)
+
+
+def _resolve_lifecycle_fault(
+    evt: Dict[str, Any], ctx: Any, evt_status: str, *, detail: str = "",
+) -> None:
+    """Give a refused ``task_done`` an OWNER, or the worker slot wedges.
+
+    Refusing the publication is right — the incident published a cancel latch as
+    a terminal — but a refusal alone leaves the task in RUNNING with its worker
+    still marked busy and nothing scheduled to finish it. Two cases:
+
+    - A durable cancel intent (or a legacy ``cancel_requested`` latch) exists:
+      cancellation custody and the watchdog already own this task, so the row
+      stays exactly where it is and they settle it honestly.
+    - Nothing owns it: record the infrastructure failure and release the slot.
+      An early terminal checkpoint keeps its sticky lifecycle and receives the
+      failed execution axis; other stored axes and authored text stay intact.
+      A CURRENT fully published result wins over a stale fault. Failed storage
+      retains the existing file-recovery owner for the next health tick.
+
+    ``detail`` overrides the default event-status wording — the durable-result
+    fault (AR2-3) refuses an event whose OWN status looks settled.
+    """
+    task_id = str(evt.get("task_id") or "").strip()
+    if not task_id:
+        return
+    try:
+        from ouroboros.cancel_intents import cancel_pending
+
+        if cancel_pending(ctx.DRIVE_ROOT, task_id):
+            log.info(
+                "task_done lifecycle fault for %s left to cancellation custody (cancel pending)",
+                task_id,
+            )
+            return
+    except Exception:
+        log.debug("lifecycle-fault cancel-pending check failed for %s", task_id, exc_info=True)
+    detail = detail or (
+        f"Worker published a non-settled task_done ({evt_status!r}) and no cancellation "
+        "owns this task; the supervisor terminalized it so the slot is not wedged."
+    )
+    # Capture the RUNNING row BEFORE the dispatch below pops it: it carries the
+    # routing facts (chat/lineage/type) the terminal frame needs.
+    task_row: Dict[str, Any] = {}
+    try:
+        running = getattr(ctx, "RUNNING", None)
+        meta = running.get(task_id) if isinstance(running, dict) else None
+        if isinstance(meta, dict) and isinstance(meta.get("task"), dict):
+            task_row = dict(meta["task"])
+    except Exception:
+        task_row = {}
+    # GR4-3: the synthetic terminal fires the SAME assisted-update hooks the
+    # normal task_done path reaches — an orphaned managed-update transaction or
+    # a held assisted writer gate would otherwise survive a lifecycle-fault
+    # terminal until an unrelated task released them.
+    try:
+        event_metadata = evt.get("metadata")
+        task_metadata = (
+            task_row.get("metadata")
+            if isinstance(task_row.get("metadata"), dict)
+            else event_metadata if isinstance(event_metadata, dict) else None
+        )
+        from supervisor.update_merge import (
+            abort_orphaned_assisted_tx,
+            release_assisted_writer_gate_after_task,
+        )
+
+        abort_orphaned_assisted_tx(str(task_id), task_metadata)
+        release_assisted_writer_gate_after_task(task_metadata)
+    except Exception:
+        log.debug("assisted-merge orphan watchdog failed (lifecycle fault)", exc_info=True)
+    stored: Dict[str, Any] = {}
+    try:
+        from ouroboros.headless import terminal_task_files_ready
+        from ouroboros.task_results import STATUS_FAILED, write_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        def project_fault(current: Dict[str, Any], _incoming: Dict[str, Any]) -> Dict[str, Any]:
+            bound = {**current, **task_row, "id": task_id}
+            if terminal_task_files_ready(ctx.DRIVE_ROOT, bound, current):
+                return {"status": current["status"]}  # A completed publication won this race.
+            status = current.get("status") if current.get("status") in SETTLED_STATUSES else STATUS_FAILED
+            axes = normalize_outcome_axes({**current, "status": status})
+            axes["execution"] = {
+                **axes["execution"], "status": EXECUTION_INFRA_FAILED,
+                "reason_code": "task_done_lifecycle_fault",
+            }
+            return {
+                "status": status, "reason_code": "task_done_lifecycle_fault", "outcome_axes": axes,
+                **({"result": detail} if not current.get("result") else {}),
+            }
+
+        write_task_result(
+            ctx.DRIVE_ROOT, task_id, STATUS_FAILED,
+            _field_projector=project_fault, strict_existing_dict=True,
+        )
+        stored = load_task_result(ctx.DRIVE_ROOT, task_id, strict=True) or {}
+        fault_written = (
+            stored.get("reason_code") == "task_done_lifecycle_fault"
+            and normalize_outcome_axes(stored)["execution"]["status"] == EXECUTION_INFRA_FAILED
+        )
+        if not fault_written and not terminal_task_files_ready(
+            ctx.DRIVE_ROOT, {**stored, **task_row, "id": task_id}, stored,
+        ):
+            raise OSError("Lifecycle-fault publication did not settle canonical truth")
+    except Exception:
+        # Preserve unknown durable truth, with an actual retry owner on the
+        # existing reaper/health cadence rather than an unowned busy slot.
+        log.error(
+            "Failed to terminalize lifecycle-fault task %s; retaining file recovery",
+            task_id, exc_info=True,
+        )
+        from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+        enqueue_terminal_file_recovery(ctx, evt, task_row)
+        return
+    # GR3-6: the synthetic terminal goes through the NORMAL dispatch seam —
+    # terminal UI frame, acceptance-fence clearing, campaign/project hooks,
+    # RUNNING/slot bookkeeping, snapshot — instead of the old private partial
+    # copy (RUNNING pop + slot clear only), which resolved nothing owner-visible.
+    status = str(stored.get("status") or "failed")
+    task_type = str(evt.get("task_type") or task_row.get("type") or "")
+    task_done_event: Dict[str, Any] = {
+        "ts": utc_now_iso(),
+        "type": "task_done",
+        "task_id": task_id,
+        "task_type": task_type,
+        "chat_id": row_chat_identity(
+            _events()._bound_project_chat_id(
+                ctx, task_id, task_row.get("parent_task_id"), task_row.get("root_task_id")
+            ) or None,
+            evt.get("chat_id"), task_row.get("chat_id"), stored.get("chat_id"),
+            default=HIDDEN_CHAT_ID,
+        ),
+        "status": status,
+        "reason_code": str(stored.get("reason_code") or ""),
+        "outcome_axes": normalize_outcome_axes(stored),
+    }
+    for key in ("review_projection", "review_status", "artifact_status", "artifact_bundle", "root_phase_checkpoint"):
+        if key in stored:
+            task_done_event[key] = stored[key]
+    try:
+        task_done_event.update(_events()._authoritative_terminal_cost(
+            task_id, task_row, stored, evt, pathlib.Path(ctx.DRIVE_ROOT),
+        ))
+    except Exception:
+        log.debug("lifecycle-fault cost projection failed for %s", task_id, exc_info=True)
+    try:
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
+    except Exception:
+        log.warning("Failed to log lifecycle-fault task_done to events.jsonl", exc_info=True)
+    if task_type == "evolution":
+        _events()._handle_evolution_task_done(
+            ctx, evt=evt, task_id=task_id, task=task_row,
+            task_done_event=task_done_event,
+            outcome_axes=task_done_event.get("outcome_axes") or {},
+            cost=task_done_event.get("accounted_upper_bound_usd"),
+            rounds=task_done_event.get("total_rounds"),
+        )
+    # GR4-3: the cooperative-checkpoint hooks fire for the synthetic terminal
+    # exactly as the normal path fires them — a lifecycle-fault root would
+    # otherwise never checkpoint its coop tree, and a faulted last subagent
+    # would never trigger the tree-quiescence checkpoint.
+    try:
+        if task_row and str(task_row.get("delegation_role") or "") != "subagent":
+            _events()._checkpoint_coop_roots_on_root_done(ctx, task_row, task_id)
+    except Exception:
+        log.debug("coop root-done checkpoint failed (lifecycle fault)", exc_info=True)
+    _events()._finish_task_done_dispatch(
+        evt, ctx,
+        task_id=task_id, worker_id=evt.get("worker_id"),
+        task=task_row, final_task_result=stored, task_done_event=task_done_event,
+    )
+    try:
+        if task_row and str(task_row.get("delegation_role") or "") == "subagent":
+            _events()._maybe_checkpoint_coop_on_tree_quiescence(ctx, task_row, task_id)
+    except Exception:
+        log.debug("coop quiescence checkpoint failed (lifecycle fault)", exc_info=True)
+
+
+def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> bool:
+    """AR2-3 / GR2-3 (§8-A1): validate ``task_done`` through the DURABLE result.
+
+    UNCONDITIONAL for every task_done: the durable post-copy-back
+    result must be settled (or the formalized ``interrupted`` transient),
+    regardless of what the event's own status field says. The original AR2-3
+    check gated on a settled event CLAIM — and the PRIMARY producer
+    (``agent_task_pipeline``) emits task_done with a blank status, so ordinary
+    completions bypassed validation entirely; a blank-status event over a
+    running/absent row sailed through to publication. A blank status is now
+    validated exactly like a settled claim: the worker asserted "done" and the
+    disk must agree. Refused + forensic row; the existing fault-resolution
+    path decides slot fate. The exemption is an ``interrupted``
+    event status (its owner is the snapshot restore/requeue path). Never
+    raises.
+    """
+    try:
+        if not task_id:
+            return False
+        evt_status = str(evt.get("status") or "").strip().lower()
+        from ouroboros.task_results import STATUS_INTERRUPTED
+        from ouroboros.task_status import SETTLED_STATUSES
+
+        if evt_status == STATUS_INTERRUPTED:
+            return False  # formalized transient: the restore/requeue path owns the row
+        if evt_status and evt_status not in SETTLED_STATUSES:
+            return False  # non-settled claims were already refused at the gate
+        try:
+            durable_status = str(
+                (load_task_result(ctx.DRIVE_ROOT, str(task_id), strict=True) or {}).get("status") or ""
+            ).strip().lower()
+        except Exception:
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            meta = ctx.RUNNING.get(str(task_id), {})
+            enqueue_terminal_file_recovery(ctx, evt, meta.get("task") or {})
+            log.warning("task_done durable validation read failed for %s", task_id, exc_info=True)
+            return True
+        meta = ctx.RUNNING.get(str(task_id), {})
+        recovery = meta.get("_terminal_file_recovery") or {}
+        invalid_source = bool(recovery.get("event_sent")) and recovery.get("terminal_source_present") is False
+        if not invalid_source and (durable_status in SETTLED_STATUSES or durable_status == STATUS_INTERRUPTED):
+            return False
+        if evt.get("_files_prepared_attempt") is not None and not recovery.get("event_sent"):
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            if enqueue_terminal_file_recovery(ctx, evt, meta.get("task") or {}):
+                return True
+        log.error(
+            "task_done for %s claims settled %r but the durable result is %r; "
+            "refused (durable lifecycle fault)",
+            task_id, evt_status or "(blank)", durable_status or "absent",
+        )
+        try:
+            ctx.append_jsonl(
+                ctx.DRIVE_ROOT / "logs" / "events.jsonl",
+                {
+                    "ts": utc_now_iso(),
+                    "type": "task_done_invalid_status",
+                    "task_id": str(task_id),
+                    "status": evt_status,
+                    "durable_status": durable_status,
+                    "worker_id": evt.get("worker_id"),
+                },
+            )
+        except Exception:
+            log.debug("task_done_invalid_status record failed", exc_info=True)
+        _events()._resolve_lifecycle_fault(
+            evt, ctx, evt_status,
+            detail=(
+                "Worker published task_done without a settled execution source; "
+                "the supervisor terminalized it so the slot is not wedged."
+                if invalid_source else
+                f"Worker published task_done claiming settled {evt_status or '(blank)'!r} "
+                f"while the durable result is {durable_status or 'absent'!r} (not settled) "
+                "and no cancellation owns this task; the supervisor terminalized it so the "
+                "slot is not wedged."
+            ),
+        )
+        return True
+    except Exception:
+        log.warning("task_done durable validation unavailable for %s", task_id, exc_info=True)
+        return True
+
+
+def _notify_consciousness_of_root_done(ctx: Any, task: Dict[str, Any], task_metadata: Any,
+                                       final_task_result: Any, task_done_event: Dict[str, Any]) -> None:
+    """A ROOT finishing (any outcome) is a reason for an early consciousness wake —
+    except the owner's own direct turn (В13: an owner message never wakes it, and
+    neither does that turn ending), a wake-up's own finish or a root consciousness
+    started (``metadata.initiator == "consciousness"``), or the chain would never sleep."""
+    metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    if "subagent" in (str(task.get("delegation_role") or ""), str(metadata.get("delegation_role") or "")):
+        return  # the cancel path has already popped the RUNNING row; the event's metadata still says
+    if bool(task_done_event.get("_is_direct_chat")) or bool(task.get("_is_direct_chat")):
+        return
+    from ouroboros.consciousness_authority import is_consciousness_origin
+
+    result_metadata = final_task_result.get("metadata") if isinstance(final_task_result, dict) else None
+    if is_consciousness_origin(result_metadata) or is_consciousness_origin(task_metadata):
+        return
+    consciousness = getattr(ctx, "consciousness", None)
+    if consciousness is None:
+        return
+    try:
+        consciousness.notify(
+            f"task_finished:{task_done_event.get('task_id') or ''}:{task_done_event.get('status') or ''}")
+    except Exception:
+        log.debug("consciousness notify on task_done failed", exc_info=True)
+
+
+def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
+    task_id = evt.get("task_id")
+    wid = evt.get("worker_id")
+    meta = ctx.RUNNING.get(str(task_id or ""), {}) if task_id else {}
+    task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else {}
+    prepared_attempt = evt.get("_files_prepared_attempt")
+    if prepared_attempt is not None and (
+        type(prepared_attempt) is not int or prepared_attempt < 1
+        or (meta and prepared_attempt != int(meta.get("attempt") or task.get("_attempt") or 1))
+        or (meta.get("worker_id") is not None and wid != meta["worker_id"])
+    ):
+        log.warning("Ignoring terminal file preparation from a stale task/worker attempt: %s", task_id)
+        return
+    # Phase A1.7: ``task_done`` asserts a SETTLED outcome. A non-settled status
+    # (the incident's shape: the cancel latch published as a terminal) is a
+    # durable LIFECYCLE FAULT — recorded loudly, RUNNING/worker state NOT
+    # released (the row stays visible for custody/watchdog to settle honestly),
+    # never a crash. The deliberate exemption is ``interrupted`` — the
+    # FORMALIZED transient the update/restart
+    # teardown publishes for this generation (A1.11): its owner is the snapshot
+    # restore/requeue path, and the effective-status orphan reconcile terminal-
+    # izes a retry-less leftover, so it can never wedge the way the latch did.
+    # The durable half of the same law (AR2-3) runs after the child copy-back:
+    # a SETTLED event claim over a NON-settled durable row is refused too.
+    _evt_status = str(evt.get("status") or "").strip().lower()
+    if _evt_status:
+        from ouroboros.task_results import STATUS_INTERRUPTED as _INTERRUPTED
+        from ouroboros.task_status import SETTLED_STATUSES as _SETTLED
+
+        if _evt_status not in _SETTLED and _evt_status != _INTERRUPTED:
+            log.error(
+                "task_done with non-settled status %r for %s refused (lifecycle fault)",
+                _evt_status, evt.get("task_id"),
+            )
+            try:
+                ctx.append_jsonl(
+                    ctx.DRIVE_ROOT / "logs" / "events.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "task_done_invalid_status",
+                        "task_id": str(evt.get("task_id") or ""),
+                        "status": _evt_status,
+                        "worker_id": evt.get("worker_id"),
+                    },
+                )
+            except Exception:
+                log.debug("task_done_invalid_status record failed", exc_info=True)
+            _events()._resolve_lifecycle_fault(evt, ctx, _evt_status)
+            return
+    recovery = meta.get("_terminal_file_recovery") or {}
+    if task and not (task.get("_is_direct_chat") or _evt_status == STATUS_INTERRUPTED):
+        if prepared_attempt is None or (recovery and not recovery.get("event_sent")):
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            if enqueue_terminal_file_recovery(ctx, evt, task):
+                return
+    event_metadata = evt.get("metadata")
+    task_metadata = (
+        task.get("metadata")
+        if isinstance(task.get("metadata"), dict)
+        else event_metadata if isinstance(event_metadata, dict) else None
+    )
+    if task_id:
+        try:
+            from supervisor.update_merge import (
+                abort_orphaned_assisted_tx,
+                release_assisted_writer_gate_after_task,
+            )
+
+            abort_orphaned_assisted_tx(str(task_id), task_metadata)
+            release_assisted_writer_gate_after_task(task_metadata)
+        except Exception:
+            log.debug("assisted-merge orphan watchdog failed", exc_info=True)
+    task_type = str(evt.get("task_type") or task.get("type") or "")
+
+    final_task_result: Dict[str, Any] = {}
+    if task_id:
+        # Every real file operation has ended on its worker or reaper. The
+        # internal stamp proves only that attempt; CURRENT disk is authority.
+        if _events()._task_done_durable_fault(evt, ctx, task_id):
+            return
+        try:
+            final_task_result = load_task_result(ctx.DRIVE_ROOT, str(task_id), strict=True) or {}
+            if _evt_status != STATUS_INTERRUPTED:
+                from ouroboros.headless import terminal_task_files_ready
+
+                if not terminal_task_files_ready(
+                    ctx.DRIVE_ROOT, {**final_task_result, **task, "id": str(task_id)}, final_task_result,
+                ):
+                    from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+                    if enqueue_terminal_file_recovery(ctx, evt, task):
+                        return
+        except Exception:
+            from supervisor.task_reaper import enqueue_terminal_file_recovery
+
+            enqueue_terminal_file_recovery(ctx, evt, task)
+            return
+        if task and str(task.get("delegation_role") or "") != "subagent":
+            _events()._checkpoint_coop_roots_on_root_done(ctx, task, str(task_id))
+
+    outcome_axes = normalize_outcome_axes({**evt, **(final_task_result if isinstance(final_task_result, dict) else {})})
+    reason_code = final_task_result.get("reason_code") or evt.get("reason_code")
+    artifact_bundle = final_task_result.get("artifact_bundle") if isinstance(final_task_result, dict) else None
+    if not isinstance(artifact_bundle, dict):
+        artifact_bundle = evt.get("artifact_bundle")
+    artifact_status = (artifact_bundle.get("status") if isinstance(artifact_bundle, dict) else "") or final_task_result.get("artifact_status") or evt.get("artifact_status")
+    terminal_cost = _events()._authoritative_terminal_cost(
+        str(task_id or ""), task,
+        final_task_result if isinstance(final_task_result, dict) else {}, evt,
+        pathlib.Path(ctx.DRIVE_ROOT),
+    )
+    eff_cost = terminal_cost.get("accounted_upper_bound_usd")
+    eff_rounds = terminal_cost.get("total_rounds")
+    task_done_event = {
+        "ts": evt.get("ts", utc_now_iso()),
+        "type": "task_done",
+        "task_id": task_id,
+        "task_type": task_type,
+        "chat_id": row_chat_identity(
+            _events()._bound_project_chat_id(
+                ctx, task_id,
+                (final_task_result.get("parent_task_id") if isinstance(final_task_result, dict) else "") or evt.get("parent_task_id"),
+                (final_task_result.get("root_task_id") if isinstance(final_task_result, dict) else "") or evt.get("root_task_id"),
+            ) or None,
+            evt.get("chat_id"),
+            (final_task_result.get("chat_id") if isinstance(final_task_result, dict) else None),
+            default=HIDDEN_CHAT_ID,
+        ),
+        "status": str(final_task_result.get("status") or evt.get("status") or ""),
+        # The direct-turn fact rides the rebuilt terminal so the chat block keys
+        # its chrome on host truth: the worker frame carries it, the durable
+        # result carries it, and a reaper-delivered terminal reads the result.
+        "_is_direct_chat": bool(evt.get("_is_direct_chat") or (
+            isinstance(final_task_result, dict) and final_task_result.get("_is_direct_chat"))),
+        "root_phase_checkpoint": final_task_result.get("root_phase_checkpoint") or {},
+        "outcome_axes": outcome_axes,
+        "reason_code": reason_code,
+        "artifact_status": artifact_status,
+        **terminal_cost,
+    }
+    if str(evt.get("typed_routing_action") or "").strip():
+        task_done_event["typed_routing_action"] = str(evt.get("typed_routing_action") or "").strip()
+    if isinstance(artifact_bundle, dict):
+        task_done_event["artifact_bundle"] = artifact_bundle
+    if isinstance(final_task_result.get("cancel_origin"), dict):
+        task_done_event["cancel_origin"] = dict(final_task_result["cancel_origin"])
+    review_status = final_task_result.get("review_status") if isinstance(final_task_result, dict) else None
+    if not isinstance(review_status, dict):
+        review_status = evt.get("review_status")
+    if isinstance(review_status, dict):
+        task_done_event["review_status"] = review_status
+    if review_projection := _events()._task_done_review_projection(final_task_result, evt):
+        task_done_event["review_projection"] = review_projection
+    model_execution = final_task_result.get("model_execution")
+    if isinstance(model_execution, dict):
+        task_done_event["model_execution"] = model_execution
+    try:
+        append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", task_done_event)
+    except Exception:
+        log.warning("Failed to log task_done to events.jsonl", exc_info=True)
+
+    if task_type == "evolution":
+        _events()._handle_evolution_task_done(
+            ctx,
+            evt=evt,
+            task_id=task_id,
+            task=task,
+            task_done_event=task_done_event,
+            outcome_axes=outcome_axes,
+            cost=eff_cost,
+            rounds=eff_rounds,
+        )
+
+    _events()._finish_task_done_dispatch(
+        evt,
+        ctx,
+        task_id=task_id,
+        worker_id=wid,
+        task=task,
+        final_task_result=final_task_result,
+        task_done_event=task_done_event,
+    )
+    _notify_consciousness_of_root_done(ctx, task, task_metadata, final_task_result, task_done_event)
+
+    # v6.91 tree-quiescence coop checkpoint: MUST run after the dispatch
+    # bookkeeping above removed this terminal child from RUNNING, or the
+    # finishing child still counts live and "zero live members" is never true.
+    if task_id and str(task.get("delegation_role") or "") == "subagent":
+        _events()._maybe_checkpoint_coop_on_tree_quiescence(ctx, task, str(task_id))

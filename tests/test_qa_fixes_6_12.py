@@ -29,19 +29,14 @@ def test_dedupe_marketplace_skill_name_avoids_cross_bucket_collision(tmp_path, m
     clawhub_root = tmp_path / "data" / "skills" / "clawhub"
     native_dir.mkdir(parents=True)
     clawhub_root.mkdir(parents=True)
-
-    native_skill = SimpleNamespace(name="weather", skill_dir=native_dir)
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.discover_skills",
-        lambda drive_root, **kw: [native_skill],
-    )
+    (native_dir / "SKILL.md").write_text("---\nname: weather\n---\n", encoding="utf-8")
     # Collides with native/weather in another bucket -> suffixed.
     assert inst.dedupe_marketplace_skill_name(
         tmp_path / "data", clawhub_root, "weather", suffix="clawhub"
     ) == "weather-clawhub"
 
     # No collision -> name is preserved unchanged (no behaviour change).
-    monkeypatch.setattr("ouroboros.skill_loader.discover_skills", lambda drive_root, **kw: [])
+    (native_dir / "SKILL.md").unlink()
     assert inst.dedupe_marketplace_skill_name(
         tmp_path / "data", clawhub_root, "weather", suffix="clawhub"
     ) == "weather"
@@ -112,9 +107,10 @@ def test_dedupe_reuses_own_bucket_dir_on_reinstall(tmp_path, monkeypatch):
     clawhub_root = tmp_path / "data" / "skills" / "clawhub"
     existing = clawhub_root / "weather-clawhub"
     existing.mkdir(parents=True)
+    (existing / "SKILL.md").write_text(
+        "---\nname: weather-clawhub\n---\n", encoding="utf-8"
+    )
     # An in-bucket skill with the deduped name is NOT a collision (overwrite path).
-    own = SimpleNamespace(name="weather-clawhub", skill_dir=existing)
-    monkeypatch.setattr("ouroboros.skill_loader.discover_skills", lambda drive_root, **kw: [own])
     assert inst.dedupe_marketplace_skill_name(
         tmp_path / "data", clawhub_root, "weather-clawhub", suffix="clawhub"
     ) == "weather-clawhub"

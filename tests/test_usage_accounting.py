@@ -9,6 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import httpx
 
 from ouroboros import usage_accounting as ua
 
@@ -20,6 +21,9 @@ def data_root(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     (root / "state").mkdir(parents=True)
+    # The reservation prices the task's own observed cache split; keep that
+    # process-local memory out of the next test.
+    ua._reset_task_cache_splits()
     return root
 
 
@@ -65,8 +69,95 @@ def test_attempt_lifecycle_and_root_projection(data_root):
     assert [row["seq"] for row in rows] == [1, 2, 3]
 
 
+def test_unresolved_reason_is_redacted_before_truncation_and_fails_closed(
+    data_root, monkeypatch,
+):
+    secret = "dXNlcjpiYXNpYy1zZWNyZXQtdmFsdWU="
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+    ua.mark_unresolved(reservation, f"{'x' * 485} Basic {secret}")
+
+    reason = _ledger(data_root)[-1]["reason"]
+    assert secret not in reason
+    assert reason.endswith(" ***REDACTED***")
+
+    from ouroboros import observability
+
+    monkeypatch.setattr(
+        observability,
+        "redact_projection",
+        lambda _value: (_ for _ in ()).throw(RuntimeError("redactor failed")),
+    )
+    fallback = ua.reserve_attempt(_request(data_root, task_id="fallback"))
+    ua.mark_dispatched(fallback)
+    raw = f"must-not-persist:{secret}"
+    facts = ua._provider_exception_facts(RuntimeError(raw))
+    assert facts == (
+        None,
+        "",
+        "RuntimeError",
+        "RuntimeError: provider error details unavailable",
+    )
+    assert raw not in json.dumps(facts)
+    ua.mark_unresolved(fallback, raw)
+    assert _ledger(data_root)[-1]["reason"] == "provider_outcome_unknown:redaction_failed"
+
+
 def test_projection_uses_explicit_runtime_limit_over_environment(data_root):
     assert ua.usage_projection(data_root, global_limit_usd=7.5)["limit_usd"] == 7.5
+
+
+def test_projection_fallback_uses_the_shipped_total_budget(data_root, monkeypatch):
+    from ouroboros.config import SETTINGS_DEFAULTS
+
+    monkeypatch.delenv("TOTAL_BUDGET", raising=False)
+
+    assert ua.usage_projection(data_root)["limit_usd"] == SETTINGS_DEFAULTS["TOTAL_BUDGET"]
+
+
+def test_a_bucket_whose_rows_disclosed_no_token_counts_reports_absence_not_zero(data_root):
+    """`disclosed_tokens` keeps null as null at the ROW level, on the control schema's
+    own instruction ("null until a harness reported it — never render null as 0"), and
+    then `_breakdown_bucket` summed `int(row.get(field) or 0)` and handed back a
+    confident 0. So a page of delegated sessions that reported no token counts at all
+    displayed "0 tokens used" — the same render-unknown-as-zero claim this module
+    refuses one axis over for cost.
+
+    A bucket is absent only when NOT ONE contributing row has the count; a bucket where
+    some rows reported still sums the ones that did, rather than being erased by the
+    ones that did not."""
+    ua.record_subscription_session(
+        "sess-silent", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=None, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    silent = ua.usage_breakdown(data_root)
+    assert silent["prompt_tokens"] is None
+    assert silent["completion_tokens"] is None
+    assert silent["total_tokens"] is None
+    assert silent["cached_tokens"] is None
+    # The row itself is still counted — absence of TOKENS is not absence of the row.
+    assert silent["subscription_sessions"] == 1
+
+    ua.record_subscription_session(
+        "sess-reporting", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=120, completion_tokens=None, cached_tokens=None,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    mixed = ua.usage_breakdown(data_root)
+    assert mixed["prompt_tokens"] == 120           # the one that reported
+    assert mixed["completion_tokens"] is None      # still nobody
+    assert mixed["total_tokens"] == 120            # a real total of what was measured
+
+    # And a MEASURED zero stays a zero: the fix must not turn every 0 into absence.
+    ua.record_subscription_session(
+        "sess-real-zero", drive_root=data_root, route="codex", task_id="t1",
+        prompt_tokens=0, completion_tokens=0, cached_tokens=0,
+        spend_usd=0.0, spend_estimated=False,
+    )
+    measured = ua.usage_breakdown(data_root)
+    assert measured["completion_tokens"] == 0
+    assert measured["cached_tokens"] == 0
 
 
 def test_breakdown_uses_final_rows_and_keeps_unattributed_explicit(data_root):
@@ -131,6 +222,68 @@ def test_provider_failure_remains_unresolved(data_root):
     projection = ua.usage_projection(data_root)
     assert projection["unresolved_upper_bound_usd"] == 1.0
     assert _ledger(data_root)[-1]["state"] == "unresolved"
+
+
+def test_generic_physical_attempt_releases_typed_connect_failure(data_root):
+    with pytest.raises(httpx.ConnectError):
+        ua.execute_physical_attempt(
+            _request(data_root),
+            lambda: (_ for _ in ()).throw(httpx.ConnectError("connection refused")),
+        )
+    assert (_ledger(data_root)[-1]["state"], _ledger(data_root)[-1]["reason"]) == ("released", "before_dispatch_failed:ConnectError")
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 0.0
+
+
+def test_generic_async_physical_attempt_releases_typed_connect_timeout(data_root):
+    async def send():
+        raise httpx.ConnectTimeout("connection timed out")
+    with pytest.raises(httpx.ConnectTimeout):
+        asyncio.run(ua.execute_physical_attempt_async(_request(data_root), send))
+    assert (_ledger(data_root)[-1]["state"], _ledger(data_root)[-1]["reason"]) == ("released", "before_dispatch_failed:ConnectTimeout")
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 0.0
+
+
+def test_abandoned_attempt_settles_with_the_usage_the_dead_child_reported(data_root, monkeypatch):
+    """A killed out-of-process dispatch must not hold its bound forever."""
+    monkeypatch.setattr(ua, "estimate_cost_optional", lambda *a, **k: 0.42)
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=None, max_budget_usd=5.0))
+    ua.mark_dispatched(reservation)
+    assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 5.0
+
+    state = ua.terminalize_abandoned_attempt(
+        reservation,
+        reason="child timed out",
+        usage={"prompt_tokens": 1200, "completion_tokens": 300},
+    )
+
+    assert state == "settled"
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["accounted_usd"] < 5.0
+    # Idempotent: a terminal attempt is never transitioned again (a post-terminal
+    # row would make the whole ledger unreadable for every later reader).
+    assert ua.terminalize_abandoned_attempt(reservation, reason="again") == "settled"
+    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "settled"]
+
+
+def test_abandoned_attempt_closes_with_its_price_honestly_unknown(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+    ua.mark_dispatched(reservation)
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="child aborted") == "settled"
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == projection["accounted_usd"] == 1.0
+    assert projection["confirmed_usd"] == 0.0 and projection["cost_final"] is False
+    assert _ledger(data_root)[-1]["settle_reason"] == "abandoned"
+
+
+def test_abandoned_attempt_before_dispatch_is_released(data_root):
+    reservation = ua.reserve_attempt(_request(data_root))
+
+    assert ua.terminalize_abandoned_attempt(reservation, reason="never started") == "released"
+    projection = ua.usage_projection(data_root)
+    assert projection["reserved_usd"] == 0.0
+    assert projection["unresolved_upper_bound_usd"] == 0.0
 
 
 def test_lock_failure_is_fail_closed_before_send(data_root, monkeypatch):
@@ -371,6 +524,109 @@ def test_explicit_reservation_is_not_inflated_by_tokenizer_margin(data_root):
     ua.release_attempt(opaque)
 
 
+def _isolated_anthropic_catalog(monkeypatch):
+    from ouroboros import pricing
+
+    monkeypatch.setattr(pricing, "_cached_pricing", {})
+    monkeypatch.setattr(pricing, "_pricing_fetched_at", {})
+    monkeypatch.setattr(pricing, "_pricing_retry_after", {})
+    monkeypatch.setattr(pricing, "_pricing_fetch_in_progress", set())
+    monkeypatch.setattr(
+        "ouroboros.llm.fetch_openrouter_pricing",
+        # (input, cached_read, cache_write(5m), output) per 1M tokens.
+        lambda **kwargs: {"anthropic/claude-test": (3.0, 0.3, 3.75, 15.0)},
+    )
+
+
+def test_reservation_prices_the_owner_cache_ttl_not_a_hardcoded_1h(data_root, monkeypatch):
+    """G3-5: `_reservation_cost` must bill the cache-write tier the owner's
+    global `OUROBOROS_PROMPT_CACHE_TTL` actually ships, not an unconditional
+    worst-case "1h". With the whole prompt assumed written to cache, 1h bills
+    2.0x base input while 5m/default bill 1.25x — a 1.28x admission inflation
+    that can reject calls the budget affords."""
+    _isolated_anthropic_catalog(monkeypatch)
+    request = _request(
+        data_root,
+        model="anthropic/claude-test",
+        provider="openrouter",
+        reservation_usd=None,
+        prompt_tokens_estimate=1_000,
+        max_completion_tokens=1_000,
+    )
+    # 1000 write-tokens * $3.75/M * (2.0/1.25) + 1000 out * $15/M = 0.021
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+    assert ua._reservation_cost(request) == 0.021
+    # 1000 write-tokens * $3.75/M + 1000 out * $15/M = 0.01875
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    assert ua._reservation_cost(request) == 0.01875
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
+    assert ua._reservation_cost(request) == 0.01875
+
+
+def test_request_carried_applied_ttl_wins_over_the_global_setting(data_root, monkeypatch):
+    """The dispatch path knows the finalizer's APPLIED wire TTL per payload;
+    that recorded fact outranks the global predictor. Junk values fall back to
+    the owner authority instead of becoming a third tier."""
+    _isolated_anthropic_catalog(monkeypatch)
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+
+    def _priced(ttl):
+        return ua._reservation_cost(_request(
+            data_root,
+            model="anthropic/claude-test",
+            provider="openrouter",
+            reservation_usd=None,
+            prompt_tokens_estimate=1_000,
+            max_completion_tokens=1_000,
+            prompt_cache_ttl=ttl,
+        ))
+
+    marker_free_candidate = _request(
+        data_root,
+        model="anthropic/claude-test",
+        provider="openrouter",
+        reservation_usd=None,
+        prompt_tokens_estimate=1_000,
+        max_completion_tokens=1_000,
+        prompt_cache_ttl="",
+        candidate_measurement_kind="canonical_json_v1",
+    )
+    assert ua._reservation_cost(marker_free_candidate) == 0.01875
+
+    assert _priced("5m") == 0.01875
+    assert _priced("default") == 0.01875
+    assert _priced("1h") == 0.021
+    assert _priced("24h") == 0.021  # unknown value -> owner global ("1h")
+
+
+def test_admission_honors_the_cheaper_owner_tier(data_root, monkeypatch):
+    """G3-5 end-to-end: under a finite root limit sized between the 5m and 1h
+    reservation bounds, the owner's 5m selection must ADMIT the call that the
+    old hardcoded-1h pricing rejected — and 1h must still reject it."""
+    _isolated_anthropic_catalog(monkeypatch)
+
+    def _admit(root_id):
+        return ua.reserve_attempt(_request(
+            data_root,
+            model="anthropic/claude-test",
+            provider="openrouter",
+            reservation_usd=None,
+            prompt_tokens_estimate=1_000,
+            max_completion_tokens=1_000,
+            task_id=root_id,
+            root_task_id=root_id,
+            root_limit_usd=0.02,
+        ))
+
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "1h")
+    with pytest.raises(ua.BudgetExceeded):
+        _admit("ttl-root-1h")
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "5m")
+    reservation = _admit("ttl-root-5m")
+    assert _ledger(data_root)[-1]["reservation_upper_bound_usd"] == 0.01875
+    ua.release_attempt(reservation)
+
+
 def test_known_hold_does_not_override_provider_reported_settlement(data_root):
     reservation = ua.reserve_attempt(_request(
         data_root,
@@ -470,6 +726,22 @@ def test_unknown_pricing_is_not_reported_as_zero(data_root, monkeypatch):
     assert projection["cost_final"] is False
     assert _ledger(data_root)[-1]["cost_usd"] is None
     assert _ledger(data_root)[-1]["cost_final"] is False
+
+
+def test_typed_pre_dispatch_release_closes_dispatched_attempt(data_root, monkeypatch):
+    from ouroboros.transport_custody import release_pre_dispatch_attempt
+
+    monkeypatch.setenv("TOTAL_BUDGET", "10")
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=1.0))
+    ua.mark_dispatched(reservation)
+    assert release_pre_dispatch_attempt(reservation, ConnectionError("refused")) is False
+    import httpx
+    assert release_pre_dispatch_attempt(reservation, httpx.ConnectError("refused")) is True
+
+    row = _ledger(data_root)[-1]
+    assert row["state"] == "released"
+    assert row["reason"] == "before_dispatch_failed:ConnectError"
+    assert ua.usage_projection(data_root)["non_final_rows"] == 0
 
 
 def test_legacy_metadata_gap_is_count_only_not_monetary_unknown():
@@ -671,17 +943,20 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     first_started = threading.Event()
+    second_started = threading.Event()
     release_first = threading.Event()
     calls = []
 
-    def breakdown(_root):
+    def breakdown(_root, **_display_read):
         calls.append(len(calls) + 1)
         if len(calls) == 1:
             first_started.set()
             assert release_first.wait(2.0)
             value = 1.0
         else:
+            second_started.set()
             value = 2.0
         return {
             "accounted_usd": value, "physical_calls": int(value),
@@ -689,17 +964,21 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
             "settled_usd": value, "confirmed_usd": value, "estimated_usd": 0.0,
             "reserved_usd": 0.0, "unresolved_upper_bound_usd": 0.0,
             "unknown_unmetered": 0, "cost_final": True, "attempt_counts": {},
+            "_ledger_high_water_seq": [0, int(value)],
         }
 
     monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(ua, "usage_breakdown", breakdown)
+    monkeypatch.setattr(ua, "usage_writer_snapshot", breakdown)
     older = threading.Thread(target=state.update_budget_from_usage, args=({},))
     newer = threading.Thread(target=state.update_budget_from_usage, args=({},))
     older.start()
     assert first_started.wait(2.0)
     newer.start()
-    time.sleep(0.1)
-    assert calls == [1]
+    # Ledger snapshots are intentionally taken before STATE_LOCK, so the
+    # newer writer can read while the older one is paused; the sequence marker
+    # below prevents the paused snapshot from regressing state afterward.
+    assert second_started.wait(2.0)
+    assert calls == [1, 2]
     release_first.set()
     older.join(2.0)
     newer.join(2.0)
@@ -712,6 +991,7 @@ def test_legacy_budget_projection_accepts_nullable_usage_cost(data_root):
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     reservation = ua.reserve_attempt(_request(
         data_root,
         provider="openai",
@@ -882,30 +1162,36 @@ def test_actor_limit_blocks_third_retry_before_provider_send(data_root, monkeypa
     client = LLMClient(api_key="unused")
     sends = 0
 
+    class ParameterRejection(RuntimeError):
+        status_code = 400
+
+        def __init__(self, message):
+            super().__init__(message)
+            self.body = {"error": {"message": message}}
+
     def create(**kwargs):
         nonlocal sends
         sends += 1
-        raise RuntimeError(f"provider failure {sends}")
-
-    monkeypatch.setattr(
-        client,
-        "_retry_without_optional_sampling",
-        lambda kwargs, model, exc: {**kwargs, "temperature": None},
-    )
-    monkeypatch.setattr(
-        client,
-        "_openrouter_signature_retry_kwargs",
-        lambda target, kwargs, exc: {**kwargs, "messages": []},
-    )
+        message = (
+            "reasoning_effort value 'high' is not supported"
+            if sends == 1 else "temperature unsupported"
+        )
+        raise ParameterRejection(message)
     target = {
         "provider": "openai",
         "usage_model": "openai/gpt-5.2",
         "resolved_model": "gpt-5.2",
+        "base_url": "https://api.openai.example/v1",
     }
     with ua.physical_attempt_limit(2), pytest.raises(ua.PhysicalAttemptLimitExceeded):
         client._create_chat_completion_with_retries(
             create,
-            {"model": "gpt-5.2", "messages": [{"role": "user", "content": "x"}]},
+            {
+                "model": "gpt-5.2",
+                "messages": [{"role": "user", "content": "x"}],
+                "reasoning_effort": "high",
+                "temperature": 0.2,
+            },
             target,
         )
 
@@ -954,44 +1240,6 @@ def test_explicit_zero_root_limit_blocks_only_that_root(data_root, monkeypatch):
         )
     assert exc_info.value.limit_scope == "root"
     assert exc_info.value.root_task_id == "root-a"
-
-
-def test_claude_sdk_reserves_max_budget_and_settles_actual(data_root, monkeypatch):
-    from ouroboros.gateways import claude_code as cc
-
-    class Result:
-        session_id = "session"
-        total_cost_usd = 0.12
-        usage = {"input_tokens": 20, "output_tokens": 4}
-        subtype = "success"
-
-    class Client:
-        def __init__(self, options):
-            self.options = options
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def query(self, prompt):
-            return None
-
-        async def receive_response(self):
-            yield Result()
-
-    monkeypatch.setattr(cc, "ClaudeAgentOptions", lambda **kwargs: kwargs)
-    monkeypatch.setattr(cc, "ClaudeSDKClient", Client)
-    monkeypatch.setattr(cc, "ResultMessage", Result)
-
-    result = asyncio.run(cc._run_edit_async("do work", str(data_root), budget=2.0))
-    assert result.success is True
-    assert result.usage["ledger_attempt_ids"]
-    projection = ua.usage_projection(data_root)
-    assert projection["confirmed_usd"] == 0.12
-    rows = _ledger(data_root)
-    assert rows[0]["reservation_upper_bound_usd"] == 2.0
 
 
 def test_body_error_zero_usage_settles_confirmed_zero():
@@ -1124,3 +1372,119 @@ def test_cache_bearing_sends_are_measured_on_every_cache_inclusive_route(tmp_pat
     )
     measured = get_token_density(root, normalize_model_identity("gigachat/some-model"))
     assert abs(measured - 1.5) < 1e-6
+
+
+def test_an_open_row_is_not_final_however_little_it_costs(data_root):
+    """`cost_final` asked a STATE question of a dollar sum on three of its four terms.
+
+    `_reservation_cost` returns exactly `0.0` for `provider="local"` — a first-class
+    supported configuration, not a fixture — so a DISPATCHED row, a physical send still in
+    flight, held a $0.00 bound, added nothing to `unresolved`, and left the projection
+    reporting `cost_final: True`. `not reserved` and `not unresolved` were the two terms
+    the estimated-spend fix did not reach.
+    """
+    reservation = ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert reservation.reservation_upper_bound_usd == 0.0, \
+        "a local send really does reserve exactly zero — this is the trap, not a mock"
+    ua.mark_dispatched(reservation)
+
+    projection = ua.usage_projection(data_root)
+    assert projection["unresolved_upper_bound_usd"] == 0.0
+    assert projection["unknown_unmetered"] == 0
+    assert projection["cost_final"] is False, \
+        "a send in flight is open however little it is expected to cost"
+
+    # Settling it closes the row — `_final_rows` keys by attempt_id, so the dispatched row
+    # is REPLACED, not accumulated. Without that the count would never reach zero.
+    ua.settle_attempt(reservation, {"prompt_tokens": 1}, cost_usd=0.0, cost_final=True)
+    assert ua.usage_projection(data_root)["cost_final"] is True
+
+    # And a RESERVED row at the same zero bound is open for the same reason.
+    ua.reserve_attempt(_request(
+        data_root, model="local/test", provider="local", reservation_usd=None))
+    assert ua.usage_projection(data_root)["reserved_usd"] == 0.0
+    assert ua.usage_projection(data_root)["cost_final"] is False
+
+
+def test_a_non_final_projection_names_its_cause(data_root):
+    """A flag without its cause is not reconstructible (docs/DEVELOPMENT.md).
+
+    An estimated $0.00 makes every dollar bucket zero and `unknown_unmetered` zero, so
+    `cost_final: false` arrived with nothing anywhere on the projection — or in the
+    dashboard it feeds — that could explain it. The count that DECIDES finality is the
+    same number that discloses it, so the two cannot disagree.
+    """
+    ua.record_subscription_session(
+        "s-est", drive_root=data_root, route="r", task_id="t", root_task_id="root",
+        spend_usd=0.0, spend_estimated=True)
+    projection = ua.usage_projection(data_root)
+    assert projection["cost_final"] is False
+    assert [projection[key] for key in (
+        "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+        "unresolved_upper_bound_usd", "accounted_usd")] == [0.0] * 6
+    assert projection["unknown_unmetered"] == 0
+    assert projection["non_final_rows"] == 1, \
+        "the ONLY field on the projection that explains the flag"
+
+    # A second open row of a different kind is counted too, so the number is a real cause
+    # and not a boolean wearing an integer's clothes.
+    ua.mark_dispatched(ua.reserve_attempt(_request(data_root, reservation_usd=2.0)))
+    second = ua.usage_projection(data_root)
+    assert second["non_final_rows"] == 2 and second["cost_final"] is False
+
+    # A fully settled ledger says so with the same field.
+    ua.record_subscription_session(
+        "s-free", drive_root=data_root / "free", route="r", task_id="t",
+        root_task_id="root", spend_usd=0.0)
+    free = ua.usage_projection(data_root / "free")
+    assert free["non_final_rows"] == 0 and free["cost_final"] is True
+
+
+def test_review_wave_admission_override_compares_against_the_given_remaining(monkeypatch):
+    """The managed-update admission gate runs OUTSIDE any task usage scope: the
+    override branch must estimate with the normal reservation math and compare
+    against the caller's remaining USD, never a task projection."""
+    import ouroboros.usage_accounting as ua
+
+    monkeypatch.setattr(ua, "_reservation_cost", lambda _request: 1.25)
+    monkeypatch.setattr(
+        ua, "usage_projection",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("override must not read a projection")),
+    )
+
+    tight = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=2.0,
+    )
+    assert tight["fits"] is False
+    assert tight["estimated_wave_usd"] == 2.5
+    assert tight["remaining_usd"] == 2.0
+    assert tight["limit_usd"] is None
+
+    roomy = ua.review_wave_admission(
+        root_task_id="managed-update-admission",
+        models=["prov/a", "prov/b"],
+        prompt_chars=400_000,
+        remaining_usd_override=3.0,
+    )
+    assert roomy["fits"] is True and roomy["estimated_wave_usd"] == 2.5
+
+
+def test_unresolved_reason_cause_suffix_leads_and_survives_truncation(data_root):
+    """Nanny-leaf S3 + fable F4: the transport-cause suffix rides BEFORE the raw
+    provider text, so a verbose body cannot truncate away the one datum the
+    enrichment adds."""
+    import httpx
+
+    reservation = ua.reserve_attempt(_request(data_root, task_id="cause"))
+    ua.mark_dispatched(reservation)
+    cause = httpx.RemoteProtocolError("peer closed connection without response")
+    try:
+        raise RuntimeError("Connection error. " + "x" * 600) from cause
+    except RuntimeError as exc:
+        assert ua._terminalize_failed_attempt(reservation, exc) == "unresolved"
+    reason = _ledger(data_root)[-1]["reason"]
+    assert reason.startswith("RuntimeError [cause: RemoteProtocolError]:")

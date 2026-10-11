@@ -1,40 +1,56 @@
-"""Tool-history compaction with safe structural fallback on LLM failure."""
+"""Checkpoint-bound, complete-input context-reclaim materialization."""
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import logging
-import os
+import math
 import pathlib
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, replace
+from collections import Counter
+from typing import Any, Callable, Dict, List, Literal, Mapping, MutableSet, Optional, Sequence, Tuple
+
+from ouroboros.context_budget import (
+    CONTEXT_OVERFLOW_CODES as _TYPED_CONTEXT_OVERFLOW_CODES,
+    context_overflow_message as _context_overflow_message,
+    ContextReclaimReceipt,
+    ContextReclaimRequest,
+    ReclaimStatus,
+    SummarizerContextOverflow,
+    _AtomicUnit,
+    _Part,
+    _SelectedUnit,
+    _Selection,
+    _UnitSummaryFailure,
+    _UnsafeVisual,
+)
+from ouroboros.anthropic_native_custody import anthropic_tool_unit_active, custody_private_key
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
-_COMPACTION_PROTECTED_TOOLS = frozenset({
-    "commit_reviewed",
-    "vcs_commit_reviewed",
-    "advisory_review",
-    "task_acceptance_review",
-    "skill_review",
-    "review_status",
-    "knowledge_read",
-})
-
-_SUMMARY_INPUT_LIMIT = 2500
+_CAPSULE_VERSION = 1
+_SUMMARY_CONTRACT_VERSION = 1
+_SUMMARY_OUTPUT_TOKENS = 32_768
 _BLOCKS_PER_BATCH = 8
+_MIN_CAPSULE_BYTES = 512
+_SHA256_HEX = frozenset("0123456789abcdef")
+_SUMMARY_GUIDANCE = (
+    "Summarize each supplied context source without dropping late facts. Preserve "
+    "the actor's hypotheses, exact consequential errors, tool inputs when they "
+    "affect meaning, results, decisions, owner-visible constraints, and unresolved "
+    "next steps. Every source is complete input: do not assume that a head excerpt "
+    "represents its tail. Honor each source's summary_budget_tokens. Write a third-person "
+    "host record, attributing the actor's judgments to Ouroboros; you are the summarization helper."
+)
 
-_SHELL_EXIT_ERROR_MARKER = "⚠️ SHELL_EXIT_ERROR"
-
-# Structured summary protocol: the summarizer returns one entry per round via
-# a pinned tool call instead of the fragile "[round:N]" text framing that weak
-# models drift away from (mis-numbered/merged blocks made whole compaction
-# passes fail on coding transcripts). The text protocol remains the fallback
-# for local light models without reliable tool calling.
-_ROUND_SUMMARIES_TOOL = {
+_CONTEXT_SUMMARIES_TOOL = {
     "type": "function",
     "function": {
-        "name": "emit_round_summaries",
-        "description": "Emit one summary entry per reasoning round block, keyed by round_id.",
+        "name": "emit_context_summaries",
+        "description": "Emit exactly one non-empty summary for every supplied source_id.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -43,10 +59,10 @@ _ROUND_SUMMARIES_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "round_id": {"type": "integer", "description": "The [round:id] number of the block."},
-                            "summary": {"type": "string", "description": "3-6 sentence first-person summary."},
+                            "source_id": {"type": "string"},
+                            "summary": {"type": "string"},
                         },
-                        "required": ["round_id", "summary"],
+                        "required": ["source_id", "summary"],
                     },
                 }
             },
@@ -56,450 +72,1302 @@ _ROUND_SUMMARIES_TOOL = {
 }
 
 
-def _find_tool_name_for_result(msg: dict, messages: list) -> str:
-    """Look up which tool produced a given tool-result message."""
-    target_id = msg.get("tool_call_id", "")
-    if not target_id:
-        return ""
-    msg_idx = None
-    for idx, item in enumerate(messages):
-        if item is msg:
-            msg_idx = idx
-            break
-    if msg_idx is None:
-        return ""
-    for j in range(msg_idx - 1, -1, -1):
-        prev = messages[j]
-        if prev.get("role") != "assistant":
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _canonical_bytes(value: Any) -> bytes:
+    return _canonical_json(value).encode("utf-8")
+
+
+def _reclaim_tokens_for_byte_delta(byte_delta: int, measurement_density: float) -> int:
+    density = float(measurement_density)
+    if not math.isfinite(density) or density <= 0:
+        raise ValueError("context reclaim measurement_density must be finite and positive")
+    return max(0, math.ceil((max(0, int(byte_delta)) / 4) * density))
+
+
+def _context_tokens_for_messages(
+    messages: Sequence[Mapping[str, Any]], measurement_density: float,
+) -> int:
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+    _reclaim_tokens_for_byte_delta(0, measurement_density)
+    estimate = estimate_context_prompt_tokens(list(messages))
+    return max(0, math.ceil(estimate * float(measurement_density)))
+
+
+def _sha256(value: Any) -> str:
+    raw = value if isinstance(value, bytes) else str(value).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def context_reclaim_transcript_sha256(messages: Sequence[Mapping[str, Any]]) -> str:
+    return _sha256(_canonical_bytes(list(messages)))
+
+
+def _unique_strings(values: Sequence[Any]) -> Tuple[str, ...]:
+    seen: set[str] = set()
+    result: List[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            result.append(text)
+    return tuple(result)
+
+
+def _unique_refs(values: Sequence[Any]) -> Tuple[Dict[str, Any], ...]:
+    seen: set[str] = set()
+    result: List[Dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, Mapping) or not value:
             continue
-        for tc in (prev.get("tool_calls") or []):
-            if tc.get("id") == target_id:
-                return tc.get("function", {}).get("name", "")
-        break
-    return ""
+        normalized = dict(value)
+        identity = _sha256(_canonical_bytes(normalized))
+        if identity not in seen:
+            seen.add(identity)
+            result.append(normalized)
+    return tuple(result)
 
 
-def _tool_round_starts(messages: list) -> list[int]:
-    return [
-        idx for idx, msg in enumerate(messages)
-        if msg.get("role") == "assistant" and msg.get("tool_calls")
-    ]
-
-
-def _tool_round_spans(messages: list) -> list[Tuple[int, int]]:
-    starts = _tool_round_starts(messages)
-    spans: list[Tuple[int, int]] = []
-    for idx, start in enumerate(starts):
-        end = starts[idx + 1] - 1 if idx + 1 < len(starts) else len(messages) - 1
-        spans.append((start, end))
-    return spans
-
-
-def _protected_warning_in_head(content: str) -> bool:
-    """Whether a tool result carries a compaction-protected ⚠️ marker.
-
-    The marker is not always at character 0: shell prepends autocorrect notes
-    before the ⚠️ line and some results lead with whitespace, which made the
-    old ``startswith`` check silently unprotect prefixed warnings. Scan the
-    first two non-empty lines instead. SHELL_EXIT_ERROR markers are exempt:
-    failed-command rounds are exactly the trial-and-error history that MUST
-    compact (the summarizer is instructed to keep the first error line), while
-    every other ⚠️ marker keeps full protection.
-    """
-    seen = 0
-    for line in str(content or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("⚠️"):
-            return not line.startswith(_SHELL_EXIT_ERROR_MARKER)
-        seen += 1
-        if seen >= 2:
-            break
-    return False
-
-
-def _round_has_protected_content(messages: list, start: int, end: int) -> bool:
-    for idx in range(start, end + 1):
-        msg = messages[idx]
-        role = msg.get("role", "")
-        content = str(msg.get("content") or "")
-        # Protect critical tool results and error markers from compaction.
-        if role == "tool":
-            tool_name = _find_tool_name_for_result(msg, messages)
-            if tool_name in _COMPACTION_PROTECTED_TOOLS or _protected_warning_in_head(content):
-                return True
-    return False
-
-
-def _excerpt_for_summary(text: str, limit: int = _SUMMARY_INPUT_LIMIT) -> str:
-    text = str(text or "")
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n<<EXCERPT_FOR_COMPACTION len={len(text)} chars>>"
-
-
-def _compact_argument_value(value: Any, depth: int = 0) -> Any:
-    if depth > 3:
-        return {"_depth_limit": True, "_type": type(value).__name__}
-    if isinstance(value, str):
-        if len(value) <= 160:
-            return value
-        return f"<<LONG_STRING len={len(value)}>>"
-    if isinstance(value, dict):
-        return {k: _compact_argument_value(v, depth + 1) for k, v in value.items()}
-    if isinstance(value, list):
-        if len(value) > 20:
-            return {"_list_len": len(value), "_type": "list"}
-        return [_compact_argument_value(v, depth + 1) for v in value]
+def _summary_projection(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        kind = str(value.get("type") or "").strip().lower()
+        if kind in {"image", "image_url"}:
+            descriptor = str(
+                value.get("_caption")
+                or value.get("caption")
+                or value.get("alt")
+                or value.get("text")
+                or ""
+            ).strip()
+            if not descriptor:
+                raise _UnsafeVisual("image/base64 content has no safe textual descriptor")
+            return {"type": "image_descriptor", "text": descriptor}
+        projected: Dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key) == "_context_capsule" or custody_private_key(key):
+                continue
+            projected[str(key)] = _summary_projection(item)
+        return projected
+    if isinstance(value, (list, tuple)):
+        return [_summary_projection(item) for item in value]
+    if isinstance(value, bytes):
+        raise _UnsafeVisual("opaque byte content has no safe textual descriptor")
+    if isinstance(value, str) and "data:image/" in value.lower():
+        raise _UnsafeVisual("embedded image data has no safe textual descriptor")
     return value
 
 
-def _compact_tool_call_arguments(tool_name: str, args_json: str) -> Dict[str, Any]:
-    """Compact tool call arguments for old rounds without silent truncation."""
-    large_content_tools = {
-        "write_file": "content",
-        "update_scratchpad": "content",
-        "update_identity": "content",
-    }
-
+def _capsule_metadata(message: Mapping[str, Any]) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    content = message.get("content")
+    if str(message.get("role") or "") not in {"assistant", "user"} or not isinstance(content, list):
+        return False, None
+    blocks = [block for block in content
+              if isinstance(block, Mapping) and "_context_capsule" in block]
+    if not blocks:
+        return False, None
+    if len(content) != 1 or len(blocks) != 1 or message.get("tool_calls"):
+        return True, None
+    block = blocks[0]
+    meta = block.get("_context_capsule")
+    text = str(block.get("text") or "")
+    if not isinstance(meta, Mapping) or not text.strip():
+        return True, None
     try:
-        args = json.loads(args_json)
-        if not isinstance(args, dict):
-            return {"name": tool_name, "arguments": f"<<NON_DICT_ARGS type={type(args).__name__}>>"}
-
-        compacted = dict(args)
-        large_field = large_content_tools.get(tool_name)
-        if large_field and large_field in compacted and compacted[large_field]:
-            raw = compacted[large_field]
-            raw_str = raw if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-            compacted[large_field] = f"<<CONTENT_OMITTED len={len(raw_str)}>>"
-
-        compacted = {k: _compact_argument_value(v) for k, v in compacted.items()}
-        return {"name": tool_name, "arguments": json.dumps(compacted, ensure_ascii=False)}
-    except (json.JSONDecodeError, TypeError, ValueError):
-        return {"name": tool_name, "arguments": f"<<UNPARSEABLE_ARGS_JSON len={len(args_json)}>>"}
-
-
-def _render_round_block(messages: list, start: int, end: int) -> str:
-    lines: list[str] = []
-    for idx in range(start, end + 1):
-        msg = messages[idx]
-        role = msg.get("role")
-        if role == "assistant":
-            content = str(msg.get("content") or "").strip()
-            if content:
-                lines.append("REASONING:")
-                lines.append(_excerpt_for_summary(content))
-            for tc in msg.get("tool_calls") or []:
-                func = tc.get("function", {})
-                tool_name = func.get("name", "")
-                args_json = func.get("arguments", "")
-                compacted = _compact_tool_call_arguments(tool_name, args_json) if args_json else {"name": tool_name, "arguments": "{}"}
-                lines.append(f"TOOL_CALL {compacted['name']}: {compacted['arguments']}")
-        elif role == "tool":
-            tool_name = _find_tool_name_for_result(msg, messages) or "unknown_tool"
-            content = str(msg.get("content") or "")
-            lines.append(f"TOOL_RESULT {tool_name}:")
-            lines.append(_excerpt_for_summary(content))
-        elif role == "user":
-            content = msg.get("content")
-            if isinstance(content, list):
-                # Multipart user content: never str() an image block (the
-                # base64 payload would flood the light summarizer's prompt).
-                parts = []
-                for block in content:
-                    if not isinstance(block, dict):
-                        parts.append(str(block))
-                    elif str(block.get("type") or "") in ("image_url", "image"):
-                        caption = str(block.get("_caption") or "").strip()
-                        parts.append(f"[image: {caption or 'omitted'}]")
-                    else:
-                        parts.append(str(block.get("text", "")))
-                content = "\n".join(part for part in parts if part)
-            else:
-                content = str(content or "")
-            lines.append("USER_INPUT:")
-            lines.append(_excerpt_for_summary(content))
-    return "\n".join(lines).strip()
+        generation = int(meta.get("generation") or 0)
+        version = int(meta.get("version") or 0)
+        source_length = int(meta.get("source_length_chars"))
+        part_count = int(meta.get("part_count"))
+        summary_contract_version = int(meta.get("summary_contract_version"))
+    except (TypeError, ValueError):
+        return True, None
+    source_hashes, source_refs = meta.get("source_hashes"), meta.get("source_refs")
+    parts, checkpoint_ref = meta.get("parts"), meta.get("checkpoint_ref")
+    source_unit_sha256 = str(meta.get("source_unit_sha256") or "")
+    summary_contract_digest = str(meta.get("summary_contract_digest") or "")
+    valid = (
+        str(block.get("type") or "") == "text"
+        and version == _CAPSULE_VERSION
+        and generation >= 1
+        and str(meta.get("retention") or "") in {"summarized", "source_view"}
+        and bool(str(meta.get("unit_id") or "").strip())
+        and str(meta.get("visible_sha256") or "") == _sha256(text)
+        and len(source_unit_sha256) == 64 and set(source_unit_sha256) <= _SHA256_HEX
+        and isinstance(source_hashes, list) and bool(source_hashes)
+        and source_unit_sha256 in source_hashes
+        and all(isinstance(item, str) and len(item) == 64 and set(item) <= _SHA256_HEX
+                for item in source_hashes)
+        and isinstance(source_refs, list)
+        and all(isinstance(item, Mapping) and item for item in source_refs)
+        and isinstance(parts, list) and bool(parts)
+        and part_count == len(parts)
+        and source_length > 0
+        and isinstance(checkpoint_ref, Mapping) and bool(checkpoint_ref)
+        and any(dict(item) == dict(checkpoint_ref) for item in source_refs)
+        and str(meta.get("measurement_basis") or "")
+        in {"fresh_route_usage", "fresh_model_usage", "cold_estimate"}
+        and summary_contract_version == _SUMMARY_CONTRACT_VERSION
+        and summary_contract_digest in {_SUMMARY_CONTRACT_DIGEST, _LEGACY_SUMMARY_CONTRACT_DIGEST}
+    )
+    if not valid:
+        return True, None
+    expected_start = 0
+    seen_source_ids: set[str] = set()
+    for part in parts:
+        if not isinstance(part, Mapping):
+            return True, None
+        try:
+            start = int(part.get("start_char"))
+            end = int(part.get("end_char"))
+        except (TypeError, ValueError):
+            return True, None
+        source_id = str(part.get("source_id") or "")
+        digest = str(part.get("sha256") or "")
+        if (not source_id or source_id in seen_source_ids or start != expected_start
+                or end <= start or len(digest) != 64 or not set(digest) <= _SHA256_HEX
+                or digest not in source_hashes):
+            return True, None
+        seen_source_ids.add(source_id)
+        expected_start = end
+    return (True, dict(meta)) if expected_start == source_length else (True, None)
 
 
-def compact_tool_history(messages: list, keep_recent: int = 6) -> list:
-    """Safe fallback: preserve full content, compact only oversized tool-call payloads."""
-    spans = _tool_round_spans(messages)
-    if len(spans) <= keep_recent:
-        return messages
+def _unit_from_slice(
+    messages: Sequence[Mapping[str, Any]],
+    start: int,
+    end: int,
+    *,
+    trace_refs_by_tool_call_id: Mapping[str, Any],
+    capsule_meta: Optional[Mapping[str, Any]] = None,
+    measurement_density: float = 1.0,
+) -> Optional[_AtomicUnit]:
+    raw_messages = list(messages[start:end + 1])
+    raw_bytes = _canonical_bytes(raw_messages)
+    try:
+        source_text = _canonical_json(_summary_projection(raw_messages))
+    except _UnsafeVisual:
+        return None
+    raw_sha = _sha256(raw_bytes)
+    source_sha = _sha256(source_text)
+    generation = int((capsule_meta or {}).get("generation") or 0)
+    lineage_hashes: List[str] = list((capsule_meta or {}).get("source_hashes") or [])
+    refs: List[Any] = list((capsule_meta or {}).get("source_refs") or [])
+    if capsule_meta:
+        refs.append(capsule_meta.get("checkpoint_ref"))
+    for message in raw_messages:
+        for call in message.get("tool_calls") or []:
+            call_id = str((call or {}).get("id") or "")
+            if call_id:
+                refs.append(trace_refs_by_tool_call_id.get(call_id))
+    lineage_hashes.extend((raw_sha, source_sha))
+    context_size_tokens = _context_tokens_for_messages(raw_messages, measurement_density)
+    capsule_floor = _reclaim_tokens_for_byte_delta(_MIN_CAPSULE_BYTES, measurement_density)
+    predicted = max(0, context_size_tokens - capsule_floor)
+    return _AtomicUnit(
+        unit_id=f"unit:{start}:{end}:{raw_sha[:16]}",
+        start=start,
+        end=end,
+        raw_sha256=raw_sha,
+        raw_size_bytes=len(raw_bytes),
+        context_size_tokens=context_size_tokens,
+        source_text=source_text,
+        source_sha256=source_sha,
+        predicted_reclaim_tokens=predicted,
+        generation=generation,
+        lineage_hashes=_unique_strings(lineage_hashes),
+        source_refs=_unique_refs(refs),
+    )
 
-    compactable_starts = {start for start, _ in spans[:-keep_recent]}
-    result = []
-    for idx, msg in enumerate(messages):
-        if idx in compactable_starts and msg.get("role") == "assistant" and msg.get("tool_calls"):
-            compacted = dict(msg)
-            compacted_calls = []
-            for tc in msg.get("tool_calls") or []:
-                tc_copy = dict(tc)
-                if "function" in tc_copy:
-                    func = dict(tc_copy["function"])
-                    args_str = func.get("arguments", "")
-                    tc_copy["function"] = _compact_tool_call_arguments(func.get("name", ""), args_str) if args_str else func
-                compacted_calls.append(tc_copy)
-            compacted["tool_calls"] = compacted_calls
-            result.append(compacted)
+
+def _atomic_units(
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    trace_refs_by_tool_call_id: Optional[Mapping[str, Any]] = None,
+    measurement_density: float = 1.0,
+) -> Tuple[_AtomicUnit, ...]:
+    """Find completed tool units and capsules; leave malformed units raw."""
+    trace_refs = trace_refs_by_tool_call_id or {}
+    units: List[_AtomicUnit] = []
+    idx = 0
+    while idx < len(messages):
+        message = messages[idx]
+        capsule_present, capsule_meta = _capsule_metadata(message)
+        if capsule_present:
+            if capsule_meta is not None:
+                unit = _unit_from_slice(
+                    messages, idx, idx,
+                    trace_refs_by_tool_call_id=trace_refs,
+                    capsule_meta=capsule_meta,
+                    measurement_density=measurement_density,
+                )
+                if unit is not None:
+                    units.append(unit)
+            idx += 1
             continue
-        result.append(msg)
+
+        calls = message.get("tool_calls") or []
+        if (str(message.get("role") or "") != "assistant"
+                or not isinstance(calls, list) or not calls
+                or not all(isinstance(call, Mapping)
+                           and isinstance(call.get("function"), Mapping)
+                           and str(call["function"].get("name") or "").strip()
+                           for call in calls)):
+            idx += 1
+            continue
+        call_ids = [str((call or {}).get("id") or "") for call in calls]
+        if not all(call_ids) or len(call_ids) != len(set(call_ids)):
+            idx += 1
+            continue
+        end = idx
+        results: List[Mapping[str, Any]] = []
+        cursor = idx + 1
+        while cursor < len(messages) and str(messages[cursor].get("role") or "") == "tool":
+            results.append(messages[cursor])
+            end = cursor
+            cursor += 1
+        result_ids = [str(result.get("tool_call_id") or "") for result in results]
+        complete = (
+            len(result_ids) == len(call_ids)
+            and all(result_ids)
+            and len(result_ids) == len(set(result_ids))
+            and set(result_ids) == set(call_ids)
+        )
+        if complete and not anthropic_tool_unit_active(messages, idx, end):
+            unit = _unit_from_slice(
+                messages, idx, end,
+                trace_refs_by_tool_call_id=trace_refs,
+                measurement_density=measurement_density,
+            )
+            if unit is not None:
+                units.append(unit)
+        idx = max(idx + 1, end + 1)
+    return tuple(units)
+
+
+def _source_atoms(messages: Sequence[Mapping[str, Any]]) -> Counter:
+    """Content identities across function/custom and native tool-result syntax.
+
+    The transport may change JSON syntax and coalesce text blocks, but a call's
+    name/arguments and its whole result still have to be present. IDs alone are
+    never exposure evidence; counts also distinguish repeated identical parts.
+    """
+    atoms: Counter = Counter()
+    calls_by_id: Dict[str, tuple] = {}
+    calls_by_name: Dict[str, tuple] = {}
+    last_call: tuple = ("", None)
+
+    def add(kind: str, *values: Any) -> None:
+        atoms[_sha256(_canonical_bytes((kind, *values)))] += 1
+
+    def arguments(value: Any) -> Any:
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                pass
+        return value
+
+    def content(value: Any) -> Any:
+        if isinstance(value, list) and all(isinstance(p, Mapping) and p.get("type") == "text" for p in value):
+            return "".join(str(p.get("text") or "") for p in value)
+        return value
+
+    def result_content(value: Any) -> Any:
+        value = content(value) or "(no tool output)"
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return {"result": value}  # native function-result JSON envelope
+        return value
+
+    for message in messages:
+        role, body = message.get("role"), message.get("content")
+        if role in {"tool", "function"}:
+            call = calls_by_id.get(str(message.get("tool_call_id") or "")) or calls_by_name.get(str(message.get("name") or "")) or last_call
+            add("result", *call, result_content(body))
+            continue
+        blocks = body if isinstance(body, list) else [{"type": "text", "text": body}]
+        text = "".join(str(block.get("text") or "") for block in blocks if isinstance(block, Mapping))
+        if role == "assistant" and text:
+            add("text", text)
+        for block in blocks:
+            if not isinstance(block, Mapping):
+                continue
+            if role == "user" and block.get("type") == "text" and block.get("text"):
+                add("host_text", str(block["text"]))
+            if block.get("type") == "tool_use":
+                last_call = (str(block.get("name") or ""), arguments(block.get("input")))
+                calls_by_id[str(block.get("id") or "")] = last_call
+                calls_by_name[last_call[0]] = last_call
+                add("call", *last_call)
+            elif block.get("type") == "tool_result":
+                call = calls_by_id.get(str(block.get("tool_use_id") or "")) or last_call
+                add("result", *call, result_content(block.get("content")))
+        if role == "assistant" and message.get("reasoning_content"):
+            add("reasoning", message["reasoning_content"])
+        calls = message.get("tool_calls") or []
+        if message.get("function_call"):
+            calls = [{"function": message["function_call"]}]
+        for call in calls:
+            function = call.get("function") or call.get("custom") or {}
+            last_call = (str(function.get("name") or ""), arguments(function.get("arguments", function.get("input"))))
+            calls_by_id[str(call.get("id") or "")] = last_call
+            calls_by_name[last_call[0]] = last_call
+            add("call", *last_call)
+    return atoms
+
+
+def exposed_context_units(messages: list, physical_messages: list) -> Tuple[Dict[str, str], ...]:
+    """Exact canonical source identities whose complete contents reached the wire."""
+    remaining = _source_atoms(physical_messages)
+    exposed = []
+    for unit in _atomic_units(messages):
+        atoms = _source_atoms(messages[unit.start:unit.end + 1])
+        if atoms and all(remaining[key] >= count for key, count in atoms.items()):
+            remaining.subtract(atoms)
+            exposed.append({"unit_id": unit.unit_id, "raw_sha256": unit.raw_sha256})
+    return tuple(exposed)
+
+
+def _typed_context_overflow(exc: BaseException) -> bool:
+    try:
+        from ouroboros.llm import LocalContextTooLargeError
+
+        if isinstance(exc, LocalContextTooLargeError):
+            return True
+    except Exception:
+        pass
+    candidates = [getattr(exc, key, None) for key in ("kind", "code", "type")]
+    body = getattr(exc, "body", None)
+    payloads = [body] if isinstance(body, Mapping) else []
+    response = getattr(exc, "response", None)
+    if response is not None:
+        try:
+            response_body = response.json()
+        except Exception:
+            response_body = None
+        if isinstance(response_body, Mapping):
+            payloads.append(response_body)
+    for payload in payloads:
+        candidates.extend(payload.get(key) for key in ("kind", "code", "type"))
+        nested = payload.get("error")
+        if isinstance(nested, Mapping):
+            candidates.extend(nested.get(key) for key in ("kind", "code", "type"))
+    capture = getattr(exc, "physical_attempt_capture", None)
+    candidates.extend((getattr(capture, "provider_code", None),
+                       getattr(capture, "provider_error_type", None)))
+    if any(str(value or "").strip().lower() in _TYPED_CONTEXT_OVERFLOW_CODES for value in candidates):
+        return True
+    return _context_overflow_message(str(exc))
+
+
+def _record_usage(total: Dict[str, Any], usage: Mapping[str, Any]) -> None:
+    from ouroboros.llm import add_usage
+
+    add_usage(total, dict(usage))
+    for key in ("provider", "model", "prompt_cache_ttl"):
+        if usage.get(key) is not None:
+            total[key] = usage[key]
+
+
+def _summarizer_spec() -> Dict[str, Any]:
+    from ouroboros.config import get_light_model
+
+    model = str(get_light_model() or "")
+    use_local = runtime_setting("USE_LOCAL_LIGHT", "").strip().lower() in {"1", "true", "yes", "on"}
+    route: Dict[str, Any] = {"model": model, "use_local": use_local}
+    if use_local:
+        route.update({"provider": "local", "resolved_model": model})
+    else:
+        try:
+            from ouroboros.llm import LLMClient
+
+            target = LLMClient()._resolve_remote_target(model)
+            route.update({"provider": str(target.get("provider") or ""),
+                          "resolved_model": str(target.get("usage_model") or target.get("resolved_model") or model),
+                          "base_url": str(target.get("base_url") or "")})
+        except Exception:
+            route.update({"provider": "unknown", "resolved_model": model, "base_url": ""})
+    route["route_fp"] = _sha256(_canonical_bytes(route))
+    route["effort"] = "low"
+    route["output_budget"] = _SUMMARY_OUTPUT_TOKENS
+    return route
+
+
+_SUMMARY_CONTRACT_DIGEST = _sha256(_canonical_bytes({
+    "version": _SUMMARY_CONTRACT_VERSION, "guidance": _SUMMARY_GUIDANCE,
+    "tool": _CONTEXT_SUMMARIES_TOOL,
+    "input_fields": ("source_id", "start_char", "end_char", "sha256",
+                     "summary_budget_tokens", "content"),
+}))
+# The previous serialized capsule contract remains readable after attribution changes.
+_LEGACY_SUMMARY_CONTRACT_DIGEST = "6bd892aa2479a9c8b65036b0c18e53ccc076cb5bf5a0d87e351ea38182fa3402"
+
+
+def _summary_map_from_entries(entries: Any) -> Dict[str, str]:
+    if not isinstance(entries, list):
+        return {}
+    result: Dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            return {}
+        source_id = str(entry.get("source_id") or "").strip()
+        summary = str(entry.get("summary") or "").strip()
+        if not source_id or not summary or source_id in result:
+            return {}
+        result[source_id] = summary
     return result
 
 
-_SUMMARY_GUIDANCE = (
-    "Summarize each reasoning round block below. Preserve: user steering, "
-    "key hypotheses, tools used only when relevant, outcomes, what changed, "
-    "and the next step or open question. If a command or tool failed, keep "
-    "the exact first error line verbatim. Write as Ouroboros in first person. "
-    "Keep each summary to 3-6 sentences."
-)
+def _parse_structured_summaries(message: Mapping[str, Any]) -> Dict[str, str]:
+    calls = message.get("tool_calls") or []
+    if not isinstance(calls, list) or len(calls) != 1 or not isinstance(calls[0], Mapping):
+        return {}
+    function = calls[0].get("function") or {}
+    if not isinstance(function, Mapping) or str(function.get("name") or "") != "emit_context_summaries":
+        return {}
+    try:
+        payload = json.loads(function.get("arguments") or "{}")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return _summary_map_from_entries(payload.get("summaries"))
 
 
-def _parse_structured_summaries(resp_msg: Dict[str, Any]) -> Dict[int, str]:
-    """Extract round summaries from an emit_round_summaries tool call."""
-    for tc in resp_msg.get("tool_calls") or []:
-        func = tc.get("function") or {}
-        if str(func.get("name") or "") != "emit_round_summaries":
-            continue
-        try:
-            args = json.loads(func.get("arguments") or "{}")
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        parsed: Dict[int, str] = {}
-        for entry in args.get("summaries") or []:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                round_id = int(entry.get("round_id"))
-            except (TypeError, ValueError):
-                continue
-            summary = str(entry.get("summary") or "").strip()
-            if summary:
-                parsed[round_id] = summary
-        if parsed:
-            return parsed
-    return {}
+def _parse_json_summaries(content: Any) -> Dict[str, str]:
+    try:
+        payload = json.loads(str(content or ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    return _summary_map_from_entries(payload.get("summaries") if isinstance(payload, Mapping) else None)
 
 
-def _parse_text_protocol_summaries(summary_text: str) -> Dict[int, str]:
-    """Parse the legacy ``[round:N]``-framed text protocol (local fallback)."""
-    summary_map: Dict[int, str] = {}
-    current_round: Optional[int] = None
-    current_lines: list[str] = []
-    for line in summary_text.strip().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("[round:") and stripped.endswith("]"):
-            if current_round is not None:
-                summary_map[current_round] = " ".join(current_lines).strip()
-            current_lines = []
-            try:
-                current_round = int(stripped[len("[round:"):-1])
-            except ValueError:
-                current_round = None
-            continue
-        if current_round is not None:
-            current_lines.append(stripped)
-    if current_round is not None:
-        summary_map[current_round] = " ".join(current_lines).strip()
-    return {k: v for k, v in summary_map.items() if v}
-
-
-def _merge_compaction_usage(
-    total: Optional[Dict[str, Any]], usage: Optional[Dict[str, Any]]
-) -> Optional[Dict[str, Any]]:
-    if not usage:
-        return total
-    if total is None:
-        return dict(usage)
-    for key, value in usage.items():
-        if isinstance(value, (int, float)):
-            total[key] = total.get(key, 0) + value
-        else:
-            total[key] = value
-    return total
-
-
-def _summarize_round_batch(
-    rendered_blocks: List[Tuple[int, str]],
+def _call_summarizer(
+    parts: Sequence[_Part],
     *,
     drive_root: pathlib.Path,
     task_id: str,
-) -> Tuple[Dict[int, str], Optional[Dict[str, Any]]]:
-    """Summarize one batch of rounds; returns (summary_map, usage).
-
-    Tries the structured tool protocol first (reliable round_id keying), then
-    falls back to the legacy text protocol within the same response or — for
-    local light models without dependable tool calling — as the primary path.
-    Usage is returned even when parsing yields nothing so the caller can
-    account spend for failed batches.
-    """
-    batch_text = "\n\n---\n\n".join(
-        f"[round:{start}]\n{content}" for start, content in rendered_blocks
-    )
-
-    from ouroboros.config import get_light_model
+    phase: Literal["map", "fold"],
+    spec: Mapping[str, Any],
+    summary_budgets: Mapping[str, int],
+    usage_total: Dict[str, Any],
+) -> Dict[str, str]:
+    """Summarize complete parts. Typed overflow is never retried unchanged."""
     from ouroboros.llm import LLMClient
     from ouroboros.llm_observability import chat_observed
-
-    light_model = get_light_model()
+    payload = [
+        {
+            "source_id": part.source_id,
+            "start_char": part.start_char,
+            "end_char": part.end_char,
+            "sha256": part.sha256,
+            "summary_budget_tokens": int(summary_budgets[part.root_id]),
+            "content": part.text,
+        }
+        for part in parts
+    ]
+    source_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     client = LLMClient()
-    use_local_light = os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1")
-    total_usage: Optional[Dict[str, Any]] = None
+    use_local = bool(spec.get("use_local"))
+    common = {
+        "drive_root": drive_root,
+        "task_id": task_id,
+        "call_type": f"context_compaction_{phase}",
+        "model_role": "light",
+        "model": str(spec.get("model") or ""),
+        "reasoning_effort": str(spec.get("effort") or "low"),
+        "max_tokens": int(spec.get("output_budget") or _SUMMARY_OUTPUT_TOKENS),
+        "use_local": use_local,
+        # One sticky session per data root: without it a system-less prompt gets
+        # no OpenRouter session_id/OpenAI key, so sibling map/fold calls may land
+        # on different upstream caches.
+        "cache_affinity": "" if use_local else f"context_compaction:{drive_root}",
+    }
 
-    if not use_local_light:
-        structured_prompt = (
-            _SUMMARY_GUIDANCE
-            + " Call emit_round_summaries exactly once with one entry per [round:id] block.\n\n"
-            + batch_text
-        )
+    if not use_local:
+        prompt = (_SUMMARY_GUIDANCE
+                  + "\nCall emit_context_summaries exactly once, with one entry for every source_id.\n"
+                  + source_json)
         try:
-            resp_msg, usage = chat_observed(
-                client,
-                drive_root=drive_root,
-                task_id=task_id,
-                call_type="context_compaction",
-                messages=[{"role": "user", "content": structured_prompt}],
-                model=light_model,
-                tools=[_ROUND_SUMMARIES_TOOL],
-                tool_choice="required",
-                reasoning_effort="low",
-                max_tokens=32768,
-                use_local=False,
+            from ouroboros.openai_chat_dispatch import call_with_custom_validation_continuation
+            message, observed_usage, executable = call_with_custom_validation_continuation(
+                lambda request_messages: chat_observed(
+                    client, messages=request_messages,
+                    tools=[_CONTEXT_SUMMARIES_TOOL], tool_choice="required", **common,
+                ),
+                [{"role": "user", "content": prompt}],
             )
-            total_usage = _merge_compaction_usage(total_usage, usage)
-            summary_map = _parse_structured_summaries(resp_msg)
-            if not summary_map:
-                # Some models answer in prose despite the pin; salvage it.
-                summary_map = _parse_text_protocol_summaries(str(resp_msg.get("content") or ""))
-            if summary_map:
-                return summary_map, total_usage
-        except Exception:
-            log.warning(
-                "Structured compaction protocol failed; retrying with text protocol",
-                exc_info=True,
-            )
+            for _usage in observed_usage:
+                _record_usage(usage_total, _usage)
+            if executable:
+                parsed = _parse_structured_summaries(message)
+                if parsed:
+                    return parsed
+        except Exception as exc:
+            if _typed_context_overflow(exc):
+                raise SummarizerContextOverflow(str(exc)) from exc
+            from ouroboros.llm_claudexor import propagate_model_error
+            propagate_model_error(exc)
+            log.warning("Structured context summary failed; trying JSON response", exc_info=True)
 
-    text_prompt = (
-        _SUMMARY_GUIDANCE
-        + " Output one block per [round:id] in the same order.\n\n"
-        + batch_text
-    )
+    prompt = (_SUMMARY_GUIDANCE
+              + "\nReturn only a JSON object {\"summaries\":[{\"source_id\":...,\"summary\":...}]}, "
+                "with one entry for every source_id.\n"
+              + source_json)
     try:
-        resp_msg, usage = chat_observed(
+        message, _usage = chat_observed(
             client,
+            messages=[{"role": "user", "content": prompt}],
+            **common,
+        )
+        _record_usage(usage_total, _usage)
+    except Exception as exc:
+        if _typed_context_overflow(exc):
+            raise SummarizerContextOverflow(str(exc)) from exc
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
+        raise _UnitSummaryFailure(
+            f"summary call failed: {type(exc).__name__}: {exc}",
+        ) from exc
+    return _parse_json_summaries(message.get("content"))
+
+
+def _part(source_id: str, text: str, start: int = 0) -> _Part:
+    end = start + len(text)
+    return _Part(root_id=source_id,
+                 source_id=f"{source_id}:{start}:{end}:{_sha256(text)[:12]}",
+                 start_char=start, end_char=end, text=text, sha256=_sha256(text))
+
+
+def _split_part(part: _Part) -> Optional[Tuple[_Part, _Part]]:
+    if len(part.text) < 2:
+        return None
+    midpoint = len(part.text) // 2
+    # Newline boundary only NEAR the midpoint: a lone newline near an edge
+    # used to produce degenerate 1%/99% splits that re-overflowed unchanged.
+    window = max(1, len(part.text) // 4)
+    before = part.text.rfind("\n", 1, midpoint + 1)
+    after = part.text.find("\n", midpoint, len(part.text) - 1)
+    candidates = [pos + 1 for pos in (before, after)
+                  if pos > 0 and abs((pos + 1) - midpoint) <= window]
+    split_at = min(candidates, key=lambda pos: abs(pos - midpoint)) if candidates else midpoint
+    if split_at <= 0 or split_at >= len(part.text):
+        split_at = midpoint
+    if split_at <= 0 or split_at >= len(part.text):
+        return None
+    left_text = part.text[:split_at]
+    right_text = part.text[split_at:]
+    return (_part(part.root_id, left_text, part.start_char),
+            _part(part.root_id, right_text, part.start_char + split_at))
+
+
+def _map_complete_parts(
+    parts: Sequence[_Part],
+    *,
+    drive_root: pathlib.Path,
+    task_id: str,
+    spec: Mapping[str, Any],
+    summary_budgets: Mapping[str, int],
+    usage_total: Dict[str, Any],
+) -> Tuple[Tuple[_Part, ...], Dict[str, str], set[str]]:
+    try:
+        summaries = _call_summarizer(
+            parts,
             drive_root=drive_root,
             task_id=task_id,
-            call_type="context_compaction",
-            messages=[{"role": "user", "content": text_prompt}],
-            model=light_model,
-            reasoning_effort="low",
-            max_tokens=32768,
-            use_local=use_local_light,
+            phase="map",
+            spec=spec,
+            summary_budgets=summary_budgets,
+            usage_total=usage_total,
         )
+    except SummarizerContextOverflow:
+        if len(parts) > 1:
+            middle = len(parts) // 2
+            subsets: Sequence[Sequence[_Part]] = (parts[:middle], parts[middle:])
+        else:
+            split = _split_part(parts[0])
+            if split is None:
+                return (), {}, {parts[0].root_id}
+            # One call PER half: both halves together equal the failed payload.
+            subsets = ((split[0],), (split[1],))
+        leaves: List[_Part] = []
+        merged: Dict[str, str] = {}
+        failed: set[str] = set()
+        for subset in subsets:
+            child_leaves, child_map, child_failed = _map_complete_parts(
+                subset,
+                drive_root=drive_root,
+                task_id=task_id,
+                spec=spec,
+                summary_budgets=summary_budgets,
+                usage_total=usage_total,
+            )
+            leaves.extend(child_leaves)
+            merged.update(child_map)
+            failed.update(child_failed)
+        return tuple(leaves), merged, failed
+    except _UnitSummaryFailure:
+        return (), {}, {part.root_id for part in parts}
+    expected = {part.source_id: part.root_id for part in parts}
+    if set(summaries) - set(expected):
+        return tuple(parts), {}, set(expected.values())
+    missing = set(expected) - set(summaries)
+    failed = {expected[source_id] for source_id in missing}
+    return tuple(parts), summaries, failed
+
+
+def _fold_summaries(
+    leaves: Sequence[_Part],
+    summaries: Mapping[str, str],
+    *,
+    drive_root: pathlib.Path,
+    task_id: str,
+    spec: Mapping[str, Any],
+    summary_budget_tokens: int,
+    usage_total: Dict[str, Any],
+) -> str:
+    nodes = [(leaf.source_id, summaries[leaf.source_id]) for leaf in leaves]
+    while len(nodes) > 1:
+        next_nodes: List[Tuple[str, str]] = []
+        for offset in range(0, len(nodes), _BLOCKS_PER_BATCH):
+            group = nodes[offset:offset + _BLOCKS_PER_BATCH]
+            if len(group) == 1:
+                next_nodes.append(group[0])
+                continue
+            labelled = "\n\n".join(f"[{source_id}]\n{summary}" for source_id, summary in group)
+            fold_id = "fold:" + _sha256(labelled)[:16]
+            fold_part = _part(fold_id, labelled)
+            try:
+                folded = _call_summarizer(
+                    [fold_part],
+                    drive_root=drive_root,
+                    task_id=task_id,
+                    phase="fold",
+                    spec=spec,
+                    summary_budgets={fold_part.root_id: summary_budget_tokens},
+                    usage_total=usage_total,
+                )
+                text = str(folded.get(fold_part.source_id) or "").strip() \
+                    if set(folded) == {fold_part.source_id} else ""
+            except (SummarizerContextOverflow, _UnitSummaryFailure):
+                text = ""
+            next_nodes.append((fold_id, text or labelled))
+        nodes = next_nodes
+    return nodes[0][1]
+
+
+def _negative_memo_key(
+    unit: _AtomicUnit,
+    *,
+    summary_budget_tokens: int,
+    spec: Mapping[str, Any],
+) -> str:
+    return _sha256(_canonical_bytes({
+        "unit_raw_sha256": unit.raw_sha256,
+        "unit_source_sha256": unit.source_sha256,
+        "lineage_hashes": unit.lineage_hashes,
+        "source_ref_hashes": [_sha256(_canonical_bytes(ref)) for ref in unit.source_refs],
+        "requested_unit_summary_budget": summary_budget_tokens,
+        "summarizer_route_fp": str(spec.get("route_fp") or ""),
+        "summarizer_model": str(spec.get("resolved_model") or spec.get("model") or ""),
+        "summarizer_effort": str(spec.get("effort") or ""),
+        "summarizer_output_budget": int(spec.get("output_budget") or 0),
+        "summary_contract_digest": _SUMMARY_CONTRACT_DIGEST,
+        "summary_contract_version": _SUMMARY_CONTRACT_VERSION,
+    }))
+
+
+def _select_units(
+    messages: Sequence[Mapping[str, Any]],
+    request: ContextReclaimRequest,
+    *,
+    keep_recent: int,
+    trace_refs_by_tool_call_id: Mapping[str, Any],
+    negative_memo: MutableSet[str],
+    spec: Mapping[str, Any],
+    exposed_units: Optional[Sequence[Mapping[str, Any]]] = None,
+    automatic: bool = False,
+    provider_refused: bool = False,
+) -> Tuple[Optional[_Selection], ReclaimStatus]:
+    units = list(_atomic_units(
+        messages, trace_refs_by_tool_call_id=trace_refs_by_tool_call_id,
+        measurement_density=request.measurement_density))
+    # Earlier records are residue, not fresh sources for another helper retelling. Only the
+    # provider's own refusal of this request lets an automatic pass re-fold them, as the last
+    # resort after every raw source. Keep the general unit reader broad for explicit
+    # authored views and restore.
+    if automatic:
+        units = ([unit for unit in units if unit.generation == 0]
+                 + ([unit for unit in units if unit.generation] if provider_refused else []))
+    if exposed_units is not None or automatic:
+        exposed = {(ref.get("unit_id"), ref.get("raw_sha256")) for ref in (exposed_units or ())}
+        units = [unit for unit in units if (unit.unit_id, unit.raw_sha256) in exposed]
+    if keep_recent > 0:
+        units = units[:-keep_recent] if len(units) > keep_recent else []
+    if not units:
+        return None, "no_eligible"
+    if int(request.reclaim_goal_tokens) <= 0:
+        return None, "no_positive_reclaim"
+    selected: List[_SelectedUnit] = []
+    predicted = 0
+    for unit in units:
+        if unit.predicted_reclaim_tokens <= 0:
+            continue
+        source_tokens = max(1, len(unit.source_text.encode("utf-8")) // 4)
+        summary_budget = min(_SUMMARY_OUTPUT_TOKENS, max(
+            512, min(source_tokens // 2, max(512, int(request.reclaim_goal_tokens))),
+        ))
+        memo_key = _negative_memo_key(unit, summary_budget_tokens=summary_budget, spec=spec)
+        if memo_key in negative_memo:
+            continue
+        selected.append(_SelectedUnit(unit, summary_budget, memo_key))
+        predicted += unit.predicted_reclaim_tokens
+        if predicted >= int(request.reclaim_goal_tokens):
+            break
+    if not selected or (not request.allow_partial_shrink and predicted < int(request.reclaim_goal_tokens)):
+        return None, "no_positive_reclaim"
+    fingerprint = _sha256(_canonical_bytes({
+        "request": {
+            "route_fp": request.route_fp,
+            "round_id": request.round_id,
+            "transcript_sha256": request.transcript_sha256,
+            "measurement_basis": request.measurement_basis,
+            "measurement_density": float(request.measurement_density),
+            "reclaim_goal_tokens": int(request.reclaim_goal_tokens),
+            "allow_partial_shrink": bool(request.allow_partial_shrink),
+        },
+        "units": [
+            {
+                "unit_id": item.unit.unit_id,
+                "raw_sha256": item.unit.raw_sha256,
+                "memo_key": item.negative_memo_key,
+            }
+            for item in selected
+        ],
+    }))
+    return _Selection(tuple(selected), fingerprint, predicted), "applied"
+
+
+def _persist_reclaim_checkpoint(
+    messages: Sequence[Mapping[str, Any]],
+    request: ContextReclaimRequest,
+    selection: _Selection,
+    *,
+    drive_root: pathlib.Path,
+    task_id: str,
+) -> Optional[Dict[str, Any]]:
+    from ouroboros.observability import new_call_id, persist_call
+    payload = {"messages": list(messages), "request": asdict(request),
+        "observed_view_revision": context_reclaim_transcript_sha256(messages),
+        "selection_fingerprint": selection.fingerprint, "selected_unit_ids": [item.unit.unit_id for item in selection.units],
+    }
+    try:
+        persisted = persist_call(
+            pathlib.Path(drive_root).resolve(strict=False),
+            task_id=str(task_id or "context_compaction"),
+            call_id=new_call_id("context_reclaim_checkpoint"),
+            call_type="context_reclaim_checkpoint",
+            payload=payload,
+            manifest={
+                "route_fp": request.route_fp, "round_id": request.round_id,
+                "selection_fingerprint": selection.fingerprint, "selected_unit_ids": [item.unit.unit_id for item in selection.units],
+            },
+            keep_raw=True,
+        )
+    except Exception:
+        log.debug("Failed to persist selected context-reclaim checkpoint", exc_info=True)
+        return None
+    if not isinstance(persisted, Mapping) or not persisted.get("manifest_ref"): return None
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+        return store_actor_source_bytes(
+            pathlib.Path(drive_root), str(task_id or "context_compaction"),
+            category="context_checkpoints", source_id=selection.fingerprint,
+            data=json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+            extension="json",
+        )
+    except Exception:
+        log.debug("Failed to persist actor-readable context-reclaim checkpoint", exc_info=True)
+        return None
+
+
+def _capsule_message(
+    selected: _SelectedUnit,
+    summary: str,
+    parts: Sequence[_Part],
+    checkpoint_ref: Mapping[str, Any],
+    request: ContextReclaimRequest,
+    *, retention: str = "summarized",
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    unit = selected.unit
+    generation = unit.generation + 1
+    label = ("Historical source: read-only projection, not live assistant/tool turns; "
+             "private transport data omitted; exact original retained by checkpoint"
+             if retention == "source_view" else
+             f"Host memory record from a summarization helper, generation {generation}; exact source retained by checkpoint")
+    text = f"[{label}]\n" + str(summary or "").strip()
+    if retention == "source_view":
+        address = {"checkpoint_ref": dict(checkpoint_ref), "unit_id": unit.unit_id, "raw_sha256": unit.raw_sha256}
+        text = f"[{label}]\nSource reference: {_canonical_json(address)}\n" + str(summary or "").strip()
+    source_hashes = _unique_strings([
+        *unit.lineage_hashes, unit.raw_sha256, unit.source_sha256,
+        *(part.sha256 for part in parts),
+    ])
+    source_refs = _unique_refs([*unit.source_refs, dict(checkpoint_ref)])
+    metadata: Dict[str, Any] = {
+        "version": _CAPSULE_VERSION,
+        "generation": generation,
+        "retention": retention,
+        "unit_id": unit.unit_id,
+        "source_unit_sha256": unit.raw_sha256,
+        "source_length_chars": len(unit.source_text),
+        "source_hashes": list(source_hashes),
+        "source_refs": list(source_refs),
+        "checkpoint_ref": dict(checkpoint_ref),
+        "parts": [{
+            "source_id": part.source_id, "start_char": part.start_char,
+            "end_char": part.end_char, "sha256": part.sha256,
+        } for part in parts],
+        "part_count": len(parts),
+        "route_fp": request.route_fp,
+        "round_id": request.round_id,
+        "measurement_basis": request.measurement_basis,
+        "summary_contract_version": _SUMMARY_CONTRACT_VERSION,
+        "summary_contract_digest": _SUMMARY_CONTRACT_DIGEST,
+        "visible_sha256": _sha256(text),
+        "authorship": "host" if retention == "source_view" else "helper",
+    }
+    message = {"role": "user", "content": [{
+        "type": "text", "text": text, "_context_capsule": metadata,
+    }]}
+    capsule_ref = {
+        "unit_id": unit.unit_id,
+        "generation": generation,
+        "checkpoint_ref": dict(checkpoint_ref),
+        "source_hashes": list(source_hashes),
+        "source_refs": list(source_refs),
+    }
+    return message, capsule_ref
+
+
+def _receipt(
+    status: ReclaimStatus,
+    *,
+    before_sha: str,
+    after_sha: Optional[str] = None,
+    selection: Optional[_Selection] = None,
+    reclaimed_tokens: int = 0,
+    goal_reached: bool = False,
+    checkpoint_ref: Optional[Dict[str, Any]] = None,
+    capsule_refs: Sequence[Dict[str, Any]] = (),
+    **view_facts: Any,
+) -> ContextReclaimReceipt:
+    return ContextReclaimReceipt(
+        status=status,
+        before_transcript_sha256=before_sha,
+        after_transcript_sha256=after_sha or before_sha,
+        selection_fingerprint=selection.fingerprint if selection else "",
+        selected_unit_ids=tuple(item.unit.unit_id for item in selection.units) if selection else (),
+        reclaimed_tokens=max(0, int(reclaimed_tokens)),
+        goal_reached=bool(goal_reached),
+        checkpoint_ref=checkpoint_ref,
+        capsule_refs=tuple(dict(item) for item in capsule_refs),
+        **view_facts,
+    )
+
+
+def _view_source_messages(messages: Sequence[Mapping[str, Any]]) -> list:
+    """Compare source while ignoring only the host's cache presentation."""
+    normalized = copy.deepcopy(list(messages))
+    first_user = next((i for i, m in enumerate(normalized) if m.get("role") == "user"), None)
+    for idx, message in enumerate(normalized):
+        message.pop("cache_control", None)
+        content = message.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+            if ((message.get("role") == "tool" or idx == first_user) and len(content) == 1
+                    and isinstance(content[0], dict) and set(content[0]) == {"type", "text"}
+                    and content[0]["type"] == "text" and isinstance(content[0]["text"], str)):
+                message["content"] = content[0]["text"]
+    return normalized
+
+
+def _materialize_replacements(messages: list, replacements: Mapping[int, tuple]) -> tuple[list, list]:
+    """Publish complete units at their existing positions; preserve every other turn."""
+    rebuilt, capsule_refs = [], []
+    pending = dict(replacements)
+    idx = 0
+    while idx <= len(messages):
+        replacement = pending.pop(idx, None)
+        if replacement is not None:
+            end, added, refs = replacement
+            rebuilt.extend(added)
+            capsule_refs.extend(refs)
+            idx = end + 1
+        elif idx < len(messages):
+            rebuilt.append(messages[idx])
+            idx += 1
+        else:
+            break
+    return rebuilt, capsule_refs
+
+
+def _restored_source_views(refs: Sequence[Mapping[str, Any]], *, drive_root: pathlib.Path,
+                           task_id: str, request: ContextReclaimRequest) -> tuple[list, list]:
+    """Retrieve exact checkpoint-local units as source text, never live protocol turns."""
+    from ouroboros.artifacts import read_actor_source_bytes
+
+    messages, capsule_refs = [], []
+    for ref in _unique_refs(refs):
+        checkpoint = ref.get("checkpoint_ref")
+        payload = json.loads(read_actor_source_bytes(drive_root, task_id, checkpoint))
+        original = payload.get("messages") if isinstance(payload, Mapping) else None
+        if not isinstance(original, list) or not all(isinstance(m, Mapping) for m in original):
+            raise ValueError("checkpoint has no complete message source")
+        unit = next((u for u in _atomic_units(original)
+                     if u.unit_id == ref.get("unit_id") and u.raw_sha256 == ref.get("raw_sha256")), None)
+        if unit is None:
+            raise ValueError("checkpoint unit identity or full raw hash does not match")
+        unit = replace(unit, source_refs=_unique_refs([*unit.source_refs, ref]))
+        message, capsule_ref = _capsule_message(
+            _SelectedUnit(unit, 0, ""), unit.source_text, [_part(unit.unit_id, unit.source_text)],
+            checkpoint, request, retention="source_view")
+        messages.append(message)
+        capsule_refs.append(capsule_ref)
+    return messages, capsule_refs
+
+
+def _authored_view(
+    messages: list, request: ContextReclaimRequest, *, observed_messages: Optional[Sequence[Mapping[str, Any]]],
+    observed_tool_schemas: Optional[Sequence[Mapping[str, Any]]],
+    tool_schemas: Sequence[Mapping[str, Any]], fit_candidate: Optional[Callable[[list, list], Mapping[str, Any]]],
+    drive_root: pathlib.Path, task_id: str, trace_refs: Mapping[str, Any],
+    exposed_units: Optional[Sequence[Mapping[str, Any]]] = None,
+) -> Tuple[list, ContextReclaimReceipt, None]:
+    """Materialize one actor's selection through the existing unit/checkpoint/capsule engine."""
+    restore_refs = []
+    for ref in request.restore_unit_refs:
+        checkpoint = ref.get("checkpoint_ref") if isinstance(ref, Mapping) else None
+        if (isinstance(checkpoint, Mapping) and set(checkpoint) == {"kind", "root", "path", "size", "sha256"}
+                and checkpoint.get("kind") == "task_source" and checkpoint.get("root") == "artifact_store"):
+            # Inspection omits the repeated reader hint. Restore still verifies
+            # exact source bytes below; published custody keeps the full contract.
+            checkpoint = {**checkpoint, "read": {"tool": "read_file", "arguments": {
+                "root": checkpoint["root"], "path": checkpoint["path"]}}}
+            ref = {**ref, "checkpoint_ref": checkpoint}
+        restore_refs.append(ref)
+    request = replace(request, restore_unit_refs=tuple(restore_refs))
+    before_sha = context_reclaim_transcript_sha256(messages)
+    observed = copy.deepcopy(list(observed_messages)) if observed_messages is not None else []
+    observed_sha = context_reclaim_transcript_sha256(observed)
+    facts = {"observed_view_revision": observed_sha, "view_revision": before_sha,
+             "schema_names": request.schema_names, "restored_unit_refs": _unique_refs(request.restore_unit_refs)}
+    if (not isinstance(request.working_note, str) or observed_messages is None or request.expected_view_revision != observed_sha
+            or _view_source_messages(messages[:len(observed)]) != _view_source_messages(observed)):
+        return messages, _receipt("binding_mismatch", before_sha=before_sha, **facts), None
+    if any(not isinstance(ref, Mapping) or not ref for ref in request.restore_unit_refs):
+        return messages, _receipt("source_unavailable", before_sha=before_sha, **facts), None
+    if not callable(fit_candidate):
+        return messages, _receipt("fit_rejected", before_sha=before_sha,
+                                  fit={"accepted": False, "reason": "fit_callback_missing"}, **facts), None
+    units = _atomic_units(observed, trace_refs_by_tool_call_id=trace_refs,
+                          measurement_density=request.measurement_density)
+    keep = set(request.keep_unit_ids) if request.keep_unit_ids is not None else {u.unit_id for u in units}
+    if not keep <= {u.unit_id for u in units}:
+        return messages, _receipt("binding_mismatch", before_sha=before_sha, **facts), None
+    authored = [u for u in units if (_capsule_metadata(observed[u.start])[1] or {}).get("authorship") == "actor"]
+    removed = [u for u in units if u.unit_id not in keep or u in authored]
+    if exposed_units is not None:
+        exposed = {(ref.get("unit_id"), ref.get("raw_sha256")) for ref in exposed_units}
+        removed = [u for u in removed if (u.unit_id, u.raw_sha256) in exposed]
+    facts["retained_unit_ids"] = tuple(u.unit_id for u in units if u not in removed)
+    visible_sources = [meta for u in units if u not in removed
+                       if (meta := _capsule_metadata(observed[u.start])[1]) and meta.get("retention") == "source_view"]
+    restore = [ref for ref in facts["restored_unit_refs"] if not any(
+        meta["unit_id"] == ref.get("unit_id") and meta["source_unit_sha256"] == ref.get("raw_sha256")
+        and meta["checkpoint_ref"] == ref.get("checkpoint_ref") for meta in visible_sources)]
+    same_note = (len(authored) == 1 and removed == authored
+                 and observed[authored[0].start]["content"][0]["text"].partition("\n")[2] == request.working_note.strip())
+    messages_unchanged = not restore and (same_note or not removed and not request.working_note.strip())
+    schemas_unchanged = (list(observed_tool_schemas) == list(tool_schemas) if observed_tool_schemas is not None
+                         else request.schema_names is None)
+    no_op = messages_unchanged and schemas_unchanged
+    if messages_unchanged:
+        facts["retained_unit_ids"] = tuple(u.unit_id for u in units)
+    checkpoint_ref, selection, capsule_refs = None, None, []
+    candidate = messages
+    if not messages_unchanged:
+        try:
+            restored, restored_capsules = _restored_source_views(
+                restore, drive_root=drive_root, task_id=task_id, request=request)
+        except (OSError, ValueError, TypeError, KeyError):
+            return messages, _receipt("source_unavailable", before_sha=before_sha, **facts), None
+        fingerprint = _sha256(_canonical_bytes({"observed": observed_sha, "removed": [u.unit_id for u in removed],
+                                               "working_note": request.working_note, "restore": restore}))
+        selection = _Selection(tuple(_SelectedUnit(u, 0, "") for u in removed), fingerprint, 0)
+        checkpoint_ref = _persist_reclaim_checkpoint(observed, request, selection,
+                                                     drive_root=drive_root, task_id=task_id)
+        if checkpoint_ref is None:
+            return messages, _receipt("checkpoint_failed", before_sha=before_sha, selection=selection, **facts), None
+        source_refs = _unique_refs([ref for u in removed for ref in (*u.source_refs, {
+            "checkpoint_ref": checkpoint_ref, "unit_id": u.unit_id, "raw_sha256": u.raw_sha256})])
+        source = [m for u in removed for m in observed[u.start:u.end + 1]]
+        combined = _unit_from_slice(source, 0, len(source) - 1, trace_refs_by_tool_call_id=trace_refs,
+                                    measurement_density=request.measurement_density)
+        combined = replace(combined, unit_id=f"view:{fingerprint}", generation=max((u.generation for u in removed), default=0),
+                           lineage_hashes=_unique_strings([h for u in removed for h in u.lineage_hashes]),
+                           source_refs=source_refs)
+        note, note_ref = _capsule_message(_SelectedUnit(combined, 0, ""), request.working_note,
+                                         [_part(combined.unit_id, combined.source_text)], checkpoint_ref, request)
+        note["content"][0]["_context_capsule"]["authorship"] = "actor"
+        note["role"] = "assistant"
+        note["content"][0]["text"] = "[Actor-authored working view; exact source retained by checkpoint]\n" + request.working_note.strip()
+        note["content"][0]["_context_capsule"]["visible_sha256"] = _sha256(note["content"][0]["text"])
+        replacements = {u.start: (u.end, [], []) for u in removed}
+        at = removed[0].start if removed else len(observed)
+        replacements[at] = (removed[0].end if removed else at - 1,
+                            [*restored, note], [*restored_capsules, note_ref])
+        candidate, capsule_refs = _materialize_replacements(messages, replacements)
+        facts["source_refs"] = _unique_refs([*source_refs, checkpoint_ref, *facts["restored_unit_refs"]])
+    try:
+        fit = dict(fit_candidate(copy.deepcopy(candidate), copy.deepcopy(list(tool_schemas))))
     except Exception as exc:
-        # Spend already incurred by the structured attempt must survive the
-        # text-protocol failure so the caller can account it.
-        raise _BatchSummaryError(
-            f"text-protocol call failed: {type(exc).__name__}: {exc}", usage=total_usage
-        ) from exc
-    total_usage = _merge_compaction_usage(total_usage, usage)
-    summary_text = resp_msg.get("content") or ""
-    if not summary_text.strip():
-        raise _BatchSummaryError("empty summary response", usage=total_usage)
-    return _parse_text_protocol_summaries(summary_text), total_usage
-
-
-class _BatchSummaryError(RuntimeError):
-    """Batch-level summarization failure that still carries spend to account."""
-
-    def __init__(self, message: str, *, usage: Optional[Dict[str, Any]] = None):
-        super().__init__(message)
-        self.usage = usage
+        fit = {"accepted": False, "reason": f"fit_callback_failed:{type(exc).__name__}"}
+    facts["fit"] = fit
+    if context_reclaim_transcript_sha256(messages) != before_sha:
+        return messages, _receipt("binding_mismatch", before_sha=before_sha, selection=selection,
+                                  checkpoint_ref=checkpoint_ref, **facts), None
+    if fit.get("accepted") is not True:
+        return messages, _receipt("fit_rejected", before_sha=before_sha, selection=selection,
+                                  checkpoint_ref=checkpoint_ref, **facts), None
+    after_sha = context_reclaim_transcript_sha256(candidate)
+    facts["view_revision"] = after_sha
+    reclaimed = (_context_tokens_for_messages(messages, request.measurement_density)
+                 - _context_tokens_for_messages(candidate, request.measurement_density))
+    return candidate, _receipt("no_op" if no_op else "applied", before_sha=before_sha, after_sha=after_sha,
+                               selection=selection, checkpoint_ref=checkpoint_ref, capsule_refs=capsule_refs,
+                               reclaimed_tokens=reclaimed, goal_reached=reclaimed >= request.reclaim_goal_tokens,
+                               **facts), None
 
 
 def compact_tool_history_llm(
     messages: list,
-    keep_recent: int = 6,
+    keep_recent: int = 0,
     *,
+    request: Optional[ContextReclaimRequest] = None,
     drive_root: Optional[pathlib.Path] = None,
     task_id: str = "context_compaction",
-) -> Tuple[list, Optional[Dict[str, Any]]]:
-    """LLM-driven compaction of old reasoning rounds, with safe non-destructive fallback."""
-    spans = _tool_round_spans(messages)
-    if len(spans) <= keep_recent:
-        return messages, None
+    trace_refs_by_tool_call_id: Optional[Mapping[str, Any]] = None,
+    negative_memo: Optional[MutableSet[str]] = None,
+    observed_messages: Optional[Sequence[Mapping[str, Any]]] = None,
+    observed_tool_schemas: Optional[Sequence[Mapping[str, Any]]] = None,
+    tool_schemas: Sequence[Mapping[str, Any]] = (),
+    fit_candidate: Optional[Callable[[list, list], Mapping[str, Any]]] = None,
+    exposed_units: Optional[Sequence[Mapping[str, Any]]] = None,
+    automatic_deficit_tokens: Optional[int] = None,
+    provider_refused: bool = False,
+) -> Tuple[list, ContextReclaimReceipt, Optional[Dict[str, Any]]]:
+    """Return a candidate and receipt; the caller owns atomic view publication.
 
-    spans_to_keep = spans[-keep_recent:]
-    {start for start, _ in spans_to_keep}
-    compactable_spans = []
-    protected_starts = set()
-    for start, end in spans[:-keep_recent]:
-        if _round_has_protected_content(messages, start, end):
-            protected_starts.add(start)
+    Legacy ``keep_recent`` requests use Light. An explicit ``working_note``
+    uses the actor's observed snapshot/selection, requires a non-generating prospective
+    ``fit_candidate(messages, tools)`` returning ``accepted`` plus fit facts,
+    and never calls Light. Supply observed schemas to prove a whole-view no-op
+    when selecting schemas. Missing fit evidence leaves current messages intact.
+    Main supplies ``automatic_deficit_tokens`` without optional headroom: only
+    newly exposed raw units are eligible, and an unreachable measured deficit
+    returns facts before any checkpoint or paid helper call. Zero means that
+    a real overflow has not supplied a measurable deficit, not that no shrink helps.
+    ``provider_refused`` (the provider's typed refusal of this very request) also
+    admits earlier capsules, after every raw unit, as the last resort.
+    """
+
+    before_sha = context_reclaim_transcript_sha256(messages)
+    effective_request = request or ContextReclaimRequest(
+        route_fp="manual",
+        round_id=str(task_id or "context_compaction"),
+        transcript_sha256=before_sha,
+        measurement_basis="cold_estimate",
+        measurement_density=1.0,
+        reclaim_goal_tokens=2**31 - 1,
+        allow_partial_shrink=True,
+    )
+    if str(effective_request.transcript_sha256 or "") != before_sha:
+        return messages, _receipt("binding_mismatch", before_sha=before_sha), None
+    _reclaim_tokens_for_byte_delta(0, effective_request.measurement_density)
+    root = pathlib.Path(drive_root) if drive_root is not None else pathlib.Path("../data").resolve(strict=False)
+    if effective_request.working_note is not None:
+        return _authored_view(messages, effective_request, observed_messages=observed_messages,
+                              observed_tool_schemas=observed_tool_schemas,
+                              tool_schemas=tool_schemas, fit_candidate=fit_candidate, drive_root=root,
+                              task_id=str(task_id or "context_compaction"), trace_refs=trace_refs_by_tool_call_id or {},
+                              exposed_units=exposed_units)
+
+    memo = negative_memo if negative_memo is not None else set()
+    trace_refs = trace_refs_by_tool_call_id or {}
+    spec = _summarizer_spec()
+    selection, empty_status = _select_units(
+        messages,
+        effective_request,
+        keep_recent=max(0, int(keep_recent)),
+        trace_refs_by_tool_call_id=trace_refs,
+        negative_memo=memo,
+        spec=spec,
+        exposed_units=exposed_units,
+        automatic=automatic_deficit_tokens is not None,
+        provider_refused=provider_refused,
+    )
+    reclaim_fit = None
+    if automatic_deficit_tokens is not None:
+        # Optimistic upper bound: even deleting every eligible source must be
+        # able to reach the triggering boundary. Do not subtract a guessed
+        # capsule size or require the optional low-water margin to be reachable.
+        removed = {index for item in (selection.units if selection else ())
+                   for index in range(item.unit.start, item.unit.end + 1)}
+        residue = [message for index, message in enumerate(messages) if index not in removed]
+        maximum = max(0, _context_tokens_for_messages(messages, effective_request.measurement_density)
+                      - _context_tokens_for_messages(residue, effective_request.measurement_density))
+        required = max(0, int(automatic_deficit_tokens))
+        reclaim_fit = {"required_reclaim_tokens": required, "maximum_reclaim_tokens": maximum,
+                       "measurement_basis": effective_request.measurement_basis,
+                       "measurement_density": effective_request.measurement_density}
+        if maximum < required:
+            reclaim_fit["reason"] = "automatic_reclaim_unreachable"
+            return messages, _receipt(
+                "no_positive_reclaim" if selection else empty_status,
+                before_sha=before_sha, selection=selection, fit=reclaim_fit,
+            ), None
+    if selection is None:
+        return messages, _receipt(empty_status, before_sha=before_sha, fit=reclaim_fit), None
+
+    checkpoint_ref = _persist_reclaim_checkpoint(
+        messages, effective_request, selection, drive_root=root, task_id=str(task_id or "context_compaction"),
+    )
+    if checkpoint_ref is None:
+        return messages, _receipt(
+            "checkpoint_failed", before_sha=before_sha, selection=selection,
+        ), None
+
+    replacements: Dict[int, tuple] = {}
+    memo_candidates: List[str] = []
+    usage_total: Dict[str, Any] = {}
+    summary_failures = 0
+    initial_parts = [_part(item.unit.unit_id, item.unit.source_text) for item in selection.units]
+    summary_budgets = {part.root_id: item.summary_budget_tokens for part, item in zip(initial_parts, selection.units)}
+    leaves_by_root: Dict[str, List[_Part]] = {part.root_id: [] for part in initial_parts}
+    summaries: Dict[str, str] = {}
+    failed_roots: set[str] = set()
+    for offset in range(0, len(initial_parts), _BLOCKS_PER_BATCH):
+        leaves, batch_map, failed = _map_complete_parts(
+            initial_parts[offset:offset + _BLOCKS_PER_BATCH], drive_root=root,
+            task_id=str(task_id or "context_compaction"), spec=spec,
+            summary_budgets=summary_budgets, usage_total=usage_total)
+        for leaf in leaves:
+            leaves_by_root[leaf.root_id].append(leaf)
+        summaries.update(batch_map)
+        failed_roots.update(failed)
+
+    for selected in selection.units:
+        leaves = tuple(leaves_by_root[selected.unit.unit_id])
+        if (selected.unit.unit_id in failed_roots or not leaves
+                or any(leaf.source_id not in summaries for leaf in leaves)):
+            summary_failures += 1
             continue
-        compactable_spans.append((start, end))
-
-    if not compactable_spans:
-        return messages, None
-
-    rendered_blocks = [(start, _render_round_block(messages, start, end)) for start, end in compactable_spans]
-
-    total_usage: Optional[Dict[str, Any]] = None
-    summary_map: Dict[int, str] = {}
-    observed_drive_root = pathlib.Path(drive_root) if drive_root is not None else pathlib.Path("../data").resolve(strict=False)
-    observed_task_id = str(task_id or "context_compaction")
-    # Per-batch isolation: one failed batch leaves ONLY its own rounds raw
-    # (the old whole-pass try/except threw away every successful summary, so
-    # a single bad batch made large transcripts permanently uncompactable).
-    # Rounds whose summary is missing within a successful batch likewise stay
-    # raw individually. Spend from failed batches is still accounted.
-    for idx in range(0, len(rendered_blocks), _BLOCKS_PER_BATCH):
-        batch = rendered_blocks[idx:idx + _BLOCKS_PER_BATCH]
-        try:
-            batch_map, usage = _summarize_round_batch(
-                batch,
-                drive_root=observed_drive_root,
-                task_id=observed_task_id,
-            )
-        except _BatchSummaryError as exc:
-            log.warning("Compaction batch failed (%s); leaving its rounds raw", exc)
-            total_usage = _merge_compaction_usage(total_usage, exc.usage)
+        summary = _fold_summaries(
+            leaves, summaries, drive_root=root,
+            task_id=str(task_id or "context_compaction"), spec=spec,
+            summary_budget_tokens=selected.summary_budget_tokens,
+            usage_total=usage_total,
+        )
+        if not str(summary or "").strip():
+            summary_failures += 1
             continue
-        except Exception:
-            log.warning("Compaction batch failed; leaving its rounds raw", exc_info=True)
+        replacement, capsule_ref = _capsule_message(
+            selected, summary, leaves, checkpoint_ref, effective_request,
+        )
+        from ouroboros.knowledge import observed_route_stamp
+        replacement["content"][0]["_context_capsule"]["author"] = {
+            "kind": "summarization_helper", "route": observed_route_stamp(usage_total),
+        }
+        if _context_tokens_for_messages(
+            [replacement], effective_request.measurement_density,
+        ) >= selected.unit.context_size_tokens:
+            memo_candidates.append(selected.negative_memo_key)
             continue
-        total_usage = _merge_compaction_usage(total_usage, usage)
-        for start, _ in batch:
-            if batch_map.get(start):
-                summary_map[start] = batch_map[start]
+        replacements[selected.unit.start] = (selected.unit.end, [replacement], [capsule_ref])
 
-    if not summary_map:
-        log.warning("LLM compaction produced no summaries, preserving original rounds")
-        return compact_tool_history(messages, keep_recent=keep_recent), total_usage
+    if context_reclaim_transcript_sha256(messages) != before_sha:
+        receipt = _receipt("binding_mismatch", before_sha=before_sha, selection=selection,
+                           checkpoint_ref=checkpoint_ref)
+        return messages, receipt, usage_total or None
 
-    compacted_by_start = {
-        start: (end, summary_map[start])
-        for start, end in compactable_spans
-        if start in summary_map
-    }
+    memo.update(memo_candidates)
 
-    result = []
-    idx = 0
-    while idx < len(messages):
-        block = compacted_by_start.get(idx)
-        if block:
-            end, summary = block
-            result.append({
-                "role": "assistant",
-                "content": f"[Compacted reasoning block]\n{summary}",
-            })
-            idx = end + 1
-            continue
-        result.append(messages[idx])
-        idx += 1
+    if not replacements:
+        status: ReclaimStatus = "summarizer_failed" if summary_failures else "no_measurable_shrink"
+        receipt = _receipt(status, before_sha=before_sha, selection=selection, checkpoint_ref=checkpoint_ref)
+        return messages, receipt, usage_total or None
 
-    return result, total_usage
+    if automatic_deficit_tokens is not None:
+        # One host record per uninterrupted replaced range. Reuse the complete
+        # unit summaries without another paid fold, and keep each original unit
+        # individually restorable. An owner/control turn or retained unit breaks
+        # adjacency, so grouping cannot move information across those boundaries.
+        # Ranges follow the transcript, not the selection's raw-first order.
+        groups: list[list[_SelectedUnit]] = []
+        for item in sorted(selection.units, key=lambda item: item.unit.start):
+            if item.unit.start not in replacements:
+                continue
+            if groups and groups[-1][-1].unit.end + 1 == item.unit.start:
+                groups[-1].append(item)
+            else:
+                groups.append([item])
+        grouped = {}
+        for group in groups:
+            start, end = group[0].unit.start, group[-1].unit.end
+            unit = _unit_from_slice(messages, start, end, trace_refs_by_tool_call_id=trace_refs,
+                                    measurement_density=effective_request.measurement_density)
+            # A re-folded earlier capsule (after a provider refusal) keeps counting its generations and
+            # keeps the original provenance union: every member's lineage hashes and references.
+            unit = replace(unit, generation=max(item.unit.generation for item in group),
+                           lineage_hashes=_unique_strings([*unit.lineage_hashes, *(
+                               digest for item in group for digest in item.unit.lineage_hashes)]),
+                           source_refs=_unique_refs([*unit.source_refs, *(
+                               ref for item in group for ref in item.unit.source_refs), *(
+                               {"checkpoint_ref": checkpoint_ref, "unit_id": item.unit.unit_id,
+                                "raw_sha256": item.unit.raw_sha256} for item in group)]))
+            text = "\n\n".join(
+                f"Source unit {item.unit.unit_id}:\n"
+                + replacements[item.unit.start][1][0]["content"][0]["text"].partition("\n")[2]
+                for item in group)
+            record, ref = _capsule_message(_SelectedUnit(unit, 0, ""), text,
+                [_part(unit.unit_id, unit.source_text)], checkpoint_ref, effective_request)
+            record["content"][0]["_context_capsule"]["author"] = {
+                "kind": "summarization_helper", "route": observed_route_stamp(usage_total),
+            }
+            grouped[start] = (end, [record], [ref])
+        replacements = grouped
+    rebuilt, capsule_refs = _materialize_replacements(messages, replacements)
+
+    before_tokens = _context_tokens_for_messages(messages, effective_request.measurement_density)
+    after_tokens = _context_tokens_for_messages(rebuilt, effective_request.measurement_density)
+    if after_tokens >= before_tokens:
+        receipt = _receipt("no_measurable_shrink", before_sha=before_sha, selection=selection,
+                           checkpoint_ref=checkpoint_ref)
+        return messages, receipt, usage_total or None
+    reclaimed_tokens = before_tokens - after_tokens
+    after_sha = context_reclaim_transcript_sha256(rebuilt)
+    return rebuilt, _receipt(
+        "applied",
+        before_sha=before_sha,
+        after_sha=after_sha,
+        selection=selection,
+        reclaimed_tokens=reclaimed_tokens,
+        goal_reached=reclaimed_tokens >= int(effective_request.reclaim_goal_tokens),
+        checkpoint_ref=checkpoint_ref,
+        capsule_refs=capsule_refs,
+        fit=reclaim_fit,
+    ), usage_total or None

@@ -4,7 +4,10 @@ import subprocess
 from unittest.mock import patch, MagicMock
 
 
-from ouroboros.tools.review_helpers import check_worktree_readiness
+from ouroboros.tools.review_helpers import (
+    check_worktree_readiness,
+    check_worktree_version_sync,
+)
 
 
 class TestCheckWorktreeReadiness:
@@ -101,6 +104,19 @@ class TestCheckWorktreeReadiness:
                 warnings = check_worktree_readiness(tmp_path)
                 assert any("version" in w.lower() or "mismatch" in w.lower() for w in warnings)
 
+    def test_stale_uv_lock_root_version_is_reported(self, tmp_path):
+        (tmp_path / "VERSION").write_text("4.99.0\n", encoding="utf-8")
+        (tmp_path / "pyproject.toml").write_text('version = "4.99.0"\n', encoding="utf-8")
+        (tmp_path / "uv.lock").write_text(
+            '[[package]]\nname = "ouroboros"\nversion = "4.98.0"\n'
+            'source = { editable = "." }\n',
+            encoding="utf-8",
+        )
+
+        warning = check_worktree_version_sync(tmp_path)
+
+        assert "uv.lock" in warning
+
     def test_git_error_does_not_crash(self, tmp_path):
         """If git subprocess fails, the gate should not crash."""
         with patch("ouroboros.tools.review_helpers.subprocess.run",
@@ -111,6 +127,7 @@ class TestCheckWorktreeReadiness:
 
     def test_paths_scoping(self, tmp_path):
         """When paths are provided, only those paths should be checked."""
+        selected = ["ouroboros/loop.py", "ouroboros/config.py"]
         def side_effect(cmd, **kwargs):
             result = MagicMock(returncode=0, stderr="")
             if "status" in cmd and "--porcelain" in cmd:
@@ -119,13 +136,14 @@ class TestCheckWorktreeReadiness:
                 else:
                     result.stdout = " M ouroboros/loop.py\n M tests/test_loop.py\n"
             elif "diff" in cmd:
+                assert cmd[cmd.index("--") + 1:] == selected
                 result.stdout = "small diff"
             else:
                 result.stdout = ""
             return result
 
         with patch("ouroboros.tools.review_helpers.subprocess.run", side_effect=side_effect):
-            warnings = check_worktree_readiness(tmp_path, paths=["ouroboros/loop.py"])
+            warnings = check_worktree_readiness(tmp_path, paths=selected)
             # With path scoping, only ouroboros/loop.py is visible → tests/ not in scope → warning
             assert any("test" in w.lower() for w in warnings)
 
@@ -135,6 +153,25 @@ class TestCheckWorktreeReadiness:
             mock_run.return_value = MagicMock(returncode=0, stdout=" M foo.py\n", stderr="")
             result = check_worktree_readiness(tmp_path)
             assert isinstance(result, list), f"Expected list, got {type(result)}"
+
+    def test_size_ratchet_findings_surface_as_official_ci_warnings(self, tmp_path, monkeypatch):
+        """Size-ratchet validator findings surface as warn-only readiness lines
+        naming the enforcing surface (the official repository CI), never as a
+        local block. Real scratch git checkout; the validator is stubbed to a
+        deterministic finding."""
+        import ouroboros.review as review_module
+
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        (repo / "dirty.py").write_text("x = 1\n", encoding="utf-8")
+
+        finding = "byte debt grew: ouroboros/example.py 200001 -> 200002"
+        monkeypatch.setattr(review_module, "validate_size_ratchet", lambda *_a, **_k: [finding])
+
+        warnings = check_worktree_readiness(repo)
+
+        assert f"official CI will enforce: {finding}" in warnings
 
 
 class TestReadinessGateBlocksBeforeAlreadyFresh:
@@ -175,58 +212,6 @@ class TestReadinessGateBlocksBeforeAlreadyFresh:
             # Should NOT have a large diff warning or test-related warnings
             assert not any("test" in w.lower() for w in warnings)
             assert not any("large" in w.lower() for w in warnings)
-
-
-class TestBuildAdvisoryChangedContextNoDuplicateGitStatus:
-    """build_advisory_changed_context must not perform a second git-status call."""
-
-    def test_uses_changed_files_text_not_second_git_status(self, tmp_path):
-        """When paths is None, resolved paths come from changed_files_text, not a new subprocess."""
-        from ouroboros.tools.review_helpers import build_advisory_changed_context
-
-        porcelain_text = "M  ouroboros/loop.py\nM  ouroboros/tools/review_helpers.py\n"
-
-        subprocess_call_count = [0]
-
-        def mock_subprocess_run(cmd, **kwargs):
-            subprocess_call_count[0] += 1
-            result = MagicMock(returncode=0)
-            result.stdout = b""
-            return result
-
-        with patch("ouroboros.tools.review_helpers.subprocess.run", side_effect=mock_subprocess_run):
-            with patch("ouroboros.tools.review_helpers.build_touched_file_pack", return_value=("(touched files)", [])):
-                resolved, touched, omitted = build_advisory_changed_context(
-                    tmp_path,
-                    changed_files_text=porcelain_text,
-                    paths=None,
-                )
-
-        # No subprocess calls should have been made (paths resolved from porcelain text)
-        assert subprocess_call_count[0] == 0, (
-            f"Expected 0 subprocess calls, got {subprocess_call_count[0]}; "
-            "build_advisory_changed_context must use changed_files_text, not a second git-status"
-        )
-        assert "ouroboros/loop.py" in resolved
-        assert "ouroboros/tools/review_helpers.py" in resolved
-
-    def test_explicit_paths_override_changed_files_text(self, tmp_path):
-        """When paths is explicitly provided, it overrides changed_files_text entirely."""
-        from ouroboros.tools.review_helpers import build_advisory_changed_context
-
-        explicit_paths = ["ouroboros/agent.py"]
-        porcelain_text = "M  ouroboros/loop.py\n"
-
-        with patch("ouroboros.tools.review_helpers.build_touched_file_pack", return_value=("(pack)", [])):
-            resolved, touched, omitted = build_advisory_changed_context(
-                tmp_path,
-                changed_files_text=porcelain_text,
-                paths=explicit_paths,
-            )
-
-        # Explicit paths take precedence — porcelain_text paths should NOT appear
-        assert resolved == ["ouroboros/agent.py"]
-        assert "ouroboros/loop.py" not in resolved
 
 
 class TestSharedGitReviewHelpers:

@@ -1,0 +1,9 @@
+{
+  "requested": "ultra",
+  "submitted": "xhigh",
+  "resolution": "downward",
+  "source": "account_catalog",
+  "parameter": "reasoning.effort",
+  "observed": null,
+  "observedSource": null
+}

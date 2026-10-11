@@ -1,0 +1,607 @@
+/* Shared values and portable controls. Pages own layout; opt-in author pages
+   use these same bytes without inheriting an application-wide reset. */
+:root {
+    --native-color-scheme: dark;
+    --neutral-rgb: 255, 255, 255;
+    --shell-rgb: 13, 11, 15;
+    --composer-rgb: 26, 21, 32;
+    --composer-hover-rgb: 38, 25, 34;
+    --modal-rgb: 18, 20, 26;
+    --menu-rgb: 12, 14, 18;
+    --media-rgb: 6, 7, 10;
+    --wizard-panel-rgb: 20, 18, 28;
+    --wizard-rgb: 11, 9, 16;
+    --code-bg: #121016;
+    --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    --bg-primary: #0d0b0f;
+    --bg-secondary: #1a1520;
+    --bg-card: rgba(var(--neutral-rgb), 0.06);
+    --bg-hover: rgba(var(--neutral-rgb), 0.08);
+    /* Type scale + foreground semantics: docs/DESIGN.md. Four sizes, no fifth. */
+    --type-meta: 12px;
+    --type-body: 14px;
+    --type-section: 16px;
+    --type-page: 24px;
+    /* Not UI sizes: the chat reading ladder, relative to the bubble's reading
+       text (20px and 18px over the 16px bubble; DESIGN.md §1). */
+    --md-heading-major: 1.25em;
+    --md-heading-minor: 1.125em;
+    --line-meta: 1.35;
+    --line-body: 1.5;
+    --line-title: 1.3;
+    --text-primary: #e2e8f0;
+    --text-secondary: rgba(var(--neutral-rgb), 0.54);
+    --text-meta: rgba(var(--neutral-rgb), 0.68);
+    --text-disabled: rgba(var(--neutral-rgb), 0.38);
+    --text-muted: var(--text-disabled);  /* legacy alias */
+    --accent: #c93545;
+    --accent-light: #f07a86;
+    --accent-dim: rgba(201, 53, 69, 0.15);
+    /* Accent alpha tokens; keep future tweaks off hardcoded rgba literals. */
+    --accent-04: rgba(201, 53, 69, 0.04);
+    --accent-05: rgba(201, 53, 69, 0.05);
+    --accent-08: rgba(201, 53, 69, 0.08);
+    --accent-10: rgba(201, 53, 69, 0.10);
+    --accent-12: rgba(201, 53, 69, 0.12);
+    --accent-18: rgba(201, 53, 69, 0.18);
+    --accent-22: rgba(201, 53, 69, 0.22);
+    --accent-25: rgba(201, 53, 69, 0.25);
+    --accent-35: rgba(201, 53, 69, 0.35);
+    --accent-45: rgba(201, 53, 69, 0.45);
+    --accent-55: rgba(201, 53, 69, 0.55);
+    --accent-65: rgba(201, 53, 69, 0.65);
+    /* Project identity (vivid fuchsia): a converted task card, its sidebar marker,
+       and the project panel header share this so "this is a project" reads as a
+       deliberate state — never the red task accent (looked like an error, P3) and
+       never the blue owner voice. The old calm-indigo sat next to the user-message
+       blue and the two blurred together; fuchsia is unmistakably its own role.
+       Base is legible-on-dark fuchsia-400; every tint shares the SAME hue (C7.3). */
+    --project: #e879f9;
+    --project-08: rgba(232, 121, 249, 0.08);
+    --project-12: rgba(232, 121, 249, 0.12);
+    --project-18: rgba(232, 121, 249, 0.18);
+    /* User / owner voice: the owner's chat bubble + sender accents. Tokenized so
+       the hue lives in one place and stays clear of the project fuchsia (C7.2). */
+    --user-bubble-from: rgba(80, 120, 190, 0.14);
+    --user-bubble-to: rgba(55, 85, 155, 0.12);
+    --user-border: rgba(110, 150, 210, 0.18);
+    --user-glow: rgba(160, 190, 245, 0.04);
+    --user-sender: rgba(155, 185, 240, 0.95);
+    --user-text: rgba(215, 230, 255, 0.96);
+    /* System / owner-control voice: amber notices (system bubble + sender). Same
+       hue as the system role, tokenized so it tracks one source (C7.2). */
+    --system-bubble-bg: rgba(245, 158, 11, 0.12);
+    --system-border: rgba(245, 158, 11, 0.45);
+    --system-sender: rgba(245, 158, 11, 0.9);
+    --system-text: rgba(255, 240, 210, 0.78);
+    /* Assistant / agent voice: the assistant bubble's sender + body tints,
+       tokenized like the user/system voices above (C7.2). */
+    --assistant-sender: rgba(250, 125, 125, 0.95);
+    --assistant-text: rgba(255, 235, 238, 0.96);
+    --blue: #3b82f6;
+    --amber: #f59e0b;
+    --amber-dim: rgba(245, 158, 11, 0.15);
+    --green: #22c55e;
+    --green-dim: rgba(34, 197, 94, 0.15);
+    --red: #ef4444;
+    --red-dim: rgba(239, 68, 68, 0.15);
+    --divider: rgba(var(--neutral-rgb), 0.06);
+    --surface-border: rgba(var(--neutral-rgb), 0.08);
+    --surface-border-soft: rgba(var(--neutral-rgb), 0.06);
+    --surface-card: rgba(var(--neutral-rgb), 0.03);
+    --surface-card-soft: rgba(var(--neutral-rgb), 0.025);
+    --surface-control: rgba(var(--neutral-rgb), 0.04);
+    /* Chart chrome (grid lines, tick/legend text). Chart.js paints to a canvas
+       and cannot read CSS, so these tokens are the SSOT that theme_palette.js
+       copies into every mounted instance — the canvas twin of --diagram-*. */
+    --chart-grid: rgba(var(--neutral-rgb), 0.10);
+    --chart-text: #a8b0bd;
+    /* The native select arrow is a data-URI, so its stroke cannot read a token
+       at paint time; the whole image is the token instead. Painting a near-white
+       arrow on the light surface is what made the arrows look washed out. */
+    --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%23e2e8f0' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    --diagram-font: Inter, system-ui, sans-serif;
+    --diagram-bg: #151318;
+    --diagram-primary: #25222c;
+    --diagram-primary-text: #f4eef7;
+    --diagram-border: #6f6678;
+    --diagram-line: #9b90a6;
+    --diagram-secondary: #302b39;
+    --diagram-tertiary: #19171d;
+    --ui-card-bg: var(--surface-card);
+    --ui-card-bg-soft: var(--surface-card-soft);
+    --ui-card-border: var(--surface-border);
+    --ui-modal-bg: rgba(var(--modal-rgb), 0.98);
+    /* Status triples: fg/bg/border named together, never derived
+       (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
+       near-black; the saturated --green/--amber/--red stay for dots, tracks and
+       other large indicators. */
+    --status-ok-fg: #6ee7b7;
+    --status-ok-bg: var(--green-dim);
+    --status-ok-border: rgba(34, 197, 94, 0.28);
+    --status-warn-fg: #fcd34d;
+    --status-warn-bg: var(--amber-dim);
+    --status-warn-border: rgba(245, 158, 11, 0.30);
+    --status-error-fg: #fca5a5;
+    --status-error-bg: var(--red-dim);
+    --status-error-border: rgba(239, 68, 68, 0.30);
+    --status-info-fg: #93c5fd;
+    --status-neutral-fg: var(--text-meta);
+    --status-neutral-bg: rgba(var(--neutral-rgb), 0.06);
+    --status-neutral-border: rgba(var(--neutral-rgb), 0.12);
+    --focus-accent-border: rgba(201, 53, 69, 0.4);
+    --focus-accent-ring: var(--accent-10);
+    --radius-xs: 3px;
+    --radius-sm: 8px;
+    /* In-between radius used by chips, counters, and fade rules. */
+    --radius-md: 10px;
+    --radius: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 20px;
+    --page-header-padding-y: 10px;
+    --page-header-padding-x: 20px;
+    --page-header-padding-bottom: 6px;
+    --pill-padding-y: 7px;
+    --pill-padding-x: 14px;
+    --pill-font-size: 13px;
+    --pill-radius: 999px;
+    --pill-strip-padding: 6px 0 8px;
+    --button-padding-y: 8px;
+    --button-padding-x: 16px;
+    --button-font-size: 13px;
+    --button-min-height: 34px;
+    --widget-fault-status-max-width: min(240px, 35vw);
+    /* App shell: persistent desktop sidebar + optional project detail pane. */
+    --sidebar-width: 280px;
+    --project-panel-width: clamp(340px, 36vw, 440px);
+    --nav-item-radius: 10px;
+    /* One hover fill for an item in a popup menu or a picker list. Six menus
+       used five different fills (0.04 / 0.06 / 0.08 / an accent tint / an
+       undeclared --surface-2), so the same gesture looked like a different
+       control depending on which menu you opened. */
+    --menu-item-hover: rgba(var(--neutral-rgb), 0.07);
+    /* 8pt spacing scale (Apple HIG / common 8pt grid) — use these instead of
+       ad-hoc pixel values so spacing stays consistent across components. */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    /* Bounded scroll region for the Updates restore list (DESIGN section 5:
+       a new visual dimension becomes a variable before a page-local literal). */
+    --updates-list-max-height: 320px;
+    /* Bounded scroll window for the sidebar project list (v6.32.0 geometry): a
+       share of the visual viewport height below, so the navigation column keeps
+       its height whatever the project count. Distinct from the fixed Updates
+       window above: one is a page-local list, this one follows the viewport. */
+    --nav-projects-list-max-height: calc(var(--vvh) * 0.38);
+    --vvh: 100dvh;
+}
+
+:root[data-theme="light"] {
+    --native-color-scheme: light;
+    --neutral-rgb: 32, 35, 43;
+    --shell-rgb: 255, 255, 255;
+    --composer-rgb: 244, 245, 248;
+    --composer-hover-rgb: 248, 237, 239;
+    --modal-rgb: 255, 255, 255;
+    --menu-rgb: 250, 251, 253;
+    --media-rgb: 244, 245, 248;
+    --wizard-panel-rgb: 255, 255, 255;
+    --wizard-rgb: 255, 255, 255;
+    --code-bg: #f2f4f7;
+    --bg-primary: #ffffff;
+    --bg-secondary: #f5f6f8;
+    --text-primary: #20232b;
+    --text-meta: #555d69;
+    --text-secondary: #626977;
+    --text-disabled: #89909b;
+    --accent-light: #a82c3b;
+    --project: #8f2499;
+    --user-sender: #24558d;
+    --user-text: #233b58;
+    --system-sender: #805000;
+    --system-text: #58451f;
+    --assistant-sender: #a82c3b;
+    --assistant-text: #35272c;
+    --status-ok-fg: #176b49;
+    --status-warn-fg: #805300;
+    --status-error-fg: #b42332;
+    --status-info-fg: #24558d;
+    --focus-accent-border: #a82c3b;
+    --chart-grid: rgba(var(--neutral-rgb), 0.14);
+    --chart-text: #4a515d;
+    --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%2320232b' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    --diagram-bg: #ffffff;
+    --diagram-primary: #f3e8ec;
+    --diagram-primary-text: #20232b;
+    --diagram-border: #77717d;
+    --diagram-line: #66606e;
+    --diagram-secondary: #edf0f5;
+    --diagram-tertiary: #f5f6f8;
+}
+
+.ouro-ui { font-family: var(--font-sans); color-scheme: var(--native-color-scheme); }
+.muted { color: var(--text-meta); }
+/* Appearance tri-state (Light / Dark / System), rendered by theme.js. It lives in
+   ui.css, not settings.css, because standalone onboarding loads ui.css only and
+   must offer the identical control — one look, one keyboard model, both surfaces. */
+.theme-choice-group {
+    display: inline-grid;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(0, 1fr);
+    gap: 8px;
+}
+.theme-choice {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    min-height: 38px;
+    line-height: 1.2;
+    border: 1px solid rgba(var(--neutral-rgb), 0.08);
+    background: rgba(var(--neutral-rgb), 0.04);
+    color: var(--text-secondary);
+    border-radius: 12px;
+    padding: 10px 16px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    font-size: var(--button-font-size);
+    font-weight: 600;
+}
+.theme-choice:hover,
+.theme-choice[aria-checked="true"] {
+    color: var(--text-primary);
+    border-color: var(--focus-accent-border);
+    background: var(--accent-12);
+}
+.theme-choice:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.theme-choice-label {
+    display: block;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+.theme-status { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.theme-status:empty { display: none; }
+
+.btn {
+    box-sizing: border-box;
+    padding: var(--button-padding-y) var(--button-padding-x);
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+    font-size: var(--button-font-size);
+    font-weight: 500;
+    font-family: var(--font-sans);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    min-height: var(--button-min-height);
+    text-align: center;
+    transition: transform 0.15s ease, border-color 0.15s ease, background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+
+.btn:hover {
+    transform: scale(1.02);
+}
+
+.btn:active {
+    transform: scale(0.98);
+    box-shadow: 0 0 0 3px var(--accent-08);
+}
+
+.btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    transform: none;
+    box-shadow: none;
+}
+
+.btn-primary {
+    background: var(--accent-dim);
+    color: var(--accent-light);
+    border-color: var(--accent-18);
+}
+.btn-primary:hover {
+    background: var(--accent-25);
+    border-color: var(--accent-35);
+}
+/* An action the owner can take is legible at rest (docs/DESIGN.md section 6):
+   a button label parked at secondary ink reads as disabled next to the one
+   beside it. */
+.btn-secondary {
+    background: rgba(var(--neutral-rgb), 0.04);
+    color: var(--text-primary);
+    border-color: rgba(var(--neutral-rgb), 0.10);
+}
+.btn-secondary:hover {
+    background: rgba(var(--neutral-rgb), 0.07);
+    border-color: var(--accent-25);
+}
+.btn-ghost {
+    background: transparent;
+    color: var(--text-primary);
+    border-color: rgba(var(--neutral-rgb), 0.08);
+}
+.btn-ghost:hover {
+    background: rgba(var(--neutral-rgb), 0.04);
+}
+.btn-danger {
+    background: rgba(220, 38, 38, 0.2);
+    color: var(--status-error-fg);
+    border: 1px solid rgba(220, 38, 38, 0.3);
+}
+.btn-danger:hover { background: rgba(220, 38, 38, 0.35); }
+
+.btn-save {
+    background: var(--green-dim);
+    color: var(--status-ok-fg);
+    border-color: rgba(34, 197, 94, 0.22);
+}
+.btn-save:hover { background: rgba(34, 197, 94, 0.25); }
+.btn-default {
+    background: var(--bg-card);
+    color: var(--text-primary);
+    border-color: rgba(var(--neutral-rgb), 0.08);
+}
+.btn-default:hover {
+    background: var(--bg-hover);
+    border-color: rgba(var(--neutral-rgb), 0.14);
+}
+
+
+.ui-chip,
+:where(.status-badge, .skills-status-chip, .mcp-server-status, .evo-runtime-pill, .evo-runtime-chip) {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 999px;
+    white-space: nowrap;
+}
+
+/* The chip primitive reserves its border so a tone can paint it without
+   changing the chip's size. The aliases above keep their own geometry. */
+.ui-chip {
+    border: 1px solid transparent;
+}
+
+.ui-status,
+:where(.settings-inline-status, .marketplace-status, .wizard-runtime-status) {
+    color: var(--text-secondary);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+
+/* Tone primitive (docs/DESIGN.md "Status and chips"). A status states a fact
+   with an EXPLICIT pair; it never derives its foreground from whatever generic
+   opacity happens to sit on the element.
+   Two shapes, because a status appears as two things:
+     - `.ui-status[data-tone]` — a status SENTENCE: foreground only, rendered as
+       dot + text. Giving it a fill would turn every inline status into a badge
+       and make the loudest thing on the panel the one that says "connected".
+     - `.ui-chip[data-tone]` — a status CHIP: the full triple, because the chip
+       itself is the status and has nothing else to carry it.
+   Tone is a STATE and must outrank the `.muted` utility: `#mp-status` carries
+   both classes, so a :where()-wrapped tone (specificity 0) would lose to it. */
+.ui-chip[data-tone="ok"] {
+    color: var(--status-ok-fg);
+    background: var(--status-ok-bg);
+    border-color: var(--status-ok-border);
+}
+.ui-chip[data-tone="warn"] {
+    color: var(--status-warn-fg);
+    background: var(--status-warn-bg);
+    border-color: var(--status-warn-border);
+}
+.ui-chip[data-tone="danger"],
+.ui-chip[data-tone="error"] {
+    color: var(--status-error-fg);
+    background: var(--status-error-bg);
+    border-color: var(--status-error-border);
+}
+.ui-chip[data-tone="neutral"],
+.ui-chip[data-tone="muted"] {
+    color: var(--status-neutral-fg);
+    background: var(--status-neutral-bg);
+    border-color: var(--status-neutral-border);
+}
+
+.ui-status[data-tone="ok"],
+.settings-inline-status[data-tone="ok"],
+.settings-test-result[data-tone="ok"],
+.marketplace-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.ui-status[data-tone="warn"],
+.settings-inline-status[data-tone="warn"],
+.settings-test-result[data-tone="warn"],
+.marketplace-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.ui-status[data-tone="danger"],
+.ui-status[data-tone="error"],
+.settings-inline-status[data-tone="danger"],
+.settings-inline-status[data-tone="error"],
+.settings-test-result[data-tone="danger"],
+.settings-test-result[data-tone="error"],
+.marketplace-status[data-tone="danger"] { color: var(--status-error-fg); }
+/* `muted` is a tone the code emits but no rule named. */
+.ui-status[data-tone="neutral"],
+.ui-status[data-tone="muted"],
+.settings-inline-status[data-tone="neutral"],
+.settings-inline-status[data-tone="muted"],
+.marketplace-status[data-tone="muted"] { color: var(--status-neutral-fg); }
+
+/* Status sentences share one dot anatomy in every consumer. */
+.ui-status[data-tone]:not(:empty)::before,
+.settings-inline-status[data-tone]:not(:empty)::before {
+    content: "";
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    margin-right: 7px;
+    border-radius: 999px;
+    background: currentColor;
+    vertical-align: middle;
+    position: relative;
+    top: -1px;
+}
+
+
+/* One field anatomy; existing widget/form classes remain layout hooks only. */
+.ui-field {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    min-width: 0;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+.ui-field-inline { flex-direction: row; align-items: center; flex-wrap: wrap; }
+.ui-field-help { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.ui-control {
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    padding: var(--space-2) var(--space-3);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+.ui-control::placeholder { color: var(--text-disabled); }
+.ui-control:focus {
+    border-color: var(--focus-accent-border);
+    box-shadow: 0 0 0 3px var(--focus-accent-ring);
+}
+.ui-control:disabled { color: var(--text-disabled); cursor: not-allowed; }
+/* WebKit (the packaged desktop shell) computes `overflow: visible` on a native
+   select, so a long selected option paints past the control and turns the page
+   scroller into a horizontal one; the clip keeps it inside the control's box. */
+select.ui-control {
+    -webkit-appearance: none;
+    appearance: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding-inline-end: calc(var(--space-3) * 3);
+    background-image: var(--select-arrow);
+    background-repeat: no-repeat;
+    background-position: right var(--space-3) center;
+}
+textarea.ui-control { resize: vertical; }
+.ui-checkbox {
+    box-sizing: border-box;
+    width: 14px;
+    height: 14px;
+    min-width: 14px;
+    margin: 0;
+    padding: 0;
+    flex: 0 0 auto;
+    accent-color: var(--accent);
+}
+.ui-checkbox:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.ui-status:empty { display: none; }
+@media (max-width: 640px), (pointer: coarse) {
+    .ui-control { font-size: var(--type-section); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .btn, .ui-control { transition: none; }
+    .btn:hover, .btn:active { transform: none; }
+}
+
+/* Measured popup placement is shared; menu/listbox interaction stays separate. */
+.ui-popup {
+    position: fixed;
+    margin: 0;
+    right: auto;
+    bottom: auto;
+    top: var(--ui-popup-top);
+    left: var(--ui-popup-left);
+    box-sizing: border-box;
+    max-width: var(--ui-popup-max-width);
+    max-height: var(--ui-popup-max-height);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    z-index: 1200;
+}
+.ui-model-chooser { display: block; min-width: 0; }
+.ui-model-chooser > .ui-control { width: 100%; }
+.ui-model-options {
+    width: var(--ui-popup-anchor-width);
+    margin: 0;
+    padding: var(--space-1);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    background: var(--ui-modal-bg);
+    color: var(--text-primary);
+    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
+    list-style: none;
+}
+.ui-model-option, .ui-model-empty {
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    overflow-wrap: anywhere;
+}
+.ui-model-option { cursor: pointer; }
+.ui-model-option:hover { background: var(--menu-item-hover); }
+.ui-model-option[aria-selected="true"] { color: var(--accent-light); background: var(--accent-12); }
+.ui-model-empty { color: var(--text-meta); }
+
+/* One menu surface; callers retain only domain meaning such as danger. */
+.ui-popup[role="menu"] {
+    display: flex;
+    flex-direction: column;
+    width: max-content;
+    min-width: min(160px, var(--ui-popup-max-width));
+    padding: var(--space-1);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius);
+    background: var(--ui-modal-bg);
+    color: var(--text-primary);
+    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+}
+.ui-popup [role^="menuitem"] {
+    flex: 0 0 auto;
+    width: 100%;
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    border: none;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    text-align: start;
+    white-space: normal;
+    cursor: pointer;
+}
+.ui-popup [role^="menuitem"]:hover { background: var(--menu-item-hover); }
+.ui-popup [role^="menuitem"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+.ui-popup [role^="menuitem"]:disabled,
+.ui-popup [role^="menuitem"][aria-disabled="true"] { color: var(--text-disabled); background: transparent; cursor: default; }
+.ui-popup [role^="menuitem"]:is(.danger, .files-context-item-danger) { color: var(--status-error-fg); }
+
+.ui-control[aria-invalid="true"] { border-color: var(--status-error-border); }
+.ui-field-help[data-tone="error"] { color: var(--status-error-fg); }
+
+.ui-control-code {
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+    white-space: pre;
+    tab-size: 4;
+}
+
+.ui-popup[hidden], dialog.ui-popup:not([open]) { display: none; }

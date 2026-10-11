@@ -247,8 +247,9 @@ def test_chat_async_no_proxy_non_anthropic_uses_httpx_async_client():
     ))
     fake_oa_client.chat.completions.create = fake_create
 
-    with patch("httpx.AsyncClient", FakeAsyncClient), \
-         patch("openai.AsyncOpenAI", return_value=fake_oa_client), \
+    # Resolve SDK inheritance before substituting its HTTP base class.
+    with patch("openai.AsyncOpenAI", return_value=fake_oa_client), \
+         patch("httpx.AsyncClient", FakeAsyncClient), \
          patch("requests.get", side_effect=AssertionError("no_proxy must not use requests.get")):
         asyncio.run(
             client.chat_async(messages=messages, model=model, no_proxy=True)
@@ -313,11 +314,19 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
     messages = [{"role": "user", "content": "hello"}]
     captured_kwargs = []
 
+    class ParameterRejection(RuntimeError):
+        status_code = 404
+        body = {"error": {
+            "message": "No endpoints found for requested parameter temperature",
+        }}
+
     class FakeCompletions:
         def create(self, **kwargs):
             captured_kwargs.append(kwargs)
             if len(captured_kwargs) == 1:
-                raise RuntimeError("404 No endpoints found that can handle the requested parameters")
+                raise ParameterRejection(
+                    "404 No endpoints found for requested parameter temperature"
+                )
             return MagicMock(
                 model_dump=lambda: {
                     "choices": [{"message": {"role": "assistant", "content": "ok", "tool_calls": None}}],
@@ -357,7 +366,7 @@ def test_chat_remote_no_proxy_retries_openrouter_parameter_rejection():
 
 def test_plan_review_slots_use_no_proxy(tmp_path):
     """plan_review's shared ReviewCoordinator path must pass no_proxy=True."""
-    from ouroboros.tools import plan_review
+    from ouroboros.tools import plan_review, plan_review_runtime
 
     captured_kwargs = []
 
@@ -378,13 +387,17 @@ def test_plan_review_slots_use_no_proxy(tmp_path):
         "event_queue": None,
     })()
 
-    with patch.object(plan_review, "LLMClient", return_value=FakeLLMClient()):
+    # The slot runner (and its LLMClient construction site) moved to
+    # plan_review_runtime; patch the owning module, not the re-exporting one.
+    from ouroboros.review_substrate import ReviewSlot
+
+    with patch.object(plan_review_runtime, "LLMClient", return_value=FakeLLMClient()):
         result = _asyncio.run(
             plan_review._run_plan_review_slots(
                 fake_ctx,
-                ["openai/gpt-5.5"],
-                "system prompt",
-                "user content",
+                [ReviewSlot(slot_id="slot_1", model="openai/gpt-5.5", effort="high")],
+                system_prompt="system prompt",
+                user_content="user content",
             )
         )
 
@@ -443,29 +456,29 @@ def test_review_query_model_uses_no_proxy():
 # Test: scope_review _call_scope_llm calls chat_async with no_proxy=True
 # ---------------------------------------------------------------------------
 
-def test_scope_review_call_scope_llm_uses_no_proxy():
-    """_call_scope_llm in scope_review.py must call chat_async with no_proxy=True.
+def test_scope_review_call_scope_llm_uses_no_proxy(tmp_path):
+    """_call_scope_llm must send with no_proxy=True.
 
-    Both the ThreadPoolExecutor path and the RuntimeError fallback path must pass
-    no_proxy=True. We test the asyncio.run() fallback path (RuntimeError branch)
-    by ensuring no running loop is active during the call.
+    Every scope row retrieves, so the send is the bounded native inspection
+    episode's synchronous ``chat`` call; the flag rides the shared request the
+    same way it does on every other review transport.
     """
     from ouroboros.tools import scope_review
 
     captured_kwargs = []
 
     class FakeLLMClient:
-        async def chat_async(self, **kwargs):
+        def chat(self, **kwargs):
             captured_kwargs.append(kwargs)
             return {"content": "[]"}, {"prompt_tokens": 100, "completion_tokens": 50}
 
-    prompt = "test prompt for scope review"
-
     with patch.object(scope_review, "LLMClient", return_value=FakeLLMClient()):
-        raw_text, usage, error = scope_review._call_scope_llm(prompt)
+        scope_review._call_scope_llm(
+            "", session_task="review the staged change", session_root=str(tmp_path),
+        )
 
-    assert len(captured_kwargs) >= 1, "chat_async should be called at least once"
+    assert len(captured_kwargs) >= 1, "the episode should send at least once"
     for kw in captured_kwargs:
         assert kw.get("no_proxy") is True, (
-            f"scope_review._call_scope_llm chat_async called without no_proxy=True: {kw}"
+            f"scope_review._call_scope_llm sent without no_proxy=True: {kw}"
         )

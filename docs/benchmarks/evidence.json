@@ -1,0 +1,290 @@
+{
+  "schema_version": 1,
+  "snapshot": {
+    "repository": "https://github.com/razzant/ouroboros",
+    "version": "6.92.1",
+    "tag": "v6.92.1",
+    "commit": "d8087f42e4d369db393cbfb8318b8a82f9bb73b2",
+    "claims_source": "https://github.com/razzant/ouroboros/blob/d8087f42e4d369db393cbfb8318b8a82f9bb73b2/README.md#benchmarks"
+  },
+  "evidence_collection": "https://huggingface.co/collections/razzant/ouroboros-benchmark-evidence-6a6e7fec1cfdc2d8d93ed3a3",
+  "benchmarks": [
+    {
+      "id": "terminal-bench-2.1-claude-opus-5-high",
+      "benchmark": "Terminal-Bench 2.1",
+      "model": "Claude Opus-5 high",
+      "result": {
+        "value": 86.74,
+        "unit": "percent",
+        "raw_value": 86.97,
+        "adjustment": "One disclosed reward-hack trial was scored as zero."
+      },
+      "comparisons": [
+        {
+          "system": "Claude Code + Fable 5",
+          "value": 83.8,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:48:57Z",
+        "evidence_status": "public_run"
+      },
+      "evidence": [
+        {
+          "kind": "upstream_submission",
+          "url": "https://github.com/harbor-framework/terminal-bench-2-1/pull/175"
+        },
+        {
+          "kind": "public_run",
+          "url": "https://hub.harborframework.com/jobs/2b145543-edeb-4a3b-b46f-4800310f1182"
+        }
+      ]
+    },
+    {
+      "id": "terminal-bench-2.1-claude-opus-4.8-high",
+      "benchmark": "Terminal-Bench 2.1",
+      "model": "Claude Opus-4.8 high",
+      "result": {
+        "value": 80.22,
+        "unit": "percent"
+      },
+      "comparisons": [
+        {
+          "system": "Claude Code",
+          "value": 78.9,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "evidence_status": "public_run"
+      },
+      "evidence": [
+        {
+          "kind": "public_run",
+          "url": "https://hub.harborframework.com/jobs/4b8e244f-8ab0-4d28-8218-7cf346282faa"
+        }
+      ]
+    },
+    {
+      "id": "terminal-bench-2.1-gpt-5.5",
+      "benchmark": "Terminal-Bench 2.1",
+      "model": "GPT-5.5",
+      "result": {
+        "value": 84.3,
+        "unit": "percent",
+        "calculation": {
+          "self_reported_aggregation": "mean_over_tasks_of_per_task_pass_rate",
+          "self_reported_unrounded_value": 84.26966292134831,
+          "tasks": 89,
+          "scheduled_trials": 445,
+          "graded_trials": 444,
+          "passed_trials": 374,
+          "ungraded_trials_excluded": 1,
+          "ungraded_trial": {
+            "task": "mcmc-sampling-stan",
+            "graded_task_passes": 4,
+            "graded_task_trials": 4
+          },
+          "leaderboard_compatible": {
+            "aggregation": "passed_trials_over_scheduled_trials_with_errors_counted_as_zero",
+            "unrounded_value": 84.04494382022472,
+            "rounded_value": 84.04,
+            "display_value": 84.0
+          }
+        }
+      },
+      "comparisons": [
+        {
+          "system": "Codex CLI",
+          "value": 83.1,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:49:39Z",
+        "submission_validation": "failed_source_filter",
+        "evidence_status": "public_run"
+      },
+      "evidence": [
+        {
+          "kind": "upstream_submission",
+          "url": "https://github.com/harbor-framework/terminal-bench-2-1/pull/119"
+        },
+        {
+          "kind": "public_run",
+          "url": "https://hub.harborframework.com/jobs/f02fd019-23e1-495f-af0a-ebd9a65f3079"
+        }
+      ]
+    },
+    {
+      "id": "terminal-bench-2.1-grok-4.5",
+      "benchmark": "Terminal-Bench 2.1",
+      "model": "Grok-4.5",
+      "result": {
+        "value": 84.94,
+        "unit": "percent",
+        "adjustment": "The published result includes the reward-hack audit."
+      },
+      "comparisons": [
+        {
+          "system": "Cursor CLI",
+          "value": 79.3,
+          "unit": "percent"
+        },
+        {
+          "system": "Hermes",
+          "value": 77.53,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "submission_status": "closed",
+        "submission_merged": false,
+        "submission_closed_at": "2026-09-19T20:49:21Z",
+        "evidence_status": "upstream_submission"
+      },
+      "evidence": [
+        {
+          "kind": "upstream_submission",
+          "url": "https://github.com/harbor-framework/terminal-bench-2-1/pull/146"
+        }
+      ]
+    },
+    {
+      "id": "osworld-verified-claude-opus-5",
+      "benchmark": "OSWorld-Verified",
+      "model": "Claude Opus-5",
+      "result": {
+        "value": 90.69,
+        "unit": "percent",
+        "score": 327.39,
+        "total": 361
+      },
+      "comparisons": [
+        {
+          "system": "Previous best on the public board",
+          "value": 90.19,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "evidence_status": "full_traces"
+      },
+      "evidence": [
+        {
+          "kind": "hugging_face_dataset",
+          "repository": "razzant/ouroboros-osworld-verified-opus5",
+          "revision": "f52ebf2248ce0ce0c496db18f5e6edce631304fa",
+          "url": "https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-opus5/tree/f52ebf2248ce0ce0c496db18f5e6edce631304fa"
+        }
+      ]
+    },
+    {
+      "id": "osworld-verified-claude-sonnet-4.6",
+      "benchmark": "OSWorld-Verified",
+      "model": "Claude Sonnet-4.6",
+      "result": {
+        "value": 83.27,
+        "unit": "percent",
+        "score": 300.59,
+        "total": 361
+      },
+      "comparisons": [
+        {
+          "system": "Pointer",
+          "value": 81.45,
+          "unit": "percent"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "evidence_status": "full_traces"
+      },
+      "evidence": [
+        {
+          "kind": "hugging_face_dataset",
+          "repository": "razzant/ouroboros-osworld-verified-sonnet46",
+          "revision": "0e8ad516a4eeaa586607ead400429885814e7633",
+          "url": "https://huggingface.co/datasets/razzant/ouroboros-osworld-verified-sonnet46/tree/0e8ad516a4eeaa586607ead400429885814e7633"
+        }
+      ]
+    },
+    {
+      "id": "cl-bench-claude-sonnet-4.6",
+      "benchmark": "CL-Bench",
+      "model": "Claude Sonnet-4.6",
+      "result": {
+        "value": 0.2301,
+        "unit": "normalized_reward",
+        "rank": 1
+      },
+      "comparisons": [
+        {
+          "system": "Previous top",
+          "value": 0.196,
+          "unit": "normalized_reward"
+        }
+      ],
+      "reporting": {
+        "self_reported": true,
+        "submission_status": "open",
+        "evidence_status": "full_traces"
+      },
+      "evidence": [
+        {
+          "kind": "upstream_submission",
+          "url": "https://github.com/pgasawa/continual-learning-bench/pull/10"
+        },
+        {
+          "kind": "hugging_face_dataset",
+          "repository": "razzant/ouroboros-clbench-traces",
+          "revision": "85958a21989ee7a52efaaf6d26d498f831835c70",
+          "url": "https://huggingface.co/datasets/razzant/ouroboros-clbench-traces/tree/85958a21989ee7a52efaaf6d26d498f831835c70"
+        }
+      ]
+    },
+    {
+      "id": "swe-bench-pro-gpt-5.6-luna",
+      "benchmark": "SWE-bench Pro",
+      "model": "GPT-5.6-luna",
+      "result": {
+        "value": 58.2,
+        "unit": "percent"
+      },
+      "comparisons": [
+        {
+          "system": "Codex CLI",
+          "value": 59.4,
+          "unit": "percent"
+        }
+      ],
+      "analysis": {
+        "test": "McNemar",
+        "p_value": 0.4,
+        "conclusion": "no_significant_difference"
+      },
+      "reporting": {
+        "self_reported": true,
+        "evidence_status": "matched_traces"
+      },
+      "evidence": [
+        {
+          "kind": "hugging_face_dataset",
+          "repository": "razzant/swepro-luna-matched-pair",
+          "revision": "62280378fd82ab9df0b7216745cd42e559ab3435",
+          "url": "https://huggingface.co/datasets/razzant/swepro-luna-matched-pair/tree/62280378fd82ab9df0b7216745cd42e559ab3435"
+        }
+      ]
+    }
+  ]
+}

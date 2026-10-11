@@ -801,3 +801,82 @@ def test_trashed_worktree_overflow_is_a_typed_blocker(tmp_path, monkeypatch):
     candidates = ma.attributed_git_candidates(data, "task-trash", root)
     assert candidates["candidates"] == []
     assert candidates["blockers"] == ["baseline_dirty_overflow"]
+
+
+def test_acceptance_evidence_aggregates_capability_deltas(tmp_path):
+    """W3 adjacent (f): the finalizer's evidence packet carries ONE typed
+    host-attested aggregate of capability reductions — the task's own dispatch
+    delta plus every direct child that ran below what was asked — using the
+    SAME disclosable predicate the absorption surfaces use. Nothing reduced =
+    no section (noise-free)."""
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    root = _repo(tmp_path)
+    data = tmp_path / "data"
+    write_task_result(
+        data, "task-parent", STATUS_RUNNING,
+        capability_delta={"reduced": True, "reason": "subscription_window_exhausted"},
+    )
+    write_task_result(
+        data, "task-kid-a", STATUS_COMPLETED,
+        parent_task_id="task-parent", root_task_id="task-parent",
+        delegation_role="subagent",
+        capability_delta={"reduced": True, "reason": "lane_ran_on_main"},
+    )
+    # A child whose delta took nothing away is noise and must not appear.
+    write_task_result(
+        data, "task-kid-b", STATUS_COMPLETED,
+        parent_task_id="task-parent", root_task_id="task-parent",
+        delegation_role="subagent",
+        capability_delta={"reduced": False},
+    )
+    ctx = ToolContext(repo_dir=root, system_repo_dir=root, drive_root=data, task_id="task-parent")
+
+    packet = build_task_acceptance_evidence(ctx, drive_root=data, task_id="task-parent")
+    section = packet["capability_deltas"]
+    assert packet["__provenance__"]["capability_deltas"] == "host_attested"
+    assert section["own"]["reason"] == "subscription_window_exhausted"
+    assert section["children_reduced_count"] == 1
+    assert section["children"][0]["task_id"] == "task-kid-a"
+    assert section["children"][0]["capability_delta"]["reason"] == "lane_ran_on_main"
+
+    # Nothing reduced anywhere -> the section is absent, not an empty stub.
+    write_task_result(data, "task-clean", STATUS_RUNNING)
+    ctx_clean = ToolContext(repo_dir=root, system_repo_dir=root, drive_root=data, task_id="task-clean")
+    clean_packet = build_task_acceptance_evidence(ctx_clean, drive_root=data, task_id="task-clean")
+    assert "capability_deltas" not in clean_packet
+
+
+def test_acceptance_packet_reads_mutation_evidence_from_the_canonical_root(tmp_path):
+    """AP4(1): the writer and the outcome consumer resolve `budget_drive_root`
+    first. Reading the EXECUTION drive made the whole section vanish from the
+    packet on a split-root install, with no absence marker to notice."""
+    from ouroboros.mutation_attribution import (
+        capture_mutation_baseline,
+        load_mutation_evidence_projection,
+    )
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.registry import ToolContext
+
+    root = _repo(tmp_path)
+    canonical = tmp_path / "canonical"
+    local = tmp_path / "local"
+    local.mkdir(parents=True)
+    write_task_result(canonical, "task-split", STATUS_RUNNING)
+    capture_mutation_baseline(
+        canonical, "task-split",
+        [{"surface_type": "system_repo", "host_root": str(root)}],
+    )
+    assert load_mutation_evidence_projection(canonical, "task-split")
+    assert not load_mutation_evidence_projection(local, "task-split")
+
+    ctx = ToolContext(
+        repo_dir=root, system_repo_dir=root, drive_root=local,
+        budget_drive_root=canonical, task_id="task-split",
+    )
+    packet = build_task_acceptance_evidence(ctx, drive_root=local, task_id="task-split")
+    assert packet["mutation_attribution"]["present"] is True
+    assert packet["__provenance__"]["mutation_attribution"] == "host_attested"

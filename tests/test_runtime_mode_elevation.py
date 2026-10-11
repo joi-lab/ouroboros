@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import os
 import pathlib
-import types
 
 import pytest
 
@@ -310,7 +309,7 @@ def test_data_write_blocks_self_authored_state_marker(tmp_path, monkeypatch):
     assert not (drive_root / "state" / "skills" / "demo" / "self_authored.json").exists()
 
 
-def test_data_write_blocks_unseeded_native_payload(tmp_path, monkeypatch):
+def test_data_write_blocks_missing_native_payload_creation(tmp_path, monkeypatch):
     from ouroboros import config as cfg
     from ouroboros.tools.core import _data_write
 
@@ -330,19 +329,31 @@ def test_data_write_blocks_unseeded_native_payload(tmp_path, monkeypatch):
     assert not (drive_root / "skills" / "native" / "demo" / "SKILL.md").exists()
 
 
-def test_data_write_blocks_serialized_content_object(tmp_path, monkeypatch):
+@pytest.mark.serial
+@pytest.mark.parametrize("body", [
+    '{"content":"ordinary document","id":7}\n',
+    '{"id":7,"content":"ordinary document"}\n',
+])
+def test_write_file_preserves_ordinary_content_json(tmp_path, monkeypatch, body):
     from ouroboros import config as cfg
-    from ouroboros.tools.core import _data_write
+    from ouroboros.tools.registry import ToolRegistry
 
     drive_root = tmp_path / "data"
     drive_root.mkdir()
     monkeypatch.setattr(cfg, "DATA_DIR", drive_root, raising=True)
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     ctx = _make_drive_ctx(tmp_path)
+    ctx.repo_dir.mkdir()
+    registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=drive_root)
+    registry.set_context(ctx)
 
-    result = _data_write(ctx, "skills/external/demo/plugin.py", "{'content': 'print(1)\\n'}")
+    result = registry.execute("write_file", {
+        "root": "runtime_data", "path": "notes/document.json", "content": body,
+    })
 
-    assert "DATA_WRITE_BLOCKED" in result
-    assert "serialized tool result" in result
+    assert "BLOCKED" not in result, result
+    assert (drive_root / "notes/document.json").read_bytes() == body.encode("utf-8")
 
 
 def test_str_replace_blocks_self_authored_marker(tmp_path, monkeypatch):
@@ -578,11 +589,18 @@ def test_owner_runtime_mode_endpoint_reports_no_restart_when_mode_unchanged(isol
 
     app = Starlette(routes=[Route("/api/owner/runtime-mode", endpoint=api_owner_runtime_mode, methods=["POST"])])
     app.state.drive_root = isolated_settings.parent
+    before = isolated_settings.stat().st_mtime_ns
     response = TestClient(app).post("/api/owner/runtime-mode", json={"mode": "advanced"})
 
     assert response.status_code == 200, response.text
     assert response.json() == {"ok": True, "runtime_mode": "advanced", "restart_required": False}
     assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
+    # A no-change POST must not rewrite settings.json: the rewrite raced a
+    # concurrent generic save (last-writer-wins over a stale read).
+    assert isolated_settings.stat().st_mtime_ns == before
+    assert json.loads(isolated_settings.read_text(encoding="utf-8")) == {
+        "OUROBOROS_RUNTIME_MODE": "advanced",
+    }
 
 
 def test_owner_runtime_mode_endpoint_reports_restart_until_pending_mode_is_active(isolated_settings, monkeypatch):
@@ -648,6 +666,79 @@ def test_generic_settings_save_preserves_pending_runtime_mode_without_hot_apply(
     assert os.environ["OUROBOROS_BOOT_RUNTIME_MODE"] == "advanced"
 
 
+def test_settings_save_warns_when_an_agent_task_is_running(isolated_settings, monkeypatch):
+    """Owner decision (2026-08-05, option B): the task-start snapshot boundary
+    stays, and a save landing while an agent task runs must SAY that the running
+    task keeps its previous reviewer/subagent config — a bare "Settings saved"
+    read as "applied to the task you are watching"."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as settings_mod
+    from ouroboros.gateway.settings import api_settings_post
+
+    _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "advanced"})
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    # The REAL save endpoint applies saved keys to os.environ; register the key
+    # with monkeypatch so teardown restores it (the save below writes "claude",
+    # which otherwise leaks into later tests' route resolution). delenv on an
+    # ABSENT key records nothing — setenv is what makes teardown restore.
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")
+    cfg.initialize_runtime_mode_baseline("advanced")
+    monkeypatch.setattr(settings_mod, "apply_runtime_provider_defaults", lambda s: (s, False, []))
+    monkeypatch.setattr(settings_mod, "_start_supervisor_if_needed_for_request", lambda *_a, **_k: False)
+    monkeypatch.setattr(settings_mod, "_has_started_agent_tasks", lambda: True)
+
+    app = Starlette(routes=[Route("/api/settings", endpoint=api_settings_post, methods=["POST"])])
+    app.state.drive_root = isolated_settings.parent
+    client = TestClient(app)
+
+    # A next-task-class key (the delegation route) changed while a task runs.
+    resp = client.post("/api/settings", json={"OUROBOROS_SUBAGENT_HARNESS": "off"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "saved"
+    assert data.get("agent_task_running") is True
+    warnings = data.get("warnings") or []
+    assert any("keeps the configuration it started with" in w for w in warnings), warnings
+    assert any("next task" in w for w in warnings), warnings
+
+    # No running task -> no warning noise.
+    monkeypatch.setattr(settings_mod, "_has_started_agent_tasks", lambda: False)
+    resp2 = client.post("/api/settings", json={"OUROBOROS_SUBAGENT_HARNESS": "claude"})
+    assert resp2.status_code == 200, resp2.text
+    data2 = resp2.json()
+    assert "agent_task_running" not in data2
+    assert not any("keeps the configuration" in w for w in (data2.get("warnings") or []))
+
+
+def test_started_predicate_is_read_only_and_never_constructs_the_agent(monkeypatch):
+    """Negative pin (delta gate 2026-08-05): _has_started_agent_tasks must never
+    call workers._get_chat_agent() — that CONSTRUCTS the agent and inserts the
+    canonical repo into sys.path (proven test-isolation poison). Reading the
+    existing instance (or its absence) is the whole contract."""
+    import supervisor.workers as workers
+    from ouroboros.gateway.settings import _has_started_agent_tasks
+
+    def _boom():
+        raise AssertionError("predicate constructed the agent")
+
+    monkeypatch.setattr(workers, "_get_chat_agent", _boom)
+    monkeypatch.setattr(workers, "RUNNING", {}, raising=False)
+    monkeypatch.setattr(workers, "_chat_agent", None, raising=False)
+    assert _has_started_agent_tasks() is False
+
+    class _Busy:
+        _busy = True
+
+    from supervisor.active_activity import get_direct_activity_registry
+
+    get_direct_activity_registry().register("settings-turn", 1, actor=_Busy())
+    assert _has_started_agent_tasks() is True
+
+
 def test_owner_auto_grant_endpoint_persists_outside_generic_settings(isolated_settings, monkeypatch):
     from starlette.applications import Starlette
     from starlette.routing import Route
@@ -691,13 +782,8 @@ def test_owner_context_mode_endpoint_persists_and_hot_applies(isolated_settings,
         "OUROBOROS_CONTEXT_MODE": "max",
     })
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "max")
-    # Owned by monkeypatch so the endpoint's DIRECT os.environ write is undone at
-    # teardown. This is the only writer of an owner-declared `false`, and leaking it
-    # into the worker process makes every later load_settings() overlay that owner
-    # declaration onto a settings.json that carries none — after which save_settings
-    # correctly refuses the resulting unknown -> false clearing, failing unrelated
-    # tests. Seeded as the SYSTEM value so the endpoint's clearing is observable.
-    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "true")
+    # Own the compatibility tombstone because the endpoint writes os.environ directly.
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE_AUTO_LOW", "false")
 
     app = Starlette(routes=[Route("/api/owner/context-mode", endpoint=api_owner_context_mode, methods=["POST"])])
     app.state.drive_root = isolated_settings.parent
@@ -711,16 +797,14 @@ def test_owner_context_mode_endpoint_persists_and_hot_applies(isolated_settings,
     assert on_disk["OUROBOROS_CONTEXT_MODE"] == "low"
     assert on_disk["OUROBOROS_RUNTIME_MODE"] == "pro"
     assert os.environ["OUROBOROS_CONTEXT_MODE"] == "low"
-    # An explicit owner selection re-authors the derived flag (v6.80.0): this endpoint
-    # is the ONLY path that may clear it, so `low` chosen here really does mean the P3
-    # scope review is not performed. save_settings refuses the same clearing anywhere
-    # else, which is why the state must be established through THIS path.
+    # Owner selection atomically carries the one-window false provenance tombstone,
+    # so stored Low still means the P3 scope review is not performed.
     assert on_disk["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
     assert os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "false"
 
     invalid = client.post("/api/owner/context-mode", json={"mode": "huge"})
     assert invalid.status_code == 400, invalid.text
-    assert "'mode' must be one of: low, max" in invalid.text
+    assert "'mode' must be one of: nano, low, max" in invalid.text
     assert os.environ["OUROBOROS_CONTEXT_MODE"] == "low"
 
 
@@ -747,21 +831,20 @@ def test_owner_context_mode_endpoint_refuses_lowering_while_task_runs(isolated_s
 
 
 def test_owner_context_mode_idle_predicate_covers_pending_and_direct_chat_busy(monkeypatch):
-    from types import SimpleNamespace
+    from supervisor.active_activity import get_direct_activity_registry
 
     from ouroboros.gateway import settings as settings_mod
     import supervisor.workers as workers
 
     monkeypatch.setattr(workers, "PENDING", [{"id": "queued"}])
     monkeypatch.setattr(workers, "RUNNING", {})
-    monkeypatch.setattr(workers, "_get_chat_agent", lambda: SimpleNamespace(_busy=False))
     assert settings_mod._has_running_agent_tasks() is True
 
     monkeypatch.setattr(workers, "PENDING", [])
-    monkeypatch.setattr(workers, "_get_chat_agent", lambda: SimpleNamespace(_busy=True))
+    get_direct_activity_registry().register("preparing", 1)
     assert settings_mod._has_running_agent_tasks() is True
 
-    monkeypatch.setattr(workers, "_get_chat_agent", lambda: SimpleNamespace(_busy=False))
+    get_direct_activity_registry().unregister("preparing")
     assert settings_mod._has_running_agent_tasks() is False
 
 
@@ -801,40 +884,38 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
 
     Rounds three, four and five each fixed the disk-authored-key rule on ONE path while a sibling
     path kept bypassing it (sibling keys, then the projection, then the generic owner POST). The
-    rule now lives in ``config.prepare_settings_for_persist``, and this test enumerates every
-    function that writes the settings file so a NEW writer cannot quietly reintroduce the shape:
-    it must either route through the prologue or be added here with a reason.
+    rule now lives in ``config.prepare_settings_for_persist``, and this test walks every function
+    in the tree that writes a settings document (``tests._shared.settings_writers``, the one
+    predicate the byte pin's inventory is closed over too) so a NEW writer cannot quietly
+    reintroduce the shape: it must route through the prologue or be exempted here with a reason,
+    AND it must join ``SETTINGS_WRITERS`` so the byte pin drives it — a routed sixth writer is
+    still a sixth writer, and one outside this closed set is exactly what the scan exists to see.
     """
-    import ast
     import pathlib
-    import re
+
+    from tests._shared import SETTINGS_WRITERS, settings_writers
 
     # (module, function) -> why it may write settings.json without the prologue
     exempt = {
-        ("ouroboros/tools/registry.py", "_restore_owner_files"):
-            "immune-system ROLLBACK: rewrites the exact bytes snapshotted before an agent shell "
-            "command. It authors no value, and filtering a restore would corrupt it — an "
-            "owner-authored default would be dropped instead of restored.",
-        ("ouroboros/usage_accounting.py", "_legacy_snapshot"):
+        ("ouroboros/context_mode_compat.py", "normalize_and_persist_context_mode_compat"):
+            "one-window startup migration: while the settings lock is held, atomically rewrites "
+            "the raw document with only its context compatibility pair changed, in serializer "
+            "bytes. Routing through the prologue would merge defaults and turn unrelated absence "
+            "into authorship.",
+        ("ouroboros/usage_legacy_import.py", "_legacy_snapshot"):
             "reads/hashes the settings file for the usage archive; its writes target the archive.",
         ("ouroboros/tools/core.py", "_data_write"):
             "names SETTINGS_PATH only to REFUSE agent writes to it.",
+        ("ouroboros/colab_bootstrap.py", "write_colab_settings"):
+            "writes the generated document for ANOTHER root (the Colab Drive data dir) in "
+            "serialize_settings bytes. The prologue proves its ratchets against the value on "
+            "THIS process's disk, so routing a foreign path through it would answer the wrong file.",
     }
     # Keys are POSIX-normalised: `str(WindowsPath(...))` is backslash-separated, so on Windows
     # every `exempt` lookup below would miss and every hardcoded assertion at the end would
     # fail — turning the tripwire into either a red matrix or, worse, a guard that flags the
     # exempted writers while silently vouching for nothing.
-    writers = {}
-    for path in sorted(pathlib.Path("ouroboros").rglob("*.py")) + [pathlib.Path("server.py")]:
-        src = path.read_text(encoding="utf-8")
-        if "SETTINGS_PATH" not in src:
-            continue
-        for node in ast.walk(ast.parse(src)):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            seg = ast.get_source_segment(src, node) or ""
-            if "SETTINGS_PATH" in seg and re.search(r"\.write_text\(|atomic_write_json\(|json\.dump\(", seg):
-                writers[(path.as_posix(), node.name)] = "prepare_settings_for_persist" in seg
+    writers = settings_writers(pathlib.Path(__file__).resolve().parents[1])
 
     unrouted = {k for k, routed in writers.items() if not routed and k not in exempt}
     assert not unrouted, (
@@ -843,9 +924,22 @@ def test_every_settings_writer_routes_through_the_shared_prologue():
         f"(naming any key they genuinely author in `authored_keys`), or add them to `exempt` with "
         f"a reason. Do not re-implement the silence/ratchet rule at the call site."
     )
-    # The two real writers must still BE routed — deleting the call must fail this test.
+    # The inventory is CLOSED over the scanned roots, routed or not: the flagged set is exactly
+    # the writers the byte pin drives plus the matches declared above as non-writers.
+    expected = set(SETTINGS_WRITERS) | set(exempt)
+    assert set(writers) == expected, (
+        f"the settings-writer inventory drifted: {sorted(set(writers) ^ expected)}. A function "
+        f"that persists a settings document belongs in tests._shared.SETTINGS_WRITERS, where the "
+        f"byte pin in tests/test_settings_read_seam.py drives it; one this scan flags without "
+        f"persisting a settings document belongs in `exempt` with a reason; a stale entry leaves "
+        f"whichever list holds it."
+    )
+    # The three real writers must still BE routed — deleting the call must fail this test.
+    # The owner endpoints' write lives in the locked read-modify-write primitive that
+    # `_owner_write_settings` is now one caller of.
     assert writers.get(("ouroboros/config.py", "save_settings")) is True
-    assert writers.get(("ouroboros/gateway/settings.py", "_owner_write_settings")) is True
+    assert writers.get(("ouroboros/gateway/owner_settings.py", "_owner_update_settings")) is True
+    assert writers.get(("ouroboros/packaged_cli.py", "_save_settings")) is True
 
 
 def test_generic_settings_post_does_not_author_a_mode_decision(isolated_settings, monkeypatch):
@@ -866,7 +960,6 @@ def test_generic_settings_post_does_not_author_a_mode_decision(isolated_settings
     from ouroboros.gateway import settings as settings_mod
     from ouroboros.gateway.settings import api_settings_post
 
-    monkeypatch.setattr(_os, "environ", dict(_os.environ))
     _own_ratchet_env(monkeypatch)
     _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"  # forwarded by the benchmark launcher
     _os.environ["OUROBOROS_SAFETY_MODE"] = "light"
@@ -905,7 +998,6 @@ def test_owner_endpoint_authors_its_own_key_even_at_the_default(isolated_setting
     from ouroboros import config as cfg
     from ouroboros.gateway.settings import api_owner_safety_mode
 
-    monkeypatch.setattr(_os, "environ", dict(_os.environ))
     _own_ratchet_env(monkeypatch)
     _os.environ["OUROBOROS_SAFETY_MODE"] = "light"
     _seed_disk(isolated_settings, {"TOTAL_BUDGET": "10"})
@@ -928,8 +1020,8 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     load_settings does not let env author these keys, the dict it returns carries a DEFAULT wherever
     settings.json is silent — and projecting that default overwrote (or popped) a value the launcher
     forwarded on purpose. ``devtools/benchmarks/terminal_bench/harbor_installed_agent.py`` runs the
-    container with NO settings.json at all and forwards ``OUROBOROS_CONTEXT_MODE`` (+ the derived
-    auto-low flag) for context-ablation runs; ``server_runner._patch_settings_ports`` and
+    container with NO settings.json at all and forwards ``OUROBOROS_CONTEXT_MODE`` (plus the
+    explicit false tombstone for owner-Low runs); ``server_runner._patch_settings_ports`` and
     ``run_gaia._resolve_provider_keys`` both document the same "settings.json over env" clobber; and
     ``run_clb`` forwards the context mode and ``OUROBOROS_SAFETY_MODE`` the same way. Projection must
     therefore say only what the FILE says, and stay silent where the file says nothing.
@@ -938,12 +1030,10 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
 
     from ouroboros import config as cfg
 
-    # Own the WHOLE environment: apply_settings_to_env writes ~122 keys, so a real copy is the only
-    # honest ownership boundary here (the same technique the auto-low regression test uses).
-    monkeypatch.setattr(_os, "environ", dict(_os.environ))
+    # Own every mode key: apply_settings_to_env writes ~122 keys, and the autouse
+    # os.environ snapshot restores the rest after the test.
     _own_ratchet_env(monkeypatch)
     _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
-    _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "true"  # derived/system low, travels with the mode
     _os.environ["OUROBOROS_SAFETY_MODE"] = "light"
 
     # 1. No settings.json at all — the harbor container shape.
@@ -951,7 +1041,7 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     cfg.apply_settings_to_env(cfg.load_settings())
     assert cfg.get_context_mode() == "low", "startup clobbered an env-forwarded context mode"
     assert cfg.get_safety_mode() == "light", "startup clobbered an env-forwarded safety mode"
-    assert _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] == "true"
+    assert "OUROBOROS_CONTEXT_MODE_AUTO_LOW" not in _os.environ
     # A bare forwarded `low` is still NOT an owner-declared scope-review skip.
     assert cfg.get_owner_context_mode() == "max"
 
@@ -967,13 +1057,13 @@ def test_env_forwarded_modes_survive_the_documented_startup_path(isolated_settin
     assert cfg.get_context_mode() == "max"
     assert cfg.get_safety_mode() == "full"
 
-    # 4. The fail-closed exception: env may not author the owner-declared-low CLAIM, which would
-    #    switch the BIBLE P3 scope gate off. Disk is silent about the flag; the claim is cleared.
+    # 4. An explicit forwarded false accompanies a benchmark/operator Low declaration.
+    _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
     _os.environ["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
-    _seed_disk(isolated_settings, {"OUROBOROS_CONTEXT_MODE": "low"})
+    _seed_disk(isolated_settings, {"TOTAL_BUDGET": "10"})
     cfg.apply_settings_to_env(cfg.load_settings())
     assert cfg.get_context_mode() == "low"
-    assert cfg.get_owner_context_mode() == "max", "env alone must not switch the P3 scope gate off"
+    assert cfg.get_owner_context_mode() == "low"
 
 
 def test_agent_save_cannot_end_a_forwarded_mode_mid_run(isolated_settings, monkeypatch):
@@ -992,7 +1082,6 @@ def test_agent_save_cannot_end_a_forwarded_mode_mid_run(isolated_settings, monke
     from ouroboros import config as cfg
     from ouroboros.tools.control import _set_tool_timeout
 
-    monkeypatch.setattr(_os, "environ", dict(_os.environ))  # the tool writes os.environ via apply
     _own_ratchet_env(monkeypatch)
     _os.environ["OUROBOROS_CONTEXT_MODE"] = "low"
     _os.environ["OUROBOROS_SAFETY_MODE"] = "light"
@@ -1025,7 +1114,7 @@ def test_agent_save_cannot_end_a_forwarded_mode_mid_run(isolated_settings, monke
 def test_env_declared_context_mode_cannot_author_a_lowering(isolated_settings, monkeypatch):
     """A ratchet reads its PREVIOUS value off DISK for every key it guards — env never.
 
-    Round-3 regression: the bypass closed for the derived auto-low flag was still open one key
+    Round-3 regression: the bypass closed for the context provenance tombstone was still open one key
     over. With no ``OUROBOROS_CONTEXT_MODE`` stored, an inherited/forwarded env ``low`` made the
     guard compare ``low -> low`` instead of ``max -> low``, so any caller could persist the
     lowered cognitive horizon without ``allow_context_lowering``. Absent from disk resolves
@@ -1208,6 +1297,43 @@ def test_launcher_runtime_mode_bridge_saves_after_confirmation(monkeypatch):
     assert saved["OUROBOROS_RUNTIME_MODE"] == "pro"
 
 
+def test_launcher_owner_writer_persists_cyber_pro_after_boot_pin(isolated_settings, monkeypatch):
+    """The confirmed desktop-owner path must bypass the agent boot ratchet.
+
+    ``config.save_settings(..., allow_elevation=True)`` is intentionally inert
+    after boot.  The launcher must therefore use the existing owner settings
+    writer, otherwise a confirmed Cyber Pro choice is silently persisted as the
+    active Advanced mode again.
+    """
+    import launcher
+    from ouroboros import config as cfg
+
+    _seed_disk(isolated_settings, {"OUROBOROS_RUNTIME_MODE": "advanced"})
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    cfg.initialize_runtime_mode_baseline("advanced")
+
+    launcher._save_settings({"OUROBOROS_RUNTIME_MODE": "cyber_pro"})
+
+    on_disk = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert on_disk["OUROBOROS_RUNTIME_MODE"] == "cyber_pro"
+    assert os.environ["OUROBOROS_RUNTIME_MODE"] == "advanced"
+
+
+def test_settings_ui_uses_confirm_only_bridge_and_owner_endpoint():
+    """A stale desktop bridge must never receive the new mode value to write."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "web/modules/settings.js").read_text(
+        encoding="utf-8"
+    )
+    start = source.index("async function saveRuntimeModeViaNativeBridgeIfNeeded")
+    end = source.index("async function saveAutoGrantViaNativeBridgeIfNeeded", start)
+    runtime_save = source[start:end]
+    assert "confirm_runtime_mode_change" in runtime_save
+    assert "ownerRuntimeMode(nextMode)" in runtime_save
+    assert "window.pywebview?.api?.request_runtime_mode_change" not in runtime_save
+
+
 def test_launcher_runtime_mode_bridge_reports_pending_restart_against_active(monkeypatch):
     import launcher
 
@@ -1262,271 +1388,117 @@ def test_launcher_auto_grant_bridge_disables_truthy_alias(monkeypatch):
     assert saved["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] == "false"
 
 
+def _launcher_grant_skill(tmp_path, monkeypatch, *, name="demo", skill_type="script", permissions=(), keys=("OPENROUTER_API_KEY",)):
+    import launcher
+    from ouroboros.skill_loader import SkillReviewState, load_skill, save_review_state
+
+    drive = tmp_path / "data"
+    payload = drive / "skills" / "external" / name
+    payload.mkdir(parents=True)
+    declaration = {
+        "script": "runtime: python3\nscripts:\n  - name: run.py\n",
+        "extension": "entry: plugin.py\nplugin_api: '2.0'\n",
+        "instruction": "",
+    }[skill_type]
+    (payload / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: Launcher grant fixture.\nversion: 1.0.0\ntype: {skill_type}\n"
+        f"permissions: {json.dumps(list(permissions))}\nenv_from_settings: {json.dumps(list(keys))}\n"
+        "subscribe_events: [chat.outbound]\n" + declaration + "---\n"
+    )
+    if skill_type == "script":
+        (payload / "scripts").mkdir()
+        (payload / "scripts" / "run.py").write_text("print('ok')\n")
+    if skill_type == "extension":
+        (payload / "plugin.py").write_text("def register(api):\n    return None\n")
+    loaded = load_skill(payload, drive)
+    save_review_state(drive, name, SkillReviewState(status="clean", content_hash=loaded.content_hash))
+    monkeypatch.setattr(launcher, "DATA_DIR", drive)
+    monkeypatch.setattr(launcher, "REPO_DIR", tmp_path / "repo")
+    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
+    monkeypatch.setattr(launcher, "_read_port_file", lambda: 8765)
+    monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", "")
+    return loaded, drive
+
+
 def test_launcher_skill_key_grant_validates_review_and_manifest(monkeypatch, tmp_path):
     import launcher
+    from ouroboros.skill_loader import load_skill_grants
 
-    class _Manifest:
-        env_from_settings = ["OPENROUTER_API_KEY"]
-        def is_script(self):
-            return True
-        def is_extension(self):
-            return False
-
-    class _Review:
-        status = "advisory_pass"
-        def is_stale_for(self, _hash):
-            return False
-
-    loaded = types.SimpleNamespace(
-        name="demo",
-        manifest=_Manifest(),
-        review=_Review(),
-        content_hash="hash-a",
-    )
-    captured = {}
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
-    monkeypatch.setattr("ouroboros.skill_loader.find_skill", lambda *_a, **_kw: loaded)
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.save_skill_grants",
-        lambda drive, name, keys, **kw: captured.update(
-            {"drive": drive, "name": name, "keys": keys, **kw}
-        ),
-    )
-
-    result = launcher._request_skill_key_grant(
-        "demo",
-        ["OPENROUTER_API_KEY"],
-        lambda _title, _message: True,
-    )
-
+    loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch)
+    result = launcher._request_skill_key_grant("demo", ["OPENROUTER_API_KEY"], lambda *a: True)
     assert result["ok"] is True
-    assert captured["name"] == "demo"
-    assert captured["keys"] == ["OPENROUTER_API_KEY"]
-    assert captured["content_hash"] == "hash-a"
-    assert captured["requested_keys"] == ["OPENROUTER_API_KEY"]
-    # v5.2.2: scripts pick up grants on next ``_scrub_env`` call so no
-    # server reconcile is invoked. ``extension_action`` and
-    # ``extension_reason`` therefore stay ``None`` for script-type
-    # skills.
+    grants = load_skill_grants(drive, "demo")
+    assert grants["granted_keys"] == ["OPENROUTER_API_KEY"]
+    assert grants["requested_keys"] == ["OPENROUTER_API_KEY"]
+    assert grants["content_hash"] == loaded.content_hash
     assert result.get("extension_action") is None
     assert result.get("extension_reason") is None
 
 
 def test_launcher_skill_grant_supports_permission_grants(monkeypatch, tmp_path):
+    import io
     import launcher
+    from ouroboros.skill_loader import load_skill_grants
 
-    class _Manifest:
-        env_from_settings = []
-        permissions = ["inject_chat", "subscribe_event"]
-        subscribe_events = ["chat.outbound"]
-        def is_script(self):
-            return False
-        def is_extension(self):
-            return True
-
-    class _Review:
-        status = "pass"
-        def is_stale_for(self, _hash):
-            return False
-
-    loaded = types.SimpleNamespace(
-        name="bridge",
-        manifest=_Manifest(),
-        review=_Review(),
-        content_hash="hash-a",
-    )
-    captured = {}
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
-    monkeypatch.setattr("ouroboros.skill_loader.find_skill", lambda *_a, **_kw: loaded)
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.save_skill_grants",
-        lambda drive, name, keys, **kw: captured.update(
-            {"drive": drive, "name": name, "keys": keys, **kw}
-        ),
-    )
-    monkeypatch.setattr("urllib.request.urlopen", lambda *_a, **_kw: types.SimpleNamespace(read=lambda: b'{"ok": true}'))
-
-    result = launcher._request_skill_key_grant(
-        "bridge",
-        ["inject_chat", "subscribe_event:chat.outbound"],
-        lambda _title, _message: True,
-    )
-
+    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="bridge", skill_type="extension",
+                                         keys=(), permissions=("inject_chat", "subscribe_event"))
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: io.BytesIO(b'{"ok":true}'))
+    result = launcher._request_skill_key_grant("bridge", ["inject_chat", "subscribe_event:chat.outbound"], lambda *a: True)
     assert result["ok"] is True
-    assert captured["keys"] == []
-    assert captured["granted_permissions"] == ["inject_chat", "subscribe_event:chat.outbound"]
-    assert captured["requested_permissions"] == ["inject_chat", "subscribe_event:chat.outbound"]
+    assert result["granted_permissions"] == ["inject_chat", "subscribe_event:chat.outbound"]
+    grants = load_skill_grants(drive, "bridge")
+    assert grants["granted_keys"] == []
+    assert grants["granted_permissions"] == result["granted_permissions"]
 
 
 def test_launcher_skill_key_grant_supports_extensions(monkeypatch, tmp_path):
-    """v5.2.2 dual-track grants: ``type: extension`` skills can be
-    granted core keys and the launcher posts to the agent server's
-    /api/skills/<name>/reconcile so the new grant reaches the live
-    plugin without forcing a manual disable/enable.
-
-    The launcher and server are independent OS processes — this test
-    verifies the cross-process contract by stubbing ``urllib.request.urlopen``
-    instead of stubbing ``reconcile_extension`` directly (which only
-    runs in the launcher process and would not affect the server).
-    """
+    """The launcher grants locally, then reconciles in the real server process."""
+    import io
     import launcher
+    from ouroboros.skill_loader import load_skill_grants
 
-    class _Manifest:
-        env_from_settings = ["OPENROUTER_API_KEY"]
-        def is_script(self):
-            return False
-        def is_extension(self):
-            return True
+    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="demo_ext", skill_type="extension")
+    calls = []
 
-    class _Review:
-        status = "pass"
-        def is_stale_for(self, _hash):
-            return False
+    def response(request, timeout=10):
+        calls.append((request.full_url, request.get_method()))
+        assert load_skill_grants(drive, "demo_ext")["granted_keys"] == ["OPENROUTER_API_KEY"]
+        return io.BytesIO(b'{"extension_action":"extension_loaded","extension_reason":"ready","live_loaded":true}')
 
-    loaded = types.SimpleNamespace(
-        name="demo_ext",
-        manifest=_Manifest(),
-        review=_Review(),
-        content_hash="ext-hash",
-    )
-    captured: dict = {}
-    reconcile_calls: list = []
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
-    monkeypatch.setattr(launcher, "_read_port_file", lambda: 8765)
-    monkeypatch.setattr("ouroboros.skill_loader.find_skill", lambda *_a, **_kw: loaded)
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.save_skill_grants",
-        lambda drive, name, keys, **kw: captured.update(
-            {"drive": drive, "name": name, "keys": keys, **kw}
-        ),
-    )
-
-    class _FakeResponse:
-        def __init__(self, body: bytes):
-            self._body = body
-        def read(self):
-            return self._body
-        def __enter__(self):
-            return self
-        def __exit__(self, *_):
-            return False
-
-    def _fake_urlopen(req, timeout=10):
-        reconcile_calls.append({
-            "url": req.full_url,
-            "method": req.get_method(),
-            "data": req.data,
-        })
-        return _FakeResponse(
-            b'{"skill":"demo_ext","extension_action":"extension_loaded",'
-            b'"extension_reason":"ready","live_loaded":true,"load_error":null}'
-        )
-
-    monkeypatch.setattr("urllib.request.urlopen", _fake_urlopen)
-
-    result = launcher._request_skill_key_grant(
-        "demo_ext",
-        ["OPENROUTER_API_KEY"],
-        lambda _title, _message: True,
-    )
-
+    monkeypatch.setattr("urllib.request.urlopen", response)
+    result = launcher._request_skill_key_grant("demo_ext", ["OPENROUTER_API_KEY"], lambda *a: True)
     assert result["ok"] is True
-    assert captured["name"] == "demo_ext"
-    assert captured["keys"] == ["OPENROUTER_API_KEY"]
-    assert len(reconcile_calls) == 1
-    call = reconcile_calls[0]
-    assert call["url"] == "http://127.0.0.1:8765/api/skills/demo_ext/reconcile"
-    assert call["method"] == "POST"
-    assert result.get("extension_action") == "extension_loaded"
+    assert calls == [("http://127.0.0.1:8765/api/skills/demo_ext/reconcile", "POST")]
+    assert result["extension_action"] == "extension_loaded"
 
 
 def test_launcher_skill_key_grant_handles_reconcile_http_error(monkeypatch, tmp_path):
-    """If the server-side reconcile HTTP call fails, the grant write
-    succeeded but the response carries ``extension_reason='reconcile_call_failed'``
-    so the UI can warn the user without throwing away the persisted grant."""
+    """A failed reconcile does not undo a grant already persisted by its owner."""
     import launcher
+    from ouroboros.skill_loader import load_skill_grants
 
-    class _Manifest:
-        env_from_settings = ["OPENROUTER_API_KEY"]
-        def is_script(self):
-            return False
-        def is_extension(self):
-            return True
+    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="demo_ext", skill_type="extension")
 
-    class _Review:
-        status = "pass"
-        def is_stale_for(self, _hash):
-            return False
-
-    loaded = types.SimpleNamespace(
-        name="demo_ext",
-        manifest=_Manifest(),
-        review=_Review(),
-        content_hash="ext-hash",
-    )
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
-    monkeypatch.setattr(launcher, "_read_port_file", lambda: 8765)
-    monkeypatch.setattr("ouroboros.skill_loader.find_skill", lambda *_a, **_kw: loaded)
-    monkeypatch.setattr(
-        "ouroboros.skill_loader.save_skill_grants",
-        lambda *_a, **_kw: None,
-    )
-
-    def _broken_urlopen(*_a, **_kw):
+    def unavailable(*a, **k):
         raise ConnectionError("server not reachable")
 
-    monkeypatch.setattr("urllib.request.urlopen", _broken_urlopen)
-
-    result = launcher._request_skill_key_grant(
-        "demo_ext",
-        ["OPENROUTER_API_KEY"],
-        lambda _title, _message: True,
-    )
-
-    # Grant itself succeeded (file persisted)
+    monkeypatch.setattr("urllib.request.urlopen", unavailable)
+    result = launcher._request_skill_key_grant("demo_ext", ["OPENROUTER_API_KEY"], lambda *a: True)
     assert result["ok"] is True
-    assert result.get("granted_keys") == ["OPENROUTER_API_KEY"]
-    # But the server reconcile failed and the UI is told
-    assert result.get("extension_reason") == "reconcile_call_failed"
-    assert result.get("extension_action") is None
+    assert load_skill_grants(drive, "demo_ext")["granted_keys"] == ["OPENROUTER_API_KEY"]
+    assert result["extension_reason"] == "reconcile_call_failed"
+    assert result["extension_action"] is None
 
 
 def test_launcher_skill_key_grant_rejects_instruction_skill(monkeypatch, tmp_path):
     import launcher
+    from ouroboros.skill_loader import load_skill_grants
 
-    class _Manifest:
-        env_from_settings = ["OPENROUTER_API_KEY"]
-        def is_script(self):
-            return False
-        def is_extension(self):
-            return False
-
-    class _Review:
-        status = "pass"
-        def is_stale_for(self, _hash):
-            return False
-
-    loaded = types.SimpleNamespace(
-        name="instr",
-        manifest=_Manifest(),
-        review=_Review(),
-        content_hash="instr-hash",
-    )
-    monkeypatch.setattr(launcher, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(launcher, "_load_settings", lambda: {"OUROBOROS_SKILLS_REPO_PATH": ""})
-    monkeypatch.setattr("ouroboros.skill_loader.find_skill", lambda *_a, **_kw: loaded)
-
-    result = launcher._request_skill_key_grant(
-        "instr",
-        ["OPENROUTER_API_KEY"],
-        lambda _title, _message: True,
-    )
+    _loaded, drive = _launcher_grant_skill(tmp_path, monkeypatch, name="instr", skill_type="instruction")
+    result = launcher._request_skill_key_grant("instr", ["OPENROUTER_API_KEY"], lambda *a: True)
     assert result["ok"] is False
     assert "script and extension" in result["error"]
+    assert load_skill_grants(drive, "instr")["granted_keys"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -1650,137 +1622,10 @@ def test_set_tool_timeout_sanitizes_corrupted_disk_to_env(isolated_settings, mon
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "blocked_cmd",
-    [
-        # Combination: save_settings + OUROBOROS_RUNTIME_MODE → blocked.
-        "python -c \"from ouroboros.config import save_settings; save_settings({'OUROBOROS_RUNTIME_MODE': 'pro'}, allow_elevation=True)\"",
-        "python3 -c \"import ouroboros.config; ouroboros.config.save_settings({'OUROBOROS_RUNTIME_MODE': 'pro'})\"",
-        # Dotted-path short-circuit: ouroboros.config.save_settings.
-        "python -c \"import ouroboros.config; ouroboros.config.save_settings({})\"",
-    ],
-)
-def test_elevation_indicators_block_attack_patterns_in_all_modes(blocked_cmd, tmp_path, monkeypatch):
-    """Iteration-2 fix (real triad finding T1, iter-2 multi-critic F2-6):
-    the elevation indicators block actual attack patterns — runs
-    ``ToolRegistry.execute("run_command", ...)`` end-to-end in each
-    runtime mode and asserts ``ELEVATION_BLOCKED`` is returned. The
-    earlier string-level test only verified substring presence; this
-    covers the dispatch wiring."""
-    from ouroboros.tools.registry import ToolRegistry
-
-    for mode in ("light", "advanced", "pro"):
-        monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-        reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-        result = reg.execute("run_command", {"cmd": blocked_cmd})
-        assert "ELEVATION_BLOCKED" in result, (
-            f"mode={mode!r} cmd={blocked_cmd!r}: "
-            f"got {result[:200]!r}"
-        )
-
-
-def test_workspace_mode_still_blocks_runtime_mode_elevation(tmp_path, monkeypatch):
-    from ouroboros.tools.registry import ToolContext, ToolRegistry
-
-    workspace = tmp_path / "workspace"
-    repo = tmp_path / "repo"
-    data = tmp_path / "data"
-    workspace.mkdir()
-    repo.mkdir()
-    data.mkdir()
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = ToolRegistry(repo_dir=repo, drive_root=data)
-    reg.set_context(ToolContext(
-        repo_dir=repo,
-        drive_root=data,
-        workspace_root=workspace,
-        workspace_mode="external",
-    ))
-    result = reg.execute(
-        "run_command",
-        {"cmd": "python -c \"from ouroboros.config import save_settings; save_settings({'OUROBOROS_RUNTIME_MODE': 'pro'}, allow_elevation=True)\""},
-    )
-
-    assert "ELEVATION_BLOCKED" in result
-
-
-@pytest.mark.parametrize(
-    "diagnostic_cmd",
-    [
-        # Diagnostic queries about the chokepoint must NOT be blocked.
-        "echo \"$OUROBOROS_RUNTIME_MODE\"",
-        "printenv OUROBOROS_RUNTIME_MODE",
-        "grep save_settings ouroboros/config.py",
-        "rg save_settings ouroboros/",
-        "git log -S save_settings",
-        # save_settings without OUROBOROS_RUNTIME_MODE: legitimate dev work.
-        "grep -n 'def save_settings' ouroboros/config.py",
-    ],
-)
-def test_elevation_indicators_do_not_false_positive(diagnostic_cmd, tmp_path, monkeypatch):
-    """Iteration-2 fix (multi-critic F2-2): diagnostic shell commands
-    that mention ``save_settings`` OR ``OUROBOROS_RUNTIME_MODE`` (but
-    not both, and not the dotted-path attack form) must NOT trip
-    ELEVATION_BLOCKED. The conjunctive check is the discriminator."""
-    from ouroboros.tools.registry import ToolRegistry
-
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    result = reg.execute("run_command", {"cmd": diagnostic_cmd})
-    assert "ELEVATION_BLOCKED" not in result, (
-        f"Diagnostic cmd {diagnostic_cmd!r} was wrongly blocked as "
-        "elevation attempt. The conjunctive check should let this pass."
-    )
-
-
-@pytest.mark.parametrize(
-    "blocked_cmd",
-    [
-        "curl -X POST http://127.0.0.1:8765/api/owner/context-mode -d '{\"mode\":\"low\"}'",
-        "python -c \"from ouroboros.config import save_settings; save_settings({'OUROBOROS_CONTEXT_MODE': 'low'})\"",
-        "python -c \"import json; p='data/settings.json'; json.dump({'OUROBOROS_CONTEXT_MODE':'low'}, open(p,'w'))\"",
-        "ouroboros settings context-mode low",
-        "python -m ouroboros.cli settings context-mode low",
-    ],
-)
-def test_context_mode_self_lowering_indicators_block_attack_patterns(blocked_cmd, tmp_path, monkeypatch):
-    from ouroboros.tools.registry import ToolRegistry
-
-    for mode in ("light", "advanced", "pro"):
-        monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
-        reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-        result = reg.execute("run_command", {"cmd": blocked_cmd})
-        assert "CONTEXT_MODE_SELF_LOWERING_BLOCKED" in result, (
-            f"mode={mode!r} cmd={blocked_cmd!r}: got {result[:200]!r}"
-        )
-
-
-@pytest.mark.parametrize(
-    "diagnostic_cmd",
-    [
-        "echo \"$OUROBOROS_CONTEXT_MODE\"",
-        "rg OUROBOROS_CONTEXT_MODE ouroboros/",
-        "curl http://127.0.0.1:8765/api/state",
-    ],
-)
-def test_context_mode_guard_does_not_block_readonly_diagnostics(diagnostic_cmd, tmp_path, monkeypatch):
-    from ouroboros.tools.registry import ToolRegistry
-
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    result = reg.execute("run_command", {"cmd": diagnostic_cmd})
-    assert "CONTEXT_MODE_SELF_LOWERING_BLOCKED" not in result
-
-
-def test_browser_evaluate_context_mode_self_lowering_guard():
+def test_browser_context_mode_owner_post_uses_the_actual_operation():
     from types import SimpleNamespace
 
-    from ouroboros.tools.browser import _blocks_context_mode_self_lowering_js, _is_context_mode_owner_post
-
-    assert _blocks_context_mode_self_lowering_js(
-        "fetch('/api/owner/context-mode', {method:'POST', body: JSON.stringify({mode:'low'})})"
-    )
-    assert not _blocks_context_mode_self_lowering_js("fetch('/api/state').then(r => r.json())")
+    from ouroboros.browser_policy import _is_context_mode_owner_post
     assert _is_context_mode_owner_post(SimpleNamespace(url="http://127.0.0.1:8765/api/owner/context-mode", method="POST"))
     assert not _is_context_mode_owner_post(SimpleNamespace(url="http://127.0.0.1:8765/api/state", method="POST"))
 
@@ -1929,61 +1774,167 @@ def test_files_api_owner_only_helper_blocks_symlinked_skill_state_dir(tmp_path, 
 @pytest.mark.parametrize("filename", [
     "grants.json", "review.json", "review_history.jsonl", "accepted_rebuttals.json", "enabled.json", "Review.JSON",
 ])
-def test_run_shell_blocks_obfuscated_skill_owner_state_write(filename, tmp_path, monkeypatch):
+@pytest.mark.parametrize("shape", ["redirect", "cp"])
+def test_run_shell_writes_skill_state_examples(shape, filename, tmp_path, monkeypatch):
+    """An example tree may contain state/skills names without becoming live state."""
     from ouroboros.tools.registry import ToolRegistry
 
     _clear_safety_provider_env(monkeypatch)
     drive_root = tmp_path / "data"
-    skill_state_dir = drive_root / "state" / "skills" / "weather"
+    skill_state_dir = drive_root / "examples" / "state" / "skills" / "weather"
     skill_state_dir.mkdir(parents=True)
-    helper_path = tmp_path / "owner_state_writer.py"
-    stem, suffix = filename.split(".", 1)
-    helper_path.write_text(
-        "import json, pathlib, sys\n"
-        "root = pathlib.Path(sys.argv[1])\n"
-        f"name = {stem!r} + '.{suffix}'\n"
-        "target = root / 'state' / 'skills' / 'weather' / name\n"
-        "target.parent.mkdir(parents=True, exist_ok=True)\n"
-        "target.write_text(json.dumps({'status':'pass','enabled':True}))\n",
-        encoding="utf-8",
-    )
+    target = skill_state_dir / filename
+    payload = tmp_path / "payload.json"
+    payload.write_text('{"status":"pass","enabled":true}', encoding="utf-8")
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
     reg = ToolRegistry(repo_dir=tmp_path, drive_root=drive_root)
-    result = reg.execute("run_command", {"cmd": ["python3", str(helper_path), str(drive_root)]})
-    assert "OWNER_STATE_RESTORED" in result
-    assert not (skill_state_dir / filename).exists()
+    if os.name == "nt":
+        # ``bash`` on hosted Windows resolves to WSL, which has no distro in
+        # the GitHub runner image. Exercise the same redirect/copy shapes via
+        # the native command interpreter instead of depending on WSL setup.
+        # Separate operands let subprocess quote paths without backslash-escaping
+        # the inner quotes of a prequoted cmd body.
+        cmd = (
+            ["cmd.exe", "/d", "/c", "type", str(payload), ">", str(target)]
+            if shape == "redirect"
+            else ["cmd.exe", "/d", "/c", "copy", "/Y", str(payload), str(target), ">NUL"]
+        )
+    else:
+        cmd = (
+            ["bash", "-c", f"cat {payload} > {target}"]
+            if shape == "redirect"
+            else ["cp", str(payload), str(target)]
+        )
+    result = reg.execute("run_command", {"cmd": cmd})
+    assert "exit_code=0" in result, result
+    assert target.read_bytes() == payload.read_bytes()
 
 
-def test_run_shell_blocks_delayed_skill_owner_state_writer(tmp_path, monkeypatch):
+def test_shell_post_checks_run_when_handler_errors_after_execution(tmp_path, monkeypatch):
+    """Issue #447 B2: the surviving post-exec tripwires must run on the error path.
+
+    Two of the four early_error returns in ``_invoke_builtin_handler`` fire AFTER
+    the process already ran (a handler exception → TOOL_ERROR), so returning the
+    error before ``_run_shell_post_checks`` was a real fail-open: a command that
+    mutated the light-mode repo and then raised skipped the tripwire entirely.
+    """
+    import subprocess
+
+    import ouroboros.safety as safety_mod
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "t@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "T"], cwd=repo, check=True)
+    (repo / "README.md").write_text("ok\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True)
+
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "drive")
+
+    def _mutating_then_raising(ctx, _resolved_binding=None, **kwargs):
+        (repo / "README.md").write_text("hacked\n", encoding="utf-8")
+        raise RuntimeError("post-write failure")
+
+    reg.override_handler("run_command", _mutating_then_raising)
+    result = reg.execute("run_command", {"cmd": ["true"]})
+
+    assert "TOOL_ERROR" in result, result[:300]
+    assert "LIGHT_MODE_REPO_CHANGED" in result, result[:300]
+
+
+def test_shell_settings_tripwire_flags_obfuscated_owner_settings_write(tmp_path, monkeypatch):
+    """#447 S1/SC2: the lexical settings.json mention-gates are bypassable by an
+    obfuscated argument-level writer, and the deleted X2 restore used to be the
+    only thing that made such a write visible. The surviving tripwire must flag
+    the change with a typed ``tripwire`` fact in the result envelope plus an
+    appended ⚠️ note AFTER the payload (#447 В12: line 1 stays with the command
+    output; detect-and-report — deliberately no auto-revert, a rollback can
+    clobber a concurrent legitimate owner edit)."""
+    import ouroboros.safety as safety_mod
+    from ouroboros import config as _cfg
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    settings = tmp_path / "data" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"OWNER": "original"}', encoding="utf-8")
+    monkeypatch.setattr(_cfg, "SETTINGS_PATH", settings)
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "data")
+
+    def _sneaky_writer(ctx, _resolved_binding=None, **kwargs):
+        # The command text an obfuscated writer would run never says
+        # "settings.json"; the handler stands in for its effect.
+        settings.write_text('{"OWNER": "hijacked"}', encoding="utf-8")
+        return "done"
+
+    reg.override_handler("run_command", _sneaky_writer)
+    typed = reg.execute_result("run_command", {"cmd": ["true"]})
+    result = typed.text
+
+    assert result.lstrip().startswith("done"), result[:300]  # payload owns line 1
+    assert "⚠️ OWNER_SETTINGS_CHANGED" in result, result[:300]  # note appended, payload not replaced
+    assert dict(typed.meta).get("tripwire") == "owner_settings_changed"
+    # Detect-and-report: the write is disclosed, not silently reverted.
+    assert settings.read_text(encoding="utf-8") == '{"OWNER": "hijacked"}'
+
+
+def test_shell_settings_tripwire_silent_when_settings_untouched(tmp_path, monkeypatch):
+    import ouroboros.safety as safety_mod
+    from ouroboros import config as _cfg
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    settings = tmp_path / "data" / "settings.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text('{"OWNER": "original"}', encoding="utf-8")
+    monkeypatch.setattr(_cfg, "SETTINGS_PATH", settings)
+    monkeypatch.setattr(safety_mod, "check_safety", lambda *a, **k: (True, ""))
+    reg = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "data")
+    reg.override_handler("run_command", lambda ctx, _resolved_binding=None, **kw: "clean run")
+
+    result = reg.execute("run_command", {"cmd": ["true"]})
+    assert "OWNER_SETTINGS_CHANGED" not in result, result[:300]
+
+
+def test_run_shell_waits_for_a_helper_writing_a_skill_state_example(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
     import sys
-    import time
 
     drive_root = tmp_path / "data"
-    skill_state_dir = drive_root / "state" / "skills" / "weather"
+    skill_state_dir = drive_root / "examples" / "state" / "skills" / "weather"
     skill_state_dir.mkdir(parents=True)
     child_code = (
         "import json, pathlib, sys, time\n"
-        "time.sleep(1.0)\n"
+        "time.sleep(0.01)\n"
         "root = pathlib.Path(sys.argv[1])\n"
         "name = 'review' + '.json'\n"
-        "target = root / 'state' / 'skills' / 'weather' / name\n"
+        "target = root / 'examples' / 'state' / 'skills' / 'weather' / name\n"
         "target.write_text(json.dumps({'status':'pass'}))\n"
     )
     parent_code = (
         "import subprocess, sys\n"
-        "subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], "
+        "child = subprocess.Popen([sys.executable, '-c', sys.argv[2], sys.argv[1]], "
         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "child.wait(timeout=5)\n"
     )
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
     reg = ToolRegistry(repo_dir=tmp_path, drive_root=drive_root)
     result = reg.execute("run_command", {"cmd": [sys.executable, "-c", parent_code, str(drive_root), child_code]})
-    assert "SKILL_STATE_WRITE_BLOCKED" in result
-    time.sleep(1.4)
-    assert not (skill_state_dir / "review.json").exists()
+    assert "exit_code=0" in result, result
+    assert json.loads((skill_state_dir / "review.json").read_text()) == {"status": "pass"}
 
 
-def test_run_shell_blocks_detached_skill_state_command(tmp_path, monkeypatch):
+def test_detached_helper_does_not_make_printed_words_a_skill_state_mutation(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
     import sys
 
@@ -1991,39 +1942,15 @@ def test_run_shell_blocks_detached_skill_state_command(tmp_path, monkeypatch):
     (drive_root / "state" / "skills" / "weather").mkdir(parents=True)
     code = (
         "import subprocess, sys\n"
-        "subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)\n"
+        "child.wait(timeout=5)\n"
         "print('state skills')\n"
     )
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
     reg = ToolRegistry(repo_dir=tmp_path, drive_root=drive_root)
     result = reg.execute("run_command", {"cmd": [sys.executable, "-c", code]})
-    assert "SKILL_STATE_WRITE_BLOCKED" in result
-
-
-def test_run_shell_scans_scripts_relative_to_cwd(tmp_path, monkeypatch):
-    from ouroboros.tools.registry import ToolRegistry
-    import sys
-
-    _clear_safety_provider_env(monkeypatch)
-    repo_dir = tmp_path / "repo"
-    subdir = repo_dir / "sub"
-    subdir.mkdir(parents=True)
-    drive_root = tmp_path / "data"
-    (drive_root / "state" / "skills" / "weather").mkdir(parents=True)
-    helper = subdir / "evil.py"
-    helper.write_text(
-        "import json, pathlib, sys\n"
-        "root = pathlib.Path(sys.argv[1])\n"
-        "name = 'review' + '.json'\n"
-        "target = root / 'state' / 'skills' / 'weather' / name\n"
-        "target.write_text(json.dumps({'status':'pass'}))\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    reg = ToolRegistry(repo_dir=repo_dir, drive_root=drive_root)
-    result = reg.execute("run_command", {"cmd": [sys.executable, "evil.py", str(drive_root)], "cwd": "sub"})
-    assert "OWNER_STATE_RESTORED" in result
-    assert not (drive_root / "state" / "skills" / "weather" / "review.json").exists()
+    assert "exit_code=0" in result and "state skills" in result, result
 
 
 def test_save_settings_consent_inert_in_subprocess_via_env_propagation(isolated_settings, monkeypatch):

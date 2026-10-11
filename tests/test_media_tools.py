@@ -148,12 +148,21 @@ def test_youtube_transcript_is_web_gated():
     assert "youtube_transcript" in _WEB_TOOLS
 
 
-def test_media_tools_visible_to_workspace_tasks():
-    """The new media tools must be in the workspace allowlist, else a top-level workspace task
-    cannot see/execute them despite the prompt/docs advertising them (scope review finding)."""
-    from ouroboros.tools.registry import _WORKSPACE_ALLOWED_TOOLS
-    assert "ocr_pdf" in _WORKSPACE_ALLOWED_TOOLS
-    assert "youtube_transcript" in _WORKSPACE_ALLOWED_TOOLS
+def test_media_tools_visible_to_workspace_tasks(tmp_path):
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    system, workspace, data = tmp_path / "system", tmp_path / "workspace", tmp_path / "data"
+    for path in (system, workspace, data):
+        path.mkdir()
+    registry = ToolRegistry(system, data)
+    registry.set_context(ToolContext(
+        repo_dir=system,
+        drive_root=data,
+        workspace_root=workspace,
+        workspace_mode="external",
+    ))
+    assert registry.get_schema_by_name("ocr_pdf") is not None
+    assert registry.get_schema_by_name("youtube_transcript") is not None
 
 
 def test_staged_dotfile_name_is_artifact_store_readable():
@@ -253,3 +262,70 @@ def test_harbor_agent_prefix_installs_imageio_ffmpeg():
     src = (pathlib.Path(__file__).resolve().parents[1]
            / "devtools" / "benchmarks" / "terminal_bench" / "harbor_installed_agent.py").read_text(encoding="utf-8")
     assert "pip install imageio-ffmpeg" in src
+
+
+def test_media_user_files_admission_read_parity(tmp_path, monkeypatch):
+    """SC-6 read_file parity: media inherits vision._allowed_file_roots and the
+    shared _read_file_parity_block, so it must track read_file exactly — and
+    since capinv-447 / В23=A read_file no longer shape-denies credential-LIKE
+    names under home for the root principal, ocr_pdf admits them too (the
+    LOCATION guards still apply)."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    doc = home / "token.pdf"  # credential-like NAME under home
+    doc.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
+    assert "USER_FILES_PATH_BLOCKED" not in (err or "")
+    assert fp is not None
+
+
+def test_media_child_reads_credential_named_runtime_content(tmp_path):
+    """Helpers receive the same runtime file bytes as their parent."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    data = tmp_path / "data"
+    secret_dir = data / "credentials"
+    secret_dir.mkdir(parents=True)
+    doc = secret_dir / "scan.pdf"
+    doc.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(data),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    fp, err = _resolve_local_file(ctx, str(doc), max_bytes=10**7)
+    assert fp == doc and err == ""
+
+
+def test_media_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
+    """G5-3: media (ocr_pdf/extract_video_frames) shares _read_file_parity_block,
+    so it must refuse a canonical-root owner-control path for a forked child whose
+    ctx.drive_root is the ISOLATED child drive — the guard can't be anchored on
+    the child drive alone or the canonical <canonical>/state/skills admission
+    (via _allowed_file_roots) skips it."""
+    from types import SimpleNamespace
+    from ouroboros.tools.media import _resolve_local_file
+
+    canonical = tmp_path / "data"
+    child = canonical / "state" / "headless_tasks" / "t1" / "data"
+    child.mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    owner_state = canonical / "state" / "skills" / "myskill" / "grants.json"
+    owner_state.parent.mkdir(parents=True)
+    owner_state.write_bytes(b"%PDF-1.4 fake")
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(child),
+        budget_drive_root=str(canonical),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    fp, err = _resolve_local_file(ctx, str(owner_state), max_bytes=10**7)
+    assert fp is None
+    # This is the same ordinary-mode skill owner-state rule as the parent.
+    assert "DATA_READ_BLOCKED" in err or "USER_FILES_PATH_BLOCKED" in err

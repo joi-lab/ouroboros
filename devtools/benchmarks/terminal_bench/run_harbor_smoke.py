@@ -15,7 +15,14 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[3]))
 
-from devtools.benchmarks.common.manifests import admit_benchmark_run, finalize_run_manifest
+from devtools.benchmarks.common.manifests import (
+    admit_benchmark_run,
+    finalize_run_manifest,
+    write_json,
+)
+from devtools.benchmarks.common.model_slots import (
+    fixed_model_actor_snapshot,
+)
 from devtools.benchmarks.common.result_index import task_result_row, write_result_index
 from devtools.benchmarks.common.run_roots import (
     default_settings_path,
@@ -137,8 +144,9 @@ def _harbor_task_outcomes(result_path: pathlib.Path) -> list[dict[str, object]]:
     return sorted(outcomes, key=lambda item: str(item["instance_id"]))
 
 
-def _harbor_child_env(repo_root: pathlib.Path) -> dict[str, str]:
-    env = dict(os.environ)
+def _harbor_child_env(repo_root: pathlib.Path,
+                      pinned_env: dict[str, str]) -> dict[str, str]:
+    env = dict(pinned_env)
     existing = env.get("PYTHONPATH", "")
     entries = [str(repo_root)]
     if existing:
@@ -172,6 +180,14 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = repo_root_from_devtools()
+    effective_light = str(args.ouroboros_light_model or "").strip() or args.model
+    child_env = dict(os.environ)
+    fixed_actor = fixed_model_actor_snapshot(
+        args.model,
+        light_model=effective_light,
+        target=child_env,
+    )
+    actor_slots = fixed_actor["model_slots"]
     settings_path = pathlib.Path(args.settings_path).expanduser() if args.settings_path else default_settings_path()
     run_root = assert_outside_repo(
         pathlib.Path(args.run_root).expanduser() if args.run_root else default_run_root("terminal_bench"),
@@ -185,7 +201,7 @@ def main() -> int:
     task_names = actual_include_filters or [f"selection-slot-{idx + 1}" for idx in range(effective_n_tasks)]
     cmd = harbor_command(
         task_names=actual_include_filters,
-        model=args.model,
+        model=actor_slots["OUROBOROS_MODEL"],
         run_root=run_root,
         dataset=args.dataset,
         harbor_bin=args.harbor_bin,
@@ -194,7 +210,7 @@ def main() -> int:
         k=args.k,
         agent_setup_timeout_multiplier=args.agent_setup_timeout_multiplier,
         environment_build_timeout_multiplier=args.environment_build_timeout_multiplier,
-        light_model=args.ouroboros_light_model,
+        light_model=actor_slots["OUROBOROS_MODEL_LIGHT"],
         options={"execute": args.execute, "host_settings_path": str(settings_path)},
     )
     ledger_output = (
@@ -234,6 +250,18 @@ def main() -> int:
             },
         },
     )
+    manifest["model_slots"] = {
+        key: actor_slots[key]
+        for key in (
+            "OUROBOROS_MODEL",
+            "OUROBOROS_MODEL_LIGHT",
+            "OUROBOROS_MODEL_FALLBACKS",
+        )
+    }
+    manifest["available_subagents"] = fixed_actor["available_subagents"]
+    manifest["harness"]["fixed_model_actor"] = fixed_actor
+    # Durable before Harbor can spend: no ambient settings model/Heavy can survive.
+    write_json(manifest_path, manifest)
     if not actual_include_filters:
         manifest["requested_count"] = effective_n_tasks
     with finalize_run_manifest(manifest_path, manifest) as final:
@@ -249,7 +277,11 @@ def main() -> int:
         if args.execute:
             before_results = set(_harbor_results(run_root))
             try:
-                completed = subprocess.run(cmd, cwd=repo_root, env=_harbor_child_env(repo_root))
+                completed = subprocess.run(
+                    cmd,
+                    cwd=repo_root,
+                    env=_harbor_child_env(repo_root, child_env),
+                )
             except Exception as exc:
                 harbor_result_error = f"{type(exc).__name__}: {exc}"
                 status = "harness_failed"

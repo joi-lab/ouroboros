@@ -1,33 +1,3 @@
-openai>=1.66.0
-gigachat>=0.2.1,<0.3
-requests
-httpx
-ddgs
-dulwich
-starlette
-python-multipart
-Pillow>=10.0
-pypdf>=4.0
-uvicorn[standard]
-websockets
-huggingface_hub
-PyYAML>=6.0
-croniter
-# Upper-bounded: tree-sitter 0.25.x / language-pack 1.x broke the WS3 polyglot
-# symbol extraction in CI (worked locally on 0.23.2/0.9.1). Pin until updated.
-tree-sitter>=0.23.2,<0.25
-tree-sitter-language-pack>=0.9.1,<1.0
-tzdata
-pytest>=7.0
-pytest-xdist>=3.5
-pytest-timeout>=2.1
-claude-agent-sdk>=0.1.60
-# MCP (Model Context Protocol) client. The runtime guards imports so a
-# broken/minimal source checkout reports sdk_available=false instead of
-# crashing, but packaged/source installs include the SDK by default.
-mcp>=1.6,<2.0
-# optional: browser automation tools (for browse_page/browser_action)
-playwright
-playwright-stealth
-# optional: local model server (requires Metal-enabled build on macOS)
-# CMAKE_ARGS="-DGGML_METAL=on" pip install llama-cpp-python[server]
+# Compatibility pointer for managed updaters released before the uv migration.
+# Direct dependencies belong only in pyproject.toml.
+-r requirements-runtime.lock

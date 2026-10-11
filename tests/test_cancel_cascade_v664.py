@@ -112,7 +112,8 @@ def test_cascade_resweeps_descendants_admitted_after_the_first_snapshot(monkeypa
 
     monkeypatch.setattr(q, "PENDING", [{"id": "root"}], raising=False)
     monkeypatch.setattr(q, "RUNNING", {}, raising=False)
-    monkeypatch.setattr(q, "cancel_task_custody", lambda tid: q.CANCEL_CANCELLED if _fake_single(tid) else q.CANCEL_FAILED)
+    monkeypatch.setattr("supervisor.task_lifecycle.CANCELLED_ROOT_FENCES", {})
+    monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _fake_single(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
     assert cancel_task_by_id("root", cascade=True) is True
@@ -130,7 +131,7 @@ def test_cancelled_root_fences_late_descendant_admission(monkeypatch):
     monkeypatch.setattr(q, "RUNNING", {}, raising=False)
     import supervisor.task_lifecycle as tl
     monkeypatch.setattr(tl, "CANCELLED_ROOT_FENCES", {}, raising=False)
-    def _custody(tid):
+    def _custody(tid, **_kw):
         # A realistic custody: the cancelled task really leaves the live maps, so
         # the cascade's no-live-subtree postcondition can actually be satisfied.
         q.RUNNING.pop(tid, None)
@@ -177,7 +178,7 @@ def test_mid_tree_cancel_fences_a_grandchild_scheduled_by_a_live_descendant(monk
                 break
         return True
 
-    monkeypatch.setattr(q, "cancel_task_custody", lambda tid: q.CANCEL_CANCELLED if _remove_from_live(tid) else q.CANCEL_FAILED)
+    monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _remove_from_live(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
     assert cancel_task_by_id("mid", cascade=True) is True
@@ -219,7 +220,7 @@ def test_a_500_child_cascade_never_evicts_its_own_fence(monkeypatch):
                 return True
         return False
 
-    monkeypatch.setattr(q, "cancel_task_custody", lambda tid: q.CANCEL_CANCELLED if _remove(tid) else q.CANCEL_FAILED)
+    monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _remove(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
     assert cancel_task_by_id("root", cascade=True) is True
@@ -317,7 +318,7 @@ def test_a_child_that_refuses_to_die_fails_the_whole_cascade(monkeypatch, tmp_pa
     ])
     monkeypatch.setattr(tl, "CANCELLED_ROOT_FENCES", {}, raising=False)
 
-    def _custody(tid):
+    def _custody(tid, **_kw):
         if tid == "child":
             return q.CANCEL_FAILED  # stays live on purpose
         for index, item in enumerate(list(q.PENDING)):
@@ -403,13 +404,22 @@ def test_concurrent_cascades_on_overlapping_trees_both_settle(monkeypatch, tmp_p
     ])
     monkeypatch.setattr(tl, "CANCELLED_ROOT_FENCES", {}, raising=False)
 
-    def _custody(tid):
-        with q._queue_lock:
-            for index, item in enumerate(list(q.PENDING)):
-                if str(item.get("id")) == tid:
-                    q.PENDING.pop(index)
-                    return q.CANCEL_CANCELLED
-        return q.CANCEL_NOT_FOUND
+    def _custody(tid, **_kw):
+        # Mirrors the real contract: custody is the ONE settle owner, so the
+        # durable cancel intent a cascade mints for each captured descendant
+        # LEAVES the projection here. Without that the second cascade would see
+        # its own target still fenced by the first cascade's intent.
+        from ouroboros.cancel_intents import settle_intent
+
+        try:
+            with q._queue_lock:
+                for index, item in enumerate(list(q.PENDING)):
+                    if str(item.get("id")) == tid:
+                        q.PENDING.pop(index)
+                        return q.CANCEL_CANCELLED
+            return q.CANCEL_NOT_FOUND
+        finally:
+            settle_intent(q.DRIVE_ROOT, tid, outcome="cancelled")
 
     monkeypatch.setattr(q, "cancel_task_custody", _custody)
 
@@ -427,25 +437,34 @@ def test_concurrent_cascades_on_overlapping_trees_both_settle(monkeypatch, tmp_p
     assert results["root"] is not False and results["mid"] is not False
 
 
-def test_a_settled_task_with_a_live_worker_is_left_to_its_own_finalizer(monkeypatch, tmp_path):
-    """A completed task whose worker is still winding down belongs to that worker's
-    finalizer: taking the RUNNING row without killing the process would orphan it,
-    and killing it would destroy the completion this branch protects."""
-    from ouroboros.task_results import write_task_result
+def test_a_settled_task_with_a_live_worker_is_killed_and_keeps_its_result(monkeypatch, tmp_path):
+    """GR6-1b (superseding the old left-to-its-own-finalizer contract): the durable
+    terminal result is persisted BEFORE post-task cognition ends, so a settled
+    STATUS with a live WORKER is a process still spending — cancel custody kills
+    it. Completion wins on the durable side: the stored completed result is
+    preserved verbatim, and the outcome is ``already_settled``."""
+    from ouroboros.task_results import load_task_result, write_task_result
     import supervisor.queue as q
 
     _isolate_queue(monkeypatch, tmp_path, [])
-    worker, _state = _fake_worker("done-ish")
+    worker, state = _fake_worker("done-ish")
     _install_worker(monkeypatch, worker)
     monkeypatch.setattr(q, "RUNNING", {"done-ish": {"task": {"id": "done-ish"}}}, raising=False)
+    monkeypatch.setattr(
+        "ouroboros.platform_layer.kill_pid_tree",
+        lambda *a, **k: state.__setitem__("alive", False),
+    )
     emitted: list[str] = []
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: emitted.append("emit"))
     write_task_result(tmp_path, "done-ish", "completed", result="Finished on its own.")
 
     assert q.cancel_task_custody("done-ish") == q.CANCEL_ALREADY_SETTLED
-    assert "done-ish" in q.RUNNING, "the finalizer still owns the row"
-    assert not emitted
-    assert worker.proc.is_alive(), "a completed task's worker is never killed"
+    assert not state["alive"], "the settled-but-live worker IS killed (GR6-1b)"
+    stored = load_task_result(tmp_path, "done-ish")
+    assert stored["status"] == "completed", "completion wins: the result is kept"
+    assert stored["result"] == "Finished on its own."
+    assert "done-ish" not in q.RUNNING, "custody owns the row after the confirmed death"
+    assert emitted == ["emit"], "the card resolves through the stored terminal truth"
 
 
 def test_cancelling_a_running_task_completes_the_whole_publish_phase(monkeypatch, tmp_path):
@@ -688,7 +707,7 @@ def test_a_cascade_settles_when_a_child_is_terminal_but_still_winding_down(monke
     }, raising=False)
     write_task_result(tmp_path, "child", "completed", result="Finished on its own.")
 
-    def _custody(tid):
+    def _custody(tid, **_kw):
         for index, item in enumerate(list(q.PENDING)):
             if str(item.get("id")) == tid:
                 q.PENDING.pop(index)
@@ -756,7 +775,6 @@ def test_a_natural_task_done_in_the_kill_window_keeps_one_owner(monkeypatch, tmp
     restore leaves no RUNNING ghost and no freed slot."""
     import types
 
-    import supervisor.events as events_mod
     import supervisor.queue as q
 
     _isolate_queue(monkeypatch, tmp_path, [])
@@ -779,7 +797,9 @@ def test_a_natural_task_done_in_the_kill_window_keeps_one_owner(monkeypatch, tmp
 
     assert worker.busy_task_id == "racer2", "a custody-owned slot is not freed by task_done"
     assert "racer2" not in ctx.RUNNING, "completion-wins still consumes the row"
-    # ...and the handler's real source implements exactly that guard.
+    # ...and the handler's real source implements exactly that guard
+    # (F2.2: the task_done dispatch lives in its family leaf).
     import pathlib as _pl
-    src = _pl.Path(events_mod.__file__).read_text(encoding="utf-8")
+    from supervisor import events_task_done as _etd
+    src = _pl.Path(_etd.__file__).read_text(encoding="utf-8")
     assert 'if not getattr(ctx.WORKERS[worker_id], "reaping", False):' in src

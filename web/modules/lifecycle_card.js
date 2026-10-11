@@ -85,9 +85,9 @@ export function getPendingBySlug() {
 }
 
 export function lifecycleCardClassFor(pending) {
-    return pending ? 'marketplace-card is-working' : 'marketplace-card';
+    return pending && pending.failed !== true ? 'marketplace-card is-working' : 'marketplace-card';
 }
 
 export function lifecycleSpinnerFor(pending) {
-    return pending ? '<span class="marketplace-working-spinner" aria-hidden="true"></span>' : '';
+    return pending && pending.failed !== true ? '<span class="marketplace-working-spinner" aria-hidden="true"></span>' : '';
 }

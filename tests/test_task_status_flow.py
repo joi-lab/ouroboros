@@ -1,7 +1,16 @@
 import json
 import pathlib
+import threading
 import time
 from types import SimpleNamespace
+
+import pytest
+
+_TEST_SUBAGENTS = '{"enabled":true,"items":[{"subagent_id":"api-scout","name":"API scout","recommended_use":"Tests","route":{"kind":"api_model","target_id":"openai/gpt-5.6-sol"},"effort":"high"}]}'
+
+
+def _configure_test_subagent(monkeypatch):
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", _TEST_SUBAGENTS)
 
 
 class _FakeEventQueue:
@@ -20,12 +29,16 @@ class _FakeEventQueue:
         self.events.append(dict(evt))
 
 
-def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path):
+def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
     from ouroboros.task_results import STATUS_REQUESTED
 
+    _configure_test_subagent(monkeypatch)
     event_queue = _FakeEventQueue(status_root=tmp_path)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -43,12 +56,18 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path)
         expected_output="A concise handoff",
         role="architecture",
         context="Model focus A",
+        subagent_id="api-scout",
     )
 
     assert "Subagent request queued" in result
+    # The result names the engine by its handle; the stored key stays in the
+    # durable snapshot and never reaches the model.
+    assert "(subagent_id=openai/gpt-5.6-sol/high, route=api_model" in result
+    assert "api-scout" not in result
     assert ctx.pending_events == []
     assert len(event_queue.events) == 1
     evt = event_queue.events[0]
+    assert evt["configured_subagent"]["selected_subagent_id"] == "api-scout"
     task_id = evt["task_id"]
     assert evt["description"] == "Do the thing"
     assert evt["expected_output"] == "A concise handoff"
@@ -76,10 +95,14 @@ def test_schedule_task_live_emits_strict_contract_and_requested_status(tmp_path)
 
 
 def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(tmp_path, monkeypatch):
-    from ouroboros.tools import control as control_mod
+    from ouroboros.tools import control_scheduling as control_mod
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=_FakeEventQueue(fail=True),
@@ -90,7 +113,7 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
         is_workspace_mode=lambda: False,
     )
 
-    result = _schedule_task(ctx, objective="Fallback child", expected_output="Result")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="Fallback child", expected_output="Result")
 
     assert "Subagent request queued" in result
     assert len(ctx.pending_events) == 1
@@ -100,19 +123,21 @@ def test_schedule_task_falls_back_to_pending_events_when_live_queue_unavailable(
     ctx.pending_events = []
     ctx.event_queue = event_queue
     monkeypatch.setattr(control_mod, "write_task_result", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("disk full")))
-    result = _schedule_task(ctx, objective="No status", expected_output="No child")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="No status", expected_output="No child")
     assert "SUBTASK_STATUS_ERROR" in result
     assert ctx.pending_events == []
     assert event_queue.events == []
 
 
-def test_cancel_task_latches_cancel_requested_and_emits_live(tmp_path):
+def test_cancel_task_writes_durable_intent_and_emits_live(tmp_path):
+    """Phase A: the cancel_task tool records a DURABLE intent, never a status."""
+    from ouroboros.cancel_intents import active_intent
     from ouroboros.tools.join_ledger import _cancel_task
     from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED, STATUS_RUNNING, load_task_result, write_task_result,
+        STATUS_RUNNING, load_task_result, write_task_result,
     )
+    from ouroboros.task_status import load_effective_task_result
 
-    # Pre-existing running status: the latch must advance running -> cancel_requested.
     write_task_result(tmp_path, "child42", STATUS_RUNNING, result="working")
     event_queue = _FakeEventQueue()
     ctx = SimpleNamespace(
@@ -121,20 +146,31 @@ def test_cancel_task_latches_cancel_requested_and_emits_live(tmp_path):
         is_direct_chat=False, is_workspace_mode=lambda: False,
     )
 
-    result = _cancel_task(ctx, "child42")
+    result = _cancel_task(ctx, "child42", reason="not needed")
 
     assert "Cancel requested" in result
-    # The latch is actually written (a missing write_task_result import would
-    # silently skip this and leave the status at running).
-    assert load_task_result(tmp_path, "child42")["status"] == STATUS_CANCEL_REQUESTED
+    # The canonical status is NOT touched — intent lives in the projection.
+    assert load_task_result(tmp_path, "child42")["status"] == STATUS_RUNNING
+    intent = active_intent(tmp_path, "child42")
+    assert intent is not None and intent["state"] == "requested"
+    assert intent["reason"] == "not needed"
+    # The typed public projection rides every effective read.
+    effective = load_effective_task_result(tmp_path, "child42")
+    assert effective["status"] == STATUS_RUNNING
+    assert effective["cancel_state"] == "pending"
     # And the cancel is emitted live (not buffered to round end).
     assert any(e.get("type") == "cancel_task" and e.get("task_id") == "child42" for e in event_queue.events)
+    # Idempotent: a second request reuses the intent instead of re-minting.
+    again = _cancel_task(ctx, "child42")
+    assert "existing cancellation custody retained" in again
+    assert active_intent(tmp_path, "child42")["request_id"] == intent["request_id"]
 
 
-def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkeypatch):
+def test_natural_completion_wins_a_late_cancel(tmp_path, monkeypatch):
+    """A child that completed before teardown keeps its result and artifacts."""
+    from ouroboros.cancel_intents import active_intent
     from ouroboros.outcomes import public_task_result
     from ouroboros.task_results import (
-        STATUS_CANCELLED,
         STATUS_COMPLETED,
         load_task_result,
         write_task_result,
@@ -142,6 +178,7 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
     from ouroboros.tools.join_ledger import _cancel_task
     from supervisor import queue as queue_module
     from supervisor import workers
+    from supervisor import task_lifecycle
 
     write_task_result(
         tmp_path,
@@ -151,9 +188,9 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
         root_task_id="parent123",
         delegation_role="subagent",
         result="finished in the cancellation race",
-        final_answer="late answer",
-        trace_summary="late trace",
-        artifacts=[{"name": "late.txt"}],
+        final_answer="kept answer",
+        trace_summary="kept trace",
+        artifacts=[{"name": "kept.txt"}],
         artifact_bundle={"status": "ready"},
         outcome_axes={
             "execution": {"status": "ok"},
@@ -161,7 +198,7 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
             "objective": {"status": "solved"},
             "review": {"status": "pass"},
         },
-        cost_usd=0.75,
+        accounted_upper_bound_usd=0.75,
     )
     event_queue = _FakeEventQueue()
     ctx = SimpleNamespace(
@@ -175,7 +212,14 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
         is_workspace_mode=lambda: False,
     )
 
-    assert "Cancel requested" in _cancel_task(ctx, "fast-child")
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    atomic_write_json(
+        tmp_path / "state" / "queue_snapshot.json",
+        {"ts": utc_now_iso(), "running": [], "pending": []},
+    )
+    assert "Nothing to cancel" in _cancel_task(ctx, "fast-child")
+    assert active_intent(tmp_path, "fast-child") is None
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(queue_module, "PENDING", [])
     monkeypatch.setattr(queue_module, "RUNNING", {})
@@ -185,16 +229,20 @@ def test_explicit_cancel_wins_when_child_completed_before_latch(tmp_path, monkey
 
     assert queue_module.cancel_task_by_id("fast-child") is True
     stored = load_task_result(tmp_path, "fast-child")
-    assert stored["status"] == STATUS_CANCELLED
-    assert stored["cost_usd"] == 0.75
-    assert stored["parent_task_id"] == "parent123"
-    assert stored.get("final_answer") is None
-    assert stored.get("trace_summary") is None
-    assert stored.get("artifacts") is None
+    assert stored["status"] == STATUS_COMPLETED
+    assert stored["accounted_upper_bound_usd"] == 0.75
+    assert stored["result"] == "finished in the cancellation race"
+    assert stored["final_answer"] == "kept answer"
+    assert stored["artifacts"] == [{"name": "kept.txt"}]
+    # Completion wins WITHOUT a parent_decision stamp: discarding a kept result
+    # stays a separate explicit action (discard_child_result).
+    assert "parent_decision" not in stored
+    # The durable intent settled (already_settled) — nothing left pending.
+    assert active_intent(tmp_path, "fast-child") is None
     public = public_task_result(stored)
-    assert public["outcome_axes"]["execution"]["status"] == "cancelled"
-    assert public["outcome_axes"]["objective"]["status"] == "not_evaluated"
-    assert public["outcome_axes"]["review"]["status"] == "skipped"
+    assert public["outcome_axes"]["execution"]["status"] == "ok"
+    # The typed custody outcome (not the boolean facade) reports already_settled.
+    assert task_lifecycle.cancel_task_custody("fast-child") == task_lifecycle.CANCEL_ALREADY_SETTLED
 
 
 def test_cancel_workspace_task_records_terminal_artifact_state(tmp_path, monkeypatch):
@@ -270,9 +318,10 @@ def test_effective_cancelled_workspace_with_stale_bundle_is_terminal(tmp_path):
     assert waited["all_terminal"] is True
 
 
-def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path):
+def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
     parent_memory = tmp_path / "memory"
     (parent_memory / "knowledge").mkdir(parents=True)
     (parent_memory / "identity.md").write_text("stable identity", encoding="utf-8")
@@ -280,7 +329,10 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path):
     (parent_memory / "knowledge" / "pattern.md").write_text("stable pattern", encoding="utf-8")
 
     event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=event_queue,
@@ -291,29 +343,101 @@ def test_schedule_task_memory_modes_prepare_declared_drive_shape(tmp_path):
         is_workspace_mode=lambda: False,
     )
 
-    _schedule_task(ctx, objective="Fork child", expected_output="Result", memory_mode="forked")
+    _schedule_task(ctx, subagent_id="api-scout", objective="Fork child", expected_output="Result", memory_mode="forked")
     forked_drive = tmp_path / "state" / "headless_tasks" / event_queue.events[-1]["task_id"] / "data"
     assert event_queue.events[-1]["drive_root"] == str(forked_drive)
     assert (forked_drive / "memory" / "identity.md").read_text(encoding="utf-8") == "stable identity"
     assert not (forked_drive / "memory" / "scratchpad.md").exists()
     assert (forked_drive / "memory" / "knowledge" / "pattern.md").is_file()
 
-    _schedule_task(ctx, objective="Empty child", expected_output="Result", memory_mode="empty")
+    _schedule_task(ctx, subagent_id="api-scout", objective="Empty child", expected_output="Result", memory_mode="empty")
     empty_drive = tmp_path / "state" / "headless_tasks" / event_queue.events[-1]["task_id"] / "data"
     assert event_queue.events[-1]["drive_root"] == str(empty_drive)
     assert not (empty_drive / "memory" / "identity.md").exists()
 
     before_shared = len(event_queue.events)
-    shared_result = _schedule_task(ctx, objective="Shared child", expected_output="Result", memory_mode="shared")
+    shared_result = _schedule_task(ctx, subagent_id="api-scout", objective="Shared child", expected_output="Result", memory_mode="shared")
     assert "TOOL_ARG_ERROR" in shared_result
     assert "memory_mode=shared is disabled" in shared_result
     assert len(event_queue.events) == before_shared
 
 
-def test_schedule_task_rejects_legacy_description_schema(tmp_path):
+def test_configured_session_child_materializes_initial_and_steered_attachments(tmp_path, monkeypatch):
+    from ouroboros.artifacts import stage_task_attachments
+    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.subagent_work_order import compile_external_work_order
+    from ouroboros.tools.control import _schedule_task
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+
+    monkeypatch.setenv(
+        "OUROBOROS_SUBAGENTS",
+        '{"enabled":true,"items":[{"subagent_id":"session-scout","name":"Session scout",'
+        '"recommended_use":"Tests","route":{"kind":"agent_session",'
+        '"target_id":"codex=gpt-5.6-sol"},"effort":"high"}]}',
+    )
+    source = tmp_path / "parent-input.txt"
+    source.write_text("session-child-readable", encoding="utf-8")
+    parent_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(source), "label": "parent input"}],
+    )
+    later = tmp_path / "steered-input.txt"
+    later.write_text("steered-child-readable", encoding="utf-8")
+    steered_manifest = stage_task_attachments(
+        tmp_path, "parent-attachments", [{"path": str(later), "label": "steered input"}],
+    )
+    assert write_owner_message(
+        tmp_path, "Use the later input", "parent-attachments", msg_id="steer-1",
+        attachment_manifest=steered_manifest,
+    )
+    event_queue = _FakeEventQueue()
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
+    ctx = SimpleNamespace(
+        repo_dir=repo,
+        task_depth=0, pending_events=[], event_queue=event_queue,
+        drive_root=tmp_path, task_id="parent-attachments",
+        task_contract={"attachment_manifest": [dict(row) for row in parent_manifest]},
+        task_metadata={}, is_direct_chat=False, is_workspace_mode=lambda: False,
+    )
+
+    result = _schedule_task(
+        ctx, subagent_id="session-scout", objective="Inspect inherited input",
+        expected_output="Report", memory_mode="forked",
+    )
+
+    assert "Subagent request queued" in result
+    event = event_queue.events[0]
+    child_manifest = event["task_contract"]["attachment_manifest"]
+    assert [row["label"] for row in child_manifest] == ["parent input", "steered input"]
+    assert str(parent_manifest[0]["abs_path"]) not in str(child_manifest)
+    assert str(steered_manifest[0]["abs_path"]) not in str(child_manifest)
+    child_ctx = ToolContext(
+        repo_dir=tmp_path, drive_root=pathlib.Path(event["drive_root"]),
+        task_id=event["task_id"],
+    )
+    assert "session-child-readable" in _read_file(
+        child_ctx, child_manifest[0]["relpath"], root="artifact_store",
+    )
+    assert "steered-child-readable" in _read_file(
+        child_ctx, child_manifest[1]["relpath"], root="artifact_store",
+    )
+    work_order = compile_external_work_order(event)
+    # The canonical work-order renderer serializes the manifest with Python's
+    # repr; assert the exact serialized value on both POSIX and Windows.
+    assert all(repr(row["abs_path"]) in work_order for row in child_manifest)
+    assert repr(parent_manifest[0]["abs_path"]) not in work_order
+    assert repr(steered_manifest[0]["abs_path"]) not in work_order
+
+
+def test_schedule_task_rejects_legacy_description_schema(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
 
+    _configure_test_subagent(monkeypatch)
+    repo = tmp_path / "repo"
+    repo.mkdir(exist_ok=True)
     ctx = SimpleNamespace(
+        repo_dir=repo,
         task_depth=0,
         pending_events=[],
         event_queue=None,
@@ -331,11 +455,19 @@ def test_schedule_task_rejects_legacy_description_schema(tmp_path):
     assert ctx.pending_events == []
     assert not (tmp_path / "task_results").exists()
 
-    # Runtime-INTERNAL scheduling options are not part of the public schema and are not
-    # bindable by keyword (they ride the positional-only mapping), so a model emitting one is
-    # refused exactly like any other unsupported argument.
-    internal_as_kwarg = _schedule_task(ctx, objective="o", expected_output="e", deadline_at="2026-01-01T00:00:00Z")
-    assert "TOOL_ARG_ERROR" in internal_as_kwarg and "deadline_at" in internal_as_kwarg
+    from datetime import timedelta
+
+    from ouroboros.deadline_utils import utc_now
+
+    future = (utc_now() + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    accepted = _schedule_task(ctx, subagent_id="api-scout", objective="o", expected_output="e", deadline_at=future)
+    assert "TOOL_ARG_ERROR" not in accepted
+    assert ctx.pending_events
+    ctx.pending_events.clear()
+
+    # An option the schema does not expose is still refused with the strict v6 message.
+    unknown_as_kwarg = _schedule_task(ctx, objective="o", expected_output="e", nonesuch="x")
+    assert "TOOL_ARG_ERROR" in unknown_as_kwarg and "nonesuch" in unknown_as_kwarg
     assert ctx.pending_events == []
 
 
@@ -355,10 +487,11 @@ def test_schedule_task_internal_options_mapping_is_closed(tmp_path):
         _schedule_task(ctx, {"deadline_ats": "typo"}, objective="o", expected_output="e")
 
 
-def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path):
+def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
     from ouroboros.tools.control import _get_task_result, _schedule_task, _wait_for_task
 
+    _configure_test_subagent(monkeypatch)
     budget_root = tmp_path / "root-data"
     ctx = SimpleNamespace(
         task_depth=0,
@@ -373,7 +506,7 @@ def test_schedule_task_workspace_mode_inherits_context_and_enqueues(tmp_path):
         workspace_mode="external",
     )
 
-    result = _schedule_task(ctx, objective="Inspect workspace", expected_output="Findings")
+    result = _schedule_task(ctx, subagent_id="api-scout", objective="Inspect workspace", expected_output="Findings")
 
     assert "Subagent request queued" in result
     assert ctx.pending_events == []
@@ -403,7 +536,7 @@ def test_get_task_result_returns_full_completed_output(tmp_path):
         "abc123",
         STATUS_COMPLETED,
         result=full_text,
-        cost_usd=1.23,
+        accounted_upper_bound_usd=1.23,
         trace_summary="trace",
     )
 
@@ -415,6 +548,453 @@ def test_get_task_result_returns_full_completed_output(tmp_path):
     assert "[SUBTASK_OUTCOME]" in output
     assert '"outcome_axes"' in output
     assert "[BEGIN_SUBTASK_OUTPUT]" in output
+
+
+def test_get_task_result_carries_bounded_per_receipt_rows(tmp_path):
+    """W2: the FULL single-child handoff (get_task_result/wait_task) shows WHICH
+    checks passed as bounded identity rows — OUTSTANDING first, then newest, hard
+    cap 10, exact omitted count — while the wait_tasks batch projection stays
+    counts-compact.
+
+    The bound must not be able to bury the fact the parent's absorption decision
+    turns on: a child that failed a check early and then produced ten greens for
+    OTHER criteria used to hand up an affirmatively all-green list."""
+    import json as _json
+
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    write_task_result(tmp_path, "abc123", STATUS_COMPLETED, result="done", accounted_upper_bound_usd=0.1)
+    for idx in range(12):
+        append_verification_receipt(tmp_path, "abc123", {
+            "status": "pass" if idx else "fail",
+            "check": f"pytest tests/x{idx}.py",
+            "criterion_id": f"claim_{idx}",
+        })
+
+    output = _get_task_result(SimpleNamespace(drive_root=tmp_path), "abc123")
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+
+    rows = summary["verification_receipts"]
+    assert len(rows) == 10                                   # hard cap
+    assert summary["verification_receipts_omitted"] == 2     # disclosed, exact
+    # The still-unreconciled RED is carried FIRST and says why, even though ten
+    # newer greens exist — no green of another criterion clears it.
+    assert rows[0]["criterion_id"] == "claim_0"
+    assert rows[0]["status"] == "fail"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+    # ...the rest of the cap is the newest remaining receipts, and only the OLDEST
+    # greens are the ones left out.
+    assert [row["criterion_id"] for row in rows[1:]] == [
+        f"claim_{idx}" for idx in range(11, 2, -1)
+    ]
+    assert all("outstanding" not in row for row in rows[1:])
+    assert "check" in rows[0] and "reconciliation_identity" in rows[0]
+
+    # A red that a LATER green for the same criterion reconciles is not carried:
+    # the rule is the shared unreconciled-set SSOT, not "always float failures".
+    write_task_result(tmp_path, "closed", STATUS_COMPLETED, result="done", accounted_upper_bound_usd=0.1)
+    append_verification_receipt(tmp_path, "closed", {
+        "status": "fail", "check": "pytest tests/a.py", "criterion_id": "claim_a",
+    })
+    for idx in range(11):
+        append_verification_receipt(tmp_path, "closed", {
+            "status": "pass", "check": "pytest tests/a.py", "criterion_id": "claim_a"
+            if idx == 0 else f"claim_b{idx}",
+        })
+    closed = _json.loads(
+        _get_task_result(SimpleNamespace(drive_root=tmp_path), "closed")
+        .split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    assert all("outstanding" not in row for row in closed["verification_receipts"])
+    assert closed["verification_receipts"][0]["criterion_id"] == "claim_b10"
+    # No receipts -> no rows key at all (the wave1 zero-receipt shape stays visible
+    # through the ledger counts, not an empty list).
+    write_task_result(tmp_path, "noreceipts", STATUS_COMPLETED, result="done")
+    bare = _get_task_result(SimpleNamespace(drive_root=tmp_path), "noreceipts")
+    assert "verification_receipts_omitted" not in bare
+
+
+def _receipt_rows_of(output):
+    import json as _json
+
+    summary = _json.loads(
+        output.split("[SUBTASK_OUTCOME]\n", 1)[1].split("\n[/SUBTASK_OUTCOME]", 1)[0]
+    )
+    return summary.get("verification_receipts")
+
+
+def test_default_receipt_read_stays_all_or_nothing_on_invalid_utf8(tmp_path):
+    from ouroboros.outcomes import (
+        read_verification_receipts,
+        verification_receipts_path,
+    )
+
+    path = verification_receipts_path(tmp_path, "invalid-utf8", create=True)
+    path.write_bytes(b'\xff\n{"status":"pass","criterion_id":"partial-green"}\n')
+
+    # Existing observational consumers must not receive a partial green view.
+    assert read_verification_receipts(tmp_path, "invalid-utf8") == []
+
+    gaps: set[str] = set()
+    rows = read_verification_receipts(
+        tmp_path, "invalid-utf8", gap_reasons=gaps,
+    )
+    assert [row["criterion_id"] for row in rows] == ["partial-green"]
+    assert "unreadable_bytes" in gaps
+
+
+def test_child_finalization_publishes_receipts_to_canonical_root(tmp_path):
+    """S3 seam (a): every real schedule_subagent child runs memory_mode forked|empty
+    on an ISOLATED drive, so verify_and_record writes its receipts under the CHILD
+    drive while the parent-side W2 reader resolves them against the canonical root.
+    Child finalization (headless.copy_child_task_result) must publish
+    verification_receipts.jsonl to the canonical root alongside the artifact rebase
+    — WITHOUT any parent read in between (the opportunistic effective-read artifact
+    sync must not be the only carrier: it dies with the child drive, which the
+    cancel path and the startup prune both delete)."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childsplit"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert child_drive == tmp_path / "state" / "headless_tasks" / tid / "data"
+
+    # Parent-side scheduled record (the shape schedule_subagent writes); the child
+    # self-finalizes and records receipts ONLY on its isolated drive.
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="child split done", accounted_upper_bound_usd=0.2)
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/green.py", "criterion_id": "claim_green",
+    })
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "complete",
+    })
+
+    # Finalization copy-back publishes the receipts file to the canonical root
+    # (no parent-side read has happened yet — the publish alone must carry them).
+    copied = copy_child_task_result(tmp_path, {"id": tid, "drive_root": str(child_drive)})
+    assert copied is not None
+    canonical = read_verification_receipts(tmp_path, tid)
+    assert [r.get("criterion_id") for r in canonical] == [
+        "claim_red", "claim_green", None,
+    ]
+    assert canonical[-1]["contract_kind"] == "delegation_zero_run"
+
+    # Durability: the receipts survive child-drive pruning (retention GC / the
+    # cancel path delete the drive; the canonical copy is the durable record).
+    import shutil as _shutil
+
+    _shutil.rmtree(child_drive)
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 3
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+
+
+def test_child_receipt_republish_is_idempotent_refresh(tmp_path):
+    """S3 seam (a) re-entry: copy_child_task_result runs more than once per child
+    (task_done + reaper/cancel re-checks). The publish refreshes the union of the
+    append-only child and canonical stores — newer rows land, nothing duplicates."""
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+
+    tid = "childagain"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(child_drive, tid, STATUS_COMPLETED, result="done")
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    task = {"id": tid, "drive_root": str(child_drive)}
+    copy_child_task_result(tmp_path, task)
+    copy_child_task_result(tmp_path, task)  # re-entry: no duplication
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == ["claim_red"]
+
+    append_verification_receipt(child_drive, tid, {
+        "status": "pass", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    copy_child_task_result(tmp_path, task)
+    assert [r["criterion_id"] for r in read_verification_receipts(tmp_path, tid)] == [
+        "claim_red", "claim_red",
+    ]
+
+
+def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tmp_path):
+    """Generic artifact refresh must never own the receipt authority stream.
+
+    A running parent's ``wait_tasks`` performs materializing reads.  Before this
+    regression, the first read registered the child receipt file as an ordinary
+    artifact; a later read reused that source/destination manifest mapping and
+    copied the stale child bytes over a newer canonical-only zero-run row.
+    """
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+    from ouroboros.task_results import (
+        STATUS_COMPLETED,
+        STATUS_SCHEDULED,
+        load_task_result,
+        write_task_result,
+    )
+    from ouroboros.task_status import effective_task_result
+
+    tid = "child-materialized-receipts"
+    child_drive = prepare_task_drive(tmp_path, tid, "empty")
+    assert child_drive is not None
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+        "ts": "2026-01-01T00:00:01+00:00",
+    })
+    from ouroboros.outcomes import verification_receipts_path
+
+    child_receipts = verification_receipts_path(child_drive, tid)
+    write_task_result(
+        child_drive,
+        tid,
+        STATUS_COMPLETED,
+        result="done",
+        # Historical/current pre-fix task rows may already carry the authority
+        # file as an ordinary artifact even though collection now excludes it.
+        artifacts=[{
+            "kind": "task_artifact",
+            "name": child_receipts.name,
+            "path": str(child_receipts),
+        }],
+    )
+
+    from ouroboros.artifacts import collect_task_artifact_records
+
+    assert collect_task_artifact_records(child_drive, tid) == []
+
+    # The first wait/detail read observes the child while its local receipt file
+    # exists.  It must not register that authority stream as a generic artifact.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared",
+        "contract_kind": "delegation_zero_run",
+        "zero_run": True,
+        "zero_run_decision": "complete",
+        "zero_run_basis": "completed useful direct child",
+        "physical_run_started": False,
+        "ts": "2026-01-01T00:00:02+00:00",
+    })
+
+    # Repeated polling must preserve the canonical-only row, and a read writes no
+    # receipt (TZ-1 A: reads are pure). Final copy-back then unions the ordinary
+    # child check into that same authority file.
+    effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
+    assert [
+        row.get("contract_kind")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == ["delegation_zero_run"]
+
+    copied = copy_child_task_result(
+        tmp_path, {"id": tid, "drive_root": str(child_drive)},
+    )
+    assert copied is not None
+    rows = read_verification_receipts(tmp_path, tid)
+    assert [row.get("criterion_id") for row in rows] == ["child-check", None]
+    assert rows[-1]["contract_kind"] == "delegation_zero_run"
+    assert all(
+        str(item.get("name") or "") != "verification_receipts.jsonl"
+        for item in copied.get("artifacts") or []
+    )
+
+
+def test_child_receipt_publish_preserves_corrupt_canonical_authority(tmp_path):
+    from ouroboros.headless import _publish_child_verification_receipts, prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt, verification_receipts_path
+
+    tid = "child-corrupt-authority"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass",
+        "check": "pytest tests/ordinary.py",
+        "criterion_id": "ordinary",
+    })
+    canonical = verification_receipts_path(tmp_path, tid, create=True)
+    corrupt = b'{"contract_kind":"delegation_zero_run","zero_run":true\n'
+    canonical.write_bytes(corrupt)
+
+    _publish_child_verification_receipts(tmp_path, tid, child_drive)
+
+    assert canonical.read_bytes() == corrupt
+
+
+def test_child_receipt_publish_serializes_late_canonical_append(tmp_path, monkeypatch):
+    """An append arriving after union-read must survive the atomic refresh."""
+    import ouroboros.outcome_receipt_store as receipt_store
+    import ouroboros.utils as utils
+    from ouroboros.outcomes import append_verification_receipt, read_verification_receipts
+
+    tid = "child-late-canonical-append"
+    child_drive = tmp_path / "child"
+    assert append_verification_receipt(child_drive, tid, {
+        "status": "pass", "criterion_id": "child-check",
+    })
+    assert append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "criterion_id": "canonical-before",
+    })
+
+    publisher_at_replace = threading.Event()
+    allow_replace = threading.Event()
+    real_write = receipt_store.write_text_atomic
+
+    def paused_write(path, content, **kwargs):
+        publisher_at_replace.set()
+        assert allow_replace.wait(timeout=2.0)
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(receipt_store, "write_text_atomic", paused_write)
+    append_blocked_on_union = threading.Event()
+    real_sleep = utils.time.sleep
+
+    def observed_sleep(seconds):
+        if (
+            threading.current_thread().name == "late-receipt-append"
+            and seconds == 0.01
+        ):
+            append_blocked_on_union.set()
+        return real_sleep(seconds)
+
+    monkeypatch.setattr(utils.time, "sleep", observed_sleep)
+    publish_result = []
+    publish_thread = threading.Thread(
+        target=lambda: publish_result.append(
+            receipt_store.publish_verification_receipt_union(
+                tmp_path, tid, child_drive,
+            )
+        )
+    )
+    publish_thread.start()
+    assert publisher_at_replace.wait(timeout=2.0)
+
+    append_result = []
+    append_thread = threading.Thread(
+        name="late-receipt-append",
+        target=lambda: append_result.append(
+            append_verification_receipt(tmp_path, tid, {
+                "status": "declared", "criterion_id": "canonical-late",
+            })
+        )
+    )
+    append_thread.start()
+    assert append_blocked_on_union.wait(timeout=2.0)
+    assert append_result == [], "late append must wait on the union writer's sidecar"
+
+    allow_replace.set()
+    publish_thread.join(timeout=2.0)
+    append_thread.join(timeout=2.0)
+    assert not publish_thread.is_alive()
+    assert not append_thread.is_alive()
+    assert publish_result == [True]
+    assert append_result == [True]
+    assert [
+        row.get("criterion_id")
+        for row in read_verification_receipts(tmp_path, tid)
+    ] == ["child-check", "canonical-before", "canonical-late"]
+
+
+def test_verification_receipt_append_refuses_unlocked_timeout(tmp_path, monkeypatch):
+    import ouroboros.platform_layer as platform
+    from ouroboros.outcome_receipt_store import (
+        append_verification_receipt,
+        verification_receipts_path,
+    )
+
+    monkeypatch.setattr(
+        platform, "acquire_exclusive_file_lock", lambda *_args, **_kwargs: None,
+    )
+
+    assert append_verification_receipt(
+        tmp_path, "locked-receipt", {"status": "pass"},
+    ) is False
+    assert not verification_receipts_path(
+        tmp_path, "locked-receipt", create=False,
+    ).exists()
+
+
+def test_authority_lock_never_steals_from_live_owner_by_age(tmp_path):
+    import os
+
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+    from ouroboros.utils import jsonl_append_lock_path
+
+    receipt_path = tmp_path / "verification_receipts.jsonl"
+    lock_path = jsonl_append_lock_path(receipt_path)
+    owner_fd = acquire_exclusive_file_lock(lock_path)
+    assert owner_fd is not None
+    old = time.time() - 60.0
+    os.utime(lock_path, (old, old))
+    contender_fd = acquire_exclusive_file_lock(
+        lock_path, timeout_sec=0.05, stale_sec=0.01,
+        poll_sec=0.005, owner_aware_stale=True,
+    )
+    try:
+        assert contender_fd is None
+        assert lock_path.exists()
+    finally:
+        release_exclusive_file_lock(lock_path, contender_fd)
+        release_exclusive_file_lock(lock_path, owner_fd)
+
+
+def test_get_task_result_merges_child_and_canonical_receipts(tmp_path):
+    """S3 seam (b): before copy-back, a canonical actor lifecycle receipt and
+    child-local ordinary checks are one effective evidence view rather than
+    competing fallback stores."""
+    from ouroboros.agent_startup_checks import task_result_authority_projection
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.outcomes import append_verification_receipt
+    from ouroboros.task_results import STATUS_SCHEDULED, load_task_result, write_task_result
+    from ouroboros.tools.control import _get_task_result
+
+    tid = "childlive"
+    child_drive = prepare_task_drive(tmp_path, tid, "forked")
+    write_task_result(
+        tmp_path, tid, STATUS_SCHEDULED,
+        drive_root=str(child_drive), child_drive_root=str(child_drive),
+    )
+    # The child has recorded receipts but NO result yet (still running): nothing
+    # exists canonically and the effective read has no child result to sync from.
+    append_verification_receipt(child_drive, tid, {
+        "status": "fail", "check": "pytest tests/red.py", "criterion_id": "claim_red",
+    })
+    append_verification_receipt(tmp_path, tid, {
+        "status": "declared", "contract_kind": "delegation_zero_run",
+        "zero_run": True, "zero_run_decision": "unknown",
+    })
+
+    rows = _receipt_rows_of(_get_task_result(SimpleNamespace(drive_root=tmp_path), tid))
+    assert rows is not None and len(rows) == 2
+    assert rows[0]["criterion_id"] == "claim_red"
+    assert rows[0]["outstanding"] == "unreconciled_failed"
+    assert rows[1]["status"] == "declared"
+
+    authority = task_result_authority_projection(
+        load_task_result(tmp_path, tid), drive_root=tmp_path,
+    )
+    assert [row.get("criterion_id") for row in authority["verification_receipts"]] == [
+        "claim_red", None,
+    ]
 
 
 def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
@@ -435,7 +1015,7 @@ def test_get_task_result_uses_child_terminal_over_stale_parent(tmp_path):
         "child123",
         STATUS_COMPLETED,
         result="child terminal handoff",
-        cost_usd=0.42,
+        accounted_upper_bound_usd=0.42,
         trace_summary="child trace",
     )
 
@@ -460,7 +1040,7 @@ def test_wait_for_tasks_returns_compact_structural_batch(tmp_path):
         "parentdone",
         STATUS_COMPLETED,
         result="parent finished",
-        cost_usd=1.25,
+        accounted_upper_bound_usd=1.25,
         loop_outcome={"result_status": "succeeded", "compat_result_status": "succeeded"},
         verification_ledger={"entries": [{"kind": "objective_outcome"}]},
         trace_refs=[{"path": "logs/trace.jsonl"}],
@@ -483,7 +1063,7 @@ def test_wait_for_tasks_returns_compact_structural_batch(tmp_path):
     assert parent["task_id"] == "parentdone"
     assert parent["status"] == STATUS_COMPLETED
     assert parent["result"] == "parent finished"
-    assert parent["cost_usd"] == 1.25
+    assert parent["accounted_upper_bound_usd"] == 1.25
     assert parent["outcome_axes"]["lifecycle"]["status"] == STATUS_COMPLETED
     # Forensics stay on disk — not inlined into the batch projection.
     assert "loop_outcome" not in parent
@@ -499,17 +1079,107 @@ def test_wait_for_tasks_returns_compact_structural_batch(tmp_path):
     child = payload["tasks"]["childdone"]
     assert child["result"] == "child finished"
     assert child["trace_summary"] == "trace"
-    assert child["cost_usd"] is None  # absent accounting -> honest null, not $0
+    assert child["accounted_upper_bound_usd"] is None  # absent accounting -> honest null, not $0
     assert child["child_result_sha256"] == _child_result_sha256(
         load_effective_task_result(tmp_path, "childdone")
     )
+
+
+def test_wait_for_tasks_projects_execution_evidence_for_harness_children(tmp_path):
+    # Q1A (2026-08-10 amendments): the batch projection is the surface a fan-out
+    # parent absorbs its children through, and it used to hide whether a
+    # harness-dispatched child ever actually delegated (the e9108a09 shape:
+    # nine "harness" children, zero delegated runs, invisible in the batch).
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "harnesskid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+        actual_substrate="native_only",
+        subagent_envelope={
+            "actual_substrate": "native_only",
+            "execution_evidence": {
+                "delegated_runs_started": 0, "delegated_runs_settled": 0,
+                "delegated_runs_succeeded": 0, "delegated_run_failure_states": [],
+                "delegated_runs_source_unresolved": 0,
+                "evidence_read_failed": False, "subscription_cost_usd": None,
+                "subscription_cost_estimated": False, "harness_models": [],
+            },
+        },
+    )
+    write_task_result(tmp_path, "nativekid", STATUS_COMPLETED, result="done")
+
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["harnesskid", "nativekid"], timeout_sec=0))
+
+    assert payload["tasks"]["harnesskid"]["execution_evidence"] == {
+        "delegated_runs_settled": 0,
+        "delegated_runs_failed": 0,
+        "native_contribution": "unknown",
+        "dispatch_executor": "harness",
+        "actual_substrate": "native_only",
+        "delegated_runs_started": 0,
+        "delegated_runs_succeeded": 0,
+        "delegated_runs_source_unresolved": 0,
+    }
+    # A native child with no custody evidence stays compact — no evidence block.
+    assert "execution_evidence" not in payload["tasks"]["nativekid"]
+
+
+def test_wait_for_tasks_projection_marks_unreadable_evidence(tmp_path):
+    # v6.94.0 landing-gate scope fix: unreadable custody evidence means the
+    # counts are UNKNOWN — the projection carries ONLY dispatch_executor and
+    # the typed evidence_read_failed marker. Emitting the raw zeros beside the
+    # marker fabricated a "no runs" receipt for a log that was never read; the
+    # substrate claim is likewise dropped even when the stored record carries
+    # one (same omission rule subagents.envelope_from_task applies).
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "blindkid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+        actual_substrate="native_only",
+        subagent_envelope={
+            "actual_substrate": "native_only",
+            "execution_evidence": {
+                "delegated_runs_started": 0, "delegated_runs_succeeded": 0,
+                "evidence_read_failed": True,
+            },
+        },
+    )
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["blindkid"], timeout_sec=0))
+    assert payload["tasks"]["blindkid"]["execution_evidence"] == {
+        "dispatch_executor": "harness",
+        "evidence_read_failed": True,
+    }
+
+
+def test_wait_for_tasks_projection_omits_counts_without_envelope_evidence(tmp_path):
+    # 6c03c24e corrective wave (LOW b): a stored harness child with NO envelope
+    # evidence at all (pre-6.94 records) must not read as a zero-run receipt —
+    # absence means "no evidence yet", so no counts and no substrate claim.
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    write_task_result(
+        tmp_path, "oldkid", STATUS_COMPLETED, result="done",
+        effective_executor="harness", executor_route="codex",
+    )
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    payload = json.loads(_wait_for_tasks(ctx, ["oldkid"], timeout_sec=0))
+    assert payload["tasks"]["oldkid"]["execution_evidence"] == {
+        "dispatch_executor": "harness",
+    }
 
 
 def test_wait_for_tasks_any_terminal_early_return_projects_pending_child(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
     from ouroboros.tools.control import _wait_for_tasks
 
-    write_task_result(tmp_path, "fastchild", STATUS_COMPLETED, result="done first", cost_usd=0.10)
+    write_task_result(tmp_path, "fastchild", STATUS_COMPLETED, result="done first", accounted_upper_bound_usd=0.10)
     write_task_result(tmp_path, "slowchild", STATUS_SCHEDULED, result="")
 
     ctx = SimpleNamespace(drive_root=tmp_path)
@@ -519,10 +1189,10 @@ def test_wait_for_tasks_any_terminal_early_return_projects_pending_child(tmp_pat
     assert payload["all_terminal"] is False
     assert payload["timed_out"] is False
     assert payload["tasks"]["fastchild"]["status"] == STATUS_COMPLETED
-    assert payload["tasks"]["fastchild"]["cost_usd"] == 0.10
+    assert payload["tasks"]["fastchild"]["accounted_upper_bound_usd"] == 0.10
     # The still-pending child gets the same compact shape with cost present.
     assert payload["tasks"]["slowchild"]["status"] == STATUS_SCHEDULED
-    assert "cost_usd" in payload["tasks"]["slowchild"]
+    assert "accounted_upper_bound_usd" in payload["tasks"]["slowchild"]
     assert "child_result_sha256" in payload["tasks"]["slowchild"]
 
 
@@ -530,7 +1200,7 @@ def test_wait_for_tasks_cost_present_on_cancelled_and_failed(tmp_path):
     from ouroboros.task_results import STATUS_CANCELLED, STATUS_FAILED, write_task_result
     from ouroboros.tools.control import _wait_for_tasks
 
-    write_task_result(tmp_path, "cancelledchild", STATUS_CANCELLED, result="best-effort partial handoff", cost_usd=0.42)
+    write_task_result(tmp_path, "cancelledchild", STATUS_CANCELLED, result="best-effort partial handoff", accounted_upper_bound_usd=0.42)
     write_task_result(tmp_path, "failedchild", STATUS_FAILED, result="provider exploded")
 
     ctx = SimpleNamespace(drive_root=tmp_path)
@@ -538,13 +1208,13 @@ def test_wait_for_tasks_cost_present_on_cancelled_and_failed(tmp_path):
 
     cancelled = payload["tasks"]["cancelledchild"]
     assert cancelled["status"] == STATUS_CANCELLED
-    assert cancelled["cost_usd"] == 0.42
+    assert cancelled["accounted_upper_bound_usd"] == 0.42
     assert cancelled["result"] == "best-effort partial handoff"
     failed = payload["tasks"]["failedchild"]
     assert failed["status"] == STATUS_FAILED
     # Absent accounting projects an honest null — never a confirmed-looking $0
     # (triad v6.71.2 r1; mirrors the ledger's unknown-cost discipline).
-    assert "cost_usd" in failed and failed["cost_usd"] is None
+    assert "accounted_upper_bound_usd" in failed and failed["accounted_upper_bound_usd"] is None
     assert "child_result_sha256" in failed
 
 
@@ -566,7 +1236,298 @@ def test_wait_for_tasks_rejected_duplicate_carries_duplicate_of(tmp_path):
     dupe = payload["tasks"]["dupechild"]
     assert dupe["status"] == STATUS_REJECTED_DUPLICATE
     assert dupe["duplicate_of"] == "original123"
-    assert "cost_usd" in dupe
+    assert "accounted_upper_bound_usd" in dupe
+
+
+# --- v6.91 wait terminality: cancel_requested is a latch, not a settled record
+
+
+def test_wait_for_effective_tasks_keeps_polling_cancel_requested(tmp_path):
+    """The cancel-INTENT latch is not settled: the worker may still be exiting
+    and the supervisor finalizes to `cancelled` shortly after. Returning
+    "completed after 0.0s" here (pre-v6.91 FINAL_STATUSES) disagreed with the
+    acceptance fence's SETTLED_STATUSES quiescence and looped the parent on the
+    gap (wave3's $1.64 endgame loop). The wait stays bounded by its timeout."""
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, write_task_result
+    from ouroboros.task_status import wait_for_effective_tasks
+
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is False
+    assert waited["timed_out"] is True
+    # A pending cancellation is reported as the typed state — never terminal/unknown.
+    assert waited["live_child_status"]["cancelling1"] == "cancel_pending"
+
+    # Once the supervisor settles it, the same wait completes normally.
+    write_task_result(tmp_path, "cancelling1", STATUS_CANCELLED, result="cancelled")
+    waited = wait_for_effective_tasks(tmp_path, ["cancelling1"], timeout_sec=0)
+    assert waited["all_terminal"] is True
+
+
+def test_wait_task_does_not_claim_completion_on_cancel_requested(tmp_path):
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    write_task_result(tmp_path, "cancelling2", STATUS_CANCEL_REQUESTED, result="cancel pending")
+
+    output = _wait_for_task(SimpleNamespace(drive_root=tmp_path), "cancelling2", timeout_sec=0)
+    assert output.startswith("Task wait timed out")
+    assert not output.startswith("Task wait completed")
+
+
+def test_wait_tools_surface_preentry_beacons_once_per_actor_context(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.tools.control import _wait_for_task, _wait_for_tasks
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    for task_id in ("waitingchild1", "waitingchild2"):
+        write_task_result(
+            tmp_path, task_id, STATUS_RUNNING,
+            parent_task_id="waitparent2", root_task_id="waitparent2",
+            delegation_role="subagent",
+        )
+        assert task_tree_ledger.tree_ledger_append(
+            "waitparent2", "question", f"preentry-{task_id}", task_id=task_id,
+        ).startswith("OK:")
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent2",
+        task_metadata={"root_task_id": "waitparent2"},
+    )
+    single = _wait_for_task(ctx, "waitingchild1", timeout_sec=0)
+    assert single.startswith("Task wait interrupted by a child attention beacon")
+    assert "preentry-waitingchild1" in single
+
+    batch = json.loads(_wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0))
+    assert batch["early_return"]["reason"] == "child_attention_beacon"
+    assert [row["text"] for row in batch["early_return"]["beacons"]] == [
+        "preentry-waitingchild2"
+    ]
+
+    # A later wait in this same actor context does not replay either row.
+    assert _wait_for_task(ctx, "waitingchild1", timeout_sec=0).startswith("Task wait timed out")
+    assert "early_return" not in json.loads(
+        _wait_for_tasks(ctx, ["waitingchild2"], timeout_sec=0)
+    )
+
+
+def test_wait_surfaces_preentry_beacon_before_terminal_fast_path(tmp_path, monkeypatch):
+    from ouroboros import task_tree_ledger
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_task
+
+    monkeypatch.setattr(task_tree_ledger, "DATA_DIR", str(tmp_path))
+    write_task_result(
+        tmp_path, "terminal-beacon-child", STATUS_COMPLETED,
+        parent_task_id="terminal-beacon-parent", root_task_id="terminal-beacon-parent",
+        delegation_role="subagent",
+    )
+    assert task_tree_ledger.tree_ledger_append(
+        "terminal-beacon-parent", "question", "answer me before completion",
+        task_id="terminal-beacon-child",
+    ).startswith("OK:")
+    ctx = SimpleNamespace(
+        drive_root=tmp_path, task_id="terminal-beacon-parent",
+        task_metadata={"root_task_id": "terminal-beacon-parent"},
+    )
+    first = _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0)
+    assert first.startswith("Task wait interrupted by a child attention beacon")
+    assert "answer me before completion" in first
+    assert _wait_for_task(ctx, "terminal-beacon-child", timeout_sec=0).startswith(
+        "Task wait completed"
+    )
+
+
+# --- v6.91 wait_tasks typed unknown ids + children roster ---------------------
+
+
+def test_wait_for_tasks_flags_unknown_ids_and_attaches_children_roster(tmp_path):
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _wait_for_tasks
+
+    # A READABLE queue snapshot that does not know the phantom: a MISSING
+    # snapshot fail-softs to "known" (never brand a real child unknown on an
+    # unreadable surface), so the unknown verdict needs all surfaces present.
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    write_task_result(
+        tmp_path,
+        "realchild1",
+        STATUS_COMPLETED,
+        result="real child finished",
+        accounted_upper_bound_usd=0.55,
+        parent_task_id="waitparent1",
+        root_task_id="waitparent1",
+        delegation_role="subagent",
+    )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="waitparent1",
+        task_metadata={"root_task_id": "waitparent1"},
+    )
+    payload = json.loads(_wait_for_tasks(ctx, ["realchild1", "phantomid9"], timeout_sec=0))
+
+    # The phantom id gets a TYPED marker row, not a silent empty projection.
+    phantom = payload["tasks"]["phantomid9"]
+    assert phantom["unknown_task_id"] is True
+    assert "not yet registered or never scheduled" in phantom["note"]
+    assert payload["unknown_task_ids"] == ["phantomid9"]
+
+    # The real child still projects the normal compact row.
+    real = payload["tasks"]["realchild1"]
+    assert real["status"] == STATUS_COMPLETED
+    assert "unknown_task_id" not in real
+
+    # Actual children stay compact, with execution evidence and honest accounting.
+    roster = payload["children_roster"]
+    assert [row["task_id"] for row in roster] == ["realchild1"]
+    assert set(roster[0]) == {"task_id", "status", "accounted_upper_bound_usd",
+                              "child_result_sha256", "outcome_axes", "execution_observation"}
+    assert roster[0]["execution_observation"]["state"] == "terminal"
+    assert roster[0]["accounted_upper_bound_usd"] == 0.55
+    # Nothing was capped away, and the projection SAYS so (BIBLE P1).
+    assert payload["children_roster_omitted"] == 0
+
+
+def test_children_roster_projection_discloses_the_capped_tail(tmp_path):
+    """A parent with MORE direct children than the roster cap: the repair surface
+    stays bounded, but the bound is disclosed — `children_roster_omitted` carries
+    the exact count of real children the cap hid. A silent [:30] here could hide
+    the very replacement id wait_tasks' unknown-id repair exists to surface."""
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools.control import _children_roster_projection
+
+    total = 33
+    for idx in range(total):
+        write_task_result(
+            tmp_path,
+            f"bigchild{idx:03d}",
+            STATUS_COMPLETED,
+            result=f"child {idx} finished",
+            parent_task_id="bigparent1",
+            root_task_id="bigparent1",
+            delegation_role="subagent",
+        )
+
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        task_id="bigparent1",
+        task_metadata={"root_task_id": "bigparent1"},
+    )
+    projected = _children_roster_projection(ctx, tmp_path)
+    roster = projected["children_roster"]
+    assert len(roster) == 30  # the cap holds — the surface stays compact
+    assert projected["children_roster_omitted"] == total - 30  # …and is disclosed
+    assert all(
+        set(row) == {"task_id", "status", "accounted_upper_bound_usd",
+                     "child_result_sha256", "outcome_axes", "execution_observation"}
+        and row["execution_observation"]["state"] == "terminal" for row in roster
+    )
+
+
+def test_wait_for_tasks_phantom_only_set_short_circuits_the_window(tmp_path, monkeypatch):
+    """A wait set in which NOTHING was ever minted ends after the registration
+    grace instead of blocking the whole requested window — and says so."""
+    import json as _json
+
+    from ouroboros.tools import control
+    # The wait internals live in the extracted owner leaf (v7 D07 split):
+    # _wait_for_tasks reads the grace knob from its own module, so the
+    # interception targets the leaf, not the re-exporting facade.
+    from ouroboros.tools import control_task_results
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control_task_results, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent3", task_metadata={})
+    started = time.monotonic()
+    payload = json.loads(control._wait_for_tasks(ctx, ["phantomid7", "phantomid8"], timeout_sec=600))
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 30, "phantom-only wait must not block for the requested window"
+    short = payload["wait_short_circuited"]
+    assert short["reason"] == "all_task_ids_unminted"
+    assert short["requested_timeout_sec"] == 600.0
+    assert sorted(payload["unknown_task_ids"]) == ["phantomid7", "phantomid8"]
+    # An id this tree never minted is disclosed as unknown, never counted as a
+    # live child of an expired window.
+    assert "wait_expired_with_live_children" not in payload
+
+
+def test_wait_for_tasks_id_minted_during_grace_keeps_waiting(tmp_path, monkeypatch):
+    """The grace is for the registration race: an id that becomes real during it
+    is a genuine child, so the wait resumes with the remaining window."""
+    import json as _json
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control
+    # The wait internals live in the extracted owner leaf (v7 D07 split):
+    # _wait_for_tasks reads the grace knob and the minted-ids probe from its
+    # own module, so the interceptions target the leaf, not the facade.
+    from ouroboros.tools import control_task_results
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(
+        _json.dumps({"pending": [], "running": []}), encoding="utf-8"
+    )
+    monkeypatch.setattr(control_task_results, "_UNMINTED_WAIT_GRACE_SEC", 0.1)
+
+    real_calls = {"n": 0}
+    original = control_task_results._unminted_wait_ids
+
+    def _mint_after_grace(ctx, drive_root, task_ids):
+        real_calls["n"] += 1
+        if real_calls["n"] > 1:
+            # The child registered during the grace window.
+            write_task_result(
+                tmp_path, "latechild1", STATUS_COMPLETED, result="registered late",
+                parent_task_id="waitparent4", root_task_id="waitparent4",
+                delegation_role="subagent",
+            )
+        return original(ctx, drive_root, task_ids)
+
+    monkeypatch.setattr(control_task_results, "_unminted_wait_ids", _mint_after_grace)
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent4", task_metadata={})
+    payload = json.loads(control._wait_for_tasks(ctx, ["latechild1"], timeout_sec=5))
+
+    assert "wait_short_circuited" not in payload
+    assert payload["timeout_sec"] == 5.0
+    assert payload["tasks"]["latechild1"]["status"] == STATUS_COMPLETED
+
+
+def test_wait_for_tasks_queue_scheduled_id_is_not_unknown(tmp_path):
+    """An id with a queue-snapshot row but no task result yet is a REAL child
+    (just-scheduled), never a phantom — and without unknowns the roster is not
+    attached (the compact batch stays compact, v6.71.2)."""
+    import json as _json
+
+    from ouroboros.tools.control import _wait_for_tasks
+
+    snapshot = {"pending": [{"id": "queuedonly1", "task": {}}], "running": []}
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / "queue_snapshot.json").write_text(_json.dumps(snapshot), encoding="utf-8")
+
+    ctx = SimpleNamespace(drive_root=tmp_path, task_id="waitparent2", task_metadata={})
+    payload = json.loads(_wait_for_tasks(ctx, ["queuedonly1"], timeout_sec=0))
+
+    assert "unknown_task_ids" not in payload
+    assert "children_roster" not in payload
+    assert "unknown_task_id" not in payload["tasks"]["queuedonly1"]
 
 
 def test_recent_tasks_includes_outcome_contract_and_ledger(tmp_path):
@@ -591,6 +1552,39 @@ def test_recent_tasks_includes_outcome_contract_and_ledger(tmp_path):
     assert record["task_contract"]["objective"] == "Do work"
     assert record["artifact_bundle"]["status"] == "ready_no_changes"
     assert record["verification_ledger"]["entry_count"] == 1
+
+    # A ledger above the inline threshold rides as a stub with NO entries: its
+    # own summary is the count authority, so the row must not report zero.
+    write_task_result(
+        tmp_path,
+        "recent2",
+        STATUS_COMPLETED,
+        result="done",
+        verification_ledger={
+            "schema_version": 1, "omitted_to_artifact": True,
+            "summary": {"entry_count": 9, "has_failures": True},
+        },
+    )
+    payload = json.loads(_handle_recent_tasks(SimpleNamespace(drive_root=tmp_path), limit=2))
+    stub_record = next(row for row in payload["tasks"] if row["task_id"] == "recent2")
+    assert stub_record["verification_ledger"]["entry_count"] == 9
+    assert stub_record["verification_ledger"]["summary"]["has_failures"] is True
+
+
+def test_subtask_outcome_summary_reports_a_stub_ledger_count(tmp_path):
+    """The same count authority on the parent-visible child summary: a stub
+    ledger used to report ``0 entries / no failures`` to its parent."""
+    from ouroboros.tools.control import _subtask_outcome_summary
+
+    summary = json.loads(_subtask_outcome_summary({
+        "status": "completed", "result": "done",
+        "verification_ledger": {
+            "schema_version": 1, "omitted_to_artifact": True,
+            "summary": {"entry_count": 9, "has_failures": True},
+        },
+    }))
+    assert summary["verification_ledger"]["entry_count"] == 9
+    assert summary["verification_ledger"]["summary"]["has_failures"] is True
 
 
 def test_effective_status_keeps_workspace_finalization_nonterminal_without_child_drive(tmp_path):
@@ -639,7 +1633,10 @@ def test_effective_status_repairs_stale_running_infra_failure_when_queue_empty(t
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
 
     effective = load_effective_task_result(tmp_path, "providerfail")
 
@@ -692,7 +1689,10 @@ def test_effective_status_repairs_orphan_running_after_worker_restart(tmp_path, 
         },
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "cc4db6fa"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -728,7 +1728,10 @@ def test_reconcile_durably_finalizes_orphaned_running_task(tmp_path, monkeypatch
         result="Task is running.", ts="2026-05-28T00:00:00+00:00",
     )
     (tmp_path / "state").mkdir(exist_ok=True)
-    (tmp_path / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}',
+        encoding="utf-8",
+    )
     events = tmp_path / "logs" / "events.jsonl"
     append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": "orphan1"})
     append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
@@ -871,7 +1874,7 @@ def test_effective_status_preserves_parent_retry_status_over_stale_child_running
 
 def test_find_child_tasks_requires_subagent_role_and_can_exclude_current_task(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
-    from ouroboros.task_status import find_child_tasks, format_handoff_message
+    from ouroboros.task_status import find_child_tasks
 
     write_task_result(
         tmp_path,
@@ -896,14 +1899,9 @@ def test_find_child_tasks_requires_subagent_role_and_can_exclude_current_task(tm
 
     children = find_child_tasks(tmp_path, parent_task_id="parent1", root_task_id="parent1")
     excluded = find_child_tasks(tmp_path, parent_task_id="parent1", root_task_id="parent1", exclude_task_id="child1")
-    handoff = format_handoff_message(children)
 
     assert [row["task_id"] for row in children] == ["child1"]
     assert excluded == []
-    assert "should not be treated as child" not in handoff
-    assert len(handoff) < 1200
-    assert "Use get_task_result" in handoff
-    assert "result_chars" in handoff
 
 
 def test_wait_for_task_times_out_when_child_is_not_terminal(tmp_path):
@@ -952,25 +1950,38 @@ def test_wait_for_task_reports_rejected_duplicate(tmp_path):
     assert "duplicate_of=orig999" in output
 
 
-def test_handle_schedule_task_duplicate_writes_rejected_status(tmp_path, monkeypatch):
+def test_handle_schedule_task_admits_identical_siblings_without_semantic_veto(tmp_path, monkeypatch):
+    """No semantic duplicate judge stands between a parent and its siblings.
+
+    Exact task-id fencing, the active-child cap and cost ceilings are the floor;
+    identical objectives under one parent are the parent's call, so every sibling
+    is admitted as ``scheduled`` and none is stamped ``duplicate_of``.
+    """
     from supervisor import events as ev_module
-    from ouroboros.task_results import STATUS_REJECTED_DUPLICATE
+    import ouroboros.llm as llm_module
+    from ouroboros.task_results import STATUS_SCHEDULED
 
-    captured_identity = {}
+    # Admission must not consult any model: a judge that merely failed open
+    # (provider unreachable in a keyless run) would make this test pass on a
+    # tree that still carries the veto, so constructing a client is the failure.
+    constructed = []
 
-    def _duplicate(*args, **kwargs):
-        captured_identity.update(kwargs.get("dedupe_identity") or {})
-        return "orig111"
+    def _no_client(*args, **kwargs):
+        constructed.append((args, kwargs))
+        raise AssertionError("admission constructed an LLM client")
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", _duplicate)
+    monkeypatch.setattr(llm_module, "LLMClient", _no_client)
 
     sent = []
+    enqueued = []
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
-        PENDING = []
-        RUNNING = {}
         WORKERS = {0: SimpleNamespace(busy_task_id=None)}
+
+        def __init__(self):
+            self.PENDING = []
+            self.RUNNING = {}
 
         def load_state(self):
             return {"owner_chat_id": 1}
@@ -978,301 +1989,61 @@ def test_handle_schedule_task_duplicate_writes_rejected_status(tmp_path, monkeyp
         def send_with_budget(self, chat_id, text, **kwargs):
             sent.append((chat_id, text, kwargs))
 
-    ev_module._handle_schedule_task(
-        {
-            "type": "schedule_subagent",
-            "task_id": "dup222",
-            "objective": "Do the thing",
-            "expected_output": "Duplicate verdict",
-            "context": "Model focus B",
-            "depth": 1,
-            "memory_mode": "forked",
-            "parent_task_id": "parent111",
-            "root_task_id": "root111",
-            "drive_root": str(tmp_path / "state" / "headless_tasks" / "dup222" / "data"),
-            "child_drive_root": str(tmp_path / "state" / "headless_tasks" / "dup222" / "data"),
-            "budget_drive_root": str(tmp_path),
-        },
-        FakeCtx(),
-    )
+        def enqueue_task(self, task):
+            enqueued.append(task)
+            self.PENDING.append(task)
+            return task
 
-    path = tmp_path / "task_results" / "dup222.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
-    assert data["status"] == STATUS_REJECTED_DUPLICATE
-    assert data["duplicate_of"] == "orig111"
-    assert sent and "semantically similar" in sent[0][1]
-    assert sent[0][2]["is_progress"] is True
-    assert sent[0][2]["progress_meta"]["delegation_role"] == "subagent"
-    assert sent[0][2]["progress_meta"]["parent_task_id"] == "parent111"
-    assert sent[0][2]["progress_meta"]["status"] == STATUS_REJECTED_DUPLICATE
-    assert captured_identity == {
-        "delegation_role": "subagent",
-        "task_id": "dup222",
-        "parent_task_id": "parent111",
-        "root_task_id": "root111",
-        "budget_drive_root": str(tmp_path),
-    }
+        def persist_queue_snapshot(self, reason=""):
+            self.snapshot_reason = reason
 
+    ctx = FakeCtx()
 
-def test_find_duplicate_task_includes_subagent_handoff_fields(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    captured = {}
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            captured["prompt"] = messages[0]["content"]
-            return {"content": "NONE"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Review shared surface",
-        "same context",
-        [
+    def _dispatch(tid, configured_subagent):
+        ev_module._handle_schedule_task(
             {
-                "id": "pending1",
-                "description": "Review shared surface",
-                "context": "same context",
-                "expected_output": "Docs table",
-                "constraints": "docs only",
-                "role": "docs reviewer",
-            }
-        ],
-        {},
-        expected_output="Security table",
-        constraints="security only",
-        role="security reviewer",
-    )
+                "type": "schedule_subagent",
+                "task_id": tid,
+                "objective": "Do the thing",
+                "expected_output": "Duplicate verdict",
+                "context": "Model focus B",
+                "depth": 1,
+                "memory_mode": "forked",
+                "parent_task_id": "parent111",
+                "root_task_id": "root111",
+                "drive_root": str(tmp_path / "state" / "headless_tasks" / tid / "data"),
+                "child_drive_root": str(tmp_path / "state" / "headless_tasks" / tid / "data"),
+                "budget_drive_root": str(tmp_path),
+                "configured_subagent": configured_subagent,
+            },
+            ctx,
+        )
 
-    assert result is None
-    prompt = captured["prompt"]
-    assert "Expected output:\nSecurity table" in prompt
-    assert "Expected output:\nDocs table" in prompt
-    assert "Constraints:\nsecurity only" in prompt
-    assert "Constraints:\ndocs only" in prompt
-    assert "Role:\nsecurity reviewer" in prompt
-    assert "Role:\ndocs reviewer" in prompt
+    # Same objective, same lineage, same (default) role; only the selected
+    # configured subagent differs.
+    _dispatch("sib1", {"selected_subagent_id": "primary-builder"})
+    _dispatch("sib2", {"selected_subagent_id": "fast-scout"})
+    # ... and a pair whose configured subagent is identical too.
+    _dispatch("sib3", {"selected_subagent_id": "primary-builder"})
+    _dispatch("sib4", {"selected_subagent_id": "primary-builder"})
 
-
-def test_find_duplicate_task_allows_distinct_subagent_roles(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="l1-beta-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_keeps_same_role_subagent_dedupe(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="l1-alpha-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result == "pending1"
-
-
-def test_find_duplicate_task_allows_distinct_subagent_parent_branches(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "pending1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "Run nested branch smoke slot",
-        "",
-        [
-            {
-                "id": "pending1",
-                "description": "Run nested branch smoke slot",
-                "expected_output": "Smoke handoff",
-                "role": "shared-l2-role",
-                "delegation_role": "subagent",
-                "parent_task_id": "l1-alpha",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="Smoke handoff",
-        role="shared-l2-role",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "l1-beta",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_allows_subagent_against_running_root_ancestor(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "root1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "You are l1-alpha-coordinator; schedule L2 smoke agents",
-        "",
-        [],
-        {
-            "root1": {
-                "task": {
-                    "id": "root1",
-                    "description": "Root coordinator: schedule l1-alpha, l1-beta, l1-gamma subagents",
-                    "delegation_role": "root",
-                    "parent_task_id": "",
-                    "root_task_id": "root1",
-                }
-            }
-        },
-        expected_output="L1 handoff",
-        role="l1-alpha-coordinator",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "root1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
-
-
-def test_find_duplicate_task_allows_subagent_against_pending_parent_ancestor(monkeypatch):
-    from supervisor import events as ev_module
-    import ouroboros.config as config_module
-    import ouroboros.llm as llm_module
-
-    calls = []
-
-    class FakeClient:
-        def chat(self, messages, **kwargs):
-            calls.append(messages[0]["content"])
-            return {"content": "parent1"}, {}
-
-    monkeypatch.setattr(config_module, "get_light_model", lambda: "test-light")
-    monkeypatch.setattr(llm_module, "LLMClient", lambda: FakeClient())
-
-    result = ev_module._find_duplicate_task(
-        "You are l1-alpha-coordinator-l2-1; return a smoke handoff",
-        "",
-        [
-            {
-                "id": "parent1",
-                "description": "You are l1-alpha-coordinator; schedule three L2 smoke subagents",
-                "role": "l1-alpha-coordinator",
-                "delegation_role": "subagent",
-                "parent_task_id": "root1",
-                "root_task_id": "root1",
-            }
-        ],
-        {},
-        expected_output="L2 handoff",
-        role="l1-alpha-coordinator-l2-1",
-        dedupe_identity={
-            "delegation_role": "subagent",
-            "parent_task_id": "parent1",
-            "root_task_id": "root1",
-        },
-    )
-
-    assert result is None
-    assert calls == []
+    assert [task["id"] for task in enqueued] == ["sib1", "sib2", "sib3", "sib4"]
+    for tid in ("sib1", "sib2", "sib3", "sib4"):
+        path = tmp_path / "task_results" / f"{tid}.json"
+        assert path.exists(), f"{tid} was not admitted"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        assert data["status"] == STATUS_SCHEDULED
+        assert "duplicate_of" not in data
+    assert not [text for _chat, text, _kw in sent if "semantically similar" in text]
+    # The judge caught every exception and failed open, so a raise alone would
+    # not distinguish a tree that still consults a model: the record does.
+    assert constructed == []
 
 
 def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constraint(tmp_path, monkeypatch):
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_SCHEDULED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -1289,7 +2060,8 @@ def test_handle_schedule_task_accepts_unique_subagent_with_lineage_and_constrain
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -1346,7 +2118,6 @@ def test_handle_schedule_task_rejects_internal_subagent_without_child_drive_cont
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -1390,7 +2161,6 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_SCHEDULED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -1407,7 +2177,8 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             self.snapshot_reason = reason
@@ -1451,14 +2222,16 @@ def test_handle_schedule_task_uses_event_chat_id_without_owner(tmp_path, monkeyp
     )
 
     # B1 (v6.33.0): a headless subagent with no chat target is no longer
-    # rejected — it is enqueued and runs (the live "🗓️ Scheduled" notification is
-    # skipped because chat_id is 0). Restores headless/CLI multi-agent.
+    # rejected — it is enqueued and runs. The durable record now keeps its real
+    # address instead of recording the hidden partition as "no chat" (that is the
+    # truthiness class this sprint closed), while the LIVE toast is still skipped:
+    # a progress notice needs a reader, the hidden partition has none, and a
+    # headless run's progress log is read back as its benchmark trajectory.
     assert len(enqueued) == 2
     assert enqueued[1]["id"] == "headless2"
     scheduled2 = json.loads((tmp_path / "task_results" / "headless2.json").read_text(encoding="utf-8"))
     assert scheduled2["status"] == STATUS_SCHEDULED
-    # No chat notification was emitted for the chat-less subagent.
-    assert all(s[0] != 0 for s in sent)
+    assert scheduled2["chat_id"] == 0
     assert len(sent) == 1
 
 
@@ -1467,7 +2240,6 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
     from ouroboros.config import get_max_subagent_depth
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -1510,31 +2282,38 @@ def test_handle_schedule_task_depth_rejection_writes_failed_status(tmp_path, mon
 
 
 def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monkeypatch):
-    """v6.79.0 (owner Q26): a configured depth of 0 means NO delegation.
-
-    Before this, ``_bounded_positive_int_setting`` rewrote a configured 0 to the default 2,
-    so every run that asked for "no swarm" silently delegated two levels deep. All three
-    facts are pinned together: the resolved setting, the tool-side gate, and the supervisor
-    gate — plus the invariant that a ROOT task (depth 0 itself) still runs at depth 0."""
+    """A configured depth of zero disables child delegation, not the root task."""
     from supervisor import events as ev_module
     from ouroboros.config import get_max_subagent_depth
     from ouroboros.task_results import STATUS_FAILED
 
     monkeypatch.setenv("OUROBOROS_MAX_SUBAGENT_DEPTH", "0")
+    _configure_test_subagent(monkeypatch)
     assert get_max_subagent_depth() == 0
 
-    # Tool-side gate: the first child of a root task is already too deep.
     import ouroboros.tools.control as control
     from ouroboros.tools.registry import ToolContext
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "root-no-swarm"
     ctx.task_depth = 0
-    out = control._schedule_task(ctx, objective="Delegate", expected_output="Something")
+    out = control._schedule_task(
+        ctx, subagent_id="api-scout", objective="Delegate", expected_output="Something")
     assert "depth limit (0) exceeded" in out
+    assert "subtask_depth_limit" in out
+    refused_id = out.split("task_id=", 1)[1].split(";", 1)[0]
+    refused = json.loads(
+        (tmp_path / "task_results" / f"{refused_id}.json").read_text(encoding="utf-8")
+    )
+    assert refused["status"] == STATUS_FAILED
+    assert refused["delegation_admission"]["reason_code"] == "subtask_depth_limit"
+    assert refused["depth_provenance"] == {
+        "requested_depth": None,
+        "permitted_depth": 0,
+        "attempted_depth": 1,
+        "achieved_depth": None,
+    }
 
-    # Supervisor gate: a depth-1 child event is refused; a depth-0 ROOT task is NOT.
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
 
     class FakeCtx:
@@ -1550,7 +2329,8 @@ def test_configured_zero_subagent_depth_truly_disables_delegation(tmp_path, monk
             pass
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -1592,17 +2372,20 @@ def test_other_bounded_int_settings_keep_their_min_of_one(monkeypatch):
 
 def test_settings_ui_carries_a_configured_zero_subagent_depth():
     """The runtime honouring 0 is worthless if the Settings page silently reverts it: 0 is FALSY
-    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 2, and
-    the next Save (which posts every number field unconditionally) wrote 2 back — re-enabling two
+    in JS, so a stored 0 read through the plain `if (value)` branch displayed the fallback 3, and
+    the next Save (which posts every number field unconditionally) wrote 3 back — re-enabling three
     levels of delegation through the UI. All three carriers of the owner's 0 are pinned: the input
     can reach it, the depth entry is falsy-tolerant, and the load path still honours that flag
     (without which the flag is inert)."""
     root = pathlib.Path(__file__).resolve().parents[1]
     settings_js = (root / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    settings_ui = (root / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
+    # The input moved from Advanced -> Runtime Limits to Agents -> Delegation
+    # (D-10): the counts bound the agents, not the process pool. Same invariant,
+    # new address.
+    settings_ui = (root / "web" / "modules" / "subagents_settings.js").read_text(encoding="utf-8")
     assert 'id="s-subagent-depth" type="number" min="0"' in settings_ui
     # The 4th tuple element is the falsy-tolerant flag consumed by the load path below.
-    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 2, true]" in settings_js
+    assert "['s-subagent-depth', 'OUROBOROS_MAX_SUBAGENT_DEPTH', 3, true]" in settings_js
     assert (
         "if (allowFalsy ? value !== null && value !== undefined : value) byId(id).value = value;"
         in settings_js
@@ -1613,7 +2396,6 @@ def test_handle_schedule_task_rejects_legacy_subagent_event_schema(tmp_path, mon
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     enqueued = []
     sent = []
 
@@ -1662,7 +2444,6 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_COMPLETED, STATUS_FAILED, STATUS_SCHEDULED, load_task_result, write_task_result
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     monkeypatch.setenv("OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT", "3")  # pin cap (v6.20.0 raised default to 6)
     sent = []
     enqueued = []
@@ -1680,7 +2461,8 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
             sent.append((chat_id, text, kwargs))
 
         def enqueue_task(self, task):
-            enqueued.append(task)
+            enqueued.append(dict(task))
+            return enqueued[-1]
 
         def persist_queue_snapshot(self, reason=""):
             pass
@@ -1779,7 +2561,11 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task"}, ctx)
+    from ouroboros.headless import prepare_terminal_task_files
+
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childdone"]["task"])
+    ev_module._handle_task_done({"task_id": "childdone", "worker_id": 7, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childdone")["result"] == "summary"
     assert not (tmp_path / "task_results" / "artifacts" / "childdone" / "memory_export.json").exists()
@@ -1816,7 +2602,9 @@ def test_handle_schedule_task_queues_when_active_subagent_cap_is_full(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task"}, ctx)
+    prepare_terminal_task_files(tmp_path, ctx.RUNNING["childfail"]["task"])
+    ev_module._handle_task_done({"task_id": "childfail", "worker_id": 8, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
     assert load_task_result(tmp_path, "childfail")["status"] == STATUS_FAILED
     assert sent and "failed" in sent[-1][1]
@@ -1830,7 +2618,6 @@ def test_handle_schedule_task_fails_fast_when_worker_pool_unavailable(tmp_path, 
     from supervisor import events as ev_module
     from ouroboros.task_results import STATUS_FAILED
 
-    monkeypatch.setattr(ev_module, "_find_duplicate_task", lambda *args, **kwargs: None)
     sent = []
 
     class FakeCtx:
@@ -1877,26 +2664,8 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
     import ouroboros.headless as headless
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
-    calls = []
-
-    def fake_copy(root, task):
-        calls.append(("copy", task["id"]))
-        return write_task_result(pathlib.Path(root), task["id"], STATUS_COMPLETED, result="child handoff")
-
-    monkeypatch.setattr(headless, "copy_child_task_result", fake_copy)
-
-    def fake_finalize(root, task):
-        calls.append(("finalize", task["id"]))
-        write_task_result(
-            pathlib.Path(root),
-            task["id"],
-            STATUS_COMPLETED,
-            result="done",
-            artifact_status="failed",
-            artifact_bundle={"status": "failed", "artifacts": []},
-        )
-
-    monkeypatch.setattr(headless, "finalize_task_artifacts", fake_finalize)
+    for name in ("copy_child_task_result", "finalize_task_artifacts"):
+        monkeypatch.setattr(headless, name, lambda *_a: pytest.fail("canonical readonly task needs no file work"))
     pushed = []
 
     worker = SimpleNamespace(busy_task_id="workspace-child")
@@ -1922,17 +2691,21 @@ def test_handle_task_done_skips_workspace_readonly_subagent_artifacts(tmp_path, 
         persist_queue_snapshot=lambda reason="": None,
     )
 
-    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task"}, ctx)
+    write_task_result(tmp_path, "workspace-child", STATUS_COMPLETED, result="child handoff")
+    headless.prepare_terminal_task_files(tmp_path, ctx.RUNNING["workspace-child"]["task"])
+    ev_module._handle_task_done({"task_id": "workspace-child", "worker_id": 3, "task_type": "task",
+                                "_files_prepared_attempt": 1}, ctx)
 
-    assert ("copy", "workspace-child") in calls
-    assert ("finalize", "workspace-child") not in calls
     assert pushed[-1]["status"] == STATUS_COMPLETED
     assert pushed[-1]["artifact_status"] is None
 
 
 def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch):
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.task_results import write_task_result
     from supervisor import queue as queue_module
 
+    write_task_result(tmp_path, "previous", "completed", result="Previous exact result")
     snapshot_path = tmp_path / "state" / "queue_snapshot.json"
     monkeypatch.setattr(queue_module, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(queue_module, "QUEUE_SNAPSHOT_PATH", snapshot_path)
@@ -1979,6 +2752,10 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
             },
             "child_drive_root": str(tmp_path / "state" / "headless_tasks" / "sub1" / "data"),
             "task_constraint": {"mode": "local_readonly_subagent", "allow_enable": False},
+            "predecessor_authority_source": {
+                "kind": "task_result", "task_id": "previous", "tool": "get_task_result",
+                "arguments": {"task_id": "previous", "include_authority": True},
+            },
         }
     )
 
@@ -1994,6 +2771,7 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
     assert saved["task_contract"]["resource_policy"]["protected_artifacts"][0]["id"] == "reference"
     assert pathlib.Path(saved["child_drive_root"]).parts[-4:] == ("state", "headless_tasks", "sub1", "data")
     assert saved["task_constraint"]["mode"] == "local_readonly_subagent"
+    assert saved["predecessor_authority_source"]["task_id"] == "previous"
 
     queue_module.PENDING.clear()
     assert queue_module.restore_pending_from_snapshot(max_age_sec=900) == 1
@@ -2008,6 +2786,12 @@ def test_queue_snapshot_preserves_subagent_contract_fields(tmp_path, monkeypatch
     assert restored["task_contract"]["resource_policy"]["protected_artifacts"][0]["paths"] == ["reference.bin"]
     assert pathlib.Path(restored["child_drive_root"]).parts[-4:] == ("state", "headless_tasks", "sub1", "data")
     assert restored["task_constraint"]["mode"] == "local_readonly_subagent"
+    assert restored["predecessor_authority_source"]["task_id"] == "previous"
+    assert validate_task_authority_sources(
+        SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path), restored,
+    ) == {}
+    assert restored["predecessor_authority"]["source"] == restored["predecessor_authority_source"]
+    assert restored["predecessor_authority"]["result"] == "Previous exact result"
 
 
 def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, monkeypatch):
@@ -2050,7 +2834,7 @@ def test_assign_tasks_mirrors_running_subagent_status_to_parent_drive(tmp_path, 
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
@@ -2142,12 +2926,94 @@ def test_assign_tasks_honors_depth_reservation_for_first_grandchild(tmp_path, mo
     monkeypatch.setattr(workers_module, "WORKERS", {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())})
     monkeypatch.setattr(workers_module, "load_state", lambda: {})
     monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
-    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
 
     workers_module.assign_tasks()
 
     assert delivered and delivered[0]["id"] == "grandchild1"
     assert "grandchild1" in workers_module.RUNNING
+
+
+def test_assignment_depth_fact_reaches_worker_and_survives_child_copyback(tmp_path, monkeypatch):
+    from supervisor import queue as queue_module
+    from supervisor import workers as workers_module
+    from supervisor import state as state_module
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+
+    delivered = []
+
+    class FakeWorkerQueue:
+        def put(self, task):
+            delivered.append(task)
+
+    child_drive = tmp_path / "state" / "headless_tasks" / "child-depth" / "data"
+    child_drive.mkdir(parents=True)
+    queued_contract = build_task_contract({
+        "delegation_budget": {
+            "depth_remaining": 2,
+            "depth_provenance": {
+                "requested_depth": 3,
+                "permitted_depth": 3,
+                "attempted_depth": 1,
+                "achieved_depth": None,
+            },
+        },
+    })
+    pending = [{
+        "id": "child-depth",
+        "type": "task",
+        "chat_id": 1,
+        "description": "Assigned depth child",
+        "depth": 1,
+        "root_task_id": "root-depth",
+        "parent_task_id": "root-depth",
+        "delegation_role": "subagent",
+        "drive_root": str(child_drive),
+        "child_drive_root": str(child_drive),
+        "budget_drive_root": str(tmp_path),
+        "task_contract": queued_contract,
+        "metadata": {"task_contract": queued_contract},
+    }]
+    monkeypatch.setattr(workers_module, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers_module, "PENDING", pending)
+    monkeypatch.setattr(workers_module, "RUNNING", {})
+    monkeypatch.setattr(
+        workers_module,
+        "WORKERS",
+        {1: SimpleNamespace(wid=1, busy_task_id=None, in_q=FakeWorkerQueue())},
+    )
+    monkeypatch.setattr(workers_module, "load_state", lambda: {})
+    monkeypatch.setattr(state_module, "budget_remaining", lambda _state, **_kwargs: 100.0)
+    monkeypatch.setattr(queue_module, "persist_queue_snapshot", lambda reason="": True)
+
+    workers_module.assign_tasks()
+
+    assert delivered and delivered[0]["depth_provenance"]["achieved_depth"] == 1
+    worker_contract = delivered[0]["task_contract"]
+    assert worker_contract["delegation_budget"]["depth_provenance"]["achieved_depth"] == 1
+    assert delivered[0]["metadata"]["task_contract"] == worker_contract
+
+    # Reproduce the real terminal replica: the worker writes the contract it
+    # received to its child drive, then the supervisor copies that result back.
+    write_task_result(
+        child_drive,
+        "child-depth",
+        STATUS_COMPLETED,
+        parent_task_id="root-depth",
+        root_task_id="root-depth",
+        delegation_role="subagent",
+        task_contract=worker_contract,
+        depth_provenance=delivered[0]["depth_provenance"],
+        result="done",
+    )
+    copied = copy_child_task_result(tmp_path, delivered[0])
+    assert copied is not None
+    canonical = load_task_result(tmp_path, "child-depth")
+    nested = canonical["task_contract"]["delegation_budget"]["depth_provenance"]
+    assert nested == canonical["depth_provenance"]
+    assert nested["achieved_depth"] == 1
 
 
 def test_override_delegation_constraint_requires_parent_lineage(tmp_path, monkeypatch):
@@ -2197,8 +3063,6 @@ def test_subagent_hard_timeout_retry_preserves_task_id(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "PENDING", [])
     monkeypatch.setattr(queue_module, "RUNNING", {})
     monkeypatch.setattr(queue_module, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
-    monkeypatch.setattr(queue_module, "HARD_TIMEOUT_SEC", 1)
-    monkeypatch.setattr(queue_module, "SOFT_TIMEOUT_SEC", 1)
     monkeypatch.setattr(queue_module, "FINALIZATION_GRACE_SEC", 0)
     monkeypatch.setattr(queue_module, "QUEUE_MAX_RETRIES", 1)
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
@@ -2273,8 +3137,6 @@ def test_absolute_deadline_does_not_retry_expired_task(tmp_path, monkeypatch):
     monkeypatch.setattr(queue_module, "PENDING", [])
     monkeypatch.setattr(queue_module, "RUNNING", {})
     monkeypatch.setattr(queue_module, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
-    monkeypatch.setattr(queue_module, "HARD_TIMEOUT_SEC", 9999)
-    monkeypatch.setattr(queue_module, "SOFT_TIMEOUT_SEC", 9999)
     monkeypatch.setattr(queue_module, "FINALIZATION_GRACE_SEC", 0)
     monkeypatch.setattr(queue_module, "QUEUE_MAX_RETRIES", 3)
     monkeypatch.setattr(queue_module, "load_state", lambda: {})
@@ -2326,15 +3188,95 @@ def test_handle_text_response_keeps_full_reasoning_note():
     assert updated["reasoning_notes"] == [content]
 
 
+def _orphan_shaped_running_task(tmp_path, task_id, *, snapshot_ts):
+    """The exact fixture the pooled orphan reconciler accepts as proof of death:
+    an aged ``running`` row, an empty queue snapshot and a LATER worker boot."""
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from ouroboros.utils import append_jsonl
+
+    write_task_result(
+        tmp_path, task_id, STATUS_RUNNING,
+        result="Task is running.", ts="2026-05-28T00:00:00+00:00",
+    )
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": snapshot_ts, "pending": [], "running": []}), encoding="utf-8",
+    )
+    events = tmp_path / "logs" / "events.jsonl"
+    append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": task_id})
+    append_jsonl(events, {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
+
+
+def test_orphan_reconcile_never_terminalizes_a_live_direct_activity(tmp_path, monkeypatch):
+    """A direct-chat actor is deliberately absent from PENDING/RUNNING, so a
+    FOREIGN ``worker_boot`` plus a fresh empty snapshot cannot prove it dead."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import (
+        load_effective_task_result, reconcile_orphaned_running_tasks,
+    )
+    from supervisor import active_activity
+    from supervisor.active_activity import (
+        DirectActivityRegistry, get_direct_activity_registry,
+    )
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    # Reliable fixture isolation for a process-global (DEVELOPMENT.md, parallel
+    # pass): monkeypatch reverses exactly this singleton, so the real
+    # ``get_direct_activity_registry`` seam is still the one under test.
+    monkeypatch.setattr(active_activity, "_DIRECT_ACTIVITY_REGISTRY", DirectActivityRegistry())
+    _orphan_shaped_running_task(tmp_path, "direct-live", snapshot_ts="2027-01-15T08:00:00+00:00")
+
+    registry = get_direct_activity_registry()
+    from types import SimpleNamespace
+    registry.register("direct-live", chat_id=1, actor=SimpleNamespace(env=SimpleNamespace(drive_root=tmp_path)))
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_effective_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+    assert load_task_result(tmp_path, "direct-live")["status"] == STATUS_RUNNING
+
+    # Non-vacuous: the SAME evidence is an ordinary orphan once the actor is gone,
+    # so the guard — not the fixture — is what kept the live row alive.
+    registry.unregister("direct-live")
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    healed = load_task_result(tmp_path, "direct-live")
+    assert healed["reason_code"] == "orphaned_running_after_worker_restart"
+
+
+def test_orphan_reconcile_does_not_use_a_stale_snapshot_as_death_proof(tmp_path, monkeypatch):
+    """GR7-1a polarity for the DESTRUCTIVE reconciler: an out-of-date snapshot
+    cannot prove a pooled owner is gone, but a fresh one still can."""
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    _orphan_shaped_running_task(tmp_path, "pooled-live", snapshot_ts="2026-05-28T00:00:03+00:00")
+
+    assert reconcile_orphaned_running_tasks(tmp_path) == 0
+    assert load_task_result(tmp_path, "pooled-live")["status"] == STATUS_RUNNING
+
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        json.dumps({"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}),
+        encoding="utf-8",
+    )
+    assert reconcile_orphaned_running_tasks(tmp_path) == 1
+    assert load_task_result(tmp_path, "pooled-live")["reason_code"] == (
+        "orphaned_running_after_worker_restart"
+    )
+
+
 def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     from ouroboros.tools import control as control_module
+    from ouroboros.tools import control_runtime
 
-    monkeypatch.setattr(control_module, "run_cmd", lambda *args, **kwargs: "value")
+    from supervisor import evolution_lifecycle
+
+    monkeypatch.setattr(control_runtime, "run_cmd", lambda *args, **kwargs: "value")
     written = {}
+    # The marker write lives in the shared writer helper (W4-F3: one schema for
+    # the tool and the supervisor), so the capture sits at its seam.
     monkeypatch.setattr(
-        control_module,
+        evolution_lifecycle,
         "atomic_write_json",
-        lambda path, payload: written.setdefault(str(path), payload),
+        lambda path, payload, **_kwargs: written.setdefault(str(path), payload),
     )
 
     class _Ctx:
@@ -2343,6 +3285,7 @@ def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
         pending_events = []
         pending_restart_reason = None
         repo_dir = tmp_path
+        drive_root = tmp_path
 
         def drive_path(self, rel):
             return tmp_path / rel
@@ -2354,3 +3297,94 @@ def test_request_restart_latches_reason_until_task_end(tmp_path, monkeypatch):
     assert ctx.pending_events == []
     assert ctx.pending_restart_reason == "reload runtime"
     assert written
+
+
+def test_expired_batch_wait_discloses_live_children_as_facts(tmp_path):
+    """I10: an expired batch wait names the still-live children and the ceiling.
+
+    Facts only. How wide a window to ask for next is the mind's call, so the
+    block carries no advisory note and the host imposes no floor; the long-term
+    orientation lives in the schema description read BEFORE the window is
+    chosen.
+    """
+    from ouroboros.task_results import STATUS_COMPLETED, STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+
+    write_task_result(tmp_path, "donechild", STATUS_COMPLETED, result="done")
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+
+    payload = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+
+    assert payload["timed_out"] is True and payload["all_terminal"] is False
+    assert payload["wait_expired_with_live_children"] == {
+        "reason": "timeout_expired_before_terminal",
+        "requested_timeout_sec": 0.0,
+        "max_timeout_sec": float(_WAIT_TASKS_CLAMP_SEC),
+        "live_task_ids": ["livechild"],
+    }
+
+    write_task_result(tmp_path, "livechild", STATUS_COMPLETED, result="done too")
+    settled = json.loads(_wait_for_tasks(ctx, ["donechild", "livechild"], timeout_sec=0))
+    assert settled["all_terminal"] is True
+    assert "wait_expired_with_live_children" not in settled
+
+
+def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path, monkeypatch):
+    """A request above the ceiling is disclosed as asked, beside the ceiling.
+
+    Reporting the clamp as requested_timeout_sec would hide the fact the model
+    most needs from the expiry: that the window it asked for was cut down.
+    """
+    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+    from ouroboros.tools.control import _WAIT_TASKS_CLAMP_SEC, _wait_for_tasks
+    from ouroboros.tools import control_task_results
+
+    write_task_result(tmp_path, "livechild", STATUS_SCHEDULED, result="")
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    # The clamp itself is unchanged; the wait returns at once on a spent window.
+    monkeypatch.setattr(
+        control_task_results, "wait_for_effective_tasks",
+        lambda root, ids, **kw: {
+            "mode": kw.get("mode"), "timeout_sec": float(kw.get("timeout_sec") or 0),
+            "elapsed_sec": 0.0, "timed_out": True, "all_terminal": False,
+            "tasks": {tid: {"task_id": tid, "status": STATUS_SCHEDULED} for tid in ids},
+        },
+    )
+
+    payload = json.loads(_wait_for_tasks(ctx, ["livechild"], timeout_sec=10000))
+
+    block = payload["wait_expired_with_live_children"]
+    assert block["requested_timeout_sec"] == 10000.0
+    assert block["max_timeout_sec"] == float(_WAIT_TASKS_CLAMP_SEC) == 7200.0
+    assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
+
+
+def test_wait_clamp_constants_are_the_windows_the_waits_use(tmp_path, monkeypatch):
+    """The schema text's number and the real wait window are one fact (A10)."""
+    from ouroboros.tools import control_task_results as mod
+
+    seen = []
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", lambda root, ids, **kw: seen.append(
+        kw["timeout_sec"]) or {"all_terminal": True, "elapsed_sec": 0.0, "tasks": {}})
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    mod._wait_for_task(ctx, "anychild", timeout_sec=10**6)
+    mod._wait_for_tasks(ctx, ["anychild"], timeout_sec=10**6)
+    assert seen == [mod._WAIT_TASK_CLAMP_SEC, mod._WAIT_TASKS_CLAMP_SEC]
+
+
+def test_wait_schemas_name_the_real_clamp(tmp_path):
+    """The model reads the real ceiling before it picks a window, not after."""
+    import pathlib
+
+    from ouroboros.tools.control import _WAIT_TASK_CLAMP_SEC, _WAIT_TASKS_CLAMP_SEC
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(
+        repo_dir=pathlib.Path(__file__).resolve().parents[1], drive_root=tmp_path,
+    )
+    by_name = {t["function"]["name"]: t["function"] for t in registry.schemas()}
+    one = by_name["wait_task"]["parameters"]["properties"]["timeout_sec"]["description"]
+    many = by_name["wait_tasks"]["parameters"]["properties"]["timeout_sec"]["description"]
+    assert str(_WAIT_TASK_CLAMP_SEC) in one and "expected life" in one
+    assert str(_WAIT_TASKS_CLAMP_SEC) in many and "expected life" in many

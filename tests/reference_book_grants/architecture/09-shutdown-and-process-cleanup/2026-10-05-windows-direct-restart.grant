@@ -1,0 +1,2 @@
+269
+The direct restart's transfer per platform: POSIX re-execs in place, Windows spawns the custodied successor because its C runtime only emulates exec; the token is no recovery acknowledgement there.

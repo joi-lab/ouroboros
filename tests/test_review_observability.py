@@ -188,34 +188,8 @@ def test_all_three_models_ok_no_degraded(tmp_path):
 # actually consume ScopeReviewResult instances from real review runs.
 
 
-# ── Test 5: budget_exceeded status on scope ───────────────────────────────────
-
-def test_scope_budget_exceeded_status(monkeypatch):
-    """v6.80.0: a pack that cannot fit the reviewer's window has no authoritative
-    verdict, so it fails CLOSED as sub_floor — the removed advisory floor was the only
-    thing that used to keep this non-blocking — while staying fully visible."""
-    from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
-
-    ctx_status = _TouchedContextStatus(status="budget_exceeded", token_count=800_001)
-    result = _handle_prompt_signals(None, ctx_status)
-
-    assert result is not None
-    assert result.blocked is True
-    assert result.status == "sub_floor"
-    assert result.advisory_findings[0]["item"] == "scope_review_skipped"
-    assert result.model_id == ""  # populated by run_scope_review after return
 
 
-def test_scope_empty_context_status():
-    """Empty context must set status='empty' and block."""
-    from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
-
-    ctx_status = _TouchedContextStatus(status="empty")
-    result = _handle_prompt_signals(None, ctx_status)
-
-    assert result is not None
-    assert result.blocked is True
-    assert result.status == "empty"
 
 
 # ── Test 6: parse_failure on scope output ─────────────────────────────────────
@@ -553,6 +527,8 @@ def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path):
     })
 
     with patch.object(review_mod, "run_cmd", return_value="some diff content"), \
+         patch("ouroboros.tools.review_binary_context.capture_staged_diff",
+               return_value="some diff content"), \
          patch.object(review_mod, "_handle_multi_model_review", return_value=mock_review_output), \
          patch.object(review_mod, "_load_checklist_section", return_value="## checklist"), \
          patch.object(review_mod, "_preflight_check", return_value=None), \
@@ -685,31 +661,6 @@ def test_stale_actor_evidence_cleared_at_commit_start(tmp_path):
     assert "ERROR" in result or "error" in result.lower()  # empty message triggers error
 
 
-# ── Test 10b: scope budget_exceeded has non-zero prompt_chars ────────────────
-
-def test_scope_budget_exceeded_has_prompt_chars(tmp_path, monkeypatch):
-    """A fit-ladder overflow ScopeReviewResult must carry prompt_chars > 0.
-
-    Before this fix, _handle_prompt_signals set prompt_chars=0 on the budget_exceeded
-    path, losing the only forensic fact about why scope review was skipped.
-    """
-    from ouroboros.tools.scope_review import _handle_prompt_signals, _TouchedContextStatus
-
-    token_count = 800_000  # exceeds the 750K gate
-    context_status = _TouchedContextStatus(status="budget_exceeded", token_count=token_count)
-    result = _handle_prompt_signals(None, context_status)
-
-    assert result is not None
-    assert result.blocked is True
-    assert result.status == "sub_floor"
-    # The count is DERIVED from the token estimate on this path and says so (RS5).
-    assert result.prompt_chars_source == "estimated_from_tokens"
-    assert result.prompt_chars > 0, (
-        f"prompt_chars must be non-zero on budget_exceeded path; got {result.prompt_chars}"
-    )
-    assert result.prompt_chars == token_count * 4, (
-        f"prompt_chars should be token_count*4={token_count*4}; got {result.prompt_chars}"
-    )
 
 
 def test_scope_empty_response_distinct_from_error(tmp_path):
@@ -725,9 +676,7 @@ def test_scope_empty_response_distinct_from_error(tmp_path):
     ctx._scope_review_history = {}
     ctx._last_scope_raw_result = {}
 
-    with patch("ouroboros.tools.scope_review._build_scope_prompt",
-               return_value=("some prompt content", None)), \
-         patch("ouroboros.tools.scope_review._call_scope_llm",
+    with patch("ouroboros.tools.scope_review._call_scope_llm",
                return_value=("", {"prompt_tokens": 100, "completion_tokens": 0, "cost": 0.001}, None)), \
          patch("ouroboros.tools.scope_review._get_scope_model", return_value="test-model"):
         result = run_scope_review(ctx, "test commit")

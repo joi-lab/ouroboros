@@ -44,8 +44,8 @@ def test_active_lifecycle_job_is_merged_into_skill_event_stream():
     assert "function lifecycleEventsFromQueue(queueResp)" in src
     assert "const active = queueResp?.active;" in src
     assert "return [...deduped, active];" in src
-    assert "const lifecycleEvents = lifecycleEventsFromQueue(queueResp);" in src
-    assert "mergeLifecycleEvents(extResp.skills || [], lifecycleEvents)" in src
+    assert "lifecycleEventsFromQueue(snapshot.queue)" in src
+    assert "mergeLifecycleEvents(snapshot.rawSkills," in src
 
 
 def test_card_renders_pending_lifecycle_chip():

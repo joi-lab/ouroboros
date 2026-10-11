@@ -53,49 +53,6 @@ def test_find_child_tasks_scope_direct_excludes_siblings_and_parent(tmp_path):
     assert {r["task_id"] for r in p_direct} == {"g"}
 
 
-# --- 1.5d cost_usd_with_children rollup -------------------------------------
-
-def test_compute_cost_with_children_rolls_up_direct_children(tmp_path):
-    from ouroboros.task_status import compute_cost_with_children
-
-    root = tmp_path
-    _write_result(root, "child1", delegation_role="subagent", parent_task_id="parent",
-                  root_task_id="parent", cost_usd=1.5, cost_final=True, status="completed")
-    # A grandchild already rolled up into child2's own with-children total.
-    _write_result(root, "child2", delegation_role="subagent", parent_task_id="parent",
-                  root_task_id="parent", cost_usd=2.0, cost_usd_with_children=5.0,
-                  cost_final=True, status="completed")
-
-    total, partial = compute_cost_with_children(root, "parent", own_cost_usd=0.5)
-    # own(0.5) + child1(1.5) + child2 rolled-up(5.0) = 7.0
-    assert total == 7.0
-    assert partial is False
-
-
-def test_compute_cost_with_children_marks_partial_for_running_child(tmp_path):
-    from ouroboros.task_status import compute_cost_with_children
-
-    root = tmp_path
-    _write_result(root, "c1", delegation_role="subagent", parent_task_id="p",
-                  root_task_id="p", cost_usd=1.0, status="running")
-    total, partial = compute_cost_with_children(root, "p", own_cost_usd=0.25)
-    assert total == 1.25
-    assert partial is True
-
-
-def test_compute_cost_with_children_marks_unavailable_terminal_child_partial(tmp_path):
-    from ouroboros.task_status import compute_cost_with_children
-
-    _write_result(
-        tmp_path, "c1", delegation_role="subagent", parent_task_id="p",
-        root_task_id="p", status="completed", cost_usd=None,
-        cost_accounting_status="unavailable", cost_final=False,
-    )
-    total, partial = compute_cost_with_children(tmp_path, "p", own_cost_usd=0.25)
-    assert total == 0.25
-    assert partial is True
-
-
 # --- 1.3 policy_denials bucket ----------------------------------------------
 
 def test_policy_denial_does_not_degrade_or_headline_tool_failure():
@@ -115,8 +72,8 @@ def test_policy_denial_does_not_degrade_or_headline_tool_failure():
         assert ex["policy_denials"][0]["status"] == status, status
 
 
-def test_genuine_error_still_headlines_tool_failure():
-    from ouroboros.outcomes import EXECUTION_DEGRADED, derive_loop_outcome
+def test_genuine_error_is_recorded_without_headlining_a_tool_failure():
+    from ouroboros.outcomes import EXECUTION_OK, derive_loop_outcome
 
     out = derive_loop_outcome(
         "done",
@@ -124,16 +81,19 @@ def test_genuine_error_still_headlines_tool_failure():
         {"tool_calls": [{"tool": "run_command", "is_error": True, "status": "error",
                          "result": "⚠️ boom"}]},
     )
-    assert out["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert out["reason_code"] == "tool_failure"
+    assert out["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert out["reason_code"] == "final_message"
+    assert out["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "error"
+    assert out["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
 
 # --- EFFORT_SCALE SSOT (1.8) -------------------------------------------------
 
-def test_effort_scale_ordered_and_includes_xhigh_max():
-    assert EFFORT_SCALE == ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+def test_effort_scale_ordered_and_top_tier_is_last():
+    assert EFFORT_SCALE == ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
     assert effort_rank("xhigh") > effort_rank("high")
-    assert effort_rank("max") == len(EFFORT_SCALE) - 1
+    assert effort_rank("ultra") > effort_rank("max")
+    assert effort_rank("ultra") == len(EFFORT_SCALE) - 1
     assert effort_rank("bogus") == -1
 
 
@@ -145,16 +105,19 @@ def test_clamp_effort_to_ceiling():
 
 
 def test_effort_one_step_down():
+    assert effort_one_step_down("ultra") == "max"
     assert effort_one_step_down("max") == "xhigh"
     assert effort_one_step_down("xhigh") == "high"
     assert effort_one_step_down("none") == "none"       # floor
 
 
-def test_resolve_effort_accepts_xhigh_and_max(monkeypatch):
+def test_resolve_effort_accepts_the_top_tiers(monkeypatch):
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "xhigh")
     assert resolve_effort("task") == "xhigh"
     monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "max")
     assert resolve_effort("task") == "max"
+    monkeypatch.setenv("OUROBOROS_EFFORT_TASK", "ultra")
+    assert resolve_effort("task") == "ultra"
 
 
 def test_normalize_reasoning_effort_uses_scale():
@@ -162,6 +125,7 @@ def test_normalize_reasoning_effort_uses_scale():
 
     assert normalize_reasoning_effort("max") == "max"
     assert normalize_reasoning_effort("xhigh") == "xhigh"
+    assert normalize_reasoning_effort("ultra") == "ultra"
     assert normalize_reasoning_effort("bogus") == "medium"
 
 
@@ -293,7 +257,7 @@ def test_anthropic_direct_effort_rejection_degrades_gracefully(
     monkeypatch.setattr(_requests, "post", fake_post)
     client = LLMClient(api_key="test")
     LLMClient._REJECTED_PARAMS_CACHE.clear()
-    target = {"resolved_model": "claude-old", "usage_model": "anthropic/claude-old",
+    target = {"provider": "anthropic", "resolved_model": "claude-old", "usage_model": "anthropic/claude-old",
               "base_url": "https://api.anthropic.test", "api_key": "k"}
     msg, _ = client._chat_anthropic(target, [{"role": "user", "content": "hi"}], None, "high", 128, "auto")
     assert msg["content"] == "ok"
@@ -341,10 +305,7 @@ def test_openrouter_nested_reasoning_rejection_retries_and_learns(_clean_effort_
 def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
     _clean_effort_ceiling_cache, monkeypatch
 ):
-    """Anthropic-direct: (a) our `minimal` maps to the provider floor `low` (its
-    documented set has no minimal — an out-of-range value would 400 and poison the
-    learned ceiling); (b) a learned-ceiling clamp lands in the RETURNED usage as
-    reasoning_effort_clamped (the durable llm_usage disclosure, adversarial r1)."""
+    """Anthropic maps minimal to low while legacy model-global clamps stay inert."""
     import requests as _requests
 
     from ouroboros.llm import LLMClient
@@ -368,7 +329,7 @@ def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
 
     monkeypatch.setattr(_requests, "post", fake_post)
     client = LLMClient(api_key="test")
-    target = {"resolved_model": "claude-test-5", "usage_model": "anthropic/claude-test-5",
+    target = {"provider": "anthropic", "resolved_model": "claude-test-5", "usage_model": "anthropic/claude-test-5",
               "base_url": "https://api.anthropic.test", "api_key": "k"}
     msgs = [{"role": "user", "content": "hi"}]
 
@@ -378,11 +339,8 @@ def test_anthropic_direct_effort_mapping_and_clamp_disclosure(
 
     LLMClient._EFFORT_CEILING_CACHE["anthropic/claude-test-5"] = "high"
     _, usage2 = client._chat_anthropic(target, msgs, None, "xhigh", 128, "auto")
-    assert captured[-1]["output_config"] == {"effort": "high"}
-    assert usage2["reasoning_effort_clamped"] == {
-        "requested": "xhigh", "applied": "high",
-        "reason": "learned_ceiling", "model": "anthropic/claude-test-5",
-    }
+    assert captured[-1]["output_config"] == {"effort": "xhigh"}
+    assert "reasoning_effort_clamped" not in usage2
 
 
 def test_remote_lane_usage_carries_clamp_disclosure(_clean_effort_ceiling_cache):

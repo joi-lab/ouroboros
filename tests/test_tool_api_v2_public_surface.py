@@ -2,7 +2,8 @@ import pathlib
 import re
 import shlex
 import sys
-from types import ModuleType, SimpleNamespace
+
+import pytest
 
 from ouroboros.tools.registry import ToolRegistry
 
@@ -41,12 +42,27 @@ def test_legacy_tool_names_are_not_public_schemas(tmp_path):
         assert registry.get_schema_by_name(name) is None
         assert registry.execute(name, {}).startswith("⚠️ Unknown tool")
 
+    # D10: the external coding gateway tool was retired; delegate_start is its
+    # successor. The dead name must be gone from the public schema surface.
+    # (Not folded into LEGACY_PUBLIC_TOOL_NAMES: docs/DEVELOPMENT.md keeps the
+    # D10 retirement record that mentions the old name; the runtime prompts no
+    # longer do — the prompt audit removed the retirement note from SYSTEM.md.)
+    assert "claude_code_edit" not in names
+    assert registry.get_schema_by_name("claude_code_edit") is None
+    assert registry.execute("claude_code_edit", {}).startswith("⚠️ Unknown tool")
+
+    # `run_ci_tests` (push, dispatch, wait) is retired with no alias; `get_github_checks` succeeds it
+    # for reading only (tests/test_disabled_tools_policy.py pins the absent shim and table rows).
+    assert "run_ci_tests" not in names and "get_github_checks" in names
+    assert registry.get_schema_by_name("run_ci_tests") is None
+    assert registry.execute("run_ci_tests", {}).startswith("⚠️ Unknown tool")
+
     assert {
         "read_file",
         "write_file",
         "search_code",
         "run_command",
-        "claude_code_edit",
+        "delegate_start",
         "commit_reviewed",
         "schedule_subagent",
         "skill_review",
@@ -109,7 +125,7 @@ def test_runtime_prompts_do_not_advertise_legacy_public_tool_names():
         "read_file",
         "run_command",
         "commit_reviewed",
-        "advisory_review",
+        "preflight_review",
         "schedule_subagent",
         "task_acceptance_review",
     ):
@@ -150,7 +166,9 @@ def test_skill_payload_write_named_bible_is_not_system_protected(tmp_path, monke
     repo = tmp_path / "repo"
     data = tmp_path / "data"
     repo.mkdir()
-    (data / "skills" / "external" / "alpha").mkdir(parents=True)
+    payload = data / "skills" / "external" / "alpha"
+    payload.mkdir(parents=True)
+    (payload / "SKILL.md").write_text("# alpha\n", encoding="utf-8")
     registry = ToolRegistry(repo_dir=repo, drive_root=data)
 
     result = registry.execute(
@@ -179,6 +197,21 @@ def _registry_under_fake_home(tmp_path, monkeypatch):
     monkeypatch.setattr(pathlib.Path, "home", lambda: home)
     registry = ToolRegistry(repo_dir=repo, drive_root=data)
     registry._ctx.task_id = "task1"
+    from ouroboros.tools import shell
+
+    original_env = shell._shell_env_for_cwd
+
+    def fixture_child_env(ctx, cwd):
+        return {**original_env(ctx, cwd), "HOME": str(home), "USERPROFILE": str(home),
+                "OUROBOROS_DATA_DIR": str(data), "OUROBOROS_SETTINGS_PATH": str(data / "settings.json")}
+
+    # Bind the process environment without moving the parent pytest live-data
+    # guard onto this fixture's production-shaped home/Ouroboros/data tree.
+    monkeypatch.setattr(shell, "_shell_env_for_cwd", fixture_child_env)
+    child_env = shell._shell_env_for_cwd(registry._ctx, registry._ctx.task_drive_root())
+    assert child_env["HOME"] == child_env["USERPROFILE"] == str(home)
+    assert child_env["OUROBOROS_DATA_DIR"] == str(data)
+    assert child_env["OUROBOROS_SETTINGS_PATH"] == str(data / "settings.json")
     return registry, repo, data, desktop
 
 
@@ -237,11 +270,13 @@ def test_user_files_root_blocks_ouroboros_control_plane(tmp_path, monkeypatch):
     assert not case_variant.exists()
 
 
-def test_user_files_root_blocks_workspace_parent_and_home_secrets(tmp_path, monkeypatch):
+def test_user_files_root_blocks_workspace_parent_reads_home_secrets(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     home = pathlib.Path.home()
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "id_rsa").write_text("plain marker content", encoding="utf-8")
 
     parent_result = registry.execute(
         "write_file",
@@ -254,22 +289,35 @@ def test_user_files_root_blocks_workspace_parent_and_home_secrets(tmp_path, monk
 
     assert "WRITE_FILE_ERROR" in parent_result
     assert "user_files path blocked" in parent_result
-    assert "READ_FILE_ERROR" in secret_result
-    assert "credential-like" in secret_result
+    # capinv-447 / В23=A: the ROOT principal READS credential-shaped home
+    # paths (secret BYTES are masked at egress, not refused at read time).
+    assert "USER_FILES_PATH_BLOCKED" not in secret_result
+    assert "plain marker content" in secret_result
     assert not (home / "Ouroboros" / "AGENTS.md").exists()
 
 
-def test_user_files_root_blocks_case_insensitive_home_secrets(tmp_path, monkeypatch):
+def test_user_files_root_preserves_ordinary_credential_named_files(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    keychain = home / "library" / "Keychains" / "login.keychain-db"
+    keychain.parent.mkdir(parents=True)
+    keychain.write_text("keychain marker", encoding="utf-8")
 
+    # READS of credential-shaped paths are allowed for root (capinv-447 / В23=A)...
     library = registry.execute("read_file", {"root": "user_files", "path": "library/Keychains/login.keychain-db"})
+    # A project filename alone is not an owner credential store.
     creds = registry.execute("write_file", {"root": "user_files", "path": "Desktop/Credentials.json", "content": "{}"})
+    # A key/certificate SUFFIX is not a credential: the write lands (owner
+    # answer Q6 of batch 2 - refusal authority is leaves and locations, not names).
     pem = registry.execute("write_file", {"root": "user_files", "path": "Desktop/id_rsa.PEM", "content": "secret"})
 
-    assert "credential-like" in library
-    assert "credential-like" in creds
-    assert "credential-like" in pem
+    assert "USER_FILES_PATH_BLOCKED" not in library
+    assert "keychain marker" in library
+    assert "ARTIFACT_OUTPUTS" in creds
+    assert (home / "Desktop/Credentials.json").read_text() == "{}"
+    assert "credential-like" not in pem
+    assert (home / "Desktop" / "id_rsa.PEM").read_text(encoding="utf-8") == "secret"
 
 
 def test_list_files_user_files_blocks_ouroboros_control_plane(tmp_path, monkeypatch):
@@ -279,7 +327,8 @@ def test_list_files_user_files_blocks_ouroboros_control_plane(tmp_path, monkeypa
 
     result = registry.execute("list_files", {"root": "user_files", "path": "Ouroboros/repo"})
 
-    assert "LIST_FILES_ERROR" in result
+    # Typed policy-denial prefix (v6.57.0 partition) — no generic LIST_FILES_ERROR wrap.
+    assert "USER_FILES_PATH_BLOCKED" in result
     assert "user_files path blocked" in result
     assert "README.md" not in result
 
@@ -310,7 +359,8 @@ def test_light_mode_blocks_runtime_data_as_artifact_workaround(tmp_path, monkeyp
     assert not (data / "uploads" / "report.html").exists()
 
 
-def test_light_mode_blocks_process_runtime_data_upload_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_process_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -333,12 +383,12 @@ def test_light_mode_blocks_process_runtime_data_upload_writes(tmp_path, monkeypa
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.exists()
 
 
-def test_light_mode_blocks_run_script_runtime_data_upload_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_run_script_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -353,15 +403,16 @@ def test_light_mode_blocks_run_script_runtime_data_upload_writes(tmp_path, monke
                 "p.parent.mkdir(parents=True, exist_ok=True)\n"
                 "p.write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.exists()
 
 
-def test_light_mode_blocks_relative_process_runtime_data_upload_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_relative_process_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -385,12 +436,12 @@ def test_light_mode_blocks_relative_process_runtime_data_upload_writes(tmp_path,
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.exists()
 
 
-def test_light_mode_blocks_env_runtime_data_upload_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_env_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -404,19 +455,18 @@ def test_light_mode_blocks_env_runtime_data_upload_writes(tmp_path, monkeypatch)
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.read_text() == "bad\n"
 
 
-def test_light_mode_blocks_interpreter_runtime_data_touch_without_write_marker(tmp_path, monkeypatch):
+
+@pytest.mark.serial
+def test_light_mode_executes_interpreter_runtime_data_touch_without_write_marker(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     upload = data / "uploads" / "touch-report.html"
     python_exe = str(pathlib.Path(sys.executable))
-    if not pathlib.PurePath(python_exe).name.lower().endswith(".exe"):
-        python_exe = f"{python_exe}.exe"
 
     result = registry.execute(
         "run_command",
@@ -435,12 +485,12 @@ def test_light_mode_blocks_interpreter_runtime_data_touch_without_write_marker(t
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.exists()
 
 
-def test_light_mode_blocks_home_runtime_data_upload_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_home_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -466,15 +516,14 @@ def test_light_mode_blocks_home_runtime_data_upload_writes(tmp_path, monkeypatch
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in home_result
-    assert "runtime_data" in home_result
-    assert "LIGHT_MODE_BLOCKED" in tilde_result
-    assert "runtime_data" in tilde_result
-    assert not home_upload.exists()
-    assert not tilde_upload.exists()
+    assert "exit_code=0" in home_result, home_result
+    assert "exit_code=0" in tilde_result, tilde_result
+    assert home_upload.read_bytes() == tilde_upload.read_bytes() == b""
 
 
-def test_light_mode_blocks_relative_run_script_runtime_data_upload_writes(tmp_path, monkeypatch):
+
+@pytest.mark.serial
+def test_light_mode_executes_relative_run_script_runtime_data_upload_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -489,12 +538,12 @@ def test_light_mode_blocks_relative_run_script_runtime_data_upload_writes(tmp_pa
                 "p.parent.mkdir(parents=True, exist_ok=True)\n"
                 "p.write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
+    assert "exit_code=0" in result, result
+    assert upload.exists()
 
 
 def test_light_run_script_allows_readonly_repo_analysis_with_external_write(tmp_path, monkeypatch):
@@ -513,6 +562,7 @@ def test_light_run_script_allows_readonly_repo_analysis_with_external_write(tmp_
                 "out.write_text(repo)\n"
                 "import sys; sys.stdout.write(repo)\n"
             ),
+            "cwd": "task_drive",
             "outputs": [str(out)],
         },
     )
@@ -521,7 +571,8 @@ def test_light_run_script_allows_readonly_repo_analysis_with_external_write(tmp_
     assert out.read_text(encoding="utf-8") == str(repo)
 
 
-def test_light_run_script_blocks_dynamic_repo_write_even_from_task_drive(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_run_script_executes_dynamic_repo_write_even_from_task_drive(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -536,14 +587,16 @@ def test_light_run_script_blocks_dynamic_repo_write_even_from_task_drive(tmp_pat
                 "name = 'dynamic.txt'\n"
                 "(repo / name).write_text('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert not target.exists()
+    assert "exit_code=0" in result, result
+    assert target.read_text(encoding="utf-8") == "bad"
 
 
-def test_light_run_script_blocks_path_open_repo_write(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_run_script_executes_path_open_repo_write(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -556,11 +609,12 @@ def test_light_run_script_blocks_path_open_repo_write(tmp_path, monkeypatch):
                 "from pathlib import Path\n"
                 f"Path({str(target)!r}).open('w').write('bad')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert not target.exists()
+    assert "exit_code=0" in result, result
+    assert target.read_text(encoding="utf-8") == "bad"
 
 
 def test_light_run_script_allows_constant_expression_task_drive_write(tmp_path, monkeypatch):
@@ -577,6 +631,7 @@ def test_light_run_script_allows_constant_expression_task_drive_write(tmp_path, 
                 "name = 'out' + '.txt'\n"
                 "Path(name).write_text('ok')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -598,6 +653,7 @@ def test_light_run_script_allows_resolved_open_handle_task_drive_write(tmp_path,
                 "f.write('ok')\n"
                 "f.close()\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -613,7 +669,7 @@ def test_light_run_script_allows_with_open_handle_task_drive_write(tmp_path, mon
 
     result = registry.execute(
         "run_script",
-        {"script": "with open('with-open.txt', 'w') as f:\n    f.write('ok')\n"},
+        {"script": "with open('with-open.txt', 'w') as f:\n    f.write('ok')\n", "cwd": "task_drive"},
     )
 
     assert "LIGHT_MODE_BLOCKED" not in result, result
@@ -633,6 +689,7 @@ def test_light_run_script_allows_path_cwd_task_drive_write(tmp_path, monkeypatch
                 "from pathlib import Path\n"
                 "(Path.cwd() / 'cwd-write.txt').write_text('ok')\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -654,6 +711,7 @@ def test_light_run_script_allows_in_memory_write_method(tmp_path, monkeypatch):
                 "buf.write('ok')\n"
                 "print(buf.getvalue())\n"
             ),
+            "cwd": "task_drive",
         },
     )
 
@@ -681,7 +739,8 @@ def test_artifact_store_blocks_control_manifest_edits(tmp_path, monkeypatch):
     )
 
     assert "WRITE_FILE_BLOCKED" in write_result
-    assert "WRITE_FILE_BLOCKED" in hidden_result
+    assert "OK: wrote artifact_store:.meta/report.json" in hidden_result
+    assert (data / "task_results/artifacts/task1/.meta/report.json").read_text() == "{}"
     assert "EDIT_TEXT_BLOCKED" in edit_result
     assert not (data / "task_results" / "artifacts" / "task1" / ".artifact_manifest.json").exists()
 
@@ -713,7 +772,7 @@ def test_write_file_batch_partial_failure_is_semantic_failure(tmp_path, monkeypa
     assert not (data / "task_results" / "artifacts" / "task1" / ".artifact_manifest.json").exists()
 
 
-def test_run_script_light_default_cwd_is_task_drive_and_outputs_are_artifacts(tmp_path, monkeypatch):
+def test_run_script_light_explicit_task_drive_outputs_are_artifacts(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     registry, repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
@@ -722,6 +781,7 @@ def test_run_script_light_default_cwd_is_task_drive_and_outputs_are_artifacts(tm
         "run_script",
         {
             "script": "from pathlib import Path\nif 1 > 0:\n    Path('probe.txt').write_text('ok')\n",
+            "cwd": "task_drive",
             "outputs": ["probe.txt"],
         },
     )
@@ -788,6 +848,7 @@ def test_run_script_registers_directory_outputs_as_manifest_and_zip(tmp_path, mo
                 "Path('site/index.html').write_text('<h1>ok</h1>')\n"
                 "Path('site/assets/app.js').write_text('console.log(1)')\n"
             ),
+            "cwd": "task_drive",
             "outputs": ["site"],
         },
     )
@@ -885,6 +946,7 @@ def test_run_command_outputs_registers_artifact(tmp_path, monkeypatch):
 
     assert "exit_code=0" in result
     assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "ARTIFACT_OUTPUT_UNDECLARED" not in result
     assert "registered output" in result
     assert (data / "task_results" / "artifacts" / "task1" / "deliverable.txt").read_text(encoding="utf-8") == "ok"
     records = collect_task_artifact_records(data, "task1")
@@ -987,7 +1049,7 @@ def test_run_command_without_outputs_blocks_absolute_user_file_writes(tmp_path, 
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1020,7 +1082,7 @@ def test_run_command_artifact_error_still_invalidates_repo_advisory(tmp_path, mo
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert calls
     assert calls[-1][1]["source_tool"] == "run_command"
     assert "changed.txt" in calls[-1][1]["changed_paths"]
@@ -1046,6 +1108,7 @@ def test_run_command_without_outputs_allows_absolute_user_file_reads(tmp_path, m
     )
 
     assert "ARTIFACT_OUTPUT_ERROR" not in result
+    assert "ARTIFACT_OUTPUT_UNDECLARED" not in result
     assert "exit_code=0" in result
 
 
@@ -1067,7 +1130,7 @@ def test_run_command_without_outputs_blocks_absolute_user_file_open_writes(tmp_p
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1091,9 +1154,14 @@ def test_run_script_without_outputs_flags_absolute_user_file_writes(tmp_path, mo
         },
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "run_script wrote user_files without declaring outputs" in result
     assert str(target) in result
+    # #447/D5: the nudge must not REPLACE the payload. It held line 1 (the typed
+    # policy-denial surface the classifier reads) and returned nothing else, so a
+    # successful script's own output was discarded. The script path and the run
+    # result now ride behind the marker.
+    assert "# script_path=" in result
     # The write happened (post-exec) but the file is NOT registered as an artifact.
     assert target.read_text(encoding="utf-8") == "<h1>ok</h1>"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1110,7 +1178,7 @@ def test_run_command_without_outputs_detects_shell_redirection_to_user_files(tmp
         {"cmd": ["sh", "-c", f"echo ok > {shlex.quote(target.as_posix())}"], "cwd": str(desktop)},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
+    assert result.startswith("⚠️ ARTIFACT_OUTPUT_UNDECLARED"), result
     assert "without declaring outputs" in result
     assert target.read_text(encoding="utf-8").strip() == "ok"
     assert not (data / "task_results" / "artifacts" / "task1" / target.name).exists()
@@ -1154,7 +1222,7 @@ def test_run_command_outputs_block_new_credential_like_repo_file(tmp_path, monke
     assert not (data / "task_results" / "artifacts" / "task1" / ".env").exists()
 
 
-def test_workspace_run_command_outputs_cannot_import_user_files(tmp_path, monkeypatch):
+def test_workspace_run_command_outputs_can_reference_policy_visible_user_files(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     workspace = tmp_path / "workspace"
@@ -1169,191 +1237,9 @@ def test_workspace_run_command_outputs_cannot_import_user_files(tmp_path, monkey
         {"cmd": ["python3", "-c", "print('ok')"], "cwd": str(workspace), "outputs": [str(desktop / "outside.txt")]},
     )
 
-    assert result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
-    assert "output escapes allowed artifact roots" in result
-    assert not (data / "task_results" / "artifacts" / "task1" / "outside.txt").exists()
-
-
-def test_light_mode_allows_claude_code_edit_external_user_files_cwd(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-    captured = {}
-
-    def fake_run_edit(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit external file", "cwd": str(desktop)})
-
-    assert "LIGHT_MODE_BLOCKED" not in result
-    assert result.startswith("OK: external edit")
-    assert "ARTIFACT_AUDIT_GAP" in result
-    assert pathlib.Path(captured["cwd"]) == desktop
-
-
-def test_claude_code_edit_user_files_cwd_reuses_user_files_secret_guard(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        blocker = kwargs.get("write_path_blocker")
-        control_plane_case_variant = pathlib.Path.home() / "ouroboros" / "repo" / "README.md"
-        assert blocker is not None
-        assert "credential-like" in blocker(desktop / ".env")
-        assert "credential-like" in blocker(desktop / "Credentials.json")
-        assert "overlaps" in blocker(control_plane_case_variant)
-        assert blocker(desktop / "report.html") == ""
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit external file", "cwd": str(desktop)})
-
-    assert result.startswith("OK: external edit")
-
-
-def test_claude_code_edit_artifact_store_cwd_reuses_artifact_control_guard(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    artifact_store = pathlib.Path(registry._ctx.drive_root) / "task_results" / "artifacts" / "task1"
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        blocker = kwargs.get("write_path_blocker")
-        assert blocker is not None
-        assert "reserved" in blocker(artifact_store / ".artifact_manifest.json")
-        assert blocker(artifact_store / "report.html") == ""
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: artifact edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit artifact", "cwd": str(artifact_store)})
-
-    assert result.startswith("OK: artifact edit")
-
-
-def test_claude_code_edit_external_outputs_are_registered(tmp_path, monkeypatch):
-    from ouroboros.artifacts import collect_task_artifact_records
-
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**kwargs):
-        pathlib.Path(kwargs["cwd"], "deck.html").write_text("<h1>ok</h1>", encoding="utf-8")
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute(
-        "claude_code_edit",
-        {"prompt": "create external file", "cwd": str(desktop), "outputs": ["deck.html"]},
-    )
-
-    assert result.startswith("OK: external edit")
-    assert "ARTIFACT_OUTPUTS" in result
-    assert (data / "task_results" / "artifacts" / "task1" / "deck.html").read_text(encoding="utf-8") == "<h1>ok</h1>"
-    records = collect_task_artifact_records(data, "task1")
-    assert records[0]["kind"] == "process_output"
-    assert records[0]["source_path"] == str(desktop / "deck.html")
-
-
-def test_claude_code_edit_outputs_require_fresh_file_change(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    (desktop / "deck.html").write_text("old", encoding="utf-8")
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-
-    def fake_run_edit(**_kwargs):
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: external edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "create external file", "cwd": str(desktop), "outputs": ["deck.html"]})
-
-    # C2 (v6.36.0): present-but-unchanged declared output is cosmetic, not blocking.
     assert not result.startswith("⚠️ ARTIFACT_OUTPUT_ERROR"), result
     assert "unchanged output (cosmetic)" in result
-    assert not (data / "task_results" / "artifacts" / "task1" / "deck.html").exists()
+    assert not (data / "task_results" / "artifacts" / "task1" / "outside.txt").exists()
 
 
 def test_repeated_user_file_write_updates_same_canonical_artifact(tmp_path, monkeypatch):
@@ -1446,47 +1332,6 @@ def test_search_code_user_files_default_path_prunes_protected_children(tmp_path,
     assert "Desktop/notes.txt" in result
 
 
-def test_claude_code_edit_workspace_allows_task_drive_cwd(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    registry._ctx.workspace_mode = "workspace"
-    registry._ctx.workspace_root = str(workspace)
-    registry._ctx.active_repo_dir = lambda: workspace
-    task_drive = registry._ctx.task_drive_root()
-    task_drive.mkdir(parents=True, exist_ok=True)
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
-    captured = {}
-
-    def fake_run_edit(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            success=True,
-            cost_usd=0,
-            usage={},
-            changed_files=[],
-            diff_stat="",
-            validation_summary="",
-            error="",
-            result_text="ok",
-            to_tool_output=lambda: "OK: task drive edit",
-        )
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "edit artifact", "cwd": str(task_drive)})
-
-    assert result == "OK: task drive edit"
-    assert pathlib.Path(captured["cwd"]) == task_drive
-    assert (data / "task_results" / "artifacts" / "task1").exists() is False
-
-
 def test_task_drive_root_is_scratch_even_for_forked_workspace(tmp_path, monkeypatch):
     registry, _repo, data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     child_drive = data / "headless_tasks" / "task1" / "data"
@@ -1504,32 +1349,22 @@ def test_invalid_workspace_overlap_blocked_at_tool_boundary(tmp_path, monkeypatc
     registry, repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
     registry._ctx.workspace_mode = "workspace"
     registry._ctx.workspace_root = str(repo)
-    called = {"value": False}
-    gateway = ModuleType("ouroboros.gateways.claude_code")
-    gateway.DEFAULT_CLAUDE_CODE_MAX_TURNS = 3
-    gateway.resolve_claude_code_model = lambda: "claude-test"
 
-    def fake_run_edit(**_kwargs):
-        called["value"] = True
-        return SimpleNamespace(success=True, cost_usd=0, usage={}, changed_files=[], diff_stat="", validation_summary="", error="", result_text="", to_tool_output=lambda: "OK")
-
-    gateway.run_edit = fake_run_edit
-    monkeypatch.setitem(sys.modules, "ouroboros.gateways.claude_code", gateway)
-
-    result = registry.execute("claude_code_edit", {"prompt": "try forged workspace", "cwd": str(repo)})
+    result = registry.execute("run_command", {"command": "echo forged-workspace-probe"})
 
     assert "WORKSPACE_MODE_BLOCKED" in result
     assert "overlaps" in result
-    assert called["value"] is False
+    assert "forged-workspace-probe" not in result
 
     registry._ctx.workspace_root = str(pathlib.Path(str(repo).replace("Ouroboros", "ouroboros")))
-    case_result = registry.execute("claude_code_edit", {"prompt": "try forged workspace", "cwd": str(repo)})
+    case_result = registry.execute("run_command", {"command": "echo forged-workspace-probe"})
 
     assert "WORKSPACE_MODE_BLOCKED" in case_result
     assert "overlaps" in case_result
+    assert "forged-workspace-probe" not in case_result
 
 
-def test_system_repo_write_blocks_when_active_workspace_differs(tmp_path, monkeypatch):
+def test_system_repo_write_targets_system_when_active_workspace_differs(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     repo = tmp_path / "repo"
     active = tmp_path / "workspace"
@@ -1542,12 +1377,14 @@ def test_system_repo_write_blocks_when_active_workspace_differs(tmp_path, monkey
 
     result = registry.execute("write_file", {"root": "system_repo", "path": "x.txt", "content": "x"})
 
-    assert "WRITE_FILE_BLOCKED" in result
+    assert result.startswith("✅ Written")
+    assert "system_repo:x.txt" in result
     assert not (active / "x.txt").exists()
-    assert not (repo / "x.txt").exists()
+    assert (repo / "x.txt").read_text(encoding="utf-8") == "x"
 
 
-def test_light_mode_blocks_interpreter_inline_repo_writes(tmp_path, monkeypatch):
+@pytest.mark.serial
+def test_light_mode_executes_interpreter_inline_repo_writes(tmp_path, monkeypatch):
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
     repo = tmp_path / "repo"
@@ -1560,8 +1397,8 @@ def test_light_mode_blocks_interpreter_inline_repo_writes(tmp_path, monkeypatch)
         {"cwd": str(repo), "script": "open('tmp_probe_no_write', 'w').write('x')"},
     )
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert not (repo / "tmp_probe_no_write").exists()
+    assert "exit_code=0" in result, result
+    assert (repo / "tmp_probe_no_write").read_text(encoding="utf-8") == "x"
 
 
 def test_light_mode_default_root_does_not_treat_repo_skills_path_as_payload(tmp_path, monkeypatch):
@@ -1592,3 +1429,149 @@ def test_get_runtime_mode_prefers_boot_baseline(monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "pro")
 
     assert cfg.get_runtime_mode() == "light"
+
+
+# --- submarine unwind (2026-08-08): legible confinement + typed policy denials --
+
+def test_user_files_block_names_subagent_projects_root(tmp_path, monkeypatch):
+    """A refused coop-tree path names the ONE root that can actually reach it
+    (root=subagent_projects + the exact relative path) instead of four roots
+    that cannot (waves 2-3 rediscovery loop). Message-only: the root stays
+    read-only and the shell/write boundary is unchanged."""
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    projects = home / "Ouroboros" / "projects"
+    (projects / "coop_abc123" / "render").mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects))
+
+    result = registry.execute(
+        "list_files",
+        {"root": "user_files", "path": str(projects / "coop_abc123" / "render")},
+    )
+    assert "USER_FILES_PATH_BLOCKED" in result
+    assert "root=subagent_projects" in result
+    assert "coop_abc123" in result
+    # The suggested call actually works (read-only root, same profile).
+    listing = registry.execute(
+        "list_files", {"root": "subagent_projects", "path": "coop_abc123/render"}
+    )
+    assert "⚠️" not in listing
+
+
+def test_user_files_read_block_status_is_policy_denial(tmp_path, monkeypatch):
+    """The typed USER_FILES_PATH_BLOCKED status is partitioned as a policy denial
+    (v6.57.0): an unrecovered read-side confinement refusal lands in
+    execution.policy_denials, never unresolved/tool_failure."""
+    from ouroboros.loop_tool_execution import _extract_result_metadata
+    from ouroboros.outcomes import _POLICY_DENIAL_STATUSES, _classify_tool_errors
+
+    meta = _extract_result_metadata(
+        "list_files",
+        "⚠️ USER_FILES_PATH_BLOCKED: user_files path blocked: path overlaps ...",
+        True,
+    )
+    assert meta["status"] == "user_files_path_blocked"
+    assert meta["status"] in _POLICY_DENIAL_STATUSES
+    buckets = _classify_tool_errors({
+        "tool_calls": [
+            {"tool": "list_files", "is_error": True, "status": "user_files_path_blocked", "args": {}},
+        ]
+    })
+    assert buckets["unresolved"] == []
+    assert len(buckets["policy_denials"]) == 1
+
+
+def test_artifact_output_nudge_split_from_registration_failure():
+    """The exit_code=0 undeclared-outputs NUDGE is typed apart from the real
+    'declared output registration failed' case: the nudge is a policy denial,
+    the registration failure stays a genuine blocking error."""
+    from ouroboros.loop_tool_execution import _extract_result_metadata, _is_tool_execution_failure
+    from ouroboros.outcomes import _BLOCKING_TOOL_STATUSES, _POLICY_DENIAL_STATUSES
+
+    nudge = (
+        "⚠️ ARTIFACT_OUTPUT_UNDECLARED: command appears to write user_files outputs "
+        "without declaring outputs=[...]. Paths: /x/y.txt.\n\nexit_code=0\n"
+    )
+    assert _is_tool_execution_failure(True, nudge) is True  # honest ⚠️ in the trace
+    nudge_meta = _extract_result_metadata("run_command", nudge, True)
+    assert nudge_meta["status"] == "artifact_output_undeclared"
+    assert nudge_meta["status"] in _POLICY_DENIAL_STATUSES
+
+    real = "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.\nexit_code=0\n"
+    real_meta = _extract_result_metadata("run_command", real, True)
+    assert real_meta["status"] == "artifact_output_error"
+    assert real_meta["status"] in _BLOCKING_TOOL_STATUSES
+    assert real_meta["status"] not in _POLICY_DENIAL_STATUSES
+
+
+def test_python_cwd_failure_emits_canonical_cwd_message(tmp_path, monkeypatch):
+    """A python/python3 launch with a confined cwd gets the SAME self-healing
+    SHELL_CWD_BLOCKED root list a non-python command gets — not an opaque
+    interpreter-provenance message (submarine waves 1/3, python3 -m http.server)."""
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    blocked_cwd = home / "Ouroboros" / "projects" / "coop_x"
+    blocked_cwd.mkdir(parents=True)
+
+    result = registry.execute(
+        "run_command",
+        {"cmd": ["python3", "-m", "http.server"], "cwd": str(blocked_cwd)},
+    )
+    assert "SHELL_CWD_BLOCKED" in result
+    assert "PYTHON_INTERPRETER_UNAVAILABLE" not in result
+    assert "task_drive=" in result  # label=path root list (v6.54.3)
+
+
+def test_service_cwd_failure_emits_canonical_cwd_message(tmp_path, monkeypatch):
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    registry, _repo, _data, _desktop = _registry_under_fake_home(tmp_path, monkeypatch)
+    home = pathlib.Path.home()
+    blocked_cwd = home / "Ouroboros" / "projects" / "coop_y"
+    blocked_cwd.mkdir(parents=True)
+
+    result = registry.execute(
+        "start_service",
+        {"cmd": ["node", "server.js"], "name": "svc-cwd", "cwd": str(blocked_cwd)},
+    )
+    assert "SHELL_CWD_BLOCKED" in result
+    assert "SERVICE_CWD_ERROR" not in result
+    assert "task_drive=" in result
+
+
+def test_preflight_review_rename_keeps_a_callable_unadvertised_alias(tmp_path):
+    """Q1 rename: `preflight_review` is the advertised organ; `advisory_review`
+    stays CALLABLE as a compat alias (saved prompts/memories/configs keep
+    working) but never appears on the public schema surface, and a contract
+    that withholds either spelling silences both."""
+    from ouroboros.safety import POLICY_SKIP, TOOL_POLICY
+    from ouroboros.contracts.task_contract import build_task_contract
+
+    registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+    names = {schema["function"]["name"] for schema in registry.schemas()}
+    assert "preflight_review" in names
+    assert "advisory_review" not in names
+    assert "advisory_review" not in registry.available_tools()
+    # The core/heal envelope (schemas(core_only=True)) must not advertise the
+    # alias either — B1 class: the default path filtered it, the core path
+    # leaked it into heal-mode prompts.
+    core_names = {schema["function"]["name"] for schema in registry.schemas(core_only=True)}
+    assert "preflight_review" in core_names
+    assert "advisory_review" not in core_names
+    # The alias dispatches to the same organ (a refusal about tool identity
+    # would start with "Unknown tool").
+    assert not registry.execute("advisory_review", {}).startswith("⚠️ Unknown tool")
+    # And the unknown-tool refusal's Available listing never advertises it.
+    listing = registry.execute("definitely_not_a_tool", {})
+    assert "advisory_review" not in listing
+    # Policy rows exist for BOTH spellings (the alias call is policy-skipped
+    # exactly like the canonical one).
+    assert TOOL_POLICY.get("preflight_review") is POLICY_SKIP
+    assert TOOL_POLICY.get("advisory_review") is POLICY_SKIP
+    # disabled_tools compat: either spelling withholds both.
+    for withheld in ("advisory_review", "preflight_review"):
+        contract = build_task_contract({"description": "x", "disabled_tools": [withheld]})
+        reg = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
+        reg._ctx.task_metadata = {"task_contract": contract}
+        listed = {schema["function"]["name"] for schema in reg.schemas()}
+        assert "preflight_review" not in listed

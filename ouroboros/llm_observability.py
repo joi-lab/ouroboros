@@ -3,10 +3,46 @@
 from __future__ import annotations
 
 import pathlib
+import logging
 from typing import Any, Dict, Tuple
 
 from ouroboros.observability import new_call_id, persist_call
+from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.utils import sanitize_tool_result_for_log
+
+
+def retain_cancelled_response(request, response, capture) -> dict:
+    """Keep a received physical response before cancellation unwinds its caller.
+
+    Reuse private CAS and the ordinary call reader. This records the provider
+    object (model_dump for SDK responses), not a completed task/review verdict.
+    Native transports continue to own any original wire-byte receipt separately.
+    """
+    from dataclasses import asdict
+
+    body = response.model_dump() if hasattr(response, "model_dump") else response
+    return persist_call(
+        request.drive_root, task_id=request.task_id or "llm",
+        call_id=f"physical_{capture.attempt_id}_response", call_type="physical_response",
+        payload={"response": body, "physical_attempt_capture": asdict(capture)}, keep_raw=True,
+        manifest={"attempt_id": capture.attempt_id, "model": capture.model,
+                  "provider": capture.provider, "state": capture.state,
+                  "status": "received", "control_reason": "caller_cancelled"},
+    )
+
+
+def persist_observed_call(root: Any, *, payload: Any, writer: Any = None, **identity: Any) -> dict:
+    """Best-effort public trace: opaque continuation never enters this projection.
+
+    Failure to write observability cannot discard an already useful response or
+    authorize another provider call. Private exact-byte transport custody uses
+    persist_call directly and retains its own stronger acknowledgement contract.
+    """
+    try:
+        return (writer or persist_call)(root, payload=public_custody_projection(payload), **identity)
+    except Exception:
+        logging.getLogger(__name__).warning("Failed to persist LLM observability payload", exc_info=True)
+        return {}
 
 
 def _root(drive_root: Any) -> pathlib.Path:
@@ -38,40 +74,42 @@ def chat_observed(
 
     root = _root(drive_root)
     call_id = new_call_id(call_type)
-    try:
-        persist_call(
-            root,
-            task_id=task_id or call_type,
-            call_id=f"{call_id}_request",
-            call_type=f"{call_type}_request",
-            payload={"kwargs": kwargs},
-            manifest=_base_manifest(call_type, kwargs),
-        )
-    except Exception:
-        pass
+    traced_kwargs = {key: value for key, value in kwargs.items() if key != "model_context_observer"}
+    persist_observed_call(
+        root,
+        task_id=task_id or call_type,
+        call_id=f"{call_id}_request",
+        call_type=f"{call_type}_request",
+        payload={"kwargs": traced_kwargs},
+        manifest=_base_manifest(call_type, kwargs),
+    )
     try:
         msg, usage = llm.chat(**kwargs)
     except Exception as exc:
         safe = sanitize_tool_result_for_log(f"{type(exc).__name__}: {exc}")
-        try:
-            persist_call(
-                root,
-                task_id=task_id or call_type,
-                call_id=f"{call_id}_error",
-                call_type=f"{call_type}_error",
-                payload={"error": f"{type(exc).__name__}: {exc}", "kwargs": kwargs},
-                manifest={**_base_manifest(call_type, kwargs), "status": "error", "error": safe},
-            )
-        except Exception:
-            pass
+        persist_observed_call(
+            root,
+            task_id=task_id or call_type,
+            call_id=f"{call_id}_error",
+            call_type=f"{call_type}_error",
+            payload={"error": f"{type(exc).__name__}: {exc}", "kwargs": traced_kwargs},
+            manifest={**_base_manifest(call_type, kwargs), "status": "error", "error": safe},
+        )
         raise
     try:
+        from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
+
+        public_usage = dict(usage)
+        public_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
         persist_call(
             root,
             task_id=task_id or call_type,
             call_id=f"{call_id}_response",
             call_type=f"{call_type}_response",
-            payload={"message": msg, "usage": usage},
+            payload={
+                "message": public_custody_projection(msg),
+                "usage": public_usage,
+            },
             manifest={**_base_manifest(call_type, kwargs), "status": "ok"},
         )
     except Exception:

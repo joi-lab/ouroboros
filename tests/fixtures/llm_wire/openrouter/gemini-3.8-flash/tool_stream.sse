@@ -1,0 +1,12 @@
+data: {"id":"gen-1789330961-uZBxQHAjhuWST342ZRGN","object":"chat.completion.chunk","created":1789330961,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null,"reasoning_details":[{"type":"reasoning.encrypted","data":"AY89a188i0JSWxzcnDmehATx…","format":"google-gemini-v1","id":"call_2023222","index":0}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789330961-uZBxQHAjhuWST342ZRGN","object":"chat.completion.chunk","created":1789330961,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":0,"id":"call_2023222","type":"function","function":{"name":"lookup","arguments":""}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789330961-uZBxQHAjhuWST342ZRGN","object":"chat.completion.chunk","created":1789330961,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":null,"role":"assistant","tool_calls":[{"index":0,"function":{"arguments":"{\"query\":\"ouroboros\"}"}}]},"finish_reason":null,"native_finish_reason":null}]}
+
+data: {"id":"gen-1789330961-uZBxQHAjhuWST342ZRGN","object":"chat.completion.chunk","created":1789330961,"model":"google/gemini-3.8-flash","provider":"Google","choices":[{"index":0,"delta":{"content":"","role":"assistant","reasoning":null},"finish_reason":"tool_calls","native_finish_reason":"STOP"}]}
+
+data: {"id":"gen-1789330961-uZBxQHAjhuWST342ZRGN","object":"chat.completion.chunk","created":1789330961,"model":"google/gemini-3.8-flash","provider":"Google","service_tier":"default","choices":[{"index":0,"delta":{"content":"","role":"assistant"},"finish_reason":"tool_calls","native_finish_reason":"STOP"}],"usage":{"prompt_tokens":45,"completion_tokens":52,"total_tokens":97,"cost":0.00022875,"is_byok":false,"prompt_tokens_details":{"cached_tokens":0,"cache_write_tokens":0,"audio_tokens":0,"video_tokens":0},"cost_details":{"upstream_inference_cost":0.00022875,"upstream_inference_prompt_cost":0.00003375,"upstream_inference_completions_cost":0.000195},"completion_tokens_details":{"reasoning_tokens":36,"image_tokens":0,"audio_tokens":0}}}
+
+data: [DONE]
+

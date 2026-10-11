@@ -36,7 +36,7 @@ def _resolve_local_file(ctx: ToolContext, path: str, *, max_bytes: int) -> tuple
     """Resolve a local file path through the SAME trust boundary as view_image/read_file:
     it must sit under an allowed file root and pass the protected-artifact read guard.
     Returns (path, "") on success or (None, error_message)."""
-    from ouroboros.tools.vision import _allowed_file_roots
+    from ouroboros.tools.vision import _allowed_file_roots, _read_file_parity_block
     from ouroboros.tool_access import path_is_relative_to
 
     text = str(path or "").strip()
@@ -59,6 +59,13 @@ def _resolve_local_file(ctx: ToolContext, path: str, *, max_bytes: int) -> tuple
             "(uploads / active workspace / artifact store / task drive)."
         )
     fp = next((c for c in confined if c.is_file()), confined[0])
+    # SC-6: the SAME per-path rules read_file applies on the matrix-derived roots
+    # (user_files confinement and the
+    # project-store guard) — shared with view_image/vlm_query so root admission
+    # never out-reaches read_file here either.
+    parity_block = _read_file_parity_block(ctx, fp)
+    if parity_block:
+        return None, parity_block
     try:
         from ouroboros.protected_artifacts import block_reason_for_path
 
@@ -104,7 +111,7 @@ def _ocr_pdf(ctx: ToolContext, path: str = "", max_pages: int = 0) -> str:
         return (
             "⚠️ OCR_PDF_SCANNED_UNAVAILABLE: this PDF has no extractable text layer (likely "
             "scanned/image-only). True OCR of scanned pages is not available in this build — "
-            "render a page to an image and call vlm_query on it instead."
+            "render a page to an image and view_image it (or vlm_query it) instead."
         )
     note = "" if total <= cap else f"\n\n[disclosed: showed first {cap} of {total} pages]"
     if len(text) > _OCR_PDF_MAX_CHARS:
@@ -272,7 +279,7 @@ def get_tools() -> List[ToolEntry]:
                     "Extract the text of a local PDF file (the embedded text layer of a digital PDF). "
                     "Use for reading PDFs attached to the task (see the [ATTACHMENTS] manifest) or produced "
                     "during work. Scanned/image-only PDFs have no text layer and return a typed "
-                    "OCR_PDF_SCANNED_UNAVAILABLE notice — for those, render a page and use vlm_query."
+                    "OCR_PDF_SCANNED_UNAVAILABLE notice — for those, render a page and view_image it (or vlm_query it)."
                 ),
                 "parameters": {
                     "type": "object",

@@ -90,7 +90,7 @@ class TestWebAttachmentBlocks:
 
 class TestImageEviction:
     def test_keeps_only_newest_k(self):
-        from ouroboros.loop import _append_or_merge_user_content
+        from ouroboros.loop_messages import _append_or_merge_user_content
 
         messages = []
         for idx in range(MAX_LIVE_IMAGE_BLOCKS + 2):
@@ -116,7 +116,7 @@ class TestImageEviction:
         assert "[image evicted: shot-1]" in rendered
 
     def test_placeholder_includes_reviewable_path(self):
-        from ouroboros.loop import _evict_stale_image_blocks
+        from ouroboros.loop_messages import _evict_stale_image_blocks
 
         block = _image_block("a", caption="screen")
         block["_source_path"] = "/data/uploads/screenshots/x.png"
@@ -130,19 +130,21 @@ class TestImageEviction:
 
 class TestImageTokenEstimates:
     def test_loop_estimate_uses_fixed_equivalent(self):
-        from ouroboros.loop import _estimate_messages_chars
+        from ouroboros.context_fit import estimate_context_prompt_tokens
 
-        huge_b64 = "A" * 1_000_000
-        messages = [{
+        def messages(size):
+            return [{
             "role": "user",
             "content": [
                 {"type": "text", "text": "hi"},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{huge_b64}"}},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/png;base64,{'A' * size}",
+                    }},
             ],
-        }]
-        total = _estimate_messages_chars(messages)
-        assert total < IMAGE_BLOCK_CHAR_EQUIVALENT + 1000, (
-            "image block must count as the fixed equivalent, not base64 length"
+            }]
+
+        assert estimate_context_prompt_tokens(messages(10_000)) == (
+            estimate_context_prompt_tokens(messages(1_000_000))
         )
 
     def test_llm_estimate_symmetric(self):
@@ -158,18 +160,27 @@ class TestImageTokenEstimates:
 
 class TestCompactionAndLanes:
     def test_render_round_block_replaces_image(self):
-        from ouroboros.context_compaction import _render_round_block
+        from ouroboros.context_compaction import _atomic_units
 
         messages = [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "see this"},
-                _image_block("a", caption="login page"),
-            ],
+            "role": "assistant",
+            "content": "inspect",
+            "tool_calls": [{
+                "id": "call-1", "type": "function",
+                "function": {"name": "view", "arguments": "{}"},
+            }],
+        }, {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": [_image_block("a", caption="login page")],
         }]
-        rendered = _render_round_block(messages, 0, 0)
-        assert "[image: login page]" in rendered
-        assert "base64" not in rendered
+        units = _atomic_units(messages)
+        assert len(units) == 1
+        assert "login page" in units[0].source_text
+        assert "base64" not in units[0].source_text
+
+        messages[1]["content"] = [_image_block("a")]
+        assert _atomic_units(messages) == ()
 
     def test_gigachat_text_placeholder(self):
         from ouroboros.llm import LLMClient
@@ -193,6 +204,42 @@ class TestCompactionAndLanes:
         )
         block = cleaned[0]["content"][0]
         assert "_caption" not in block and "_source_path" not in block
+
+    def test_vision_preparation_runs_outside_main_physical_binding(self, tmp_path, monkeypatch):
+        from ouroboros import usage_accounting as ua
+        from ouroboros.loop_llm_call import call_llm_with_retry
+        from ouroboros.vision_routing import prepare_messages_for_send as real_prepare
+
+        seen = {}
+
+        def prepare(messages, *, routing):
+            seen["prepare_context"] = ua.current_physical_attempt_context()
+            seen["prepare_predicate"] = ua.current_physical_attempt_predicate()
+            return real_prepare(messages, routing=routing)
+
+        class LLM:
+            def chat(self, **kwargs):
+                seen["chat_context"] = ua.current_physical_attempt_context()
+                seen["chat_predicate"] = ua.current_physical_attempt_predicate()
+                return {"content": "ok"}, {}
+
+        physical = ua.PhysicalAttemptContext(
+            profile="owner_max", rendered_mode="max", measurement_basis="cold_estimate",
+            route_fp="route", round_id="round", target_total_tokens=None,
+            capacity_total_tokens=500_000, context_target_miss=False,
+            automatic_pass_used=False,
+        )
+        predicate = lambda request: True
+        monkeypatch.setattr("ouroboros.vision_routing.prepare_messages_for_send", prepare)
+        call_llm_with_retry(
+            LLM(), [{"role": "user", "content": "plain"}], "openai/gpt-5.5",
+            None, "medium", 1, tmp_path, "task", 1, None, {}, "task", False,
+            physical_context=physical, candidate_predicate=predicate,
+        )
+        assert seen["prepare_context"] is None
+        assert seen["prepare_predicate"] is None
+        assert seen["chat_context"] == physical
+        assert seen["chat_predicate"] is predicate
 
 
 class TestNativeScreenshotInjection:

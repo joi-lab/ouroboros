@@ -1,32 +1,45 @@
-import { renderPageHeader, renderSegmentedField, renderTabStrip } from './page_header.js';
+import { renderPageHeader, renderSegmentedField, renderTabStrip, bindTabStrip } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
+import { renderAgentAccountsSection, renderAgentsServiceBanner } from './harness_accounts.js';
+import { renderReviewerSlotsSection } from './reviewer_slots.js';
+import { renderSubagentsSection } from './subagents_settings.js';
+import { languageBlockHtml } from './settings_language.js';
+import { modelRolesHost } from './model_roles.js';
+import { bindSecretReveal } from './settings_secrets.js';
 
+// Reads as a sequence: keys → secrets → which API models → who among the agents
+// does what → behavior → technical. "Agents", not "Coding agents" (D-10): the
+// same subscriptions build presentations and run arbitrary tasks, so the
+// narrower word named only one of their uses.
 const SETTINGS_TABS = [
-    { value: 'providers', label: 'Providers' },
+    { value: 'providers', label: 'Accounts' },
     { value: 'secrets', label: 'Secrets' },
     { value: 'models', label: 'Models' },
+    { value: 'agents', label: 'Agents' },
     { value: 'behavior', label: 'Behavior' },
+    { value: 'appearance', label: 'Appearance' },
     { value: 'advanced', label: 'Advanced' },
     { value: 'about', label: 'About' },
 ];
 // Guard markers: renderTabStrip emits behavior/advanced tabs at runtime.
 
-const MODEL_CARDS = [
-    ['Main', 'Primary reasoning model.', 's-model', 's-local-main', 'x-ai/grok-4.5'],
-    ['Heavy', 'Strong acting/coding lane for mutative first-level subagents. Empty uses Main.', 's-model-heavy', 's-local-heavy', ''],
-    ['Light', 'Fast summaries, lightweight tasks, and all deep subagents. Empty uses Main.', 's-model-light', 's-local-light', 'google/gemini-3.6-flash'],
-    ['Vision', 'Caption and VLM lane. Empty uses Main.', 's-model-vision', '', ''],
-    ['Consciousness', 'High-horizon background consciousness. Empty uses Main.', 's-model-consciousness', 's-local-consciousness', ''],
-    ['Fallback', 'Resilience and degraded path (comma-separated chain).', 's-model-fallback', 's-local-fallback', 'openai/gpt-5.6-luna'],
-];
-
+// 6.3: Review and Scope Review efforts moved to per-slot dropdowns in
+// Agents → Review lanes. Behavior keeps the surface-level lanes.
 const EFFORT_FIELDS = [
     ['s-effort-task', 'Task / Chat', 'medium'],
     ['s-effort-evolution', 'Evolution', 'high'],
-    ['s-effort-review', 'Review', 'high'],
-    ['s-effort-scope-review', 'Scope Review', 'high'],
     ['s-effort-deep-self-review', 'Deep Self-Review', 'high'],
-    ['s-effort-consciousness', 'Consciousness', 'high'],
+    ['s-effort-consciousness', 'Consciousness', ''],  // '' = the Task / Chat effort (a wake-up is a Main turn)
+];
+
+// Runtime mode is one axis of the owner policy contract. Keep the Settings
+// presentation in the same vocabulary as the onboarding setup contract; the
+// saved value is still handled by settings.js and the owner endpoint.
+const RUNTIME_MODE_OPTIONS = [
+    { value: 'light', label: 'Light' },
+    { value: 'advanced', label: 'Advanced' },
+    { value: 'pro', label: 'Pro' },
+    { value: 'cyber_pro', label: 'Cyber Pro' },
 ];
 
 function providerCard({ id, title, icon, hint, body, open = false }) {
@@ -48,30 +61,34 @@ function providerCard({ id, title, icon, hint, body, open = false }) {
 
 function secretField({ id, settingKey, label, placeholder }) {
     return `
-        <div class="form-field">
-            <label>${label}</label>
+        <div class="form-field ui-field">
+            <label for="${id}">${label}</label>
             <div class="secret-input-row">
-                <input id="${id}" data-secret-setting="${settingKey}" class="secret-input" type="password" placeholder="${placeholder}">
-                <button type="button" class="settings-ghost-btn secret-toggle" data-target="${id}">Show</button>
-                <button type="button" class="settings-ghost-btn secret-clear" data-target="${id}">Clear</button>
+                <input id="${id}" name="${settingKey}" data-secret-setting="${settingKey}" class="secret-input ui-control" type="password" placeholder="${placeholder}">
+                <button type="button" class="btn btn-default secret-toggle" data-target="${id}">Show</button>
+                <button type="button" class="btn btn-default secret-clear" data-target="${id}">Clear</button>
             </div>
         </div>
     `;
 }
 
 function plainField({ id, label, placeholder }) {
-    return `<div class="form-field"><label>${label}</label><input id="${id}" placeholder="${placeholder}"></div>`;
+    return `<div class="form-field ui-field"><label for="${id}">${label}</label><input id="${id}" name="${id}" type="text" class="ui-control" placeholder="${placeholder}"></div>`;
 }
 
 const PROVIDER_CARDS = [
     {
         id: 'openrouter', title: 'OpenRouter', icon: '/static/providers/openrouter.ico', hint: 'Default multi-model router', open: true,
         fields: [{ id: 's-openrouter', settingKey: 'OPENROUTER_API_KEY', label: 'OpenRouter API Key', placeholder: 'sk-or-...' }],
+        // testInputs must cover BOTH the secret and the plain fields of the card:
+        // the probe runs against what is typed, before anything is saved.
+        testProvider: 'openrouter', testInputs: { 's-openrouter': 'OPENROUTER_API_KEY' },
     },
     {
         id: 'openai', title: 'OpenAI', icon: '/static/providers/openai.svg', hint: 'Official OpenAI API',
         fields: [{ id: 's-openai', settingKey: 'OPENAI_API_KEY', label: 'OpenAI API Key', placeholder: 'sk-...' }],
-        note: 'Use model values like <code>openai::gpt-5.6-terra</code> in the Models tab to route models directly here. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
+        testProvider: 'openai', testInputs: { 's-openai': 'OPENAI_API_KEY' },
+        note: 'Pick OpenAI as the source in Models or Agents to route a role through this key. If OpenRouter is absent and the shipped defaults are still untouched, Ouroboros auto-remaps them to official OpenAI defaults.',
     },
     {
         id: 'compatible', title: 'OpenAI Compatible', icon: '/static/providers/openai-compatible.svg', hint: 'Custom OpenAI-style endpoint',
@@ -79,6 +96,11 @@ const PROVIDER_CARDS = [
             { id: 's-openai-compatible-key', settingKey: 'OPENAI_COMPATIBLE_API_KEY', label: 'API Key', placeholder: 'Compatible provider key' },
             { id: 's-openai-compatible-base-url', label: 'Base URL', placeholder: 'https://provider.example/v1' },
         ],
+        testProvider: 'openai-compatible',
+        testInputs: {
+            's-openai-compatible-key': 'OPENAI_COMPATIBLE_API_KEY',
+            's-openai-compatible-base-url': 'OPENAI_COMPATIBLE_BASE_URL',
+        },
         note: 'Use this card for custom base URLs. Built-in web search only works with the official OpenAI Responses API, so keep <code>OPENAI_BASE_URL</code> empty when you want <code>web_search</code>.',
     },
     {
@@ -90,6 +112,40 @@ const PROVIDER_CARDS = [
             { id: 's-cloudru-key', settingKey: 'CLOUDRU_FOUNDATION_MODELS_API_KEY', label: 'API Key', placeholder: 'Cloud.ru Foundation Models API key' },
             { id: 's-cloudru-base-url', label: 'Base URL', placeholder: 'https://foundation-models.api.cloud.ru/v1' },
         ],
+        testProvider: 'cloudru',
+        testInputs: {
+            's-cloudru-key': 'CLOUDRU_FOUNDATION_MODELS_API_KEY',
+            's-cloudru-base-url': 'CLOUDRU_FOUNDATION_MODELS_BASE_URL',
+        },
+    },
+    {
+        id: 'minimax', title: 'MiniMax', icon: '', hint: 'Direct regional OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-minimax-key', settingKey: 'MINIMAX_API_KEY', label: 'API Key', placeholder: 'MiniMax API key' },
+            { id: 's-minimax-region', label: 'Region', placeholder: 'global_en or cn_zh' },
+        ],
+        testProvider: 'minimax',
+        testInputs: { 's-minimax-key': 'MINIMAX_API_KEY', 's-minimax-region': 'MINIMAX_REGION' },
+        note: 'Pick MiniMax as the source in Models or Agents, then choose MiniMax-M3 or MiniMax-M2.7. Leave Region empty for <code>global_en</code>; use <code>cn_zh</code> for the China endpoint.',
+    },
+    {
+        id: 'deepseek', title: 'DeepSeek', icon: '', hint: 'Direct OpenAI-compatible runtime (v4 family)', advanced: true,
+        fields: [
+            { id: 's-deepseek-key', settingKey: 'DEEPSEEK_API_KEY', label: 'API Key', placeholder: 'sk-...' },
+        ],
+        testProvider: 'deepseek',
+        testInputs: { 's-deepseek-key': 'DEEPSEEK_API_KEY' },
+        note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
+    },
+    {
+        id: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-zai-key', settingKey: 'ZAI_API_KEY', label: 'API Key', placeholder: 'sk-...' },
+            { id: 's-zai-plan', label: 'Plan', placeholder: 'payg or coding' },
+        ],
+        testProvider: 'zai',
+        testInputs: { 's-zai-key': 'ZAI_API_KEY', 's-zai-plan': 'ZAI_PLAN' },
+        note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
     },
     {
         id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
@@ -101,82 +157,77 @@ const PROVIDER_CARDS = [
             { id: 's-gigachat-base-url', label: 'Base URL', placeholder: 'https://api.giga.chat/v1' },
             { id: 's-gigachat-verify-ssl', label: 'Verify SSL Certs', placeholder: 'true / false' },
         ],
-        note: 'Use model values like <code>gigachat::GigaChat-2-Max</code> in the Models tab to route directly through GigaChat. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
+        testProvider: 'gigachat',
+        testInputs: {
+            's-gigachat-credentials': 'GIGACHAT_CREDENTIALS',
+            's-gigachat-scope': 'GIGACHAT_SCOPE',
+            's-gigachat-user': 'GIGACHAT_USER',
+            's-gigachat-password': 'GIGACHAT_PASSWORD',
+            's-gigachat-base-url': 'GIGACHAT_BASE_URL',
+            's-gigachat-verify-ssl': 'GIGACHAT_VERIFY_SSL_CERTS',
+        },
+        note: 'Pick GigaChat as the source in Models or Agents to route a role through this account. Authenticate with either an Authorization Key (OAuth, scope <code>GIGACHAT_API_PERS</code>, <code>GIGACHAT_API_B2B</code>, or <code>GIGACHAT_API_CORP</code>) or User + Password.',
     },
     {
-        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct runtime plus Claude tooling',
+        id: 'anthropic', title: 'Anthropic', icon: '/static/providers/anthropic.png', hint: 'Direct Anthropic API access',
         fields: [{ id: 's-anthropic', settingKey: 'ANTHROPIC_API_KEY', label: 'Anthropic API Key', placeholder: 'sk-ant-...' }],
-        note: 'Use model values like <code>anthropic::claude-sonnet-5</code> in the Models tab to route models directly through Anthropic. Claude tooling still reuses this key.',
-        extra: `
-            <div class="settings-toolbar" id="settings-claude-code-panel" hidden>
-                <button type="button" class="settings-ghost-btn" id="btn-claude-code-install">Repair Runtime</button>
-                <span id="settings-claude-code-status" class="settings-inline-status">Checking Claude runtime...</span>
-            </div>
-            <div class="settings-inline-note" id="settings-claude-code-copy" hidden>Claude runtime powers delegated code editing and advisory review. It is managed automatically by the app.</div>
-        `,
+        testProvider: 'anthropic', testInputs: { 's-anthropic': 'ANTHROPIC_API_KEY' },
+        note: 'Pick Anthropic as the source in Models or Agents to route a role directly through this key.',
     },
 ];
 
+// {backend provider id: {DOM input id: settings key}} — settings.js reads the
+// live input values through this map to build the unsaved-credential overrides.
+export const PROVIDER_TEST_INPUTS = Object.fromEntries(
+    PROVIDER_CARDS.filter((card) => card.testProvider).map((card) => [card.testProvider, card.testInputs]),
+);
+
 function providerSettingsCard(spec) {
     const fields = (spec.fields || [])
-        .map((field) => field.settingKey ? secretField(field) : plainField(field))
+        .map((field) => {
+            const named = { ...field, label: field.label === "API Key" || field.label === "Base URL"
+                ? `${spec.title} ${field.label}` : field.label };
+            return field.settingKey ? secretField(named) : plainField(named);
+        })
         .join('');
+    const test = spec.testProvider ? `
+            <div class="settings-action-row">
+                <span class="settings-inline-status" data-provider-test-status="${spec.testProvider}" role="status" aria-live="polite" aria-atomic="true"></span>
+                <button type="button" class="btn btn-default" data-provider-test="${spec.testProvider}" title="Sends one short model request. Provider charges may apply.">Test</button>
+            </div>
+        ` : '';
     return providerCard({
         id: spec.id,
         title: spec.title,
         icon: spec.icon,
         hint: spec.hint,
         open: spec.open,
-        body: `<div class="form-row">${fields}</div>${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}${spec.extra || ''}`,
+        body: `<div class="form-row">${fields}</div>${test}${spec.note ? `<div class="settings-inline-note">${spec.note}</div>` : ''}`,
     });
-}
-
-function modelCard({ title, copy, inputId, toggleId, defaultValue }) {
-    const toggle = toggleId ? `<label class="local-toggle"><input type="checkbox" id="${toggleId}"> Local</label>` : '';
-    return `
-        <div class="settings-model-card">
-            <div class="settings-model-header">
-                <div>
-                    <h4>${title}</h4>
-                    <p>${copy}</p>
-                </div>
-                ${toggle}
-            </div>
-            <div class="model-picker" data-model-picker>
-                <input
-                    id="${inputId}"
-                    value="${defaultValue}"
-                    autocomplete="off"
-                    spellcheck="false"
-                >
-                <div class="model-picker-results" hidden></div>
-            </div>
-        </div>
-    `;
 }
 
 // The owner-facing subset of ouroboros/config.py EFFORT_SCALE: `minimal` is a
 // valid runtime tier (bench adapters / agent-side switch_model use it) but is
 // deliberately NOT offered as an owner slot default — sub-`low` thinking is a
-// per-call tactical choice, not a standing configuration. xhigh/max are clamped
-// to each model's real ceiling at the provider boundary (llm.py), so selecting
-// them never errors on a model that tops out lower — it clamps down with a
-// disclosed usage note.
+// per-call tactical choice, not a standing configuration. xhigh/max/ultra adapt
+// down to each route's real ceiling (exact-route request-wire recovery on API
+// routes, per-model resolution on delegated ones); the adaptation is disclosed
+// in usage, and a cold route whose provider rejects without naming supported
+// tiers remains the PR-disclosed limit of the two-send recovery rail.
 const EFFORT_OPTIONS = [
-    { value: 'none', label: 'None' },
-    { value: 'low', label: 'Low' },
-    { value: 'medium', label: 'Medium' },
-    { value: 'high', label: 'High' },
-    { value: 'xhigh', label: 'X-High' },
-    { value: 'max', label: 'Max' },
+    { value: 'none', label: 'None' }, { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'X-High' }, { value: 'max', label: 'Max' }, { value: 'ultra', label: 'Ultra' },
 ];
 
 function effortField({ id, label, defaultValue }) {
+    // Consciousness may inherit the Task / Chat effort ('' — a wake-up is a Main turn).
+    const options = id === 's-effort-consciousness' ? [{ value: '', label: 'Same as Task / Chat' }, ...EFFORT_OPTIONS] : EFFORT_OPTIONS;
     return `
         <div class="settings-effort-card">
-            <label>${label}</label>
+            <label for="${id}">${label}</label>
             <input id="${id}" type="hidden" value="${defaultValue}">
-            ${renderSegmentedField({ target: id, options: EFFORT_OPTIONS })}
+            ${renderSegmentedField({ target: id, options })}
         </div>
     `;
 }
@@ -189,6 +240,9 @@ export const SECRET_KEYS = [
     ['GIGACHAT_CREDENTIALS', 'GigaChat Authorization Key', 'Base64 client_id:secret'],
     ['GIGACHAT_PASSWORD', 'GigaChat Password (basic auth)', 'password'],
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
+    ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
+    ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
+    ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -244,7 +298,8 @@ export function renderSettingsPage() {
                 <div class="settings-tabs-bar">
                     <button type="button" class="settings-mobile-back" data-settings-back hidden>Settings</button>
                     ${renderTabStrip({
-                        items: SETTINGS_TABS,
+                        items: SETTINGS_TABS.map((item) => ({ ...item,
+                            tabId: `settings-tab-${item.value}`, panelId: `settings-panel-${item.value}` })),
                         active: 'providers',
                         dataAttr: 'data-settings-tab',
                         ariaLabel: 'Settings sections',
@@ -258,14 +313,17 @@ export function renderSettingsPage() {
             <div class="settings-scroll scroll-fade-y">
                 <section class="settings-panel active" data-settings-panel="providers">
                     <div class="settings-section-copy">
-                        Configure remote providers and the optional network gate. Secret fields now have explicit
-                        <code>Clear</code> actions so masked values can be removed intentionally.
+                        Connect subscriptions and API keys here, then choose their roles in Models and Agents.
+                        Adding an account keeps your existing assignments.
                     </div>
+                    ${renderAgentsServiceBanner()}
+                    ${renderAgentAccountsSection()}
+                    <h3>API keys</h3>
                     ${PROVIDER_CARDS.filter((card) => !card.advanced).map(providerSettingsCard).join('')}
                     <details class="settings-more-providers" id="settings-more-providers">
                         <summary>
                             <span class="settings-provider-title"><span>More providers</span></span>
-                            <span class="settings-provider-hint">Cloud.ru Foundation Models and GigaChat</span>
+                            <span class="settings-provider-hint">Cloud.ru Foundation Models, MiniMax, DeepSeek, and GigaChat</span>
                         </summary>
                         <div class="settings-more-providers-body">
                             ${PROVIDER_CARDS.filter((card) => card.advanced).map(providerSettingsCard).join('')}
@@ -274,9 +332,9 @@ export function renderSettingsPage() {
                     <div class="form-section compact">
                         <h3>Legacy Compatibility</h3>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Legacy OpenAI Base URL</label>
-                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint">
+                            <div class="form-field ui-field">
+                                <label for="s-openai-base-url">Legacy OpenAI Base URL</label>
+                                <input id="s-openai-base-url" placeholder="https://api.openai.com/v1 or compatible endpoint" class="ui-control" name="s-openai-base-url" type="text">
                             </div>
                         </div>
                         <div class="settings-inline-note">Backward-compatibility escape hatch for older installs. For new custom providers, use the dedicated <code>OpenAI Compatible</code> card instead.</div>
@@ -290,10 +348,10 @@ export function renderSettingsPage() {
                             placeholder: 'Leave blank to keep the network surface open',
                         })}</div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Server Bind Host</label>
-                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0">
-                                <div class="settings-inline-note">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-server-host">Server Bind Host</label>
+                                <input id="s-server-host" placeholder="127.0.0.1 or 0.0.0.0" class="ui-control" name="s-server-host" type="text" aria-describedby="s-server-host-help">
+                                <div class="settings-inline-note ui-field-help" id="s-server-host-help">Use <code>127.0.0.1</code> for this machine only. Use <code>0.0.0.0</code> for LAN/Docker access with a Network Password in the same save. Specific LAN IP binds are manual/env-only.</div>
                             </div>
                         </div>
                         <div class="settings-inline-note">Adds a password wall only for non-localhost app and API access. If you expose Ouroboros on LAN or Docker, set a password before sharing the URL.</div>
@@ -309,59 +367,76 @@ export function renderSettingsPage() {
                     <div class="form-section">
                         <h3>Model Routing</h3>
                         <div class="settings-section-copy">
-                            These fields are cloud model IDs. Enable <code>Local</code> to route that model
-                            through the GGUF server configured in Advanced.
+                            Choose a source, model, and subscription account for each role. Auto rotates
+                            compatible accounts. Local uses the runtime configured in Advanced.
                         </div>
-                        <div class="settings-toolbar">
-                            <button type="button" class="settings-ghost-btn" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
-                            <span id="settings-model-catalog-status" class="settings-inline-status">Model catalog is optional and failure-tolerant.</span>
+                        <div class="settings-action-row">
+                            <span id="settings-model-catalog-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true">Model catalog is optional and failure-tolerant.</span>
+                            <button type="button" class="btn btn-default" id="btn-refresh-model-catalog">Refresh Model Catalog</button>
                         </div>
-                        <div class="settings-model-grid">
-                            ${MODEL_CARDS.map(([title, copy, inputId, toggleId, defaultValue]) => modelCard({ title, copy, inputId, toggleId, defaultValue })).join('')}
-                        </div>
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Claude Code Model</label>
-                                <input id="s-claude-code-model" value="opus[1m]" placeholder="sonnet, opus, opus[1m], or full name">
-                                <div class="settings-inline-note">Anthropic model for delegated review/edit integrations. Requires Anthropic key in Providers.</div>
-                            </div>
-                        </div>
+                        ${modelRolesHost('settings-model-roles')}
                     </div>
 
+                    <!-- Review lanes and Delegation moved to the Agents tab
+                         (D-10): they answer "who does the work", not "which API
+                         model id". One capability, one section — no control here
+                         duplicates one there. The deep self-review reviewer is a
+                         Review lanes row too (R7); its former model field's key,
+                         OUROBOROS_MODEL_DEEP_SELF_REVIEW, survives only as the
+                         backend's invisible migration source for that row. -->
+
                     <div class="form-section">
-                        <h3>Review Models</h3>
-                        <div class="settings-section-copy">Reviewer slots used by plan, task acceptance, and commit review surfaces.</div>
-                        <div class="form-row">
-                            <div class="form-field">
-                                <label>Review Slots</label>
-                                <input id="s-review-models" placeholder="model1,model2,model3">
-                                <div class="settings-inline-note">Comma-separated reviewer slots. Duplicate model IDs are valid independent slots for same-model sampling.</div>
-                            </div>
-                        </div>
+                        <h3>Other Model Slots</h3>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Scope Review Slots</label>
-                                <input id="s-scope-review-models" placeholder="openai/gpt-5.6-terra">
-                                <div class="settings-inline-note">Comma-separated scope reviewer slots. Empty falls back to the legacy single scope model setting.</div>
-                            </div>
-                            <div class="form-field">
-                                <label>Deep Self-Review Model</label>
-                                <input id="s-deep-self-review-model" placeholder="openai/gpt-5.6-sol-pro">
-                                <div class="settings-inline-note">Dedicated model slot for deep self-review. Empty uses the shipped default.</div>
-                            </div>
-                            <div class="form-field">
-                                <label>Web Search Model</label>
-                                <input id="s-websearch-model" placeholder="gpt-5.2">
-                                <div class="settings-inline-note">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-websearch-model">Web Search Model</label>
+                                <input id="s-websearch-model" placeholder="gpt-5.2" class="ui-control" name="s-websearch-model" type="text" aria-describedby="s-websearch-model-help">
+                                <div class="settings-inline-note ui-field-help" id="s-websearch-model-help">OpenAI model for <code>web_search</code>. Requires <code>OPENAI_API_KEY</code> and an empty Legacy Base URL.</div>
                             </div>
                         </div>
                     </div>
                 </section>
 
+                <section class="settings-panel" data-settings-panel="agents">
+                    <div class="settings-section-copy">
+                        Configure the subagents and reviewers Ouroboros works with. Subscriptions and
+                        API keys are in Accounts; global model roles are in Models.
+                    </div>
+                    <!-- ONE service banner for the whole tab: the single place a
+                         daemon or runtime problem is explained, instead of the
+                         scattering of "(not in discovery)" the owner reported. -->
+                    ${renderSubagentsSection()}
+                    ${renderReviewerSlotsSection()}
+                </section>
+
                 <section class="settings-panel" data-settings-panel="behavior">
+                    <div class="form-section" data-autostart-settings hidden>
+                        <h3>Startup &amp; background</h3>
+                        <div class="settings-section-copy">
+                            Applies immediately to the host computer running Ouroboros, including when you
+                            connect from another device. Signing in preserves Panic stops and saved pauses.
+                            In the background, tasks, schedules and Telegram keep working; an icon reopens
+                            the window or quits.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-autostart-toggle>
+                                Start Ouroboros on the host computer when you sign in
+                            </label>
+                            <div class="settings-inline-status" data-autostart-status role="status" aria-live="polite"></div>
+                            <div data-background-row hidden>
+                                <label class="local-toggle ui-field ui-field-inline">
+                                    <input type="checkbox" class="ui-checkbox" data-background-toggle>
+                                    When the window is closed, keep Ouroboros running in the background
+                                </label>
+                                <div class="settings-inline-status" data-background-status role="status" aria-live="polite"></div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div class="form-section">
                         <h3>Reasoning Effort</h3>
-                        <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
+                        <div class="settings-section-copy">Preferred reasoning effort per task type. Unsupported levels adapt to the route; native mappings, required minimums or provider defaults may apply. Requested, sent and reported effort are recorded in Logs.</div>
                         <div class="settings-effort-grid">
                             ${EFFORT_FIELDS.map(([id, label, defaultValue]) => effortField({ id, label, defaultValue })).join('')}
                         </div>
@@ -381,12 +456,13 @@ export function renderSettingsPage() {
                                     { value: 'blocking', label: 'Blocking' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="review" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
                     <div class="form-section">
                         <h3>Task Result Review</h3>
-                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped; Required additionally enforces the selected Advisory or Blocking improvement policy.</div>
+                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped. Once review applies, both follow the selected Advisory or Blocking policy.</div>
                         <div class="settings-effort-card">
                             <label>Task Result Review</label>
                             <input id="s-task-review-mode" type="hidden" value="auto">
@@ -397,6 +473,26 @@ export function renderSettingsPage() {
                                     { value: 'off', label: 'Off' },
                                     { value: 'auto', label: 'Auto' },
                                     { value: 'required', label: 'Required' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Max Review Cycles</h3>
+                        <div class="settings-section-copy">Limits paid review waves, including dispatched technical failures: plan and task review per task, commit triad+scope per root task, and skill review per root task or manual snapshot. The last review still permits author corrections within ordinary task limits; explicit task-local author limits remain separate. Collection and exact replay are free. Advisory allows an explicit decision after receiving feedback or a disclosed unavailable result; Blocking still requires reviewer approval. <code>&infin;</code> removes the count cap, while deadlines, budgets and lifecycle limits still apply.</div>
+                        <div class="settings-effort-card">
+                            <label>Max Review Cycles</label>
+                            <input id="s-review-max-cycles" type="hidden" value="2">
+                            ${renderSegmentedField({
+                                target: 's-review-max-cycles',
+                                modifier: 'data-review-cycles-group',
+                                options: [
+                                    { value: '1', label: '1' },
+                                    { value: '2', label: '2' },
+                                    { value: '3', label: '3' },
+                                    { value: '5', label: '5' },
+                                    { value: 'unlimited', label: '\u221E' },
                                 ],
                             })}
                         </div>
@@ -427,8 +523,8 @@ export function renderSettingsPage() {
                             Closed-loop skill development can auto-grant the keys and host permissions a skill declares after a fresh executable review for the current content hash.
                             Leave this off when every skill permission should require a separate human approval.
                         </div>
-                        <label class="local-toggle" title="Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.">
-                            <input type="checkbox" id="s-auto-grant-reviewed-skills">
+                        <label class="local-toggle ui-field ui-field-inline" title="Applies only after a fresh executable skill review and only to manifest-declared grants for that exact content hash.">
+                            <input type="checkbox" id="s-auto-grant-reviewed-skills" class="ui-checkbox" name="s-auto-grant-reviewed-skills">
                             Auto-grant reviewed skills' keys and permissions
                         </label>
                     </div>
@@ -438,18 +534,41 @@ export function renderSettingsPage() {
                         <div class="settings-section-copy">
                             Working-context size profile (separate axis from Runtime Mode and Review Enforcement).
                             <code>Max</code> inlines ARCHITECTURE and DEVELOPMENT in full &mdash; for ~1M-context models (today's behavior).
-                            <code>Low</code> fits ~200K / local models: ARCHITECTURE becomes a navigation map (read full sections on demand), DEVELOPMENT stays full for normal runnable tasks unless a structured non-development caller opts out, and memory compacts sooner. It never changes the model or reasoning effort, and never lowers the review context floor.
-                            <br><strong>Human controlled:</strong> saved via the owner endpoint; saves immediately (no restart), and lowering to Low requires Ouroboros to be idle.
+                            <code>Nano</code> is the compact owner window. <code>Low</code> fits ~250K / local models: ARCHITECTURE becomes a navigation map (read full sections on demand), DEVELOPMENT stays full for normal runnable tasks unless a structured non-development caller opts out, and memory compacts sooner. It governs Ouroboros's own working window: it never changes the model or reasoning effort, and scope review runs in every mode.
+                            <br><strong>Human controlled:</strong> saved via the owner endpoint; saves immediately (no restart), and lowering requires Ouroboros to be idle.
                         </div>
                         <div class="settings-effort-card">
                             <label>Context Mode</label>
                             <input id="s-context-mode" type="hidden" value="max">
                             ${renderSegmentedField({
                                 target: 's-context-mode',
-                                title: 'Saves immediately; no restart required. Lowering to Low requires Ouroboros to be idle.',
+                                title: 'Saves immediately; no restart required. Lowering requires Ouroboros to be idle.',
                                 options: [
+                                    { value: 'nano', label: 'Nano' },
                                     { value: 'low', label: 'Low' },
                                     { value: 'max', label: 'Max' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Prompt Cache TTL</h3>
+                        <div class="settings-section-copy">
+                            How long provider prompt caches keep this agent's stable context warm (Anthropic-family routes; other providers manage caching implicitly).
+                            <code>1h</code> keeps the large stable prefix cached across long waits and review cycles &mdash; cache writes bill at 2&times; base input instead of 1.25&times;, but one wait longer than 5 minutes already pays that back on big contexts.
+                            <code>5m</code> is the provider default tier as an explicit value; <code>Default</code> sends bare markers (provider default, callers may still declare their own TTL).
+                            One honest global: it applies to every lane, including review and safety prompts.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Prompt Cache TTL</label>
+                            <input id="s-prompt-cache-ttl" type="hidden" value="1h">
+                            ${renderSegmentedField({
+                                target: 's-prompt-cache-ttl',
+                                options: [
+                                    { value: 'default', label: 'Default' },
+                                    { value: '5m', label: '5m' },
+                                    { value: '1h', label: '1h' },
                                 ],
                             })}
                         </div>
@@ -462,76 +581,82 @@ export function renderSettingsPage() {
                             <code>Full</code> &mdash; every guarded tool call gets the LLM safety check.
                             <code>Light</code> keeps the LLM check only for integration-policy tools; conditional shell/verify fall to the deterministic guards. Light is the default for new DESKTOP setups (authored by the first-run wizard); existing installs, web and Docker keep Full.
                             <code>Off</code> makes no LLM safety calls. In every mode the deterministic registry sandbox, protected-path policy, and light-mode guards STAY ON &mdash; the LLM supervisor is a layer, not the floor. Lowering coverage emits a durable audit event per waved-through call.
-                            <br><strong>Human controlled:</strong> saved via the owner endpoint (the agent cannot lower its own supervision); applies on the next task.
+                            <br><strong>Configuration authority:</strong> outside Cyber Pro, the agent cannot lower its own supervision. Cyber Pro also lets the agent configure Supervisor coverage. Changes apply on the next task.
                         </div>
                         <div class="settings-effort-card">
                             <label>Safety Supervisor</label>
                             <input id="s-safety-mode" type="hidden" value="full">
                             ${renderSegmentedField({
                                 target: 's-safety-mode',
-                                title: 'Owner-only. Lowering coverage prompts for confirmation.',
+                                title: 'Lowering coverage here prompts for confirmation.',
                                 options: [
                                     { value: 'full', label: 'Full' },
                                     { value: 'light', label: 'Light' },
                                     { value: 'off', label: 'Off' },
                                 ],
                             })}
+                            <div class="settings-inline-note" data-policy-state="supervisor" role="status" aria-live="polite"></div>
                             <div id="s-safety-skip-counter" class="settings-section-copy"></div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Runtime Mode</h3>
+                        <h3>Update Channel</h3>
+                        <div class="settings-section-copy">
+                            Chooses which official branch Update checks. Your local work branch stays <code>ouroboros</code>.
+                            <code>Stable</code> follows released code on <code>main</code> (default),
+                            <code>QA</code> follows <code>ouroboros-stable</code>, and
+                            <code>Development</code> follows <code>ouroboros</code>.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label>Official Update Source</label>
+                            <input id="s-update-channel" type="hidden" value="stable">
+                            ${renderSegmentedField({
+                                target: 's-update-channel',
+                                modifier: 'data-update-channel-group',
+                                title: 'Applies immediately; no restart required.',
+                                options: [
+                                    { value: 'stable', label: 'Stable' },
+                                    { value: 'qa', label: 'QA' },
+                                    { value: 'development', label: 'Development' },
+                                ],
+                            })}
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Access</h3>
                         <div class="settings-section-copy">
                             Separate axis from Review Enforcement. Controls how far Ouroboros is allowed to self-modify.
                             <code>Light</code> blocks repo self-modification but allows reviewed + enabled skills to run.
                             <code>Advanced</code> is the default &mdash; self-modify the evolutionary layer; protected core/contract/release files stay guarded by the shared runtime-mode policy.
                             <code>Pro</code> can edit protected core/contract/release surfaces, but commits still go through the normal triad + scope review gate; Advanced remains limited to the evolutionary layer.
+                            <code>Cyber Pro</code> grants the full host and configuration authority, including credentials, models, Supervisor configuration and protected rewrites. Review scope and enforcement stay owner-controlled. Review Enforcement remains independent, so <code>Blocking</code> stays available in Cyber Pro.
                             <br><strong>Human controlled:</strong> desktop builds ask the launcher for native confirmation before saving a mode change.
                             Web/Docker sessions save mode changes through the owner endpoint; the new mode takes effect after restart.
                         </div>
                         <div class="settings-effort-card">
-                            <label>Runtime Mode</label>
+                            <label>Access level</label>
                             <input id="s-runtime-mode" type="hidden" value="advanced">
                             ${renderSegmentedField({
                                 target: 's-runtime-mode',
                                 modifier: 'data-runtime-mode-group',
-                                title: 'Runtime mode changes require native launcher confirmation and restart.',
-                                options: [
-                                    { value: 'light', label: 'Light' },
-                                    { value: 'advanced', label: 'Advanced' },
-                                    { value: 'pro', label: 'Pro' },
-                                ],
+                                title: 'Access changes take effect after restart.',
+                                options: RUNTIME_MODE_OPTIONS,
                             })}
+                            <div class="settings-inline-note" data-policy-state="access" role="status" aria-live="polite"></div>
                         </div>
                     </div>
 
-                    <div class="form-section">
-                        <h3>Mutative Subagents</h3>
-                        <div class="settings-section-copy">
-                            Master switch for whether Ouroboros may spawn mutative ("acting") subagents that write code &mdash; in an isolated git worktree of this repo, an external workspace, or a from-scratch project &mdash; and return patches for the parent to review and integrate. Read-only subagents are always allowed.
-                            Default behavior follows Runtime Mode when no owner override exists: OFF in Light, ON in Advanced/Pro. This control saves an explicit On/Off override.
-                            <br><strong>Human controlled:</strong> the agent cannot self-enable this; applies on the next task (no restart).
-                        </div>
-                        <div class="settings-effort-card">
-                            <label>Allow Mutative Subagents</label>
-                            <input id="s-allow-mutative-subagents" type="hidden" value="on">
-                            ${renderSegmentedField({
-                                target: 's-allow-mutative-subagents',
-                                title: 'Applies on the next task; no restart required.',
-                                options: [
-                                    { value: 'off', label: 'Off' },
-                                    { value: 'on', label: 'On' },
-                                ],
-                            })}
-                        </div>
-                    </div>
+                    <!-- Allow Mutative Subagents moved to Agents → Delegation: one
+                         subagent story in one place, and two controls over one
+                         setting would have carried two drafts. -->
 
                     <div class="form-section">
                         <h3>Post-Task Self-Evolution</h3>
                         <div class="settings-section-copy">
                             After an eligible task, Ouroboros can optionally run one reviewed self-improvement cycle: the worker asks a light model whether to promote a backlog item, writes a durable request, and the supervisor starts a one-shot campaign later on an idle tick if all gates pass.
-                            <br><strong>Human controlled:</strong> the agent cannot self-enable this (shell/browser/settings self-elevation is blocked). These controls apply on the next task.
+                            <br><strong>Configuration authority:</strong> outside Cyber Pro, only the owner can enable this. Cyber Pro also lets the agent configure it; selecting Cyber Pro does not enable evolution automatically. Changes apply on the next task.
                         </div>
                         <div class="settings-effort-card">
                             <label>Self-Improvement Trigger</label>
@@ -547,46 +672,56 @@ export function renderSettingsPage() {
                             <div class="settings-inline-note"><strong>Counts every eligible task, including trivial chats.</strong> <code>Every N=1</code> means Ouroboros considers self-improvement after every task, then runs the actual cycle later on an idle supervisor tick.</div>
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
+                            <div class="form-field ui-field">
                                 <div data-evo-every-n-row>
-                                <label>Every N Tasks</label>
-                                <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3">
-                                <div class="settings-inline-note">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
+                                <label for="s-evo-cadence-n">Every N Tasks</label>
+                                <input id="s-evo-cadence-n" type="number" min="1" step="1" placeholder="3" class="ui-control" name="s-evo-cadence-n" aria-describedby="s-evo-cadence-n-help">
+                                <div class="settings-inline-note ui-field-help" id="s-evo-cadence-n-help">Visible only when Self-Improvement Trigger = Every N Tasks.</div>
                                 </div>
                             </div>
-                            <div class="form-field">
-                                <label>Per-Cycle Budget Reserve (USD)</label>
-                                <input id="s-evo-budget" placeholder="0">
-                                <div class="settings-inline-note">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task soft cap and the supervisor's reserved-budget floor.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-evo-budget">Per-Cycle Budget Reserve (USD)</label>
+                                <input id="s-evo-budget" placeholder="0" class="ui-control" name="s-evo-budget" type="text" aria-describedby="s-evo-budget-help">
+                                <div class="settings-inline-note ui-field-help" id="s-evo-budget-help">Minimum remaining global budget required to start a post-task cycle. <code>0</code> = rely on the normal gates. Running cycles still inherit the global per-task hard cost cap and the supervisor's reserved-budget floor.</div>
                             </div>
                         </div>
-                        <div class="form-field">
-                            <label>Standing Objective (optional)</label>
-                            <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency">
-                            <div class="settings-inline-note">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
+                        <div class="form-field ui-field">
+                            <label for="s-evo-objective">Standing Objective (optional)</label>
+                            <input id="s-evo-objective" placeholder="(none) — e.g. prioritize test coverage and latency" class="ui-control" name="s-evo-objective" type="text" aria-describedby="s-evo-objective-help">
+                            <div class="settings-inline-note ui-field-help" id="s-evo-objective-help">Optional steer appended to every evolution cycle objective. It never overrides the LLM-first promotion; leave empty for pure LLM choice.</div>
                         </div>
                     </div>
 
                     <div class="form-section">
                         <h3>Background Cognition</h3>
-                        <div class="settings-section-copy">
-                            Cadence for Ouroboros's background cognition loop. These values are read at startup; save them, then restart for the new timing to take effect.
+                        <div class="settings-section-copy">When Ouroboros wakes up on its own, what a wake-up is allowed to do, and what it may spend doing it.</div>
+                        <div class="settings-effort-card">
+                            <label>Consciousness Autonomy</label>
+                            <input id="s-consciousness-autonomy" type="hidden" value="act">
+                            ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
+                            <div class="settings-inline-note"><strong>Observe:</strong> research, internal memory and task/project notes, read-only research children it can also stop, schedule controls and replies to you; no shell, user-file, source, skill/settings or publication changes. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>BG Wakeup Min (sec)</label>
-                                <input id="s-bg-wakeup-min" type="number" min="1" step="1" placeholder="30">
+                            <div class="form-field ui-field">
+                                <label for="s-consciousness-daily-usd">Daily Allowance (USD)</label>
+                                <input id="s-consciousness-daily-usd" placeholder="20" class="ui-control" name="s-consciousness-daily-usd" type="text" aria-describedby="s-consciousness-daily-usd-help">
+                                <div class="settings-inline-note ui-field-help" id="s-consciousness-daily-usd-help">Spending cap for consciousness over a rolling 24-hour window: the wake-ups plus the tasks they start. When it is exhausted, no new wake-up or task starts until spend leaves the window. <code>0</code> = consciousness may not spend.</div>
                             </div>
-                            <div class="form-field">
-                                <label>BG Wakeup Max (sec)</label>
-                                <input id="s-bg-wakeup-max" type="number" min="1" step="1" placeholder="7200">
+                            <div class="form-field ui-field">
+                                <label for="s-consciousness-max-tasks">Max Concurrent Tasks</label>
+                                <input id="s-consciousness-max-tasks" type="number" min="0" step="1" placeholder="2" class="ui-control" name="s-consciousness-max-tasks" aria-describedby="s-consciousness-max-tasks-help">
+                                <div class="settings-inline-note ui-field-help" id="s-consciousness-max-tasks-help">How many tasks started by consciousness may run at once. <code>0</code> = it never starts tasks.</div>
                             </div>
-                            <div class="form-field">
-                                <label>BG Max Rounds</label>
-                                <input id="s-bg-max-rounds" type="number" min="1" step="1" placeholder="10">
+                            <div class="form-field ui-field">
+                                <label for="s-bg-wakeup-min">Wake-Up Interval Min (sec)</label>
+                                <input id="s-bg-wakeup-min" type="number" min="60" step="1" placeholder="900" class="ui-control" name="s-bg-wakeup-min">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-bg-wakeup-max">Wake-Up Interval Max (sec)</label>
+                                <input id="s-bg-wakeup-max" type="number" min="60" step="1" placeholder="14400" class="ui-control" name="s-bg-wakeup-max">
                             </div>
                         </div>
-                        <div class="settings-inline-note"><strong>Applies after restart:</strong> BG Wakeup Min/Max and BG Max Rounds are read when the background cognition loop starts.</div>
+                        <div class="settings-inline-note">Ouroboros chooses the interval between its own wake-ups; the two values above are the lower and upper bound it must stay within. All four settings apply without a restart: the alarm clock reads them at each decision.</div>
                     </div>
 
                     <div class="form-section">
@@ -598,10 +733,10 @@ export function renderSettingsPage() {
                             cloning or pulling them. Leave empty to use only the data plane.
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Skills Repo Path</label>
-                                <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills">
-                                <div class="settings-inline-note">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-skills-repo-path">Skills Repo Path</label>
+                                <input id="s-skills-repo-path" placeholder="~/Ouroboros/skills or /absolute/path/to/skills" class="ui-control" name="s-skills-repo-path" type="text" aria-describedby="s-skills-repo-path-help">
+                                <div class="settings-inline-note ui-field-help" id="s-skills-repo-path-help">Absolute or <code>~</code>-prefixed path. Ouroboros never clones/pulls this directory — you manage it yourself.</div>
                             </div>
                         </div>
                     </div>
@@ -618,11 +753,81 @@ export function renderSettingsPage() {
                             are filtered out — only skill packages are installable.
                         </div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>Registry URL</label>
-                                <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1">
-                                <div class="settings-inline-note">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
+                            <div class="form-field ui-field">
+                                <label for="s-clawhub-registry-url">Registry URL</label>
+                                <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1" class="ui-control" name="s-clawhub-registry-url" type="text" aria-describedby="s-clawhub-registry-url-help">
+                                <div class="settings-inline-note ui-field-help" id="s-clawhub-registry-url-help">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
                             </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="appearance">
+                    ${languageBlockHtml()}
+
+                    <div class="form-section">
+                        <h3>Theme</h3>
+                        <div class="settings-section-copy">
+                            <code>System</code> follows this device's OS appearance and is the default for a new client.
+                            <code>Light</code> and <code>Dark</code> pin the palette regardless of the OS.
+                            <br><strong>Per device, not per account:</strong> the choice is stored by this client alone
+                            (the desktop window and each browser keep their own), never sent to the server and never
+                            shared with other devices. Clearing this client's site data returns it to System.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="theme-choice-label" id="s-appearance-theme-label">Theme</label>
+                            <div data-theme-control aria-labelledby="s-appearance-theme-label"></div>
+                            <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section" data-notify-settings>
+                        <h3>Notifications</h3>
+                        <div class="settings-section-copy">
+                            While this client is running, Ouroboros can pull you back to a question or a
+                            finished task. Notifications arrive whether or not this window has focus, and
+                            clicking one opens its source; a banner from the tray or menu-bar indicator
+                            opens the window as you left it. Sound silences this client's tone and the
+                            macOS sound; a Windows tray balloon follows Windows' own sound setting.
+                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
+                            are stored by this client alone and never sent to the server.
+                            Where this system exposes no notifications, or permission is denied, alerts appear
+                            inside the app instead. Do Not Disturb and OS permissions still decide what you see.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="enabled">
+                                Enable notifications
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="needs_answer">
+                                A question or decision is waiting for you
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="task_done">
+                                A task finished or stopped
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
+                                Messages Ouroboros sends you while it works, its reminders, and skill notices
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
+                                Ordinary replies in Main
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
+                                Sound
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
+                                Show the message text (otherwise only the kind of event)
+                            </label>
+                            <div class="settings-toolbar">
+                                <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
+                            </div>
+                            <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
+                            <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
                 </section>
@@ -634,7 +839,7 @@ export function renderSettingsPage() {
                                 <h3>MCP Servers</h3>
                                 <div class="settings-section-copy">
                                     External Model Context Protocol tool servers. MCP is a base-runtime client:
-                                    it borrows tools from trusted HTTP/SSE servers and exposes them as non-core
+                                    it borrows tools from trusted HTTP/SSE servers or local stdio processes and exposes them as non-core
                                     <code>mcp_&lt;server&gt;__&lt;tool&gt;</code> tools after refresh. Changes are hot-reloadable.
                                     Treat server descriptions and results as untrusted third-party data.
                                 </div>
@@ -645,13 +850,13 @@ export function renderSettingsPage() {
                             </div>
                         </div>
                         <div class="form-grid two">
-                            <label class="local-toggle">
-                                <input type="checkbox" id="s-mcp-enabled">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" id="s-mcp-enabled" class="ui-checkbox" name="s-mcp-enabled">
                                 Enable MCP client
                             </label>
-                            <div class="form-field">
-                                <label>Per-tool timeout (s)</label>
-                                <input id="s-mcp-tool-timeout" type="number" min="1" value="60">
+                            <div class="form-field ui-field">
+                                <label for="s-mcp-tool-timeout">Per-tool timeout (s)</label>
+                                <input id="s-mcp-tool-timeout" type="number" min="1" value="60" class="ui-control" name="s-mcp-tool-timeout">
                             </div>
                         </div>
                         <div id="mcp-global-status" class="settings-inline-status">Checking MCP status…</div>
@@ -662,9 +867,21 @@ export function renderSettingsPage() {
                         <h3>Source Control</h3>
                         <div class="settings-section-copy">Repository metadata for GitHub integration. Tokens live in Secrets; this is not secret.</div>
                         <div class="form-row">
-                            <div class="form-field">
-                                <label>GitHub Repo</label>
-                                <input id="s-gh-repo" placeholder="owner/repo-name">
+                            <div class="form-field ui-field">
+                                <label for="s-gh-repo">GitHub Repo</label>
+                                <input id="s-gh-repo" placeholder="owner/repo-name" class="ui-control" name="s-gh-repo" type="text">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Extra CA Certificates</h3>
+                        <div class="settings-section-copy">Only for a network whose TLS certificates the default bundle does not trust: a TLS-inspecting proxy, or an endpoint behind a national CA such as GigaChat's. Ouroboros adds the file to its defaults for every provider call; everything else keeps working.</div>
+                        <div class="form-row">
+                            <div class="form-field ui-field">
+                                <label for="s-extra-ca-bundle">Extra CA bundle (PEM)</label>
+                                <input id="s-extra-ca-bundle" placeholder="/path/to/extra-ca.pem" class="ui-control" name="s-extra-ca-bundle" type="text" aria-describedby="s-extra-ca-bundle-help">
+                                <div class="settings-inline-note ui-field-help" id="s-extra-ca-bundle-help">Absolute or <code>~</code>-prefixed path to a PEM file on the machine that runs Ouroboros (its own filesystem, not the device showing this page). Leave empty unless a provider fails with a certificate error.</div>
                             </div>
                         </div>
                     </div>
@@ -673,31 +890,31 @@ export function renderSettingsPage() {
                         <h3>Local Model Runtime</h3>
                         <div class="settings-section-copy">Only fill this in when you want Ouroboros to start and route to a GGUF model on this machine.</div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Model Source</label>
-                                <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf">
+                            <div class="form-field ui-field">
+                                <label for="s-local-source">Model Source</label>
+                                <input id="s-local-source" placeholder="bartowski/Llama-3.3-70B-Instruct-GGUF or /path/to/model.gguf" class="ui-control" name="s-local-source" type="text">
                             </div>
-                            <div class="form-field">
-                                <label>GGUF Filename (for HF repos)</label>
-                                <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf">
+                            <div class="form-field ui-field">
+                                <label for="s-local-filename">GGUF Filename (for HF repos)</label>
+                                <input id="s-local-filename" placeholder="Llama-3.3-70B-Instruct-Q4_K_M.gguf" class="ui-control" name="s-local-filename" type="text">
                             </div>
                         </div>
                         <div class="form-grid four">
-                            <div class="form-field">
-                                <label>Port</label>
-                                <input id="s-local-port" type="number" value="8766">
+                            <div class="form-field ui-field">
+                                <label for="s-local-port">Port</label>
+                                <input id="s-local-port" type="number" value="8766" class="ui-control" name="s-local-port">
                             </div>
-                            <div class="form-field">
-                                <label>GPU Layers (-1 = all)</label>
-                                <input id="s-local-gpu-layers" type="number" value="-1">
+                            <div class="form-field ui-field">
+                                <label for="s-local-gpu-layers">GPU Layers (-1 = all)</label>
+                                <input id="s-local-gpu-layers" type="number" value="-1" class="ui-control" name="s-local-gpu-layers">
                             </div>
-                            <div class="form-field">
-                                <label>Context Length</label>
-                                <input id="s-local-ctx" type="number" value="16384">
+                            <div class="form-field ui-field">
+                                <label for="s-local-ctx">Context Length</label>
+                                <input id="s-local-ctx" type="number" value="16384" class="ui-control" name="s-local-ctx">
                             </div>
-                            <div class="form-field">
-                                <label>Chat Format</label>
-                                <input id="s-local-chat-format" placeholder="auto-detect">
+                            <div class="form-field ui-field">
+                                <label for="s-local-chat-format">Chat Format</label>
+                                <input id="s-local-chat-format" placeholder="auto-detect" class="ui-control" name="s-local-chat-format" type="text">
                             </div>
                         </div>
                         <div class="settings-toolbar">
@@ -705,7 +922,8 @@ export function renderSettingsPage() {
                             <button class="btn btn-primary" id="btn-local-stop">Stop</button>
                             <button class="btn btn-primary" id="btn-local-test">Test Tool Calling</button>
                         </div>
-                        <div id="local-model-status" class="settings-inline-status">Status: Offline</div>
+                        <div id="local-model-status" class="settings-inline-status" role="status" aria-live="polite">Status: Offline</div>
+                        <div id="local-model-action-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                         <div id="local-model-progress-wrap" class="local-model-progress-wrap local-model-hidden" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
                             <div id="local-model-progress-bar" class="local-model-progress-bar"></div>
                         </div>
@@ -715,55 +933,56 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Runtime Limits</h3>
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds.</div>
+                        <!-- Active Subagents / Root and Subagent Depth moved to
+                             Agents → Delegation (D-10): they bound the agents,
+                             not the process pool. Max Workers stays: it is
+                             runtime worker processes, not an agent setting. -->
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>Max Workers</label>
-                                <input id="s-workers" type="number" min="1" max="50" value="10">
+                            <div class="form-field ui-field">
+                                <label for="s-workers">Max Workers</label>
+                                <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
                             </div>
-                            <div class="form-field">
-                                <label>Active Subagents / Root</label>
-                                <input id="s-active-subagents" type="number" min="1" max="500" value="6">
+                            <div class="form-field ui-field">
+                                <label for="s-max-rounds">Max Rounds per Task</label>
+                                <input id="s-max-rounds" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-max-rounds">
                             </div>
-                            <div class="form-field">
-                                <label>Subagent Depth</label>
-                                <!-- 0 is a real owner choice ("no delegation at all"), honoured
-                                     structurally since v6.79.0 — it must be reachable here. -->
-                                <input id="s-subagent-depth" type="number" min="0" max="10" value="2">
+                            <div class="form-field ui-field">
+                                <label for="s-task-lifetime">Task Lifetime Limit (s)</label>
+                                <input id="s-task-lifetime" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-task-lifetime">
                             </div>
-                            <div class="form-field">
-                                <label>Tool Timeout (s)</label>
-                                <input id="s-tool-timeout" type="number" value="600">
+                            <div class="form-field ui-field">
+                                <label for="s-presence-max-active">Concurrent Presence Conversations</label>
+                                <input id="s-presence-max-active" type="number" min="1" max="20" value="2" class="ui-control" name="s-presence-max-active">
                             </div>
-                            <div class="form-field">
-                                <label>Total Budget (USD)</label>
-                                <input id="s-total-budget" type="number" min="0.01" step="any" value="10.0">
+                            <div class="form-field ui-field">
+                                <label for="s-tool-timeout">Tool Timeout (s)</label>
+                                <input id="s-tool-timeout" type="number" value="600" class="ui-control" name="s-tool-timeout">
                             </div>
-                            <div class="form-field">
-                                <label>Per-Task Soft Threshold (USD)</label>
-                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="20.0">
+                            <div class="form-field ui-field">
+                                <label for="s-total-budget">Total Budget (USD)</label>
+                                <input id="s-total-budget" type="number" min="0.01" step="any" value="200.0" class="ui-control" name="s-total-budget">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-settings-per-task-cost">Per-Task Cost Cap (USD)</label>
+                                <input id="s-settings-per-task-cost" type="number" min="0.01" step="any" value="50.0" class="ui-control" name="s-settings-per-task-cost">
                             </div>
                         </div>
                     </div>
 
                     <div class="form-section">
-                        <h3>Cleanup &amp; Subagent Workspaces</h3>
+                        <h3>Cleanup</h3>
+                        <!-- The two subagent path roots moved to Agents →
+                             Delegation → Advanced (D-10). GC Retention stays: it
+                             governs every disposable runtime artifact, not just
+                             subagent worktrees. -->
                         <div class="settings-section-copy">
-                            <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365).
-                            The roots are where acting subagents check out a git worktree of this repo or build a from-scratch (<code>genesis</code>) project; both live outside the app repo and data. Genesis projects are durable and never auto-removed. Leave a root blank for the default under <code>~/Ouroboros/</code>.
+                            <strong>GC Retention</strong> is the single age knob (days) for all disposable runtime artifacts the startup garbage collector removes: acting-subagent worktrees, terminal task drives, and leftover service logs (hard max 365). Genesis projects are durable and never auto-removed. Where subagents check out that work is set in <code>Agents</code>.
                         </div>
                         <div class="form-grid two">
-                            <div class="form-field">
-                                <label>GC Retention (days)</label>
-                                <input id="s-gc-retention-days" type="number" min="1" max="365" value="7">
-                            </div>
-                            <div class="form-field">
-                                <label>Subagent Worktree Root</label>
-                                <input id="s-subagent-worktree-root" type="text" placeholder="~/Ouroboros/subagent_worktrees">
-                            </div>
-                            <div class="form-field">
-                                <label>Subagent Projects Root (genesis)</label>
-                                <input id="s-subagent-projects-root" type="text" placeholder="~/Ouroboros/projects">
+                            <div class="form-field ui-field">
+                                <label for="s-gc-retention-days">GC Retention (days)</label>
+                                <input id="s-gc-retention-days" type="number" min="1" max="365" value="7" class="ui-control" name="s-gc-retention-days">
                             </div>
                         </div>
                     </div>
@@ -813,10 +1032,13 @@ export function renderSettingsPage() {
                 <div class="settings-footer-actions">
                     <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
                     <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
+                    <button type="button" class="btn btn-secondary" id="btn-restart-now" hidden
+                        title="Restart the agent process">Restart now</button>
                 </div>
                 <div class="settings-footer-status">
                     <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
-                    <div id="settings-status" class="settings-inline-status"></div>
+                    <div id="settings-restart-status" class="settings-inline-status" role="status" aria-live="polite" hidden></div>
+                    <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                 </div>
             </div>
         </div>
@@ -824,47 +1046,52 @@ export function renderSettingsPage() {
 }
 
 export function bindSettingsTabs(root, options = {}) {
-    const tabs = Array.from(root.querySelectorAll('.settings-tab'));
     const panels = Array.from(root.querySelectorAll('.settings-panel'));
     const scrollRoot = root.querySelector('.settings-scroll');
     const state = options.state || null;
     const onActivate = typeof options.onActivate === 'function' ? options.onActivate : null;
 
-    // All viewports use horizontal tab pills; mobile back remains DOM-only for compat.
-    function activate(tabName) {
+    const tabs = bindTabStrip(root.querySelector('.settings-tabs'), {
+        dataAttr: 'data-settings-tab', onChange: (value) => activate(value),
+    });
+    panels.forEach((panel) => {
+        panel.id = `settings-panel-${panel.dataset.settingsPanel}`;
+        panel.setAttribute('role', 'tabpanel');
+        panel.setAttribute('aria-labelledby', `settings-tab-${panel.dataset.settingsPanel}`);
+    });
+
+    function activate(tabName, notify = true) {
+        if (!tabs.select(tabName)) return;
+        const changed = root.dataset.activeSettingsTab !== tabName;
         root.dataset.activeSettingsTab = tabName;
-        let activeButton = null;
-        tabs.forEach((button) => {
-            const isActive = button.dataset.settingsTab === tabName;
-            button.classList.toggle('active', isActive);
-            if (isActive) activeButton = button;
-        });
         panels.forEach((panel) => {
             panel.classList.toggle('active', panel.dataset.settingsPanel === tabName);
+            panel.hidden = panel.dataset.settingsPanel !== tabName;
         });
-        if (scrollRoot) scrollRoot.scrollTop = 0;
+        if (scrollRoot && changed && notify) scrollRoot.scrollTop = 0;
         if (state) state.settingsActiveSubtab = tabName;
-        // Keep active pill visible in the horizontal strip.
-        if (activeButton && typeof activeButton.scrollIntoView === 'function') {
-            activeButton.scrollIntoView({
-                behavior: 'auto',
-                inline: 'center',
-                block: 'nearest',
-            });
+        if (notify && changed) {
+            if (onActivate) onActivate(tabName);
+            window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
         }
-        if (onActivate) onActivate(tabName);
-        window.dispatchEvent(new CustomEvent('ouro:settings-subtab-shown', { detail: { tab: tabName } }));
     }
 
-    tabs.forEach((button) => {
-        button.addEventListener('click', () => activate(button.dataset.settingsTab));
-    });
     root.activateSettingsTab = activate;
-    if (state && !state.settingsActiveSubtab) state.settingsActiveSubtab = 'providers';
-    root.dataset.activeSettingsTab = state?.settingsActiveSubtab || 'providers';
+    activate(state?.settingsActiveSubtab || 'providers', false);
+    return () => { tabs.destroy(); delete root.activateSettingsTab; };
 }
 
 export function bindSecretInputs(root) {
+    root.querySelectorAll('.secret-toggle, .secret-clear').forEach((button) => {
+        const input = root.querySelector(`#${button.dataset.target}`);
+        if (!input) return;
+        button.setAttribute('aria-controls', input.id);
+        const label = input.labels?.[0];
+        if (label) {
+            label.id ||= `${input.id}-label`;
+            button.setAttribute('aria-describedby', label.id);
+        }
+    });
     root.querySelectorAll('.secret-input').forEach((input) => {
         input.addEventListener('input', () => {
             if (input.value.trim()) delete input.dataset.forceClear;
@@ -872,12 +1099,18 @@ export function bindSecretInputs(root) {
     });
 
     root.querySelectorAll('.secret-toggle').forEach((button) => {
-        button.addEventListener('click', () => {
-            const target = root.querySelector(`#${button.dataset.target}`);
-            if (!target) return;
-            const nextType = target.type === 'password' ? 'text' : 'password';
-            target.type = nextType;
-            button.textContent = nextType === 'password' ? 'Show' : 'Hide';
+        const input = root.querySelector(`#${button.dataset.target}`);
+        if (!input) return;
+        const customRow = input.closest('[data-custom-secret-row]');
+        const keyInput = customRow?.querySelector('[data-custom-secret-key]');
+        bindSecretReveal(input, button, {
+            savedSelector: () => {
+                const key = customRow?.dataset.originalKey || input.dataset.secretSetting;
+                return key ? { key } : null;
+            },
+            savedLabel: () => keyInput && keyInput.value.trim().toUpperCase() !== customRow.dataset.originalKey
+                ? `Saved value for ${customRow.dataset.originalKey}` : '',
+            identityInputs: keyInput ? [keyInput] : [],
         });
     });
 
@@ -890,6 +1123,10 @@ export function bindSecretInputs(root) {
             target.dataset.forceClear = '1';
             const toggle = root.querySelector(`.secret-toggle[data-target="${button.dataset.target}"]`);
             if (toggle) toggle.textContent = 'Show';
+            // Programmatic value changes fire no 'input' event, but a Clear is
+            // an edit like any other: the provider-test verdict-expiry listener
+            // must see it, or a stale OK keeps vouching for a cleared key.
+            target.dispatchEvent(new Event('input', { bubbles: true }));
         });
     });
 }

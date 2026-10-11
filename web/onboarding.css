@@ -1,41 +1,14 @@
 :root {
-  color-scheme: dark;
-  --bg: #0b0910;
-  --panel: rgba(20, 18, 28, 0.92);
-  --panel-2: rgba(255, 255, 255, 0.04);
-  --panel-3: rgba(255, 255, 255, 0.03);
-  --border: rgba(255, 255, 255, 0.10);
-  --ui-card-bg: var(--panel);
-  --ui-card-border: var(--border);
-  --ui-tone-ok: var(--green);
-  --ui-tone-danger: var(--red);
-  --border-strong: rgba(232, 93, 111, 0.35);
-  --text: #edf2f7;
-  --muted: rgba(237, 242, 247, 0.62);
-  --ghost: rgba(237, 242, 247, 0.28);
-  --accent: #e85d6f;
-  --accent-2: #fb7185;
-  --green: #34d399;
-  --green-dim: rgba(52, 211, 153, 0.14);
-  --amber: #f59e0b;
-  --amber-dim: rgba(245, 158, 11, 0.12);
-  --red: #ef4444;
-  --red-dim: rgba(239, 68, 68, 0.12);
+  --bg: rgb(var(--wizard-rgb));
+  --panel: rgba(var(--wizard-panel-rgb), 0.92);
+  --panel-2: rgba(var(--neutral-rgb), 0.04);
+  --panel-3: rgba(var(--neutral-rgb), 0.03);
+  --border: rgba(var(--neutral-rgb), 0.10);
+  --border-strong: rgba(201, 53, 69, 0.35);
+  --text: var(--text-primary);
+  --muted: var(--text-meta);
+  --ghost: rgba(var(--neutral-rgb), 0.28);
   --shadow: 0 28px 64px rgba(0, 0, 0, 0.45);
-  /* Shared design-system vocabulary (C7.2): the onboarding page is inlined
-     standalone (it cannot import style.css), so it mirrors the same role tokens
-     by VALUE — project fuchsia and the owner-voice blue match style.css exactly,
-     and the role names (task/system/user/project, ok/warn/danger) read the same
-     on both surfaces. The base brand red/green stay as defined above. */
-  --project: #e879f9;
-  --user: #6e96d2;
-  --accent-task: var(--accent);
-  --accent-system: var(--amber);
-  --accent-user: var(--user);
-  --accent-project: var(--project);
-  --tone-ok: var(--green);
-  --tone-warn: var(--amber);
-  --tone-danger: var(--red);
 }
 
 * {
@@ -48,20 +21,43 @@ body {
   min-height: 100%;
 }
 
+/* The appearance control sits above the wizard, so a shell with a hard
+   `100vh - padding` floor overflowed every onboarding page by exactly the
+   control's height. A body column lets the shell take the space that is really
+   left: `flex: 1 0 auto` fills a short page and still grows past the viewport
+   when a step is genuinely taller — the only scroll onboarding should have. */
 body {
   min-height: 100vh;
   padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   background:
-    radial-gradient(circle at top left, rgba(232, 93, 111, 0.12), transparent 35%),
+    radial-gradient(circle at top left, rgba(201, 53, 69, 0.12), transparent 35%),
     radial-gradient(circle at top right, rgba(232, 121, 249, 0.12), transparent 30%),
     var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
+.onboarding-appearance {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+#root {
+  display: flex;
+  flex: 1 0 auto;
+  flex-direction: column;
+}
+
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
 }
 
@@ -72,7 +68,8 @@ textarea::placeholder {
 
 .wizard-shell {
   max-width: 1080px;
-  min-height: calc(100vh - 32px);
+  width: 100%;
+  flex: 1 0 auto;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -80,7 +77,7 @@ textarea::placeholder {
   padding: 14px;
   border: 1px solid var(--border);
   border-radius: 12px;
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.02));
+  background: linear-gradient(180deg, rgba(var(--neutral-rgb), 0.035), rgba(var(--neutral-rgb), 0.02));
   backdrop-filter: blur(18px);
   box-shadow: var(--shadow);
 }
@@ -92,9 +89,11 @@ textarea::placeholder {
   align-items: start;
 }
 
+/* Was a one-off 32px (plus a 28px compact variant); joins the scale. */
 .wizard-title {
   margin: 0 0 4px;
-  font-size: 32px;
+  font-size: var(--type-page);
+  line-height: var(--line-title);
   font-weight: 700;
   letter-spacing: 0;
 }
@@ -103,7 +102,8 @@ textarea::placeholder {
   margin: 0;
   max-width: 760px;
   color: var(--muted);
-  line-height: 1.42;
+  font-size: var(--type-body);
+  line-height: var(--line-body);
 }
 
 .wizard-badge {
@@ -112,13 +112,18 @@ textarea::placeholder {
   border: 1px solid var(--border);
   background: var(--panel-2);
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   white-space: nowrap;
 }
 
+/* One row of equal columns for HOWEVER many steps the setup contract declares.
+   A hardcoded column count wrapped the moment a step was added (the Agents step
+   pushed "Review before launch" onto a second row of its own). */
 .wizard-steps {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-auto-flow: column;
+  grid-auto-columns: minmax(0, 1fr);
   gap: 10px;
 }
 
@@ -136,12 +141,12 @@ textarea::placeholder {
 
 .wizard-step.active {
   border-color: var(--border-strong);
-  background: rgba(232, 93, 111, 0.09);
-  box-shadow: inset 0 0 0 1px rgba(232, 93, 111, 0.12);
+  background: var(--accent-08);
+  box-shadow: inset 0 0 0 1px var(--accent-12);
 }
 
 .wizard-step.done {
-  border-color: rgba(52, 211, 153, 0.22);
+  border-color: rgba(34, 197, 94, 0.22);
 }
 
 .wizard-step-index {
@@ -151,31 +156,31 @@ textarea::placeholder {
   margin-bottom: 0;
   padding: 4px 9px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.07);
-  color: var(--muted);
-  font-size: 10px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: 1;
   font-weight: 700;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0.04em;
 }
 
 .wizard-step.active .wizard-step-index {
-  background: rgba(232, 93, 111, 0.18);
+  background: var(--accent-18);
   color: var(--text);
 }
 
 .wizard-step-title {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--type-meta);
   font-weight: 600;
-  line-height: 1.35;
+  line-height: var(--line-meta);
 }
 
 .wizard-step-copy {
   margin: 0;
   color: var(--muted);
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 @media (max-width: 1100px) {
@@ -215,7 +220,8 @@ textarea::placeholder {
 
 .step-title {
   margin: 0 0 6px;
-  font-size: 24px;
+  font-size: var(--type-page);
+  line-height: var(--line-title);
   font-weight: 700;
 }
 
@@ -223,7 +229,8 @@ textarea::placeholder {
   margin: 0;
   color: var(--muted);
   max-width: 780px;
-  line-height: 1.42;
+  font-size: var(--type-body);
+  line-height: var(--line-body);
 }
 
 .panel-card,
@@ -247,7 +254,10 @@ textarea::placeholder {
 .summary-card h3,
 .wizard-choice h3 {
   margin: 0 0 8px;
-  font-size: 15px;
+  font-size: var(--type-section);
+  line-height: var(--line-title);
+  font-weight: 600;
+  color: var(--text);
 }
 
 .panel-card p,
@@ -256,15 +266,15 @@ textarea::placeholder {
 .field-note {
   margin: 0;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.42;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .wizard-inline-note code,
 .field-note code {
   padding: 1px 4px;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.08);
+  background: rgba(var(--neutral-rgb), 0.08);
 }
 
 .grid {
@@ -294,41 +304,7 @@ textarea::placeholder {
   min-width: 0;
 }
 
-.wizard-model-field {
-  position: relative;
-}
 
-.wizard-model-suggestions {
-  position: absolute;
-  z-index: 50;
-  left: 0;
-  right: 0;
-  top: 56px;
-  max-height: 220px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  background: rgba(18, 20, 26, 0.98);
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.38);
-}
-
-.wizard-model-suggestion {
-  display: block;
-  width: 100%;
-  padding: 8px 10px;
-  border: 0;
-  background: transparent;
-  color: var(--text);
-  text-align: left;
-  cursor: pointer;
-  font: inherit;
-  font-size: 12px;
-}
-
-.wizard-model-suggestion:hover {
-  background: rgba(255, 255, 255, 0.06);
-}
 
 .field-full {
   grid-column: 1 / -1;
@@ -341,38 +317,30 @@ textarea::placeholder {
   gap: 12px;
 }
 
+/* Uppercase micro-label retired (docs/DESIGN.md "Hierarchy rule"). */
 .field label {
-  color: rgba(237, 242, 247, 0.68);
-  font-size: 12px;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  text-transform: none;
+  letter-spacing: normal;
 }
 
 .field-clear {
   padding: 0;
   border: none;
   background: transparent;
-  color: rgba(237, 242, 247, 0.48);
+  color: var(--text-meta);
   cursor: pointer;
-  font-size: 11px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
 .field-clear:hover {
   color: var(--text);
 }
 
-input,
-select {
-  width: 100%;
-  min-width: 0;
-  padding: 10px 12px;
-  border-radius: 12px;
-  border: 1px solid var(--border);
-  background: rgba(11, 9, 16, 0.72);
-  color: var(--text);
-  outline: none;
-}
 
 .compatible-model-actions,
 .compatible-model-list {
@@ -394,11 +362,6 @@ select {
   margin: 0;
 }
 
-input:focus,
-select:focus {
-  border-color: var(--border-strong);
-  box-shadow: 0 0 0 3px rgba(232, 93, 111, 0.12);
-}
 
 .selection-row,
 .footer-actions {
@@ -409,7 +372,7 @@ select:focus {
 
 .selection-pill {
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.03);
+  background: rgba(var(--neutral-rgb), 0.03);
   color: var(--text);
   padding: 10px 14px;
   border-radius: 999px;
@@ -418,12 +381,12 @@ select:focus {
 }
 
 .selection-pill:hover {
-  border-color: rgba(255, 255, 255, 0.24);
+  border-color: rgba(var(--neutral-rgb), 0.24);
   transform: translateY(-1px);
 }
 
 .selection-pill.active {
-  background: rgba(232, 93, 111, 0.16);
+  background: var(--accent-dim);
   border-color: var(--border-strong);
 }
 
@@ -455,15 +418,21 @@ select:focus {
   justify-content: center;
   padding: 5px 10px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--muted);
-  font-size: 11px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 600;
 }
 
 .wizard-choice-grid.three {
-  /* Runtime-mode picker has three choices, not the default two. */
+  /* Runtime-mode picker for contracts with three choices. */
   grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.wizard-choice-grid.four {
+  /* Cyber Pro adds a fourth access level to the same independent picker. */
+  grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
 .wizard-choice {
@@ -477,28 +446,32 @@ select:focus {
 
 .wizard-choice.active {
   border-color: var(--border-strong);
-  background: rgba(232, 93, 111, 0.09);
+  background: var(--accent-08);
 }
 
+/* Choice-card chip. Only advisory/blocking declared a pair, so the three
+   runtime-mode chips rendered as bare white text; neutral is now the default. */
 .wizard-choice .tone {
   display: inline-flex;
   margin-bottom: 10px;
   padding: 4px 8px;
   border-radius: 999px;
-  font-size: 11px;
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
   font-weight: 700;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0.02em;
 }
 
 .wizard-choice.advisory .tone {
-  background: var(--amber-dim);
-  color: #fbbf24;
+  background: var(--status-warn-bg);
+  color: var(--status-warn-fg);
 }
 
 .wizard-choice.blocking .tone {
-  background: var(--green-dim);
-  color: #6ee7b7;
+  background: var(--status-ok-bg);
+  color: var(--status-ok-fg);
 }
 
 .wizard-runtime-strip {
@@ -510,42 +483,62 @@ select:focus {
 
 .wizard-runtime-status {
   color: var(--muted);
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+
+.wizard-runtime-status[data-tone="muted"] {
+  color: var(--status-neutral-fg);
 }
 
 .wizard-runtime-status[data-tone="ok"] {
-  color: var(--ui-tone-ok);
+  color: var(--status-ok-fg);
 }
 
 .wizard-runtime-status[data-tone="error"] {
-  color: var(--ui-tone-danger);
+  color: var(--status-error-fg);
+}
+
+/* Status = dot + text, matching the settings shell. */
+.wizard-runtime-status[data-tone]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
 }
 
 .wizard-test-result {
-  display: none;
   padding: 10px 12px;
   border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(var(--neutral-rgb), 0.08);
+  background: rgba(var(--neutral-rgb), 0.03);
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
   white-space: pre-wrap;
 }
 
+.wizard-test-result[hidden] { display: none; }
+
 .wizard-test-result[data-tone="ok"] {
-  border-color: rgba(52, 211, 153, 0.22);
-  color: #86efac;
+  border-color: rgba(34, 197, 94, 0.22);
+  color: var(--status-ok-fg);
 }
 
 .wizard-test-result[data-tone="warn"] {
   border-color: rgba(245, 158, 11, 0.18);
-  color: #fcd34d;
+  color: var(--status-warn-fg);
 }
 
 .wizard-test-result[data-tone="error"] {
   border-color: rgba(239, 68, 68, 0.18);
-  color: #fca5a5;
+  color: var(--status-error-fg);
 }
 
 .summary-card {
@@ -554,16 +547,19 @@ select:focus {
   gap: 10px;
 }
 
+/* Key at meta ink, value at primary (docs/DESIGN.md "Hierarchy rule"). */
 .summary-kv {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
   gap: 10px;
-  font-size: 12px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--text);
   align-items: start;
 }
 
 .summary-kv strong {
-  color: rgba(237, 242, 247, 0.72);
+  color: var(--text-meta);
   font-weight: 600;
 }
 
@@ -578,46 +574,566 @@ select:focus {
 .footer-copy {
   max-width: 640px;
   color: var(--muted);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
 }
 
-.btn {
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px 14px;
-  cursor: pointer;
-  transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
-}
-
-.btn:hover:not(:disabled) {
-  transform: translateY(-1px);
-}
-
-.btn-primary {
-  min-width: 170px;
-  background: linear-gradient(135deg, var(--accent), var(--accent-2));
-  border-color: rgba(251, 113, 133, 0.55);
-  color: #fff;
-  font-weight: 700;
-}
-
-.btn-secondary,
-.btn-ghost {
-  background: rgba(255, 255, 255, 0.03);
-  color: var(--text);
-}
-
-.btn:disabled {
-  opacity: 0.42;
-  cursor: default;
-  transform: none;
-}
 
 .wizard-error {
   min-height: 22px;
-  color: #fca5a5;
-  font-size: 12px;
+  color: var(--status-error-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+
+/* ---------------------------------------------------------------------------
+   Agents step (phase 3C). Semantics in docs/DESIGN.md §7 (onboarding density)
+   and §6 (row anatomy): one primary thing per row, meta ink for everything
+   else, and the artwork — not the ladder — is what a short viewport drops.
+   --------------------------------------------------------------------------- */
+
+/* The figure column is sized to the diagram's own coordinate space, so its
+   labels render at the meta size instead of being scaled to illegibility. */
+.agent-ladder-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 360px);
+  gap: 18px;
+  align-items: start;
+}
+
+.agent-ladder {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-rung {
+  display: grid;
+  grid-template-columns: 62px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+}
+
+.agent-rung-tone {
+  justify-self: start;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--status-neutral-bg);
+  color: var(--status-neutral-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+
+/* The last rung is the destination the owner is being shown, so it is the one
+   place on this step that carries the connected colour. */
+.agent-rung:last-child .agent-rung-tone {
+  border-color: rgba(34, 197, 94, 0.32);
+  background: var(--status-ok-bg);
+  color: var(--status-ok-fg);
+}
+
+.agent-rung-text,
+.agent-rung-title,
+.agent-rung-body,
+.agent-family-identity,
+.agent-family-name,
+.agent-family-status {
+  display: block;
+}
+
+.agent-rung-title {
+  font-size: var(--type-body);
+  line-height: var(--line-title);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agent-rung-body {
+  margin-top: 2px;
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+  color: var(--text-meta);
+}
+
+.agent-ladder-note {
+  margin-top: 10px;
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+  color: var(--text-meta);
+}
+
+/* The rotation diagram. Every stroke is currentColor so the figure inherits the
+   wizard's ink; the accent is spent once, on the thing everything points at. */
+.agents-rotation-figure {
+  margin: 0;
+}
+
+.agents-rotation-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  color: var(--text-meta);
+}
+
+.agents-rotation-ink {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+
+.agents-rotation-ink text {
+  fill: currentColor;
+  stroke: none;
+  font-family: inherit;
+  font-size: var(--type-meta);
+}
+
+.agents-rotation-sub {
+  opacity: 0.62;
+}
+
+.agents-rotation-group {
+  stroke-dasharray: 4 4;
+  opacity: 0.7;
+}
+
+.agents-rotation-more {
+  opacity: 0.35;
+}
+
+.agents-rotation-fill {
+  fill: currentColor;
+  stroke: none;
+}
+
+.agents-rotation-core {
+  stroke: var(--accent);
+  stroke-width: 1.5;
+}
+
+.agents-rotation-core-label {
+  font-weight: 600;
+  opacity: 0.95;
+}
+
+/* One equivalent row per agent family: name + status on the left, its own
+   Connect on the right. No family is laid out differently for being first. */
+.agent-family-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.agent-family-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-3);
+}
+
+.agent-family-name {
+  font-size: var(--type-body);
+  line-height: var(--line-title);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.agent-family-status {
+  margin-top: 2px;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--status-neutral-fg);
+}
+
+.agent-family-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.agent-family-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.agent-family-status[data-tone="error"] { color: var(--status-error-fg); }
+
+.agent-family-status[data-tone]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
+}
+
+.agent-service-note,
+.agent-outcome {
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+  color: var(--text-meta);
+}
+
+.agent-family-purpose {
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+.agent-family-heading {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+}
+.wizard-footer [hidden] { display: none; }
+/* The Language block is the Settings control (settings_language.js) mounted here; the wizard loads neither
+   style.css nor settings.css, so the three layout rules that block relies on there are stated for it. */
+.wizard-content [data-i18n-settings] [hidden] { display: none; }
+.wizard-content [data-i18n-settings] .settings-effort-card { display: flex; flex-direction: column; gap: var(--space-2); }
+.wizard-content [data-i18n-settings] .settings-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); }
+.wizard-content .settings-section-copy {
+  font-size: var(--type-body);
+  color: var(--text-meta);
+  line-height: var(--line-body);
+  margin-block: var(--space-2);
+}
+.wizard-content .reviewer-slots-group { margin-block: var(--space-3); }
+.wizard-content .reviewer-slot-controls > input,
+.wizard-content .reviewer-slot-controls > select { min-width: 0; }
+.subscription-quota-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-block: var(--space-2);
+  font-size: var(--type-body);
+  color: var(--text-primary);
+}
+.subscription-quota-row > span {
+  font-size: var(--type-meta);
+  color: var(--text-meta);
+}
+
+.agent-service-note {
+  margin-bottom: 10px;
+}
+
+.agent-service-note[data-tone="warn"] { color: var(--status-warn-fg); }
+.agent-service-note[data-tone="error"] { color: var(--status-error-fg); }
+
+.agent-outcome {
+  margin-top: 10px;
+}
+
+/* Mirror of the settings.css compact card (docs/DESIGN.md §6 row anatomy):
+   the wizard loads only this sheet. Same rhythm tokens, the wizard's own
+   surface tokens. */
+.available-subagents-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.available-subagents-toolbar,
+.available-subagent-head,
+.available-subagent-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.available-subagents-toolbar .btn-default,
+.available-subagent-actions { margin-left: auto; }
+
+.available-subagents-count,
+.available-subagents-source,
+.available-subagents-diagnostics,
+.available-subagents-empty,
+.available-subagent-meta {
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+}
+
+.available-subagents-diagnostics[data-tone="error"],
+.available-subagent-meta[data-tone="error"] { color: var(--status-error-fg); }
+
+.available-subagents-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.available-subagent-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel-3);
+}
+
+/* An entry the owner tried to finish with an error is emphasised, not dimmed. */
+.available-subagent-row[data-invalid] {
+  border-color: var(--status-error-border);
+  background: var(--status-error-bg);
+}
+
+.available-subagent-route {
+  display: grid;
+  /* A track minimum yields to the container: the viewport query does not know
+     the wizard column width, so the floor is capped at 100% of the row. */
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
+  gap: var(--space-2);
+}
+
+.available-subagent-heading {
+  margin: 0;
+  color: var(--text);
+  font-size: var(--type-body);
+  font-weight: 600;
+}
+
+/* The per-row owner switch leads the card head; padding buys the pointer
+   target around the 14px native box and the negative margin keeps the head's
+   own rhythm (docs/DESIGN.md §6). */
+.available-subagent-enable {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-2);
+  margin: calc(-1 * var(--space-2));
+  cursor: pointer;
+}
+
+.available-subagent-head .settings-inline-status {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Standalone mirror of style.css: onboarding does not load the app sheet. */
+.harness-identity {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 100%;
+  vertical-align: middle;
+}
+
+.harness-identity-mark {
+  inline-size: 1em;
+  block-size: 1em;
+  flex: 0 0 1em;
+  color: currentColor;
+  fill: currentColor;
+}
+
+.harness-identity-label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.available-subagent-route-identity-wrap {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+}
+
+.available-subagent-purpose {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+}
+
+/* One line that grows with its text up to four, then scrolls (`field-sizing`);
+   a shell without it keeps the one-line field and manual resize. */
+.available-subagent-purpose textarea {
+  width: 100%;
+  field-sizing: content;
+  line-height: var(--line-body);
+  min-height: calc(var(--type-body) * var(--line-body) + 22px);
+  max-height: calc(4 * var(--type-body) * var(--line-body) + 22px);
+  overflow-y: auto;
+  resize: vertical;
+}
+
+.available-subagent-meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.available-subagent-meta[data-run-history] {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.available-subagent-actions .btn-default {
+  min-height: 34px;
+  padding: 0 11px;
+}
+
+/* The shared login card (harness_login_cards.js) renders the same markup here
+   as in Settings, but Settings' stylesheets are never loaded by this page — so
+   its classes are given the same anatomy against the wizard's own tokens. */
+.harness-login-card {
+  margin-top: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+}
+
+.harness-login-card h4 {
+  margin: 0;
+  font-size: var(--type-body);
+  line-height: var(--line-title);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.harness-login-card p {
+  margin: 0;
+  font-size: var(--type-body);
+  line-height: var(--line-body);
+  color: var(--text-meta);
+}
+
+.harness-signin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.harness-signin-actions a.btn {
+  text-decoration: none;
+}
+
+.harness-device-code p {
+  margin: 4px 0;
+}
+
+.harness-code {
+  display: inline-block;
+  padding: 8px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--type-page);
+  letter-spacing: 0.18em;
+  user-select: all;
+}
+
+.harness-code-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.harness-code-entry label {
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--text-meta);
+}
+
+.harness-code-entry-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.harness-code-entry-row input { width: auto; min-width: min(220px, 100%); flex: 1 1 220px; }
+
+.harness-advanced {
+  align-self: stretch;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.harness-advanced summary {
+  cursor: pointer;
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--text-meta);
+}
+
+.harness-advanced[open] summary {
+  margin-bottom: 6px;
+}
+
+.harness-advanced p {
+  margin: 4px 0;
+  font-size: var(--type-meta);
+}
+
+.harness-attach-command {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(var(--neutral-rgb), 0.05);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: var(--type-meta);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  user-select: all;
+}
+
+.settings-inline-note {
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
+  color: var(--text-meta);
+}
+
+.settings-inline-note[data-tone="ok"] { color: var(--status-ok-fg); }
+.settings-inline-note[data-tone="warn"] { color: var(--status-warn-fg); }
+.settings-inline-note[data-tone="error"] { color: var(--status-error-fg); }
+
+.settings-inline-status {
+  font-size: var(--type-meta);
+  line-height: var(--line-meta);
+  color: var(--status-neutral-fg);
+}
+
+.settings-inline-status[data-tone="neutral"] { color: var(--status-neutral-fg); }
+.settings-inline-status[data-tone="ok"] { color: var(--status-ok-fg); }
+.settings-inline-status[data-tone="warn"] { color: var(--status-warn-fg); }
+.settings-inline-status[data-tone="error"] { color: var(--status-error-fg); }
+
+.settings-inline-status[data-tone]::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: middle;
+  position: relative;
+  top: -1px;
 }
 
 @media (max-height: 820px), (max-width: 900px) {
@@ -631,10 +1147,8 @@ select:focus {
     align-items: center;
   }
 
-  .wizard-title {
-    font-size: 28px;
-  }
-
+  /* Title shrinks dropped with the one-off sizes they adjusted; hiding the
+     copy below reclaims far more height. */
   .wizard-subtitle,
   .wizard-step-copy,
   .step-copy,
@@ -642,6 +1156,60 @@ select:focus {
   .field-note,
   .footer-copy {
     display: none;
+  }
+
+  /* Agents step: the ARTWORK is what a short viewport drops, never the ladder.
+     Everything the diagram draws is stated in the text beside it, so hiding it
+     costs nothing and buys back ~180px. The login card's own sentences are
+     re-exempted from the blanket `.panel-card p` rule above: they are the live
+     sign-in instructions, not explanatory prose. */
+  .agents-rotation-figure {
+    display: none;
+  }
+
+  .agent-ladder-layout {
+    grid-template-columns: 1fr;
+    gap: 0;
+  }
+
+  /* Compact row anatomy: name and status share one line instead of stacking.
+     Three rows at two lines each was the single largest block of reclaimable
+     height on this step, and nothing is dropped — only re-flowed. */
+  .agent-family-identity {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px;
+  }
+
+  .agent-family-status {
+    margin-top: 0;
+  }
+
+  .agent-family-row {
+    padding: 6px 10px;
+  }
+
+  .agent-family-list {
+    gap: 5px;
+    margin-top: 8px;
+  }
+
+  .agent-ladder {
+    gap: 6px;
+  }
+
+  .agent-ladder-note,
+  .agent-outcome {
+    margin-top: 8px;
+  }
+
+  .available-subagent-route {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .harness-login-card p {
+    display: block;
   }
 
   .wizard-steps {
@@ -660,7 +1228,6 @@ select:focus {
 
   .step-title {
     margin-bottom: 0;
-    font-size: 22px;
   }
 
   .panel-card,
@@ -670,11 +1237,6 @@ select:focus {
     padding: 10px 12px;
   }
 
-  input,
-  select,
-  .btn {
-    padding: 8px 10px;
-  }
 
   .wizard-footer {
     justify-content: flex-end;
@@ -691,14 +1253,15 @@ select:focus {
   }
 
   .wizard-shell {
-    min-height: calc(100vh - 32px);
     padding: 14px;
   }
 
   .field-grid,
   .grid.two,
   .grid.three,
-  .wizard-choice-grid {
+  .wizard-choice-grid,
+  .wizard-choice-grid.four,
+  .agent-ladder-layout {
     grid-template-columns: 1fr;
   }
 
@@ -711,12 +1274,16 @@ select:focus {
     display: none;
   }
 
-  .wizard-step-title {
-    font-size: 12px;
-  }
-
   .summary-kv {
     grid-template-columns: 1fr;
+  }
+
+  .available-subagent-route {
+    grid-template-columns: 1fr;
+  }
+
+  .available-subagents-toolbar .btn-default {
+    margin-left: 0;
   }
 }
 
@@ -731,3 +1298,29 @@ select:focus {
     display: none;
   }
 }
+
+/* track-migration:begin — Removed with the shared wizard role adapters. */
+
+
+input:not(.ui-control):not(.ui-checkbox),
+select:not(.ui-control):not(.ui-checkbox),
+textarea:not(.ui-control):not(.ui-checkbox) {
+  width: 100%;
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(var(--wizard-rgb), 0.72);
+  color: var(--text);
+  font-size: var(--type-body);
+  outline: none;
+}
+
+
+input:not(.ui-control):not(.ui-checkbox):focus,
+select:not(.ui-control):not(.ui-checkbox):focus,
+textarea:not(.ui-control):not(.ui-checkbox):focus {
+  border-color: var(--focus-accent-border);
+  box-shadow: 0 0 0 3px var(--focus-accent-ring);
+}
+/* track-migration:end */

@@ -3,10 +3,12 @@
 An LLM-first short human title for a project card, with a deterministic heuristic
 fallback. Shared by every path that names a project so the UI conversion and the
 agent never drift:
-  - the proactive card namer (names ANY task card up front, supervisor side);
-  - ``gateway/projects.py`` turn-into-project conversion (reuses the up-front name,
+  - ``gateway/projects.py`` turn-into-project conversion (reuses an admission name,
     or names inline as a race fallback);
-  - ``ensure_project_scope`` (the agent self-creates + names a project).
+  - ``ensure_project_scope`` (the agent self-creates + names a project);
+  - ``admission_names`` (headless runs and chat promotion, no model call);
+  - ``spawn_turn_namer`` (a direct Main turn, named once it starts working:
+    the first non-addressing tool call triggers one bounded Light call).
 
 Doctrine:
   - P5 LLM-first: the model COINS the name; post-processing is purely lexical
@@ -18,12 +20,12 @@ Doctrine:
 
 from __future__ import annotations
 
+import contextvars
 import logging
-import os
 import pathlib
 import threading
 from dataclasses import replace
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence
 
 log = logging.getLogger("ouroboros.project_naming")
 
@@ -33,9 +35,11 @@ def _light_use_local(explicit: Optional[bool]) -> bool:
     otherwise follow the runtime ``USE_LOCAL_LIGHT`` flag — naming runs on the LIGHT model,
     so it must route local/remote like every other light-lane caller (e.g. the safety
     check at ``ouroboros/safety.py::_resolve_safety_routing``) instead of hardcoding remote."""
+    from ouroboros.config import runtime_setting
+
     if explicit is not None:
         return bool(explicit)
-    return str(os.environ.get("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1")
+    return str(runtime_setting("USE_LOCAL_LIGHT", "") or "").lower() in ("true", "1")
 
 # Mirror gateway ``_MAX_DERIVED_NAME`` so heuristic and LLM names share one cap.
 MAX_PROJECT_NAME = 60
@@ -94,11 +98,13 @@ def _light_naming_model() -> str:
 def _naming_timeout_sec() -> float:
     """Provider-call transport timeout for the naming LIGHT call. SSOT: config
     SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import SETTINGS_DEFAULTS
 
     default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC"]
     try:
-        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", default))
+        return float(runtime_setting("OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC", default))
     except (TypeError, ValueError):
         return float(default)
 
@@ -106,17 +112,21 @@ def _naming_timeout_sec() -> float:
 def _naming_async_timeout_sec() -> float:
     """Gateway HARD wait for the inline turn-into-project name. SSOT: config
     SETTINGS_DEFAULTS (no duplicated literal — the default IS the SSOT value)."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.config import SETTINGS_DEFAULTS
 
     default = SETTINGS_DEFAULTS["OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC"]
     try:
-        return float(os.environ.get("OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", default))
+        return float(runtime_setting("OUROBOROS_PROJECT_NAMING_ASYNC_TIMEOUT_SEC", default))
     except (TypeError, ValueError):
         return float(default)
 
 
 def _project_naming_usage_scope(drive_root: Optional[Any], task_id: str):
     """Bind a naming send to its task tree even from a daemon/gateway thread."""
+    from ouroboros.config import runtime_setting
+
     from ouroboros.usage_accounting import UsageScope, current_usage_scope
 
     active = current_usage_scope()
@@ -136,12 +146,11 @@ def _project_naming_usage_scope(drive_root: Optional[Any], task_id: str):
     root_task_id = str(persisted.get("root_task_id") or metadata.get("root_task_id") or scoped_task_id)
     parent_task_id = str(persisted.get("parent_task_id") or metadata.get("parent_task_id") or "")
     budget_root = persisted.get("budget_drive_root") or metadata.get("budget_drive_root") or drive_root
+    from ouroboros.settings_setup_contract import resolve_total_budget_usd
+
+    global_limit = resolve_total_budget_usd()
     try:
-        global_limit = float(os.environ.get("TOTAL_BUDGET", "0") or 0)
-    except (TypeError, ValueError):
-        global_limit = 0.0
-    try:
-        root_limit = float(os.environ.get("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+        root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
     except (TypeError, ValueError):
         root_limit = 0.0
     return UsageScope(
@@ -151,7 +160,7 @@ def _project_naming_usage_scope(drive_root: Optional[Any], task_id: str):
         parent_task_id=parent_task_id,
         category="project_naming",
         source="project_naming",
-        global_limit_usd=global_limit if global_limit > 0 else None,
+        global_limit_usd=global_limit,
         root_limit_usd=root_limit if root_limit > 0 else None,
     )
 
@@ -194,6 +203,7 @@ def llm_project_name(
         chat_kwargs = dict(
             messages=[{"role": "user", "content": _NAMING_PROMPT.format(request=naming_input)}],
             model=model,
+            model_role="light",
             tools=None,
             reasoning_effort="low",
             max_tokens=256,
@@ -280,19 +290,25 @@ def _refresh_root_cost_after_naming(drive_root: Any, task_id: str) -> None:
         log.debug("project naming cost refresh failed for %s", task_id, exc_info=True)
 
 
-def spawn_proactive_namer(
+def spawn_turn_namer(
     drive_root: Any, task_id: str, text: str, *, broadcast: Optional[Callable[[dict], None]] = None,
 ) -> None:
-    """Proactively coin an LLM project name for a fresh card in a DAEMON thread (Cluster B).
+    """Coin an LLM title for a direct turn that started working, in a DAEMON thread.
 
-    Writes the coined ``suggested_name`` onto the task result (turn-into-project then reuses
-    it with zero extra call) and, via ``broadcast``, emits a ``task_named`` event so the live
-    card shows a human title up front. NEVER blocks the task. ``drive_root`` is captured at
+    Called once per Main turn from the first non-addressing tool-call frame (the
+    seam that already stamps that frame as work: ``supervisor/log_addressing.py``),
+    so a greeting that runs no tool costs no naming call while a turn that does
+    real work gets a human title as its block becomes the task card. Writes the
+    coined ``suggested_name`` onto the task result (turn-into-project then reuses
+    it with zero extra call) and, via ``broadcast``, emits a ``task_named`` event so
+    the live card shows the title. NEVER blocks the task. ``drive_root`` is captured at
     CALL time — NOT read from a mutable module global at thread-execution time — so a later
     context switch (or a test that swaps the supervisor drive) can't redirect this thread's
     write. Skips cleanly unless ``drive_root`` is a real directory (test safety: a stub /
     MagicMock drive must never materialise a stray path — chat_observed persists BEFORE the
     LLM call). Fail-soft."""
+    from ouroboros.settings_integrity import copy_task_settings_context
+
     body = " ".join(str(text or "").split())
     if not body:
         return
@@ -328,13 +344,15 @@ def spawn_proactive_namer(
                 try:
                     _result.append(llm_project_name(body, drive_root=drive_root, task_id=task_id))
                 except Exception:
-                    log.debug("proactive namer inner call failed for %s", task_id, exc_info=True)
+                    log.debug("turn namer inner call failed for %s", task_id, exc_info=True)
                 finally:
                     _finished.set()
                     if _detached.is_set():
                         _refresh_detached_once()
 
-            inner = threading.Thread(target=_call, name=f"namer-call-{task_id}", daemon=True)
+            settings_context = contextvars.Context()
+            copy_task_settings_context(settings_context)
+            inner = threading.Thread(target=settings_context.run, args=(_call,), name=f"namer-call-{task_id}", daemon=True)
             inner.start()
             if not _finished.wait(timeout=max(0.0, _naming_timeout_sec() + 30.0)):
                 _detached.set()
@@ -342,11 +360,11 @@ def spawn_proactive_namer(
                 # the detached marker. The once-guard covers both interleavings.
                 if _finished.is_set():
                     _refresh_detached_once()
-                log.debug("proactive namer exceeded its wall-clock bound for %s; skipped", task_id)
+                log.debug("turn namer exceeded its wall-clock bound for %s; skipped", task_id)
                 return
             inner.join()
             if not _result:
-                log.debug("proactive namer exceeded its wall-clock bound for %s; skipped", task_id)
+                log.debug("turn namer exceeded its wall-clock bound for %s; skipped", task_id)
                 return
             name = _result[0]
             if not name:
@@ -377,9 +395,32 @@ def spawn_proactive_namer(
                 except Exception:
                     log.debug("task_named broadcast failed for %s", task_id, exc_info=True)
         except Exception:
-            log.debug("proactive namer failed for %s", task_id, exc_info=True)
+            log.debug("turn namer failed for %s", task_id, exc_info=True)
 
     try:
-        threading.Thread(target=_work, name=f"namer-{task_id}", daemon=True).start()
+        settings_context = contextvars.Context()
+        copy_task_settings_context(settings_context)
+        threading.Thread(target=settings_context.run, args=(_work,), name=f"namer-{task_id}", daemon=True).start()
     except Exception:
-        log.debug("proactive namer thread spawn failed for %s", task_id, exc_info=True)
+        log.debug("turn namer thread spawn failed for %s", task_id, exc_info=True)
+
+
+def admission_names(body: Dict[str, Any], description: str) -> tuple:
+    """The run's owner-facing name at admission: ``(title, suggested_name)``.
+
+    A caller-supplied title is AUTHORSHIP — it fills both slots, exactly as a
+    chat turn promoted into a task does. Without one, the request's first line is
+    DERIVED for display only: it fills ``suggested_name`` (what the live card,
+    history replay and the Project lifecycle row read) and leaves ``title``
+    empty, so a truncated prompt never outranks a real name coined later. Lexical
+    only — markdown is stripped before the first line is taken, then the shared
+    title cleaner caps it at the project-name length (P5: no model call, and
+    therefore no benchmark-visible cost for a scripted run).
+    """
+    from ouroboros.projects_registry import PROJECT_NAME_MAX
+    from ouroboros.utils import strip_markdown
+
+    explicit = clean_model_title(strip_markdown(str(body.get("title") or "")), max_len=PROJECT_NAME_MAX)
+    if explicit:
+        return explicit, explicit
+    return "", clean_model_title(strip_markdown(description), max_len=PROJECT_NAME_MAX)

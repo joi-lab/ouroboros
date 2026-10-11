@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install Ouroboros on Apple silicon macOS, x86_64 Linux, or x64 Windows, or run it from source with Python 3.10 or newer.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <link rel="canonical" href="https://ouroboros-agent.ai/install/">
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Ouroboros">
+  <meta property="og:title" content="Install Ouroboros">
+  <meta property="og:description" content="Desktop downloads, headless CLI setup, source installation, and verified release metadata for Ouroboros.">
+  <meta property="og:url" content="https://ouroboros-agent.ai/install/">
+  <meta property="og:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta property="og:image:alt" content="Ouroboros install and release downloads">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:image" content="https://ouroboros-agent.ai/assets/og-preview.png?v=44a9e298f8">
+  <meta name="twitter:image:alt" content="Ouroboros install and release downloads">
+  <title>Install Ouroboros</title>
+  <link rel="icon" href="/assets/icon_1024.png" type="image/png">
+  <link rel="stylesheet" href="/src/ouroboros.css">
+  <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "SoftwareApplication",
+      "name": "Ouroboros",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS 12+ on Apple silicon, Linux x86_64, Windows x64",
+      "installUrl": "https://ouroboros-agent.ai/install/",
+      "downloadUrl": "https://ouroboros-agent.ai/install/",
+      "codeRepository": "https://github.com/razzant/ouroboros",
+      "license": "https://github.com/razzant/ouroboros/blob/ouroboros/LICENSE",
+      "isAccessibleForFree": true
+    }
+  </script>
+</head>
+<body class="text-page">
+  <div class="ambient" aria-hidden="true"></div>
+  <header class="text-nav"><a class="brand" href="/" aria-label="Ouroboros home"><img src="/assets/icon_1024.png" alt=""><span>Ouroboros</span></a><nav aria-label="Text pages"><a href="/paper/">Paper</a><a href="/about/">About</a><a href="/benchmarks/">Benchmarks</a><a href="https://github.com/razzant/ouroboros/releases/latest">Releases</a></nav></header>
+  <main class="text-document text-document-wide">
+    <p class="chapter-index">DOWNLOAD / CURRENT RELEASE</p>
+    <h1>Download Ouroboros.</h1>
+    <p class="text-lede">Choose your platform and download the app. Normal installation does not require cloning the repository, Python, or uv.</p>
+
+    <div class="download-grid platform-downloads" aria-label="Ouroboros platform downloads">
+      <article>
+        <p class="download-platform">macOS 12+ · Apple silicon only</p>
+        <h2>macOS</h2>
+        <a data-release-download="macos-arm64" class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/Ouroboros-7.6.0.dmg">Download for macOS (.dmg)</a>
+        <p>Open the DMG, drag <code>Ouroboros.app</code> to Applications, then launch it from Applications.</p>
+      </article>
+      <article>
+        <p class="download-platform">Windows x64</p>
+        <h2>Windows</h2>
+        <a data-release-download="windows-x64" class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/Ouroboros-7.6.0-windows-x64.zip">Download for Windows (.zip)</a>
+        <p>Extract the ZIP, open the <code>Ouroboros</code> folder, and run <code>Ouroboros.exe</code>.</p>
+      </article>
+      <article id="linux">
+        <p class="download-platform">Linux x86_64</p>
+        <h2>Linux</h2>
+        <div class="download-actions">
+          <a data-release-download="linux-deb-amd64" class="btn btn-primary" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/ouroboros_7.6.0_amd64.deb">Debian / Ubuntu / Astra (.deb)</a>
+          <a data-release-download="linux-rpm-x86_64" class="btn btn-quiet" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/ouroboros-7.6.0-1.x86_64.rpm">Fedora / RHEL (.rpm)</a>
+          <a data-release-download="linux-rpm-red80-x86_64" class="btn btn-quiet" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/ouroboros-7.6.0-1.red80.x86_64.rpm">RED OS 8 (.rpm)</a>
+          <a data-release-download="linux-appimage-x86_64" class="btn btn-quiet" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/Ouroboros-7.6.0-linux-x86_64.AppImage">Portable AppImage</a>
+          <a data-release-download="linux-x86_64" class="btn btn-quiet" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/Ouroboros-7.6.0-linux-x86_64.tar.gz">tar.gz archive</a>
+        </div>
+        <p>Prefer the package for your distribution. Use the AppImage or archive on other distributions; Git must already be installed.</p>
+      </article>
+    </div>
+
+    <p class="download-proof-note"><strong>Looking at the GitHub release page?</strong> Files named <code>SHA256SUMS</code>, <code>release-evidence.json</code>, <code>release-smoke-*.json</code>, and <code>sbom-*.cdx.json</code> are verification evidence, not additional installers.</p>
+
+    <section class="install-primary" aria-labelledby="macos-quick-start">
+      <h2 id="macos-quick-start">macOS quick start</h2>
+      <ol class="install-steps">
+        <li>Click <a data-release-download="macos-arm64" href="https://github.com/razzant/ouroboros/releases/download/v7.6.0/Ouroboros-7.6.0.dmg">Download for macOS (.dmg)</a>.</li>
+        <li>Open the DMG and drag <code>Ouroboros.app</code> onto the <strong>Applications</strong> shortcut.</li>
+        <li>Open Ouroboros from Applications. If Gatekeeper asks, right-click the app and choose <strong>Open</strong>.</li>
+      </ol>
+      <figure class="install-shot">
+        <img src="/assets/install-macos.png?v=0b0056c10b" width="1536" height="1024" alt="Ouroboros DMG window with a large arrow from Ouroboros.app to the Applications shortcut and Install CLI.command below">
+      </figure>
+    </section>
+
+    <p class="install-requirement"><strong>Model access:</strong> choose a connected Codex account as the Main model source, configure a supported remote provider API key, or use a local GGUF model. Claude Code and Cursor subscriptions can run delegated coding and review; they are not Main model sources. The first-run wizard guides model access, review policy, and budget setup.</p>
+
+    <h2>Optional CLI included with the app</h2>
+    <p>The desktop downloads already contain an optional CLI installer. On macOS, after copying the app to Applications, double-click <code>Install CLI.command</code> in the mounted DMG. On Linux use <code>./Ouroboros/bin/install-ouroboros-cli</code>; on Windows use <code>Ouroboros\bin\install-ouroboros-cli.cmd</code>. The installer creates a user-local <code>ouroboros</code> command without sudo.</p>
+
+    <h2>Advanced: packaged Linux setup</h2>
+    <p>Install the downloaded Debian package with <code>sudo apt install ./ouroboros_*_amd64.deb</code>, or an RPM with <code>sudo dnf install ./ouroboros-*.x86_64.rpm</code>. Native packages install to <code>/opt/ouroboros</code>, put <code>ouroboros</code> on <code>PATH</code>, and add a desktop entry plus an opt-in systemd user unit. They never enable or start that service during installation.</p>
+    <p>The AppImage can run from a user-writable path. Pass <code>--cli</code> for the packaged CLI or set <code>APPIMAGE_EXTRACT_AND_RUN=1</code> when FUSE is unavailable. Chromium and WebKit binaries are bundled, but distro shared libraries remain host dependencies. If needed, extract the AppImage and run <code>./squashfs-root/usr/lib/ouroboros/_internal/python-standalone/bin/python3 -m playwright install-deps chromium webkit</code>.</p>
+
+    <h2>Advanced: headless CLI with uv</h2>
+    <p>Use this for a user-level CLI/server install without a checkout. This follows the contribution branch and resolves <code>pyproject.toml</code>; it does not consume the repository's <code>uv.lock</code>.</p>
+    <pre><code>uv tool install "git+https://github.com/razzant/ouroboros.git@ouroboros"
+ouroboros --help
+uv tool upgrade ouroboros
+# Later: uv tool uninstall ouroboros</code></pre>
+
+    <h2>Develop or run from source</h2>
+    <p>Clone the repository only to contribute, modify Ouroboros, run tests, or create a lock-verified development environment. Source mode needs Python 3.10 or newer, Git, and uv 0.12.1.</p>
+    <pre><code>curl -LsSf https://astral.sh/uv/0.12.1/install.sh | sh
+# Windows PowerShell:
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"</code></pre>
+    <pre><code>git clone https://github.com/razzant/ouroboros.git
+cd ouroboros
+uv sync --locked --extra browser --group dev
+source .venv/bin/activate
+ouroboros server</code></pre>
+
+    <h2>Verify the download</h2>
+    <p>Proof files vary by release. Check the selected release for its checksums and evidence file, if present. Releases built by the current workflow also include CycloneDX SBOMs, packaged smoke receipts, and GitHub attestations. <a href="/install.json">install.json</a> gives machine-readable release discovery, artifact name templates, and accepted proof filenames.</p>
+  </main>
+  <footer class="text-footer"><a href="/">Home</a><a href="/paper/">Paper</a><a href="/about/">About</a><a href="/benchmarks/">Benchmarks</a><a href="/install.json">install.json</a></footer>
+</body>
+</html>

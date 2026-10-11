@@ -1,20 +1,33 @@
 <!DOCTYPE html>
-<html>
+<html lang="en" class="ouro-ui">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Ouroboros Setup</title>
-  <style>
-__ONBOARDING_CSS__
-  </style>
+  <script src="/static/theme.js"></script>
+  <link rel="icon" href="/static/favicon.png" type="image/png">
+  <link rel="stylesheet" href="/static/ui.css">
+  <link rel="stylesheet" href="/static/onboarding.css">
+  <link rel="stylesheet" href="/static/model_roles.css">
+  <link rel="stylesheet" href="/static/reviewer_slots.css">
 </head>
 <body>
+  <div class="onboarding-appearance">
+    <span class="theme-choice-label" id="onboarding-appearance-label">Appearance</span>
+    <div data-theme-control aria-labelledby="onboarding-appearance-label"></div>
+    <span class="theme-status" data-theme-status role="status"></span>
+  </div>
   <div id="root"></div>
   <script>
     window.__OURO_ONBOARDING_BOOTSTRAP__ = __ONBOARDING_BOOTSTRAP__;
   </script>
-  <script>
-__ONBOARDING_JS__
+  <script type="module" src="/static/modules/onboarding_wizard.js"></script>
+  <script type="module">
+    // The wizard paints from the same translation memory as the SPA: an install with an
+    // imported pack or an existing dictionary is translated from the first screen; with
+    // nothing on disk the English source renders.
+    import { bootLanguage } from '/static/modules/i18n.js';
+    bootLanguage();
   </script>
 </body>
 </html>

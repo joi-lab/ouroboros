@@ -27,10 +27,10 @@ Design constraints (codex review):
 from __future__ import annotations
 
 import contextlib
-import os
 import threading
 import time
 from typing import Optional
+from ouroboros.config import runtime_setting
 
 _LOCK = threading.Lock()
 _SEMAPHORES: dict = {}
@@ -42,7 +42,7 @@ def _max_slot_wait_sec() -> float:
 
     default = SETTINGS_DEFAULTS["OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC"]
     try:
-        return float(os.environ.get("OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC", default))
+        return float(runtime_setting("OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC", default))
     except (TypeError, ValueError):
         return float(default)
 
@@ -54,7 +54,7 @@ def _cap() -> int:
 
     default = SETTINGS_DEFAULTS.get("OUROBOROS_MODEL_MAX_CONCURRENCY", 3)
     try:
-        return int(os.environ.get("OUROBOROS_MODEL_MAX_CONCURRENCY", default))
+        return int(runtime_setting("OUROBOROS_MODEL_MAX_CONCURRENCY", default))
     except (TypeError, ValueError):
         try:
             return int(default)

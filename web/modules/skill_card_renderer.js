@@ -2,10 +2,15 @@ import {
     escapeHtmlAttr as escapeHtml,
     grantReady,
     isRateLimitError,
+    preflightFailed,
+    preflightFailedStale,
+    preflightFindingText,
+    renderSubmissionHistory,
     reviewReady,
     safeExternalHrefAttr as safeExternalUrl,
 } from './utils.js';
 import { formatRelativeAge, installedTime, renderToneBadge } from './ui_helpers.js';
+import { hubListingRowFor, hubSubmissionFacts, hubSyncVerdict } from './hub_sync.js';
 
 function hasSkillUiTab(skill, live = {}) {
     return (live?.ui_tabs || []).some((tab) => (tab?.skill || tab?.skill_name || tab?.extension || '') === skill.name);
@@ -28,12 +33,28 @@ function missingGrantLoadError(skill) {
     return !grantReady(skill) && String(skill.load_error || '').includes('missing owner grants');
 }
 
-function repairReady(skill) {
+function repairableSource(skill) {
     const source = (skill.source || 'native').toLowerCase();
     const payloadRoot = String(skill.payload_root || '');
-    return ['clawhub', 'ouroboroshub', 'external'].includes(source)
-        && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot)
-        && (skill.review_status === 'blockers' || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
+    // self_authored payloads live under skills/external/ (config
+    // SKILL_SOURCE_SUBDIRS has no self_authored bucket), so the payload-root
+    // gate already matches them — only the source list kept them out (#335).
+    return ['clawhub', 'ouroboroshub', 'external', 'self_authored'].includes(source)
+        && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot);
+}
+
+function repairReady(skill) {
+    return repairableSource(skill)
+        && (skill.review_status === 'blockers'
+            || preflightFailed(skill)
+            || (Boolean(skill.load_error) && !missingGrantLoadError(skill)));
+}
+
+// D11: the recorded preflight FAIL is STALE for the current payload bytes —
+// Re-review stays primary; Repair is offered from the menu, honestly labeled
+// as based on the last recorded preflight run.
+function staleRepairOffer(skill) {
+    return repairableSource(skill) && preflightFailedStale(skill) && !preflightFailed(skill);
 }
 
 function skillConflictReason(skill) {
@@ -51,8 +72,13 @@ function primaryAction(skill, reviewInProgress, repairInProgress, live) {
     if (skill.lifecycle_virtual && (skill.load_error || isRateLimitError(skill.load_error)) && (skill.source || '').toLowerCase() === 'clawhub') {
         return { action: 'retry_install', label: isRateLimitError(skill.load_error) ? 'Retry later' : 'Retry install' };
     }
-    if ((skill.load_error && !missingGrantLoadError(skill)) || (skill.review_status === 'blockers' && !reviewReady(skill))) {
-        return repairReady(skill) ? { action: 'repair', label: 'Repair' } : { label: '', disabled: true };
+    // A deterministic preflight FAIL persists as pending: Review/Re-review
+    // would deterministically fail again, so a repairable payload offers
+    // Repair first (#335). Non-repairable sources keep the Review CTA.
+    if ((skill.load_error && !missingGrantLoadError(skill))
+        || (skill.review_status === 'blockers' && !reviewReady(skill))
+        || (preflightFailed(skill) && repairReady(skill))) {
+        return repairReady(skill) ? { action: 'repair', label: 'Repair and run' } : { label: '', disabled: true };
     }
     if (!reviewReady(skill)) return { action: skill.review_stale ? 'rereview' : 'review', label: skill.review_stale ? 'Re-review' : 'Review' };
     const grants = skill.grants || {};
@@ -104,14 +130,50 @@ function statusChip(skill, action, live) {
     else if (skill.lifecycle_virtual && isRateLimitError(skill.load_error)) status = { tone: 'warn', label: 'Rate limited' };
     else if (skill.load_error) status = { tone: 'danger', label: 'Failed to load' };
     else if (conflictReason) status = { tone: 'danger', label: conflictReason.charAt(0).toUpperCase() + conflictReason.slice(1) };
+    else if (preflightFailed(skill)) status = { tone: 'danger', label: 'Preflight failed' };
     else if (!reviewReady(skill)) status = { tone: 'warn', label: 'Needs review' };
     else if (skill.enabled && skill.type === 'extension') {
         status = skill.live_loaded && (skill.dispatch_live || hasSkillUiTab(skill, live))
             ? { tone: 'ok', label: 'Loaded' }
             : { tone: 'warn', label: skill.live_loaded ? 'Loaded — UI tab pending' : 'Enabled — not loaded' };
     } else if (skill.enabled) status = { tone: 'ok', label: 'Enabled' };
+    const process = ['server', 'worker'].includes(skill.process) ? skill.process : '';
+    if (skill.type === 'extension' && process) status.label += ` · ${process}`;
     const attrs = action.action ? `data-skill="${escapeHtml(skill.name)}" data-skill-action="${escapeHtml(action.action)}" role="button" tabindex="0"` : '';
     return `<span class="skills-status-chip skills-status-${status.tone} ${action.action ? 'is-clickable' : ''}" ${attrs}>${escapeHtml(status.label)}</span>`;
+}
+
+/**
+ * Display-only OuroborosHub sync badges for an installed card. The verdict
+ * comes from the shared hub_sync helper: "Update available" when the live
+ * catalog serves a different version for a hub-bucket skill, and
+ * "Published vX" (just "Published" when the manifest names no version) on
+ * the server's byte-exact verification. Without a catalog snapshot (fetch
+ * failed or not passed) only listing-plane facts ("Published vX") may be
+ * claimed. The publish receipt is history in the card's details
+ * (submissionDetailRow), never a badge.
+ */
+export function renderSkillHubBadges(skill, options = {}) {
+    const map = options.hubCatalogByName instanceof Map ? options.hubCatalogByName : null;
+    const verdict = hubSyncVerdict(
+        hubListingRowFor(skill),
+        map ? (map.get(skill.name) || null) : null,
+        { catalogUnavailable: options.hubCatalogAvailable !== true },
+    );
+    const out = [];
+    if (verdict.badges.includes('update_available')) {
+        out.push('<span class="skills-badge skills-badge-warn">Update available</span>');
+    }
+    if (verdict.badges.includes('published')) {
+        out.push(`<span class="skills-badge skills-badge-ok">Published${skill.version ? ` v${escapeHtml(skill.version)}` : ''}</span>`);
+    }
+    return out.join(' ');
+}
+
+/** The local publish receipt as one quiet details row, whatever the catalog says. */
+function submissionDetailRow(skill) {
+    const line = renderSubmissionHistory(hubSubmissionFacts(hubListingRowFor(skill)));
+    return line ? `<div class="skills-detail-row"><span class="skills-detail-label">Submission</span>${line}</div>` : '';
 }
 
 function sourceChip(skill) {
@@ -128,11 +190,24 @@ function sourceChip(skill) {
     return `<span class="skills-source-chip skills-source-${tone}">${escapeHtml(label)}</span>`;
 }
 
+/** The findings list a card builds when its block is opened (skills.js), from the row already in memory. */
+export function renderReviewFindingsList(skill) {
+    const findings = Array.isArray(skill?.review_findings) ? skill.review_findings : [];
+    if (!findings.length) return '<div class="muted">Findings are not in the current list; Refresh to reload them.</div>';
+    const rows = findings.map((f) => {
+        const preflight = preflightFindingText(f);
+        const reason = preflight || f.reason || f.message || JSON.stringify(f);
+        return `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong> ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(reason)}</li>`;
+    }).join('');
+    return `<ul>${rows}</ul>`;
+}
+
 function reviewFindings(skill) {
     const findings = Array.isArray(skill.review_findings) ? skill.review_findings : [];
     if (!findings.length) return '';
-    const rows = findings.map((f) => `<li><strong>${escapeHtml(f.verdict || f.severity || '')}</strong> ${escapeHtml(f.item || f.check || f.title || 'finding')}: ${escapeHtml(f.reason || f.message || JSON.stringify(f))}</li>`).join('');
-    return `<details class="skills-review-findings ui-rich-content"><summary class="muted">${findings.length} review finding${findings.length === 1 ? '' : 's'}</summary><ul>${rows}</ul></details>`;
+    // Collapsed on every render with its summary only: findings are most of
+    // the list payload, and a hidden list costs nothing until it is opened.
+    return `<details class="skills-review-findings ui-rich-content" data-skill-findings="${escapeHtml(skill.name)}"><summary class="muted">${findings.length} review finding${findings.length === 1 ? '' : 's'}</summary></details>`;
 }
 
 function reviewRunTitle(run) {
@@ -146,7 +221,10 @@ function reviewRunTitle(run) {
 function reviewHistory(skill) {
     const review = skill.skill_review && typeof skill.skill_review === 'object'
         ? skill.skill_review : {};
-    const history = Array.isArray(review.history) ? review.history.slice(-10) : [];
+    // The backend projection already bounds history to its ten-row window and
+    // discloses the exact omitted count; a second client-side slice would be
+    // an undisclosed bound on top of a disclosed one.
+    const history = Array.isArray(review.history) ? review.history : [];
     const current = review.current && Object.keys(review.current).length
         ? review.current : history[history.length - 1];
     if (!current) return '';
@@ -155,9 +233,13 @@ function reviewHistory(skill) {
         const source = run.source ? ` · ${run.source}` : '';
         return `<li>${escapeHtml(reviewRunTitle(run))} · ${escapeHtml(status)}${escapeHtml(source)}</li>`;
     }).join('');
+    const omitted = Number(review.history_omitted);
+    const historyLabel = Number.isFinite(omitted) && omitted > 0
+        ? `${history.length} of ${history.length + omitted}`
+        : `${history.length}`;
     const currentStatus = current.review_status || current.status || current.job_status || 'unknown';
     return `<div class="skills-review-current"><strong>${escapeHtml(reviewRunTitle(current))}</strong> · ${escapeHtml(currentStatus)}</div>
-        ${rows ? `<details class="skills-review-history ui-rich-content"><summary class="muted">Skill Review history (${history.length})</summary><ol>${rows}</ol></details>` : ''}`;
+        ${rows ? `<details class="skills-review-history ui-rich-content"><summary class="muted">Skill Review history (${historyLabel})</summary><ol>${rows}</ol></details>` : ''}`;
 }
 
 function grantBlock(skill) {
@@ -188,8 +270,44 @@ function provenanceBlock(prov) {
         + (warnings ? `<details class="skills-card-warnings"><summary class="muted">adapter warnings</summary><ul>${warnings}</ul></details>` : '');
 }
 
+function presenceRuntimeBlock(skill) {
+    const runtime = skill.presence_runtime;
+    if (!runtime || typeof runtime !== 'object') return '';
+    if (runtime.error) {
+        return `<div class="skills-load-error">Presence runtime unavailable: ${escapeHtml(runtime.error)}</div>`;
+    }
+    const defaults = runtime.defaults || {};
+    const overrides = runtime.overrides || {};
+    const modelOverride = ['main', 'light'].includes(overrides.model_slot) ? overrides.model_slot : '';
+    const roundsOverride = Number.isInteger(overrides.inline_max_rounds) ? overrides.inline_max_rounds : '';
+    const fingerprint = String(runtime.state_fingerprint || '');
+    return `<form class="skills-presence-runtime" data-presence-runtime-form data-skill-name="${escapeHtml(skill.name)}" data-state-fingerprint="${escapeHtml(fingerprint)}">
+        <div class="skills-presence-runtime-title">Presence runtime</div>
+        <label class="ui-field">Model
+            <select name="model_slot" class="ui-control">
+                <option value="" ${modelOverride ? '' : 'selected'}>Reviewed default (${escapeHtml(defaults.model_slot || 'main')})</option>
+                <option value="main" ${modelOverride === 'main' ? 'selected' : ''}>Main</option>
+                <option value="light" ${modelOverride === 'light' ? 'selected' : ''}>Light</option>
+            </select>
+        </label>
+        <label class="ui-field">Inline rounds
+            <input name="inline_max_rounds" class="ui-control" type="number" min="1" step="1" value="${escapeHtml(roundsOverride)}" placeholder="${escapeHtml(defaults.inline_max_rounds || 10)}">
+        </label>
+        <label class="ui-field skills-presence-workspace">Working folder
+            <input name="workspace_root" class="ui-control" type="text" value="${escapeHtml(runtime.workspace_root || '')}" placeholder="No external folder">
+        </label>
+        <div class="skills-presence-runtime-actions">
+            <button type="submit" class="btn btn-default btn-sm">Save</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-presence-runtime-reset>Use reviewed defaults</button>
+        </div>
+        <div class="muted">Applies to new Presence turns only. Memory stays shared.</div>
+    </form>`;
+}
+
 export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), repairingSkills = new Set(), live = {}, options = {}) {
     const safeName = escapeHtml(skill.name);
+    const description = skill.lifecycle_virtual && [skill.lifecycle_error, skill.load_error].includes(skill.description)
+        ? '' : skill.description;
     const reviewInProgress = reviewingSkills.has(skill.name);
     const repairInProgress = repairingSkills.has(skill.name);
     const action = primaryAction(skill, reviewInProgress, repairInProgress, live);
@@ -200,13 +318,14 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
     const payloadRoot = skill.payload_root || '';
     const localDelete = (source === 'self_authored' || source === 'external') && payloadRoot.startsWith('skills/external/');
     const prov = market ? skill.provenance : null;
-    const submit = submitHubReady(skill, Boolean(options.githubTokenConfigured));
+    const hubBadges = renderSkillHubBadges(skill, options);
+    const submit = submitHubReady(skill, options.githubTokenConfigured);
     // Instruction skills from a marketplace/external bucket can be converted into
     // runnable script skills by the repair agent (it authors scripts/<file> and
     // flips type instruction->script, then re-reviews). Offer it as a secondary
     // action so the normal review/grant/enable CTA stays primary.
     const makeRunnable = skill.type === 'instruction'
-        && ['clawhub', 'ouroboroshub', 'external'].includes(source)
+        && ['clawhub', 'ouroboroshub', 'external', 'self_authored'].includes(source)
         && /^skills\/(external|clawhub|ouroboroshub)\//.test(payloadRoot)
         && !repairInProgress;
     // Owner-attestation: let the owner SKIP the expensive LLM review for THEIR OWN skill,
@@ -226,13 +345,17 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         && !thirdPartySource
         && !(skill.review_profile === 'owner_attested' && !skill.review_stale)
         && (officialHubHint || ownSourceHint)
+        // A deterministic preflight FAIL makes attestation a guaranteed 409
+        // (run_owner_attestation reruns the preflight); hide the dead end (#335).
+        && !preflightFailed(skill)
         && (!reviewReady(skill) || skill.review_stale);
     const menu = (market || localDelete || !reviewInProgress || submit.visible || makeRunnable || ownerAttestable)
         ? `<div class="skills-card-menu"><button type="button" class="skills-card-menu-trigger" aria-label="More actions" aria-haspopup="menu" aria-expanded="false" data-skill-menu-trigger>⋮</button><dialog class="skills-card-menu-dialog" role="menu">
             ${makeRunnable ? `<button type="button" role="menuitem" class="skills-menu-item skills-make-runnable" data-skill="${safeName}" data-skill-action="repair" title="Author a runnable script for this instruction skill via the repair agent">Make runnable</button>` : ''}
-            ${!reviewInProgress ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
+            ${!reviewInProgress && !(preflightFailed(skill) && repairReady(skill)) ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
+            ${!reviewInProgress && !repairInProgress && staleRepairOffer(skill) ? `<button type="button" role="menuitem" class="skills-menu-item skills-repair-stale" data-skill="${safeName}" data-skill-action="repair" title="Repair based on the last recorded preflight — the payload changed since that run, so Re-review would recheck it first">Repair and run</button>` : ''}
             ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">⚠️ Skip review</button>` : ''}
-            ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Submit to OuroborosHub</button>` : ''}
+            ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" data-submit-state="${escapeHtml(submit.state || '')}" data-publication-ready="${submit.publication_ready === true ? 'true' : 'false'}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Publish to OuroborosHub</button>` : ''}
             ${market ? `<button type="button" role="menuitem" class="skills-menu-item skills-update" data-skill="${safeName}" data-source="${escapeHtml(source)}">Update</button><button type="button" role="menuitem" class="skills-menu-item skills-uninstall" data-skill="${safeName}" data-source="${escapeHtml(source)}">Uninstall</button>` : ''}
             ${localDelete ? `<button type="button" role="menuitem" class="skills-menu-item skills-delete-local" data-skill="${safeName}" data-payload-root="${escapeHtml(payloadRoot)}">Delete</button>` : ''}
         </dialog></div>` : '';
@@ -254,11 +377,13 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         <div class="skills-detail-row"><span class="skills-detail-label">Type</span><code>${escapeHtml(skill.type || 'skill')}</code> · version ${escapeHtml(skill.version || '—')} · source ${escapeHtml(source)}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Review</span>${statusBadge(skill.review_status, skill.review_gate, skill.review_profile)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">stale</span>' : ''}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Permissions</span>${(skill.permissions || []).map((p) => `<code>${escapeHtml(p)}</code>`).join(' ') || '<i class="muted">none</i>'}</div>
+        ${submissionDetailRow(skill)}
+        ${presenceRuntimeBlock(skill)}
         ${provenanceBlock(prov)}
     </details>`;
     return `<article class="skills-card" data-skill="${safeName}" ${reviewInProgress ? 'data-reviewing="1"' : ''} ${repairInProgress ? 'data-repairing="1"' : ''}>
         <header class="skills-card-head">
-            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}</h3>${skill.description ? `<p class="skills-card-desc">${escapeHtml(skill.description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
+            <div class="skills-card-title"><h3>${safeName}${sourceChip(skill) ? ` ${sourceChip(skill)}` : ''}<span data-skill-hub-badges="${safeName}">${hubBadges ? ` ${hubBadges}` : ''}</span></h3>${description ? `<p class="skills-card-desc">${escapeHtml(description)}</p>` : ''}${formatRelativeAge(installedTime(skill)) ? `<div class="skills-card-installed muted">${escapeHtml(formatRelativeAge(installedTime(skill)))}</div>` : ''}</div>
             <div class="skills-card-toggle">${statusChip(skill, action, live)}${primary}${toggle}${menu}</div>
         </header>
         ${lockReason ? `<div class="skills-lock-hint ${action.action ? 'is-clickable' : ''}" title="${escapeHtml(lockReason)}" ${actionAttrs}>Locked: ${escapeHtml(lockReason)}</div>` : ''}
@@ -267,24 +392,92 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         ${grantBlock(skill)}
         ${reviewHistory(skill)}
         ${reviewFindings(skill)}
+        <div data-skill-errors>
         ${skill.lifecycle_status === 'failed' && skill.lifecycle_error ? `<div class="skills-load-error">${escapeHtml(skill.lifecycle_error)}</div>` : ''}
-        ${skill.load_error && !missingGrantLoadError(skill) ? `<div class="skills-load-error">${escapeHtml(skill.load_error)}</div>` : ''}
+        ${skill.load_error && !missingGrantLoadError(skill) && !(skill.lifecycle_status === 'failed' && skill.load_error === skill.lifecycle_error) ? `<div class="skills-load-error">${escapeHtml(skill.load_error)}</div>` : ''}
         ${skill.health_regressed ? `<div class="skills-load-error">Regression: was live at ${escapeHtml(String((skill.last_known_good || {}).version || '?'))} (${escapeHtml(String((skill.last_known_good || {}).sha || '').slice(0, 12))}); broken after a code update.</div>` : ''}
+        </div>
         <footer class="skills-card-actions">${details}</footer>
     </article>`;
 }
 
-function submitHubReady(skill, githubTokenConfigured = false) {
-    // FR1: prefer the host's SSOT verdict (the gateway serializes `submit_hub`) so the
-    // card and the backend publish gate never diverge. The backend accepts a no-blocker
-    // review — clean OR advisory-only warnings — and this is now the single rule.
-    if (skill.submit_hub && typeof skill.submit_hub === 'object') return skill.submit_hub;
-    // Fallback for older payloads without submit_hub (kept in sync with the SSOT).
+/** Patch only state/queue/action-derived facts; forms, disclosure and open menus keep identity. */
+export function patchInstalledSkillEnrichment(card, skill, reviewing, repairing, live, options, menu = card) {
+    const template = card.ownerDocument.createElement('template');
+    template.innerHTML = renderInstalledSkillCard(skill, reviewing, repairing, live, options);
+    const next = template.content.firstElementChild;
+    function attributes(target, source, preserveDisabled = false) {
+        for (const attr of [...target.attributes]) {
+            if (preserveDisabled && attr.name === 'disabled') continue;
+            if (!source.hasAttribute(attr.name)) target.removeAttribute(attr.name);
+        }
+        for (const attr of source.attributes) {
+            if (preserveDisabled && attr.name === 'disabled') continue;
+            if (target.getAttribute(attr.name) !== attr.value) target.setAttribute(attr.name, attr.value);
+        }
+    }
+    // An action in flight marks the card and shows its progress row without a list read.
+    for (const name of ['data-reviewing', 'data-repairing']) {
+        if (next.hasAttribute(name)) card.setAttribute(name, next.getAttribute(name));
+        else card.removeAttribute(name);
+    }
+    for (const selector of ['.skills-status-chip', '.skills-primary-action', '[data-skill-errors]', '.skills-card-desc', '.skills-review-progress']) {
+        const target = card.querySelector(selector), source = next.querySelector(selector);
+        if (!target && source) {
+            // Only virtual queue rows gain a new action or description here; a
+            // progress row goes under the header, where a fresh render puts it.
+            if (selector === '.skills-primary-action') card.querySelector('.skills-card-toggle').appendChild(source);
+            else if (selector === '.skills-review-progress') (card.querySelector('.skills-lock-hint') || card.querySelector('.skills-card-head')).after(source);
+            else card.querySelector('.skills-card-title').appendChild(source);
+        } else if (target && !source) target.remove();
+        else if (target && source) {
+            attributes(target, source, target.tagName === 'BUTTON' && target.dataset.skillAction === source.dataset.skillAction);
+            if (target.innerHTML !== source.innerHTML) target.innerHTML = source.innerHTML;
+        }
+    }
+    const control = card.querySelector('.skills-toggle');
+    if (control && control.dataset.skillPending !== 'true') {
+        const source = next.querySelector('.skills-toggle');
+        attributes(control.closest('.skills-switch'), source.closest('.skills-switch'));
+        attributes(control, source);
+        control.checked = source.checked;
+        control.disabled = source.disabled;
+    }
+    const publish = menu.querySelector('.skills-submit-hub'), nextPublish = next.querySelector('.skills-submit-hub');
+    if (publish && nextPublish) attributes(publish, nextPublish, true);
+    // A late hub fact adds or drops "Skip review" in place; the menu stays as it is.
+    const attest = menu.querySelector('.skills-attest-review'), nextAttest = next.querySelector('.skills-attest-review');
+    if (attest && !nextAttest) attest.remove();
+    else if (!attest && nextAttest) {
+        const dialog = menu.querySelector('.skills-card-menu-dialog') || menu.closest?.('.skills-card-menu-dialog');
+        dialog?.insertBefore(nextAttest, dialog.querySelector('.skills-submit-hub, .skills-update, .skills-delete-local'));
+    }
+}
+
+function submitHubReady(skill, githubTokenConfigured) {
+    // Prefer the host's SSOT verdict. The additive task_start_allowed fact owns
+    // admission when present; disabled remains only a compatibility projection.
+    if (skill.submit_hub && typeof skill.submit_hub === 'object') {
+        const submit = skill.submit_hub;
+        return {
+            ...submit,
+            disabled: typeof submit.task_start_allowed === 'boolean'
+                ? !submit.task_start_allowed
+                : (typeof submit.disabled === 'boolean' ? submit.disabled : true),
+        };
+    }
+    // Older payloads cannot know publication readiness. Keep the selected preflight
+    // reachable for every otherwise supported source; it owns review/repair truth.
     const source = (skill.source || 'native').toLowerCase();
     const visible = ['external', 'self_authored', 'user_repo', 'ouroboroshub', 'clawhub'].includes(source);
     if (!visible) return { visible: false, disabled: true, reason: '' };
-    if (!githubTokenConfigured) return { visible: true, disabled: true, reason: 'Configure GITHUB_TOKEN in Settings -> Secrets' };
-    if (skill.review_profile === 'owner_attested') return { visible: true, disabled: true, reason: 'Owner-attested skills can\'t be published — run a full LLM review first' };
-    if ((skill.review_status !== 'clean' && skill.review_status !== 'warnings') || skill.review_stale) return { visible: true, disabled: true, reason: 'Skill needs a fresh clean (or advisory-only warnings) review before submission' };
-    return { visible: true, disabled: false, reason: 'Open a PR to OuroborosHub from your GitHub fork' };
+    if (githubTokenConfigured !== true) return { visible: true, disabled: true, reason: githubTokenConfigured === false
+        ? 'Configure GITHUB_TOKEN in Settings -> Secrets' : 'GitHub token status unavailable. Refresh to retry.' };
+    return {
+        visible: true,
+        publication_ready: false,
+        task_start_allowed: true,
+        disabled: false,
+        reason: 'Run the selected publish preflight',
+    };
 }

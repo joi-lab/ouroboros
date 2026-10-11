@@ -7,12 +7,13 @@ A project-scoped task (an external/workspace task, or one given an explicit
   a task's child drive — so it persists across forked/empty runs;
 - OUTSIDE ``memory/knowledge/**`` and any ``_copy_stable_memory`` path — so it
   never leaks into the forked seed or another project (red-team R3.1/guard #2);
-- never identity — there is no per-project identity.
+- facts only — identity and the scratchpad stay canonical and are written from
+  any room through their own tools; there is no per-project copy of either.
 
 This is a thin SSOT helper, NOT a parallel memory subsystem (P7): the existing
 knowledge tool + context loader simply redirect their base dir when a task is
 project-scoped, and the post-task canonical dual-run is suppressed for such tasks
-so project facts cannot contaminate the global memory.
+so the automatic post-task writers cannot contaminate the global memory.
 """
 from __future__ import annotations
 
@@ -22,6 +23,10 @@ import re
 from typing import Any, Dict
 
 _SAFE = re.compile(r"[^a-zA-Z0-9_.-]")
+# A character a slug cannot carry: whitespace maps to "-" deterministically, so it
+# is not loss; anything else disappears and two different names can collapse onto
+# one id (see project_id_from_display_name).
+_LOSSY = re.compile(r"[^a-zA-Z0-9_.\-\s]")
 # Windows reserved device names (case-insensitive, incl. extension variants like
 # "con.md"): never allow these as a project dir component.
 _RESERVED_NAMES = frozenset(
@@ -49,14 +54,60 @@ def project_id_from_display_name(value: Any) -> str:
     emoji-only name like 'динозавры' still creates a project instead of failing —
     the Russian-speaking owner's common case). The real display name is stored
     separately on the registry, so the user always sees their own name, never the
-    id. Returns "" only for a truly empty name."""
-    slug = sanitize_project_id(value)
-    if slug:
-        return slug
+    id. Returns "" only for a truly empty name.
+
+    Two rules keep a LOSSY name from producing a misleading or COLLIDING id: runs
+    of ``-`` collapse (a Cyrillic word between two Latin ones minted
+    ``mlconf--------------------ouroboros``), and when the name held any character
+    the slug could not carry, a short digest of the whole raw name is appended — two
+    different Cyrillic titles otherwise normalized onto the same id and silently
+    shared one project. Only NEWLY minted ids are affected: ``sanitize_project_id``
+    is untouched, so every existing id, lookup and derived project chat stays
+    exactly as it is."""
     raw = str(value or "").strip()
     if not raw:
         return ""
-    return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    slug = re.sub(r"-{2,}", "-", sanitize_project_id(raw)).strip("-.")
+    if not slug:
+        return "proj_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    if _LOSSY.search(raw):
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        # The slug never starts with "-" or ".", so the truncated head stays usable.
+        slug = f"{slug[:63 - len(digest)].strip('-.')}-{digest}"
+    return slug
+
+
+# A NEW project folder keeps its human name (#1308): only what a supported
+# filesystem cannot hold is replaced — path separators, the Windows-forbidden set,
+# control characters — and whitespace runs become "-". Leading/trailing dots,
+# spaces and dashes go (hidden, "."/"..", Windows trailing rules). Bounded by
+# characters AND UTF-8 bytes; a cut name carries a digest of the RAW name so two
+# long names with one prefix stay distinguishable (#850 rule for ids).
+_FOLDER_FORBIDDEN = re.compile(r'[<>:"/\\|?*]')
+_FOLDER_MAX_CHARS = 64
+_FOLDER_MAX_BYTES = 180  # leaves room for a "_N" collision suffix under 255 bytes
+
+
+def project_folder_basename(display_name: Any) -> str:
+    """Readable basename for a NEWLY created project folder, or "" when nothing
+    usable remains. NFC normalization happens here, at creation only: existing
+    folders, ids and refs are never re-derived or compared through it."""
+    import unicodedata
+
+    raw = unicodedata.normalize("NFC", str(display_name or "").strip())
+    name = "".join("_" if unicodedata.category(ch) in {"Cc", "Cs"} else ch for ch in raw)
+    name = re.sub(r"\s+", "-", _FOLDER_FORBIDDEN.sub("_", name)).strip(" .-")
+    if len(name) > _FOLDER_MAX_CHARS or len(name.encode("utf-8")) > _FOLDER_MAX_BYTES:
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        head = name[:_FOLDER_MAX_CHARS - len(digest) - 1]
+        while len(head.encode("utf-8")) > _FOLDER_MAX_BYTES - len(digest) - 1:
+            head = head[:-1]
+        head = head.rstrip(" .-")
+        name = f"{head}-{digest}" if head else digest
+    if name.split(".", 1)[0].casefold() in (_RESERVED_NAMES | {f"{prefix}{digit}" for prefix in ("com", "lpt") for digit in "¹²³"}):
+        stem, dot, rest = name.partition(".")
+        name = f"{stem}_{dot}{rest}"
+    return name
 
 
 def explicit_project_id_ok(raw: Any) -> bool:
@@ -98,13 +149,37 @@ def _registered_project_for_workspace(canon_workspace: str) -> str:
     return ""
 
 
+def _bound_project_id(task_id: str) -> str:
+    """Project a task is DURABLY bound to, read at the canonical DATA_DIR, else "".
+
+    Fail-OPEN, exactly like ``_registered_project_for_workspace``: this runs on
+    the hot resolution path of every context build, and an unreadable bindings
+    store must not stop the work. The one caller that AUTHORIZES creating a
+    project (``ensure_project_scope``) reads the same binding strictly instead.
+    """
+    if not task_id:
+        return ""
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.projects_registry import project_id_for_task
+
+        return sanitize_project_id(project_id_for_task(DATA_DIR, task_id))
+    except Exception:
+        return ""
+
+
 def resolve_project_id(task: Dict[str, Any]) -> str:
-    """Resolve a task's project id (S7): explicit ``project_id`` wins; else, for a
-    workspace task, a REGISTERED project bound to that folder (v6.58.0 registry-first)
-    or a stable hash of the workspace path; else ``""`` (not project-scoped — canonical
-    memory, unchanged behavior)."""
+    """Resolve a task's project id (S7): the DURABLE binding wins (owner decision
+    B4=A - a "turn into project" conversion never reaches a running worker, so the
+    task dict can still say nothing while the task belongs to a project); else an
+    explicit ``project_id``; else, for a workspace task, a REGISTERED project bound
+    to that folder (v6.58.0 registry-first) or a stable hash of the workspace path;
+    else ``""`` (not project-scoped — canonical memory, unchanged behavior)."""
     if not isinstance(task, dict):
         return ""
+    bound = _bound_project_id(str(task.get("id") or task.get("task_id") or "").strip())
+    if bound:
+        return bound
     pid = sanitize_project_id(task.get("project_id"))
     if pid:
         return pid
@@ -112,6 +187,12 @@ def resolve_project_id(task: Dict[str, Any]) -> str:
     # never re-derive from the child's (possibly acting) workspace, which would
     # mismatch the forked seed prepared at schedule time for an unscoped parent.
     if str(task.get("delegation_role") or "") == "subagent":
+        return ""
+    from ouroboros.dialogue_provenance import presence_metadata_binding
+
+    if presence_metadata_binding(task.get("metadata")) is not None:
+        # Presence (a speaker, or work acting for its binding) changes file/process cwd,
+        # not its canonical memory scope.
         return ""
     workspace = str(task.get("workspace_root") or "").strip()
     if workspace:
@@ -183,3 +264,9 @@ def project_journal_path(project_id: str) -> pathlib.Path:
 def project_workpad_path(project_id: str) -> pathlib.Path:
     """Free-form per-project working notes (markdown scratchpad)."""
     return _project_store_root(project_id) / "workpad.md"
+
+
+def project_reflections_path(project_id: str) -> pathlib.Path:
+    """Durable per-project execution reflections (full text lives HERE for
+    project-scoped roots; the canonical log carries a bounded pointer row)."""
+    return _project_store_root(project_id) / "logs" / "task_reflections.jsonl"

@@ -39,7 +39,12 @@ from devtools.benchmarks.common.manifests import (
     model_slot_snapshot,
 )
 from devtools.benchmarks.common.run_roots import assert_outside_repo, ensure_outside_repo
-from devtools.benchmarks.common.model_slots import pin_single_model
+from devtools.benchmarks.common.model_slots import (
+    configured_subagents_snapshot,
+    pin_single_model,
+    single_model_slot_snapshot,
+    single_model_subagents_setting,
+)
 
 PRO = pathlib.Path(__file__).resolve().parent              # .../swe_bench_pro/e1v2/
 ROOT = PRO.parent                                          # .../swe_bench_pro/
@@ -528,9 +533,9 @@ def run_instance(cid: str, row: dict, args, api_key: str, seed_settings: pathlib
         # OPENAI_API_KEY; forward it name-only (value via docker_env=os.environ below) when set.
         *(["-e", "OPENAI_API_KEY"] if os.environ.get("OPENAI_API_KEY", "").strip() else []),
         "-e", f"OUROBOROS_MODEL={args.solve_model}",
-        "-e", f"OUROBOROS_MODEL_HEAVY={args.solve_model}",
         "-e", f"OUROBOROS_MODEL_LIGHT={args.solve_model}",
         "-e", f"OUROBOROS_MODEL_FALLBACKS={args.solve_model}",
+        "-e", f"OUROBOROS_SUBAGENTS={single_model_subagents_setting(args.solve_model)}",
         # Runtime mode flows from the generated settings profile (seed settings.json);
         # only force it via env when --runtime-mode is explicitly set, so a profile's
         # mode is never silently overridden. Committed profiles all carry pro
@@ -817,9 +822,10 @@ def main() -> int:
                     help="per-task solve memory mode (shared|forked|empty); empty = entrypoint default "
                          "(empty child drive, v6.56.0 — the measured artifact is the harness, not carried memory).")
     ap.add_argument("--disable-tools",
-                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,claude_code_edit",
+                    default="web_search,browse_page,browser_action,analyze_screenshot,vlm_query,view_image,youtube_transcript,claude_code_edit,switch_model",
                     help="comma-separated tools withheld from the solve task. Default disables web/browser/vision "
-                         "and claude_code_edit. Drop view_image from the list to allow native inline vision.")
+                         "and youtube transcript lookup, the external coding gateway, and model switching. "
+                         "Drop view_image from the list to allow native inline vision.")
     ap.add_argument("--absorb-max", type=int, default=1800,
                     help="max wait for absorbed evolution cycle after a task (seconds). Cycle = "
                          "separate evolution task (review triad) plus os.execvpe restart.")
@@ -942,6 +948,22 @@ def _run_schedule(args, out_dir: pathlib.Path, vsuf: str, api_key: str) -> int:
                           "refusal": {"stage": "seed_shape", "exit_code": 2,
                                       "reason": refused.reason}})
             return 2
+        # These facts are pure CLI-derived run identity, so materialize them BEFORE
+        # the task loop; the retained finalizer persists them on every exit. If every
+        # selected task resumes from patch.diff,
+        # derive_run_settings() is never called; the old placement inside the solve
+        # branch then left the entire run carrying template/empty actor provenance.
+        manifest["model_slots"] = single_model_slot_snapshot(
+            args.solve_model,
+            review_slots=args.review_slots,
+            review_effort=args.review_effort,
+        )
+        manifest["available_subagents"] = configured_subagents_snapshot(
+            exact_model=args.solve_model,
+        )
+        manifest["harness"]["settings_template"] = str(
+            pathlib.Path(args.settings).expanduser()
+        )
         # The amendments above ride the RETAINED dict: `finalize_run_manifest` writes this same
         # path on every exit path, merging the terminal outcome/exit_code as it goes. Publishing
         # here instead put a pre-merge record — no terminal outcome at all — at the path a
@@ -1007,6 +1029,10 @@ def _run_schedule(args, out_dir: pathlib.Path, vsuf: str, api_key: str) -> int:
             # smoke, v6.76.0). Re-snapshotted from the DERIVED settings the container is about
             # to be handed; `harness.settings_template` keeps the template on record.
             manifest["model_slots"] = model_slot_snapshot(seed, env_overrides=False)
+            manifest["available_subagents"] = configured_subagents_snapshot(
+                seed,
+                env_overrides=False,
+            )
             manifest["harness"]["settings_template"] = str(pathlib.Path(args.settings).expanduser())
             manifest["harness"]["settings_derived"] = str(seed)
             print(f"\n[pro] === task {i}/{len(ids)}: {norm(cid)[:50]} === spent=${spent:.2f} cap=${task_total:.2f} lang={row.get('repo_language')}", file=sys.stderr)

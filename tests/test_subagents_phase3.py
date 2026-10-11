@@ -4,84 +4,108 @@ import json
 import queue
 
 
-def test_subagent_lane_resolution_fans_out_and_depth_coerces_light(monkeypatch):
-    import ouroboros.subagents as subagents
-    from ouroboros.subagents import expand_subagent_lane_slots
+def test_no_lane_fans_out_and_depth_does_not_downgrade(monkeypatch):
+    """A lane names STRENGTH, and strength is one model, so every lane resolves to exactly
+    one model at every depth.
 
-    monkeypatch.setattr(subagents, "get_review_models", lambda: ["review-a", "review-b"])
+    Two behaviors died in v6.87.7 and this pins both. The `review`/`scope` lanes fanned out
+    across the configured reviewer slots — a TOPOLOGY smuggled in through a strength
+    parameter, which no review surface ever used (they read their slots from config and run
+    on the review substrate). And the capability-depth cap collapsed a nested child to Light
+    regardless of what its parent asked for. Depth bounds how deep delegation NESTS, never
+    how strong a descendant is. v6.87.28 removed the last trace of the fan-out: the slot
+    LIST, which had had exactly one member per lane since the lanes went.
+    """
+    from ouroboros.subagents import (
+        SUBAGENT_MODEL_LANES,
+        normalize_subagent_model_lane,
+        resolve_subagent_lane,
+    )
+    import pytest
+
     monkeypatch.setenv("OUROBOROS_MODEL_LIGHT", "light-model")
+    monkeypatch.setenv("OUROBOROS_MODEL_HEAVY", "heavy-model")
 
-    review_slots = expand_subagent_lane_slots("review", depth=1)
+    for lane in ("review", "scope"):
+        assert lane not in SUBAGENT_MODEL_LANES
+        with pytest.raises(ValueError, match="model_lane must be one of"):
+            normalize_subagent_model_lane(lane)
 
-    assert [slot.model for slot in review_slots] == ["review-a", "review-b"]
-    assert {slot.effective_lane for slot in review_slots} == {"review"}
-    assert [slot.slot_count for slot in review_slots] == [2, 2]
-
-    nested_slots = expand_subagent_lane_slots("review", depth=2)
-
-    assert len(nested_slots) == 1
-    assert nested_slots[0].requested_lane == "review"
-    assert nested_slots[0].effective_lane == "light"
-    assert nested_slots[0].model == "light-model"
+    # Depth is not an input to the lane resolver at all (the dead parameter was
+    # removed — XG-2R.4); "at every depth alike" now holds by construction.
+    assert resolve_subagent_lane("heavy").model == "heavy-model"
+    # v6.87.26: an omitted lane inherits the parent's.
+    inherited = resolve_subagent_lane("auto", parent_lane="heavy")
+    assert inherited.effective_lane == "heavy"
 
 
-def test_schedule_subagent_review_lane_emits_task_group_metadata(monkeypatch, tmp_path):
-    import ouroboros.subagents as subagents
+def test_schedule_subagent_emits_intent_only_and_no_task_group(monkeypatch, tmp_path):
+    """One request schedules one child, and states what was ASKED FOR.
+
+    The lane, the model and the effort are DERIVED at dispatch (v6.87.28), so the
+    scheduling event carries the request and the parent's own lane — the fact an
+    omitted lane inherits — and nothing that would need live availability to know."""
     from ouroboros.task_results import STATUS_REQUESTED
     from ouroboros.tools.control import _schedule_task
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
 
-    monkeypatch.setattr(subagents, "get_review_models", lambda: ["review-a", "review-b"])
+    subagent_id = configure_test_subagent(
+        monkeypatch, target="openai/heavy-model",
+    )
     event_queue: queue.Queue = queue.Queue()
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "parent1"
     ctx.task_depth = 0
     ctx.current_chat_id = 1
     ctx.event_queue = event_queue
-    ctx.task_metadata = {"root_task_id": "root1", "session_id": "sess1"}
+    ctx.task_metadata = {"root_task_id": "root1", "session_id": "sess1",
+                         "effective_model_lane": "main"}
 
     result = _schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Review the design",
-        expected_output="Two independent findings lists",
+        expected_output="One findings list",
         role="reviewer",
-        model_lane="review",
     )
 
-    assert result.startswith("Subagent group queued")
-    events = [event_queue.get_nowait(), event_queue.get_nowait()]
-    group_ids = {event["task_group_id"] for event in events}
-    assert len(group_ids) == 1
-    assert all(event["requested_model_lane"] == "review" for event in events)
-    assert [event["model"] for event in events] == ["review-a", "review-b"]
-    assert all(event["subagent_envelope"]["status"] == STATUS_REQUESTED for event in events)
-    assert all(event["subagent_envelope"]["lineage"]["root_task_id"] == "root1" for event in events)
-    assert all(event["task_group"]["size"] == 2 for event in events)
+    assert "TOOL_ARG_ERROR" not in result
+    event = event_queue.get_nowait()
+    assert event_queue.empty()
+    assert event["requested_model_lane"] == "auto"
+    assert event["requested_executor"] == "native"
+    assert event["configured_subagent"]["selected_subagent_id"] == subagent_id
+    assert event["parent_model_lane"] == "main"
+    assert "effective_model_lane" not in event and "model" not in event
+    # One request, one child: the lane fan-out that a group id existed for has not
+    # been reachable since v6.87.7, so no group is minted and none is claimed.
+    assert "task_group_id" not in event and "task_group" not in event
+    assert event["subagent_envelope"]["task_group_id"] == ""
+    assert event["subagent_envelope"]["status"] == STATUS_REQUESTED
+    assert event["subagent_envelope"]["lineage"]["root_task_id"] == "root1"
 
-    for event in events:
-        path = tmp_path / "task_results" / f"{event['task_id']}.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        assert data["task_group_id"] == event["task_group_id"]
-        assert data["model"] == event["model"]
-        assert data["effective_model_lane"] == "review"
+    path = tmp_path / "task_results" / f"{event['task_id']}.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["requested_model_lane"] == "auto"
+    assert data["configured_subagent"]["selected_subagent_id"] == subagent_id
+    assert data["parent_model_lane"] == "main"
+    assert "model" not in data and "effective_model_lane" not in data
+    assert "task_group_id" not in data
 
 
-def test_schedule_subagent_group_drive_failure_is_fail_closed(monkeypatch, tmp_path):
-    import ouroboros.subagents as subagents
-    import ouroboros.tools.control as control
-    from ouroboros.headless import HEADLESS_TASKS_DIR, task_state_dir
+def test_schedule_subagent_drive_failure_is_fail_closed(monkeypatch, tmp_path):
+    """A drive that cannot be prepared leaves NOTHING behind: no event, no durable record,
+    no half-provisioned state directory."""
+    import ouroboros.tools.control_scheduling as control
+    from ouroboros.headless import HEADLESS_TASKS_DIR
     from ouroboros.tools.registry import ToolContext
+    from tests._shared import configure_test_subagent
 
-    monkeypatch.setattr(subagents, "get_review_models", lambda: ["review-a", "review-b"])
-    created: list[str] = []
+    subagent_id = configure_test_subagent(monkeypatch)
 
-    def fake_prepare(_root, tid, _mode):
-        child = task_state_dir(tmp_path, tid) / "data"
-        child.mkdir(parents=True)
-        created.append(tid)
-        if len(created) == 2:
-            raise RuntimeError("boom")
-        return child
+    def fake_prepare(_root, _tid, _mode):
+        raise RuntimeError("boom")
 
     monkeypatch.setattr(control, "prepare_task_drive", fake_prepare)
     event_queue: queue.Queue = queue.Queue()
@@ -94,10 +118,10 @@ def test_schedule_subagent_group_drive_failure_is_fail_closed(monkeypatch, tmp_p
 
     result = control._schedule_task(
         ctx,
+        subagent_id=subagent_id,
         objective="Review the design",
-        expected_output="Two independent findings lists",
+        expected_output="One findings list",
         role="reviewer",
-        model_lane="review",
     )
 
     assert "SUBTASK_DRIVE_ERROR" in result

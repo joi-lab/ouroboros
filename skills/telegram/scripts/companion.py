@@ -47,6 +47,7 @@ from telegram_settings import (
     TelegramSettingsError,
     TelegramSettingsObserver,
     miniapp_enabled,
+    telegram_proxy,
 )
 from telegram_menu import (
     TelegramMenuConflictError,
@@ -1210,6 +1211,7 @@ async def run() -> int:
             timeout=12,
             follow_redirects=False,
             trust_env=False,
+            proxy=telegram_proxy(state_dir),
         )
         settings_observer = TelegramSettingsObserver(state_dir, config["core_port"])
         while True:

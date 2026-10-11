@@ -1,12 +1,15 @@
-"""Shared dependency-spec resolution for skill payloads."""
+"""Shared dependency-spec resolution and installed readiness for skill payloads."""
 
 from __future__ import annotations
 
+import logging
 import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.marketplace.install_specs import normalize_install_specs
 from ouroboros.utils import read_json_dict
+
+log = logging.getLogger(__name__)
 
 
 def _coerce_dependency_specs(raw: Any) -> Any:
@@ -48,15 +51,33 @@ def normalize_declared_dependency_specs(raw: Any) -> tuple[List[Dict[str, Any]],
     return normalize_install_specs(_coerce_dependency_specs(raw))
 
 
-def _manifest_install_specs(manifest: Any) -> List[Dict[str, Any]]:
+def _manifest_declared_raw(manifest: Any) -> Any:
     extras = dict(getattr(manifest, "raw_extra", {}) or {})
     raw = extras.get("install_specs")
     if raw in (None, "", [], {}):
         raw = extras.get("install")
     if raw in (None, "", [], {}):
         raw = extras.get("dependencies")
-    auto, _manual, _warnings = normalize_declared_dependency_specs(raw)
+    return raw
+
+
+def _manifest_install_specs(manifest: Any) -> List[Dict[str, Any]]:
+    auto, _manual, _warnings = normalize_declared_dependency_specs(_manifest_declared_raw(manifest))
     return auto
+
+
+def manual_install_specs_for_skill(loaded: Any) -> tuple[List[Dict[str, Any]], List[str]]:
+    """Return ``(manual_specs, warnings)`` declared in the skill's manifest.
+
+    G3 (capinv-447): the auto-spec resolver used to DROP the manual portion, so
+    a skill whose only dependencies were manual reported an empty dependency
+    list and READY. Manual specs only ever come from the reviewed manifest
+    declaration (provenance/sidecar records carry the auto list alone).
+    """
+    _auto, manual, warnings = normalize_declared_dependency_specs(
+        _manifest_declared_raw(getattr(loaded, "manifest", None))
+    )
+    return manual, warnings
 
 
 def _payload_sidecar_specs(skill_dir: pathlib.Path) -> List[Dict[str, Any]]:
@@ -71,26 +92,75 @@ def _payload_sidecar_specs(skill_dir: pathlib.Path) -> List[Dict[str, Any]]:
     return []
 
 
+def payload_declared_install_specs(loaded: Any) -> List[Dict[str, Any]]:
+    """Auto specs declared by HASH-COVERED payload carriers only (6.2=A).
+
+    The review content hash covers the payload sidecars and the manifest, but
+    NOT the state-plane provenance record ``auto_install_specs_for_skill``
+    prefers for ClawHub payloads. This projection is the declarative
+    dependency fingerprint: a new declared name changes the payload bytes and
+    therefore forces re-review, while the installed ``.ouroboros_env`` bytes
+    stay outside the hash by design.
+    """
+    sidecar = _payload_sidecar_specs(pathlib.Path(loaded.skill_dir))
+    if sidecar:
+        return sidecar
+    return _manifest_install_specs(getattr(loaded, "manifest", None))
+
+
+def declared_dependency_names(specs: Any) -> frozenset[str]:
+    """Canonical ``kind:package`` name set of a declared spec list."""
+    return frozenset(
+        f"{str(item.get('kind') or '').strip().lower()}:{str(item.get('package') or '').strip()}"
+        for item in (specs or [])
+        if isinstance(item, dict)
+    )
+
+
 def auto_install_specs_for_skill(drive_root: pathlib.Path, loaded: Any) -> List[Dict[str, Any]]:
     """Return normalized auto-install specs declared for ``loaded``.
 
-    ClawHub provenance remains authoritative when present. Other sources can
-    declare dependencies in their reviewed manifest or, for official catalog
-    installs, in a payload sidecar.
+    ClawHub provenance remains authoritative for ClawHub-sourced skills only:
+    the state-plane ``clawhub.json`` survives payload transitions, so reading
+    it source-blind would let a stale record dictate dependencies for a skill
+    that now lives in another bucket. Other sources declare dependencies in
+    their reviewed manifest or, for official catalog installs, in a payload
+    sidecar.
     """
 
-    try:
-        from ouroboros.marketplace.provenance import read_provenance
+    if str(getattr(loaded, "source", "") or "") == "clawhub":
+        try:
+            from ouroboros.marketplace.provenance import read_provenance
 
-        prov = read_provenance(drive_root, loaded.name) or {}
-        auto = list((prov.get("install_specs") or {}).get("auto") or [])
-        if auto:
-            return auto
-    except Exception:
-        pass
+            prov = read_provenance(drive_root, loaded.name) or {}
+            auto = list((prov.get("install_specs") or {}).get("auto") or [])
+            if auto:
+                return auto
+        except Exception:
+            pass
 
     sidecar = _payload_sidecar_specs(pathlib.Path(loaded.skill_dir))
     if sidecar:
         return sidecar
 
     return _manifest_install_specs(getattr(loaded, "manifest", None))
+
+
+def skill_deps_not_ready(drive_root: pathlib.Path, loaded: Any) -> tuple[str, str]:
+    try:
+        from ouroboros.marketplace.install_specs import install_specs_hash as _specs_hash
+        from ouroboros.marketplace.isolated_deps import read_deps_state
+
+        auto_specs = auto_install_specs_for_skill(drive_root, loaded)
+        if not auto_specs:
+            return "", ""
+        deps_state = read_deps_state(drive_root, loaded.name, loaded.skill_dir)
+        deps_status = str(deps_state.get("status") or "pending")
+        if deps_status != "installed":
+            return deps_status, "status"
+        if str(deps_state.get("specs_hash") or "") != _specs_hash(auto_specs):
+            return deps_status, "fingerprint"
+        return "", ""
+    except Exception:
+        log.debug("skill deps readiness probe failed", exc_info=True)
+        return "", ""

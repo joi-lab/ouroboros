@@ -1,6 +1,6 @@
 """Pure output-contract helpers for the commit scope reviewer.
 
-This module owns no reviewer routing, retry, authority, or persistence.  It only
+This module owns no reviewer routing, retry, authority, or persistence.  It
 validates the one-pass actor's JSON checklist response and projects FAIL rows
 into the two finding buckets consumed by ``scope_review``.
 """

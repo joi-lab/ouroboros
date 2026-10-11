@@ -1,4 +1,4 @@
-from ouroboros.event_bus import CHAT_OUTBOUND, SKILL_LIFECYCLE, EventBus
+from ouroboros.event_bus import CHAT_LINKS, CHAT_OUTBOUND, SKILL_LIFECYCLE, EventBus
 import base64
 import asyncio
 import json
@@ -27,6 +27,17 @@ def test_event_bus_supports_skill_lifecycle_topic() -> None:
         "skill": "demo",
         "topic": SKILL_LIFECYCLE,
     }]
+
+
+def test_event_bus_supports_structured_chat_links_topic() -> None:
+    bus = EventBus()
+    received = []
+    bus.subscribe("skill", CHAT_LINKS, received.append)
+
+    bus.publish(CHAT_LINKS, {"actions": [{"label": "Docs", "url": "https://example.com"}]})
+
+    assert received[0]["topic"] == CHAT_LINKS
+    assert received[0]["actions"][0]["label"] == "Docs"
 
 
 def test_event_bus_unsubscribe_skill_removes_handlers() -> None:
@@ -80,7 +91,7 @@ def test_supervisor_dispatches_skill_lifecycle_to_log_and_event_bus(tmp_path, mo
         append_jsonl=append_jsonl,
         bridge=SimpleNamespace(
             push_log=pushed.append,
-            send_video=lambda chat_id, video_bytes, caption="", mime="": (
+            send_video=lambda chat_id, video_bytes, caption="", mime="", task_id="": (
                 sent_video.append((chat_id, video_bytes, caption, mime)) or (True, "ok")
             ),
         ),

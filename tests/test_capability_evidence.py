@@ -293,11 +293,11 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     assert abs(get_token_density(tmp_path, "m/one") - 1.5) < 1e-6
     density, source = resolve_token_density(tmp_path, "m/one")
     assert source == "measured"
-    # A model's OWN measured density applies (with the safety factor); the cold-start
-    # constant bounds the COLD path only, so a lighter tokenizer is not permanently
-    # charged a Claude-derived 1.65. calibrated_input_token_limit still bounds the
-    # resulting cap by the historical absolute-margin form.
-    assert abs(density - 1.5 * MEASURED_DENSITY_SAFETY_FACTOR) < 1e-6
+    # Successor pin (issue #284): a fresh exact-model witness is authoritative
+    # and MAY lower the effective review density below the cold floor; the
+    # floor keeps governing only stale/absent/cross-model evidence.
+    assert density == 1.5 * MEASURED_DENSITY_SAFETY_FACTOR
+    assert density < COLD_START_TOKEN_DENSITY
 
     # Above the floor, the measured value (with the safety factor) is what applies.
     _DENSITY_MEMO.clear()
@@ -326,12 +326,11 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
 
     # Throttle: a repeat observation within tolerance must not touch the shared store
     # AT ALL (it is one file behind one lock shared with the scope-review hot path).
-    current = get_token_density(tmp_path, "m/one")
     saves: list = []
     monkeypatch.setattr(ce, "_save", lambda root, data: saves.append(1))
     _DENSITY_MEMO.clear()
     record_token_density(
-        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(current * chars / 4),
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=int(1.64 * chars / 4),
     )
     assert saves == [], "a within-tolerance repeat must not write the shared store"
     # ...and a real drift IS persisted.
@@ -347,11 +346,253 @@ def test_token_density_is_measured_throttled_and_bounded(tmp_path, monkeypatch):
     record_token_density(tmp_path, "m/two", prompt_chars=chars, prompt_tokens=99_000_000)
     assert get_token_density(tmp_path, "m/two") == 0.0
 
-    # The cold-conservative fallback is the MAX of the constant and every fresh
-    # observation, so a light GPT measurement can never make an unknown model optimistic.
+    # The cold-conservative fallback IS the constant: the fresh m/one (1.8) and
+    # m/dense (2.0) witnesses are other tokenizers, no evidence about never/seen —
+    # neither optimistic (a light foreign row) nor pessimistic (a dense one).
     density, source = resolve_token_density(tmp_path, "never/seen")
     assert source == "cold_conservative"
-    assert density >= COLD_START_TOKEN_DENSITY
+    assert density == COLD_START_TOKEN_DENSITY
+
+
+def test_density_reducers_use_newest_route_or_model_but_densest_review_witness(
+    tmp_path, monkeypatch,
+):
+    from datetime import datetime, timezone
+
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        record_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    # Windows clock granularity can stamp back-to-back records identically.
+    # Persisted observation order, not test-synthesised time, breaks that tie.
+    base = datetime.now(timezone.utc)
+    monkeypatch.setattr(ce, "utc_now_iso", lambda: base.isoformat())
+
+    _DENSITY_MEMO.clear()
+    chars = 400_000
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=180_000, route_fp="route-a",
+        basis=ce.MAIN_DENSITY_BASIS,
+    )
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=chars, prompt_tokens=110_000, route_fp="route-a",
+        basis=ce.MAIN_DENSITY_BASIS,
+    )
+
+    assert resolve_main_token_density(tmp_path, "route-a", "m/one") == (
+        1.1, "fresh_route_usage",
+    )
+    assert resolve_main_token_density(tmp_path, "missing-route", "m/one") == (
+        1.1, "fresh_model_usage",
+    )
+    review, source = resolve_review_token_density(tmp_path, "m/one")
+    assert source == "measured"
+    assert review == max(COLD_START_TOKEN_DENSITY, 1.8 * MEASURED_DENSITY_SAFETY_FACTOR)
+    # m/one's 1.8 x 1.05 = 1.89 is m/one's tokenizer; m/missing gets the floor.
+    assert resolve_review_token_density(tmp_path, "m/missing") == (
+        COLD_START_TOKEN_DENSITY, "cold_conservative",
+    )
+
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert set(stored["token_density"]["m/one"]) == {"pairs"}
+    assert resolve_main_token_density(tmp_path, "", "never/seen") == (1.0, "cold_estimate")
+
+
+def test_foreign_density_witness_leaves_the_cold_floor_untouched(tmp_path):
+    """Paid run 2026-09-04 (lane SM1_a1): gemini-3.8-flash's witness 407,767 /
+    (900,708 / 4) = 1.81 governed gpt-5.6-terra (no exact witness yet) at
+    1.81 x 1.05 = 1.90, cutting the scope cap to 499,627 of a 1,050,000 window
+    where the floor alone gives 575,757. Another model's tokenizer is no
+    evidence about this route: the cross-model branch returns the floor."""
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        COLD_START_TOKEN_DENSITY,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        record_token_density,
+        resolve_review_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "google/gemini-3.8-flash", prompt_chars=900_708, prompt_tokens=407_767,
+    )
+    assert resolve_review_token_density(tmp_path, "openai/gpt-5.6-terra") == (
+        COLD_START_TOKEN_DENSITY, "cold_conservative",
+    )
+    density, source = resolve_review_token_density(tmp_path, "google/gemini-3.8-flash")
+    assert source == "measured"
+    assert abs(density - 407_767 / (900_708 / 4) * MEASURED_DENSITY_SAFETY_FACTOR) < 1e-9
+
+
+def test_doubled_cached_usage_row_is_not_a_density_witness(tmp_path):
+    """The same paid run: 22 openrouter gemini usage rows (every lane) reported
+    prompt_tokens = 2 x cached_tokens - 1 — a cache read added on top of an
+    already cache-inclusive total — beside honest rows of the same prompt at
+    1.00-1.17 x cached. Accepted, one such row is the densest fresh pair and
+    the review reducer promotes it for the 90-day TTL, so it is no witness.
+    Uncached ABOVE cached (a cold prompt with a small cache hit) is ordinary
+    accounting and stays measurable."""
+    from ouroboros import usage_accounting as ua
+    from ouroboros.capability_evidence import _DENSITY_MEMO, get_token_density, observe_token_density
+
+    def observe(root, usage, estimate):
+        _DENSITY_MEMO.clear()
+        observe_token_density(
+            ua.AttemptRequest(
+                model="google/gemini-3.8-flash", provider="openrouter",
+                prompt_tokens_estimate=estimate, drive_root=root,
+            ),
+            usage,
+            drive_root_resolver=lambda root: root,
+        )
+        return get_token_density(root, "google/gemini-3.8-flash")
+
+    doubled = tmp_path / "doubled"
+    assert observe(doubled, {"prompt_tokens": 407_767, "cached_tokens": 203_884}, 225_177) == 0.0
+    assert observe(doubled, {"prompt_tokens": 407_768, "cached_tokens": 203_884}, 225_177) == 0.0
+    honest = observe(tmp_path / "honest", {"prompt_tokens": 205_299, "cached_tokens": 203_884}, 226_443)
+    assert abs(honest - 205_299 / 226_443) < 1e-6
+    cold_hit = observe(tmp_path / "cold_hit", {"prompt_tokens": 412_884, "cached_tokens": 203_884}, 225_177)
+    assert abs(cold_hit - 412_884 / 225_177) < 1e-6
+
+
+def test_density_throttle_uses_legacy_list_order_for_equal_clock_ties(tmp_path):
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    observed_at = ce.utc_now_iso()
+    ce._save(tmp_path, {"token_density": {"m/one": {"pairs": [
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 100_000,
+            "observed_at": observed_at,
+            "route_fp": "route-a",
+        },
+        {
+            "prompt_chars": 400_000,
+            "prompt_tokens": 200_000,
+            "observed_at": observed_at,
+            "observation_seq": "invalid-legacy-value",
+            "route_fp": "route-a",
+        },
+    ]}}})
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=200_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 2
+
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=100_000,
+        route_fp="route-a",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert len(stored["token_density"]["m/one"]["pairs"]) == 3
+
+
+def test_density_memo_does_not_claim_a_witness_when_persistence_failed(tmp_path, monkeypatch):
+    from ouroboros.capability_evidence import _DENSITY_MEMO, record_token_density
+
+    _DENSITY_MEMO.clear()
+    monkeypatch.setattr(ce, "_save", lambda root, data: False)
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=150_000,
+        route_fp="route-a",
+    )
+    assert "m/one\0route-a" not in _DENSITY_MEMO
+
+
+def test_orphan_density_scalar_has_no_authority_without_a_retained_witness(tmp_path):
+    from ouroboros.capability_evidence import (
+        COLD_START_TOKEN_DENSITY,
+        get_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    ce._save(tmp_path, {"token_density": {"m/one": {
+        "density": 3.0,
+        "observed_at": ce.utc_now_iso(),
+        "pairs": [],
+    }}})
+    assert get_token_density(tmp_path, "m/one") == 0.0
+    assert resolve_main_token_density(tmp_path, "route-a", "m/one") == (1.0, "cold_estimate")
+    assert resolve_review_token_density(tmp_path, "m/one") == (
+        COLD_START_TOKEN_DENSITY, "cold_conservative",
+    )
+
+
+def test_density_retention_preserves_fresh_high_witness_without_refreshing_its_ttl(
+    tmp_path, monkeypatch,
+):
+    import datetime
+
+    from ouroboros.capability_evidence import (
+        _DENSITY_MEMO,
+        MEASURED_DENSITY_SAFETY_FACTOR,
+        _TOKEN_DENSITY_MAX_PAIRS,
+        _TOKEN_DENSITY_TTL_SEC,
+        record_token_density,
+        resolve_main_token_density,
+        resolve_review_token_density,
+    )
+
+    _DENSITY_MEMO.clear()
+    # The retention window itself is a pinned number: a measured witness stays
+    # usable for 90 days, so a shortened TTL cannot silently send review sizing
+    # back to the cold floor.
+    assert _TOKEN_DENSITY_TTL_SEC == 90 * 24 * 3600.0
+    now = datetime.datetime.now(datetime.timezone.utc)
+    old_high_ts = (now - datetime.timedelta(seconds=_TOKEN_DENSITY_TTL_SEC - 60)).isoformat()
+    ce._save(tmp_path, {"token_density": {"m/one": {"pairs": [{
+        "prompt_chars": 400_000,
+        "prompt_tokens": 250_000,
+        "observed_at": old_high_ts,
+        "source": "dispatch_usage",
+        "route_fp": "route-high",
+    }]}}})
+    monkeypatch.setattr(ce, "utc_now_iso", lambda: now.isoformat())
+
+    for index, density in enumerate((1.0, 1.1, 1.2, 1.3, 1.4, 1.5)):
+        _DENSITY_MEMO.clear()
+        record_token_density(
+            tmp_path, "m/one", prompt_chars=400_000,
+            prompt_tokens=int(density * 100_000), route_fp=f"route-low-{index}",
+            basis=ce.MAIN_DENSITY_BASIS,
+        )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    pairs = stored["token_density"]["m/one"]["pairs"]
+    assert len(pairs) == _TOKEN_DENSITY_MAX_PAIRS
+    assert any(pair["observed_at"] == old_high_ts for pair in pairs)
+    fresh_sequences = [
+        pair["observation_seq"] for pair in pairs if pair["observed_at"] != old_high_ts
+    ]
+    assert fresh_sequences and all(sequence > 0 for sequence in fresh_sequences)
+
+    monkeypatch.setattr(ce, "utc_now", lambda: now + datetime.timedelta(seconds=120))
+    assert resolve_main_token_density(tmp_path, "route-high", "m/one") == (
+        1.5, "fresh_model_usage",
+    )
+    # Successor pin (issue #284): the densest FRESH exact-model witness (1.5,
+    # with the safety factor) undercuts the cold floor and is honored; the
+    # stale 2.5 witness no longer counts toward review sizing.
+    assert resolve_review_token_density(tmp_path, "m/one") == (
+        1.5 * MEASURED_DENSITY_SAFETY_FACTOR, "measured",
+    )
+    _DENSITY_MEMO.clear()
+    record_token_density(
+        tmp_path, "m/one", prompt_chars=400_000, prompt_tokens=155_000, route_fp="route-new",
+    )
+    stored = json.loads((tmp_path / "state" / "capability_evidence.json").read_text())
+    assert all(pair["observed_at"] != old_high_ts for pair in stored["token_density"]["m/one"]["pairs"])
 
 
 def test_token_density_is_concurrency_safe_under_bench_like_parallelism(tmp_path):
@@ -408,6 +649,7 @@ def test_cold_density_never_demotes_the_main_loop_context_fit(tmp_path, monkeypa
     # Only a MEASURED density for that exact model may raise it.
     record_token_density(
         tmp_path, "anthropic/claude-fable-5", prompt_chars=4_000_000, prompt_tokens=1_580_000,
+        basis=ce.MAIN_DENSITY_BASIS,
     )
     assert context_fit._route_calibration_ratio(tmp_path, "fp", "openai/gpt-5.5") == 1.0
     assert context_fit._route_calibration_ratio(
@@ -428,7 +670,7 @@ def test_no_observation_non_claude_main_route_keeps_todays_initial_mode(tmp_path
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
         semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
-        docs_need_development=False, force_low_docs=False,
+        docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
     monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
@@ -481,11 +723,14 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
     _DENSITY_MEMO.clear()
     (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("TOTAL_BUDGET", "500")  # the reservation rail is not under test
+    # One observation store: the plan builder reads density from the CANONICAL
+    # evidence root, so bind it to this test's root before seeding witnesses.
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     model = "anthropic/claude-fable-5"  # Claude-family, routed through OpenRouter
     core = context_fit.ContextCore(
         base_prompt="p", bible_md="b", architecture_md="a", development_md="d",
         semi_stable_text="s", dynamic_text="y", user_content_json='"u"',
-        docs_need_development=False, force_low_docs=False,
+        docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
     monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
@@ -515,6 +760,10 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         model=model,
         provider="openrouter",
         prompt_tokens_estimate=50_000,     # == 200,000 prompt chars
+        # The modern producer stamps the fit-estimator basis (no images here,
+        # so it equals the raw estimate); a 0 legacy field records basis="raw",
+        # which the MAIN fit resolver deliberately refuses to calibrate on.
+        prompt_tokens_bounded_estimate=50_000,
         max_completion_tokens=1024,
         drive_root=tmp_path,
     )
@@ -580,3 +829,159 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         extractor=lambda resp: (dict(resp.usage), 0.0, True),
     )
     assert abs(get_token_density(tmp_path, "direct-anthropic-model") - 1.6) < 1e-6
+
+
+def test_freshness_is_an_explicit_axis_of_the_owned_predicate(tmp_path, monkeypatch):
+    """The >=1M question and the "is this still current" question are ONE predicate
+    with an explicit knob, not one predicate plus a re-derivation at each call site.
+
+    `probe` already documents that a stale record "reads as unknown for >=1M gates",
+    but `confirms_at_least` never checked `stale` — so the gate that AUTHORIZES a
+    blocking review accepted an outage-carried record, while the gate beside it
+    hand-rolled the freshness test in a local boolean."""
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 1_000_000)
+    fresh = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert fresh.stale is False
+    assert ce.is_known(fresh, require_fresh=True) is True
+    assert ce.confirms_at_least(fresh, ce.ONE_MILLION, require_fresh=True) is True
+
+    # Provider now unreachable: the prior record is KEPT (module invariant) but stale.
+    monkeypatch.setattr(ce, "_provider_metadata_window", lambda *a, **k: 0)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+    stale = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True, force=True)
+    assert stale.stale is True and stale.window_tokens == 1_000_000
+
+    # Restricting gates keep it (never downgrade the owner's horizon on a blip)...
+    assert ce.confirms_at_least(stale, ce.ONE_MILLION) is True
+    # ...authorizing gates do not.
+    assert ce.confirms_at_least(stale, ce.ONE_MILLION, require_fresh=True) is False
+    assert ce.is_known(stale, require_fresh=True) is False
+    assert ce.is_known(stale) is True
+
+    # A window of 0 is never "known", whatever the status claims.
+    assert ce.is_known(ce.CapabilityEvidence(0, ce.STATUS_CONFIRMED, "", "")) is False
+    assert ce.is_known(None) is False
+
+
+def test_no_surface_restates_the_freshness_predicate_it_does_not_own():
+    """Class guard (v6.87.45): `is_known` is the ONE place that says what counts as
+    current, sourced evidence.
+
+    Making freshness an argument of the owned predicate is only worth anything if the
+    restatements it replaced are gone. Four survived the change that claimed them —
+    `context_fit` twice (once on a real `CapabilityEvidence`, once on the plan built
+    from it) and `loop` twice — each spelling out the same
+    `status in {confirmed, asserted} and not stale and window > 0`. They agree today;
+    a fifth caller that drops the `not stale` clause is exactly how the >=1M gate lost
+    it in the first place."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parent.parent / "ouroboros"
+    pattern = re.compile(r"""in\s*\{\s*["'](?:confirmed|asserted)["']\s*,\s*["'](?:confirmed|asserted)["']\s*\}""")
+    offenders = [
+        f"{path.relative_to(root)}:{i}"
+        for path in sorted(root.rglob("*.py"))
+        if path.name != "capability_evidence.py"
+        for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert offenders == [], (
+        "these re-derive capability_evidence.is_known(...) instead of calling it: "
+        + ", ".join(offenders)
+    )
+
+
+def test_a_failed_probe_is_retried_once_its_throttle_expires_and_not_before(tmp_path, monkeypatch):
+    """The FAILED cache is a short throttle, and both of its edges are load-bearing.
+
+    `probe` serves a cached record without touching the network while it is inside its
+    TTL, and the TTL a FAILED record gets is a tenth of an hour against a confirmed
+    record's day. Nothing measured either number: both could move to any value with a
+    green suite, and each direction breaks something this branch has already had to fix
+    once. Too LONG and one transport blip reads as a dead route for the whole window —
+    every resolution past it takes the no-fetch answer and every review surface sizes
+    against an unknown route until it expires, which is v6.87.45's wedge arriving
+    through the record instead of through a process-lifetime memo. Too
+    SHORT and the throttle stops existing: a provider that is genuinely down is re-asked
+    on every resolution, on the hot path of every review.
+
+    So the behaviour is driven from both sides of the edge rather than named."""
+    import datetime
+
+    fetches = []
+
+    def fake_metadata(*_a, **_k):
+        fetches.append(1)
+        return 1_000_000
+
+    monkeypatch.setattr(ce, "_provider_metadata_window", fake_metadata)
+    monkeypatch.setattr(ce, "_metadata_fetch_transport_failed", lambda *a, **k: True)
+
+    def seed_failure(age_seconds):
+        fp = ce.route_fingerprint(provider="openrouter", base_url="", model="x/y")
+        ts = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(seconds=age_seconds)).isoformat()
+        store = tmp_path / "state" / "capability_evidence.json"
+        store.parent.mkdir(parents=True, exist_ok=True)
+        store.write_text(json.dumps({"probes": {fp: {
+            "window_tokens": 0, "status": ce.STATUS_FAILED, "source": ce.SOURCE_NONE,
+            "route_fp": fp, "model": "x/y", "provider": "openrouter", "ts": ts,
+            "detail": "provider unreachable during probe",
+        }}}), encoding="utf-8")
+
+    # Inside the throttle: the failure is served from the cache, untouched, and the
+    # provider is not asked again.
+    seed_failure(5 * 60)
+    throttled = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert throttled.status == ce.STATUS_FAILED
+    assert fetches == [], "a fresh failure record must not re-ask the provider"
+
+    # Past it: the route is retried, and a provider that has come back replaces the
+    # failure with confirmed evidence instead of staying poisoned.
+    seed_failure(20 * 60)
+    retried = ce.probe(tmp_path, provider="openrouter", model="x/y", allow_fetch=True)
+    assert fetches, "an expired failure record must be retried"
+    assert retried.status == ce.STATUS_CONFIRMED and retried.window_tokens == 1_000_000
+    assert ce.confirms_at_least(retried, ce.ONE_MILLION, require_fresh=True) is True
+
+
+def test_expired_probe_records_drop_on_write(tmp_path):
+    """CPL4-C8: the write seam drops probe records the reader already treats as
+    expired — failed/unprobeable past their TTL, confirmed past GC retention —
+    while owner acks, in-retention stale confirmed (the blip-keep invariant),
+    and records with unreadable timestamps survive untouched."""
+    from ouroboros.utils import utc_now_iso
+
+    store = tmp_path / "state" / "capability_evidence.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    old_failed = {"status": ce.STATUS_FAILED, "ts": "2020-01-01T00:00:00+00:00"}
+    old_unprobeable = {"status": ce.STATUS_UNPROBEABLE, "ts": "2020-01-01T00:00:00+00:00"}
+    ancient_confirmed = {
+        "status": ce.STATUS_CONFIRMED, "window_tokens": 1_000_000,
+        "ts": "2020-01-01T00:00:00+00:00",
+    }
+    stale_confirmed_within_gc = {
+        "status": ce.STATUS_CONFIRMED, "window_tokens": 1_000_000, "ts": utc_now_iso(),
+    }
+    broken_ts = {"status": ce.STATUS_FAILED, "ts": "not-a-time"}
+    store.write_text(json.dumps({
+        "probes": {
+            "old-failed": old_failed,
+            "old-unprobeable": old_unprobeable,
+            "ancient-confirmed": ancient_confirmed,
+            "fresh-confirmed": stale_confirmed_within_gc,
+            "broken-ts": broken_ts,
+        },
+        "owner_acks": {"acked-route": {"tokens": 1_000_000, "ts": "2020-01-01T00:00:00+00:00"}},
+    }), encoding="utf-8")
+
+    ce._store_evidence(tmp_path, "probes", "new-route", {
+        "status": ce.STATUS_CONFIRMED, "window_tokens": 200_000, "ts": utc_now_iso(),
+    })
+
+    on_disk = json.loads(store.read_text(encoding="utf-8"))
+    assert set(on_disk["probes"]) == {"fresh-confirmed", "broken-ts", "new-route"}
+    assert on_disk["owner_acks"] == {
+        "acked-route": {"tokens": 1_000_000, "ts": "2020-01-01T00:00:00+00:00"},
+    }

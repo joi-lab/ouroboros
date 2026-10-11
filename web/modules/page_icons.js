@@ -16,7 +16,12 @@ export function hydrateNavIcons(root = document) {
     Object.entries(PAGE_ICONS).forEach(([page, svg]) => {
         const button = root.querySelector(`[data-nav-page="${page}"]`);
         if (!button) return;
-        const label = button.querySelector('.nav-row-label')?.outerHTML || `<span class="nav-row-label">${page}</span>`;
-        button.innerHTML = `${svg}${label}`;
+        // Icons own only their SVG. Keep labels, unread and activity nodes.
+        const existing = button.querySelector('svg');
+        if (existing) existing.outerHTML = svg;
+        else button.insertAdjacentHTML('afterbegin', svg);
+        if (!button.querySelector('.nav-row-label')) {
+            button.insertAdjacentHTML('beforeend', `<span class="nav-row-label">${page}</span>`);
+        }
     });
 }

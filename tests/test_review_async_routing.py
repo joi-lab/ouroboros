@@ -44,14 +44,18 @@ def test_multi_model_review_async_uses_llm_client_chat_async(monkeypatch, tmp_pa
 
     assert calls
     assert calls[0]["model"] == "anthropic/claude-sonnet-4.6"
-    assert calls[0]["temperature"] == 0.2
+    # The review author supplies a host hint; the real client resolves it on
+    # the effective route. This recording fake observes intent, not wire bytes.
+    assert calls[0]["temperature"] is None
+    assert calls[0]["default_temperature"] == 0.2
     assert result["results"][0]["cached_tokens"] == 7
     assert result["results"][0]["cache_write_tokens"] == 2
     assert result["results"][0]["prompt_cache_ttl"] == "default"
     assert ctx.pending_events
-    assert ctx.pending_events[0]["usage"]["cached_tokens"] == 7
-    assert ctx.pending_events[0]["usage"]["cache_write_tokens"] == 2
-    assert ctx.pending_events[0]["usage"]["prompt_cache_ttl"] == "default"
+    usage_event = next(event for event in ctx.pending_events if event.get("type") == "llm_usage")
+    assert usage_event["usage"]["cached_tokens"] == 7
+    assert usage_event["usage"]["cache_write_tokens"] == 2
+    assert usage_event["usage"]["prompt_cache_ttl"] == "default"
 
 
 def test_multi_model_review_async_works_without_openrouter_for_official_openai(monkeypatch, tmp_path):
@@ -96,5 +100,6 @@ def test_multi_model_review_async_works_without_openrouter_for_official_openai(m
     assert calls
     assert calls[0]["model"] == "openai::gpt-5.2"
     assert result["results"][0]["model"] == "openai/gpt-5.2"
-    assert ctx.pending_events[0]["provider"] == "openai"
-    assert ctx.pending_events[0]["api_key_type"] == "openai"
+    usage_event = next(event for event in ctx.pending_events if event.get("type") == "llm_usage")
+    assert usage_event["provider"] == "openai"
+    assert usage_event["api_key_type"] == "openai"

@@ -41,6 +41,7 @@ def test_pollution_sweep_runs_on_controller(monkeypatch):
 
     assert session.exitstatus == 1, "controller must run the sweep and fail the run on pollution"
     assert not _FAKE_LEAK.exists(), "sweep must not have created anything on disk"
+    assert conftest._PYTEST_POPEN_PATCHED is True
 
 
 def test_pollution_sweep_is_skipped_on_worker(monkeypatch):
@@ -53,3 +54,4 @@ def test_pollution_sweep_is_skipped_on_worker(monkeypatch):
     # A worker must NOT run the sweep nor mutate exitstatus — the controller owns the repo-root
     # authority, so workers cannot race the rmtree or each independently fail the run.
     assert session.exitstatus == 0
+    assert conftest._PYTEST_POPEN_PATCHED is True

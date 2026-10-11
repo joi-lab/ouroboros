@@ -1,0 +1,142 @@
+"""Queue context reports dated evidence without changing scheduling authority."""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import task_status
+from ouroboros.context_runtime_facts import _queue_context_fact
+from ouroboros.tools.control_scheduling import _subagent_slot_note
+
+
+def _snapshot(age=0):
+    return {
+        "ts": datetime.fromtimestamp(1000 - age, timezone.utc).isoformat(),
+        "running": [{"id": "child", "task": {"delegation_role": "subagent", "root_task_id": "root"}}],
+        "pending": [], "reaping_count": 1, "worker_total": 3, "assignable_idle_workers": 1,
+    }
+
+
+def _write(root, snapshot):
+    path = root / "state" / "queue_snapshot.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch):
+    monkeypatch.setattr(task_status.time, "time", lambda: 1000)
+
+
+@pytest.mark.parametrize("age,fresh", [(0, True), (10, True), (10.001, False), (900, False)])
+def test_context_freshness_shares_ownership_boundary(age, fresh):
+    snapshot = _snapshot(age)
+    fact = task_status.queue_snapshot_observation(snapshot)
+    assert fact["fresh"] is fresh
+    assert task_status._snapshot_is_stale(snapshot) is not fresh
+    assert fact["age_sec"] == age
+    assert fact["freshness"] == ("fresh" if fresh else "stale")
+    assert fact["ts"] == snapshot["ts"]
+
+
+@pytest.mark.parametrize("snapshot", [{}, {"ts": "invalid"}, {"_snapshot_missing": True}, {"_snapshot_invalid": True}])
+def test_unavailable_freshness_is_unknown(snapshot):
+    fact = task_status.queue_snapshot_observation(snapshot)
+    assert fact["freshness"] == "unknown"
+    assert fact["age_sec"] is None
+    assert not fact["fresh"]
+
+
+def test_child_context_and_schedule_share_canonical_last_known_snapshot(tmp_path, monkeypatch):
+    canonical, child = tmp_path / "canonical", tmp_path / "child"
+    path = _write(canonical, _snapshot(60))
+    _write(child, {**_snapshot(), "running": [], "assignable_idle_workers": 100})
+    before = path.read_bytes()
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", child)
+    task = {"budget_drive_root": str(canonical)}
+    fact = _queue_context_fact(task)
+    ctx = SimpleNamespace(drive_root=child, budget_drive_root=canonical)
+    note = _subagent_slot_note(ctx, "root")
+    assert fact["freshness"] == "stale"
+    assert fact["running_count"] == 1
+    assert fact["free_worker_slots"] == 1
+    assert fact["free_worker_slots_basis"] == "recorded_assignable_idle_workers"
+    assert fact["source_root"] == str(canonical)
+    assert "freshness=stale" in note and "age_sec=60.0" in note
+    assert "last recorded 1/" in note
+    assert str(path) in note
+    assert path.read_bytes() == before
+    # A frozen context remains that dated observation even when the source advances.
+    _write(canonical, {**_snapshot(), "assignable_idle_workers": 2})
+    assert fact["freshness"] == "stale" and fact["free_worker_slots"] == 1
+    assert _queue_context_fact(task)["free_worker_slots"] == 2
+
+
+def test_legacy_capacity_remains_an_estimate(tmp_path, monkeypatch):
+    snapshot = _snapshot()
+    snapshot.pop("assignable_idle_workers")
+    snapshot.pop("worker_total")
+    _write(tmp_path, snapshot)
+    monkeypatch.setattr("ouroboros.config.get_max_workers", lambda: 10)
+    fact = _queue_context_fact({"budget_drive_root": str(tmp_path)})
+    assert fact["free_worker_slots"] == 8
+    assert fact["free_worker_slots_basis"] == "legacy_estimate_from_configured_limit"
+    assert fact["worker_total"] is None
+
+
+def test_runtime_renderer_exposes_dated_queue_without_live_claim(tmp_path, monkeypatch):
+    from ouroboros import context
+
+    _write(tmp_path, _snapshot(60))
+    monkeypatch.setattr(context, "_runtime_budget_info", lambda *a: {})
+    monkeypatch.setattr(context, "_delegation_capability_fact", lambda: None)
+    monkeypatch.setattr(context, "official_update_projection", lambda *_: {})
+    env = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, drive_path=lambda p: tmp_path / p)
+    rendered = context.build_runtime_section(env, {"budget_drive_root": str(tmp_path)})
+    queue = json.loads(rendered.split("\n\n", 1)[1])["queue"]
+    assert queue["freshness"] == "stale" and queue["age_sec"] == 60
+    assert queue["running_count"] == 1 and queue["free_worker_slots"] == 1
+    assert "live worker/queue load" not in rendered
+
+
+@pytest.mark.parametrize("body", [None, "broken JSON"])
+def test_missing_or_corrupt_snapshot_does_not_claim_empty_queue(tmp_path, body):
+    if body is not None:
+        path = _write(tmp_path, {})
+        path.write_text(body, encoding="utf-8")
+    fact = _queue_context_fact({"budget_drive_root": str(tmp_path)})
+    assert fact["freshness"] == "unknown"
+    assert "running_count" not in fact and "free_worker_slots" not in fact
+    assert "unknown" in _subagent_slot_note(SimpleNamespace(drive_root=tmp_path), "root")
+
+
+def test_cancellation_observation_preserves_status_and_same_freshness(tmp_path, monkeypatch):
+    from ouroboros import cancel_intents
+
+    _write(tmp_path, _snapshot(60))
+    monkeypatch.setattr(cancel_intents, "_validated_single_cancel_target", lambda *_: "child")
+    monkeypatch.setattr(task_status, "load_task_result", lambda *a, **kw: {})
+    fact = task_status.observe_cancellation_target(tmp_path, "child")["queue_snapshot"]
+    assert fact["status"] == "unknown"
+    assert fact["fresh"] is False and fact["freshness"] == "stale"
+    assert fact["age_sec"] == 60
+    # Existing cancellation admission stays fail-open toward possible live ownership.
+    assert task_status.task_has_live_queue_ownership(tmp_path, "child")
+
+
+def test_wait_dates_stale_worker_observation_without_changing_terminal_result(tmp_path, monkeypatch):
+    _write(tmp_path, _snapshot(60))
+    monkeypatch.setattr(task_status, "load_effective_task_result", lambda *a, **kw: {
+        "task_id": "child", "status": "completed", "result": "finished",
+    })
+    result = task_status.wait_for_effective_tasks(tmp_path, ["child"], timeout_sec=0)
+    assert result["all_terminal"] and not result["timed_out"]
+    assert result["tasks"]["child"]["status"] == "completed"
+    assert result["live_child_status"]["child"] == "running"
+    assert result["queue_snapshot_observation"]["freshness"] == "stale"
+    assert result["queue_snapshot_observation"]["age_sec"] == 60

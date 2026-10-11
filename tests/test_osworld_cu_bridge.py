@@ -14,8 +14,40 @@ from pathlib import Path
 
 import pytest
 
+from devtools.benchmarks.common.model_slots import pin_single_model
 from devtools.benchmarks.osworld import run_cu_bridge_agent as rcb
+from devtools.benchmarks.osworld import (
+    cu_bridge_budget,
+    cu_bridge_gate,
+    cu_bridge_runtime,
+    cu_bridge_tool_policy,
+)
 from ouroboros.extension_loader import extension_surface_name
+
+
+_CU_ACTOR_MODEL = "openai/gpt-5.5"
+
+
+def _cu_actor_settings():
+    settings = {}
+    pin_single_model(_CU_ACTOR_MODEL, target=settings)
+    return settings
+
+
+# The cu_bridge runner has owner leaves. A seam like
+# `_api` is now owned by one module and bound by name in the others, so a patch
+# that reached only `rcb` would silently miss the leaf that actually calls it.
+_CU_BRIDGE_MODULES = (
+    rcb, cu_bridge_runtime, cu_bridge_tool_policy, cu_bridge_gate, cu_bridge_budget,
+)
+
+
+def _patch_bridge_seam(monkeypatch, name, value):
+    """Patch a cu_bridge seam on EVERY module that binds it."""
+    bound = [module for module in _CU_BRIDGE_MODULES if hasattr(module, name)]
+    assert bound, name
+    for module in bound:
+        monkeypatch.setattr(module, name, value)
 
 
 def test_infeasible_checks_final_answer_fields_only():
@@ -93,7 +125,16 @@ def test_effective_max_rounds_sources(tmp_path, monkeypatch):
     assert rcb._effective_max_rounds(sp) == {"value": 77, "source": "env"}
 
     monkeypatch.delenv("OUROBOROS_MAX_ROUNDS", raising=False)
-    assert rcb._effective_max_rounds(tmp_path / "missing.json") == {"value": 200, "source": "default"}
+    # A document without the key keeps the runtime's legacy finite default ...
+    assert rcb._effective_max_rounds(sp) == {"value": 200, "source": "legacy_document_default"}
+    # ... while no document at all is the runtime's shipped "unlimited": never a number.
+    assert rcb._effective_max_rounds(tmp_path / "missing.json") == {
+        "value": None, "source": "default", "unbounded": True}
+    sp.write_text(json.dumps({"OUROBOROS_MAX_ROUNDS": "unlimited"}), encoding="utf-8")
+    assert rcb._effective_max_rounds(sp) == {
+        "value": None, "source": "settings", "unbounded": True, "raw": "unlimited"}
+    sp.write_text("{not json", encoding="utf-8")
+    assert rcb._effective_max_rounds(sp) == {"value": None, "source": "settings_unreadable"}
 
 
 def test_budget_counters_from_child_drive_tools_jsonl(tmp_path):
@@ -183,14 +224,14 @@ def test_denylist_is_allowlist_complement_blocks_all_host_surfaces():
     core = rcb._core_tool_names()
     # nothing in the allowlist is denied; everything else is
     assert denied == core - rcb._ALLOWED_CORE_TOOLS
-    for t in ("run_command", "run_script", "claude_code_edit", "write_file", "edit_text",
+    for t in ("run_command", "run_script", "write_file", "edit_text",
               "start_service", "stop_service", "verify_and_record", "commit_reviewed",
               "integrate_subagent_patch", "create_github_issue", "schedule_subagent",
               "skill_exec", "toggle_skill", "submit_skill_to_hub", "vcs_pull_ff",
               "vcs_restore", "vcs_revert", "vcs_rollback", "update_identity",
               "update_scratchpad", "knowledge_write", "journal_write", "send_user_message",
               "toggle_evolution", "toggle_consciousness", "request_deep_self_review",
-              "comment_on_pr", "comment_on_issue", "promote_to_stable", "run_ci_tests",
+              "comment_on_pr", "comment_on_issue", "promote_to_stable", "get_github_checks",
               "browse_page", "browser_action", "web_search", "plan_task",
               # host filesystem/code reads are denied too — the isolated settings.json
               # holds provider API keys a prompt-injected task could exfiltrate.
@@ -364,9 +405,12 @@ def test_cu_bridge_claim_is_acquired_inside_the_try_that_releases_it():
     # of the RUN FLOW. Anchored on `body` (the flow, from the claim declaration on), not the
     # whole file: module-level helpers defined above the flow (`_gate_round`) legitimately
     # contain the same POST literal but are only ever CALLED from inside the flow.
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < src.index("acquire_task_claim(\n")
+    attestation = src.index("runtime_attestation(args.ouroboros_url, repo_dir)")
+    actor_match = src.index("actor_preflight = _cu_actor_preflight(settings_path, args.ouroboros_url)")
+    claim = src.index("acquire_task_claim(\n")
+    assert attestation < actor_match < claim
     first_paid_post_in_flow = src.index("claim_fd: int | None = None") + body.index('"POST", "/api/tasks"')
-    assert src.index("runtime_attestation(args.ouroboros_url, repo_dir)") < first_paid_post_in_flow
+    assert attestation < actor_match < first_paid_post_in_flow
 
 
 def test_cu_bridge_refuses_before_the_claim_when_attestation_fails(tmp_path, monkeypatch, capsys):
@@ -950,13 +994,14 @@ def _cu_bridge_stubs(monkeypatch, tmp_path, *, reward=1.0):
     monkeypatch.setattr(rcb, "_enable_skill", lambda repo, data: {"skill": "seeded"})
     monkeypatch.setattr(rcb, "_publish_target", lambda data, target: tmp_path / "state_target.txt")
     monkeypatch.setattr(rcb, "_collect_budget_counters", lambda *a, **k: {})
-    monkeypatch.setattr(
-        rcb, "_api",
-        lambda url, method, path, body=None, timeout=60: (
-            {"task_id": "t1"} if method == "POST" and path == "/api/tasks"
-            else {"status": "completed", "final_answer": "done"}
-        ),
-    )
+    def _api(url, method, path, body=None, timeout=60):
+        if method == "GET" and path == "/api/settings":
+            return _cu_actor_settings()
+        if method == "POST" and path == "/api/tasks":
+            return {"task_id": "t1"}
+        return {"status": "completed", "final_answer": "done"}
+
+    _patch_bridge_seam(monkeypatch, "_api", _api)
     return rcb, env
 
 
@@ -970,7 +1015,7 @@ def _cu_bridge_argv(tmp_path, claims):
     (repo_dir / "VERSION").write_text("6.76.0\n", encoding="utf-8")
     results = tmp_path / "results"
     settings = tmp_path / "settings.json"
-    settings.write_text("{}", encoding="utf-8")
+    settings.write_text(json.dumps(_cu_actor_settings()), encoding="utf-8")
     return [
         "run_cu_bridge_agent.py", "--osworld-root", str(osworld), "--provider_name", "docker",
         "--path_to_vm", "/vm/Ubuntu.qcow2", "--task", str(task), "--result_dir", str(results),
@@ -991,6 +1036,36 @@ def _attempt_dirs(run_dir):
 def _attempt_manifests(run_dir):
     return [json.loads((d / "task_run_manifest.json").read_text(encoding="utf-8"))
             for d in _attempt_dirs(run_dir)]
+
+
+def test_target_actor_is_durable_before_claim_and_survives_claim_crash(
+        tmp_path, monkeypatch):
+    from devtools.benchmarks.osworld import run_step_agent
+
+    claims = tmp_path / "claims"
+    rcb, _env = _cu_bridge_stubs(monkeypatch, tmp_path)
+    argv, results = _cu_bridge_argv(tmp_path, claims)
+    monkeypatch.setattr(sys, "argv", argv)
+    observed = {"claim": False}
+
+    def crash_at_first_external_boundary(*_args, **_kwargs):
+        manifests = _attempt_manifests(results / "chrome" / "abc")
+        assert len(manifests) == 1
+        actor = manifests[0]["harness"]["target_runtime_actor"]
+        assert actor["mismatches"] == []
+        assert not any(actor["local_routes"].values())
+        assert actor["reviewer_slots"]["advisory"]["enabled"] is False
+        assert manifests[0]["available_subagents"] == actor["available_subagents"]
+        observed["claim"] = True
+        raise RuntimeError("synthetic claim-boundary crash")
+
+    monkeypatch.setattr(run_step_agent, "acquire_task_claim", crash_at_first_external_boundary)
+    assert rcb.main() == 1
+
+    assert observed["claim"] is True
+    final = _attempt_manifests(results / "chrome" / "abc")[0]
+    assert final["extra"]["outcome"] == "adapter_error"
+    assert final["harness"]["target_runtime_actor"]["reviewer_slots"]
 
 
 def test_two_overlapping_attempts_never_share_one_canonical_record(tmp_path, monkeypatch, capsys):
@@ -1337,17 +1412,25 @@ def test_osworld_methodology_preregisters_the_dedup_rule_and_defers_the_lane_gen
     assert "--allow-dirty-seed" in text
 
 
-def test_module_grandfather_matcher_basename_and_relpath():
+def test_module_grandfather_matcher_uses_exact_repo_relative_paths():
     from ouroboros.review import module_is_grandfathered
-    # repo-relative entry matches its rel path AND the repo/-prefixed section path
+    # Exact runtime helpers accept only actual repo-relative paths. Compatibility
+    # section-prefix decoding belongs solely to compute_complexity_metrics.
     assert module_is_grandfathered("skills/unix_computer_use/plugin.py")
-    assert module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
+    assert not module_is_grandfathered("repo/skills/unix_computer_use/plugin.py")
     # a DIFFERENT plugin.py (future skill) is NOT exempted by the path-qualified entry
     assert not module_is_grandfathered("skills/other_skill/plugin.py")
     assert not module_is_grandfathered("repo/skills/other_skill/plugin.py")
-    # legacy bare-basename entries still match
-    assert module_is_grandfathered("repo/ouroboros/server.py")
+    # Root server.py is an exact manifest path; a nested same-basename is not.
     assert module_is_grandfathered("server.py")
+    assert not module_is_grandfathered("repo/server.py")
+    assert not module_is_grandfathered("ouroboros/server.py")
+    assert not module_is_grandfathered("repo/ouroboros/server.py")
+    # tools/control.py's debt was retired by the v7 split (2110->492 lines);
+    # basename exactness still holds - NEITHER control.py is grandfathered now
+    # (the positive+negative exact-path pair above is server.py).
+    assert not module_is_grandfathered("ouroboros/tools/control.py")
+    assert not module_is_grandfathered("ouroboros/gateway/control.py")
 
 
 def test_cu_bridge_publication_failure_never_erases_an_obtained_score(tmp_path, monkeypatch):
@@ -1725,7 +1808,7 @@ def test_gate_round_posts_a_fresh_memory_gate_phase_task_and_reads_the_verdict(m
                     "total_rounds": 4}
         raise AssertionError((method, path))
 
-    monkeypatch.setattr(rcb, "_api", fake_api)
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     args = _GateArgs(feasibility_gate=True, task_timeout_sec=3600)
     args.allow_a11y = False
     args.ouroboros_url = "http://127.0.0.1:1"
@@ -1931,6 +2014,12 @@ def test_a_step_claim_the_server_cannot_honor_is_refused_before_the_vm_boots():
         rcb._refuse_uncapped_step_claim(tiny)
     # An unenforced run is never refused (it simply is not comparable).
     rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(), {"value": 999, "source": "default"}))
+    # An unlimited or unprovable server cap is not a cap of zero: a declared budget
+    # over it is refused instead of certified (the former `int(value or 0)` passed it).
+    for server in ({"value": None, "source": "default", "unbounded": True},
+                   {"value": None, "source": "settings_unreadable"}):
+        with pytest.raises(SystemExit, match="not a finite proven bound"):
+            rcb._refuse_uncapped_step_claim(rcb._step_budget(_ns(max_steps=100), server))
 
 
 def test_audit_reads_policy_turns_not_physical_calls():
@@ -1963,7 +2052,7 @@ def test_audit_reads_policy_turns_not_physical_calls():
                                   5, 0)["audited"] is False
 
 
-def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
+def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path, monkeypatch):
     """The runtime round cap is SERVER-wide and the gate is a separate task, so a
     reserve that is only arithmetic lets the gate consume the worker's allowance.
 
@@ -2002,14 +2091,14 @@ def test_gate_turns_are_enforced_per_task_from_the_live_event_log(tmp_path):
         _write_rounds(3 if polls["n"] < 2 else rcb._GATE_TURN_RESERVE)
         return {"status": "running"}
 
-    orig_api, orig_sleep = rcb._api, rcb.time.sleep
-    rcb._api = fake_api
+    orig_sleep = rcb.time.sleep
+    _patch_bridge_seam(monkeypatch, "_api", fake_api)
     rcb.time.sleep = lambda s: None
     try:
         out = rcb._await_gate_task("http://x", task_id, time.time() + 3600,
                                    turn_budget=rcb._GATE_TURN_RESERVE, data_dir=tmp_path)
     finally:
-        rcb._api, rcb.time.sleep = orig_api, orig_sleep
+        rcb.time.sleep = orig_sleep
 
     assert out["status"] == "turn_budget_exhausted"
     assert out["policy_turns"] == rcb._GATE_TURN_RESERVE

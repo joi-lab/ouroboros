@@ -9,6 +9,7 @@ provenance auditable.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -17,9 +18,8 @@ import subprocess
 import sys
 import time
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from typing import Any
-
 
 _SUBPROCESS_RUN = subprocess.run
 
@@ -51,22 +51,43 @@ CAMPAIGN_FATAL_PROVENANCE_REASONS = frozenset({
     "seed_head_unreadable",
 })
 
-MODEL_SLOT_KEYS = (
+# Non-secret role routing/options, not model IDs. Keep these in the manifest
+# vocabulary without parsing their JSON values as comma-separated model lists.
+MODEL_ROUTE_OPTION_KEYS = (
+    "OUROBOROS_MODEL_ACCOUNTS",
+    "OUROBOROS_MODEL_CONTEXT_WINDOWS",
+    "OUROBOROS_PROCESSING_PREFERENCE",
+    "OUROBOROS_MODEL_PROCESSING_PREFERENCES",
+)
+
+# Active projection used by every NEW run manifest and preflight. Heavy is not an
+# execution slot after Available subagents and must not leak in from ambient env/settings.
+ACTIVE_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
-    "OUROBOROS_MODEL_HEAVY",
     "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION",
     "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS",
     "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
-    "CLAUDE_CODE_MODEL",
     "OUROBOROS_WEBSEARCH_MODEL",
+    "OUROBOROS_REVIEWER_SLOTS",
     "OUROBOROS_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODELS",
     "OUROBOROS_SCOPE_REVIEW_MODEL",
     "OUROBOROS_EFFORT_TASK",
     "OUROBOROS_EFFORT_REVIEW",
     "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    *MODEL_ROUTE_OPTION_KEYS,
+)
+
+# Historical READ vocabulary. Old durable manifests can still carry Heavy and retain
+# their original meaning; new writers use ACTIVE_MODEL_SLOT_KEYS above. Keep the public
+# name for compatibility with existing artifact readers and cleanup code.
+MODEL_SLOT_KEYS = (
+    "OUROBOROS_MODEL",
+    "OUROBOROS_MODEL_HEAVY",
+    "CLAUDE_CODE_MODEL",  # retired transport slot; old manifests still carry it
+    *ACTIVE_MODEL_SLOT_KEYS[1:],
 )
 
 
@@ -367,9 +388,36 @@ def openrouter_key_remaining(api_key: str, *, timeout: int = 10) -> float | None
     return float(data.get("limit") or 0.0) - float(data.get("usage") or 0.0)
 
 
+def openrouter_account_credits(api_key: str, *, timeout: int = 10) -> float | None:
+    """The ACCOUNT balance behind an OpenRouter key (``total_credits - total_usage``), or None
+    when the endpoint does not report both numbers.
+
+    Never a headroom claim on its own — ``openrouter_key_remaining`` above documents why the
+    credits arithmetic alone lies. It exists because the key's limit is not money either: a key
+    capped at $12k on an account holding $2k is bounded by the ACCOUNT, and a preflight reading
+    only ``limit_remaining`` would start a run the balance cannot finish. Callers take
+    ``min(openrouter_key_remaining(key), openrouter_account_credits(key))`` over the values that
+    are not None; this helper is always the SECOND bound of that min.
+    """
+    key = str(api_key or "").strip()
+    if not key:
+        raise RuntimeError("openrouter_account_credits requires an API key")
+    request = urllib.request.Request(
+        "https://openrouter.ai/api/v1/credits",
+        headers={"Authorization": f"Bearer {key}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as resp:  # noqa: S310 - fixed provider URL
+        payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    if not isinstance(data, dict) or data.get("total_credits") is None or data.get("total_usage") is None:
+        return None
+    return float(data["total_credits"]) - float(data["total_usage"])
+
+
 def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
                         env_overrides: bool = True) -> dict[str, str]:
-    """Return configured model/review slots without exposing provider secrets.
+    """Return configured model/review slots and role options, without provider secrets.
 
     ``env_overrides`` models how the server being described gets its configuration. A server
     started in THIS process's environment reads settings.json but lets the environment win, so
@@ -386,37 +434,64 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
         except Exception:
             settings = {}
     slots: dict[str, str] = {}
-    for key in MODEL_SLOT_KEYS:
+    for key in ACTIVE_MODEL_SLOT_KEYS:
         value = os.environ.get(key) if env_overrides else None
         if value is None:
             value = settings.get(key)
         if value not in (None, ""):
-            slots[key] = str(value)
+            slots[key] = (json.dumps(value, ensure_ascii=False)
+                          if key in MODEL_ROUTE_OPTION_KEYS and isinstance(value, dict) else str(value))
     return slots
 
 
-def provider_credential_disclosure(settings_path: pathlib.Path | None = None) -> dict[str, Any]:
+def provider_credential_disclosure(
+    settings_path: pathlib.Path | None = None,
+    *,
+    runtime_credentials: Mapping[str, Any] | None = None,
+    include_claude_sdk_defaults: bool = True,
+) -> dict[str, Any]:
     """Record WHICH provider credentials the described server can reach — by fingerprint.
 
     ``model_slots`` already says which models a run declared; this says which providers it
     could actually have spent on, which is not the same fact and is the one a routing
-    fallback can falsify. Reads the settings FILE only: an isolated benchmark server loads
-    its provider credentials from the sanitized settings.json (see
-    ``server_runner.build_isolated_settings``), not from the launcher's own environment.
+    fallback can falsify. The settings-file grant and an explicitly injected runtime grant
+    are reported as separate fingerprint maps: a benchmark may keep a long-lived key out of
+    its persisted settings while passing it to one server process. Values are never returned.
     An absent/unreadable settings path yields ``{"available": False}`` — a stated gap, never
     a silently empty grant list."""
-    from devtools.benchmarks.common.secrets import isolated_credential_grants
+    from devtools.benchmarks.common.secrets import credential_disclosure, isolated_credential_grants
+    from ouroboros.provider_models import ALL_PROVIDER_CREDENTIAL_KEYS
+
+    runtime_granted: dict[str, dict[str, Any]] = {}
+    if runtime_credentials is not None:
+        selected = {
+            str(key): value
+            for key, value in runtime_credentials.items()
+            if str(key) in ALL_PROVIDER_CREDENTIAL_KEYS
+        }
+        runtime_granted = credential_disclosure(selected, sorted(selected))
+
+    def with_runtime(payload: dict[str, Any]) -> dict[str, Any]:
+        if runtime_credentials is not None:
+            payload["runtime_granted"] = runtime_granted
+        return payload
 
     path = pathlib.Path(settings_path) if settings_path else None
     if not path or not path.exists():
-        return {"available": False, "reason": "settings_path_absent"}
+        return with_runtime({"available": False, "reason": "settings_path_absent"})
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return {"available": False, "reason": "settings_unreadable"}
+        return with_runtime({"available": False, "reason": "settings_unreadable"})
     if not isinstance(loaded, dict):
-        return {"available": False, "reason": "settings_not_an_object"}
-    return {"available": True, **isolated_credential_grants(loaded)}
+        return with_runtime({"available": False, "reason": "settings_not_an_object"})
+    return with_runtime({
+        "available": True,
+        **isolated_credential_grants(
+            loaded,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
+    })
 
 
 class BenchmarkAdmissionRefused(RuntimeError):
@@ -452,6 +527,38 @@ def admit_benchmark_run(manifest_path: pathlib.Path, **manifest_kwargs: Any) -> 
     return manifest
 
 
+class _RunManifestFinalizer(dict[str, Any]):
+    """Terminal outcome mapping with an explicit non-terminal recovery checkpoint."""
+
+    def __init__(
+        self,
+        manifest_path: pathlib.Path,
+        manifest: dict[str, Any],
+        *,
+        outcome: str,
+        exit_code: int,
+    ) -> None:
+        super().__init__(outcome=outcome, exit_code=exit_code)
+        self._manifest_path = pathlib.Path(manifest_path)
+        self._manifest = manifest
+
+    def checkpoint(self, phase: str) -> None:
+        """Persist current recovery authority without publishing a terminal outcome."""
+        phase = str(phase or "").strip()
+        if not phase:
+            raise ValueError("run manifest checkpoint phase must be non-empty")
+        snapshot = copy.deepcopy(self._manifest)
+        snapshot.setdefault("extra", {}).update({
+            "outcome": "running",
+            "exit_code": None,
+            "recovery_checkpoint": {
+                "phase": phase,
+                "created_at_unix": time.time(),
+            },
+        })
+        write_json(self._manifest_path, snapshot)
+
+
 @contextlib.contextmanager
 def finalize_run_manifest(
     manifest_path: pathlib.Path,
@@ -473,7 +580,12 @@ def finalize_run_manifest(
     the process really exits with.
     """
     default_outcome = str(outcome)
-    final: dict[str, Any] = {"outcome": default_outcome, "exit_code": int(exit_code)}
+    final = _RunManifestFinalizer(
+        manifest_path,
+        manifest,
+        outcome=default_outcome,
+        exit_code=int(exit_code),
+    )
     try:
         yield final
     except BaseException as exc:
@@ -583,6 +695,16 @@ def benchmark_run_manifest(
     meta_settings_path = meta.get("settings_path")
     if meta_settings_path is not None:
         meta_settings_path = pathlib.Path(meta_settings_path)
+    include_claude_sdk_defaults = meta.get("include_claude_sdk_defaults", True)
+    if not isinstance(include_claude_sdk_defaults, bool):
+        raise ValueError("include_claude_sdk_defaults metadata must be a boolean")
+    # Some adapters hand a settings file plus a fresh child environment to a
+    # container.  Their initial/refusal manifest must describe that file, not
+    # ambient model/effort values from the operator process.  Keep the
+    # historical env-first default for all other benchmark drivers.
+    settings_authoritative_env = meta.get("settings_authoritative_env", False)
+    if not isinstance(settings_authoritative_env, bool):
+        raise ValueError("settings_authoritative_env metadata must be a boolean")
     source = repo_provenance(repo_dir)
     gate = _seed_gate(source, require_clean=require_clean, expect=str(expect or ""))
     manifest: dict[str, Any] = {
@@ -599,8 +721,14 @@ def benchmark_run_manifest(
         "timeout_sec": meta.get("timeout_sec"),
         "isolated_data_root": str(meta.get("isolated_data_root") or ""),
         "output_paths": meta.get("output_paths") or {},
-        "model_slots": model_slot_snapshot(meta_settings_path),
-        "provider_credentials": provider_credential_disclosure(meta_settings_path),
+        "model_slots": model_slot_snapshot(
+            meta_settings_path,
+            env_overrides=not settings_authoritative_env,
+        ),
+        "provider_credentials": provider_credential_disclosure(
+            meta_settings_path,
+            include_claude_sdk_defaults=include_claude_sdk_defaults,
+        ),
         "source": source,
         "seed_gate": gate,
         "extra": meta.get("extra") or {},

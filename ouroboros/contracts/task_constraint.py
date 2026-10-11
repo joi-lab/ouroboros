@@ -12,7 +12,8 @@ _ACTING_SUBAGENT_MODE = "acting_subagent"
 
 # Valid write surfaces for mutative (acting) subagents. SSOT shared with
 # tool_access.active_tool_profile so the fail-closed floor and the schema agree.
-# - self_worktree:     isolated git worktree of THIS repo (self-improvement).
+# - self_worktree:     isolated current-tree copy of the selected Git source.
+#                      Host task metadata binds its source and own-body identity.
 # - external_workspace: a pre-existing external git working tree.
 # - genesis:           a from-scratch project the supervisor provisions as a new
 #                      empty git repo under the durable projects root (game/site/
@@ -45,6 +46,14 @@ class TaskConstraint:
     external_tool_grants: tuple[str, ...] = ()
     parent_only_commit: bool = True
     return_kind: str = "workspace_patch"
+
+    @property
+    def has_selected_skill(self) -> bool:
+        """An ordinary task's payload selection, including persisted Repair rows."""
+        return bool(
+            self.mode in {"normal", "skill_repair"}
+            and self.skill_name and self.payload_root
+        )
 
 
 def normalize_task_constraint(value: Any) -> Optional[TaskConstraint]:

@@ -3,7 +3,7 @@
 import json
 
 from ouroboros.tools.verify import _expected_matches
-from ouroboros.loop import _contract_expected_output
+from ouroboros.loop_nudges import _contract_expected_output
 from ouroboros.agent_task_pipeline import _build_swarm_efficiency
 
 
@@ -74,11 +74,11 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     logs.mkdir()
     events = [
         {"type": "swarm_fanout", "parent_task_id": "root1", "task_ids": ["c1", "c2"],
-         "inter_wave_latency_sec": 0.0, "effective_model_lanes": ["heavy", "heavy"]},
+         "inter_wave_latency_sec": 0.0, "requested_model_lane": "heavy"},
         {"type": "swarm_fanout", "parent_task_id": "root1", "task_ids": ["c3"],
-         "inter_wave_latency_sec": 194.0, "effective_model_lanes": ["light"]},
+         "inter_wave_latency_sec": 194.0, "requested_model_lane": "light"},
         {"type": "swarm_fanout", "parent_task_id": "other", "task_ids": ["x1"],
-         "inter_wave_latency_sec": 5.0, "effective_model_lanes": ["heavy"]},
+         "inter_wave_latency_sec": 5.0, "requested_model_lane": "heavy"},
         {"type": "llm_round", "parent_task_id": "root1"},
     ]
     (logs / "events.jsonl").write_text(
@@ -86,9 +86,55 @@ def test_build_swarm_efficiency_rolls_up_fanout_events(tmp_path):
     roll = _build_swarm_efficiency(_Env(tmp_path), {"id": "root1"})
     assert roll is not None
     assert roll["subagent_count"] == 3            # c1,c2,c3 (other-parent x1 excluded)
-    assert roll["wave_count"] == 2
-    assert roll["inter_wave_latency_sec_total"] == 194.0
-    assert sorted(roll["lanes_used"]) == ["heavy", "light"]
+    assert roll["fanout_count"] == 2
+    assert roll["fanout_interval_sec_total"] == 194.0
+    assert sorted(roll["lanes_requested"]) == ["heavy", "light"]
+    # A plain task's rollup carries no intent annotation (rc-phaseC).
+    assert "intent_source" not in roll and "requested_count" not in roll
+
+
+def _swarm_task(task_id):
+    return {"id": task_id, "metadata": {"force_plan": True, "force_plan_source": "swarm"}}
+
+
+def test_build_swarm_efficiency_zero_fanout_swarm_intent_returns_minimal_block(tmp_path):
+    # A Swarm-button task that spawned zero children must not vanish into None:
+    # it returns the minimal no_fanout_observed block. `planned` is null — never
+    # inferred as 0 from the absence of events.
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "events.jsonl").write_text("", encoding="utf-8")
+    block = _build_swarm_efficiency(_Env(tmp_path), _swarm_task("t-swarm"))
+    assert block == {
+        "intent_source": "swarm",
+        "planned": None,
+        "observed_started": 0,
+        "status": "no_fanout_observed",
+    }
+
+
+def test_build_swarm_efficiency_rollup_carries_intent_source_and_requested_count(tmp_path):
+    # With real fanout events present, the existing rollup keys stay unchanged and
+    # the swarm-intent task additionally carries intent_source plus the waves'
+    # requested_count sum under its existing event name (no synonyms).
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    events = [
+        {"type": "swarm_fanout", "parent_task_id": "t-swarm", "task_ids": ["c1", "c2"],
+         "requested_count": 2, "inter_wave_latency_sec": 0.0, "requested_model_lane": "heavy"},
+        {"type": "swarm_fanout", "parent_task_id": "t-swarm", "task_ids": ["run-1"],
+         "requested_count": 1, "inter_wave_latency_sec": 3.5, "requested_model_lane": "codex-route"},
+    ]
+    (logs / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in events) + "\n", encoding="utf-8")
+    roll = _build_swarm_efficiency(_Env(tmp_path), _swarm_task("t-swarm"))
+    assert roll is not None
+    assert roll["subagent_count"] == 3
+    assert roll["fanout_count"] == 2
+    assert roll["fanout_interval_sec_total"] == 3.5
+    assert roll["lanes_requested"] == ["heavy", "codex-route"]
+    assert roll["intent_source"] == "swarm"
+    assert roll["requested_count"] == 3
 
 
 # --- B2: burst/absorb advisory fires when >=1 OTHER child is still live ---
@@ -171,7 +217,7 @@ def test_write_task_result_persists_swarm_efficiency(tmp_path):
 
     drive = tmp_path / "drive"
     drive.mkdir()
-    roll = {"subagent_count": 3, "wave_count": 2, "inter_wave_latency_sec_total": 194.0, "lanes_used": ["heavy", "light"]}
+    roll = {"subagent_count": 3, "fanout_count": 2, "fanout_interval_sec_total": 194.0, "lanes_requested": ["heavy", "light"]}
     rec = write_task_result(drive, "fa11fa11", STATUS_COMPLETED, swarm_efficiency=roll)
     assert rec.get("swarm_efficiency") == roll          # accepted as a field (no TypeError)
     persisted = load_task_result(drive, "fa11fa11")

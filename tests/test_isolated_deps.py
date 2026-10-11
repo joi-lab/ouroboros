@@ -33,6 +33,50 @@ def test_installer_env_scrubs_secret_keys_and_uses_isolated_home(monkeypatch, tm
     assert env["npm_config_cache"].startswith(str(tmp_path))
 
 
+def test_installer_env_node_emergency_prepends_bundled_node_dir(monkeypatch, tmp_path):
+    """Emergency only (PATH node dead + healthy bundled selected): the node
+    installer env PATH gains the bundled-node dir so npm's `#!/usr/bin/env node`
+    shebang resolves the working runtime. Python installs never get it."""
+    from ouroboros import node_runtime
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    bundle_bin = str(tmp_path / "bundle" / "bin")
+    monkeypatch.setattr(
+        node_runtime, "skill_node_emergency_path_dir", lambda timeout_sec=10: bundle_bin
+    )
+
+    node_env = _installer_env(tmp_path / ".ouroboros_env", ecosystem="node")
+    assert node_env["PATH"] == os.pathsep.join([bundle_bin, "/usr/bin"])
+
+    python_env = _installer_env(tmp_path / ".ouroboros_env", ecosystem="python")
+    assert python_env["PATH"] == "/usr/bin"
+
+
+def test_installer_env_node_healthy_system_is_byte_identical(monkeypatch, tmp_path):
+    from ouroboros import node_runtime
+
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setattr(
+        node_runtime, "skill_node_emergency_path_dir", lambda timeout_sec=10: ""
+    )
+
+    node_env = _installer_env(tmp_path / ".ouroboros_env", ecosystem="node")
+    baseline = _installer_env(tmp_path / ".ouroboros_env")
+    assert node_env == baseline
+    assert node_env["PATH"] == "/usr/bin"
+
+
+def test_install_node_package_missing_npm_fails_honestly(monkeypatch, tmp_path):
+    """npm itself is not bundled: its absence stays a typed RuntimeError."""
+    import pytest
+
+    from ouroboros.marketplace import isolated_deps
+
+    monkeypatch.setattr(isolated_deps.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="npm is not available on PATH"):
+        isolated_deps._install_node_package("left-pad", tmp_path / ".ouroboros_env", 1)
+
+
 def test_normalize_install_specs_rejects_vcs_urls_and_expands_packages():
     auto, manual, warnings = normalize_install_specs([
         {"kind": "pip", "package": "git+https://example.com/pkg.git"},

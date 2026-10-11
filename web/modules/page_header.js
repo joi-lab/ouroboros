@@ -103,9 +103,11 @@ export function renderTabStrip({
     if (!attr) {
         throw new Error('renderTabStrip requires dataAttr');
     }
+    const selected = items.find((item) => !item.disabled && String(item.value ?? item.id ?? '') === String(active))
+        || items.find((item) => !item.disabled);
     const buttons = items.map((item) => {
         const value = String(item.value ?? item.id ?? '');
-        const isActive = value === active;
+        const isActive = item === selected;
         const pill = item.pillId
             ? `<span class="${classAttr(['app-tab-pill', item.pillClass || ''])}" id="${escapeHtml(item.pillId)}" hidden></span>`
             : '';
@@ -116,6 +118,9 @@ export function renderTabStrip({
                 ${attr}="${escapeHtml(value)}"
                 role="tab"
                 aria-selected="${isActive ? 'true' : 'false'}"
+                ${item.disabled ? 'disabled' : ''}
+                ${item.tabId ? `id="${escapeHtml(item.tabId)}"` : ''}
+                ${item.panelId ? `aria-controls="${escapeHtml(item.panelId)}"` : ''}
             >
                 ${escapeHtml(item.label ?? value)}
                 ${pill}
@@ -127,4 +132,94 @@ export function renderTabStrip({
             ${buttons}
         </div>
     `;
+}
+
+/**
+ * Bind one rendered strip. onChange owns domain loading/panel visibility.
+ * select(value) synchronizes an external navigation without calling onChange;
+ * user activation calls it once, only when the selection actually changes.
+ */
+export function bindTabStrip(strip, { dataAttr, activeClass = 'active', onChange } = {}) {
+    if (!dataAttr) throw new Error('bindTabStrip requires dataAttr');
+    let disposed = false;
+    const tabs = () => Array.from(strip.querySelectorAll(`[role="tab"][${dataAttr}]`))
+        .filter((tab) => tab.closest('[role="tablist"]') === strip);
+    const enabled = (tab) => !tab.disabled && tab.getAttribute('aria-disabled') !== 'true'
+        && !tab.closest('[hidden], [inert]');
+    let selected = null;
+    function revealSelected() {
+        if (disposed || !strip.clientWidth) return;
+        const tab = tabs().find((item) => item.getAttribute(dataAttr) === selected);
+        if (!tab) return;
+        const bounds = strip.getBoundingClientRect();
+        const rect = tab.getBoundingClientRect();
+        const left = bounds.left + strip.clientLeft;
+        const right = left + strip.clientWidth;
+        // Scroll only this strip. scrollIntoView can also move the page or its
+        // scroll panel when restoring an inactive page's saved selection.
+        if (rect.left < left) strip.scrollLeft += rect.left - left;
+        else if (rect.right > right) strip.scrollLeft += rect.right - right;
+    }
+    function select(value, { focus = false } = {}) {
+        if (disposed) return false;
+        const all = tabs();
+        const next = all.find((tab) => tab.getAttribute(dataAttr) === String(value) && enabled(tab));
+        if (!next) return false;
+        selected = next.getAttribute(dataAttr);
+        all.forEach((tab) => {
+            const active = tab === next;
+            tab.classList.toggle(activeClass, active);
+            tab.setAttribute('aria-selected', String(active));
+            tab.tabIndex = active ? 0 : -1;
+        });
+        revealSelected();
+        if (focus) next.focus({ preventScroll: true });
+        return true;
+    }
+    function activate(tab, focus) {
+        const value = tab.getAttribute(dataAttr);
+        const changed = value !== selected;
+        if (select(value, { focus }) && !disposed && changed) onChange?.(value, tab);
+    }
+    const onClick = (event) => {
+        const tab = event.target.closest?.('[role="tab"]');
+        if (tabs().includes(tab) && enabled(tab)) activate(tab, false);
+    };
+    const onKey = (event) => {
+        if (event.defaultPrevented || event.altKey || event.ctrlKey || event.metaKey) return;
+        const all = tabs().filter(enabled);
+        const tab = event.target.closest?.('[role="tab"]');
+        const index = all.indexOf(tab);
+        if (index < 0) return;
+        const vertical = strip.getAttribute('aria-orientation') === 'vertical';
+        const previous = vertical ? 'ArrowUp' : 'ArrowLeft';
+        const next = vertical ? 'ArrowDown' : 'ArrowRight';
+        let target;
+        if (event.key === 'Home') target = all[0];
+        else if (event.key === 'End') target = all[all.length - 1];
+        else if (event.key === previous) target = all[(index + all.length - 1) % all.length];
+        else if (event.key === next) target = all[(index + 1) % all.length];
+        else return; // Enter/Space keep the native button click, never a second callback.
+        event.preventDefault();
+        activate(target, true);
+    };
+    strip.addEventListener('click', onClick);
+    strip.addEventListener('keydown', onKey);
+    // Initialization may happen on a hidden page; reveal when it gets a real
+    // width, and keep the selected tab reachable after a narrower resize.
+    const Observer = strip.ownerDocument?.defaultView?.ResizeObserver;
+    const observer = Observer ? new Observer(revealSelected) : null;
+    observer?.observe(strip);
+    const initial = tabs().find((tab) => enabled(tab) && tab.getAttribute('aria-selected') === 'true')
+        || tabs().find(enabled);
+    if (initial) select(initial.getAttribute(dataAttr));
+    return {
+        select,
+        destroy() {
+            disposed = true;
+            strip.removeEventListener('click', onClick);
+            strip.removeEventListener('keydown', onKey);
+            observer?.disconnect();
+        },
+    };
 }

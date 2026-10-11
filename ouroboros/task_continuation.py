@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import atomic_write_json, replace_atomic, utc_now_iso
 
 _CONTINUATION_DIR_RELPATH = "state/review_continuations"
 _CORRUPT_DIR_NAME = "corrupt"
@@ -126,6 +125,85 @@ def clear_review_continuation(drive_root: Any, task_id: str) -> bool:
     except Exception:
         return False
     return False
+
+
+_ARCHIVED_DIR_NAME = "archived"
+
+# A continuation of a SETTLED task younger than this stays in context: it is the
+# designed cross-task resume pointer (the owning task died with the commit still
+# blocked; a follow-up picks it up from the Review Continuity section). Older
+# than this, un-resumed, it is history riding into every new task's prompt.
+RETIRE_SETTLED_CONTINUATION_AFTER_DAYS = 7
+
+
+def archived_continuation_dir(drive_root: Any) -> pathlib.Path:
+    path = continuation_dir(drive_root) / _ARCHIVED_DIR_NAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _continuation_age_days(item: ReviewContinuation) -> float:
+    import datetime as _dt
+
+    ts = str(item.updated_ts or item.created_ts or "").strip()
+    if not ts:
+        return float("inf")  # undatable record: old by construction
+    try:
+        then = _dt.datetime.fromisoformat(ts)
+        if then.tzinfo is None:
+            then = then.replace(tzinfo=_dt.timezone.utc)
+        return (_dt.datetime.now(tz=_dt.timezone.utc) - then).total_seconds() / 86400.0
+    except ValueError:
+        return float("inf")
+
+
+def retire_settled_continuations(
+    drive_root: Any,
+    *,
+    is_settled: Any,
+    has_open_work: Any = None,
+    min_age_days: float = RETIRE_SETTLED_CONTINUATION_AFTER_DAYS,
+) -> List[str]:
+    """Archive continuations whose owning task SETTLED and that sat un-resumed.
+
+    A continuation exists so a follow-up can resume a blocked/interrupted review
+    — so a FRESH record of a settled task stays. But nothing clears the file
+    when a different task later lands the same work, so stale records rode into
+    every new task's Review Continuity section indefinitely (live: Aug-5 records
+    injected for days). Retirement MOVES a settled-and-older-than-``min_age_days``
+    file to ``state/review_continuations/archived/`` — durable, never deleted
+    (P1) — and returns the retired task_ids. ``is_settled(task_id) -> bool`` is
+    supplied by the caller so this module stays free of task-result imports; any
+    error leaves the continuation in place (fail-open: context noise over lost
+    review state).
+
+    Age alone never proves the blocked review work landed. When the caller can
+    check, it supplies ``has_open_work(continuation) -> bool``: a settled-and-old
+    continuation whose recorded obligations are STILL open in the review ledger
+    is kept in place — it remains the designed resume pointer for genuinely
+    unresolved work (P1/P3). Only provably-closed records ride the age path.
+    """
+    retired: List[str] = []
+    for path in sorted(continuation_dir(drive_root).glob("*.json")):
+        task_id = path.stem
+        try:
+            item = load_review_continuation(drive_root, task_id)
+            if item is None or _continuation_age_days(item) < min_age_days:
+                continue
+            if not is_settled(task_id):
+                continue
+            if has_open_work is not None and has_open_work(item):
+                continue  # recorded review work still open: keep the resume pointer
+            target = archived_continuation_dir(drive_root) / path.name
+            if target.exists():
+                target = target.with_name(f"{path.stem}.{_safe_ts_token(utc_now_iso())}.json")
+            path.rename(target)
+            retired.append(task_id)
+        except ContinuationCorruptError:
+            continue  # the corrupt-quarantine path owns malformed files
+        except Exception:
+            continue
+    return retired
 
 
 def build_review_continuation(
@@ -279,7 +357,7 @@ def _quarantine_corrupt_continuation(drive_root: Any, task_id: str, *, reason: s
     corrupt_dir = corrupt_continuation_dir(drive_root)
     archived = corrupt_dir / f"{task_id}.{stamp}.json"
     note = archived.with_suffix(".txt")
-    os.replace(src, archived)
+    replace_atomic(src, archived)
     note.write_text(reason.strip() or "corrupt continuation quarantined", encoding="utf-8")
 
 
@@ -308,3 +386,54 @@ def _safe_ts_token(ts: str) -> str:
     if not token:
         return "unknown"
     return token.replace(":", "").replace("-", "").replace("+", "_")
+
+
+def open_work_matcher(state: Any) -> Any:
+    """Build ``has_open_work(continuation)`` from the ledger's open obligations.
+
+    ``state`` is duck-typed (``get_open_obligations(repo_key=None)``) so this
+    module keeps zero review-state imports. A continuation matches when any of
+    its recorded obligation markers is still open in the ledger.
+    """
+    open_markers = {
+        marker
+        for ob in state.get_open_obligations(repo_key=None)
+        for marker in (
+            str(getattr(ob, "obligation_id", "") or ""),
+            str(getattr(ob, "fingerprint", "") or ""),
+        )
+        if marker
+    }
+
+    def _has_open_work(item: Any) -> bool:
+        markers = {str(x) for x in (item.obligation_ids or [])}
+        for entry in item.open_obligations or []:
+            if isinstance(entry, dict):
+                markers.add(str(entry.get("obligation_id") or ""))
+                markers.add(str(entry.get("fingerprint") or ""))
+        markers.discard("")
+        return bool(markers & open_markers)
+
+    return _has_open_work
+
+
+def retire_settled_continuations_for_context(
+    drive_root: Any, state: Any, load_result: Any
+) -> List[str]:
+    """Retire aged settled continuations, keeping unresolved review work live.
+
+    The Review Continuity preamble of ``build_review_context``: ``state``
+    supplies the open-obligation ledger and ``load_result(task_id)`` the task
+    result dict — both injected so this module stays free of review-state and
+    task-result imports. A settled continuation recording a still-open ledger
+    obligation is unresolved review work — age must not archive it away
+    (P1/P3); only provably-closed records ride the age path.
+    """
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    def _is_settled(tid: str) -> bool:
+        status = str((load_result(tid) or {}).get("status") or "")
+        return status.strip().lower() in SETTLED_STATUSES
+
+    return retire_settled_continuations(
+        drive_root, is_settled=_is_settled, has_open_work=open_work_matcher(state))

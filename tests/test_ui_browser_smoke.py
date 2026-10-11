@@ -9,7 +9,8 @@ import pytest
 def test_gateway_frontend_uses_api_client_boundary():
     """Minimal UI-browser lane sentinel for the Gateway Boundary refactor.
 
-    Full browser launch coverage remains in ``test_ui_smoke_playwright.py``.
+    Full browser launch coverage remains in the ``test_ui_smoke_playwright.py``
+    and ``test_ui_smoke_review_checkpoint.py`` smoke modules.
     This focused check keeps the lane aware of the new frontend boundary even
     when Playwright is unavailable locally.
     """

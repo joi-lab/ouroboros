@@ -11,7 +11,7 @@ def _install_queue(tmp_path, monkeypatch):
     from supervisor import queue, state, workers
 
     state.init(tmp_path, total_budget_limit=10.0)
-    queue.init(tmp_path, 600, 1800)
+    queue.init(tmp_path)
     workers.DRIVE_ROOT = tmp_path
     queue.DRIVE_ROOT = tmp_path
     workers.PENDING[:] = []
@@ -33,7 +33,7 @@ def test_queued_task_does_not_auto_resume_after_budget_increase(tmp_path, monkey
         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))),
     )
     workers.WORKERS[0] = worker
-    task = {"id": "paused-task", "type": "task", "chat_id": 0, "priority": 1}
+    task = {"id": "paused-task", "admitted_dispatch": "none", "type": "task", "chat_id": 0, "priority": 1}
     workers.PENDING.append(task)
 
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_kwargs: 0.0)
@@ -55,10 +55,12 @@ def test_queued_task_does_not_auto_resume_after_budget_increase(tmp_path, monkey
     assert workers.PENDING == []
 
 
-def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch):
+@pytest.mark.parametrize("dispatch", [None, "possible", "none"])
+def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch, dispatch):
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     workers.PENDING.append({
         "id": "unsafe-task",
+        **({"admitted_dispatch": dispatch} if dispatch is not None else {}),
         "type": "task",
         "_budget_pause": {
             "status": "resource_limited",
@@ -69,7 +71,7 @@ def test_resume_rejects_replay_unsafe_pause(tmp_path, monkeypatch):
 
     assert queue.resume_budget_paused_task("unsafe-task") == {
         "ok": False,
-        "error": "replay_unsafe",
+        "error": "replay_unsafe" if dispatch == "none" else "dispatch_outcome_unknown",
         "action": "cancel_or_new_run",
     }
     assert "_budget_pause" in workers.PENDING[0]
@@ -224,7 +226,7 @@ def test_root_budget_fence_is_one_durable_marker_without_subtree_reclassificatio
     assert workers.PENDING[0]["id"] == pending["id"]
 
 
-def test_root_budget_resume_checks_one_task_and_clears_marker(tmp_path, monkeypatch):
+def test_root_budget_resume_selects_one_task_and_keeps_tree_marker(tmp_path, monkeypatch):
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     fence_id = "root-fence-id"
     queue.BUDGET_ROOT_FENCES["safe-root"] = {
@@ -232,7 +234,7 @@ def test_root_budget_resume_checks_one_task_and_clears_marker(tmp_path, monkeypa
         "fence_id": fence_id, "auto_resume": False, "paused_at": "now",
     }
     workers.PENDING.append({
-        "id": "safe-child", "type": "task", "chat_id": 1,
+        "id": "safe-child", "admitted_dispatch": "none", "type": "task", "chat_id": 1,
         "root_task_id": "safe-root",
     })
     monkeypatch.setattr(queue, "reconstruct_task_cost", lambda *_a, **_k: {
@@ -243,21 +245,21 @@ def test_root_budget_resume_checks_one_task_and_clears_marker(tmp_path, monkeypa
 
     result = queue.resume_budget_paused_task("safe-child")
 
-    assert result == {"ok": True, "task_id": "safe-child", "same_generation": True}
-    assert "safe-root" not in queue.BUDGET_ROOT_FENCES
-    assert workers.PENDING[0]["budget_resumed_at"]
+    assert result["ok"] and result["task_id"] == "safe-child" and result["same_generation"]
+    assert "safe-root" in queue.BUDGET_ROOT_FENCES
+    assert workers.PENDING[0]["_budget_pause_hold"]["selected"]
 
 
-def test_root_budget_resume_refuses_unsafe_pending_sibling(tmp_path, monkeypatch):
+def test_root_budget_selection_leaves_unsafe_pending_sibling_held(tmp_path, monkeypatch):
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     fence_id = "root-fence-id"
     queue.BUDGET_ROOT_FENCES["mixed-root"] = {
         "status": "paused", "scope": "root", "root_task_id": "mixed-root",
         "fence_id": fence_id, "auto_resume": False, "paused_at": "now",
     }
-    safe = {"id": "safe-child", "type": "task", "root_task_id": "mixed-root"}
+    safe = {"id": "safe-child", "admitted_dispatch": "none", "type": "task", "root_task_id": "mixed-root"}
     unsafe = {
-        "id": "retry-child", "type": "task", "root_task_id": "mixed-root",
+        "id": "retry-child", "admitted_dispatch": "none", "type": "task", "root_task_id": "mixed-root",
         "_attempt": 2, "original_task_id": "first-child",
     }
     workers.PENDING.extend([safe, unsafe])
@@ -269,11 +271,7 @@ def test_root_budget_resume_refuses_unsafe_pending_sibling(tmp_path, monkeypatch
 
     result = queue.resume_budget_paused_task("safe-child")
 
-    assert result == {
-        "ok": False,
-        "error": "root_replay_unsafe",
-        "unsafe_task_ids": ["retry-child"],
-        "action": "cancel_or_new_run",
-    }
+    assert result["ok"] and result["task_id"] == "safe-child"
     assert "mixed-root" in queue.BUDGET_ROOT_FENCES
-    assert "budget_resumed_at" not in safe
+    assert safe["_budget_pause_hold"]["selected"]
+    assert queue.resume_budget_paused_task("retry-child")["error"] == "replay_unsafe"

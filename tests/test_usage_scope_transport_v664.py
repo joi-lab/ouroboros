@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import contextvars
 import io
@@ -58,6 +57,10 @@ def test_generic_llm_attempt_keeps_semantic_scope_source(tmp_path, monkeypatch):
     from ouroboros.usage_accounting import UsageScope, release_attempt, reserve_attempt, usage_scope
 
     monkeypatch.setenv("TOTAL_BUDGET", "10")
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, 'root-task', 'running', billing_group={
+        'billing_group_id': 'root-task', 'billing_group_limit_usd': None,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     semantic = UsageScope(
         drive_root=tmp_path,
         task_id="review-task",
@@ -86,173 +89,20 @@ def test_generic_llm_attempt_keeps_semantic_scope_source(tmp_path, monkeypatch):
     assert llm._attempt_request({}, {}).source == "llm.chat"
 
 
-def test_claude_readonly_parent_serializes_usage_scope(tmp_path, monkeypatch):
-    from ouroboros.gateways import claude_code
-    from ouroboros.usage_accounting import usage_scope
+def test_native_review_episode_scopes_every_send(tmp_path):
+    """Successor pin for the retired Claude-SDK readonly child's usage-scope
+    transport: the advisory/actor native inspection episode runs IN-PROCESS,
+    so scope attribution needs no serialization — _run_advisory_native wraps
+    its substrate call in usage_scope(category="advisory_review",
+    source="advisory_native") and the episode's LLM sends inherit it."""
+    import importlib
+    import inspect
 
-    captured = {}
-
-    class FakeProcess:
-        returncode = 0
-
-        def communicate(self, input=None, timeout=None):
-            captured["payload"] = json.loads(input)
-            return json.dumps({"success": True, "result_text": "ok"}), ""
-
-    monkeypatch.setattr(claude_code.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
-    with usage_scope(_scope(tmp_path)):
-        result = claude_code._run_readonly_out_of_process(
-            prompt="audit",
-            cwd=str(tmp_path),
-            model="opus[1m]",
-            max_turns=1,
-            effort="high",
-            max_budget_usd=2.5,
-        )
-
-    assert result.success
-    transported = captured["payload"]["usage_scope"]
-    assert transported["drive_root"] == str(tmp_path)
-    assert transported["task_id"] == "child-task"
-    assert transported["root_task_id"] == "root-task"
-    assert transported["global_limit_usd"] == 0.0
-    assert transported["root_limit_usd"] == 0.0
-    assert captured["payload"]["max_budget_usd"] == 2.5
-
-
-def test_claude_readonly_public_api_forwards_budget_cap(tmp_path, monkeypatch):
-    from ouroboros.gateways import claude_code
-
-    captured = {}
-
-    def fake_out_of_process(**kwargs):
-        captured.update(kwargs)
-        return claude_code.ClaudeCodeResult(success=True, result_text="ok")
-
-    monkeypatch.delenv("OUROBOROS_CLAUDE_READONLY_CHILD", raising=False)
-    monkeypatch.setattr(claude_code, "_run_readonly_out_of_process", fake_out_of_process)
-
-    result = claude_code.run_readonly(
-        prompt="audit",
-        cwd=str(tmp_path),
-        model="opus[1m]",
-        max_turns=1,
-        effort="high",
-        max_budget_usd=2.5,
-    )
-
-    assert result.success
-    assert captured["max_budget_usd"] == 2.5
-
-
-def test_claude_readonly_child_restores_usage_scope(tmp_path, monkeypatch, capsys):
-    from ouroboros import process_custody
-    from ouroboros.gateways import claude_code
-    from ouroboros.usage_accounting import current_usage_scope
-
-    seen = {}
-
-    async def fake_readonly(**kwargs):
-        seen["scope"] = current_usage_scope()
-        seen["kwargs"] = kwargs
-        return claude_code.ClaudeCodeResult(success=True, result_text="ok")
-
-    payload = {
-        "prompt": "audit",
-        "cwd": str(tmp_path),
-        "model": "opus[1m]",
-        "max_turns": 1,
-        "effort": "high",
-        "max_budget_usd": 2.5,
-        "usage_scope": {
-            **vars(_scope(tmp_path)),
-            "drive_root": str(tmp_path),
-        },
-    }
-    monkeypatch.setattr(process_custody, "start_parent_lifeline", lambda **kwargs: None)
-    monkeypatch.setattr(claude_code, "_run_readonly_async", fake_readonly)
-    monkeypatch.setattr(sys, "argv", ["claude_code.py", "--readonly-child"])
-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-
-    assert claude_code._main() == 0
-    capsys.readouterr()
-    assert seen["scope"].task_id == "child-task"
-    assert seen["scope"].root_task_id == "root-task"
-    assert seen["scope"].root_limit_usd == 0.0
-    assert seen["kwargs"]["max_budget_usd"] == 2.5
-    assert current_usage_scope() is None
-
-
-def test_claude_readonly_budget_cap_reaches_sdk_and_ledger(tmp_path, monkeypatch):
-    from ouroboros.gateways import claude_code
-    from ouroboros.usage_accounting import UsageScope, usage_scope
-
-    captured = {}
-
-    class FakeOptions:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    class FakeResultMessage:
-        session_id = "readonly-budget"
-        total_cost_usd = 0.25
-        usage = {"input_tokens": 10, "output_tokens": 5}
-        subtype = "success"
-
-    class FakeSDKClient:
-        def __init__(self, options=None):
-            self.options = options
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def query(self, prompt):
-            return None
-
-        async def receive_response(self):
-            yield FakeResultMessage()
-
-    monkeypatch.setattr(claude_code, "ClaudeAgentOptions", FakeOptions)
-    monkeypatch.setattr(claude_code, "ClaudeSDKClient", FakeSDKClient)
-    monkeypatch.setattr(claude_code, "ResultMessage", FakeResultMessage)
-    scope = UsageScope(
-        drive_root=tmp_path,
-        task_id="review-task",
-        root_task_id="root-task",
-        category="review",
-        source="claude_code.readonly",
-        global_limit_usd=10.0,
-        root_limit_usd=5.0,
-    )
-
-    with usage_scope(scope):
-        result = asyncio.run(claude_code._run_readonly_async(
-            prompt="audit",
-            cwd=str(tmp_path),
-            model="opus[1m]",
-            max_turns=1,
-            effort=None,
-            max_budget_usd=2.5,
-        ))
-
-    assert result.success
-    assert captured["max_budget_usd"] == 2.5
-    rows = [
-        json.loads(line)
-        for line in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
-    ]
-    reserved = next(
-        row
-        for row in rows
-        if row.get("kind") == "attempt"
-        and row.get("state") == "reserved"
-        and row.get("source") == "claude_code.readonly"
-    )
-    assert reserved["reservation_upper_bound_usd"] == 2.5
-    assert reserved["reservation_basis"] == "explicit_upper_bound"
+    adv = importlib.import_module("ouroboros.tools.claude_advisory_review")
+    source = inspect.getsource(adv._run_advisory_native)
+    assert "usage_scope" in source
+    assert 'category="advisory_review"' in source
+    assert 'source="advisory_native"' in source
 
 
 def test_vlm_child_payload_carries_usage_scope(tmp_path, monkeypatch):
@@ -310,7 +160,7 @@ def test_vlm_child_payload_carries_usage_scope(tmp_path, monkeypatch):
 
 
 def test_provider_owned_web_search_disables_sdk_retries(monkeypatch):
-    from ouroboros import llm
+    from ouroboros import llm, llm_attempt
 
     captured = {}
 
@@ -334,22 +184,26 @@ def test_provider_owned_web_search_disables_sdk_retries(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openai", types.SimpleNamespace(OpenAI=FakeOpenAI))
     monkeypatch.setitem(sys.modules, "anthropic", types.SimpleNamespace(Anthropic=FakeAnthropic))
-    monkeypatch.setattr(llm, "execute_physical_attempt", lambda request, send: send())
+    monkeypatch.setattr(llm_attempt, "execute_physical_attempt", lambda request, send: send())
 
     llm.openrouter_web_search_server_tool(
         api_key="test",
         model="openai/gpt-5.2",
         query="query",
         search_context_size="medium",
+        timeout=17,
     )
     llm.anthropic_web_search_server_tool(
         api_key="test",
         model="claude-sonnet-4-6",
         query="query",
+        timeout=17,
     )
 
     assert captured["openai"]["max_retries"] == 0
     assert captured["anthropic"]["max_retries"] == 0
+    assert captured["openai"]["timeout"] == 17
+    assert captured["anthropic"]["timeout"] == 17
 
 
 def test_openai_responses_web_search_disables_sdk_retries(tmp_path, monkeypatch):
@@ -374,8 +228,10 @@ def test_openai_responses_web_search_disables_sdk_retries(tmp_path, monkeypatch)
     monkeypatch.setenv("OPENAI_API_KEY", "test")
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
-    monkeypatch.setattr(search, "reserve_attempt", lambda request: types.SimpleNamespace(attempt_id="attempt"))
-    monkeypatch.setattr(search, "mark_dispatched", lambda reservation: None)
+    monkeypatch.setattr(search, "reserve_attempt", lambda request: types.SimpleNamespace(
+        attempt_id="attempt", drive_root=tmp_path,
+    ))
+    monkeypatch.setattr(search, "mark_dispatched", lambda reservation, **_kwargs: None)
     monkeypatch.setattr(search, "settle_attempt", lambda *args, **kwargs: None)
 
     result = json.loads(search._web_search(Ctx(), "query"))

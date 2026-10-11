@@ -22,13 +22,15 @@ from types import SimpleNamespace
 import pytest
 
 import ouroboros.loop as loop_mod
-from ouroboros.loop import (
+from ouroboros.loop_acceptance import (
     ACCEPTANCE_DECISION_REASONS,
-    _apply_task_acceptance_result,
-    _record_acceptance_infra_failure,
     _set_acceptance_decision,
     _supersede_task_acceptance_for_evidence_change,
     _supersede_task_acceptance_for_owner_followup,
+)
+from ouroboros.loop_acceptance_review import (
+    _apply_task_acceptance_result,
+    _record_acceptance_infra_failure,
 )
 from ouroboros.outcomes import (
     ACCEPTANCE_ACCEPTED,
@@ -72,7 +74,8 @@ def _apply_ctx(tmp_path, *, prior_trace=None, passes_done=0, budget_profile=None
         task_metadata={},
         task_contract={"budget_profile": budget_profile} if budget_profile else {},
         is_direct_chat=False,
-        end_acceptance_fence=(lambda **_k: {"ok": True}) if fence_ok else (lambda **_k: {"ok": False}),
+        end_acceptance_fence=(lambda **_k: (_ for _ in ()).throw(TimeoutError("no ack"))) if fence_ok == "silent"
+        else (lambda **_k: {"ok": True}) if fence_ok else (lambda **_k: {"ok": False}),
         _task_acceptance_fence_token="tok",
     )
     trace = dict(prior_trace or {})
@@ -85,7 +88,7 @@ def _apply_ctx(tmp_path, *, prior_trace=None, passes_done=0, budget_profile=None
         llm_trace=trace,
         drive_root=None,
         messages=[{"role": "user", "content": "goal"}],
-        emit_progress=lambda _m: None,
+        emit_progress=lambda _m, *, incident=None: None,
         mode="required",
         subtree_statuses=[],
         budget_profile=budget_profile or {},
@@ -98,9 +101,19 @@ _OPEN_OBLIGATION = {
     "status": "open", "disposition": "",
 }
 
+# The clean-pass fixture carries supported criteria WITH evidence_refs: the
+# evidence condition is unconditional since D-Q5 deleted the constant-true
+# require_criterion_evidence knob (production panels always ran it True, so a
+# real clean PASS always looked exactly like this).
 _CLEAN_PASS = dict(
     aggregate="PASS",
-    actors=[_actor("s0", "PASS", {"verdict": "PASS", "outcome_tier": "solved"})],
+    actors=[_actor("s0", "PASS", {
+        "verdict": "PASS", "outcome_tier": "solved",
+        "criteria_used": [{
+            "criterion": "deliverable is verified", "status": "supported",
+            "evidence_refs": ["verification_summary"],
+        }],
+    })],
 )
 # A PASS whose `solved` claim lacks supported criterion evidence: NOT clean, yet the
 # capsule has nothing actionable (no findings, no dissent, solved tier) — the A14 branch.
@@ -175,8 +188,14 @@ _DIALOGUE_TERMINAL = dict(
             "fence_reopen_failed", _ACTIONABLE_FAIL, {"fence_ok": False},
             (ACCEPTANCE_FINALIZED_UNACCEPTED, "fence_reopen_failed"),
         ),
-        ("dialogue_terminal", _DIALOGUE_TERMINAL, {}, (ACCEPTANCE_FINALIZED_UNACCEPTED, "dialogue_terminal")),
-        ("review_degraded", _NO_QUORUM, {}, (ACCEPTANCE_FINALIZED_UNACCEPTED, "review_degraded")),
+        (
+            # A supervisor that never answered the reopen is a gap, not a refusal: the improvement
+            # round still happens (the queued end reaches the queue first; the next begin re-adopts).
+            "fence_reopen_unanswered", _ACTIONABLE_FAIL, {"fence_ok": "silent"},
+            (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule"),
+        ),
+        ("dialogue_terminal", _DIALOGUE_TERMINAL, {}, (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule")),
+        ("review_degraded", _NO_QUORUM, {}, (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule")),
         (
             "open_obligations_gates_exhausted", _ACTIONABLE_FAIL,
             {
@@ -300,16 +319,16 @@ def test_bare_fail_reaches_the_reviewer_fail_branch_not_a_capsule():
     assert rs.build_improvement_capsule(_result(**_ACTIONABLE_FAIL)).strip()
 
 
-def test_infra_failure_branch_is_finalized_unaccepted(tmp_path):
+def test_infra_failure_is_returned_to_author_without_claiming_acceptance(tmp_path):
     ctx = _apply_ctx(tmp_path)
-    assert _record_acceptance_infra_failure(ctx, RuntimeError("boom")) is False
+    assert _record_acceptance_infra_failure(ctx, RuntimeError("boom")) is True
     decision = ctx.llm_trace["acceptance_decision"]
-    assert decision["status"] == ACCEPTANCE_FINALIZED_UNACCEPTED
-    assert decision["reason"] == "infra_failure"
-    assert decision["degraded_reasons"] == ["RuntimeError: boom"]
-    # The synthetic DEGRADED run record — the typed expression of "never a silent
-    # skip" — is unchanged by the host-status collapse.
-    assert ctx.llm_trace["review_runs"][-1]["aggregate_signal"] == "DEGRADED"
+    assert decision["status"] == ACCEPTANCE_REVISION_REQUESTED
+    assert decision["reason"] == "review_outcome_received"
+    assert "boom" in ctx.messages[-1]["content"]
+    assert not ctx.llm_trace.get("review_runs")  # Local failure invents no critic.
+    assert ctx.llm_trace["review_decision"]["host_failure"]["detail"] == "RuntimeError: boom"
+    assert decision["origin"] == "host_acceptance_processing"
 
 
 def test_supersede_paths_request_a_revision_with_their_own_reason(tmp_path):
@@ -358,6 +377,44 @@ def test_supersede_paths_request_a_revision_with_their_own_reason(tmp_path):
              "reason": REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE},
             "not_eligible", False,
         ),
+        # Forced-rail bypass reasons (closed enum) ride the SAME (status, reason,
+        # eligibility) key — an eligible panel bypassed by a rail is never clean.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_round_limit"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_deadline"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_provider_unavailable"},
+            "eligible", True,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_children_unabsorbed"},
+            "eligible", True,
+        ),
+        # Bypass reason without eligibility (unknown / not_eligible) never degrades.
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "not_eligible", False,
+        ),
+        (
+            {"status": ACCEPTANCE_FINALIZED_UNACCEPTED,
+             "reason": "acceptance_bypassed_budget_exhausted"},
+            "unknown", False,
+        ),
     ],
 )
 def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligibility, degrades):
@@ -371,14 +428,93 @@ def test_deadline_reserve_degradation_keys_on_status_plus_reason(decision, eligi
         },
     )
     axes = outcome["outcome_axes"]
+    is_deadline_reserve = (
+        decision["reason"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+    )
     if degrades:
         assert axes["execution"]["status"] == "degraded"
-        assert axes["execution"]["reason_code"] == REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE
+        # The typed reason itself is the degradation reason_code — deadline-reserve
+        # keeps its historical token, a forced-rail bypass carries its own.
+        assert axes["execution"]["reason_code"] == decision["reason"]
         assert axes["objective"]["status"] == "degraded"
-        assert axes["objective"]["source"] == "task_acceptance_deadline_reserve"
+        assert axes["objective"]["source"] == (
+            "task_acceptance_deadline_reserve"
+            if is_deadline_reserve else "task_acceptance_forced_bypass"
+        )
     else:
         assert axes["execution"]["status"] == "ok"
-        assert axes["objective"].get("source") != "task_acceptance_deadline_reserve"
+        assert axes["objective"].get("source") not in {
+            "task_acceptance_deadline_reserve", "task_acceptance_forced_bypass",
+        }
+
+
+def test_forced_rail_axes_are_the_production_shape(tmp_path, monkeypatch):
+    """The table above feeds `derive_loop_outcome` a usage dict a forced rail
+    cannot produce (`usage={}`), so it pins the pair-key, not the delivered shape.
+    Driven through the REAL round-limit rail, a stamped bypass ALWAYS arrives with
+    `usage.execution_status='failed'` — every writer of `usage.reason_code` writes
+    it — so the outcome lands on the stronger best_effort/failed classification and
+    the pair-keyed degrade never decides. The owner-visible "a panel was owed and
+    did not run" fact rides the REVIEW axis, which is the claim that must hold."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(
+        loop, "call_llm_with_retry",
+        lambda *_args, **_kwargs: (
+            {"role": "assistant", "content": "Best answer before the round limit."}, 0.0,
+        ),
+    )
+
+    text, usage, trace = loop._handle_round_limit(limit_ctx)
+
+    # The rail's own execution truth: failed usage + the rail reason code.
+    assert usage["execution_status"] == "failed"
+    assert usage["reason_code"] == "round_limit"
+    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_round_limit"
+
+    axes = derive_loop_outcome(text, usage, trace)["outcome_axes"]
+    # NOT "degraded/acceptance_bypassed_round_limit": the honest rail reason wins.
+    assert axes["execution"]["status"] == "best_effort"
+    assert axes["execution"]["reason_code"] == "round_limit"
+    # ...and the bypass is carried where it is owner-visible and unambiguous.
+    assert axes["review"]["eligibility"] == "eligible"
+    assert axes["review"]["trigger"] == "bypassed_round_limit"
+    assert axes["review"]["run_count"] == 0
+    assert axes["review"]["acceptance_decision"]["reason"] == (
+        "acceptance_bypassed_round_limit"
+    )
+
+
+def test_round_one_budget_rejection_is_also_a_covered_forced_sink(tmp_path):
+    """The total-budget rejection at round<=1 returns its notice directly instead
+    of going through `_forced_final_answer`, so it used to reach the ledger with
+    NO bypass record at all: `eligibility=not_evaluated / run_count=0` — exactly
+    the "indistinguishable from no panel warranted" shape the typed bypass closes.
+    Nothing was produced, so the record is the whole remedy: one ledger write."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    limit_ctx.round_idx = 1
+
+    result = loop._check_budget_limits(limit_ctx, 0.0)
+
+    assert result is not None
+    text, usage, trace = result
+    assert text.startswith("🚫 Task rejected.")
+    assert usage["reason_code"] == "budget_exhausted"
+    assert trace["review_decision"] == {
+        "eligibility": "eligible", "trigger": "bypassed_budget_exhausted",
+    }
+    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_budget_exhausted"
+    assert trace["acceptance_decision"]["source"] == "forced_finalization"
+    # No candidate existed — the record says so instead of inventing one.
+    assert trace["forced_finalization"]["candidate_sha256"] == ""
+    assert trace["forced_finalization"]["source"] == "host_budget_rejection_before_work"
+
+    axes = derive_loop_outcome(text, usage, trace)["outcome_axes"]
+    assert axes["review"]["eligibility"] == "eligible"
+    assert axes["review"]["run_count"] == 0
 
 
 def test_acceptance_projection_carries_the_typed_reason():
@@ -664,7 +800,7 @@ def test_deadline_reserve_writer_and_reader_move_together(monkeypatch, tmp_path)
 
     monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
     monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
-    monkeypatch.setattr(rs, "reviewer_slots", lambda **_k: [object()])
+    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **_k: [object()])
     monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
     now = datetime.now(timezone.utc)
     ctx = SimpleNamespace(
@@ -679,7 +815,7 @@ def test_deadline_reserve_writer_and_reader_move_together(monkeypatch, tmp_path)
     assert loop_mod._run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
         llm_trace=trace, drive_root=None,
-        messages=[{"role": "user", "content": "goal"}], emit_progress=lambda _m: None,
+        messages=[{"role": "user", "content": "goal"}], emit_progress=lambda _m, *, incident=None: None,
     ) is False
     decision = trace["acceptance_decision"]
     assert decision["status"] == ACCEPTANCE_FINALIZED_UNACCEPTED
@@ -700,7 +836,10 @@ def test_merge_point_is_the_only_status_writer_outside_the_agent_stance_merge():
         if 'llm_trace["acceptance_decision"] =' in path.read_text(encoding="utf-8")
         or '["acceptance_decision"] = _dec' in path.read_text(encoding="utf-8")
     )
-    assert writers == ["loop.py", "loop_tool_execution.py"], writers
+    # The v7 L-B split moved `_set_acceptance_decision` (and with it the single
+    # host-status assignment) into the loop_acceptance leaf; the loop.py name is
+    # a facade re-export of the same object.
+    assert writers == ["loop_acceptance.py", "loop_tool_execution.py"], writers
     trace: dict = {}
     _set_acceptance_decision(trace, {"status": ACCEPTANCE_ACCEPTED, "reason": "clean_pass"})
     assert trace["acceptance_decision"]["status"] == ACCEPTANCE_ACCEPTED

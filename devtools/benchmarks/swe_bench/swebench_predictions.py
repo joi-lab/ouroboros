@@ -136,6 +136,12 @@ def _write_logs(logs_dir: str, instance_id: str, stdout: str, stderr: str, summa
 
 def _build_ouroboros_cmd(args: argparse.Namespace, workspace: Path, result_json_path: Path, prompt: str) -> list[str]:
     cli_prefix = shlex.split(args.cli) if args.cli else [sys.executable, "-m", "ouroboros.cli"]
+    # E2BIG hygiene (C5): the prompt travels as a FILE, never as an argv tail —
+    # a benchmark prompt with a long issue body can exceed the kernel's per-arg
+    # limit. Written beside the result json so it survives as a run artifact.
+    prompt_path = result_json_path.parent / (result_json_path.stem + ".prompt.txt")
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
     return [
         *cli_prefix,
         "run",
@@ -148,7 +154,8 @@ def _build_ouroboros_cmd(args: argparse.Namespace, workspace: Path, result_json_
         "--patch",
         "--result-json-out",
         str(result_json_path),
-        prompt,
+        "--prompt-file",
+        str(prompt_path),
     ]
 
 

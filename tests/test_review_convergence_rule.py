@@ -98,39 +98,35 @@ class TestScopeOnlyRetryPath:
     the scope reviewer prompt from the 3rd scope-only attempt onward —
     otherwise the anti-thrashing fix is incomplete for this path.
 
-    We don't spin up a real git repo; instead we patch the minimum surface
-    that `_build_scope_prompt` reads (staged diff, touched entries, dev
-    guide) so the builder runs far enough to emit the history/rule section.
+    We don't spin up a real git repo: the retrieving brief carries pointers,
+    not evidence, so only the checklist and governance loaders are stubbed and
+    the builder still emits the history/rule section.
     """
 
     def _scope_prompt(self, review_history, scope_review_history, tmp_path, monkeypatch):
         import pathlib
-        from ouroboros.tools import scope_review as mod
-        (tmp_path / "f.py").write_text("x = 1\n", encoding="utf-8")
-        monkeypatch.setattr(
-            mod, "_parse_staged_name_status",
-            lambda repo_dir: [("M", "f.py")],
-        )
-        monkeypatch.setattr(
-            mod, "run_cmd",
-            lambda *args, **kwargs: "diff --git a/f.py b/f.py\n+x = 1\n",
-        )
-        monkeypatch.setattr(mod, "load_governance_doc", lambda rd, rel, **_kw: "(dev guide)")
-        monkeypatch.setattr(
-            mod, "_gather_scope_packs",
-            lambda repo_dir, all_touched_paths, fixed_prompt_tokens=0: "(scope pack)",
-        )
+        from ouroboros.tools import scope_review_session as session
+
         monkeypatch.setattr(
             "ouroboros.tools.review_helpers.load_checklist_section",
             lambda name: "(scope checklist)",
         )
-        prompt, _status = mod._build_scope_prompt(
-            pathlib.Path(tmp_path),
-            "test commit message",
-            review_history=review_history,
-            scope_review_history=scope_review_history,
+        monkeypatch.setattr(session, "load_checklist_section", lambda name: "(scope checklist)")
+        monkeypatch.setattr(
+            "ouroboros.tools.review_helpers.load_governance_doc",
+            lambda rd, rel, **_kw: "(governance doc)",
         )
-        return prompt or ""
+        brief, _manifest = session.build_scope_session_task(
+            pathlib.Path(tmp_path),
+            session.ScopeBriefInputs(
+                commit_message="test commit message",
+                intent=session.ScopeIntentContext(
+                    review_history=review_history,
+                    scope_review_history=scope_review_history,
+                ),
+            ),
+        )
+        return brief or ""
 
     def test_scope_only_third_attempt_fires_rule(self, tmp_path, monkeypatch):
         """Triad passed (review_history empty) but 2 prior scope-only blocks

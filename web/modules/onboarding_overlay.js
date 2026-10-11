@@ -1,41 +1,107 @@
 import { apiFetch } from './api_client.js';
+import { escapeHtmlAttr as escapeHtml } from './utils.js';
+
+export const OVERLAY_ID = 'onboarding-overlay';
+
+// The framed wizard's sandbox policy, in one place: it is a security boundary
+// AND the thing that has to change when a wizard step needs a new capability,
+// so it should be one edit rather than a token buried in markup.
+//
+// `allow-popups` + `allow-popups-to-escape-sandbox` are LOAD-BEARING, not
+// hygiene: the Agents step's primary action is the agent's own sign-in link,
+// opened with target="_blank". Without them the browser blocks that click
+// SILENTLY — the owner presses "Open sign-in link" and nothing happens, and
+// copying the URL by hand is the only way through. The escape variant is
+// required too: a popup that inherits this sandbox lands on the vendor's OAuth
+// page without same-origin or scripts, which no sign-in survives. Both apply
+// only to windows the framed page opens, never to the frame's own authority
+// over this document.
+export const FRAME_SANDBOX = 'allow-same-origin allow-scripts allow-forms '
+    + 'allow-popups allow-popups-to-escape-sandbox';
+
 function removeOverlay() {
-    document.getElementById('onboarding-overlay')?.remove();
+    document.getElementById(OVERLAY_ID)?.remove();
 }
 
-function mountOverlay(html) {
+/**
+ * Mount the blocking shell. Called BEFORE the readiness probe, because the
+ * decision this app is blocked on has not been made yet: until a 204 proves the
+ * install is configured, the ordinary UI must not be reachable. Mounting only
+ * after a successful probe meant a transport failure — a headless first run, a
+ * server still coming up, a dropped connection — left the owner in the ordinary
+ * UI with no onboarding and no way back to it, which contradicts what the
+ * cancelled-wizard path promises ("the blocking overlay stays available").
+ *
+ * The shell starts WITHOUT its backdrop: `.onboarding-overlay` is already a
+ * full-viewport fixed layer, so it intercepts the ordinary UI while transparent.
+ * The dark scrim arrives with the answer, so a configured install (204) never
+ * flashes a dimmed screen on its way to the app.
+ */
+function mountOverlayShell() {
     removeOverlay();
     const overlay = document.createElement('div');
-    overlay.id = 'onboarding-overlay';
+    overlay.id = OVERLAY_ID;
     overlay.className = 'onboarding-overlay';
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
     overlay.setAttribute('aria-label', 'Ouroboros setup');
-    overlay.innerHTML = `
-        <div class="onboarding-overlay-backdrop"></div>
-        <iframe class="onboarding-frame" title="Ouroboros Setup" sandbox="allow-same-origin allow-scripts allow-forms"></iframe>
-    `;
-    const frame = overlay.querySelector('.onboarding-frame');
-    if (frame) frame.srcdoc = html;
     document.body.appendChild(overlay);
+    return overlay;
 }
 
-function escapeHtml(value) {
-    // Backtick escaped too (defense-in-depth parity with utils.escapeHtmlAttr).
-    return String(value ?? '').replace(/[&<>"'`]/g, (ch) => ({
-        '&': '&amp;',
-        '<': '&lt;',
-        '>': '&gt;',
-        '"': '&quot;',
-        "'": '&#39;',
-        '`': '&#96;',
-    }[ch]));
+function setOverlayContent(overlay, node) {
+    if (!overlay.querySelector('.onboarding-overlay-backdrop')) {
+        const backdrop = document.createElement('div');
+        backdrop.className = 'onboarding-overlay-backdrop';
+        overlay.appendChild(backdrop);
+    }
+    overlay.querySelector('[data-onboarding-content]')?.remove();
+    node.setAttribute('data-onboarding-content', '');
+    overlay.appendChild(node);
+    return node;
+}
+
+function showSetupFrame(overlay) {
+    const frame = document.createElement('iframe');
+    frame.className = 'onboarding-frame';
+    frame.title = 'Ouroboros Setup';
+    frame.setAttribute('sandbox', FRAME_SANDBOX);
+    // ONE onboarding host: frame the real /onboarding page rather than an
+    // inlined srcdoc document. A srcdoc string cannot import web/modules/*,
+    // and the wizard's steps need those ordinary ES modules.
+    frame.src = '/onboarding';
+    return setOverlayContent(overlay, frame);
+}
+
+/**
+ * The readiness probe failed. This is NOT "no onboarding is due" — that answer
+ * is a 204 and nothing else. The overlay stays up and says what happened, with
+ * the only action that can resolve it.
+ */
+function showReadinessFailure(overlay, detail, onRetry) {
+    const card = document.createElement('section');
+    card.className = 'onboarding-restart-card';
+    const heading = document.createElement('h2');
+    heading.textContent = 'Setup unavailable';
+    const copy = document.createElement('p');
+    copy.textContent = `Could not check whether Ouroboros is configured (${detail}). `
+        + 'Setup stays blocked until that check succeeds.';
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'btn btn-primary';
+    retry.setAttribute('data-onboarding-retry', '');
+    retry.textContent = 'Try again';
+    retry.addEventListener('click', onRetry);
+    card.appendChild(heading);
+    card.appendChild(copy);
+    card.appendChild(retry);
+    return setOverlayContent(overlay, card);
 }
 
 function showRestartRequiredOverlay(runtimeMode) {
     const mode = escapeHtml(runtimeMode || 'advanced');
-    const overlay = document.getElementById('onboarding-overlay') || document.createElement('div');
-    overlay.id = 'onboarding-overlay';
+    const overlay = document.getElementById(OVERLAY_ID) || document.createElement('div');
+    overlay.id = OVERLAY_ID;
     overlay.className = 'onboarding-overlay';
     overlay.setAttribute('role', 'dialog');
     overlay.setAttribute('aria-modal', 'true');
@@ -72,13 +138,28 @@ export async function initOnboardingOverlay() {
 
     window.addEventListener('message', handleMessage);
 
-    try {
-        const response = await apiFetch('/api/onboarding', { cache: 'no-store' });
-        if (response.status === 204) return;
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const html = await response.text();
-        if (html.trim()) mountOverlay(html);
-    } catch (error) {
-        console.error('Failed to load onboarding overlay:', error);
+    // Blocked first, answered second. The shell exists before the request, so
+    // no outcome of the request can leave the app unblocked by accident — only
+    // a verified 204 takes it down.
+    const overlay = mountOverlayShell();
+
+    async function probeReadiness() {
+        try {
+            // Readiness probe only: 204 means the install is structurally
+            // configured and no blocking overlay is due. The wizard itself is
+            // served by the /onboarding page the frame loads.
+            const response = await apiFetch('/api/onboarding', { cache: 'no-store' });
+            if (response.status === 204) {
+                removeOverlay();
+                return;
+            }
+            if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            showSetupFrame(overlay);
+        } catch (error) {
+            console.error('Failed to load onboarding overlay:', error);
+            showReadinessFailure(overlay, String(error?.message || error || 'unknown error'), probeReadiness);
+        }
     }
+
+    await probeReadiness();
 }

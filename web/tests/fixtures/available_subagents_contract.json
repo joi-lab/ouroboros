@@ -1,0 +1,253 @@
+{
+  "valid": [
+    {
+      "name": "api actor",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "api-scout",
+            "name": "API scout",
+            "recommended_use": "Use for fast repository exploration.",
+            "route": {
+              "kind": " API_MODEL ",
+              "target_id": "openai/gpt-5.6-luna",
+              "credential_profile_id": null
+            },
+            "effort": "minimal"
+          }
+        ]
+      }
+    },
+    {
+      "name": "agy compound fast actor",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "agy-builder",
+            "name": "Antigravity builder",
+            "recommended_use": "Use for an independent task-only subscription run.",
+            "route": {
+              "kind": "agent_session",
+              "target_id": "agy=gemini-3.7-flash-high-fast",
+              "credential_profile_id": "owner-account"
+            },
+            "effort": "high"
+          }
+        ]
+      }
+    },
+    {
+      "name": "owner-disabled row keeps its full configuration",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "paused-builder",
+            "recommended_use": "Use for substantial implementation.",
+            "route": {
+              "kind": "agent_session",
+              "target_id": "codex=gpt-5.6-sol"
+            },
+            "effort": "high",
+            "enabled": false
+          }
+        ]
+      }
+    },
+    {
+      "name": "explicit row enabled true",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "api-scout",
+            "recommended_use": "Use for fast repository exploration.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            },
+            "enabled": true
+          }
+        ]
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "numeric name",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-name",
+            "name": 42,
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "numeric recommended use",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-purpose",
+            "name": "Bad purpose",
+            "recommended_use": 7,
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "numeric target",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-target",
+            "name": "Bad target",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": 123
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "numeric account pin",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-pin",
+            "name": "Bad pin",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "agent_session",
+              "target_id": "codex=gpt-5.6-sol-high",
+              "credential_profile_id": 3
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "numeric effort",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-effort",
+            "name": "Bad effort",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            },
+            "effort": 5
+          }
+        ]
+      }
+    },
+    {
+      "name": "cursor compound effort conflict",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "cursor-conflict",
+            "name": "Cursor conflict",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "agent_session",
+              "target_id": "cursor=gpt-5.6-sol-high"
+            },
+            "effort": "low"
+          }
+        ]
+      }
+    },
+    {
+      "name": "agy fast compound effort conflict",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "agy-conflict",
+            "name": "Agy conflict",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "agent_session",
+              "target_id": "agy=gemini-3.7-flash-high-fast"
+            },
+            "effort": "medium"
+          }
+        ]
+      }
+    },
+    {
+      "name": "string row enabled",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-enabled",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            },
+            "enabled": "false"
+          }
+        ]
+      }
+    },
+    {
+      "name": "numeric row enabled",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-enabled",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            },
+            "enabled": 0
+          }
+        ]
+      }
+    },
+    {
+      "name": "null row enabled",
+      "value": {
+        "enabled": true,
+        "items": [
+          {
+            "subagent_id": "bad-enabled",
+            "recommended_use": "Use for testing.",
+            "route": {
+              "kind": "api_model",
+              "target_id": "openai/gpt-5.6-luna"
+            },
+            "enabled": null
+          }
+        ]
+      }
+    }
+  ]
+}

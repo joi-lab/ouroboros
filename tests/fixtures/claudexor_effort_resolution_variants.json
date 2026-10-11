@@ -1,0 +1,8 @@
+{
+  "known_parameter_unverifiable": {"requested":"ultra","submitted":null,"resolution":"unverifiable","source":"adapter","parameter":"model_reasoning_effort","observed":null,"observedSource":null},
+  "known_parameter_omitted": {"requested":"ultra","submitted":null,"resolution":"omitted","source":"adapter","parameter":"model_reasoning_effort","observed":null,"observedSource":null},
+  "future_downward": {"requested":"ultra","submitted":"vendor-balanced","resolution":"downward","source":"live_probe","parameter":"reasoning.effort","observed":null,"observedSource":null},
+  "future_floor": {"requested":"vendor-minimal","submitted":"vendor-baseline","resolution":"floor","source":"versioned_snapshot","parameter":"reasoning.effort","observed":null,"observedSource":null},
+  "engine_order_downward": {"requested":"low","submitted":"high","resolution":"downward","source":"account_catalog","parameter":"reasoning.effort","observed":null,"observedSource":null},
+  "engine_order_floor": {"requested":"ultra","submitted":"low","resolution":"floor","source":"account_catalog","parameter":"reasoning.effort","observed":null,"observedSource":null}
+}

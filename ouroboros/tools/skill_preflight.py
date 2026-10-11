@@ -1,4 +1,4 @@
-"""Read-only skill payload syntax/contract preflight for heal-mode agents.
+"""Read-only skill payload syntax/contract preflight for skill development.
 
 Tri-model review remains authoritative. Preflight uses argv-only subprocesses,
 cwd=skill_dir, scrubbed env, 30s timeout, in-process Python compile(), and no
@@ -9,14 +9,22 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import pathlib
 import shutil
 import subprocess
+import time
 from subprocess import Popen
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    build_resolved_resource_binding,
+    load_bound_skill,
+)
+from ouroboros.tools.process_facts import publish_process_facts, signal_name_for_returncode
 from ouroboros.tools.shell import _active_subprocesses, _kill_process_group, _subprocess_lock
 from ouroboros.platform_layer import (
     merge_hidden_kwargs,
@@ -38,6 +46,17 @@ log = logging.getLogger(__name__)
 _PREFLIGHT_TIMEOUT_SEC = 30
 _PREFLIGHT_MAX_OUTPUT_BYTES = 16 * 1024
 _PREFLIGHT_HARD_FILE_LIMIT = 60  # independent preflight headroom (skill_review now uses a pack-level token budget)
+# The scrubbed validator env keeps the Windows process-base variables a child
+# needs to START: without SystemRoot a Windows process cannot initialise the
+# system services it loads (node dies in libuv's Winsock startup before it
+# reads the script), so `node --check` on a VALID file exited non-zero and
+# preflight reported a syntax error that did not exist (windows-latest,
+# 7.0.0-rc.9). TEMP/TMP back the msys `bash -n` /tmp. Forwarded only when set,
+# so a POSIX child env is byte-identical to before; the same base-env class as
+# extension_companion._COMPANION_BASE_ENV_KEYS (SYSTEMROOT/WINDIR/TEMP/TMP) and
+# CPython's own test.support.script_helper ("Windows requires at least the
+# SYSTEMROOT environment variable to start").
+_WINDOWS_BASE_ENV_KEYS: Tuple[str, ...] = ("SYSTEMROOT", "WINDIR", "TEMP", "TMP")
 
 # Extension -> argv template + runtime; {path} is substituted into argv only.
 _VALIDATORS: Dict[str, Tuple[List[str], str]] = {
@@ -48,41 +67,85 @@ _VALIDATORS: Dict[str, Tuple[List[str], str]] = {
     ".bash": (["bash", "-n", "{path}"], "bash"),
 }
 
+# A declared module-widget entry is injected as a CLASSIC inline <script>, so the
+# grammar that matters is the Script goal, not the module goal. `node --check`
+# accepts top-level import/export in a .js file; `new vm.Script(...)` rejects it
+# exactly as the browser will, and it is suffix-independent.
+_CLASSIC_SCRIPT_VALIDATOR: Tuple[List[str], str] = (
+    [
+        "node",
+        "-e",
+        "const fs=require('fs'),vm=require('vm');"
+        "new vm.Script(fs.readFileSync(process.argv[1],'utf8'),{filename:process.argv[1]})",
+        "--",
+        "{path}",
+    ],
+    "node",
+)
 
-def _resolve_runtime(runtime: str) -> Optional[str]:
+
+def _resolve_runtime(runtime: str) -> Tuple[Optional[str], str]:
+    """Resolve a validator runtime: ``(path, "")`` or ``(None, reason)``."""
     if runtime == "python3":
-        return shutil.which("python3") or shutil.which("python")
+        return (shutil.which("python3") or shutil.which("python")), ""
     if runtime == "node":
-        # Prefer the bundled, signed node over a PATH (Homebrew) node that macOS
-        # code-signing enforcement may SIGKILL inside the packaged app.
+        # Skill-family node precedence is owned by
+        # platform_layer.select_skill_node_runtime: bundled-first (the signed
+        # runtime macOS code-signing enforcement cannot SIGKILL inside the
+        # packaged app), with a health ROLLBACK to a working PATH node when the
+        # bundled one is absent or execution-probed broken. A provably dead
+        # candidate is never selected while a usable neighbour exists.
         try:
-            from ouroboros.platform_layer import resolve_bundled_node
-            bundled = resolve_bundled_node()
-            if bundled:
-                return bundled
+            from ouroboros.platform_layer import select_skill_node_runtime
+            selected, info = select_skill_node_runtime()
+            if selected:
+                return selected, ""
+            return None, info
         except Exception:
-            log.debug("resolve_bundled_node failed", exc_info=True)
-    return shutil.which(runtime)
+            log.debug("select_skill_node_runtime failed", exc_info=True)
+    return shutil.which(runtime), ""
 
 
 def _run_check(cmd: List[str], cwd: pathlib.Path) -> Dict[str, Any]:
-    """Run validator argv through panic-tracked subprocess machinery; never raises."""
+    """Run validator argv through panic-tracked subprocess machinery; never raises.
+
+    Returns the validator's own facts, never a synthesized stand-in: a
+    validator the host killed on the preflight deadline, and one that never
+    reached exec, both report ``returncode=None`` beside the typed reason
+    (``timeout`` / ``pre_exec_failure``). Earlier revisions answered ``-9`` and
+    ``-1`` there, which read downstream as real POSIX signal deaths — including
+    on Windows, where the host kill produces neither. The abnormal outcomes are
+    also published on the typed process-facts channel so the preflight CALL's
+    result_meta, tools.jsonl row and UI card carry them; a clean validator is
+    described by its finding and leaves the channel alone."""
+    env: Dict[str, str] = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": os.environ.get("HOME", ""),
+        "LANG": "C.UTF-8",
+    }
+    env.update({key: os.environ[key] for key in _WINDOWS_BASE_ENV_KEYS if os.environ.get(key)})
     popen_kwargs: Dict[str, Any] = {
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "stdin": subprocess.DEVNULL,
         "cwd": str(cwd),
-        "env": {
-            "PATH": str(__import__("os").environ.get("PATH", "")),
-            "HOME": str(__import__("os").environ.get("HOME", "")),
-            "LANG": "C.UTF-8",
-        },
+        "env": env,
     }
     popen_kwargs.update(subprocess_new_group_kwargs())
+    _check_started_ts = time.monotonic()
     try:
         proc = Popen(cmd, **merge_hidden_kwargs(popen_kwargs))  # noqa: S603 — argv array
     except FileNotFoundError as exc:
-        return {"returncode": -1, "stdout": "", "stderr": f"runtime not found: {exc}", "timeout": False}
+        publish_process_facts(
+            started_ts=_check_started_ts, pre_exec_failure="FileNotFoundError",
+        )
+        return {
+            "returncode": None,
+            "stdout": "",
+            "stderr": f"runtime not found: {exc}",
+            "timeout": False,
+            "pre_exec_failure": "FileNotFoundError",
+        }
     with _subprocess_lock:
         _active_subprocesses.add(proc)
     try:
@@ -97,17 +160,27 @@ def _run_check(cmd: List[str], cwd: pathlib.Path) -> Dict[str, Any]:
                 stdout, stderr = proc.communicate(timeout=2)
             except Exception:
                 stdout, stderr = b"", b""
+            publish_process_facts(
+                started_ts=_check_started_ts, timed_out=True, killed_by_host=True,
+            )
             return {
-                "returncode": -9,
+                "returncode": None,
                 "stdout": stdout.decode("utf-8", errors="replace")[:_PREFLIGHT_MAX_OUTPUT_BYTES],
                 "stderr": stderr.decode("utf-8", errors="replace")[:_PREFLIGHT_MAX_OUTPUT_BYTES],
                 "timeout": True,
+                "killed_by_host": True,
             }
     finally:
         with _subprocess_lock:
             _active_subprocesses.discard(proc)
+    returncode = int(proc.returncode or 0)
+    if returncode < 0:
+        # A validator killed by something OTHER than our deadline (the macOS
+        # code-signing SIGKILL this skip path exists for) is a real signal
+        # death: publish it so the call carries the exit code and signal name.
+        publish_process_facts(returncode=returncode, started_ts=_check_started_ts)
     return {
-        "returncode": int(proc.returncode or 0),
+        "returncode": returncode,
         "stdout": (stdout or b"").decode("utf-8", errors="replace")[:_PREFLIGHT_MAX_OUTPUT_BYTES],
         "stderr": (stderr or b"").decode("utf-8", errors="replace")[:_PREFLIGHT_MAX_OUTPUT_BYTES],
         "timeout": False,
@@ -137,17 +210,19 @@ def _validate_widget_render(
 ) -> Dict[str, Any]:
     """Validate one statically resolved UI declaration without importing plugin code."""
     try:
-        if settings:
-            validate_settings_schema(render)
-        else:
-            validate_ui_render(render)
-        return {
+        clean = validate_settings_schema(render) if settings else validate_ui_render(render)
+        row = {
             "item": "widget_schema",
             "source": source,
             "ok": True,
             "verified": True,
             "detail": "ok",
         }
+        if clean.get("kind") == "module":
+            # The normalized entry is what the frame will fetch; carry it so the
+            # caller can check the declared file actually exists on disk.
+            row["entry"] = clean["entry"]
+        return row
     except ExtensionRegistrationError as exc:
         return {
             "item": "widget_schema",
@@ -429,11 +504,40 @@ def _registered_ui_schema_findings(plugin_path: pathlib.Path, *, source_name: st
     return findings
 
 
+def _widget_entry_exists_finding(
+    skill_dir: pathlib.Path,
+    row: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Check that a module widget's declared render.entry file is really there."""
+    entry = str(row.get("entry") or "").strip()
+    if not entry:
+        return None
+    try:
+        target = (skill_dir / entry).resolve()
+        target.relative_to(skill_dir.resolve())
+        ok = target.is_file()
+    except ValueError:
+        ok = False
+    return {
+        "item": "widget_entry_exists",
+        "source": str(row.get("source") or ""),
+        "ok": ok,
+        "verified": True,
+        "detail": entry if ok else f"missing or escaping module widget entry: {entry}",
+    }
+
+
 def _widget_schema_findings(skill_dir: pathlib.Path, manifest: Optional[SkillManifest]) -> List[Dict[str, Any]]:
     findings: List[Dict[str, Any]] = []
     if manifest is not None and isinstance(manifest.ui_tab, dict):
         render = manifest.ui_tab.get("render")
-        findings.append(_validate_widget_render(render, source="manifest.ui_tab.render"))
+        schema_row = _validate_widget_render(render, source="manifest.ui_tab.render")
+        findings.append(schema_row)
+        # Generated before the containment early return below: an escaping
+        # plugin path must not silently drop the manifest entry check.
+        entry_row = _widget_entry_exists_finding(skill_dir, schema_row)
+        if entry_row is not None:
+            findings.append(entry_row)
     entry_name = str(manifest.entry or "plugin.py") if manifest is not None else "plugin.py"
     plugin = (skill_dir / entry_name).resolve()
     try:
@@ -441,9 +545,11 @@ def _widget_schema_findings(skill_dir: pathlib.Path, manifest: Optional[SkillMan
     except ValueError:
         return findings
     if plugin.is_file():
-        findings.extend(
-            _registered_ui_schema_findings(plugin, source_name=relative_plugin.as_posix())
-        )
+        for schema_row in _registered_ui_schema_findings(plugin, source_name=relative_plugin.as_posix()):
+            findings.append(schema_row)
+            entry_row = _widget_entry_exists_finding(skill_dir, schema_row)
+            if entry_row is not None:
+                findings.append(entry_row)
     return findings
 
 
@@ -467,51 +573,150 @@ def _plugin_permission_findings(skill_dir: pathlib.Path, manifest: Optional[Skil
         tree = ast.parse(plugin.read_text(encoding="utf-8"), filename=str(plugin))
     except Exception:
         return []
-    seen: dict[str, int] = {}
+    # Receiver proof (#447 A6): a method NAME alone does not prove a PluginAPI
+    # call — `OtherLibrary().get_settings()` made a skill permanently
+    # non-executable (STATUS_PENDING, no advisory override). Only a call whose
+    # receiver is provably the `register(api)` parameter (or an alias assigned
+    # from it) keeps blocking power; an unproven receiver DEGRADES to an ok=True
+    # note — the disposition every other unprovable preflight check already gets
+    # — and the tri-model review / runtime permission gate stay authoritative.
+    api_names: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "register"
+            and node.args.args
+        ):
+            api_names.add(node.args.args[0].arg)
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in api_names
+        ):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    api_names.add(target.id)
+    seen: dict[str, tuple[int, bool]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
         if isinstance(func, ast.Attribute):
             perm = required_by_call.get(func.attr)
-            if perm and perm not in seen:
-                seen[perm] = getattr(node, "lineno", 0)
+            if not perm:
+                continue
+            proven = isinstance(func.value, ast.Name) and func.value.id in api_names
+            line, seen_proven = seen.get(perm, (0, False))
+            if perm not in seen or (proven and not seen_proven):
+                seen[perm] = (getattr(node, "lineno", 0), proven)
     declared = set(manifest.permissions or [])
     findings: List[Dict[str, Any]] = []
-    for perm, line in sorted(seen.items()):
-        findings.append({
+    for perm, (line, proven) in sorted(seen.items()):
+        if perm in declared:
+            detail = "ok"
+        elif proven:
+            detail = f"plugin calls PluginAPI surface requiring permission {perm!r}"
+        else:
+            detail = (
+                f"call names a PluginAPI-like surface requiring permission {perm!r}, but the "
+                "receiver is not provably the plugin's `api` object — not statically required "
+                "(reviewers and the runtime permission gate stay authoritative)"
+            )
+        finding: Dict[str, Any] = {
             "item": "permission_static",
             "source": f"{plugin.name}:{line}" if line else plugin.name,
             "permission": perm,
-            "ok": perm in declared,
-            "detail": "ok" if perm in declared else f"plugin calls PluginAPI surface requiring permission {perm!r}",
-        })
+            "ok": perm in declared or not proven,
+            "detail": detail,
+        }
+        if perm not in declared and not proven:
+            finding["degraded"] = True
+        findings.append(finding)
     return findings
+
+
+def _presence_profile_findings(
+    skill_dir: pathlib.Path,
+    manifest: SkillManifest,
+) -> List[Dict[str, Any]]:
+    """Validate the optional reviewed presence declaration without live state."""
+    try:
+        from ouroboros.presence_profile import (
+            PresenceProfileError,
+            parse_presence_profile,
+            presence_profile_fingerprint,
+        )
+    except Exception as exc:
+        log.exception("presence profile preflight failed")
+        return [{
+            "item": "presence_profile",
+            "ok": False,
+            "code": "presence_internal_error",
+            "field": "presence",
+            "detail": f"{type(exc).__name__}: presence validation failed",
+        }]
+    try:
+        profile = parse_presence_profile(manifest, skill_dir)
+    except PresenceProfileError as exc:
+        return [{
+            "item": "presence_profile",
+            "ok": False,
+            "code": exc.code,
+            "field": exc.field,
+            "detail": str(exc),
+        }]
+    except Exception as exc:
+        log.exception("presence profile preflight failed")
+        return [{
+            "item": "presence_profile",
+            "ok": False,
+            "code": "presence_internal_error",
+            "field": "presence",
+            "detail": f"{type(exc).__name__}: presence validation failed",
+        }]
+    if profile is None:
+        return []
+    return [{
+        "item": "presence_profile",
+        "ok": True,
+        "code": "",
+        "field": "presence",
+        "detail": "ok",
+        "profile_fingerprint": presence_profile_fingerprint(profile),
+        "capability_requests": len(profile.capability_requests),
+    }]
 
 
 def _handle_skill_preflight(
     ctx: ToolContext,
     skill: str = "",
     paths: Optional[List[str]] = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
     **_kwargs: Any,
 ) -> str:
     skill_name = str(skill or "").strip()
     if not skill_name:
         return "⚠️ SKILL_PREFLIGHT_ERROR: 'skill' is required."
 
-    from ouroboros.skill_loader import find_skill
-
-    drive_root = pathlib.Path(ctx.drive_root)
-    loaded = find_skill(drive_root, skill_name)
+    try:
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx, root="skill_payload", operation="review", path=".",
+            skill_name=skill_name,
+        )
+    except Exception as exc:
+        return f"⚠️ SKILL_PREFLIGHT_ERROR: {exc}"
+    loaded = load_bound_skill(binding)
     if loaded is None:
         return f"⚠️ SKILL_PREFLIGHT_ERROR: skill {skill_name!r} not found."
 
-    skill_dir = loaded.skill_dir.resolve()
+    skill_dir = binding.base_path
 
     # Broken manifests still become findings; keep other validators running.
     manifest_findings: List[Dict[str, Any]] = []
     widget_findings: List[Dict[str, Any]] = []
     permission_findings: List[Dict[str, Any]] = []
+    presence_findings: List[Dict[str, Any]] = []
     manifest: Optional[SkillManifest] = None
     manifest_path = None
     for candidate in ("SKILL.md", "skill.json"):
@@ -528,6 +733,7 @@ def _handle_skill_preflight(
             manifest_findings.append({"item": "manifest_parse", "ok": True, "detail": "ok"})
             widget_findings.extend(_widget_schema_findings(skill_dir, manifest))
             permission_findings.extend(_plugin_permission_findings(skill_dir, manifest))
+            presence_findings.extend(_presence_profile_findings(skill_dir, manifest))
             if manifest.entry:
                 entry = (skill_dir / manifest.entry).resolve()
                 ok = entry.is_file()
@@ -563,6 +769,13 @@ def _handle_skill_preflight(
                 "detail": f"{type(exc).__name__}: {exc}",
             })
             widget_findings.extend(_widget_schema_findings(skill_dir, None))
+
+    # Declared module-widget entries are parsed with classic-script grammar below.
+    module_entries = {
+        (skill_dir / str(f.get("detail") or "")).resolve()
+        for f in widget_findings
+        if f.get("item") == "widget_entry_exists" and f.get("ok")
+    }
 
     # paths scopes recent edits; otherwise walk the reviewable payload surface.
     files_to_check: List[pathlib.Path] = []
@@ -620,51 +833,73 @@ def _handle_skill_preflight(
                 "stdout": result["stdout"][:2000],
             })
             continue
-        validator = _VALIDATORS.get(suffix)
+        classic_script = path in module_entries
+        validator = _CLASSIC_SCRIPT_VALIDATOR if classic_script else _VALIDATORS.get(suffix)
         if validator is None:
             continue
         argv_template, runtime = validator
-        runtime_path = _resolve_runtime(runtime)
+        grammar = {"grammar": "classic_script"} if classic_script else {}
+        runtime_path, runtime_reason = _resolve_runtime(runtime)
         rel_path = str(path.relative_to(skill_dir))
         if runtime_path is None:
-            # Missing external runtime is an environment gap, not a syntax
-            # verdict. Skip it (do not block); tri-model review still reads the
-            # file in full.
+            # Missing/unusable external runtime is an environment gap, not a
+            # syntax verdict. Skip it (do not block) and disclose the health
+            # reason; tri-model review still reads the file in full.
+            reason_note = f" ({runtime_reason})" if runtime_reason else ""
             file_findings.append({
                 "path": rel_path,
                 "runtime": runtime,
                 "ok": True,
                 "skipped": True,
                 "skip_reason": "runtime_unavailable",
-                "detail": f"{runtime} not on PATH — syntax not verified; relying on tri-model review",
+                "detail": (
+                    f"{runtime} not usable{reason_note} — syntax not verified; "
+                    "relying on tri-model review"
+                ),
+                **grammar,
             })
             continue
         cmd = [runtime_path] + [str(path) if part == "{path}" else part for part in argv_template[1:]]
         result = _run_check(cmd, cwd=skill_dir)
         rc = result["returncode"]
         timed_out = bool(result["timeout"])
-        if timed_out or (isinstance(rc, int) and rc < 0):
+        pre_exec = str(result.get("pre_exec_failure") or "")
+        if timed_out or pre_exec or (isinstance(rc, int) and rc < 0):
             # The validator process itself failed to run to completion — e.g. a
             # Homebrew `node` killed by macOS code-signing enforcement
-            # (SIGKILL), or a timeout. This is infrastructure, not a syntax
+            # (SIGKILL), a preflight-deadline kill, or a runtime that vanished
+            # between resolution and exec. This is infrastructure, not a syntax
             # error: only a clean non-zero exit (rc > 0) means bad syntax.
             # Skip so a working skill is not falsely blocked; tri-model review
             # remains the authoritative gate.
-            file_findings.append({
+            if timed_out:
+                skip_reason, detail = "validator_timeout", "timed out"
+            elif pre_exec:
+                skip_reason, detail = "validator_not_started", f"never started: {pre_exec}"
+            else:
+                # The signal NAME comes from the one host signal table, and is
+                # empty on a platform with no such signal — the disclosed
+                # residual, never a fabricated POSIX name.
+                signal_name = signal_name_for_returncode(rc)
+                skip_reason = "validator_killed"
+                detail = f"process killed, {signal_name or f'exit {rc}'}"
+            finding = {
                 "path": rel_path,
                 "runtime": runtime,
                 "ok": True,
                 "skipped": True,
-                "skip_reason": "validator_timeout" if timed_out else "validator_killed",
-                "detail": (
-                    f"{runtime} syntax not verified ("
-                    + ("timed out" if timed_out else f"process killed, signal {-rc}")
-                    + "); relying on tri-model review"
-                ),
+                "skip_reason": skip_reason,
+                "detail": f"{runtime} syntax not verified ({detail}); relying on tri-model review",
                 "returncode": rc,
                 "timeout": timed_out,
                 "stderr": result["stderr"][:2000],
-            })
+                **grammar,
+            }
+            if pre_exec:
+                finding["pre_exec_failure"] = pre_exec
+            if result.get("killed_by_host"):
+                finding["killed_by_host"] = True
+            file_findings.append(finding)
             continue
         ok = rc == 0
         file_findings.append({
@@ -675,6 +910,7 @@ def _handle_skill_preflight(
             "timeout": timed_out,
             "stderr": result["stderr"][:2000],
             "stdout": result["stdout"][:2000],
+            **grammar,
         })
 
     # ok iff every contract check passes and every file that was ACTUALLY
@@ -691,6 +927,7 @@ def _handle_skill_preflight(
         all(f.get("ok") for f in manifest_findings)
         and all(f.get("ok") for f in widget_findings)
         and all(f.get("ok") for f in permission_findings)
+        and all(f.get("ok") for f in presence_findings)
         and all(f.get("ok") for f in file_findings if not f.get("skipped"))
     )
     skipped_files = [f for f in file_findings if f.get("skipped")]
@@ -713,6 +950,8 @@ def _handle_skill_preflight(
         "omitted_files": omitted_files,
         "ok": bool(overall_ok),
     }
+    if presence_findings:
+        payload["presence"] = presence_findings
     notes: List[str] = []
     if skipped_files:
         notes.append(
@@ -743,10 +982,10 @@ _PREFLIGHT_SCHEMA = {
     "name": "skill_preflight",
     "description": (
         "Read-only payload syntax/contract validator for one skill. Runs Python "
-        "compile() (no __pycache__), node --check, and bash -n on every reviewable file "
-        "(or just the ones in `paths` if provided), plus a manifest "
-        "parse and static widget render-schema validation. Cheap and offline (no LLM, no review.json mutation, "
-        "no review status change). Heal-mode agents use this before "
+        "compile() (no __pycache__), bash -n, and node syntax checks (a declared module-widget "
+        "entry gets classic-script grammar) on every reviewable file, or just `paths`, plus a manifest "
+        "parse, module-widget entry existence, and static render-schema validation. Cheap and offline (no LLM, no review.json mutation, "
+        "no review status change). Skill-development tasks use this before "
         "calling skill_review so silly syntax errors are caught "
         "without spending tri-model review tokens. Argv-only "
         "subprocess invocation, cwd=skill_dir, scrubbed env, 30s "

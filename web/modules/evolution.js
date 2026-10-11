@@ -1,5 +1,28 @@
-import { escapeHtmlText, formatUsd2 } from './utils.js';
+import { allowanceLabel, escapeHtmlText, formatUsd2 } from './utils.js';
 import { apiFetch } from './api_client.js';
+import { openConfirmDialog } from './confirm_dialog.js';
+import { applyChartTheme, chartChrome, onThemeChange } from './theme_palette.js';
+import { tr } from './i18n.js';
+
+/**
+ * Ask for the evolution-campaign objective (pure decision helper, node-tested
+ * with an injected dialog). window.prompt is dead on the macOS desktop shell
+ * (pywebview/WKWebView answers null silently), which made Start campaign a
+ * one-click PAID launch with a hidden-empty objective and no way to cancel.
+ * Semantics (owner-approved Б1-8): cancel/Escape/backdrop = do NOT start;
+ * confirmed-empty = start with the default autonomous objective downstream
+ * (evolution_lifecycle.py); confirmed-text = start with that objective.
+ */
+export async function promptCampaignObjective({ dialogImpl = openConfirmDialog } = {}) {
+    const answer = await dialogImpl({
+        title: 'Start evolution campaign',
+        body: 'Evolution campaign objective (optional). Leave empty to let Ouroboros pick its own autonomous objective.',
+        input: true,
+        confirmLabel: 'Start campaign',
+    });
+    if (!answer?.confirmed) return { confirmed: false, objective: '' };
+    return { confirmed: true, objective: String(answer.value || '').trim() };
+}
 
 export function initEvolution({ ws, state, mount }) {
     const page = document.createElement('div');
@@ -45,6 +68,7 @@ export function initEvolution({ ws, state, mount }) {
     let evoChart = null;
     let loadSequence = 0;
     let chartLoaded = false;
+    let disposed = false;
     const refreshBtn = document.getElementById('evo-refresh');
     const startBtn = document.getElementById('evo-start');
     const stopBtn = document.getElementById('evo-stop');
@@ -93,13 +117,22 @@ export function initEvolution({ ws, state, mount }) {
     }
 
     function pillTone(status) {
-        if (['running', 'queued', 'idle_ready'].includes(status)) return 'online';
-        if (['waiting_for_idle', 'waiting_for_owner_chat', 'waiting_for_restart_verify', 'paused', 'starting'].includes(status)) return 'starting';
-        if (['budget_blocked', 'budget_stopped', 'paused_failures', 'error_backoff'].includes(status)) return 'error';
+        if (['running', 'queued', 'idle_ready', 'thinking', 'sleeping'].includes(status)) return 'online';
+        if (['waiting_for_idle', 'waiting_for_owner_chat', 'waiting_for_first_conversation', 'waiting_for_restart_verify', 'paused', 'starting', 'state_unknown', 'unknown', 'wake_paused', 'wake_outcome_unknown'].includes(status)) return 'starting';
+        if (['budget_blocked', 'budget_stopped', 'paused_failures', 'error_backoff', 'allowance_exhausted', 'allowance_unknown', 'wake_failed', 'wake_rejected'].includes(status)) return 'error';
         return 'offline';
     }
 
     function shortStatusLabel(status, fallback = 'off') {
+        if (status === 'wake_paused') return tr('consciousness.wake_paused', 'paused');
+        if (status === 'wake_outcome_unknown') return tr('consciousness.wake_outcome_unknown', 'unknown');
+        if (status === 'state_unknown' || status === 'unknown') return 'unknown';  // a null control is never "off"
+        if (status === 'thinking') return 'thinking';
+        if (status === 'sleeping') return 'sleeping';
+        if (status === 'waiting_for_first_conversation') return 'needs owner';
+        if (status === 'allowance_exhausted' || status === 'allowance_unknown') return 'allowance';
+        if (status === 'wake_failed') return 'failed';
+        if (status === 'wake_rejected') return 'refused';
         if (status === 'running') return 'running';
         if (status === 'queued') return 'queued';
         if (status === 'idle_ready') return 'idle';
@@ -122,8 +155,10 @@ export function initEvolution({ ws, state, mount }) {
         const evolution = runtime.evolution_state || {};
         const campaign = evolution.campaign || {};
         const consciousness = runtime.bg_consciousness_state || {};
-        const evolutionStatus = evolution.status || (runtime.evolution_enabled ? 'idle_ready' : 'disabled');
-        const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled ? 'running' : 'disabled');
+        const evolutionStatus = evolution.status || (runtime.evolution_enabled === null ? 'state_unknown'
+            : runtime.evolution_enabled ? 'idle_ready' : 'disabled');
+        const consciousnessStatus = consciousness.status || (runtime.bg_consciousness_enabled === null ? 'unknown'
+            : runtime.bg_consciousness_enabled ? 'sleeping' : 'disabled');
 
         evolutionPill.className = `evo-runtime-pill ${pillTone(evolutionStatus)}`;
         evolutionPill.textContent = `Evolution ${shortStatusLabel(evolutionStatus, 'off')}`;
@@ -145,8 +180,10 @@ export function initEvolution({ ws, state, mount }) {
             runtimeChip('Failures', evolution.consecutive_failures || 0),
             runtimeChip('Budget left', Number.isFinite(Number(evolution.budget_remaining_usd)) ? formatUsd2(evolution.budget_remaining_usd) : ''),
             runtimeChip('Last evolution', formatTs(evolution.last_task_at)),
-            runtimeChip('Next wakeup', consciousness.next_wakeup_sec ? `${consciousness.next_wakeup_sec}s` : ''),
-            runtimeChip('Last background cycle', formatTs(consciousness.last_cycle_finished_at || consciousness.last_cycle_started_at)),
+            runtimeChip('Next wake-up', runtime.bg_consciousness_enabled ? formatTs(consciousness.next_wake_at) : ''),
+            runtimeChip('Last wake-up', formatTs(consciousness.last_wake_at)),
+            runtimeChip('Consciousness allowance (24 h)', allowanceLabel(
+                consciousness.spent_24h_usd, consciousness.daily_usd, consciousness.unknown_unmetered, consciousness.integrity_degraded)),
             runtimeChip('Updated', formatTs(generatedAt)),
         ].filter(Boolean).join('');
         if (campaignDetail) {
@@ -173,6 +210,7 @@ export function initEvolution({ ws, state, mount }) {
     }
 
     async function loadEvolution(force = false) {
+        if (disposed) return;
         chartLoaded = true;
         const requestId = ++loadSequence;
         refreshBtn.disabled = true;
@@ -282,14 +320,16 @@ export function initEvolution({ ws, state, mount }) {
                 scales: {
                     x: {
                         ticks: { color: '#64748b', font: { size: 10, family: 'JetBrains Mono, monospace' }, maxRotation: 45 },
-                        grid: { color: '#1e293b' },
+                        grid: { color: chartChrome().grid },
                     },
                     y: {
                         type: 'linear',
                         position: 'left',
+                        // Repaint assigns readable themed blue to this series
+                        // axis, and neutral themed ink to the other axes.
                         title: { display: true, text: 'Lines of Code', color: '#60a5fa', font: { size: 11 } },
                         ticks: { color: '#60a5fa', font: { size: 10 } },
-                        grid: { color: '#1e293b' },
+                        grid: { color: chartChrome().grid },
                     },
                     y1: {
                         type: 'linear',
@@ -301,6 +341,30 @@ export function initEvolution({ ws, state, mount }) {
                 },
             },
         });
+        repaintChart();
+    }
+
+    function repaintChart() {
+        if (!evoChart) return;
+        // Keep the series-coded blue axis in a readable foreground shade.
+        // Never rebuild an instance just to change its ink.
+        const { text, grid } = chartChrome();
+        const style = getComputedStyle(document.documentElement);
+        const token = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+        const blue = token('--status-info-fg', text);
+        const tooltip = evoChart.options?.plugins?.tooltip;
+        if (tooltip) {
+            tooltip.backgroundColor = token('--bg-secondary', tooltip.backgroundColor);
+            tooltip.titleColor = token('--text-primary', tooltip.titleColor);
+            tooltip.bodyColor = token('--text-meta', tooltip.bodyColor);
+        }
+        for (const [id, scale] of Object.entries(evoChart.scales || {})) {
+            const options = scale.options;
+            if (options.grid) options.grid.color = grid;
+            if (options.ticks) options.ticks.color = id === 'y' ? blue : text;
+            if (options.title) options.title.color = id === 'y' ? blue : text;
+        }
+        applyChartTheme(evoChart, { scales: {} });
     }
 
     function renderTagsList(points) {
@@ -343,11 +407,14 @@ export function initEvolution({ ws, state, mount }) {
         loadEvolution(true);
     });
     startBtn?.addEventListener('click', async () => {
-        const objective = window.prompt('Evolution campaign objective (optional):', '') || '';
+        const asked = await promptCampaignObjective();
+        // Cancel = no campaign start (semantic fix, owner-approved Б1-8: the
+        // old `prompt() || ''` started a paid campaign even on Cancel/null).
+        if (!asked.confirmed) return;
         await apiFetch('/api/command', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ cmd: `/evolve on${objective.trim() ? ` ${objective.trim()}` : ''}` }),
+            body: JSON.stringify({ cmd: `/evolve on${asked.objective ? ` ${asked.objective}` : ''}` }),
         });
         loadEvolution(true);
     });
@@ -360,24 +427,39 @@ export function initEvolution({ ws, state, mount }) {
         loadEvolution(true);
     });
 
-    ws.on('open', () => {
+    const unsubscribeOpen = ws.on('open', () => {
         if (isEvolutionVisible()) {
             ensureEvolutionLoaded(false);
         }
     });
 
-    window.addEventListener('ouro:page-shown', (event) => {
+    const onPageShown = (event) => {
         if (event?.detail?.page === 'dashboard' && state.dashboardActiveSubtab === 'evolution') {
             ensureEvolutionLoaded(false);
         }
-    });
-    window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
+    };
+    const onSubtabShown = (event) => {
         if (event?.detail?.tab === 'evolution') ensureEvolutionLoaded(false);
-    });
-
-    document.addEventListener('visibilitychange', () => {
+    };
+    const onVisibilityChange = () => {
         if (!document.hidden && isEvolutionVisible()) {
             if (chartLoaded) loadEvolution(false);
         }
-    });
+    };
+    window.addEventListener('ouro:page-shown', onPageShown);
+    window.addEventListener('ouro:dashboard-subtab-shown', onSubtabShown);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const unsubscribeTheme = onThemeChange(repaintChart);
+    return () => {
+        if (disposed) return;
+        disposed = true;
+        loadSequence += 1;
+        unsubscribeOpen();
+        unsubscribeTheme();
+        window.removeEventListener('ouro:page-shown', onPageShown);
+        window.removeEventListener('ouro:dashboard-subtab-shown', onSubtabShown);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        if (evoChart) evoChart.destroy();
+        evoChart = null;
+    };
 }

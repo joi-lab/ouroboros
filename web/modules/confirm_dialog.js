@@ -1,14 +1,43 @@
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { bindDialogFocus } from './ui_interactions.js';
 
 let activeDialog = null;
 let activeClose = null;
 
+/**
+ * Render one caller-supplied typed detail disclosure. Values are always text;
+ * callers cannot inject markup into the shared dialog.
+ * @param {{summary?: string, rows?: Array<{label?: string, value?: string}>}|null} details
+ */
+export function renderConfirmDialogDetails(details) {
+    if (!details || typeof details !== 'object') return '';
+    const rows = Array.isArray(details.rows)
+        ? details.rows.filter((row) => row && typeof row === 'object')
+        : [];
+    if (!rows.length) return '';
+    const renderedRows = rows.map((row) => `
+        <div class="confirm-dialog-detail-row">
+            <dt>${escapeHtml(String(row.label ?? 'Detail'))}</dt>
+            <dd>${escapeHtml(String(row.value ?? ''))}</dd>
+        </div>`).join('');
+    return `<details class="confirm-dialog-details ui-rich-content">
+        <summary>${escapeHtml(String(details.summary ?? 'Show details'))}</summary>
+        <dl class="confirm-dialog-detail-list">${renderedRows}
+        </dl>
+    </details>`;
+}
+
 export function openConfirmDialog({
     title,
     body,
+    details = null,
     input = false,
     initialValue = '',
-    confirmLabel = 'Continue',
+    // Alert mode (v6.90.3): one OK-style button, no cancel button. Escape,
+    // backdrop, and the header Close still resolve the promise (false), same
+    // as a cancelled confirm — callers treat any resolution as "seen".
+    alert = false,
+    confirmLabel = alert ? 'OK' : 'Continue',
     cancelLabel = 'Cancel',
     danger = false,
 } = {}) {
@@ -24,27 +53,34 @@ export function openConfirmDialog({
                 </div>
                 <div class="marketplace-modal-body">
                     <p>${escapeHtml(body || 'Continue?')}</p>
-                    ${input ? `<input class="files-modal-input confirm-dialog-input" data-confirm-input type="text" value="${escapeHtml(initialValue)}">` : ''}
+                    ${renderConfirmDialogDetails(details)}
+                    ${input ? `<input class="ui-control files-modal-input confirm-dialog-input" data-confirm-input type="text" aria-labelledby="confirm-dialog-title" value="${escapeHtml(initialValue)}">` : ''}
                 </div>
                 <div class="marketplace-modal-actions">
-                    <button type="button" class="btn btn-default" data-confirm-cancel>${escapeHtml(cancelLabel)}</button>
+                    ${alert ? '' : `<button type="button" class="btn btn-default" data-confirm-cancel>${escapeHtml(cancelLabel)}</button>`}
                     <button type="button" class="btn ${danger ? 'btn-danger' : 'btn-primary'}" data-confirm-ok>${escapeHtml(confirmLabel)}</button>
                 </div>
             </div>
         `;
         let settled = false;
+        let disposeFocus = null;
         const finish = (value) => {
             if (settled) return;
             settled = true;
             document.removeEventListener('keydown', onKey);
             if (activeDialog === backdrop) activeDialog = null;
-            if (activeClose === finish) activeClose = null;
+            if (activeClose === cancel) activeClose = null;
+            disposeFocus?.();
             backdrop.remove();
             resolve(value);
         };
         const result = (confirmed) => input
             ? { confirmed, value: confirmed ? (backdrop.querySelector('[data-confirm-input]')?.value || '') : '' }
             : confirmed;
+        // Supersession must honor the MODE's contract: a newer dialog cancelling
+        // this one resolves the same shape a user cancel would ({confirmed:false,
+        // value:''} in input mode), never a bare false the docs do not promise.
+        const cancel = () => finish(result(false));
         backdrop.addEventListener('click', (event) => {
             if (event.target === backdrop || event.target.closest('[data-confirm-cancel]')) {
                 finish(result(false));
@@ -53,7 +89,9 @@ export function openConfirmDialog({
             }
         });
         const onKey = (event) => {
-            if (event.key === 'Escape' && activeDialog === backdrop) {
+            if (activeDialog !== backdrop || event.defaultPrevented || event.isComposing) return;
+            if (event.key === 'Escape') {
+                event.preventDefault();
                 finish(result(false));
             } else if (input && event.key === 'Enter' && event.target?.matches?.('[data-confirm-input]')) {
                 event.preventDefault();
@@ -63,8 +101,11 @@ export function openConfirmDialog({
         document.addEventListener('keydown', onKey);
         document.body.appendChild(backdrop);
         activeDialog = backdrop;
-        activeClose = finish;
-        (backdrop.querySelector(input ? '[data-confirm-input]' : '[data-confirm-ok]'))?.focus();
+        activeClose = cancel;
+        disposeFocus = bindDialogFocus(backdrop.querySelector('[role="dialog"]'), {
+            initialFocus: backdrop.querySelector(input ? '[data-confirm-input]' : '[data-confirm-ok]'),
+            onEscape: cancel,
+        });
         backdrop.querySelector('[data-confirm-input]')?.select?.();
     });
 }

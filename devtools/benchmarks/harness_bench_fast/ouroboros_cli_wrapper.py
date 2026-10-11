@@ -9,6 +9,8 @@
 This wrapper preserves that contract and delegates to ``ouroboros run`` with the
 current working directory as the external workspace root. The wrapper writes
 per-task logs outside the transient benchmark workspace so they survive cleanup.
+Downstream the prompt is handed to ``ouroboros run`` via ``--prompt-file`` (the
+durable ``prompt.txt`` in the log dir), never as an argv tail (E2BIG hygiene).
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ DEFAULT_REPO = pathlib.Path(__file__).resolve().parents[3]
 if str(DEFAULT_REPO) not in sys.path:
     sys.path.insert(0, str(DEFAULT_REPO))
 
+from devtools.benchmarks.common.model_slots import (  # noqa: E402
+    fixed_model_actor_snapshot,
+)
 from devtools.benchmarks.common.result_index import runtime_terminal_disclosure  # noqa: E402
 
 DEFAULT_DATA = DEFAULT_REPO.parent / "data"
@@ -113,7 +118,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--data-dir", default=str(DEFAULT_DATA))
     parser.add_argument("--settings-path", default=str(DEFAULT_SETTINGS))
     parser.add_argument("--ouroboros-bin", default=os.environ.get("OUROBOROS_BIN") or str(DEFAULT_OUROBOROS_BIN))
-    parser.add_argument("--model", default="")
+    parser.add_argument("--model", required=True)
     parser.add_argument("--log-root", default="")
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--memory-mode", default="empty", choices=["empty", "forked", "shared"])
@@ -143,12 +148,14 @@ def main(argv: list[str] | None = None) -> int:
     log_dir = log_root / run_id
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    (log_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+    prompt_path = log_dir / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
     summary_path = log_dir / "summary.json"
     result_json = log_dir / "ouroboros-task-result.json"
     started = time.time()
 
     env = os.environ.copy()
+    fixed_actor = fixed_model_actor_snapshot(args.model, target=env)
     env.update(
         {
             "OUROBOROS_REPO_DIR": str(repo_dir),
@@ -159,16 +166,6 @@ def main(argv: list[str] | None = None) -> int:
             "PYTHONUNBUFFERED": "1",
         }
     )
-    if args.model:
-        env.update(
-            {
-                "OUROBOROS_MODEL": args.model,
-                "OUROBOROS_MODEL_HEAVY": args.model,
-                "OUROBOROS_MODEL_LIGHT": args.model,
-                "OUROBOROS_MODEL_FALLBACKS": args.model,
-            }
-        )
-
     cmd = [
         str(pathlib.Path(args.ouroboros_bin).expanduser()),
         "run",
@@ -186,7 +183,9 @@ def main(argv: list[str] | None = None) -> int:
     ]
     if not args.no_start_server:
         cmd.append("--start")
-    cmd.append(prompt)
+    # E2BIG hygiene (C5): the prompt already lives on disk above; it travels to
+    # `ouroboros run` as a file, never as an argv tail.
+    cmd.extend(["--prompt-file", str(prompt_path)])
 
     def _run_once() -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -226,6 +225,9 @@ def main(argv: list[str] | None = None) -> int:
             "data_dir": str(data_dir),
             "settings_path": str(settings_path),
             "model": args.model,
+            "model_slots": fixed_actor["model_slots"],
+            "available_subagents": fixed_actor["available_subagents"],
+            "fixed_model_actor": fixed_actor,
             "memory_mode": args.memory_mode,
             "returncode": completed.returncode,
             "startup_retries": startup_retries,

@@ -1,0 +1,29 @@
+{
+  "status": {
+    "daemon": {"state": "running", "engine_version": "fixture"},
+    "runtime": {"status": "ready"},
+    "unified_accounts": true,
+    "reads": {"catalog": "ok", "accounts": "ok", "quota": "ok"},
+    "harnesses": [
+      {"id": "codex", "display_name": "Codex", "enabled": true, "status": "ok", "models": [{"id": "gpt-test"}]},
+      {"id": "claude", "display_name": "Claude Code", "enabled": true, "status": "ok", "models": [{"id": "claude-test"}]},
+      {"id": "cursor", "display_name": "Cursor", "enabled": true, "status": "ok", "models": []}
+    ],
+    "profiles": {"harnessAccounts": [], "profiles": [
+      {"profile": {"profile_id": "personal", "harness_id": "codex", "enabled": true}, "status": {"verification": "passed", "availability": "available"}, "identity": {"label": "Personal"}},
+      {"profile": {"profile_id": "work", "harness_id": "codex", "enabled": true}, "status": {"verification": "passed", "availability": "available"}, "identity": {"label": "Work"}}
+    ]},
+    "quota": []
+  },
+  "catalog": {
+    "model_sources": [{"id": "codex", "label": "Codex", "credentialHarness": "codex"}],
+    "items": [{"id": "gpt-test", "value": "claudexor::codex=gpt-test", "name": "Fixture model", "label": "Fixture model", "source_id": "codex", "credential_profile_id": "personal", "context_window": 272000, "max_context_window": 872000, "is_default": true, "provenance": "fixture", "supported_options": ["reasoning_effort"]}],
+    "errors": []
+  },
+  "preview": {
+    "source": "onboarding_default",
+    "available_subagents": {"enabled": true, "items": [{"subagent_id": "codex", "recommended_use": "General tasks and independent reviews.", "route": {"kind": "agent_session", "target_id": "codex=gpt-test"}}]},
+    "model_settings": {"OUROBOROS_MODEL": "claudexor::codex=gpt-test", "OUROBOROS_MODEL_LIGHT": "claudexor::codex=gpt-test", "OUROBOROS_MODEL_VISION": "", "OUROBOROS_MODEL_CONSCIOUSNESS": "", "OUROBOROS_MODEL_FALLBACKS": "", "OUROBOROS_MODEL_ACCOUNTS": {}, "OUROBOROS_MODEL_CONTEXT_WINDOWS": {}},
+    "reviewer_slots": {"triad": [{"slot_id": "triad_1", "subagent_id": "codex"}], "scope": [{"slot_id": "scope_1", "subagent_id": "codex"}], "advisory": {"enabled": true, "subagent_id": "codex"}, "deep_review": {"subagent_id": "codex"}}
+  }
+}

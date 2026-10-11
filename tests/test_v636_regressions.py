@@ -34,7 +34,8 @@ def test_reroute_same_model_strips_reasoning_and_unpins():
         "extra_body": {"provider": {"allow_fallbacks": False}, "reasoning": {"effort": "medium"}},
     }
     out = inst._reroute_same_model_kwargs(target, kwargs)
-    assert not LLMClient._has_openrouter_reasoning_details(out["messages"])
+    assert not any(m.get("reasoning_details") for m in out["messages"])
+    assert LLMClient._has_replayed_reasoning_metadata(out["messages"]) is False
     assert "allow_fallbacks" not in out.get("extra_body", {}).get("provider", {})
     # nothing pins a provider (no reasoning continuity) -> no reroute needed
     assert inst._reroute_same_model_kwargs(target, {"messages": [{"role": "user", "content": "x"}]}) is None
@@ -80,27 +81,37 @@ def test_create_with_retries_reroutes_once_on_transient_body_error(tmp_path, mon
     assert "allow_fallbacks" not in calls[1].get("extra_body", {}).get("provider", {})
 
 
-# --- WA2: provider-death -> best-effort shelf / salvage -----------------------
-def test_provider_unavailable_salvages_then_best_effort(monkeypatch):
+# --- WA2 (amended by the slime-saga honesty fix): provider-death -> salvage the
+# text, but terminalize as an INFRA FAILURE, never a completion ------------------
+def test_provider_unavailable_salvages_then_terminalizes_as_infra_failure(tmp_path, monkeypatch):
     import ouroboros.loop as loop
+    from ouroboros.outcomes import derive_loop_outcome
+
     ctx = SimpleNamespace(
         messages=[{"role": "user", "content": "do"}, {"role": "assistant", "content": "partial A"}],
-        llm=None, active_model="m", active_effort="medium", max_retries=1,
-        drive_logs=pathlib.Path("/tmp"), task_id="t", round_idx=1, event_queue=None,
+        tools=None, llm=None, active_model="m", active_effort="medium", max_retries=1,
+        drive_logs=tmp_path / "logs", task_id="t", round_idx=1, event_queue=None,
         accumulated_usage={}, task_type="", active_use_local=False, max_rounds=10, deadline_ts=None,
     )
-    # provider stays dead -> final call yields nothing -> salvage last assistant text (NOT best_effort)
+    # provider stays dead -> final call yields nothing -> salvage last assistant text
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
     text, usage, _ = loop._handle_provider_unavailable(ctx)
     assert text == "partial A"
     assert usage.get("reason_code") == "provider_unavailable"
+    assert usage.get("execution_status") == "infra_failed"
     assert not usage.get("_best_effort_extracted")
-    # provider recovers (reroute) -> fresh final answer -> best_effort
+    # provider recovers (reroute) -> the fresh final answer still rides the result
+    # BODY, but the task remains an interruption: infra_failed execution (terminal
+    # status failed), never the old "completed (best effort)" promotion.
     ctx.accumulated_usage = {}
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *a, **k: ({"content": "FINAL"}, 0.01))
     text2, usage2, _ = loop._handle_provider_unavailable(ctx)
     assert text2 == "FINAL"
-    assert usage2.get("_best_effort_extracted") is True
+    assert usage2.get("execution_status") == "infra_failed"
+    outcome = derive_loop_outcome(text2, usage2, {"tool_calls": [], "reasoning_notes": []})
+    execution = outcome["outcome_axes"]["execution"]
+    assert execution["status"] == "infra_failed"
+    assert execution["reason_code"] == "provider_unavailable"
 
 
 # --- WA3: reviewer-slot SSOT / adaptive quorum --------------------------------
@@ -278,7 +289,7 @@ def _apply_agent_acceptance_payload(trace, payload):
         }],
         [],
         trace,
-        emit_progress=lambda _msg: None,
+        emit_progress=lambda _msg, *, incident=None: None,
     )
 
 
@@ -356,13 +367,16 @@ def test_provider_unavailable_no_salvage_path_does_not_raise(monkeypatch):
     assert isinstance(text, str)
 
 
-def test_provider_unavailable_recovered_answer_lifts_to_best_effort():
-    """claudexor confirm-round finding (WA2): a genuinely-extracted final answer on
-    the provider-death path (reason_code provider_unavailable + _best_effort_extracted)
-    must reduce to best_effort, not a flat failure — provider_unavailable must be in
-    the best-effort reason-code allowlist."""
+def test_provider_unavailable_is_never_a_best_effort_completion():
+    """Slime-saga honesty fix (reverses the WA2 confirm-round decision): a task
+    killed by provider unavailability with an unmet objective must terminalize as
+    an infra failure, never be promoted to "completed (best effort)" — so
+    provider_unavailable must NOT be in the best-effort reason-code allowlist,
+    while benchmark truncation disclosure still covers it explicitly."""
     from ouroboros.outcomes import BEST_EFFORT_REASON_CODES
-    assert "provider_unavailable" in BEST_EFFORT_REASON_CODES
+    from devtools.benchmarks.common.result_index import RUNTIME_TRUNCATION_REASON_CODES
+    assert "provider_unavailable" not in BEST_EFFORT_REASON_CODES
+    assert "provider_unavailable" in RUNTIME_TRUNCATION_REASON_CODES
 
 
 def test_auto_acceptance_capsule_wrapped_review_is_still_ingested():
@@ -428,3 +442,123 @@ def test_skill_review_history_persists_single_reviewer_marker(tmp_path):
     )
     rec = _json.loads(_review_history_path(tmp_path, "demo").read_text(encoding="utf-8").strip().splitlines()[-1])
     assert rec.get("single_reviewer_no_diversity") is True
+
+
+def test_vlm_allowed_roots_derive_from_policy_matrix(tmp_path, monkeypatch):
+    """view_image roots come from the ONE Tool API matrix (wave3 r8/r9: the
+    private list could not see subagent_projects, forcing a copy-shuffle into
+    artifact_store before viewing a coop-tree render)."""
+    from ouroboros.tools import vision
+
+    projects = tmp_path / "projects"
+    projects.mkdir()
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(projects))
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    roots = vision._allowed_file_roots(ctx)
+    assert any(str(projects) == str(r) for r in roots)
+
+
+def test_vlm_user_files_admission_read_parity(tmp_path, monkeypatch):
+    """SC-6 read_file parity both ways (capinv-447 / В23=A): a credential-SHAPED
+    name under home is READABLE for the root principal (read_file no longer
+    shape-denies it), while the user_files LOCATION guards still apply — a
+    control-plane path stays refused."""
+    from ouroboros.tools import vision
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    img = home / "token.png"  # credential-like NAME under home
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(tmp_path / "data"))
+    _payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert "USER_FILES_PATH_BLOCKED" not in (err or "")
+
+
+def test_vlm_child_reads_credential_named_runtime_content(tmp_path, monkeypatch):
+    """Helpers may view parent-readable content under credential-shaped names."""
+    from ouroboros.tools import vision
+
+    data = tmp_path / "data"
+    secret_dir = data / "auth"
+    secret_dir.mkdir(parents=True)
+    img = secret_dir / "cap.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(data),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    monkeypatch.setattr(vision, "_downscale_image_for_vlm", lambda raw, mime: (raw, mime))
+    payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert payload is not None and err == ""
+
+
+def test_vlm_project_store_guard_applies(tmp_path):
+    """SC-6 read_file parity: the per-project facts store (projects/<id>/) is
+    reachable only via the project-scoped knowledge tools — read_file denies it
+    for EVERY profile, so the matrix-derived runtime_data admission must too."""
+    from ouroboros.tools import vision
+
+    data = tmp_path / "data"
+    store = data / "projects" / "p1"
+    store.mkdir(parents=True)
+    img = store / "img.png"
+    img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(data))
+    payload, err = vision._load_local_image_payload(ctx, str(img))
+    assert payload is None
+    assert "ACCESS_DENIED" in err and "projects/<id>/" in err
+
+
+def test_vlm_split_drive_child_canonical_owner_state_blocked(tmp_path, monkeypatch):
+    """G5-3: a forked/empty subagent runs on an ISOLATED child drive, so its
+    ctx.drive_root ≠ the CANONICAL data root. ``_allowed_file_roots`` admits
+    ``<canonical>/state/skills`` off OUROBOROS_DATA_DIR, so a skill owner-state
+    file there passes root admission — but the SC-6 guard anchored ONLY on
+    ctx.drive_root (the child) let ``relative_to`` fail and the restricted-
+    subagent owner-control guard NEVER ran. read_file refuses that path; view_image
+    must too. The guard must anchor on every admitted runtime-data root."""
+    from ouroboros.tools import vision
+
+    canonical = tmp_path / "data"                 # the real/parent drive
+    child = canonical / "state" / "headless_tasks" / "t1" / "data"  # isolated child
+    child.mkdir(parents=True)
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    owner_state = canonical / "state" / "skills" / "myskill" / "grants.json"
+    owner_state.parent.mkdir(parents=True)
+    # PNG bytes: WITHOUT the fix this file is admitted AND passes the MIME sniff,
+    # so a read-only child would receive the owner-control file's bytes as an image.
+    owner_state.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    ctx = SimpleNamespace(
+        repo_dir=tmp_path / "repo",
+        drive_root=str(child),
+        budget_drive_root=str(canonical),
+        task_constraint={"mode": "local_readonly_subagent"},
+    )
+    payload, err = vision._load_local_image_payload(ctx, str(owner_state))
+    assert payload is None
+    # This is the same ordinary-mode skill owner-state rule as the parent.
+    assert "DATA_READ_BLOCKED" in err or "USER_FILES_PATH_BLOCKED" in err
+
+
+def test_vlm_split_drive_child_canonical_job_artifact_admitted(tmp_path, monkeypatch):
+    """G5-3 companion: the widened guard-anchor set must NOT over-block. A
+    legitimate skill job output (a screenshot under state/skills/<name>/jobs/...)
+    on the canonical root stays admitted for an orchestrating profile — only the
+    secret/owner-control/project-store paths are refused."""
+    from ouroboros.tools import vision
+
+    import pathlib
+
+    canonical = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(canonical))
+    shot = canonical / "state" / "skills" / "myskill" / "jobs" / "run1" / "shot.png"
+    shot.parent.mkdir(parents=True)
+    shot.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+    # Orchestrating profile (no subagent constraint) — drive_root == canonical.
+    ctx = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=str(canonical))
+    # Assert the shared parity gate itself is clean (empty = admitted); the later
+    # PIL decode of these placeholder bytes is out of scope for the guard.
+    assert vision._read_file_parity_block(ctx, pathlib.Path(str(shot)).resolve()) == ""
+    assert any(vision._path_is_under(pathlib.Path(str(shot)).resolve(), r) for r in vision._allowed_file_roots(ctx))

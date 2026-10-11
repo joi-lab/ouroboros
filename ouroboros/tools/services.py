@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 import re
 import stat
@@ -13,19 +12,40 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tools.tool_result import launch_refusal_result
 from ouroboros.observability import redact_projection, write_blob
+from ouroboros.secret_masking import redact_known_values
 from ouroboros.platform_layer import (
     bootstrap_process_path,
     kill_process_group_id,
     kill_process_tree,
     process_group_id,
+    request_process_tree_kill,
+)
+from ouroboros.process_interpreters import (
+    active_node_resolution,
+    apply_env_path_prepend,
+    interpreter_path_overlay,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tool_access import resolve_shell_cwd
+from ouroboros.config import load_settings, runtime_settings
+from ouroboros.tools.tool_result import (
+    ToolResult,
+    _publish_tool_result,
+)
+from ouroboros.tool_access import (
+    ResolvedResourceBinding,
+    active_tool_profile,
+    build_resolved_resource_binding,
+    canonical_data_root,
+    shell_cwd_block_message,
+)
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
+from ouroboros.workspace_executor import overlay_env, resolve_process_env, service_env, validate_process_env
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
-from ouroboros.workspace_executor import map_host_path as executor_map_host_path
+from ouroboros.workspace_executor import _read_local_service_marker
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
 from ouroboros.workspace_executor import start_service as executor_start_service
@@ -46,13 +66,23 @@ class ServiceRecord:
     started_at: float = field(default_factory=time.time)
     readiness: Dict[str, Any] = field(default_factory=dict)
     ready: bool = False
+    ready_observed_at: str = ""
+    readiness_log_offset: int = 0
+    readiness_log_carry: bytes = b""
+    readiness_log_identity: tuple[int, int] | None = None
     outputs: List[str] = field(default_factory=list)
     cwd_root: str = ""
+    cwd_base: str = ""
+    cwd_source: str = ""
+    skill_name: str = ""
     before_outputs: Dict[str, tuple[bool, int, str]] = field(default_factory=dict)
     keep_alive: bool = False
+    env: Dict[str, str] = field(default_factory=dict, repr=False)
+    secret_values: tuple[str, ...] = field(default=(), repr=False)
 
 
 _LOCK = threading.Lock()
+_panic_requested = False
 _SERVICES: Dict[str, ServiceRecord] = {}
 _SERVICE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,80}$")
 _MAX_SERVICE_LOG_BLOB_BYTES = 5_000_000
@@ -75,15 +105,36 @@ def task_service_teardown(ctx: ToolContext) -> str:
     return "stop"
 
 
+def _service_output_binding(
+    ctx: ToolContext,
+    *,
+    cwd_root: str,
+    cwd_base: str,
+    cwd: str,
+    cwd_source: str,
+    skill_name: str,
+) -> ResolvedResourceBinding | None:
+    """Rehydrate the exact stored target identity without resolving it again."""
+
+    if not str(cwd_base or "").strip() or not str(cwd or "").strip():
+        return None
+    return ResolvedResourceBinding(
+        profile=active_tool_profile(ctx),
+        root=str(cwd_root or "active_workspace"),
+        operation="service",
+        base_path=pathlib.Path(cwd_base).resolve(strict=False),
+        target_path=pathlib.Path(cwd).resolve(strict=False),
+        source=str(cwd_source or cwd_root or "active_workspace"),
+        skill_name=str(skill_name or ""),
+        state_drive_root=canonical_data_root(ctx),
+    )
+
+
 def _executor_can_run_cwd(ctx: ToolContext, workdir: pathlib.Path) -> bool:
-    executor_ref = executor_ref_from_ctx(ctx)
-    if executor_ref is None:
-        return False
-    try:
-        executor_map_host_path(executor_ref, pathlib.Path(workdir).resolve(strict=False))
-        return True
-    except Exception:
-        return False
+    # Keep the service keyword spelling while sharing shell's reachability rule.
+    from ouroboros.tools.shell_process import _executor_can_run_cwd as reachable
+
+    return reachable(ctx, workdir)
 
 
 def _tail(path: pathlib.Path, chars: int) -> str:
@@ -116,49 +167,11 @@ def _readiness_timeout(readiness: Dict[str, Any] | None) -> tuple[float, str]:
 
 
 def _service_env() -> Dict[str, str]:
-    allowed_exact = {
-        "PATH",
-        "HOME",
-        "USERPROFILE",
-        "APPDATA",
-        "LOCALAPPDATA",
-        "TMPDIR",
-        "TMP",
-        "TEMP",
-        "LANG",
-        "LC_ALL",
-        "VIRTUAL_ENV",
-        "PYTHONPATH",
-        "NODE_PATH",
-        "SystemRoot",
-        "SYSTEMROOT",
-        "WINDIR",
-        "windir",
-        "COMSPEC",
-        "ComSpec",
-        "PATHEXT",
-        "PROCESSOR_ARCHITECTURE",
-        "NUMBER_OF_PROCESSORS",
-        "PROGRAMDATA",
-        "ProgramData",
-        "ProgramFiles",
-        "PROGRAMFILES",
-        "ProgramFiles(x86)",
-        "PROGRAMFILES(X86)",
-    }
-    allowed_casefold = {key.casefold() for key in allowed_exact}
-    env: Dict[str, str] = {}
-    for key, value in os.environ.items():
-        if key.casefold() not in allowed_casefold and not key.startswith("LC_"):
-            continue
-        try:
-            redacted = redact_projection(str(value))
-            if redacted.records:
-                continue
-        except Exception:
-            continue
-        env[key] = str(value)
-    return env
+    return service_env()
+
+
+def _service_diagnostic(record: ServiceRecord, value: Any) -> Any:
+    return redact_projection(redact_known_values(value, getattr(record, "secret_values", ()))).value
 
 
 def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
@@ -174,15 +187,17 @@ def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
         pass
 
 
-def _finalize_service_log_for_drive(drive_root: pathlib.Path, record: ServiceRecord) -> Dict[str, Any]:
+def _finalize_service_log_for_drive(
+    drive_root: pathlib.Path, record: ServiceRecord, *, log_path: pathlib.Path | None = None,
+) -> Dict[str, Any]:
     result: Dict[str, Any] = {"deleted_live_log": False, "full_log_ref": {}, "tail": "", "errors": []}
-    log_path = record.log_path
+    log_path = log_path if log_path is not None else record.log_path
     try:
         size = log_path.stat().st_size if log_path.exists() else 0
-        result["tail"] = str(redact_projection(_tail(log_path, _MAX_SERVICE_LOG_TAIL_CHARS)).value)
+        result["tail"] = _service_diagnostic(record, _tail(log_path, _MAX_SERVICE_LOG_TAIL_CHARS))
         if size <= _MAX_SERVICE_LOG_BLOB_BYTES:
             text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-            result["full_log_ref"] = write_blob(pathlib.Path(drive_root), text, kind="txt")
+            result["full_log_ref"] = write_blob(pathlib.Path(drive_root), _service_diagnostic(record, text), kind="txt")
         else:
             result["full_log_omitted"] = f"log exceeds {_MAX_SERVICE_LOG_BLOB_BYTES} byte blob cap"
     except Exception as exc:
@@ -316,16 +331,37 @@ def archive_task_service_logs(
 
 
 def _refresh_ready(record: ServiceRecord) -> bool:
-    if record.proc.poll() is not None:
-        record.ready = False
-        return False
-    readiness = record.readiness or {}
-    contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
-    if not contains:
-        record.ready = True
-        return True
-    record.ready = contains in _tail(record.log_path, 20_000)
-    return record.ready
+    with _LOCK:
+        if record.proc.poll() is not None:
+            record.ready = False
+            return False
+        if record.ready:
+            return True
+        readiness = record.readiness or {}
+        contains = str(readiness.get("stdout_contains") or readiness.get("log_contains") or "").strip()
+        if not contains:
+            record.ready = True
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+            return True
+        record.ready = _readiness_marker_observed(record, contains)
+        if record.ready:
+            record.ready_observed_at = record.ready_observed_at or utc_now_iso()
+        return record.ready
+
+
+def _readiness_marker_observed(record: ServiceRecord, marker: str) -> bool:
+    """Scan only unseen service-log bytes without turning the display tail into truth."""
+
+    return _read_local_service_marker(record, record.log_path, marker)
+
+
+def _refused_before_start(ctx: ToolContext, refusal: str) -> str:
+    """Producer fact: this start_service call refused during preparation, before
+    any process, service record or executor submission existed. Errors after
+    that point never carry it."""
+    from ouroboros.tools.shell import _pre_spawn_refusal
+
+    return _pre_spawn_refusal(ctx, refusal, tool="start_service")
 
 
 def _start_service(
@@ -336,38 +372,77 @@ def _start_service(
     readiness: Dict[str, Any] | None = None,
     outputs: List[str] | None = None,
     keep_alive: bool = False,
+    env: Dict[str, str] | None = None,
+    env_from_settings: Dict[str, str] | None = None,
+    _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     if not isinstance(cmd, list) or not cmd or not all(str(x).strip() for x in cmd):
-        return "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings."
+        return _refused_before_start(ctx, "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings.")
+    proposed_env = dict(env or {})
+    try:
+        refs = validate_process_env(env_from_settings)
+        if refs:
+            from ouroboros.tools.process_facts import settings_environment_allowed
+
+            if not settings_environment_allowed(ctx):
+                return _publish_tool_result(ctx, ToolResult(
+                    status="blocked", code="ACCESS_BLOCKED",
+                    text="⚠️ SERVICE_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed service environment. A root task can start the service; existing literal environment and configured MCP access remain available.",
+                    meta={"operation_outcome": "completed_no_effect"},
+                ))
+        env, secret_values = resolve_process_env(env, refs, settings=runtime_settings(settings_reader=load_settings) if refs else None)
+    except ValueError as exc:
+        return _refused_before_start(ctx, f"⚠️ TOOL_ARG_ERROR (start_service): {exc}")
     service_name, name_error = _sanitize_service_name(name)
     if name_error:
-        return name_error
+        return _refused_before_start(ctx, name_error)
     readiness_timeout, readiness_error = _readiness_timeout(readiness)
     if readiness_error:
-        return readiness_error
+        return _refused_before_start(ctx, readiness_error)
+    if _panic_requested:
+        return _refused_before_start(ctx, "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission")
     key = _service_key(ctx, service_name)
     with _LOCK:
         existing = _SERVICES.get(key)
         if existing and existing.proc.poll() is None:
-            return f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}"
+            return _refused_before_start(ctx, f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}")
     try:
-        workdir, cwd_root, _allowed_roots = resolve_shell_cwd(ctx, cwd, operation="service")
-        workdir = pathlib.Path(workdir).resolve(strict=False)
+        binding = _resolved_binding or build_resolved_resource_binding(
+            ctx,
+            operation="service",
+            process_cwd=cwd,
+        )
+        workdir = pathlib.Path(binding.target_path)
+        cwd_root = binding.root
     except Exception as exc:
-        return f"⚠️ SERVICE_CWD_ERROR: {type(exc).__name__}: {exc}"
-    try:
-        from ouroboros.protected_artifacts import shell_block_reason
+        # One failure class, one message (v6.54.3 SSOT): the canonical cwd block
+        # names every allowed root as label=path instead of a bare rootless
+        # ValueError echo; the SHELL_CWD_BLOCKED status is a typed policy denial.
+        return _refused_before_start(ctx, shell_cwd_block_message(ctx, cwd, operation="service", error=exc))
+    if _resolved_binding is None:
+        # Registry dispatch has already checked this exact prepared binding.
+        # A direct handler caller uses the same Supervisor before the first
+        # process effect, rather than a second black-box text detector.
+        from ouroboros.safety import check_safety
 
-        protected_block = shell_block_reason(ctx, cmd, cwd=str(workdir), default_cwd=workdir)
-        if protected_block:
-            return protected_block
-    except Exception:
-        pass
+        allowed, advice = check_safety("start_service", {
+            "cmd": cmd, "cwd": str(workdir), "name": service_name,
+            "env": proposed_env, "env_from_settings": refs,
+        }, messages=getattr(ctx, "messages", None), ctx=ctx, resolved_binding=binding)
+        if not allowed:
+            return _publish_tool_result(ctx, ToolResult(
+                status="blocked", code="SAFETY_VIOLATION", text=advice,
+                meta={"operation_outcome": "completed_no_effect"},
+            ))
+        if advice:
+            ctx.emit_progress_fn(advice)
     declared_outputs = [str(item) for item in (outputs or []) if str(item or "").strip()]
     try:
         from ouroboros.tools.shell import _snapshot_declared_outputs
 
-        before_outputs = _snapshot_declared_outputs(ctx, declared_outputs, workdir, cwd_root=cwd_root)
+        before_outputs = _snapshot_declared_outputs(
+            ctx, declared_outputs, workdir, cwd_root=cwd_root, binding=binding,
+        )
     except Exception:
         before_outputs = {}
     # Resolve the effective keep BEFORE choosing a backend: a task-level
@@ -376,6 +451,10 @@ def _start_service(
     # kills it once the task ends — breaking the keep contract for a service a
     # verifier still needs (triad review r1, gpt-5.5 critical).
     keep_alive = bool(keep_alive) or task_service_teardown(ctx) == "keep"
+    if existing is not None:
+        # Retire the exited host record before a new process can append to its
+        # log with a different environment (or switch to an executor backend).
+        _stop_service(ctx, name=service_name)
     if _executor_can_run_cwd(ctx, workdir):
         try:
             payload = executor_start_service(
@@ -384,18 +463,56 @@ def _start_service(
                 cmd=[str(part) for part in cmd],
                 host_cwd=workdir,
                 cwd_root=cwd_root,
+                cwd_base=str(binding.base_path),
+                cwd_source=binding.source,
+                skill_name=binding.skill_name,
                 readiness=dict(readiness or {}),
                 outputs=declared_outputs,
                 before_outputs=before_outputs,
                 keep_alive=keep_alive,
+                env_overlay=interpreter_path_overlay(active_node_resolution(ctx)),
+                env=env,
+                secret_values=secret_values,
             )
             return json.dumps(payload, ensure_ascii=False, indent=2)
+        except OwnerPauseRefused as exc:
+            return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
         except Exception as exc:
-            return f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}"
+            text = redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
+            if getattr(exc, "process_not_started", False) is True:
+                return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR",
+                    text=text, meta={"operation_outcome": "completed_no_effect"}))
+            return text
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     log_dir = pathlib.Path(ctx.drive_root) / "services" / task_id
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{service_name}.log"
+
+    def publish_process(proc):
+        record = ServiceRecord(
+            name=service_name,
+            service_id=key,
+            task_id=task_id,
+            cmd=[str(part) for part in cmd],
+            cwd=str(workdir),
+            log_path=log_path,
+            proc=proc,
+            pgid=process_group_id(proc.pid),
+            readiness=dict(readiness or {}),
+            outputs=declared_outputs,
+            cwd_root=cwd_root,
+            cwd_base=str(binding.base_path),
+            cwd_source=binding.source,
+            skill_name=binding.skill_name,
+            before_outputs=before_outputs,
+            keep_alive=keep_alive,
+            env=env,
+            secret_values=secret_values,
+        )
+        _SERVICES[key] = record
+        if _panic_requested:
+            raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
+
     log_fh = log_path.open("ab")
     try:
         bootstrap_process_path()
@@ -412,36 +529,33 @@ def _start_service(
             purpose=f"service:{service_name}",
             scope="session" if keep_alive else "task",
             owner_task_id=task_id,
+            on_spawn=publish_process,
             cwd=str(workdir),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            env=_service_env(),
+            # The attested emergency bundled-node PATH prepend (post-gates
+            # node resolver) applies on top of the allowlisted service env;
+            # a healthy resolution leaves the env byte-identical.
+            env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
         )
-        pgid = process_group_id(proc.pid)
         log_fh.close()
+    except OwnerPauseRefused as exc:
+        log_fh.close()
+        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
     except Exception as exc:
         log_fh.close()
-        return f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}"
-    record = ServiceRecord(
-        name=service_name,
-        service_id=key,
-        task_id=task_id,
-        cmd=[str(part) for part in cmd],
-        cwd=str(workdir),
-        log_path=log_path,
-        proc=proc,
-        pgid=pgid,
-        readiness=dict(readiness or {}),
-        outputs=declared_outputs,
-        cwd_root=cwd_root,
-        before_outputs=before_outputs,
-        keep_alive=keep_alive,
-    )
-    with _LOCK:
-        _SERVICES[key] = record
+        return redact_known_values(f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}", secret_values)
+    record = _SERVICES[key]
     try:
-        if cwd_root == "active_workspace" and not bool(getattr(ctx, "is_workspace_mode", lambda: False)()):
+        system_root = pathlib.Path(
+            getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir")
+        ).resolve(strict=False)
+        mutates_system_repo = (
+            binding.root == "system_repo"
+            or pathlib.Path(binding.base_path).resolve(strict=False) == system_root
+        )
+        if mutates_system_repo:
             from ouroboros.tools.commit_gate import _invalidate_advisory
 
             _invalidate_advisory(
@@ -465,6 +579,11 @@ def _start_service(
 def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
     _refresh_ready(record)
     rc = record.proc.poll()
+    # The process can settle in the small window between the readiness poll
+    # above and this state read.  Terminal state is never currently ready,
+    # while the observation timestamp remains useful historical evidence.
+    if rc is not None:
+        record.ready = False
     state = "running" if rc is None else "exited"
     return {
         "service_id": record.service_id,
@@ -474,11 +593,15 @@ def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
         "pgid": record.pgid,
         "state": state,
         "ready": bool(record.ready),
+        "ready_observed_at": record.ready_observed_at or None,
         "returncode": rc,
         "uptime_sec": round(max(0.0, time.time() - record.started_at), 3),
         "cwd": record.cwd,
         "cwd_root": record.cwd_root,
-        "cmd": record.cmd,
+        "cwd_base": record.cwd_base,
+        "cwd_source": record.cwd_source,
+        "skill_name": record.skill_name,
+        "cmd": _service_diagnostic(record, record.cmd),
         "outputs": list(record.outputs),
         "keep_alive": bool(record.keep_alive),
         "log_path": str(record.log_path),
@@ -516,14 +639,14 @@ def _service_logs(ctx: ToolContext, name: str = "service", tail: int = 8000) -> 
         except (TypeError, ValueError):
             return "⚠️ TOOL_ARG_ERROR (service_logs): tail must be an integer."
         tail_chars = min(max(1, tail_chars), _MAX_SERVICE_LOG_TAIL_CHARS)
-        text = str(redact_projection(_tail(record.log_path, tail_chars)).value)
+        text = _service_diagnostic(record, _tail(record.log_path, tail_chars))
         ref = {}
         omitted_reason = ""
         try:
             size = record.log_path.stat().st_size if record.log_path.exists() else 0
             if size <= _MAX_SERVICE_LOG_BLOB_BYTES:
                 full = record.log_path.read_text(encoding="utf-8", errors="replace") if record.log_path.exists() else ""
-                ref = write_blob(pathlib.Path(ctx.drive_root), full, kind="txt")
+                ref = write_blob(pathlib.Path(ctx.drive_root), _service_diagnostic(record, full), kind="txt")
             else:
                 omitted_reason = f"log exceeds {_MAX_SERVICE_LOG_BLOB_BYTES} byte blob cap"
         except Exception:
@@ -560,16 +683,26 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         payload["log_finalization"] = _finalize_service_log_for_drive(pathlib.Path(ctx.drive_root), record)
         artifact_note = ""
         artifact_failed = False
+        artifact_registered = False
         if record.outputs:
             try:
                 from ouroboros.tools.shell import _register_process_outputs
 
-                artifact_note, artifact_failed = _register_process_outputs(
+                output_binding = _service_output_binding(
+                    ctx,
+                    cwd_root=record.cwd_root,
+                    cwd_base=record.cwd_base,
+                    cwd=record.cwd,
+                    cwd_source=record.cwd_source,
+                    skill_name=record.skill_name,
+                )
+                artifact_note, artifact_failed, artifact_registered = _register_process_outputs(
                     ctx,
                     record.outputs,
                     pathlib.Path(record.cwd),
                     cwd_root=record.cwd_root,
                     before_outputs=record.before_outputs,
+                    binding=output_binding,
                 )
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- service output finalization failed: {type(exc).__name__}: {exc}"
@@ -585,8 +718,24 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         payload["artifact_output_failed"] = bool(artifact_failed)
         rendered = json.dumps(payload, ensure_ascii=False, indent=2)
         if artifact_failed:
-            return "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared service outputs were not finalized.\n\n" + rendered
-        return rendered
+            text = "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared service outputs were not finalized.\n\n" + rendered
+            return _publish_tool_result(
+                ctx,
+                ToolResult(
+                    status="error",
+                    code="ARTIFACT_OUTPUT_ERROR",
+                    text=text,
+                ),
+            )
+        return _publish_tool_result(
+            ctx,
+            ToolResult(
+                status="ok",
+                code="OK",
+                text=rendered,
+                meta={"artifact_registered": True} if artifact_registered else {},
+            ),
+        )
     if executor_ref_from_ctx(ctx) is not None:
         payload = executor_stop_service(ctx, service_name)
         if payload is None:
@@ -595,17 +744,27 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
             return "⚠️ SERVICE_STOP_ERROR (stop_service): executor backend did not confirm service termination.\n\n" + json.dumps(payload, ensure_ascii=False, indent=2)
         artifact_note = ""
         artifact_failed = False
+        artifact_registered = False
         before_outputs = payload.pop("_before_outputs", {})
         if payload.get("outputs"):
             try:
                 from ouroboros.tools.shell import _register_process_outputs
 
-                artifact_note, artifact_failed = _register_process_outputs(
+                output_binding = _service_output_binding(
+                    ctx,
+                    cwd_root=str(payload.get("cwd_root") or ""),
+                    cwd_base=str(payload.get("cwd_base") or ""),
+                    cwd=str(payload.get("host_cwd") or ""),
+                    cwd_source=str(payload.get("cwd_source") or ""),
+                    skill_name=str(payload.get("skill_name") or ""),
+                )
+                artifact_note, artifact_failed, artifact_registered = _register_process_outputs(
                     ctx,
                     [str(item) for item in (payload.get("outputs") or [])],
                     pathlib.Path(str(payload.get("host_cwd") or ".")),
                     cwd_root=str(payload.get("cwd_root") or ""),
                     before_outputs=before_outputs if isinstance(before_outputs, dict) else None,
+                    binding=output_binding,
                 )
             except Exception as exc:
                 artifact_note = f"\n\n⚠️ ARTIFACT_OUTPUT_ERROR:\n- executor service output finalization failed: {type(exc).__name__}: {exc}"
@@ -615,8 +774,24 @@ def _stop_service(ctx: ToolContext, name: str = "service") -> str:
         payload["artifact_output_failed"] = bool(artifact_failed)
         rendered = json.dumps(payload, ensure_ascii=False, indent=2)
         if artifact_failed:
-            return "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared executor service outputs were not finalized.\n\n" + rendered
-        return rendered
+            text = "⚠️ ARTIFACT_OUTPUT_ERROR (stop_service): declared executor service outputs were not finalized.\n\n" + rendered
+            return _publish_tool_result(
+                ctx,
+                ToolResult(
+                    status="error",
+                    code="ARTIFACT_OUTPUT_ERROR",
+                    text=text,
+                ),
+            )
+        return _publish_tool_result(
+            ctx,
+            ToolResult(
+                status="ok",
+                code="OK",
+                text=rendered,
+                meta={"artifact_registered": True} if artifact_registered else {},
+            ),
+        )
     return f"⚠️ SERVICE_NOT_FOUND: {name}"
 
 
@@ -685,6 +860,7 @@ def kill_all_services(
     *,
     wait: bool = True,
     include_keep_alive: bool = True,
+    request_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Stop every tracked service process group for panic/shutdown paths.
 
@@ -694,6 +870,18 @@ def kill_all_services(
     emergency cleanup keep the default and kill everything.
     """
 
+    global _panic_requested
+    if request_only:
+        _panic_requested = True
+        # A shallow builtin copy keeps the existing owner table readable even
+        # when cleanup holds _LOCK; leave custody/log settlement to that owner.
+        requested = [
+            {"service_id": record.service_id, **request_process_tree_kill(record.proc)}
+            for record in _SERVICES.copy().values()
+            if include_keep_alive or not record.keep_alive
+        ]
+        requested.extend(executor_kill_all_services(drive_root, request_only=True))
+        return requested
     with _LOCK:
         if include_keep_alive:
             records = list(_SERVICES.values())
@@ -794,11 +982,20 @@ def get_tools() -> List[ToolEntry]:
     return [
         ToolEntry("start_service", {
             "name": "start_service",
-            "description": "Start a task-scoped long-running service and return pid/readiness/state.",
+            "description": "Start a task-scoped long-running service and return pid/readiness/state. In runtime_mode=light a service whose cwd is the Ouroboros repository is refused (LIGHT_MODE_BLOCKED): pass an explicit external/task/artifact cwd.",
             "parameters": {"type": "object", "properties": {
                 "cmd": {"type": "array", "items": {"type": "string"}},
-                "cwd": {"type": "string", "default": ""},
+                "cwd": {
+                    "type": "string",
+                    "default": "",
+                    "description": (
+                        "Omit for active_workspace; use system_repo[/subdir] for Ouroboros. "
+                        "Skill payload services are not supported."
+                    ),
+                },
                 "name": {"type": "string", "default": "service"},
+                "env": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Ordinary literal environment overrides, passed unchanged on local and Docker executors over the minimal host baseline. Use env_from_settings for secrets."},
+                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Root tasks and Cyber acting tasks: environment name to saved setting key. References override literal env; Settings-classified secrets are masked in diagnostics. Explicit read-only tasks retain their existing limits."},
                 "readiness": {"type": "object", "default": {}, "description": "Optional {log_contains|stdout_contains, timeout_sec} readiness probe."},
                 "outputs": {"type": "array", "items": {"type": "string"}, "default": [], "description": "Files generated by the service to copy into the task artifact store when the service stops."},
                 "keep_alive": {"type": "boolean", "default": False, "description": "Leave this service running after the task ends (e.g. a dev server the user or an external verifier still needs). It stays custody-ledgered and dies with the server session or panic."},

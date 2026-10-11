@@ -1,11 +1,41 @@
 import json
 import os
 import pathlib
+import shlex
+import subprocess
 import sys
+import threading
+import time
+
+import pytest
 from types import SimpleNamespace
 
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.services import archive_task_service_logs, prune_service_logs
+
+
+def _wait_for_service_log(drive, task_id, name, predicate, timeout_sec=15.0):
+    """Wait until the service's live log satisfies ``predicate``.
+
+    The start_service readiness contract without a stdout marker is "process
+    alive == ready" — it never waits for output. These suites assert on log
+    CONTENT, so they must wait for the observable condition themselves: on a
+    slow CI runner the child's first write can land well after start_service
+    returns (a latent race exposed when the guard path got faster), and the
+    assertions below are about redaction/finalization, never about timing.
+    """
+    log_path = drive / "services" / task_id / name
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        try:
+            if predicate(log_path.read_bytes() if log_path.exists() else b""):
+                return
+        except OSError:
+            pass
+        time.sleep(0.1)
+    raise AssertionError(
+        f"service log {log_path} did not satisfy the wait predicate within {timeout_sec}s"
+    )
 
 
 def _force_advanced_runtime(monkeypatch):
@@ -77,6 +107,7 @@ def test_service_logs_redact_secret_assignments(tmp_path, monkeypatch):
         "readiness": {"timeout_sec": 1},
     })
     assert json.loads(start)["state"] in {"running", "exited"}
+    _wait_for_service_log(drive, "task-1", "secretlog.log", lambda b: b"OPENAI_API_KEY=" in b)
     logs = json.loads(registry.execute("service_logs", {"name": "secretlog", "tail": 500}))
     registry.execute("stop_service", {"name": "secretlog"})
 
@@ -103,6 +134,353 @@ def test_service_logs_tail_is_capped(tmp_path, monkeypatch):
     registry.execute("stop_service", {"name": "bigtail"})
 
     assert len(logs["tail"]) <= 80_000
+
+
+def test_service_readiness_marker_before_large_suffix_latches_until_exit(tmp_path):
+    from ouroboros.tools.services import ServiceRecord, _refresh_ready
+
+    class RunningProcess:
+        pid = 4321
+
+        @staticmethod
+        def poll():
+            return None
+
+    log_path = tmp_path / "service.log"
+    log_path.write_bytes(b"READY\n" + (b"x" * 25_000))
+    record = ServiceRecord(
+        name="burst",
+        service_id="task:burst",
+        task_id="task",
+        cmd=["service"],
+        cwd=str(tmp_path),
+        log_path=log_path,
+        proc=RunningProcess(),
+        readiness={"log_contains": "READY"},
+    )
+
+    assert _refresh_ready(record) is True
+    log_path.write_bytes(b"y" * 30_000)
+    assert _refresh_ready(record) is True
+
+    record.proc = SimpleNamespace(poll=lambda: 0, pid=4321)
+    assert _refresh_ready(record) is False
+    assert record.ready is False
+
+
+def test_service_readiness_scan_resets_when_log_rotates(tmp_path):
+    from ouroboros.tools.services import ServiceRecord, _refresh_ready
+
+    process = SimpleNamespace(poll=lambda: None, pid=4321)
+    log_path = tmp_path / "service.log"
+    log_path.write_bytes(b"x" * 30_000)
+    record = ServiceRecord(
+        name="rotating",
+        service_id="task:rotating",
+        task_id="task",
+        cmd=["service"],
+        cwd=str(tmp_path),
+        log_path=log_path,
+        proc=process,
+        readiness={"log_contains": "READY"},
+    )
+    assert _refresh_ready(record) is False
+
+    replacement = tmp_path / "replacement.log"
+    replacement.write_bytes(b"READY\n" + (b"y" * 30_000))
+    replacement.replace(log_path)
+
+    assert _refresh_ready(record) is True
+
+
+def test_service_readiness_refresh_serializes_incremental_scans(tmp_path, monkeypatch):
+    from ouroboros.tools import services as services_mod
+
+    record = services_mod.ServiceRecord(
+        name="concurrent",
+        service_id="task:concurrent",
+        task_id="task",
+        cmd=["service"],
+        cwd=str(tmp_path),
+        log_path=tmp_path / "service.log",
+        proc=SimpleNamespace(poll=lambda: None, pid=4321),
+        readiness={"log_contains": "READY"},
+    )
+    first_scan_entered = threading.Event()
+    release_first_scan = threading.Event()
+    counter_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_scan(_record, _marker):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+            first_scan_entered.set()
+        release_first_scan.wait(timeout=2)
+        with counter_lock:
+            active -= 1
+        return False
+
+    monkeypatch.setattr(services_mod, "_readiness_marker_observed", fake_scan)
+    first = threading.Thread(target=services_mod._refresh_ready, args=(record,))
+    second = threading.Thread(target=services_mod._refresh_ready, args=(record,))
+    first.start()
+    assert first_scan_entered.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    release_first_scan.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert max_active == 1
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+
+def test_host_status_race_never_reports_terminal_service_ready(tmp_path):
+    from ouroboros.tools.services import ServiceRecord, _status_payload
+
+    class RacingProcess:
+        pid = 9911
+        calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 0
+
+    log_path = tmp_path / "race.log"
+    log_path.write_text("READY\n", encoding="utf-8")
+    proc = RacingProcess()
+    record = ServiceRecord(
+        name="race",
+        service_id="task:race",
+        task_id="task",
+        cmd=["service"],
+        cwd=str(tmp_path),
+        log_path=log_path,
+        proc=proc,
+        readiness={"log_contains": "READY"},
+    )
+
+    payload = _status_payload(record)
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert payload["ready_observed_at"]
+
+
+def test_executor_local_status_refreshes_late_readiness_after_timeout(tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    log_path = tmp_path / "late.log"
+    log_path.write_bytes(b"boot\n")
+    record = SimpleNamespace(
+        service_id="task:late",
+        name="late",
+        task_id="task",
+        executor=SimpleNamespace(executor_id="local", kind="local", network="host"),
+        backend_pid="1234",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path=str(log_path),
+        readiness={"log_contains": "READY"},
+        started_at=time.time(),
+        ready=False,
+        ready_observed_at="",
+        local_proc=SimpleNamespace(poll=lambda: None),
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=None,
+    )
+    assert workspace_executor._service_payload(record)["ready"] is False
+    log_path.write_bytes(b"boot\nREADY\n")
+    payload = workspace_executor._service_payload(record)
+    assert payload["state"] == "running"
+    assert payload["ready"] is True
+
+
+def test_executor_payload_repolls_local_terminal_after_readiness_refresh(tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    class RacingProcess:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            return None if self.calls == 1 else 0
+
+    log_path = tmp_path / "race.log"
+    log_path.write_bytes(b"READY\n")
+    record = SimpleNamespace(
+        service_id="task:race",
+        name="race",
+        task_id="task",
+        executor=SimpleNamespace(executor_id="local", kind="local", network="host"),
+        backend_pid="1234",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path=str(log_path),
+        readiness={"log_contains": "READY"},
+        started_at=time.time(),
+        ready=False,
+        ready_observed_at="",
+        local_proc=RacingProcess(),
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=None,
+    )
+
+    payload = workspace_executor._service_payload(record)
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert payload["ready_observed_at"]
+
+
+def test_executor_payload_repolls_docker_terminal_after_readiness_refresh(monkeypatch, tmp_path):
+    import ouroboros.workspace_executor as workspace_executor
+
+    record = SimpleNamespace(
+        service_id="task:docker-race",
+        name="docker-race",
+        task_id="task",
+        executor=SimpleNamespace(executor_id="docker", kind="docker_exec", network="none", container_name="svc"),
+        backend_pid="1234",
+        backend_cwd="/workspace",
+        host_cwd=tmp_path,
+        cwd_root="active_workspace",
+        cwd_base=str(tmp_path),
+        cwd_source="active_workspace",
+        skill_name="",
+        cmd=["service"],
+        outputs=[],
+        keep_alive=False,
+        backend_log_path="/tmp/service.log",
+        readiness={"log_contains": "READY"},
+        started_at=time.time(),
+        ready=False,
+        ready_observed_at="",
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=(7, 42),
+    )
+    state_calls = 0
+
+    def fake_run(cmd, **kwargs):
+        nonlocal state_calls
+        shell = str(cmd[-1])
+        if "stat -c" in shell:
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"7:42:5\nREADY", stderr=b"")
+        state_calls += 1
+        result = "running\n" if state_calls == 1 else "exited\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=result, stderr="")
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    payload = workspace_executor._service_payload(record)
+
+    assert payload["state"] == "exited"
+    assert payload["ready"] is False
+    assert state_calls == 2
+
+
+def test_executor_docker_readiness_uses_incremental_cursor_and_carry(monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    record = SimpleNamespace(
+        executor=SimpleNamespace(kind="docker_exec", container_name="svc-container"),
+        backend_log_path="/tmp/service.log",
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=(7, 42),
+    )
+    calls = []
+    remote = [b"7:42:3\nabc", b"7:42:10\ndefREADY\n"]
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[-1])
+        item = remote.pop(0)
+        return subprocess.CompletedProcess(cmd, 0, stdout=item, stderr=b"")
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    assert workspace_executor._executor_readiness_marker_observed(record, "READY") is False
+    assert workspace_executor._executor_readiness_marker_observed(record, "READY") is True
+    assert all("grep" not in shell for shell in calls)
+    assert "tail -c +1" in calls[0]
+    assert "tail -c +4" in calls[1]
+
+
+def test_executor_docker_readiness_bounds_each_remote_chunk_and_keeps_cursor(monkeypatch):
+    import ouroboros.workspace_executor as workspace_executor
+
+    record = SimpleNamespace(
+        executor=SimpleNamespace(kind="docker_exec", container_name="svc-container"),
+        backend_log_path="/tmp/service.log",
+        readiness_log_offset=0,
+        readiness_log_carry=b"",
+        readiness_log_identity=(7, 42),
+    )
+    calls = []
+    remote = [b"7:42:100000\n" + (b"x" * 65536), b"7:42:100000\n"]
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd[-1])
+        return subprocess.CompletedProcess(cmd, 0, stdout=remote.pop(0), stderr=b"")
+
+    monkeypatch.setattr(workspace_executor.subprocess, "run", fake_run)
+    assert workspace_executor._executor_readiness_marker_observed(record, "READY") is False
+    assert record.readiness_log_offset == 65536
+    assert workspace_executor._executor_readiness_marker_observed(record, "READY") is False
+    assert record.readiness_log_offset == 65536
+    assert "head -c 65536" in calls[0]
+    assert "tail -c +65537" in calls[1]
+
+
+def test_service_readiness_is_independent_of_bounded_log_tail(tmp_path, monkeypatch):
+    _force_advanced_runtime(monkeypatch)
+    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
+    repo = tmp_path / "repo"
+    drive = tmp_path / "data"
+    repo.mkdir()
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry._ctx.task_id = "task-burst-ready"
+
+    started = json.loads(registry.execute("start_service", {
+        "name": "burst",
+        "cmd": [
+            sys.executable,
+            "-c",
+            "import os,time; os.write(1, b'READY\\n' + b'x' * 25000); time.sleep(30)",
+        ],
+        "readiness": {"log_contains": "READY", "timeout_sec": 3},
+    }))
+    try:
+        status = json.loads(registry.execute("service_status", {"name": "burst"}))
+        logs = json.loads(registry.execute("service_logs", {"name": "burst", "tail": 1000}))
+    finally:
+        registry.execute("stop_service", {"name": "burst"})
+
+    assert started["ready"] is True
+    assert status["ready"] is True
+    assert started["ready_observed_at"]
+    assert "READY" not in logs["tail"]
+    assert "x" in logs["tail"]
 
 
 def test_service_log_retention_prunes_stale_directories(tmp_path):
@@ -187,6 +565,7 @@ def test_stop_service_retains_live_log_when_full_blob_omitted(tmp_path, monkeypa
         "cmd": [sys.executable, "-c", "print('x' * 100, flush=True)"],
         "readiness": {"timeout_sec": 1},
     })
+    _wait_for_service_log(drive, "task-oversize", "oversize.log", lambda b: len(b) > 100)
     stopped = json.loads(registry.execute("stop_service", {"name": "oversize"}))
 
     finalization = stopped["log_finalization"]
@@ -384,73 +763,53 @@ def test_user_files_service_without_outputs_reports_audit_gap(tmp_path, monkeypa
     assert stopped["artifact_output_failed"] is False
 
 
-def test_light_start_service_blocks_runtime_data_upload_write(tmp_path, monkeypatch):
+@pytest.mark.serial
+@pytest.mark.parametrize("relative", [False, True])
+def test_light_service_python_body_executes_once_with_bound_environment(tmp_path, monkeypatch, relative):
+    from ouroboros.tools import services
+
     _force_light_runtime(monkeypatch)
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    repo = tmp_path / "repo"
-    drive = tmp_path / "data"
-    repo.mkdir()
+    repo, drive, home = (tmp_path / name for name in ("repo", "data", "home"))
+    for path in (repo, drive, home):
+        path.mkdir()
     registry = ToolRegistry(repo_dir=repo, drive_root=drive)
     registry._ctx.task_id = "task-service-runtime-data"
     upload = drive / "uploads" / "report.html"
-    task_drive = registry._ctx.task_drive_root()
+    selected_path = "../../uploads/report.html" if relative else str(upload)
+    original_env = services._service_env
+    child_env = {**original_env(), "HOME": str(home), "USERPROFILE": str(home),
+                 "OUROBOROS_DATA_DIR": str(drive), "OUROBOROS_SETTINGS_PATH": str(drive / "settings.json")}
+    monkeypatch.setattr(services, "_service_env", lambda: dict(child_env))
+    decisions = []
 
-    result = registry.execute("start_service", {
-        "name": "runtime_data_writer",
-        "cmd": [
-            sys.executable,
-            "-c",
-            (
-                "from pathlib import Path\n"
-                f"p = Path({str(upload)!r})\n"
-                "p.parent.mkdir(parents=True, exist_ok=True)\n"
-                "p.write_text('bad')\n"
-            ),
-        ],
-        "cwd": str(task_drive),
-        "readiness": {"timeout_sec": 1},
-    })
+    def supervisor(name, args, *_a, **_kw):
+        if name == "start_service":
+            decisions.append((name, args["cmd"]))
+        return True, ""
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
-    assert registry.execute("service_status", {"name": "runtime_data_writer"}).startswith("⚠️ SERVICE_NOT_FOUND")
-
-
-def test_light_start_service_blocks_relative_runtime_data_upload_write(tmp_path, monkeypatch):
-    _force_light_runtime(monkeypatch)
-    monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
-    repo = tmp_path / "repo"
-    drive = tmp_path / "data"
-    repo.mkdir()
-    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
-    registry._ctx.task_id = "task-service-runtime-data"
-    upload = drive / "uploads" / "relative-report.html"
-    task_drive = registry._ctx.task_drive_root()
-
-    result = registry.execute("start_service", {
-        "name": "runtime_data_relative_writer",
-        "cmd": [
-            sys.executable,
-            "-c",
-            (
-                "from pathlib import Path\n"
-                "p = Path('../../uploads/relative-report.html')\n"
-                "p.parent.mkdir(parents=True, exist_ok=True)\n"
-                "p.write_text('bad')\n"
-            ),
-        ],
-        "cwd": str(task_drive),
-        "readiness": {"timeout_sec": 1},
-    })
-
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
-    assert not upload.exists()
-    assert registry.execute("service_status", {"name": "runtime_data_relative_writer"}).startswith("⚠️ SERVICE_NOT_FOUND")
+    monkeypatch.setattr("ouroboros.safety.check_safety", supervisor)
+    body = ("import os, time\nfrom pathlib import Path\n"
+            f"p = Path({selected_path!r})\np.parent.mkdir(parents=True, exist_ok=True)\n"
+            "with p.open('a', newline='') as output: output.write('once\\n')\n"
+            + "\n".join(f"assert os.environ[{key!r}] == {child_env[key]!r}" for key in
+                        ("HOME", "USERPROFILE", "OUROBOROS_DATA_DIR", "OUROBOROS_SETTINGS_PATH"))
+            + "\nprint('READY', flush=True)\ntime.sleep(60)\n")
+    command = [sys.executable, "-c", body]
+    try:
+        started = registry.execute("start_service", {
+            "name": "python_writer", "cmd": command, "cwd": str(registry._ctx.task_drive_root()),
+            "readiness": {"log_contains": "READY", "timeout_sec": 3},
+        })
+        payload = json.loads(started)
+        assert payload["ready"] and payload["pid"] > 0, started
+        assert decisions == [("start_service", command)]
+        assert upload.read_bytes() == b"once\n"
+    finally:
+        services._stop_service(registry._ctx, name="python_writer")
+    assert registry.execute("service_status", {"name": "python_writer"}).startswith("⚠️ SERVICE_NOT_FOUND")
 
 
-def test_light_start_service_blocks_env_runtime_data_upload_write(tmp_path, monkeypatch):
+def test_light_start_service_blocks_explicit_runtime_data_upload_redirect(tmp_path, monkeypatch):
     _force_light_runtime(monkeypatch)
     monkeypatch.setattr("ouroboros.safety.check_safety", lambda *a, **k: (True, ""))
     repo = tmp_path / "repo"
@@ -462,13 +821,13 @@ def test_light_start_service_blocks_env_runtime_data_upload_write(tmp_path, monk
 
     result = registry.execute("start_service", {
         "name": "runtime_data_env_writer",
-        "cmd": ["sh", "-c", "mkdir -p \"$OUROBOROS_DATA_DIR/uploads\" && echo bad > \"$OUROBOROS_DATA_DIR/uploads/env-report.html\""],
+        "cmd": ["sh", "-c", f"mkdir -p {shlex.quote(str(upload.parent))} && echo bad > {shlex.quote(str(upload))}"],
         "cwd": str(registry._ctx.task_drive_root()),
         "readiness": {"timeout_sec": 1},
     })
 
-    assert "LIGHT_MODE_BLOCKED" in result
-    assert "runtime_data" in result
+    assert "BLOCKED" in result, result
+    assert str(upload.parent) in result
     assert not upload.exists()
     assert registry.execute("service_status", {"name": "runtime_data_env_writer"}).startswith("⚠️ SERVICE_NOT_FOUND")
 
@@ -496,6 +855,7 @@ def test_service_outputs_register_artifacts_on_stop(tmp_path, monkeypatch):
         "readiness": {"timeout_sec": 1},
     })
     assert "LIGHT_MODE_BLOCKED" not in start
+    _wait_for_service_log(drive, "task-service-output", "artifact_service.log", lambda b: b"READY" in b)
 
     stopped = json.loads(registry.execute("stop_service", {"name": "artifact_service"}))
 

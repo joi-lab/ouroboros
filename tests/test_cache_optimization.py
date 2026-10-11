@@ -41,6 +41,12 @@ def test_build_llm_messages_returns_three_system_blocks():
     assert system_msg["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert system_msg["content"][1]["cache_control"] == {"type": "ephemeral"}
     assert "cache_control" not in system_msg["content"][2]
+    # The real render declares blocks 0 (governance, books) and 1 (identity, my story) as the
+    # cross-conversation stable prefix (llm_messages.split_leading_system_prefix reads it on
+    # the OpenAI-family/Codex wire; the Codex cache is read only inside that leading group).
+    from ouroboros.llm_messages import STABLE_PREFIX_BLOCKS_KEY
+
+    assert system_msg[STABLE_PREFIX_BLOCKS_KEY] == 2
 
 
 def test_build_llm_messages_repartitions_stable_vs_dynamic_sections():
@@ -64,17 +70,20 @@ def test_build_llm_messages_repartitions_stable_vs_dynamic_sections():
     stable_text = messages[0]["content"][1]["text"]
     dynamic_text = messages[0]["content"][2]["text"]
 
+    # Block 1: identity, the deep review and my story; knowledge leads block 2, where its
+    # many daily edits never cost the cached story.
     assert "## Identity" in stable_text
-    assert "## Knowledge base" in stable_text
-    assert "## Known error patterns (Pattern Register)" in stable_text
+    assert "## My story" in stable_text
     assert "## Last Deep Self-Review" in stable_text
+    for knowledge in ("## Shared understanding", "## Knowledge base", "## Known error patterns (Pattern Register)"):
+        assert knowledge in dynamic_text and knowledge not in stable_text, knowledge
     assert "## Scratchpad" not in stable_text
-    assert "## Dialogue History" not in stable_text
-    assert "## Dialogue Summary" not in stable_text
     assert "## Memory Registry" not in stable_text
 
     assert "## Scratchpad" in dynamic_text
-    assert ("## Dialogue Summary" in dynamic_text) or ("## Dialogue History" in dynamic_text)
+    assert "## This room (Main)" in dynamic_text and "## My story" not in dynamic_text
+    for gone in ("## Dialogue History", "## Dialogue Summary", "## Recent chat"):
+        assert gone not in stable_text and gone not in dynamic_text, gone
     assert "## Memory Registry (what I know / don't know)" in dynamic_text
     assert "## Memory Registry\n\n" not in dynamic_text
     assert "## Memory Registry (what I know / don't know)" not in stable_text
@@ -131,11 +140,14 @@ def test_sanitize_chat_completion_tools_drops_overlong_names():
     assert [tool["function"]["name"] for tool in sanitized] == ["a" * 64]
 
 
-def test_finalized_payload_marks_last_sorted_tool_for_cache():
+def test_finalized_payload_marks_last_sorted_tool_for_cache(monkeypatch):
     """v6.77.0: the marker is placed once, by the send-time payload finalizer (the two
-    per-builder copies are gone), still on the LAST tool of the deterministic sort."""
+    per-builder copies are gone), still on the LAST tool of the deterministic sort.
+    Pinned under the explicit 'default' global TTL — the global-override stamping has
+    its own goldens in test_review_prompt_caching.py."""
     from ouroboros.llm import LLMClient
 
+    monkeypatch.setenv("OUROBOROS_PROMPT_CACHE_TTL", "default")
     client = LLMClient()
     target = client._resolve_remote_target("anthropic/claude-sonnet-4.6")
     kwargs = client._build_remote_kwargs(
@@ -157,6 +169,37 @@ def test_finalized_payload_marks_last_sorted_tool_for_cache():
     assert [tool["function"]["name"] for tool in kwargs["tools"]] == ["alpha_tool", "zeta_tool"]
     assert "cache_control" not in kwargs["tools"][0]
     assert kwargs["tools"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_attempt_request_carries_the_payloads_applied_cache_ttl():
+    """G3-5: the reservation must price the cache-write tier of the exact
+    candidate payload being sent — the applied wire TTL rides AttemptRequest so
+    usage_accounting._reservation_cost never re-invents a second TTL authority."""
+    from ouroboros.llm import _attempt_request
+
+    target = {
+        "provider": "anthropic",
+        "resolved_model": "anthropic/claude-test",
+        "usage_model": "anthropic/claude-test",
+    }
+    marker = {"type": "ephemeral", "ttl": "5m"}
+    payload = {
+        "model": "anthropic/claude-test",
+        "max_tokens": 128,
+        "messages": [{
+            "role": "user",
+            "content": [{"type": "text", "text": "hi", "cache_control": marker}],
+        }],
+    }
+    assert _attempt_request(target, payload).prompt_cache_ttl == "5m"
+    marker["ttl"] = "1h"
+    assert _attempt_request(target, payload).prompt_cache_ttl == "1h"
+    del marker["ttl"]  # bare marker = provider default tier
+    assert _attempt_request(target, payload).prompt_cache_ttl == "default"
+    del payload["messages"][0]["content"][0]["cache_control"]
+    # Marker-free physical candidates carry no invented applied TTL. Monetary
+    # admission separately retains its conservative base-tier reservation.
+    assert _attempt_request(target, payload).prompt_cache_ttl == ""
 
 
 def test_build_memory_sections_partition_modes():
@@ -181,10 +224,9 @@ def test_build_memory_sections_partition_modes():
     assert any(section.startswith("## Identity") for section in stable)
     assert not any(section.startswith("## Scratchpad") for section in stable)
     assert any(section.startswith("## Scratchpad") for section in volatile)
-    assert any(
-        section.startswith("## Dialogue Summary") or section.startswith("## Dialogue History")
-        for section in volatile
-    )
+    # The retold dialogue is the memory view's (``## My story``), never a memory section.
+    assert not any(section.startswith(("## Dialogue Summary", "## Dialogue History", "## Legacy Dialogue"))
+                   for section in [*stable, *volatile, *all_sections])
     assert not any(section.startswith("## Memory Registry") for section in volatile)
     assert registry_digest.startswith("## Memory Registry (what I know / don't know)")
     assert any(section.startswith("## Identity") for section in all_sections)
@@ -232,6 +274,58 @@ def test_llm_round_event_exposes_cache_hit_rate(tmp_path):
     assert llm_round["prompt_cache_ttl"] == "default"
 
 
+def test_llm_round_event_flags_cache_cold_restart_with_gap(tmp_path):
+    """W3 telemetry: a later round that re-wrote (almost) the whole prompt is a
+    cold restart — flagged from the round's own facts, with the gap since the
+    previous successful round. No dollar accumulator (counterfactual)."""
+    import json
+
+    from ouroboros.loop_llm_call import call_llm_with_retry
+
+    class _LLM:
+        def __init__(self, cached, written):
+            self.cached, self.written = cached, written
+
+        def chat(self, **kwargs):
+            return {"content": "ok"}, {
+                "provider": "openrouter",
+                "resolved_model": "anthropic/claude-sonnet-4.6",
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "cached_tokens": self.cached,
+                "cache_write_tokens": self.written,
+                "prompt_cache_ttl": "1h",
+                "cost": 0.1,
+            }
+
+    usage = {}
+
+    def _round(llm, round_idx):
+        call_llm_with_retry(
+            llm, [{"role": "user", "content": "hi"}], "anthropic/claude-sonnet-4.6",
+            None, "medium", 1, tmp_path, "task-cold", round_idx, None, usage, "task", False,
+        )
+
+    _round(_LLM(900, 50), 1)
+    _round(_LLM(0, 950), 2)
+
+    rounds = [
+        json.loads(line)
+        for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("type") == "llm_round"
+    ]
+    assert [r["round"] for r in rounds] == [1, 2]
+    first, second = rounds
+    assert first["cache_cold_restart"] is False  # round 1 always writes; not a RE-start
+    assert first["gap_since_prev_round_sec"] is None
+    assert second["cache_cold_restart"] is True
+    assert isinstance(second["gap_since_prev_round_sec"], float)
+    assert second["gap_since_prev_round_sec"] >= 0.0
+    # The applied TTL fact is recorded for the wait-tool disclosure to read.
+    assert usage["_last_prompt_cache_ttl"] == "1h"
+    assert "cache_cold_restart_cost_usd" not in usage
+
+
 def test_llm_round_event_zero_prompt_tokens_reports_zero_hit_rate(tmp_path):
     from ouroboros.loop_llm_call import call_llm_with_retry
 
@@ -267,3 +361,186 @@ def test_llm_round_event_zero_prompt_tokens_reports_zero_hit_rate(tmp_path):
     lines = [line for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     llm_round = next(__import__("json").loads(line) for line in lines if __import__("json").loads(line).get("type") == "llm_round")
     assert llm_round["cache_hit_rate"] == 0.0
+
+
+def test_cache_ttl_seconds_units_conversion():
+    """cache_ttl_seconds converts a RECORDED applied TTL to a wall-clock horizon for
+    the NAMED tiers only. 'default' records that a BARE marker went out — no tier —
+    so it yields no horizon, exactly like empty/unknown."""
+    from ouroboros.llm import cache_ttl_seconds
+
+    assert cache_ttl_seconds("5m") == 300
+    assert cache_ttl_seconds("1h") == 3600
+    assert cache_ttl_seconds("default") is None
+    assert cache_ttl_seconds("") is None
+    assert cache_ttl_seconds(None) is None
+    assert cache_ttl_seconds("24h") is None
+    assert cache_ttl_seconds(" 1H ") == 3600
+
+
+def test_bare_marker_never_yields_an_invented_horizon():
+    """The 'second TTL truth' guard: the finalizer reports 'default' for ANY payload
+    with markers — including routes it never normalizes, where a 5-minute horizon was
+    never established. A bare marker must therefore keep every reader silent."""
+    from types import SimpleNamespace
+
+    from ouroboros.llm import LLMClient, _route_normalizes_cache_breakpoints, cache_ttl_seconds
+    from ouroboros.tools.control import cache_horizon_note
+
+    client = LLMClient.__new__(LLMClient)
+    gemini = {
+        "provider": "openrouter",
+        "resolved_model": "google/gemini-3.6-flash",
+        "supports_openrouter_extensions": True,
+    }
+    payload = {
+        "messages": [{"role": "system", "content": [
+            {"type": "text", "text": "governance", "cache_control": {"type": "ephemeral"}},
+        ]}],
+        "tools": [],
+    }
+    # Gemini keeps BARE markers (its explicit cache documents no ttl field) and is
+    # never normalized — yet the applied-TTL report is still "default".
+    assert _route_normalizes_cache_breakpoints(gemini) is False
+    assert client._normalize_payload_cache_ttl(gemini, payload) == "default"
+    assert cache_ttl_seconds("default") is None
+
+    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "default"})
+    assert cache_horizon_note(ctx, 10_000.0) == ""
+
+
+def test_cache_horizon_note_reads_recorded_ttl_only():
+    """W3 wait-tool disclosure: one factual line when the wait outlived the APPLIED
+    cache horizon; silent below the horizon, silent without a recorded fact, and
+    NO token-count predictions in the text."""
+    from types import SimpleNamespace
+
+    from ouroboros.tools.control import cache_horizon_note
+
+    ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "5m"})
+    note = cache_horizon_note(ctx, 301.0)
+    assert "cache horizon" in note
+    assert "may be cold" in note
+    assert "token" not in note.lower()  # facts only, no re-write predictions
+    assert cache_horizon_note(ctx, 299.0) == ""
+
+    ctx_1h = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": "1h"})
+    assert cache_horizon_note(ctx_1h, 900.0) == ""
+    assert "1h" in cache_horizon_note(ctx_1h, 3601.0)
+
+    # No recorded fact (no cached send yet / non-cache route) -> no invented horizon.
+    assert cache_horizon_note(SimpleNamespace(_accumulated_usage={}), 9999.0) == ""
+    assert cache_horizon_note(SimpleNamespace(), 9999.0) == ""
+    assert cache_horizon_note(ctx, None) == ""
+
+
+def test_wait_for_task_appends_cache_horizon_note(tmp_path, monkeypatch):
+    """The wait tools surface the disclosure through their real result paths."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.task_results import STATUS_COMPLETED, write_task_result
+    from ouroboros.tools import control_task_results as control_mod
+
+    write_task_result(tmp_path, "child42", STATUS_COMPLETED, result="done")
+
+    def _instant_wait(*args, **kwargs):
+        return {"all_terminal": True, "elapsed_sec": 720.0, "tasks": {}}
+
+    monkeypatch.setattr(control_mod, "wait_for_effective_tasks", _instant_wait)
+    ctx = SimpleNamespace(
+        drive_root=tmp_path,
+        _accumulated_usage={"_last_prompt_cache_ttl": "5m"},
+    )
+    out = control_mod._wait_for_task(ctx, "child42", timeout_sec=0)
+    assert "cache horizon" in out and "may be cold" in out
+
+    batch = json.loads(control_mod._wait_for_tasks(ctx, ["child42"], timeout_sec=0))
+    assert "cache horizon" in str(batch.get("cache_horizon_note"))
+
+    # Below the horizon the line is absent on both paths.
+    def _fast_wait(*args, **kwargs):
+        return {"all_terminal": True, "elapsed_sec": 10.0, "tasks": {}}
+
+    monkeypatch.setattr(control_mod, "wait_for_effective_tasks", _fast_wait)
+    assert "cache horizon" not in control_mod._wait_for_task(ctx, "child42", timeout_sec=0)
+    assert "cache_horizon_note" not in json.loads(
+        control_mod._wait_for_tasks(ctx, ["child42"], timeout_sec=0)
+    )
+
+
+def test_cache_horizon_reachability_matches_the_wait_clamps(tmp_path, monkeypatch):
+    """Honest reachability of the wait disclosure, measured on BEHAVIOR.
+
+    The root waits measure their own elapsed window, so their line's availability is
+    per-tool and per-TTL and follows the window each one actually hands the poller: at
+    the shipped '1h' default only wait_tasks (7200s) can genuinely emit it and
+    wait_task sits exactly on the 3600s horizon; at '5m' both do. delegate_wait no
+    longer measures its 3 s tick: its wake measures the time since the task's last
+    model response, so it can emit at ANY tier (pinned in the supervising-wake test
+    below). Fails if a clamp, the ceiling or the tier scale moves without revisiting
+    the disclosure."""
+    from types import SimpleNamespace
+
+    from ouroboros.llm import cache_ttl_seconds
+    from ouroboros.tools import control_task_results as control_mod
+    from ouroboros.tools.control import cache_horizon_note
+
+    def _clamp(ceiling):
+        # The one window ladder both task waits use, probed without a deadline.
+        window = control_mod._wait_window(SimpleNamespace(), 10**9, clamp=ceiling, minimum=0, margin=30)
+        assert window == (ceiling, "ceiling")
+        return window[0]
+
+    ceilings = {
+        "wait_task": _clamp(control_mod._WAIT_TASK_CLAMP_SEC),
+        "wait_tasks": _clamp(control_mod._WAIT_TASKS_CLAMP_SEC),
+    }
+    assert ceilings == {"wait_task": 3600, "wait_tasks": 7200}
+
+    def _emits(tier, ceiling):
+        ctx = SimpleNamespace(_accumulated_usage={"_last_prompt_cache_ttl": tier})
+        return bool(cache_horizon_note(ctx, float(ceiling)))
+
+    assert cache_ttl_seconds("1h") == 3600 and cache_ttl_seconds("5m") == 300
+    assert {name: _emits("1h", sec) for name, sec in ceilings.items()} == {
+        "wait_task": False, "wait_tasks": True}
+    assert {name: _emits("5m", sec) for name, sec in ceilings.items()} == {
+        "wait_task": True, "wait_tasks": True}
+
+    doc = cache_horizon_note.__doc__ or ""
+    assert "REACHABILITY" in doc  # the limitation is stated where the note is built
+
+
+def _response_meta(seconds_ago):
+    import datetime as _dt
+
+    stamp = _dt.datetime.now(tz=_dt.timezone.utc) - _dt.timedelta(seconds=seconds_ago)
+    return {"ts": stamp.isoformat(), "provider": "anthropic", "model": "m"}
+
+
+def test_supervising_wake_horizon_fires_only_past_the_applied_ttl(tmp_path):
+    """delegate_wait's note is computed ONCE per wake from the task's last model
+    response (a lower bound on cache age): it fires past the APPLIED horizon, stays
+    silent below it and on an unknown tier, and a replay repeats the recorded wake."""
+    import json
+    from types import SimpleNamespace
+
+    from ouroboros.delegate_supervision import supervised_wait
+
+    def _wake(ttl, seconds_ago):
+        ctx = SimpleNamespace(
+            task_id=f"t-{ttl or 'none'}-{seconds_ago}", task_attempt=1, drive_root=tmp_path,
+            _accumulated_usage={"_last_prompt_cache_ttl": ttl,
+                                "_last_llm_call_meta": _response_meta(seconds_ago)})
+        raw = supervised_wait(ctx, "run-h", wait_once=lambda *_a: json.dumps(
+            {"status": "completed", "run_id": "run-h", "last_seq": 1})).text
+        return ctx, json.loads(raw)
+
+    _ctx, past = _wake("1h", 3700)
+    assert "1h" in past["cache_horizon_note"] and "may be cold" in past["cache_horizon_note"]
+    assert "cache_horizon_note" not in _wake("1h", 3500)[1]
+    assert "cache_horizon_note" not in _wake("", 10_000)[1]
+    replay = json.loads(supervised_wait(_ctx, "run-h", wait_once=lambda *_a: (_ for _ in ()).throw(
+        AssertionError("an unacknowledged wake replays before any new observation"))).text)
+    assert replay == past

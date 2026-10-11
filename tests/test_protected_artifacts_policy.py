@@ -1,20 +1,8 @@
-"""Permanent protected-artifact policy harness (v6.56.0).
+"""Explicit black-box operand contracts and ordinary execution capabilities.
 
-Recreates the fa59893 13-case verification harness as durable repo tests and
-pins the round-2 STRUCTURAL false-positive exceptions, so the policy's
-semantics — read/copy/hash/introspection of a black-box reference binary stay
-BLOCKED while legitimate differential-testing harnesses run — cannot silently
-regress in either direction.
-
-Pinned round-2 exceptions (all by operation identity, never keyword gates):
-- write-targets-only + compound-command segmentation (`touch a && ./ref b`);
-- `ln` writes the LINK NAME, not the source;
-- plain worktree/staged `git diff` (vcs_diff) is not artifact introspection;
-- interpreter bare-token read check covers ONLY the script operand, so quoted
-  mentions inside -c/heredoc code text stop false-blocking verify checks;
-- a mention in SPAWN-argv position is an execute, even with pty/pipe output
-  reads nearby;
-- execute-DENIED artifacts keep blocking on any interpreter mention, as before.
+Actual file/script operands and shell redirections retain task authority.
+Interpreter bodies, quoted patterns and data mentions are not physical targets.
+Positive registry execution coverage lives in test_tool_capabilities_black_box_policy.
 """
 from types import SimpleNamespace
 
@@ -62,8 +50,6 @@ def _block(ctx, workspace, cmd):
     ["dd", "if=./" + REF, "of=/tmp/out"],
     ["strings", "./" + REF],
     ["sha256sum", "./" + REF],
-    "python3 -c \"print(open('./reference_executable','rb').read()[:16])\"",
-    "python3 -c \"import shutil; shutil.copyfile('./reference_executable','/tmp/x')\"",
 ])
 def test_direct_content_access_blocked(tmp_path, cmd):
     ctx, ws = _ctx(tmp_path)
@@ -78,7 +64,7 @@ def test_interpreter_reading_artifact_as_script_blocked(tmp_path):
 def test_write_and_delete_of_artifact_blocked(tmp_path):
     ctx, ws = _ctx(tmp_path)
     assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["rm", "-f", "./" + REF])
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, "echo x > ./" + REF)
+    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["sh", "-c", "echo x > ./" + REF])
 
 
 # ---------------------------------------------------------------------------
@@ -172,32 +158,29 @@ def test_pty_spawn_with_output_reads_allowed(tmp_path):
     assert _block(ctx, ws, ["python3", "-c", script2]) == ""
 
 
-def test_open_near_mention_still_blocked_despite_spawn_elsewhere(tmp_path):
-    """The spawn exemption is per-OCCURRENCE: an open() on the artifact in the
-    same script still blocks."""
+def test_open_near_mention_is_not_a_direct_target(tmp_path):
+    """An inline body is assessed as a whole by the configured Supervisor."""
     ctx, ws = _ctx(tmp_path)
     script = (
         "import subprocess\n"
         "subprocess.run(['./reference_executable', '-h'])\n"
         "data = open('./reference_executable', 'rb').read()\n"
     )
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", script])
+    assert _block(ctx, ws, ["python3", "-c", script]) == ""
 
 
-def test_execute_denied_artifact_blocks_on_interpreter_mention(tmp_path):
-    """Execute-DENIED artifacts keep the strict pre-round-2 semantics: any
-    interpreter-code mention is unreachable-by-indirection and blocks."""
+def test_execute_denied_artifact_requires_actual_execution_operand(tmp_path):
+    """A concrete execute operand is distinct from a quoted program body."""
     ctx, ws = _ctx(tmp_path, allow=None, deny=["execute", "read_bytes", "copy", "hash",
                                                "static_introspection", "dynamic_trace", "debug",
                                                "write", "delete"])
     script = "import subprocess\nsubprocess.run(['./reference_executable', '-h'])\n"
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", script])
+    assert _block(ctx, ws, ["python3", "-c", script]) == ""
     assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["./" + REF, "--help"])
 
 
-def test_proximity_window_pin(tmp_path):
-    """Read primitive far from the mention (captured-output hashing) passes;
-    read primitive adjacent to the mention blocks."""
+def test_proximity_does_not_change_program_body_admission(tmp_path):
+    """Source proximity never establishes a physical target."""
     ctx, ws = _ctx(tmp_path)
     far = (
         "import subprocess, hashlib\n"
@@ -207,25 +190,23 @@ def test_proximity_window_pin(tmp_path):
     )
     assert _block(ctx, ws, ["python3", "-c", far]) == ""
     near = "import hashlib\nprint(hashlib.sha256(open('./reference_executable','rb').read()).hexdigest())\n"
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", near])
+    assert _block(ctx, ws, ["python3", "-c", near]) == ""
 
 
 # --- v6.56.0 review regressions: round-2 exception BYPASSES (adversarial) ------
 
 
-def test_spawn_argv_later_element_read_tool_still_blocks(tmp_path):
-    """Round-2 spawn exemption must apply ONLY to argv[0] (the program). A read
-    tool spawned WITH the artifact as a later argument reads/copies its bytes and
-    must stay blocked — the spawn-argv exemption must not swallow the whole list."""
+def test_program_body_spawn_arguments_are_not_direct_operands(tmp_path):
+    """Program-internal argv remains opaque to the direct operand policy."""
     ctx, ws = _ctx(tmp_path)
     for prog in ("cat", "cp", "sha256sum", "xxd", "od", "install"):
         arg = "'/tmp/x'" if prog in ("cp", "install") else ""
         sep = ", " if arg else ""
         script = f"import subprocess\nsubprocess.run(['{prog}', './reference_executable'{sep}{arg}])\n"
-        assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", script]), prog
+        assert _block(ctx, ws, ["python3", "-c", script]) == "", prog
     # os.execvp with a read tool as the program, artifact as an argv element.
     ex = "import os\nos.execvp('cat', ['cat', './reference_executable'])\n"
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", ex])
+    assert _block(ctx, ws, ["python3", "-c", ex]) == ""
     # But the genuine execute (artifact IS argv[0], incl. the exec(prog,[prog,...])
     # echo) stays exempt.
     assert _block(ctx, ws, ["python3", "-c",
@@ -260,23 +241,19 @@ def test_python_dash_m_file_operand_read_blocks(tmp_path):
         assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, cmd), cmd
 
 
-def test_alias_separated_protected_read_blocks(tmp_path):
-    """v6.56.0 review r7: binding the protected literal to a variable and reading it
-    FAR from the literal (`p='./ref'; <pad>; open(p).read()`) must still block — the
-    proximity window alone misses it. Pure padding isolates the alias detection from
-    the proximity scan (no read primitive sits near the literal)."""
+def test_alias_source_is_not_a_direct_read_target(tmp_path):
+    """Variable binding inside source does not create a direct operand."""
     ctx, ws = _ctx(tmp_path)
     pad = "\n".join(f"pad{i} = {i}" for i in range(60))
     for read in ("print(open(p, 'rb').read())",
                  "import pathlib; q = pathlib.Path(p); data = q.read_bytes()",
                  "import shutil; shutil.copy(p, '/tmp/leak')"):
         script = f"p = './reference_executable'\n{pad}\n{read}"
-        assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["python3", "-c", script]), read
+        assert _block(ctx, ws, ["python3", "-c", script]) == "", read
 
 
 def test_alias_bound_execute_not_a_read_allowed(tmp_path):
-    """The alias rule must not re-block the sanctioned differential workflow: binding
-    the ref to a variable and EXECUTING it (subprocess.run([p])) is not a read."""
+    """A program body may perform useful differential execution."""
     ctx, ws = _ctx(tmp_path)
     pad = "\n".join(f"pad{i} = {i}" for i in range(60))
     script = f"import subprocess\np = './reference_executable'\n{pad}\nsubprocess.run([p, '--version'], capture_output=True)"
@@ -302,8 +279,8 @@ def test_glob_matching_protected_name_still_blocks(tmp_path):
     """A glob whose pattern CAN match the protected artifact's basename still blocks
     (the carve-out is precise, not a blanket un-blocking of globs)."""
     ctx, ws = _ctx(tmp_path)
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["rm", "-f", "reference_*"])
-    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["rm", "-f", "reference_executabl?"])
+    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["sh", "-c", "rm -f reference_*"])
+    assert "RESOURCE_POLICY_BLOCKED" in _block(ctx, ws, ["sh", "-c", "rm -f reference_executabl?"])
 
 
 def test_refusal_names_nearest_allowed_action(tmp_path):

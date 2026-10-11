@@ -123,8 +123,8 @@ def test_render_settings_page_no_bare_bracket_backtick():
 
 def test_extension_settings_reuse_closed_safe_field_contract():
     content = SETTINGS_JS.read_text(encoding="utf-8")
-    assert "collectSafeFieldValues, renderSafeField, setInlineStatus" in content
-    assert "renderSafeField(field, {}, fieldOptions)" in content
+    assert "collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus" in content
+    assert "renderSafeField(field, values, fieldOptions)" in content
     assert "pendingExtensionSettings.has(requestKey)" in content
     assert "collectSafeFieldValues(form, spec.fields || [])" in content
     assert "type=\"${escapeHtml(field.type" not in content

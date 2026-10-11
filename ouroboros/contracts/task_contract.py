@@ -8,7 +8,10 @@ interprets whether the objective was met.
 
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping
+import copy
+import json
+from hashlib import sha256
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 
 _BOOLEAN_RESOURCE_NAMES = frozenset({
@@ -86,6 +89,37 @@ def normalize_bool(value: Any) -> bool:
     return bool(value)
 
 
+def normalize_attachment_manifest(value: Any) -> list[Dict[str, Any]]:
+    """Copy the additive complete attachment manifest into task authority.
+
+    The staging owner already sanitizes labels and rejection reasons.  This
+    normalizer keeps only the closed manifest vocabulary so a caller cannot use
+    the frozen task contract as an arbitrary metadata bag.
+    """
+
+    if not isinstance(value, list):
+        return []
+    rows: list[Dict[str, Any]] = []
+    allowed = (
+        "ordinal", "status", "reason", "label", "root", "relpath",
+        "abs_path", "mime", "is_image", "size", "sha256", "rule",
+    )
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            continue
+        row = {key: item[key] for key in allowed if key in item}
+        try:
+            row["ordinal"] = max(0, int(row.get("ordinal", index)))
+        except (TypeError, ValueError):
+            row["ordinal"] = index
+        status = str(row.get("status") or "staged")
+        row["status"] = status if status in {"staged", "rejected"} else "rejected"
+        row["reason"] = str(row.get("reason") or "")
+        row["label"] = str(row.get("label") or f"attachment {index + 1}")
+        rows.append(row)
+    return rows
+
+
 def _opt_nonneg_int(value: Any) -> Any:
     """A non-negative int, or None when unset/blank (meaning 'use the config cap')."""
     if value is None or (isinstance(value, str) and not value.strip()):
@@ -96,14 +130,33 @@ def _opt_nonneg_int(value: Any) -> Any:
         return None
 
 
-def _bounded_intent_note(value: Any, limit: int = 500) -> str:
-    """Bound a delegation intent_note to one line, with a VISIBLE omission marker
-    rather than a silent clip of the cognitive hint (BIBLE P1). Delegates to the
-    shared truncation primitive (marker + floor SSOT); single-line rendering."""
-    from ouroboros.utils import truncate_review_artifact
+def _normalized_intent_note(value: Any) -> str:
+    """Preserve the complete delegation intent in the durable authority.
 
-    text = str(value or "").strip()
-    return truncate_review_artifact(text, limit=limit).replace("\n", " ")
+    Cutting or flattening it here used to make
+    the normalized contract and every descendant fingerprint certify a prefix
+    as the parent's complete nesting/review constraint.
+    """
+    return str(value or "").strip()
+
+
+_DEPTH_PROVENANCE_KEYS = (
+    "requested_depth",
+    "permitted_depth",
+    "attempted_depth",
+    "achieved_depth",
+)
+
+
+def normalize_depth_provenance(value: Any) -> Dict[str, Any]:
+    """Normalize additive depth facts without inventing a requested depth."""
+    if not isinstance(value, Mapping):
+        return {}
+    out: Dict[str, Any] = {}
+    for key in _DEPTH_PROVENANCE_KEYS:
+        if key in value:
+            out[key] = _opt_nonneg_int(value.get(key))
+    return out
 
 
 def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
@@ -117,17 +170,27 @@ def normalize_delegation_budget(value: Any) -> Dict[str, Any]:
     explicitly granted, and ``depth_remaining``/``max_children`` default to None
     (the configured caps apply)."""
     v = value if isinstance(value, Mapping) else {}
-    return {
+    depth_remaining = _opt_nonneg_int(v.get("depth_remaining"))
+    budget = {
         "may_delegate": normalize_bool(v.get("may_delegate", True)),
         "may_mutate": normalize_bool(v.get("may_mutate", False)),
         "may_fan_out": normalize_bool(v.get("may_fan_out", True)),
-        "depth_remaining": _opt_nonneg_int(v.get("depth_remaining")),
+        "depth_remaining": depth_remaining,
         "max_children": _opt_nonneg_int(v.get("max_children")),
-        "intent_note": _bounded_intent_note(v.get("intent_note")),
+        "intent_note": _normalized_intent_note(v.get("intent_note")),
     }
+    if "depth_provenance" in v:
+        # Only an explicitly authored projection enters the frozen contract.
+        # Inferring one from a legacy depth_remaining field would rewrite old
+        # work-order hashes during restart/recovery.
+        budget["depth_provenance"] = normalize_depth_provenance(v.get("depth_provenance"))
+    return budget
 
 
-VALID_IMPROVEMENT_POLICIES = ("fixed", "adaptive", "until_deadline")
+# ABI 7.0 (owner Q10=A): the legacy ``until_deadline`` policy alias and the
+# never-consumed ``stall_rounds_threshold`` knob are REMOVED. An unknown
+# policy (including the retired spelling) normalizes to "fixed".
+VALID_IMPROVEMENT_POLICIES = ("fixed", "adaptive")
 
 
 def _opt_pct(value: Any) -> Any:
@@ -170,18 +233,19 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
 
     ``improvement_policy``: fixed (default; the configured/max pass cap decides) |
     adaptive (passes stop early when the remaining window can no longer fit a
-    review comfortably) | until_deadline (passes bounded ONLY by the time gate).
+    review comfortably).
 
     ``cost_hard_stop_pct`` (v6.56.0, additive): the in-task cost hard-stop as a
     percentage of the budget remaining at task start. None -> the historical
-    default (50: force-finalize once the task has spent half the remaining
+    default (50: the global component of the stop is half the remaining
     budget). 0 -> NO in-task cost stop at all — the deadline/rounds axes and the
     global between-task budget gate remain the only bounds, and cost milestones
     become informational against the start snapshot. The ceiling is resolved in
-    ``task_pacing.resolve_cost_ceiling_usd`` (0 maps to no ceiling, never a $0
-    ceiling). A MALFORMED value (negative / non-numeric / a ``0<v<1`` fraction)
-    maps to None (the 50% default), NOT to 0 — it must not silently disable the
-    stop (see ``_opt_cost_hard_stop_pct``).
+    ``task_pacing.resolve_cost_ceiling`` (typed; 0 maps to the ``disabled``
+    state, never a $0 ceiling; a per-task root cap contributes a second
+    min-component). A MALFORMED value (negative / non-numeric / a ``0<v<1``
+    fraction) maps to None (the 50% default), NOT to 0 — it must not silently
+    disable the stop (see ``_opt_cost_hard_stop_pct``).
     """
     v = value if isinstance(value, Mapping) else {}
     policy = str(v.get("improvement_policy") or "").strip().lower()
@@ -189,16 +253,13 @@ def normalize_budget_profile(value: Any) -> Dict[str, Any]:
         "improvement_policy": policy if policy in VALID_IMPROVEMENT_POLICIES else "fixed",
         "max_improvement_passes": _opt_nonneg_int(v.get("max_improvement_passes")),
         "reserve_finalization_pct": _opt_pct(v.get("reserve_finalization_pct")),
-        "stall_rounds_threshold": _opt_nonneg_int(v.get("stall_rounds_threshold")),
         "cost_hard_stop_pct": _opt_cost_hard_stop_pct(v.get("cost_hard_stop_pct")),
     }
 
 
-def _bounded_claim_text(value: Any, limit: int = 600) -> str:
-    from ouroboros.utils import truncate_review_artifact
-
-    text = " ".join(str(value or "").split()).strip()
-    return truncate_review_artifact(text, limit=limit).replace("\n", " ")
+def _claim_text(value: Any) -> str:
+    """Strip edges while preserving the complete claim and internal bytes."""
+    return str(value or "").strip()
 
 
 _ANSWER_PROTOCOLS = ("", "final_answer_line")
@@ -248,13 +309,13 @@ def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
     seen: set[str] = set()
     for idx, item in enumerate(items, start=1):
         if isinstance(item, Mapping):
-            claim = _bounded_claim_text(item.get("claim"))
-            surface = _bounded_claim_text(item.get("surface"), limit=300)
-            support = _bounded_claim_text(item.get("support"), limit=500)
+            claim = _claim_text(item.get("claim"))
+            surface = _claim_text(item.get("surface"))
+            support = _claim_text(item.get("support"))
             priority = str(item.get("priority") or "must").strip().lower() or "must"
             raw_id = str(item.get("id") or item.get("criterion_id") or f"claim_{idx}").strip()
         else:
-            claim = _bounded_claim_text(item)
+            claim = _claim_text(item)
             surface = ""
             support = ""
             priority = "must"
@@ -280,6 +341,76 @@ def normalize_acceptance_claims(value: Any) -> list[Dict[str, str]]:
             "priority": priority,
         })
     return out
+
+
+def effective_acceptance_claims(
+    task: Mapping[str, Any] | None,
+    closed_plan_wave: Mapping[str, Any] | None = None,
+) -> tuple[list[Dict[str, str]], str]:
+    """The claims that bind a task, with provenance — the ONE seam the
+    acceptance-evidence builder and the child-contract builder both read (W2).
+
+    Ingress-contract claims win (adapter/gateway/parent-authored — already in the
+    built contract); the CLOSED plan wave's frozen claims apply ONLY when ingress
+    is empty. PURE: no I/O and no contract mutation — the running task contract is
+    never rebuilt mid-task; plan-frozen claims live in ``plan_review_state``
+    (``task_results.closed_plan_review_wave``) and are resolved at READ time.
+    Returns ``(claims, source)`` with source ``ingress_contract`` |
+    ``plan_review`` | ``""`` (no claims anywhere)."""
+    task = task if isinstance(task, Mapping) else {}
+    contract = (
+        task.get("task_contract")
+        if isinstance(task.get("task_contract"), Mapping)
+        else task
+    )
+    ingress = normalize_acceptance_claims(contract.get("acceptance_claims"))
+    if ingress:
+        return ingress, "ingress_contract"
+    wave = closed_plan_wave if isinstance(closed_plan_wave, Mapping) else {}
+    # v2 waves freeze the whole reviewed SPEC (claims inside it); a v1 wave carried
+    # a bare ``acceptance_claims`` list — read as the legacy fallback.
+    spec = wave.get("spec") if isinstance(wave.get("spec"), Mapping) else {}
+    plan_claims = normalize_acceptance_claims(
+        spec.get("acceptance_claims") if spec else wave.get("acceptance_claims")
+    )
+    if plan_claims:
+        return plan_claims, "plan_review"
+    return [], ""
+
+
+def normalize_browser_origin(value: Any, *, origin_only: bool = False) -> str:
+    """Canonical exact HTTP(S) origin; malformed or wildcard targets grant nothing."""
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str):
+        return ""
+    if any(character.isspace() or ord(character) < 32 for character in value.strip()):
+        return ""
+    try:
+        parsed = urlsplit(value.strip())
+        host = str(parsed.hostname or "").rstrip(".").lower()
+        if parsed.scheme not in {"http", "https"} or not host or any(c in host for c in "*%\\"):
+            return ""
+        if parsed.username is not None or parsed.password is not None:
+            return ""
+        if origin_only and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+            return ""
+        port = parsed.port if parsed.port is not None else (443 if parsed.scheme == "https" else 80)
+        if not 0 < port < 65536:
+            return ""
+        host = f"[{ipaddress.ip_address(host).compressed}]" if ":" in host else host.encode("idna").decode("ascii")
+        return f"{parsed.scheme}://{host}:{port}"
+    except (ValueError, UnicodeError):
+        return ""
+
+
+def normalize_allowed_origins(value: Any) -> list[str]:
+    """Normalize only explicit origins, preserving an empty declared subset."""
+    if not isinstance(value, list):
+        return []
+    return list(dict.fromkeys(origin for item in value
+                              if (origin := normalize_browser_origin(item, origin_only=True))))
 
 
 def normalize_resource_policy(value: Any) -> Dict[str, Any]:
@@ -322,9 +453,28 @@ def normalize_resource_policy(value: Any) -> Dict[str, Any]:
     for key, raw in value.items():
         if key == "protected_artifacts":
             continue
+        if key == "allowed_origins":
+            out[key] = normalize_allowed_origins(raw)
+            continue
         if raw is not None:
             out[str(key)] = raw
     return out
+
+
+def normalize_input_sources(value: Any) -> str:
+    """An explicit source selection is closed; malformed selections never become shared."""
+    if not isinstance(value, str) or value not in {"shared", "declared"}:
+        raise ValueError("input_sources must be shared or declared")
+    return value
+
+
+def task_input_sources(task: Mapping[str, Any]) -> str:
+    """Read the persisted selection at every composition boundary; absence stays shared."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
+    for source in (task.get("task_contract"), metadata.get("task_contract"), task, metadata):
+        if isinstance(source, Mapping) and "input_sources" in source:
+            return normalize_input_sources(source["input_sources"])
+    return "shared"
 
 
 def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
@@ -365,6 +515,12 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         or metadata.get("constraints")
         or ""
     ).strip()
+    context_value = (
+        merged.get("context")
+        if merged.get("context") is not None
+        else (task.get("context") if task.get("context") is not None else metadata.get("context") or "")
+    )
+    context = "" if context_value is None else str(context_value)
     deadline_at = str(
         merged.get("deadline_at")
         or task.get("deadline_at")
@@ -376,19 +532,32 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         if merged.get("disabled_tools") is not None
         else (task.get("disabled_tools") or metadata.get("disabled_tools"))
     )
+    normalized_workspace = merged.get("workspace") if isinstance(merged.get("workspace"), Mapping) else {}
     workspace_root = str(
         merged.get("workspace_root")
+        or normalized_workspace.get("root")
         or task.get("workspace_root")
         or metadata.get("workspace_root")
         or ""
     ).strip()
     workspace_mode = str(
         merged.get("workspace_mode")
+        or normalized_workspace.get("mode")
         or task.get("workspace_mode")
         or metadata.get("workspace_mode")
         or ""
     ).strip()
     task_type = str(merged.get("task_type") or task.get("type") or "task").strip() or "task"
+    capability_ceiling = None
+    if merged.get("capability_ceiling") is not None:
+        from ouroboros.presence_authority import (
+            presence_ceiling_from_payload,
+            presence_ceiling_payload,
+        )
+
+        capability_ceiling = presence_ceiling_payload(
+            presence_ceiling_from_payload(merged.get("capability_ceiling"))
+        )
 
     acceptance_claims = normalize_acceptance_claims(
         merged.get("acceptance_claims")
@@ -396,6 +565,7 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         else (merged.get("success_criteria") or task.get("acceptance_claims") or metadata.get("acceptance_claims"))
     )
 
+    normalized_lineage = merged.get("lineage") if isinstance(merged.get("lineage"), Mapping) else {}
     contract = {
         "schema_version": 1,
         "status": str(merged.get("status") or "draft"),
@@ -404,9 +574,22 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
-        "success_criteria": list(merged.get("success_criteria") or [])
-        if isinstance(merged.get("success_criteria"), list)
-        else [],
+        # Exact caller/parent authority.  This used to live only on the task row,
+        # outside the contract rendered to the model and inherited by children.
+        "context": context,
+        # (W2) success_criteria is an INPUT ALIAS: it already feeds
+        # normalize_acceptance_claims above when no claims were given, so once
+        # acceptance_claims is populated the raw list is NOT double-persisted —
+        # one concept, one carrier. Historical records keep their stored shape
+        # untouched (no normalizer, v6.78 precedent); readers tolerate both
+        # shapes (the eligibility probe checks both keys).
+        "success_criteria": []
+        if acceptance_claims
+        else (
+            list(merged.get("success_criteria") or [])
+            if isinstance(merged.get("success_criteria"), list)
+            else []
+        ),
         "acceptance_claims": acceptance_claims,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
@@ -417,15 +600,20 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             if "context_requires_self_body_docs" in merged
             else task.get("context_requires_self_body_docs", metadata.get("context_requires_self_body_docs"))
         ),
+        "attachment_manifest": normalize_attachment_manifest(
+            merged.get("attachment_manifest")
+            if merged.get("attachment_manifest") is not None
+            else task.get("attachments")
+        ),
         "workspace": {
             "root": workspace_root,
             "mode": workspace_mode,
         },
         "lineage": {
-            "parent_task_id": str(task.get("parent_task_id") or metadata.get("parent_task_id") or ""),
-            "root_task_id": str(task.get("root_task_id") or metadata.get("root_task_id") or task.get("id") or ""),
-            "session_id": str(task.get("session_id") or metadata.get("session_id") or ""),
-            "delegation_role": str(task.get("delegation_role") or metadata.get("delegation_role") or "root"),
+            "parent_task_id": str(task.get("parent_task_id") or metadata.get("parent_task_id") or normalized_lineage.get("parent_task_id") or ""),
+            "root_task_id": str(task.get("root_task_id") or metadata.get("root_task_id") or normalized_lineage.get("root_task_id") or task.get("id") or ""),
+            "session_id": str(task.get("session_id") or metadata.get("session_id") or normalized_lineage.get("session_id") or ""),
+            "delegation_role": str(task.get("delegation_role") or metadata.get("delegation_role") or normalized_lineage.get("delegation_role") or "root"),
         },
         "delegation_budget": normalize_delegation_budget(
             merged.get("delegation_budget")
@@ -447,11 +635,216 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             else (task.get("answer_protocol") or metadata.get("answer_protocol"))
         ),
     }
+    # Additive only: ordinary contracts keep their exact historical shape/hashes.
+    for source in (merged, task, metadata):
+        if "input_sources" in source:
+            contract["input_sources"] = normalize_input_sources(source["input_sources"])
+            break
+    attachment_ref = merged.get("attachment_manifest_ref", task.get("attachment_manifest_ref"))
+    if attachment_ref is not None:
+        if not isinstance(attachment_ref, Mapping):
+            raise ValueError("attachment_manifest_ref must be a file reference")
+        contract["attachment_manifest_ref"] = {
+            key: copy.deepcopy(attachment_ref[key]) for key in
+            ("kind", "root", "path", "size", "sha256", "read", "count") if key in attachment_ref
+        }
+    predecessor_authority = (
+        merged.get("predecessor_authority")
+        if isinstance(merged.get("predecessor_authority"), Mapping)
+        else task.get("predecessor_authority")
+        if isinstance(task.get("predecessor_authority"), Mapping)
+        else metadata.get("predecessor_authority")
+    )
+    if isinstance(predecessor_authority, Mapping) and predecessor_authority:
+        # The predecessor is additive authority, not prose to merge into the new
+        # objective.  Preserve its materialized envelope so the ordinary parent
+        # contract spread carries it through direct starts and nested work orders.
+        # A legacy FAT body (pre-envelope: full result + nested contract chains)
+        # is collapsed here to its bounded reference shape - the in-flight
+        # migration point: rebuilding any contract sheds the recursion while
+        # the durable task_results (the SSOT bodies) stay untouched.
+        contract["predecessor_authority"] = _bounded_predecessor_authority(
+            dict(predecessor_authority)
+        )
     for key in ("notes", "review_notes"):
         if merged.get(key):
             contract[key] = merged.get(key)
+    if capability_ceiling is not None:
+        contract["capability_ceiling"] = capability_ceiling
     return contract
 
+
+def _serialized_chars(value: Any) -> Tuple[str, int]:
+    """A value's wire text and size - the SERIALIZED form is what rides.
+
+    Strings are measured serialized too (control characters escape to many
+    wire bytes: 15K of NULs serializes to 90K). A body too deep to serialize
+    (a recursive legacy chain) is oversized by definition, never a crash.
+    """
+    if isinstance(value, str):
+        try:
+            return value, len(json.dumps(value, ensure_ascii=False)) - 2
+        except (TypeError, ValueError, RecursionError):
+            return value, len(value)
+    try:
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except RecursionError:
+        return "<authority body too deep to serialize>", 2 ** 31
+    except (TypeError, ValueError):
+        text = repr(value)
+    return text, len(text)
+
+
+def bounded_continuation_envelope(
+    mapping: Dict[str, Any], *, digest_semantics: str,
+    source_ref: Optional[Dict[str, Any]] = None, salvage: bool = False,
+    extra: Optional[Dict[str, Any]] = None, reserve_source: bool = False,
+) -> Dict[str, Any]:
+    """The ONE bounded-envelope producer (startup binding and legacy collapse).
+
+    Every compact terminal fact inherits by copy - fields this reader predates
+    included - so authority cannot silently vanish. Only the growth carriers
+    are bounded structurally: the nested ``task_contract`` inherits its
+    operative core minus ``predecessor_authority`` (the recursion), and any
+    field whose body outgrows the tool-result budget rides as a typed preview,
+    measured on its SERIALIZED form - lists, dicts and escape-heavy strings
+    all count, previews shrink until they fit the wire. Core contract strings
+    stay strings under disclosed truncation. Row fields colliding with
+    envelope metadata names ride BOUNDED under ``shadowed_authority_fields``
+    instead of being clobbered; a malformed non-mapping ``task_contract``
+    rides as a bounded plain field rather than vanishing. The digest names
+    when it was observed; the durable task_results body stays the SSOT.
+    """
+    from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
+    from ouroboros.utils import truncate_within_limit
+
+    limit = DEFAULT_TOOL_RESULT_LIMIT
+
+    def _fit(raw: str) -> str:
+        # Every cut is taken from the ORIGINAL text, so the omission marker
+        # always discloses the true original length; the allowance shrinks
+        # proportionally to the observed escape factor (a 1-char overshoot
+        # costs 1 char, a 6x-escaping body converges near limit/6).
+        allowed = limit
+        preview = truncate_within_limit(raw, limit=allowed)
+        while allowed > 100:
+            try:
+                over = len(json.dumps(preview, ensure_ascii=False)) - 2 - limit
+            except (TypeError, ValueError, RecursionError):
+                break
+            if over <= 0:
+                break
+            allowed = max(100, min(allowed - 1, allowed * limit // (limit + over)))
+            preview = truncate_within_limit(raw, limit=allowed)
+        return preview
+
+    def _bounded(key: str, value: Any, *, field: str, force_pointer: bool = False) -> Any:
+        text, chars = _serialized_chars(value)
+        if not force_pointer and chars <= limit:
+            return copy.deepcopy(value)
+        entry: Dict[str, Any] = {
+            "kind": "unreviewed_host_salvage" if force_pointer else "bounded_field_preview",
+            "preview": _fit(text),
+            "full_chars": chars,
+        }
+        if source_ref:
+            entry["source_ref"] = {**copy.deepcopy(source_ref), "field": field}
+        return entry
+
+    digest_note = digest_semantics
+    try:
+        serialized = json.dumps(mapping, ensure_ascii=False, sort_keys=True, default=str)
+    except RecursionError:
+        # No identity can be computed over a body too deep to serialize -
+        # disclose that instead of presenting a placeholder digest as exact.
+        serialized = ""
+        digest_note = f"{digest_semantics}_unserializable"
+    except (TypeError, ValueError):
+        serialized = repr(mapping)
+    raw_contract = mapping.get("task_contract")
+    contract = raw_contract if isinstance(raw_contract, Mapping) else {}
+    reserved = {"kind", "authority_sha256", "authority_chars", "digest_semantics",
+                "previous_task_id", "collapsed_from", "shadowed_authority_fields"}
+    if reserve_source:
+        # The startup binding writes the pull pointer under ``source`` LAST; a
+        # projected row field with that name must shadow, not clobber or vanish.
+        reserved.add("source")
+    envelope: Dict[str, Any] = {}
+    shadowed: Dict[str, Any] = {}
+    for key, value in mapping.items():
+        if key == "task_contract" and isinstance(raw_contract, Mapping):
+            continue
+        if key in reserved:
+            shadowed[key] = _bounded(key, value, field=f"authority.{key}")
+            continue
+        envelope[key] = _bounded(
+            key, value, field=f"authority.{key}",
+            force_pointer=salvage and key == "result",
+        )
+    core: Dict[str, Any] = {}
+    for key, value in contract.items():
+        if key == "predecessor_authority":
+            continue
+        if isinstance(value, str):
+            _text, chars = _serialized_chars(value)
+            core[key] = _fit(value) if chars > limit else value
+            continue
+        core[key] = _bounded(key, value, field=f"authority.task_contract.{key}")
+    if core:
+        envelope["task_contract"] = core
+    if shadowed:
+        envelope["shadowed_authority_fields"] = shadowed
+    envelope.update({
+        "kind": "bounded_continuation_envelope",
+        "authority_sha256": sha256(serialized.encode("utf-8")).hexdigest() if serialized else "",
+        "authority_chars": len(serialized),
+        "digest_semantics": digest_note,
+        **(extra or {}),
+    })
+    return envelope
+
+def _bounded_predecessor_authority(mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """Collapse a legacy full-body predecessor on a growth carrier.
+
+    A body free of both carriers - no nested recursion, every field within
+    the tool-result budget on its serialized form - passes through
+    byte-identical: exact strings are authority. Otherwise the shared
+    envelope producer rewrites it once, and the minted envelope passes
+    rebuilds untouched.
+    """
+    if str(mapping.get("kind") or "") == "bounded_continuation_envelope":
+        return copy.deepcopy(mapping)
+    from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
+
+    raw_contract = mapping.get("task_contract")
+    contract = raw_contract if isinstance(raw_contract, Mapping) else {}
+    oversized = (
+        any(_serialized_chars(v)[1] > DEFAULT_TOOL_RESULT_LIMIT
+            for k, v in mapping.items()
+            if k != "task_contract" or not isinstance(raw_contract, Mapping))
+        or any(k != "predecessor_authority"
+               and _serialized_chars(v)[1] > DEFAULT_TOOL_RESULT_LIMIT
+               for k, v in contract.items())
+    )
+    if "predecessor_authority" not in contract and not oversized:
+        return copy.deepcopy(mapping)
+    source = mapping.get("source") if isinstance(mapping.get("source"), Mapping) else {}
+    # The chain cursor names the hop BEFORE this body's subject - the same rule
+    # the startup binding mints - never the subject's own id (a self-loop).
+    nested = contract.get("predecessor_authority") if isinstance(contract.get("predecessor_authority"), Mapping) else {}
+    nested_source = nested.get("source") if isinstance(nested.get("source"), Mapping) else {}
+    return bounded_continuation_envelope(
+        mapping,
+        digest_semantics="observed_at_collapse",
+        source_ref=dict(source) or None,
+        extra={
+            "collapsed_from": "legacy_full_body",
+            "previous_task_id": str(
+                nested.get("task_id") or nested.get("previous_task_id")
+                or nested_source.get("task_id") or ""
+            ),
+        },
+    )
 
 def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     contract = build_task_contract(task)
@@ -462,4 +855,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_answer_protocol", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_allowed_origins", "normalize_browser_origin", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_input_sources", "normalize_resource_policy", "task_input_sources"]

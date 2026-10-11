@@ -24,6 +24,22 @@ def resolve_web_dir(repo_dir: pathlib.Path) -> pathlib.Path:
     return repo_web_dir
 
 
+def read_author_kit_assets(repo_dir: pathlib.Path) -> dict[str, str]:
+    """Read the installed portable controls for an opt-in author page.
+
+    Extension handlers pass ``request.app.state.repo_dir`` so in-process and
+    isolated route workers read the same serving tree. Authors return these
+    texts through their own route or embed them in their HTML; this helper
+    creates no endpoint, cache, state or authentication exception. Read at
+    mount, not registration, so a new page receives the installed UI source.
+    """
+    web_dir = resolve_web_dir(pathlib.Path(repo_dir))
+    return {
+        "css": (web_dir / "ui.css").read_text(encoding="utf-8"),
+        "javascript": (web_dir / "modules" / "ui_primitives.js").read_text(encoding="utf-8"),
+    }
+
+
 class NoCacheStaticFiles:
     """Wrap StaticFiles to add Cache-Control: no-cache headers."""
 
@@ -48,6 +64,13 @@ def make_index_page(web_dir: pathlib.Path):
     async def index_page(_request) -> FileResponse | HTMLResponse:
         index = web_dir / "index.html"
         if index.exists():
+            if _request.headers.get("X-Ouroboros-Telegram-MiniApp") == "1":
+                # The authenticated sidecar proxy already stamps this presentation
+                # hint. Bootstrap navigates to this document, so it needs its own SDK.
+                html = index.read_text(encoding="utf-8")
+                html = html.replace("<html", '<html data-ouroboros-host="telegram"', 1)
+                html = html.replace("<head>", '<head><script async src="https://telegram.org/js/telegram-web-app.js"></script>', 1)
+                return HTMLResponse(html)
             return FileResponse(str(index), media_type="text/html")
         return HTMLResponse("<html><body><h1>Ouroboros — web/ not found</h1></body></html>", status_code=404)
 

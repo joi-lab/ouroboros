@@ -12,6 +12,8 @@ from ouroboros.contracts.skill_payload_policy import (
 from ouroboros.contracts.task_constraint import TaskConstraint, resolve_payload_path
 
 
+
+
 def test_resolve_payload_path_legacy_wrapper_matches_policy(tmp_path):
     drive_root = tmp_path / "data"
     skill_root = drive_root / "skills" / "external" / "alpha"
@@ -48,6 +50,54 @@ def test_owner_state_policy_matches_legacy_wrappers(tmp_path, monkeypatch):
         assert core._is_skill_owner_state_target(target, data_root) is True
         assert gateway_files._is_skill_owner_state_target(target) is True
         assert gateway_files._is_owner_only_file(target) is True
+
+
+def test_publication_receipt_is_owner_state_across_wrappers(tmp_path, monkeypatch):
+    """The OuroborosHub publication receipt is owner state: filename, stem,
+    case-variant paths, and every legacy wrapper must all agree."""
+    from ouroboros import config as cfg
+    from ouroboros.contracts.skill_payload_policy import (
+        SKILL_OWNER_STATE_FILENAMES,
+        SKILL_OWNER_STATE_STEMS,
+    )
+    from ouroboros.gateway import files as gateway_files
+    from ouroboros.tools import core
+
+    assert "ouroboroshub.json" in SKILL_OWNER_STATE_FILENAMES
+    assert "ouroboroshub" in SKILL_OWNER_STATE_STEMS
+
+    data_root = tmp_path / "data"
+    monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=True)
+
+    for parts in (("state", "skills"), ("State", "Skills")):
+        target = data_root.joinpath(*parts) / "weather" / "ouroboroshub.json"
+        assert is_skill_owner_state_target(target, data_root) is True
+        assert core._is_skill_owner_state_target(target, data_root) is True
+        assert gateway_files._is_skill_owner_state_target(target) is True
+        assert gateway_files._is_owner_only_file(target) is True
+
+
+def test_publication_receipt_hardlink_alias_is_owner_state(tmp_path, monkeypatch):
+    from ouroboros import config as cfg
+    from ouroboros.gateway import files as gateway_files
+
+    data_root = tmp_path / "data"
+    state_dir = data_root / "state" / "skills" / "weather"
+    state_dir.mkdir(parents=True)
+    record = state_dir / "ouroboroshub.json"
+    record.write_text("{}", encoding="utf-8")
+    alias = data_root / "memory" / "receipt-copy.json"
+    alias.parent.mkdir(parents=True)
+    try:
+        os.link(record, alias)
+    except OSError:
+        pytest.skip("Hardlinks unavailable on this filesystem")
+    monkeypatch.setattr(cfg, "DATA_DIR", data_root, raising=True)
+
+    assert is_skill_owner_state_alias(alias, data_root) is True
+    assert gateway_files._is_owner_only_file(alias) is True
+
+
 
 
 def test_owner_state_alias_policy_matches_files_api(tmp_path, monkeypatch):
@@ -118,31 +168,9 @@ def test_control_plane_policy_catches_hardlink_alias_inside_payload(tmp_path):
     assert is_skill_control_plane_path(alias, data_root) is True
 
 
-def test_registry_heal_sidecar_wrapper_uses_shared_control_filenames():
-    from ouroboros.tools.registry import _heal_protected_payload_sidecar
+def test_payload_sidecars_use_shared_control_filenames():
+    from ouroboros.contracts.skill_payload_policy import is_skill_payload_control_filename
 
     for filename in SKILL_PAYLOAD_CONTROL_FILENAMES:
-        assert _heal_protected_payload_sidecar(f"nested/{filename}") is True
-    assert _heal_protected_payload_sidecar("nested/plugin.py") is False
-
-
-def test_registry_shell_guard_keeps_legacy_control_dir_subset(tmp_path):
-    from ouroboros.tools.registry import ToolRegistry
-
-    repo = tmp_path / "repo"
-    drive = tmp_path / "data"
-    repo.mkdir()
-    drive.mkdir()
-    reg = ToolRegistry(repo_dir=repo, drive_root=drive)
-    blocked = reg._run_shell_safety_check(
-        {"cmd": "rm data/skills/external/alpha/.self_authored.json"},
-        "advanced",
-    )
-    assert blocked is not None
-    assert "SAFETY_VIOLATION" in blocked
-
-    allowed = reg._run_shell_safety_check(
-        {"cmd": "rm data/skills/external/alpha/__pycache__/plugin.pyc"},
-        "advanced",
-    )
-    assert allowed is None
+        assert is_skill_payload_control_filename(filename) is True
+    assert is_skill_payload_control_filename("plugin.py") is False

@@ -3,6 +3,19 @@
 
 $ErrorActionPreference = "Stop"
 
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)][scriptblock]$Command
+    )
+
+    & $Command
+    $ExitCode = $LASTEXITCODE
+    if ($ExitCode -ne 0) {
+        throw "$Description failed with exit code $ExitCode"
+    }
+}
+
 $Version = (Get-Content VERSION).Trim()
 $ArchiveName = "Ouroboros-${Version}-windows-x64.zip"
 $ManagedSourceBranch = if ($env:OUROBOROS_MANAGED_SOURCE_BRANCH) { $env:OUROBOROS_MANAGED_SOURCE_BRANCH } else { "ouroboros" }
@@ -14,6 +27,10 @@ New-Item -ItemType Directory -Force -Path $env:PYTHONPYCACHEPREFIX | Out-Null
 
 Write-Host "=== Building Ouroboros for Windows (v${Version}) ==="
 
+if (-not (Get-Command uv -ErrorAction SilentlyContinue)) {
+    throw 'uv 0.12.1 is required. Install it with: powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/0.12.1/install.ps1 | iex"'
+}
+
 if (-not (Test-Path "python-standalone\python.exe")) {
     Write-Host "ERROR: python-standalone\ not found."
     Write-Host "Run first: powershell -ExecutionPolicy Bypass -File scripts/download_python_standalone.ps1"
@@ -23,19 +40,47 @@ if (-not (Test-Path "python-standalone\python.exe")) {
 # Bundle the official Node.js runtime so node-runtime skills work out of the box.
 if (-not (Test-Path "node-standalone\node.exe")) {
     Write-Host "--- Downloading bundled Node.js runtime ---"
-    powershell -ExecutionPolicy Bypass -File scripts/download_node_standalone.ps1
+    Invoke-NativeChecked "Node.js runtime download" {
+        powershell -ExecutionPolicy Bypass -File scripts/download_node_standalone.ps1
+    }
 }
 
 Write-Host "--- Installing launcher dependencies ---"
-python -m pip install -q -r requirements-launcher.txt
+$BuildRequirements = Join-Path ([IO.Path]::GetTempPath()) "ouroboros-build-requirements-$PID.txt"
+Invoke-NativeChecked "Build dependency export" {
+    uv export --locked --no-dev --extra browser --extra desktop --extra build `
+        --no-emit-project --no-hashes --no-annotate --output-file $BuildRequirements
+}
+try {
+    Invoke-NativeChecked "Launcher dependency installation" {
+        uv pip install --python python -q -r $BuildRequirements
+    }
+} finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $BuildRequirements
+}
 
 if (-not (Test-Path "ripgrep-standalone\rg.exe")) {
     Write-Host "--- Downloading bundled ripgrep runtime ---"
-    powershell -ExecutionPolicy Bypass -File "scripts\download_ripgrep_standalone.ps1"
+    Invoke-NativeChecked "ripgrep runtime download" {
+        powershell -ExecutionPolicy Bypass -File "scripts\download_ripgrep_standalone.ps1"
+    }
+}
+
+Write-Host "--- Verifying bundled Betterleaks runtime ---"
+Invoke-NativeChecked "Betterleaks runtime installation" {
+    & "python-standalone\python.exe" -m ouroboros.betterleaks_runtime install `
+        --build-output betterleaks-standalone
 }
 
 Write-Host "--- Installing agent dependencies into python-standalone ---"
-& "python-standalone\python.exe" -m pip install -q -r requirements.txt
+Invoke-NativeChecked "Agent dependency installation" {
+    uv pip install --python "python-standalone\python.exe" -q -r requirements-runtime.lock
+}
+
+Write-Host "--- Fetching exact Claudexor runtime seed ---"
+Invoke-NativeChecked "Claudexor runtime seed fetch" {
+    & "python-standalone\python.exe" scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime
+}
 
 if (Test-Path "build") { Remove-Item -Recurse -Force "build" }
 if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
@@ -45,10 +90,14 @@ New-Item -ItemType Directory -Force -Path $env:PYINSTALLER_CONFIG_DIR | Out-Null
 
 Write-Host "--- Installing Chromium for browser tools (bundled into python-standalone) ---"
 $env:PLAYWRIGHT_BROWSERS_PATH = "0"
-& "python-standalone\python.exe" -m playwright install --only-shell chromium
+Invoke-NativeChecked "Chromium installation" {
+    & "python-standalone\python.exe" -m playwright install --only-shell chromium
+}
 
 Write-Host "--- Installing WebKit for mobile-grade browser tools (bundled into python-standalone) ---"
-& "python-standalone\python.exe" -m playwright install webkit
+Invoke-NativeChecked "WebKit installation" {
+    & "python-standalone\python.exe" -m playwright install webkit
+}
 
 Write-Host "--- Pruning optional Chromium resources with long Windows paths ---"
 $LocalBrowsers = "python-standalone\Lib\site-packages\playwright\driver\package\.local-browsers"
@@ -70,10 +119,14 @@ if (Test-Path $LocalBrowsers) {
 }
 
 Write-Host "--- Building embedded managed repo bundle ---"
-python scripts/build_repo_bundle.py --source-branch $ManagedSourceBranch
+Invoke-NativeChecked "Managed repo bundle build" {
+    python scripts/build_repo_bundle.py --source-branch $ManagedSourceBranch
+}
 
 Write-Host "--- Running PyInstaller ---"
-python -m PyInstaller Ouroboros.spec --clean --noconfirm
+Invoke-NativeChecked "PyInstaller build" {
+    python -m PyInstaller Ouroboros.spec --clean --noconfirm
+}
 
 Write-Host "--- Installing packaged CLI wrappers ---"
 New-Item -ItemType Directory -Force -Path "dist\Ouroboros\bin" | Out-Null

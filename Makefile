@@ -3,21 +3,22 @@
 
 .PHONY: test lint health clean
 
-# Run smoke tests (fast, no external deps needed at runtime)
+# Full local battery: node lane + every default-lane test in one xdist run
+# (modes and focused runs: scripts/run_tests.py)
 test:
-	python3 -m pytest tests/ -q --tb=short
+	uv run --locked python scripts/run_tests.py
 
-# Run smoke tests with verbose output
+# Single-process verbose run (slow: the whole default suite in one process)
 test-v:
-	python3 -m pytest tests/ -v --tb=long
+	uv run --locked python -m pytest tests/ -v --tb=long
 
 # Lint: deterministic F-rule gate (NameError class); matches the CI quick-test step
 lint:
-	python3 -m ruff check . --select F
+	uv run --locked python -m ruff check . --select F
 
 # Run codebase health check (requires ouroboros importable)
 health:
-	python3 -c "from ouroboros.review import collect_sections, compute_complexity_metrics; \
+	uv run --locked python -c "from ouroboros.review import collect_sections, compute_complexity_metrics; \
 		import pathlib, json; \
 		sections, stats = collect_sections(pathlib.Path('.'), pathlib.Path('../data')); \
 		m = compute_complexity_metrics(sections); \

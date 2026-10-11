@@ -40,7 +40,7 @@ class FakeApi:
 class FakeTelegramClient:
     instances = []
 
-    def __init__(self, token):
+    def __init__(self, token, **_kwargs):
         self.token = token
         self.sent = []
         self.edited = []
@@ -73,7 +73,7 @@ def test_existing_corrupt_settings_refuse_owner_rebinding(tmp_path, monkeypatch)
     plugin = _load_plugin(tmp_path)
     (tmp_path / "settings.json").write_text("{", encoding="utf-8")
 
-    def forbidden_client(_token):
+    def forbidden_client(_token, **_kwargs):
         raise AssertionError("Telegram client must not start with corrupt owner state")
 
     monkeypatch.setattr(plugin, "TelegramClient", forbidden_client)
@@ -320,7 +320,9 @@ def test_poller_surfaces_permanent_telegram_rejection_and_records_failure(tmp_pa
     assert any(message == "Telegram polling was permanently rejected." for _, message, _ in api.logs)
 
 
-def test_poller_retries_only_typed_transport_failure(tmp_path, monkeypatch):
+def test_poller_backoff_grows_monotonically_to_cap_on_typed_transport_failure(tmp_path, monkeypatch):
+    """Typed transient failures keep the poller alive with monotone backoff up
+    to the cap; a cancellation during the backoff sleep still stops it."""
     plugin = _load_plugin(tmp_path)
 
     class OfflineClient(FakeTelegramClient):
@@ -330,21 +332,216 @@ def test_poller_retries_only_typed_transport_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(plugin, "TelegramClient", OfflineClient)
     sleeps = []
 
-    async def stop_after_backoff(delay):
+    async def record_sleep(delay):
         sleeps.append(delay)
-        raise asyncio.CancelledError
+        if len(sleeps) >= 8:
+            raise asyncio.CancelledError
 
-    monkeypatch.setattr(plugin.asyncio, "sleep", stop_after_backoff)
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
     try:
         asyncio.run(plugin._make_poller(FakeApi(tmp_path))())
     except asyncio.CancelledError:
         pass
 
-    assert sleeps == [5]
+    assert sleeps[0] == 5
+    assert all(later >= earlier for earlier, later in zip(sleeps, sleeps[1:]))
+    assert max(sleeps) == 60
+    assert sleeps[-2:] == [60, 60]
     assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
         "state": "ready",
         "reason_code": "",
     }
+
+
+def test_poller_backoff_resets_after_any_successful_poll_and_logs_transitions(tmp_path, monkeypatch):
+    plugin = _load_plugin(tmp_path)
+    outcomes = iter([
+        plugin.TelegramTransportError("offline one"),
+        plugin.TelegramTransportError("offline two"),
+        [],  # empty batch still counts as success and resets the backoff
+        plugin.TelegramTransportError("offline again"),
+    ])
+
+    class FlappingClient(FakeTelegramClient):
+        async def get_updates(self, _offset):
+            outcome = next(outcomes)
+            if isinstance(outcome, Exception):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(plugin, "TelegramClient", FlappingClient)
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 4:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
+    api = FakeApi(tmp_path)
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except asyncio.CancelledError:
+        pass
+
+    # backoff, grown backoff, healthy pacing sleep, then backoff reset to base
+    assert sleeps[0] == 5
+    assert sleeps[1] > sleeps[0]
+    assert sleeps[3] == 5
+    degraded = [m for _lvl, m, _f in api.logs if "degraded" in m]
+    recovered = [m for _lvl, m, _f in api.logs if "recovered" in m]
+    assert len(degraded) == 2, degraded
+    assert "TelegramTransportError" in degraded[0]
+    assert len(recovered) == 1, recovered
+
+
+def test_startup_transient_getme_does_not_kill_poller(tmp_path, monkeypatch):
+    """A dead network during startup validation must not raise into the
+    supervised-restart budget; validation is retried from the polling loop."""
+    plugin = _load_plugin(tmp_path)
+    failures = {"count": 0}
+
+    class LateStartClient(FakeTelegramClient):
+        updates = []
+
+        async def call(self, method, **kwargs):
+            if method == "getMe" and failures["count"] < 1:
+                failures["count"] += 1
+                raise plugin.TelegramTransportError("Telegram API timed out during getMe.")
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", LateStartClient)
+
+    async def stop_sleep(_delay):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", stop_sleep)
+    api = FakeApi(tmp_path)
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except asyncio.CancelledError:
+        pass
+
+    assert failures["count"] == 1
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "ready",
+        "reason_code": "",
+    }
+    assert any("Telegram poller started" in m for _lvl, m, _f in api.logs)
+
+
+def test_startup_deferred_validation_with_network_still_down_paces_with_backoff(tmp_path, monkeypatch):
+    """After a deferred (transient) startup getMe, a network that STAYS down
+    keeps the poller alive: every in-loop revalidation failure paces with the
+    monotone 5→60 backoff instead of hot-looping or raising."""
+    plugin = _load_plugin(tmp_path)
+    failures = {"count": 0}
+
+    class StillDownClient(FakeTelegramClient):
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                failures["count"] += 1
+                raise plugin.TelegramTransportError("Telegram API timed out during getMe.")
+            return {"ok": True, "result": {}}
+
+        async def get_updates(self, _offset):
+            raise AssertionError("polling must not start before validation succeeds")
+
+    monkeypatch.setattr(plugin, "TelegramClient", StillDownClient)
+    sleeps = []
+
+    async def record_sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) >= 8:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(plugin.asyncio, "sleep", record_sleep)
+    try:
+        asyncio.run(plugin._make_poller(FakeApi(tmp_path))())
+    except asyncio.CancelledError:
+        pass
+
+    assert failures["count"] >= 8  # startup + one revalidation per backoff sleep
+    assert sleeps[0] == 5
+    assert all(later >= earlier for earlier, later in zip(sleeps, sleeps[1:]))
+    assert max(sleeps) == 60
+    assert sleeps[-2:] == [60, 60]
+    # #376: while validation stays deferred the durable status is truthful —
+    # neither `ready` nor an error, and never absent.
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "degraded",
+        "reason_code": "telegram_startup_deferred",
+    }
+
+
+def test_startup_permanent_rejection_keeps_raise_semantics(tmp_path, monkeypatch):
+    plugin = _load_plugin(tmp_path)
+
+    class RejectedStartClient(FakeTelegramClient):
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                raise plugin.TelegramRequestRejected(
+                    "Telegram API getMe returned HTTP 401.", status_code=401,
+                )
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", RejectedStartClient)
+    api = FakeApi(tmp_path)
+
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except plugin.TelegramRequestRejected as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("permanent startup rejection must stop the poller")
+
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "error",
+        "reason_code": "telegram_startup_failed",
+    }
+    assert any("Telegram token validation failed" in m for _lvl, m, _f in api.logs)
+
+
+def test_inloop_revalidation_permanent_rejection_uses_startup_labeling(tmp_path, monkeypatch):
+    """A permanent getMe rejection during in-loop revalidation is the startup
+    token-validation failure deferred by a dead network: it must route through
+    the startup labeling (telegram_startup_failed + token-validation log), not
+    'telegram_rejected'."""
+    plugin = _load_plugin(tmp_path)
+    calls = {"getme": 0}
+
+    class DeferredRejectClient(FakeTelegramClient):
+        updates = []
+
+        async def call(self, method, **kwargs):
+            if method == "getMe":
+                calls["getme"] += 1
+                if calls["getme"] == 1:
+                    raise plugin.TelegramTransportError("network down during startup getMe.")
+                raise plugin.TelegramRequestRejected(
+                    "Telegram API getMe returned HTTP 401.", status_code=401,
+                )
+            return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(plugin, "TelegramClient", DeferredRejectClient)
+    api = FakeApi(tmp_path)
+
+    try:
+        asyncio.run(plugin._make_poller(api)())
+    except plugin.TelegramRequestRejected as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("permanent revalidation rejection must stop the poller")
+
+    assert calls["getme"] == 2
+    assert json.loads((tmp_path / "bridge_status.json").read_text(encoding="utf-8")) == {
+        "state": "error",
+        "reason_code": "telegram_startup_failed",
+    }
+    assert any("Telegram token validation failed" in m for _lvl, m, _f in api.logs)
+    assert all(
+        m != "Telegram polling was permanently rejected." for _lvl, m, _f in api.logs
+    )
 
 
 def test_poller_surfaces_local_failure_to_supervisor(tmp_path, monkeypatch):
@@ -403,6 +600,14 @@ def test_required_media_subscription_failure_stops_skill_registration(tmp_path, 
             "chat.photo",
             "chat.video",
             "chat.document",
+        ],
+        "chat.links": [
+            "chat.outbound",
+            "chat.typing",
+            "chat.photo",
+            "chat.video",
+            "chat.document",
+            "chat.links",
         ],
     }
 

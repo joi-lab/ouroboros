@@ -107,7 +107,12 @@ def run_ouroboros(prompt: str, sample_id: str = "sample", attachments: list[path
     # Epistemic-grounding disclosure rule (SSOT, adapter-only; see METHODOLOGY.md).
     if GAIA_EPISTEMIC_INSTRUCTION not in prompt:
         prompt = prompt + GAIA_EPISTEMIC_INSTRUCTION
-    cmd.append(prompt)
+    # E2BIG hygiene (C5): the (instruction-augmented) prompt travels as a FILE in
+    # the sample dir — the same dir the subprocess already writes result.json to,
+    # so it stays visible inside the bwrap namespace — never as an argv tail.
+    prompt_path = sample_dir / "prompt.txt"
+    prompt_path.write_text(prompt, encoding="utf-8")
+    cmd.extend(["--prompt-file", str(prompt_path)])
     # Filesystem isolation: mask the GAIA answer cache from the whole `ouroboros run`
     # subprocess (server + task share one mount namespace; the dedicated server binds
     # loopback INSIDE the namespace, so the CLI still reaches it). Symmetric with the

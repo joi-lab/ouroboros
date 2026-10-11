@@ -1,21 +1,44 @@
 from __future__ import annotations
 
 import base64
+import html as html_lib
 import mimetypes
 import re
-from typing import Any, Dict, Optional
+from typing import Any, BinaryIO, Dict, Optional
 
 import httpx
 
-# Telegram hard-caps a single sendMessage at 4096 chars. We chunk the RAW text
-# (pre-HTML) on line/space boundaries below this so each chunk is converted and
-# sent independently — avoiding both the silent "message is too long" 400 that
-# dropped long replies and tag-splitting corruption from cutting inside HTML.
+from ..scripts.telegram_settings import validate_telegram_proxy as _telegram_proxy
+from .telegram_i18n import Index
+
+# Telegram hard-caps a single sendMessage at 4096 UTF-16 code units.
 _TELEGRAM_TEXT_LIMIT = 4096
-_TELEGRAM_CHUNK_RAW = 3500
+_TABLE_MAX_ROWS = 30
+_TABLE_MAX_COLUMNS = 6
+_TABLE_MAX_CELL_CHARS = 24
 # Match Ouroboros's existing per-photo transfer ceiling for every Telegram download.
 _MAX_TELEGRAM_DOWNLOAD_BYTES = 10 * 1024 * 1024
+# Outgoing document transport is independent of this integration's inbound cap.
+_MAX_TELEGRAM_UPLOAD_BYTES = 50 * 1024 * 1024
 _NOT_MODIFIED_PREFIX = "bad request: message is not modified"
+
+
+def _u16len(value: str) -> int:
+    """Return Telegram's text length: UTF-16 code units, not code points."""
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in value)
+
+
+def _take_u16_prefix(value: str, budget: int) -> tuple[str, str]:
+    """Split value at a UTF-16-unit boundary without bisecting a code point."""
+    used = 0
+    index = 0
+    while index < len(value):
+        width = 2 if ord(value[index]) > 0xFFFF else 1
+        if used + width > budget:
+            break
+        used += width
+        index += 1
+    return value[:index], value[index:]
 
 
 class TelegramRequestRejected(RuntimeError):
@@ -41,26 +64,50 @@ class TelegramTransportError(RuntimeError):
     """Telegram could not return a trustworthy API response yet."""
 
 
-def _chunk_raw_text(text: str, limit: int = _TELEGRAM_CHUNK_RAW) -> list[str]:
-    """Split raw text into <=limit-char pieces on line, then space, boundaries."""
-    if len(text) <= limit:
+# Shared degraded-transport pacing contract for the poller and notifier loops:
+# the first retry waits TELEGRAM_RETRY_INITIAL_SEC and each further consecutive
+# failure doubles the wait monotonically up to TELEGRAM_RETRY_MAX_SEC; any
+# successful API round resets the wait to the initial value.
+TELEGRAM_RETRY_INITIAL_SEC = 5
+TELEGRAM_RETRY_MAX_SEC = 60
+
+
+def next_telegram_retry_delay(current: float) -> float:
+    """Next monotone backoff step after one more consecutive transient failure."""
+    return min(max(float(current), TELEGRAM_RETRY_INITIAL_SEC) * 2, TELEGRAM_RETRY_MAX_SEC)
+
+
+def is_transient_telegram_error(exc: BaseException) -> bool:
+    """Whether *exc* is a typed transient Telegram failure worth retrying."""
+    if isinstance(exc, TelegramTransportError):
+        return True
+    return isinstance(exc, TelegramRequestRejected) and exc.transient
+
+
+def _chunk_raw_text(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split raw text into <=limit UTF-16-unit pieces on line/space boundaries."""
+    if _u16len(text) <= limit:
         return [text]
     chunks: list[str] = []
     buf = ""
     for line in text.split("\n"):
-        while len(line) > limit:
+        while _u16len(line) > limit:
             # A single very long line: break on the last space within the window,
             # else hard-cut at the limit.
-            cut = line.rfind(" ", 0, limit)
-            cut = cut if cut > 0 else limit
-            piece = line[:cut]
+            prefix, remainder = _take_u16_prefix(line, limit)
+            cut = prefix.rfind(" ")
+            if cut > 0:
+                piece = line[:cut]
+                line = line[cut:].lstrip(" ")
+            else:
+                piece = prefix
+                line = remainder
             if buf:
                 chunks.append(buf)
                 buf = ""
             chunks.append(piece)
-            line = line[cut:].lstrip(" ")
         candidate = f"{buf}\n{line}" if buf else line
-        if len(candidate) > limit:
+        if _u16len(candidate) > limit:
             if buf:
                 chunks.append(buf)
             buf = line
@@ -71,37 +118,179 @@ def _chunk_raw_text(text: str, limit: int = _TELEGRAM_CHUNK_RAW) -> list[str]:
     return chunks or [""]
 
 
+def _escape_html(text: str) -> str:
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _split_table_row(line: str) -> list[str]:
+    row = line.strip()
+    if row.startswith("|"):
+        row = row[1:]
+    if row.endswith("|") and not row.endswith(r"\|"):
+        row = row[:-1]
+    cells: list[str] = []
+    current: list[str] = []
+    escaped = False
+    for char in row:
+        if char == "|" and not escaped:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    cells.append("".join(current).strip())
+    return [cell.replace(r"\|", "|") for cell in cells]
+
+
+def _is_table_delimiter(line: str, header: str) -> bool:
+    cells = _split_table_row(line)
+    return (
+        "|" in line
+        and len(cells) == len(_split_table_row(header))
+        and all(re.fullmatch(r":?-+:?", cell) for cell in cells)
+    )
+
+
+def _is_non_code_indent(line: str) -> bool:
+    """Return whether CommonMark treats the line as non-code indentation."""
+    columns = 0
+    for char in line:
+        if char == " ":
+            columns += 1
+        elif char == "\t":
+            columns += 4 - (columns % 4)
+        else:
+            break
+        if columns >= 4:
+            return False
+    return True
+
+
+def _is_table_start(header_line: str, delimiter_line: str) -> bool:
+    return (
+        _is_non_code_indent(header_line)
+        and "|" in header_line
+        and _is_table_delimiter(delimiter_line, header_line)
+    )
+
+
+def _truncate_table_cell(cell: str) -> str:
+    if len(cell) <= _TABLE_MAX_CELL_CHARS:
+        return cell
+    return cell[: _TABLE_MAX_CELL_CHARS - 1] + "…"
+
+
+def _table_html(lines: list[str]) -> str:
+    rows = [_split_table_row(lines[0])]
+    rows.extend(_split_table_row(line) for line in lines[2:])
+    column_count = min(max((len(row) for row in rows), default=0), _TABLE_MAX_COLUMNS)
+    truncated = len(rows) > _TABLE_MAX_ROWS or any(len(row) > _TABLE_MAX_COLUMNS for row in rows)
+    visible_rows = rows[:_TABLE_MAX_ROWS]
+    normalized: list[list[str]] = []
+    for row in visible_rows:
+        normalized.append(
+            [_truncate_table_cell(row[index] if index < len(row) else "") for index in range(column_count)]
+        )
+    widths = [
+        max(3, max((len(row[index]) for row in normalized), default=0))
+        for index in range(column_count)
+    ]
+
+    def render(row: list[str]) -> str:
+        return " | ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)).rstrip()
+
+    grid: list[str] = []
+    if normalized:
+        grid.append(render(normalized[0]))
+        grid.append("-+-".join("-" * width for width in widths))
+        grid.extend(render(row) for row in normalized[1:])
+    if truncated:
+        grid.append("…table truncated")
+    return f"<pre>{_escape_html(chr(10).join(grid))}</pre>"
+
+
+def _replace_gfm_tables(text: str, pre_placeholder_map: dict[str, str]) -> str:
+    lines = text.splitlines(keepends=True)
+    output: list[str] = []
+    index = 0
+    while index < len(lines):
+        body = lines[index].rstrip("\r\n")
+        if (
+            index + 1 < len(lines)
+            and _is_table_start(body, lines[index + 1].rstrip("\r\n"))
+        ):
+            end = index + 2
+            while end < len(lines):
+                candidate = lines[end].rstrip("\r\n")
+                if not candidate.strip() or "|" not in candidate:
+                    break
+                end += 1
+            placeholder = f"\x00PRE{len(pre_placeholder_map)}\x00"
+            pre_placeholder_map[placeholder] = _table_html(
+                [line.rstrip("\r\n") for line in lines[index:end]]
+            )
+            newline = "\n" if lines[end - 1].endswith(("\n", "\r")) else ""
+            output.append(placeholder + newline)
+            index = end
+            continue
+        output.append(lines[index])
+        index += 1
+    return "".join(output)
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert standard rich Markdown text into Telegram-compliant HTML syntax."""
     if not text:
         return text
 
-    # 1. Escape HTML special characters
-    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
     # Placeholder dictionaries
-    pre_placeholder_map = {}
-    code_placeholder_map = {}
+    pre_placeholder_map: dict[str, str] = {}
+    code_placeholder_map: dict[str, str] = {}
+    literal_placeholder_map: dict[str, str] = {}
 
-    # 2. Extract multi-line code blocks before parsing other markdown
+    # 1. Protect fenced blocks before table detection and inline formatting.
     def replace_pre(match: re.Match) -> str:
-        code_content = match.group(2)
-        placeholder = f"PREPLACEHOLDER{len(pre_placeholder_map)}"
-        pre_placeholder_map[placeholder] = f"<pre>{code_content}</pre>"
+        code_content = match.group(1)
+        placeholder = f"\x00PRE{len(pre_placeholder_map)}\x00"
+        pre_placeholder_map[placeholder] = f"<pre>{_escape_html(code_content)}</pre>"
         return placeholder
 
-    text = re.sub(r"```([A-Za-z0-9_-]*)\s*\n?(.*?)```", replace_pre, text, flags=re.DOTALL)
+    text = re.sub(
+        r"```(?:[A-Za-z0-9_-]*[ \t]*\r?\n)?(.*?)```",
+        replace_pre,
+        text,
+        flags=re.DOTALL,
+    )
 
-    # 3. Extract inline code blocks
+    # 2. Preserve supported LaTeX delimiters as literal text. Placeholders keep
+    # emphasis and link regexes from interpreting math source.
+    def replace_literal(match: re.Match) -> str:
+        placeholder = f"\x00LITERAL{len(literal_placeholder_map)}\x00"
+        literal_placeholder_map[placeholder] = _escape_html(match.group(0))
+        return placeholder
+
+    text = re.sub(r"\$\$(.+?)\$\$", replace_literal, text, flags=re.DOTALL)
+    text = re.sub(r"\\\((.+?)\\\)", replace_literal, text, flags=re.DOTALL)
+    text = re.sub(r"\\\[(.+?)\\\]", replace_literal, text, flags=re.DOTALL)
+
+    # 3. Convert GFM pipe tables to bounded monospace grids, then escape all
+    # remaining literal HTML from the source.
+    text = _replace_gfm_tables(text, pre_placeholder_map)
+    text = _escape_html(text)
+
+    # 4. Extract inline code blocks.
     def replace_code(match: re.Match) -> str:
         inner = match.group(1)
-        placeholder = f"CODEPLACEHOLDER{len(code_placeholder_map)}"
+        placeholder = f"\x00CODE{len(code_placeholder_map)}\x00"
         code_placeholder_map[placeholder] = f"<code>{inner}</code>"
         return placeholder
 
     text = re.sub(r"`([^`\n]+)`", replace_code, text)
 
-    # 4. Headers and list markdown formatting line-by-line
+    # 5. Headers, task lists, and ordinary list formatting line-by-line.
     lines = []
     for line in text.split("\n"):
         header_match = re.match(r"^(\s*)#{1,6}\s+(.+)$", line)
@@ -110,6 +299,11 @@ def markdown_to_telegram_html(text: str) -> str:
             content = header_match.group(2)
             lines.append(f"{indent}<b>{content}</b>")
         else:
+            task_match = re.match(r"^(\s*)(?:[-*+]|\d+\.)\s+\[([ xX])\]\s+(.+)$", line)
+            if task_match:
+                glyph = "☑" if task_match.group(2).lower() == "x" else "☐"
+                lines.append(f"{task_match.group(1)}{glyph} {task_match.group(3)}")
+                continue
             # Replace starting list bullet * or - with •
             bullet_match = re.match(r"^(\s*)[*-]\s+(.+)$", line)
             if bullet_match:
@@ -118,34 +312,267 @@ def markdown_to_telegram_html(text: str) -> str:
                 lines.append(line)
     text = "\n".join(lines)
 
-    # 5. Bold and Italic replacing outside of inline blocks.
+    # 6. Bold and Italic replacing outside of protected blocks.
     # Asterisk patterns match anywhere — `**bold**` and `*italic*` are unambiguous.
     # Underscore patterns require non-word context on both sides so identifiers
     # like `chat_id`, `state_dir`, `OUROBOROS_MODEL` inside bold spans do NOT
     # trigger spurious italic wraps that cross outer tag boundaries (which
     # would produce malformed nested HTML and a Telegram 400 Bad Request).
+    text = re.sub(r"\*\*\*(.+?)\*\*\*", r"<b><i>\1</i></b>", text)
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"(?<!\w)__(?=\S)([^_\n]+?)(?<=\S)__(?!\w)", r"<b>\1</b>", text)
     text = re.sub(r"\*(.+?)\*", r"<i>\1</i>", text)
     text = re.sub(r"(?<!\w)_(?=\S)([^_\n]+?)(?<=\S)_(?!\w)", r"<i>\1</i>", text)
 
-    # 6. Links [text](url) -> <a href="url">text</a>
+    # 7. Links [text](url) -> <a href="url">text</a>
     text = re.sub(r"\[(.*?)\]\((.*?)\)", r'<a href="\2">\1</a>', text)
 
-    # 7. Reconstruct codeblocks (sorted by length descending to prevent sub-string prefix collisions)
-    for placeholder, code_html in sorted(pre_placeholder_map.items(), key=lambda x: len(x[0]), reverse=True):
-        text = text.replace(placeholder, code_html)
-    for placeholder, code_html in sorted(code_placeholder_map.items(), key=lambda x: len(x[0]), reverse=True):
-        text = text.replace(placeholder, code_html)
+    # 8. Reconstruct protected blocks (longest placeholder first prevents
+    # substring prefix collisions such as PLACEHOLDER1/PLACEHOLDER10).
+    placeholders = sorted(
+        [
+            *pre_placeholder_map.items(),
+            *code_placeholder_map.items(),
+            *literal_placeholder_map.items(),
+        ],
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+    for _ in range(len(placeholders) + 1):
+        reconstructed = text
+        for placeholder, replacement in placeholders:
+            reconstructed = reconstructed.replace(placeholder, replacement)
+        if reconstructed == text:
+            break
+        text = reconstructed
+
+    # Telegram rejects NUL bytes even without parse mode. Remove any source NUL
+    # or unresolved sentinel defensively before this text reaches a send path.
+    text = text.replace("\x00", "")
 
     return text
 
 
+def _markdown_blocks(text: str) -> list[str]:
+    """Split markdown without bisecting fenced, table, or quote blocks."""
+    lines = text.splitlines(keepends=True)
+    blocks: list[str] = []
+    index = 0
+
+    def body(at: int) -> str:
+        return lines[at].rstrip("\r\n")
+
+    def starts_special(at: int) -> bool:
+        if re.match(r"^\s*```", body(at)) or re.match(r"^\s*>", body(at)):
+            return True
+        return (
+            at + 1 < len(lines)
+            and _is_table_start(body(at), body(at + 1))
+        )
+
+    while index < len(lines):
+        start = index
+        if re.match(r"^\s*```", body(index)):
+            index += 1
+            while index < len(lines):
+                closing = bool(re.match(r"^\s*```\s*$", body(index)))
+                index += 1
+                if closing:
+                    break
+        elif (
+            index + 1 < len(lines)
+            and _is_table_start(body(index), body(index + 1))
+        ):
+            index += 2
+            while index < len(lines) and body(index).strip() and "|" in body(index):
+                index += 1
+        elif re.match(r"^\s*>", body(index)):
+            index += 1
+            while index < len(lines) and re.match(r"^\s*>", body(index)):
+                index += 1
+        elif not body(index).strip():
+            index += 1
+            while index < len(lines) and not body(index).strip():
+                index += 1
+        else:
+            index += 1
+            while index < len(lines) and body(index).strip() and not starts_special(index):
+                index += 1
+        blocks.append("".join(lines[start:index]))
+    return blocks or [""]
+
+
+_HTML_TOKEN_RE = re.compile(r"<[^>]+>|&(?:#[0-9]+|#x[0-9A-Fa-f]+|[A-Za-z]+);|\s|[^\s<&]+|[<&]")
+_HTML_TAG_RE = re.compile(r"</?([A-Za-z0-9]+)")
+
+
+def _split_html_balanced(value: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Split one oversized HTML block while closing and reopening active tags."""
+    chunks: list[str] = []
+    current = ""
+    stack: list[tuple[str, str]] = []
+
+    def suffix(active_stack: list[tuple[str, str]]) -> str:
+        return "".join(f"</{name}>" for name, _opening in reversed(active_stack))
+
+    def closing_suffix() -> str:
+        return suffix(stack)
+
+    def reopen_prefix() -> str:
+        return "".join(opening for _name, opening in stack)
+
+    def flush() -> None:
+        nonlocal current
+        if current:
+            chunks.append(current + closing_suffix())
+        current = reopen_prefix()
+
+    def append_slices(raw: str) -> None:
+        while raw:
+            piece, raw = _take_u16_prefix(raw, limit)
+            if not piece:
+                piece, raw = raw[0], raw[1:]
+            chunks.append(piece)
+
+    def hard_reset() -> None:
+        nonlocal current
+        payload = current + closing_suffix()
+        if payload:
+            if _u16len(payload) <= limit:
+                chunks.append(payload)
+            else:
+                append_slices(payload)
+        current = ""
+        stack.clear()
+
+    tokens = _HTML_TOKEN_RE.findall(value)
+    iterations = 0
+    for token_index, token in enumerate(tokens):
+        iterations += 1
+        if iterations > 200_000:
+            hard_reset()
+            append_slices("".join(tokens[token_index:]))
+            return chunks or [""]
+
+        tag_match = _HTML_TAG_RE.match(token) if token.startswith("<") else None
+        if tag_match:
+            name = tag_match.group(1).lower()
+            is_close = token.startswith("</")
+            output = token
+            if is_close:
+                matching_index = next(
+                    (index for index in range(len(stack) - 1, -1, -1) if stack[index][0] == name),
+                    None,
+                )
+                if matching_index is None:
+                    output = _escape_html(token)
+                    projected_stack = list(stack)
+                else:
+                    intervening = stack[matching_index + 1 :]
+                    output = suffix(intervening) + token + "".join(
+                        opening for _tag, opening in intervening
+                    )
+                    projected_stack = stack[:matching_index] + intervening
+            elif token.endswith("/>"):
+                projected_stack = list(stack)
+            else:
+                projected_stack = stack + [(name, token)]
+
+            projected_suffix = suffix(projected_stack)
+            projected_length = _u16len(current) + _u16len(output) + _u16len(projected_suffix)
+            if projected_length > limit and current != reopen_prefix():
+                flush()
+                projected_length = _u16len(current) + _u16len(output) + _u16len(projected_suffix)
+            if projected_length > limit:
+                hard_reset()
+                append_slices(_escape_html(token))
+                continue
+            current += output
+            stack[:] = projected_stack
+            continue
+
+        remaining = token
+        while remaining:
+            iterations += 1
+            if iterations > 200_000:
+                hard_reset()
+                append_slices(remaining + "".join(tokens[token_index + 1 :]))
+                return chunks or [""]
+
+            available = limit - _u16len(current) - _u16len(closing_suffix())
+            if available <= 0:
+                flush()
+                available = limit - _u16len(current) - _u16len(closing_suffix())
+                if available <= 0:
+                    hard_reset()
+                    append_slices(remaining)
+                    remaining = ""
+                    break
+            if _u16len(remaining) <= available:
+                current += remaining
+                break
+            if remaining.startswith("&") and remaining.endswith(";"):
+                flush()
+                if _u16len(remaining) > limit - _u16len(current) - _u16len(closing_suffix()):
+                    hard_reset()
+                    append_slices(_escape_html(remaining))
+                    remaining = ""
+                continue
+            piece, remaining = _take_u16_prefix(remaining, available)
+            if not piece:
+                hard_reset()
+                append_slices(remaining)
+                remaining = ""
+                break
+            current += piece
+            flush()
+    if current:
+        chunks.append(current + closing_suffix())
+    return chunks or [""]
+
+
+def markdown_to_telegram_chunks(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Convert markdown block-by-block, then pack balanced Telegram HTML."""
+    chunks: list[str] = []
+    buffer = ""
+
+    def append_visible(chunk: str) -> None:
+        if _telegram_html_to_plain(chunk).strip():
+            chunks.append(chunk)
+
+    for block in _markdown_blocks(text):
+        converted = markdown_to_telegram_html(block)
+        if _u16len(converted) > limit:
+            if buffer:
+                append_visible(buffer)
+                buffer = ""
+            for chunk in _split_html_balanced(converted, limit):
+                append_visible(chunk)
+        elif _u16len(buffer) + _u16len(converted) <= limit:
+            buffer += converted
+        else:
+            if buffer:
+                append_visible(buffer)
+            buffer = converted
+    if buffer:
+        append_visible(buffer)
+    return chunks
+
+
+def _telegram_html_to_plain(value: str) -> str:
+    return html_lib.unescape(re.sub(r"<[^>]+>", "", value))
+
+
 class TelegramClient:
-    def __init__(self, token: str):
+    def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None):
         self.token = str(token or "").strip()
+        self.trust_env = bool(trust_env)
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN is missing")
+        # An explicit proxy replaces ambient proxies for these calls only. The target stays
+        # https://api.telegram.org, so TLS runs end to end through the tunnel: the proxy
+        # sees the host, never the token-bearing path, and redirects are never followed.
+        self.proxy = _telegram_proxy(proxy)
         self.api_base = f"https://api.telegram.org/bot{self.token}"
         self.file_base = f"https://api.telegram.org/file/bot{self.token}"
 
@@ -153,7 +580,11 @@ class TelegramClient:
         method_text = str(method or "")
         safe_method = method_text if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", method_text) else "request"
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            # trust_env trades ambient-proxy/SSL_CERT isolation for a proxy-routed install's
+            # only egress; decided once by the caller via net_transport.env_proxies_configured.
+            async with httpx.AsyncClient(
+                timeout=timeout, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
                 response = await client.post(f"{self.api_base}/{method_text}", data=data, files=files)
         except httpx.TimeoutException:
             raise TelegramTransportError(f"Telegram API timed out during {safe_method}.") from None
@@ -199,7 +630,9 @@ class TelegramClient:
 
     async def _download_bytes(self, file_path: str) -> bytes:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(
+                timeout=30, trust_env=self.trust_env, proxy=self.proxy, follow_redirects=False,
+            ) as client:
                 async with client.stream("GET", f"{self.file_base}/{file_path}") as response:
                     if response.status_code >= 400:
                         raise RuntimeError(f"Telegram file download returned HTTP {response.status_code}")
@@ -227,16 +660,26 @@ class TelegramClient:
         return list(payload.get("result") or [])
 
     async def send_message(self, chat_id: int, text: str, parse_mode: str = "HTML") -> int:
-        """Send a text message, chunking past Telegram's 4096-char limit.
+        """Send a text message, chunking past Telegram's 4096-unit limit.
 
-        Long text is split on line/space boundaries and each chunk is sent as its
-        own message (converted independently so HTML tags never span a cut).
+        Markdown is converted at block granularity before chunks are packed.
+        Protected blocks stay whole unless one block exceeds Telegram's limit;
+        oversized blocks are split with active HTML tags re-balanced.
         Returns the LAST chunk's message_id (0 on parse failure / empty input).
         """
-        chunks = _chunk_raw_text(str(text or ""))
+        source = str(text or "")
+        chunks = (
+            markdown_to_telegram_chunks(source)
+            if parse_mode == "HTML"
+            else _chunk_raw_text(source)
+        )
         last_message_id = 0
-        for chunk in chunks:
-            formatted = markdown_to_telegram_html(chunk) if parse_mode == "HTML" else chunk
+        for formatted in chunks:
+            visible_text = (
+                _telegram_html_to_plain(formatted) if parse_mode == "HTML" else formatted
+            )
+            if not visible_text.strip():
+                continue
             data = {"chat_id": str(chat_id), "text": formatted}
             if parse_mode:
                 data["parse_mode"] = parse_mode
@@ -247,7 +690,7 @@ class TelegramClient:
                     raise
                 payload = await self.call(
                     "sendMessage",
-                    data={"chat_id": str(chat_id), "text": chunk},
+                    data={"chat_id": str(chat_id), "text": _telegram_html_to_plain(formatted)},
                     timeout=20,
                 )
             try:
@@ -293,9 +736,9 @@ class TelegramClient:
         await self.call("sendPhoto", data=data, files=files, timeout=30)
 
     async def send_document(
-        self, chat_id: int, file_bytes: bytes, filename: str = "file", *, caption: str = "", parse_mode: str = "HTML"
+        self, chat_id: int, file_bytes: bytes | BinaryIO, filename: str = "file", *, caption: str = "", parse_mode: str = "HTML"
     ) -> None:
-        """Send an arbitrary document/file to a chat via sendDocument."""
+        """Send bytes or a borrowed binary file through the existing multipart call."""
         safe_name = (str(filename or "file").replace("\r", " ").replace("\n", " ").strip() or "file")
         files = {"document": (safe_name, file_bytes, "application/octet-stream")}
         formatted = markdown_to_telegram_html(caption) if (caption and parse_mode == "HTML") else caption
@@ -306,21 +749,46 @@ class TelegramClient:
                 data["parse_mode"] = parse_mode
         await self.call("sendDocument", data=data, files=files, timeout=60)
 
+    async def send_audio(
+        self,
+        chat_id: int,
+        file_bytes: bytes | BinaryIO,
+        filename: str,
+        *,
+        caption: str = "",
+        mime: str = "audio/mpeg",
+        parse_mode: str = "HTML",
+    ) -> None:
+        """Send MP3/M4A bytes through Telegram's native audio player."""
+        safe_name = (str(filename or "audio").replace("\r", " ").replace("\n", " ").strip() or "audio")
+        files = {"audio": (safe_name, file_bytes, str(mime or "audio/mpeg"))}
+        formatted = markdown_to_telegram_html(caption) if (caption and parse_mode == "HTML") else caption
+        data = {"chat_id": str(chat_id)}
+        if formatted:
+            data["caption"] = formatted
+            if parse_mode:
+                data["parse_mode"] = parse_mode
+        await self.call("sendAudio", data=data, files=files, timeout=60)
+
     async def send_message_with_inline_keyboard(
         self, chat_id: int, text: str, keyboard: list[list[dict]], parse_mode: str = "HTML"
-    ) -> None:
-        """Send a message with an inline keyboard (list of button rows)."""
+    ) -> int:
+        """Send a message with an inline keyboard (list of button rows); return its message id (0 if unknown)."""
         import json as _json
         reply_markup = _json.dumps({"inline_keyboard": keyboard})
         formatted = markdown_to_telegram_html(text) if parse_mode == "HTML" else text
         data = {"chat_id": str(chat_id), "text": formatted, "reply_markup": reply_markup}
         if parse_mode:
             data["parse_mode"] = parse_mode
-        await self.call(
+        payload = await self.call(
             "sendMessage",
             data=data,
             timeout=20,
         )
+        try:
+            return int(((payload or {}).get("result") or {}).get("message_id") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return 0
 
     async def answer_callback_query(self, callback_query_id: str, *, text: str = "") -> None:
         """Acknowledge a callback query from an inline button press."""
@@ -368,105 +836,81 @@ class TelegramClient:
             return str(exc) == "Telegram API editMessageText: message is not modified."
 
 
-_LOCALIZED_TEXTS = {
-    "en": {
-        "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
-        "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{lang}`\n\nExplore and monitor the core using the buttons below:",
-        "btn_metrics": "📉 Status & Metrics",
-        "btn_mind": "🧠 Mind & BG",
-        "btn_language": "🌐 Select language",
-        "btn_refresh": "🔄 Update parameter card",
-        "btn_back": "⬅️ Back to main panel",
-        "btn_stop_bg": "🔴 Pause background thoughts",
-        "btn_start_bg": "🟢 Resume background thoughts",
-        "btn_thoughts": "💭 What are you thinking about?",
-        "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
-        "mind_thoughts": "\n\n**Recent thoughts catalog:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Thinking** (running)",
-        "mind_state_sleeping": "🔴 **Sleeping** (paused)",
-        "lang_title": "🌐 Select chatbot bridge interface language:\nCurrently active: **English**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Ouroboros Telegram Help**\n\n"
-            "Available commands:\n"
-            "• `/menu` — Show interactive control panel with active tabs\n"
-            "• `/language` — Change bridge interface language\n"
-            "• `/status` — Request live system status (if allowed)\n"
-            "• `/help` — Show this friendly usage guide\n\n"
-            "Modes description (changed in Web UI → Settings → Telegram):\n"
-            "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — allow status monitoring\n"
-            "• **full_access** — allow status + background loop start/stop"
-        ),
-        "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
-        "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
-        "not_authorized": "Not authorized",
-        "updating_status": "Updating status metrics...",
-        "extracting_thoughts": "Extracting thoughts...",
-        "injecting_consciousness": "Injecting consciousness signal...",
-        "restricted_safe": "⛔ Restricted in safe mode",
-        "lang_changed": "✅ Language changed to English",
-        "unknown_command": "Unknown command",
-        "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd:.4f}`\n  Limit: `${total_budget:.2f}`\n  Remaining: `${rem:.4f}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
-        "bg_active_label": "ACTIVE",
-        "bg_sleeping_label": "SLEEPING",
-        "btn_settings": "⚙️ Settings",
-        "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
-        "btn_silent_on": "🔕 Silent Mode: ON",
-        "btn_silent_off": "🔔 Silent Mode: OFF",
-        "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
-        "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
-    },
-    "ru": {
-        "menu_title_strict": "🤖 **Панель управления Ouroboros**\nРежим Strict активен. Команды заблокированы.\n\nВыберите действие:",
-        "menu_title": "🤖 **Центр управления Ouroboros**\nРежим команд: `{command_mode}`\nЯзык: `{lang}`\n\nУправляйте и следите за ядром с помощью кнопок:",
-        "btn_metrics": "📉 Статус и метрики",
-        "btn_mind": "🧠 Фоновое сознание",
-        "btn_language": "🌐 Выбор языка",
-        "btn_refresh": "🔄 Обновить показатели",
-        "btn_back": "⬅️ Назад в меню",
-        "btn_stop_bg": "🔴 Приостановить размышления",
-        "btn_start_bg": "🟢 Продолжить размышления",
-        "btn_thoughts": "💭 О чём ты думаешь сейчас?",
-        "metrics_title": "📊 **Живые показатели Ouroboros**\n\n{info_text}\n---",
-        "mind_title": "🧠 **Фоновое Сознание**\n\nТекущее состояние: {state_str}\n\nФоновое мышление анализирует информацию между вашими запросами.",
-        "mind_thoughts": "\n\n**Последние мысли из лога:**\n{thoughts_text}",
-        "mind_state_active": "🟢 **Думает** (активно)",
-        "mind_state_sleeping": "🔴 **Спит** (на паузе)",
-        "lang_title": "🌐 Выберите язык интерфейса бота-моста:\nАктивный язык: **Русский**",
-        "lang_en": "🇬🇧 English",
-        "lang_ru": "🇷🇺 Русский",
-        "help_text": (
-            "🤖 **Справка по Telegram в Ouroboros**\n\n"
-            "Доступные команды:\n"
-            "• `/menu` — Открыть интерактивную панель управления\n"
-            "• `/language` — Изменить и настроить язык интерфейса\n"
-            "• `/status` — Запросить текущий статус системы (если разрешено)\n"
-            "• `/help` — Показать это руководство\n\n"
-            "Описание режимов (меняется в Web UI → Settings → Telegram):\n"
-            "• **strict** — блокировать ввод команд (доступны только `/menu`, `/help`, `/language`)\n"
-            "• **safe_commands** — разрешить просмотр метрик и статуса\n"
-            "• **full_access** — доступ ко всем кнопкам, включая запуск/паузу фонового сознания"
-        ),
-        "slash_blocked_strict": "⛔ Слэш-команды запрещены в режиме strict. Используйте `/menu` или измените режим в Settings → Telegram.",
-        "slash_blocked_mode": "⛔ Эта команда не разрешена в текущем режиме. Используйте `/menu` для вызова управления.",
-        "not_authorized": "Доступ ограничен",
-        "updating_status": "Обновление метрик...",
-        "extracting_thoughts": "Извлечение мыслей...",
-        "injecting_consciousness": "Отправка сигнала сознания...",
-        "restricted_safe": "⛔ Ограничено в режиме Safe",
-        "lang_changed": "✅ Язык интерфейса изменен на Русский",
-        "unknown_command": "Неизвестная команда",
-        "metrics_budget_status": "• **Бюджетный статус:**\n  Потрачено: `${spent_usd:.4f}`\n  Лимит: `${total_budget:.2f}`\n  Осталось: `${rem:.4f}`\n\n• **Окружение системы:**\n  Ветка Git: `{branch}`\n  Фоновые мысли: `{bg_status}`",
-        "bg_active_label": "АКТИВНЫ",
-        "bg_sleeping_label": "СПЯТ",
-        "btn_settings": "⚙️ Настройки",
-        "settings_title": "⚙️ **Настройки Telegram**\nНастройте панель Telegram и отображение сообщений:",
-        "btn_silent_on": "🔕 Тихий режим: ВКЛ",
-        "btn_silent_off": "🔔 Тихий режим: ВЫКЛ",
-        "silent_toggled_on": "🔕 Тихий режим включён — новые мысли будут заменять предыдущее сообщение",
-        "silent_toggled_off": "🔔 Тихий режим выключен — каждая мысль становится отдельным сообщением",
-    }
+_MENU_TEXTS_EN = {
+    "menu_title_strict": "🤖 **Ouroboros Control Panel**\nStrict mode is active. Commands are blocked.\n\nSelect action:",
+    "menu_title": "🤖 **Ouroboros Control Centre**\nCommand Mode: `{command_mode}`\nLanguage: `{language}`\n\nExplore and monitor the core using the buttons below:",
+    "btn_metrics": "📉 Status & Metrics",
+    "btn_mind": "🧠 Mind & BG",
+    "btn_tasks": "📋 Tasks",
+    "btn_language": "🌐 Interface language",
+    "btn_refresh": "🔄 Update parameter card",
+    "btn_back": "⬅️ Back to main panel",
+    "btn_stop_bg": "🔴 Pause background thoughts",
+    "btn_start_bg": "🟢 Resume background thoughts",
+    "btn_thoughts": "💭 What are you thinking about?",
+    "metrics_title": "📊 **Ouroboros live metrics**\n\n{info_text}\n---",
+    "mind_title": "🧠 **Background Consciousness**\n\nCurrent state: {state_str}\n\nBackground thinking processes information between your chat queries.",
+    "mind_thoughts": "\n\n**Recent thoughts catalog:**\n{thoughts_text}",
+    "mind_state_active": "🟢 **Thinking** (running)",
+    "mind_state_sleeping": "🔴 **Sleeping** (paused)",
+    "tasks_title": "📋 Tasks",
+    "lang_title": (
+        "🌐 **Interface language of this installation**\n"
+        "The web UI, the desktop window and this bot follow one choice.\n"
+        "Currently active: **{language}**\n\n"
+        "For any other language send `/language <name>` — a code such as pt-BR, a language name, "
+        "or a description of a language to invent."
+    ),
+    "lang_english": "🇬🇧 English (source)",
+    "lang_changed": "✅ Interface language changed to {language}",
+    "lang_failed": "⚠️ The language could not be changed: {reason}",
+    "lang_needs_model": "⚠️ A language name needs a model: set one up in Settings → Models, or send a code such as `/language pt-BR`.",
+    "help_text": (
+        "🤖 **Ouroboros Telegram Help**\n\n"
+        "Available commands:\n"
+        "• `/menu` — Show interactive control panel with active tabs\n"
+        "• `/language` — Change the interface language of this installation\n"
+        "• `/status` — Request live system status (if allowed)\n"
+        "• `/help` — Show this friendly usage guide\n\n"
+        "Modes description (changed in Web UI → Settings → Telegram):\n"
+        "• **strict** — block all command injections (only `/menu`, `/help`, `/language`)\n"
+        "• **safe_commands** — allow status monitoring\n"
+        "• **full_access** — allow status + background loop start/stop"
+    ),
+    "slash_blocked_strict": "⛔ Slash commands are not allowed in strict mode. Use `/menu` to see available options, or change mode in Settings → Telegram.",
+    "slash_blocked_mode": "⛔ This command is not allowed in the current mode. Use `/menu` to see available options.",
+    "not_authorized": "Not authorized",
+    "updating_status": "Updating status metrics...",
+    "extracting_thoughts": "Extracting thoughts...",
+    "injecting_consciousness": "Injecting consciousness signal...",
+    "restricted_safe": "⛔ Restricted in safe mode",
+    "unknown_command": "Unknown command",
+    "use_miniapp": "Use the Mini App.",
+    "update_failed": "Could not deliver that Telegram update to Ouroboros.",
+    "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd}`\n  Limit: `${total_budget}`\n  Remaining: `${rem}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
+    "file_too_large_notice": "{filename} is saved in Ouroboros. This file exceeds the Telegram upload limit and cannot be mirrored here.",
+    "file_open_app_hint": "Open the app to download it.",
+    "btn_open_app": "Open Ouroboros",
+    "budget_unbounded": "unbounded",
+    "bg_active_label": "ACTIVE",
+    "bg_sleeping_label": "SLEEPING",
+    "btn_settings": "⚙️ Settings",
+    "settings_title": "⚙️ **Telegram Settings**\nConfigure the Telegram control panel and message display:",
+    "btn_silent_on": "🔕 Silent Mode: ON",
+    "btn_silent_off": "🔔 Silent Mode: OFF",
+    "silent_toggled_on": "🔕 Silent mode enabled — new thoughts will replace the last message",
+    "silent_toggled_off": "🔔 Silent mode disabled — each thought becomes a new message",
+    "cmd_menu": "Interactive panel",
+    "cmd_language": "Interface language",
+    "cmd_status": "Request status",
+    "cmd_help": "Usage guide",
+    "cmd_evolve": "Start an evolution campaign",
+    "cmd_bg": "Background consciousness on/off",
+    "cmd_review": "Run a self-review",
+    "cmd_restart": "Restart the agent",
+    "cmd_panic": "Emergency stop",
 }
+# Every line the bridge composes is English source here and translated by the install's
+# memory under the one interface language (lib/telegram_i18n.py); the skill ships no
+# dictionary, the light model fills the memory when a language is chosen.
+_LOCALIZED_TEXTS = Index("menu", _MENU_TEXTS_EN, "the Telegram bot's control panel: titles, buttons, notices, command descriptions")

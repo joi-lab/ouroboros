@@ -1,471 +1,174 @@
-"""
-Tests for the compaction policy in ouroboros/loop.py.
+"""Deletion-first loop policy: manual control plus one measured Main pass."""
 
-All tests that exercise the compaction branch import and patch the PRODUCTION
-symbols (`compact_tool_history_llm`, `_estimate_messages_chars`) so that drift
-in the real loop code causes test failures rather than silently passing against
-a copied replica.
-
-The multi-round tests keep `call_llm_with_retry` alive for N rounds by
-returning a tool-calling response for the first N-1 rounds, then a text-only
-response to stop the loop.  `handle_tool_calls` is also patched to avoid
-importing actual tool implementations.
-
-Covers:
-1. _estimate_messages_chars: content, multipart (text + non-text), tool_calls,
-   tool_call_id, image_url blocks, empty list.
-2. Remote mode: no routine compaction up to round 13 under normal context.
-3. Remote mode: emergency compaction fires when _estimate_messages_chars > 1.2M.
-4. Emergency path fires unconditionally on checkpoint rounds.
-5. Local mode: routine compaction fires at round 7 when messages > 40
-   (verified by driving the real loop to round 7).
-6. Local routine compaction is suppressed on checkpoint rounds.
-7. Manual _pending_compaction fires in both modes and is not suppressed
-   by checkpoint rounds.
-8. Manual compaction takes precedence over emergency threshold.
-"""
 from __future__ import annotations
 
-import json
-import queue
-import types
-import unittest
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
+
+import pytest
+
+from tests import test_loop_compaction as _main_loop
+
+_main_fit = _main_loop._fit
+real_main_reclaim = _main_loop.real_main_reclaim  # the shared fixture: real Main/materializer boundary
 
 
-# ---------------------------------------------------------------------------
-# Imports from production code
-# ---------------------------------------------------------------------------
-from ouroboros.loop import _estimate_messages_chars as _emc
+def _ctx(tmp_path, *, pending=None):
+    from ouroboros import loop
 
-
-# ---------------------------------------------------------------------------
-# Shared test helpers
-# ---------------------------------------------------------------------------
-
-def _msg(role: str, content="", tool_calls=None, tool_call_id: str = "") -> dict:
-    m: dict = {"role": role, "content": content}
-    if tool_calls is not None:
-        m["tool_calls"] = tool_calls
-    if tool_call_id:
-        m["tool_call_id"] = tool_call_id
-    return m
-
-
-def _tool_round(tc_id: str, content: str = "r", result: str = "ok") -> list:
-    """One assistant+tool pair."""
-    return [
-        _msg("assistant", content, tool_calls=[
-            {"id": tc_id, "function": {"name": "noop", "arguments": "{}"}}
-        ]),
-        _msg("tool", result, tool_call_id=tc_id),
-    ]
-
-
-def _make_tool_rounds(n: int, content_size: int = 10) -> list:
-    msgs = []
-    for i in range(n):
-        msgs.extend(_tool_round(f"tc{i}", "r" * content_size, "s" * content_size))
-    return msgs
-
-
-def _make_fake_registry(messages, pending_compaction=None):
-    """Build a minimal fake ToolRegistry with the compaction context attrs."""
-    fake_ctx = types.SimpleNamespace(
+    inner = SimpleNamespace(_pending_compaction=pending)
+    return loop._CompactionRoundContext(
+        tools=SimpleNamespace(_ctx=inner),
+        drive_root=tmp_path,
+        drive_logs=tmp_path / "logs",
+        task_id="task",
+        round_idx=77,
         event_queue=None,
-        task_id="test",
-        messages=messages,
-        active_model_override=None,
-        active_effort_override=None,
-        active_use_local_override=None,
-        pending_events=[],
-        _pending_compaction=pending_compaction,
+        emit_progress=lambda _text, *, incident=None: None,
     )
-    fake_registry = MagicMock()
-    fake_registry._ctx = fake_ctx
-    return fake_registry
-
-
-def _run_loop(messages, *, use_local=False, pending_compaction=None,
-              rounds_before_stop=1, checkpoint_on_round=None,
-              checkpoint_persist_ok=True, model="test-model", context_mode=None):
-    """
-    Drive run_llm_loop with mocked LLM and tools.
-
-    Parameters
-    ----------
-    rounds_before_stop:
-        Number of tool-calling rounds before the LLM returns a text-only
-        response to terminate the loop.
-    checkpoint_on_round:
-        If set, _maybe_inject_self_check returns True only on that round
-        number (simulating a checkpoint injection).
-    checkpoint_persist_ok:
-        Whether the forensic pre-compaction checkpoint write succeeds.
-
-    Returns
-    -------
-    compaction_calls : list of dict
-        Each entry: {"keep_recent": N}
-    """
-    import ouroboros.loop as loop_mod
-
-    compaction_calls = []
-
-    def fake_compact(msgs, keep_recent=6, **_kwargs):
-        compaction_calls.append({"keep_recent": keep_recent})
-        return list(msgs), {"cost": 0.0}
-
-    call_count = [0]
-
-    def fake_llm_call(llm, msgs, model, tools, effort,
-                      max_retries, drive_logs, task_id, round_idx,
-                      event_queue, accum, task_type, use_local=False,
-                      deadline_ts=None, **_kwargs):
-        call_count[0] += 1
-        if call_count[0] < rounds_before_stop:
-            # Return a tool-calling response to keep the loop alive
-            return ({"role": "assistant", "content": "",
-                     "tool_calls": [{"id": f"tc_live_{call_count[0]}",
-                                     "function": {"name": "noop", "arguments": "{}"}}]}, 0.0)
-        # Final text-only response — terminates the loop
-        return ({"role": "assistant", "content": "done", "tool_calls": []}, 0.0)
-
-    def fake_handle_tool_calls(tool_calls, tools, drive_logs, task_id,
-                                stateful_executor, messages, llm_trace, emit_progress):
-        # Append a fake tool result so the message list grows
-        for tc in tool_calls:
-            messages.append({"role": "tool",
-                              "content": "fake_result",
-                              "tool_call_id": tc.get("id", "x")})
-        return 0  # no errors
-
-    def fake_self_check(round_idx, max_rounds, messages, accumulated_usage,
-                        emit_progress, **kwargs):
-        if checkpoint_on_round is not None and round_idx == checkpoint_on_round:
-            return True
-        return False
-
-    fake_registry = _make_fake_registry(messages, pending_compaction)
-    fake_llm = MagicMock()
-    fake_llm.default_model.return_value = model
-
-    env_patch = {"USE_LOCAL_MAIN": "1" if use_local else ""}
-    if context_mode is not None:
-        env_patch["OUROBOROS_CONTEXT_MODE"] = context_mode
-
-    with patch.object(loop_mod, "compact_tool_history_llm", side_effect=fake_compact), \
-         patch.object(loop_mod, "call_llm_with_retry", side_effect=fake_llm_call), \
-         patch.object(loop_mod, "_drain_incoming_messages", return_value={}), \
-         patch.object(loop_mod, "_maybe_downgrade_max_unconfirmed",
-                      side_effect=lambda mode, *a, **k: mode), \
-         patch.object(loop_mod, "_maybe_inject_self_check", side_effect=fake_self_check), \
-         patch.object(loop_mod, "_persist_compaction_checkpoint", return_value=checkpoint_persist_ok), \
-         patch.object(loop_mod, "seal_task_transcript", return_value=None), \
-         patch.object(loop_mod, "initial_tool_schemas", return_value=[]), \
-         patch.object(loop_mod, "_setup_dynamic_tools",
-                      side_effect=lambda t, s, m: (s, set())), \
-         patch.object(loop_mod, "get_task_review_mode", return_value="off"), \
-         patch.object(loop_mod, "handle_tool_calls", side_effect=fake_handle_tool_calls), \
-         patch.dict("os.environ", env_patch, clear=False):
-        loop_mod.run_llm_loop(
-            messages=messages,
-            tools=fake_registry,
-            llm=fake_llm,
-            drive_logs=MagicMock(),
-            emit_progress=lambda _: None,
-            incoming_messages=queue.Queue(),
-            task_type="task",
-            task_id="test",
-        )
-
-    return compaction_calls
-
-
-# ===========================================================================
-# 1.  _estimate_messages_chars
-# ===========================================================================
-
-class TestEstimateMessagesChars(unittest.TestCase):
-
-    def test_plain_content_counted(self):
-        msgs = [_msg("assistant", "hello")]
-        self.assertEqual(_emc(msgs), 5)
-
-    def test_multipart_text_block_counted(self):
-        # A text block is serialised as {"type":"text","text":"abc"} → counted fully
-        block = {"type": "text", "text": "abc"}
-        msgs = [_msg("user", [block])]
-        expected = len(json.dumps(block, ensure_ascii=False))
-        self.assertEqual(_emc(msgs), expected)
-
-    def test_multipart_image_url_block_counted(self):
-        """image_url blocks count as the fixed vision-token equivalent (v6.26.0)."""
-        from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-        block = {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "A" * 100}}
-        msgs = [_msg("user", [block])]
-        result = _emc(msgs)
-        self.assertGreater(result, 100, "image_url block must be counted in size estimate")
-        self.assertEqual(result, IMAGE_BLOCK_CHAR_EQUIVALENT)
-
-    def test_tool_calls_counted(self):
-        tc = [{"id": "t1", "function": {"name": "foo", "arguments": "{}"}}]
-        msgs = [_msg("assistant", "", tool_calls=tc)]
-        expected = len(json.dumps(tc, ensure_ascii=False))
-        self.assertEqual(_emc(msgs), expected)
-
-    def test_tool_call_id_counted(self):
-        msgs = [_msg("tool", "ok", tool_call_id="tid123")]
-        self.assertEqual(_emc(msgs), len("ok") + len("tid123"))
-
-    def test_empty_list_returns_zero(self):
-        self.assertEqual(_emc([]), 0)
-
-    def test_multiple_messages_summed(self):
-        msgs = [_msg("user", "abc"), _msg("assistant", "de")]
-        self.assertEqual(_emc(msgs), 5)
-
-    def test_large_tool_call_arguments_counted(self):
-        big_arg = "x" * 10_000
-        tc = [{"id": "t1", "function": {"name": "foo", "arguments": big_arg}}]
-        msgs = [_msg("assistant", "", tool_calls=tc)]
-        self.assertGreater(_emc(msgs), 10_000)
-
-
-# ===========================================================================
-# 2.  Remote mode — no routine compaction
-# ===========================================================================
-
-class TestCompactionPolicyRemote(unittest.TestCase):
-
-    def test_no_routine_compaction_round_1_to_13(self):
-        """Remote: no compaction in the first 13 rounds with small context."""
-        messages = _make_tool_rounds(5, content_size=50)
-        # Run 13 rounds (12 tool-calling + 1 final text)
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=13)
-        self.assertEqual(calls, [],
-            "Remote mode should not compact with small context over 13 rounds")
-
-    def test_emergency_compaction_fires_when_large_context(self):
-        """Remote: emergency fires when _estimate_messages_chars > 1.2M.
-
-        keep_recent adapts to the span count (min(50, max(6, spans//2)));
-        the old fixed 50 silently no-opped whenever the oversized transcript
-        had <= 50 rounds — exactly the emergency case.
-        """
-        messages = _make_tool_rounds(5, content_size=50)
-        # Add a huge message to push size over threshold
-        messages.append({"role": "user", "content": "x" * 1_300_000})
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=1)
-        self.assertTrue(
-            any(c["keep_recent"] <= 6 for c in calls),
-            "Emergency compaction must fire at >1.2M chars with keep_recent below the span count",
-        )
-
-    def test_emergency_fires_on_checkpoint_round(self):
-        """Emergency compaction is NOT suppressed by checkpoint injection."""
-        messages = _make_tool_rounds(5, content_size=50)
-        messages.append({"role": "user", "content": "x" * 1_300_000})
-        # Simulate checkpoint on round 1
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=1,
-                          checkpoint_on_round=1)
-        self.assertTrue(
-            any(c["keep_recent"] <= 6 for c in calls),
-            "Emergency compaction must be unconditional — not suppressed by checkpoint",
-        )
-
-    def test_emergency_counts_image_url_blocks(self):
-        """image_url blocks count as a FIXED token equivalent (v6.26.0): vision
-        models bill per tile, so one image must never look like ~300K tokens
-        and permanently wedge emergency compaction."""
-        from ouroboros.context_budget import IMAGE_BLOCK_CHAR_EQUIVALENT
-
-        big_image_block = {
-            "type": "image_url",
-            "image_url": {"url": "data:image/png;base64," + "A" * 1_300_000},
-        }
-        messages = [{"role": "user", "content": [big_image_block]}]
-        size = _emc(messages)
-        self.assertEqual(size, IMAGE_BLOCK_CHAR_EQUIVALENT,
-            "an image block must count as the fixed equivalent, not base64 length")
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=1)
-        self.assertFalse(
-            any(c["keep_recent"] == 50 for c in calls),
-            "ONE image must NOT trigger emergency compaction anymore",
-        )
-
-    def test_low_mode_emergency_fires_at_400k_trigger(self):
-        """v6.33.0 (WS4): owner context MODE is the SSOT for the operating window
-        (no per-model window table). Low mode tightens the emergency trigger to
-        400K chars, so 500K fires — regardless of which model is in use."""
-        messages = _make_tool_rounds(5, content_size=50)
-        messages.append({"role": "user", "content": "x" * 500_000})  # 400K < size < 1.2M
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=1,
-                          model="anthropic/claude-opus-4-8", context_mode="low")
-        self.assertTrue(
-            any(c["keep_recent"] <= 6 for c in calls),
-            "Low mode must fire emergency compaction above the 400K trigger",
-        )
-
-    def test_max_mode_no_emergency_below_1_2m_any_model(self):
-        """Max mode keeps the 1.2M emergency ceiling for EVERY model (the window
-        table is gone — model identity no longer tightens the trigger)."""
-        for model in ("anthropic/claude-opus-4-8", "google/gemini-3.5-flash", "unknown/mystery-model"):
-            messages = _make_tool_rounds(5, content_size=50)
-            messages.append({"role": "user", "content": "x" * 500_000})
-            calls = _run_loop(messages, use_local=False, rounds_before_stop=1,
-                              model=model, context_mode="max")
-            self.assertEqual(
-                [c for c in calls if c["keep_recent"] <= 6], [],
-                f"500K chars must NOT trigger max-mode emergency for {model}",
-            )
-
-    def test_emergency_compaction_skips_when_checkpoint_persist_fails(self):
-        """Compaction is fail-closed: pre-compaction transcript must be durable."""
-        messages = _make_tool_rounds(5, content_size=50)
-        messages.append({"role": "user", "content": "x" * 1_300_000})
-        calls = _run_loop(
-            messages,
-            use_local=False,
-            rounds_before_stop=1,
-            checkpoint_persist_ok=False,
-        )
-        self.assertEqual(
-            calls,
-            [],
-            "Compaction must not mutate context when the forensic checkpoint write fails",
-        )
-
-
-# ===========================================================================
-# 3.  Local mode — routine compaction at round > 6 when messages > 40
-# ===========================================================================
-
-class TestCompactionPolicyLocal(unittest.TestCase):
-
-    def test_local_routine_compaction_fires_at_round_7(self):
-        """
-        Local: routine compaction fires once messages > 40 after round > 6.
-
-        We seed 50 messages before the loop starts so the count check passes
-        on round 7.  Each fake handle_tool_calls appends 1 tool-result message
-        per round, so by round 7 there are at least 57 messages — well above 40.
-        """
-        messages = _make_tool_rounds(25, content_size=10)  # 50 messages
-        calls = _run_loop(messages, use_local=True, rounds_before_stop=8)
-        self.assertTrue(
-            any(c["keep_recent"] == 20 for c in calls),
-            "Local routine compaction (keep_recent=20) must fire at round 7 when messages > 40",
-        )
-
-    def test_local_routine_suppressed_on_checkpoint_round(self):
-        """
-        Local routine compaction is suppressed when _maybe_inject_self_check
-        returns True on a round where routine compaction would otherwise fire.
-
-        Strategy: seed 50 messages (> 40 from round 1), checkpoint on round 7.
-        Round 7 is the ONLY round in this 8-round run where checkpoint fires.
-        We verify that across all rounds, compact was called FEWER times than
-        total rounds-where-eligible (i.e. the checkpoint round was skipped).
-
-        We compare against a baseline run without checkpoint injection: if
-        suppression works, the checkpoint run has fewer compact calls.
-        """
-        messages_base = _make_tool_rounds(25, content_size=10)
-        messages_ckpt = _make_tool_rounds(25, content_size=10)
-
-        calls_base = _run_loop(messages_base, use_local=True, rounds_before_stop=8)
-        calls_ckpt = _run_loop(messages_ckpt, use_local=True, rounds_before_stop=8,
-                               checkpoint_on_round=7)
-
-        routine_base = [c for c in calls_base if c["keep_recent"] == 20]
-        routine_ckpt = [c for c in calls_ckpt if c["keep_recent"] == 20]
-
-        self.assertLess(
-            len(routine_ckpt), len(routine_base),
-            "Checkpoint suppression should reduce the number of routine local compact calls",
-        )
-
-    def test_local_boundary_exactly_3_messages_no_compact(self):
-        """Boundary: very few messages → strict len > 40 means no compact even after many rounds."""
-        # Start with only 3 messages; fake handle_tool_calls adds 1 per round.
-        # After 7 rounds: 3 + 7 = 10 messages — never exceeds 40.
-        messages = _make_tool_rounds(1, content_size=10)  # 2 messages
-        messages.append({"role": "user", "content": "hello"})  # 3 total
-        calls = _run_loop(messages, use_local=True, rounds_before_stop=8)
-        routine_calls = [c for c in calls if c["keep_recent"] == 20]
-        self.assertEqual(
-            routine_calls, [],
-            "With only ~10 messages after 7 rounds, local compaction must NOT fire",
-        )
-
-
-# ===========================================================================
-# 3b. Context MODE drives routine compaction (v6.33.0 WS4, mode=SSOT)
-# ===========================================================================
-
-class TestCompactionPolicyContextMode(unittest.TestCase):
-
-    def test_low_mode_remote_gets_routine_compaction(self):
-        """Low context mode routinely compacts a remote-model transcript (like
-        local), independent of the model's window — mode is the SSOT."""
-        messages = _make_tool_rounds(25, content_size=10)  # 50 messages
-        calls = _run_loop(messages, use_local=False, rounds_before_stop=8,
-                          model="anthropic/claude-opus-4-8", context_mode="low")
-        self.assertTrue(
-            any(c["keep_recent"] == 20 for c in calls),
-            "Routine compaction must fire for a remote model in low context mode",
-        )
-
-    def test_max_mode_remote_keeps_no_routine_compaction(self):
-        """Max mode relies on emergency compaction alone (cache-friendly) for ALL
-        remote models — there is no per-model small-window routine override."""
-        for model in ("anthropic/claude-opus-4-8", "openai/gpt-5.5"):
-            messages = _make_tool_rounds(25, content_size=10)
-            calls = _run_loop(messages, use_local=False, rounds_before_stop=8,
-                              model=model, context_mode="max")
-            self.assertEqual(
-                [c for c in calls if c["keep_recent"] == 20], [],
-                f"Routine compaction must stay off in max mode for {model}",
-            )
-
-
-# ===========================================================================
-# 4.  Manual _pending_compaction
-# ===========================================================================
-
-class TestCompactionPolicyManual(unittest.TestCase):
-
-    def test_manual_fires_in_remote_mode(self):
-        messages = _make_tool_rounds(5, content_size=20)
-        calls = _run_loop(messages, use_local=False, pending_compaction=30)
-        self.assertTrue(any(c["keep_recent"] == 30 for c in calls),
-                        "Manual compaction must fire in remote mode")
-
-    def test_manual_fires_in_local_mode(self):
-        messages = _make_tool_rounds(5, content_size=20)
-        calls = _run_loop(messages, use_local=True, pending_compaction=15)
-        self.assertTrue(any(c["keep_recent"] == 15 for c in calls),
-                        "Manual compaction must fire in local mode")
-
-    def test_manual_fires_on_checkpoint_round(self):
-        """_pending_compaction is not suppressed on checkpoint rounds."""
-        messages = _make_tool_rounds(5, content_size=20)
-        calls = _run_loop(messages, use_local=False, pending_compaction=25,
-                          checkpoint_on_round=1)
-        self.assertTrue(any(c["keep_recent"] == 25 for c in calls),
-                        "Manual compaction must fire even on checkpoint rounds")
-
-    def test_manual_takes_precedence_over_emergency(self):
-        """_pending_compaction wins (elif chain — manual is first)."""
-        messages = [{"role": "user", "content": "x" * 1_300_000}]
-        calls = _run_loop(messages, use_local=False, pending_compaction=10)
-        self.assertTrue(calls, "Compaction must fire")
-        # First call uses manual keep_recent, not emergency keep_recent=50
-        self.assertEqual(calls[0]["keep_recent"], 10,
-                         "Manual keep_recent must take precedence over emergency")
-
-
-if __name__ == "__main__":
-    unittest.main()
+
+
+def test_no_manual_request_is_byte_identical_at_every_round(tmp_path, monkeypatch):
+    from ouroboros import loop
+
+    called = False
+
+    def forbidden(*_a, **_kw):
+        nonlocal called
+        called = True
+        raise AssertionError("fixed/routine compaction must not run")
+
+    monkeypatch.setattr(loop, "compact_tool_history_llm", forbidden)
+    messages = [{"role": "user", "content": "x" * 1_500_000}]
+    result, usage = loop._run_round_compaction(
+        messages,
+        _ctx(tmp_path),
+    )
+    assert result is messages
+    assert usage is None
+    assert called is False
+
+
+def test_manual_request_uses_the_shared_typed_materializer(tmp_path, monkeypatch):
+    from ouroboros import loop
+    from ouroboros.context_budget import ContextReclaimReceipt
+
+    seen = {}
+    rebuilt = [{"role": "assistant", "content": "summary"}]
+    receipt = ContextReclaimReceipt(
+        status="applied",
+        before_transcript_sha256="a" * 64,
+        after_transcript_sha256="b" * 64,
+        selection_fingerprint="c" * 64,
+        selected_unit_ids=("unit",),
+        reclaimed_tokens=10,
+        goal_reached=False,
+        checkpoint_ref={"path": "checkpoint"},
+        capsule_refs=(),
+    )
+
+    def fake(messages, **kwargs):
+        seen.update(kwargs)
+        return rebuilt, receipt, {"prompt_tokens": 3, "completion_tokens": 2}
+
+    monkeypatch.setattr(loop, "compact_tool_history_llm", fake)
+    context = _ctx(tmp_path, pending=4)
+    result, usage = loop._run_round_compaction([{"role": "user", "content": "go"}], context)
+    assert result is rebuilt
+    assert usage == {"prompt_tokens": 3, "completion_tokens": 2}
+    assert seen["keep_recent"] == 4
+    assert seen["negative_memo"] is context.tools._ctx._context_reclaim_negative_memo
+    assert context.tools._ctx._pending_compaction is None
+
+
+def test_old_main_trigger_authorities_are_deleted():
+    from pathlib import Path
+
+    source = Path("ouroboros/loop.py").read_text(encoding="utf-8")
+    budget = Path("ouroboros/context_budget.py").read_text(encoding="utf-8")
+    for symbol in (
+        "EMERGENCY_COMPACTION_CHARS",
+        "LOW_EMERGENCY_COMPACTION_CHARS",
+        "COMPACTION_HYSTERESIS_REGION_GROWTH",
+        "COMPACTION_HYSTERESIS_ROUNDS",
+        "_compaction_floor_chars",
+        "_emergency_keep_recent",
+    ):
+        assert symbol not in source
+        assert symbol not in budget
+    assert "round_idx > 6" not in source
+
+
+# --- earlier capsules are re-folded only after the provider's own refusal ----------------------
+
+def _long_earlier_capsule(run, monkeypatch):
+    """Put an earlier capsule whose retelling is long enough to shrink again at messages[2]."""
+    from copy import deepcopy
+    from ouroboros import context_compaction as cc
+    from tests.test_context_reclaim_materializer import _request, _unit
+
+    stub = cc._call_summarizer
+    monkeypatch.setattr(cc, "_call_summarizer", lambda parts, **_kw: {
+        part.source_id: "The earlier source was read closely and retold at length. " * 150 for part in parts})
+    old = _unit("old-long", "old long evidence ")
+    compacted, receipt, _usage = cc.compact_tool_history_llm(
+        old, request=_request(old, 100_000), drive_root=run.root, task_id="seed-long",
+        exposed_units=cc.exposed_context_units(old, old))
+    monkeypatch.setattr(cc, "_call_summarizer", stub)
+    assert receipt.status == "applied" and len(compacted) == 1
+    capsule = deepcopy(compacted[0])
+    run.context.messages[2] = capsule
+    run.context.tools._ctx._last_context_observation = {
+        "exposed_units": cc.exposed_context_units(run.context.messages, run.context.messages)}
+    units = cc._atomic_units(run.context.messages)
+    raw = next(unit for unit in units if not unit.generation)
+    earlier = next(unit for unit in units if unit.generation)
+    assert earlier.start == 2 and earlier.predicted_reclaim_tokens > 0 and raw.start > earlier.start
+    return deepcopy(capsule), raw, earlier
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_only_a_provider_refusal_refolds_earlier_capsules(real_main_reclaim, monkeypatch, refused):
+    """Both directions: a pass the raw sources cannot satisfy keeps the earlier capsule
+    unless the provider itself refused the request; after that typed refusal the capsule is
+    re-folded as the last resort, after the raw unit although it stands earlier."""
+    from ouroboros import context_compaction as cc, loop
+
+    run = real_main_reclaim
+    context = run.context
+    capsule, raw, earlier = _long_earlier_capsule(run, monkeypatch)
+    minimum_goal = raw.context_size_tokens + earlier.context_size_tokens + 25000
+    disposition = _main_fit(action="send", profile="owner_low", mode="low", goal=0,
+                       target_deficit=0, capacity_deficit=0)
+
+    receipt = loop._run_main_reclaim(context, disposition, minimum_goal_tokens=minimum_goal,
+                                     provider_refused=refused)
+
+    assert receipt.status == "applied" and receipt.reclaimed_tokens > 0
+    assert not receipt.goal_reached
+    assert receipt.selected_unit_ids == ((raw.unit_id, earlier.unit_id) if refused else (raw.unit_id,))
+    assert {part.root_id for part in run.calls} == ({raw.unit_id, earlier.unit_id} if refused else {raw.unit_id})
+    assert (context.messages[2] != capsule) is refused
+    if refused:  # one host record for the uninterrupted range, in transcript order, one generation up
+        record, meta = context.messages[2]["content"][0]["text"], cc._capsule_metadata(context.messages[2])[1]
+        assert len(context.messages) == 3 and meta["generation"] == 2
+        assert record.index(f"Source unit {earlier.unit_id}") < record.index(f"Source unit {raw.unit_id}")
+        old = cc._capsule_metadata(capsule)[1]  # the earlier capsule's original provenance survives the re-fold
+        assert set(old["source_hashes"]) < set(meta["source_hashes"])
+        assert all(ref in meta["source_refs"] for ref in old["source_refs"])
+    assert run.calls and run.events[-1]["deficit_tokens"] == 0
+    assert run.events[-1]["reclaim_goal_tokens"] == minimum_goal
+
+
+def test_refusal_takes_raw_sources_before_earlier_capsules(real_main_reclaim, monkeypatch):
+    """After a refusal, a goal the raw sources reach leaves the earlier capsule alone."""
+    from ouroboros import loop
+
+    run = real_main_reclaim
+    capsule, raw, _earlier = _long_earlier_capsule(run, monkeypatch)
+    receipt = loop._run_main_reclaim(run.context, _main_fit(action="send", profile="owner_low", mode="low", goal=0,
+                                                       target_deficit=0, capacity_deficit=0),
+                                     minimum_goal_tokens=1, provider_refused=True)
+
+    assert receipt.status == "applied" and receipt.selected_unit_ids == (raw.unit_id,)
+    assert {part.root_id for part in run.calls} == {raw.unit_id}
+    assert run.context.messages[2] == capsule

@@ -22,6 +22,8 @@ class InstallPlan:
     source: pathlib.Path
     action: str
     path_hint: str
+    obsolete_shims: tuple[pathlib.Path, ...] = ()
+    shadowing_commands: tuple[pathlib.Path, ...] = ()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -80,11 +82,23 @@ def plan_posix_install(
     source = _packaged_wrapper_source(bundle_root, windows=False)
     if not source.is_file():
         raise PackagedCLIError(f"packaged wrapper is missing: {source}")
+    use_default_target = target_dir is None
     target_parent = target_dir or choose_posix_target_dir()
     target = target_parent / "ouroboros"
     action = _existing_action(target, source, force=force)
-    path_hint = _posix_path_hint(target_parent)
-    return InstallPlan(target=target, source=source, action=action, path_hint=path_hint)
+    obsolete_shims, shadowing_commands = _posix_shadowing_plan(
+        target,
+        migrate_owned=use_default_target,
+    )
+    path_hint = _posix_path_hint(target_parent, shadowing_commands=shadowing_commands)
+    return InstallPlan(
+        target=target,
+        source=source,
+        action=action,
+        path_hint=path_hint,
+        obsolete_shims=obsolete_shims,
+        shadowing_commands=shadowing_commands,
+    )
 
 
 def install_posix(plan: InstallPlan, *, force: bool = False) -> None:
@@ -93,31 +107,84 @@ def install_posix(plan: InstallPlan, *, force: bool = False) -> None:
     if plan.target.exists() or plan.target.is_symlink():
         plan.target.unlink()
     os.symlink(str(plan.source), str(plan.target))
+    for shim in plan.obsolete_shims:
+        if not _is_owned_posix_shim(shim):
+            raise PackagedCLIError(
+                f"installed {plan.target}, but refused to remove changed earlier command: {shim}"
+            )
+        try:
+            shim.unlink()
+        except OSError as exc:
+            raise PackagedCLIError(
+                f"installed {plan.target}, but could not remove older Ouroboros shim {shim}: {exc}"
+            ) from exc
 
 
 def choose_posix_target_dir() -> pathlib.Path:
+    return pathlib.Path.home().resolve() / ".local" / "bin"
+
+
+def _posix_shadowing_plan(
+    target: pathlib.Path,
+    *,
+    migrate_owned: bool,
+) -> tuple[tuple[pathlib.Path, ...], tuple[pathlib.Path, ...]]:
+    target_parent = _resolve_for_compare(target.parent)
     home = pathlib.Path.home().resolve()
+    obsolete: list[pathlib.Path] = []
+    shadowing: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
     for raw in os.environ.get("PATH", "").split(os.pathsep):
         if not raw:
             continue
-        path = pathlib.Path(raw).expanduser()
-        try:
-            resolved = path.resolve()
-        except OSError:
+        parent = _resolve_for_compare(pathlib.Path(raw).expanduser())
+        if parent == target_parent:
+            break
+        candidate = parent / "ouroboros"
+        if candidate in seen:
             continue
-        if home in (resolved, *resolved.parents) and resolved.is_dir() and os.access(resolved, os.W_OK):
-            return resolved
-    return home / ".local" / "bin"
+        seen.add(candidate)
+        if not candidate.exists() and not candidate.is_symlink():
+            continue
+        under_home = home in (parent, *parent.parents)
+        if migrate_owned and under_home and _is_owned_posix_shim(candidate):
+            obsolete.append(candidate)
+        else:
+            shadowing.append(candidate)
+    return tuple(obsolete), tuple(shadowing)
 
 
-def _posix_path_hint(target_dir: pathlib.Path) -> str:
+def _is_owned_posix_shim(path: pathlib.Path) -> bool:
+    if not path.is_symlink():
+        return False
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as handle:
+            for _ in range(8):
+                line = handle.readline()
+                if not line:
+                    break
+                if line.rstrip("\r\n") == MARKER:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _posix_path_hint(
+    target_dir: pathlib.Path,
+    *,
+    shadowing_commands: tuple[pathlib.Path, ...] = (),
+) -> str:
     target_text = str(target_dir)
+    if shadowing_commands:
+        earlier_dir = shadowing_commands[0].parent
+        return f"Put {target_text} before {earlier_dir} in PATH, or remove the earlier command if it is obsolete."
     path_parts = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
     if target_text in path_parts:
         return "Open a new terminal if your shell cached an older command path."
     shell = pathlib.Path(os.environ.get("SHELL", "")).name
     profile = "~/.zprofile" if shell == "zsh" else "~/.bash_profile"
-    return f'Add this to {profile} if needed: export PATH="$PATH:{target_text}"'
+    return f'Add this to {profile} if needed: export PATH="{target_text}:$PATH"'
 
 
 def plan_windows_install(
@@ -189,6 +256,14 @@ def _existing_action(target: pathlib.Path, source: pathlib.Path, *, force: bool)
 def _print_plan(plan: InstallPlan, *, dry_run: bool) -> None:
     prefix = "Would install" if dry_run else "Installed"
     print(f"{prefix} ouroboros CLI: {plan.target} -> {plan.source}")
+    cleanup_prefix = "Would remove" if dry_run else "Removed"
+    for shim in plan.obsolete_shims:
+        print(f"{cleanup_prefix} older Ouroboros CLI shim: {shim}")
+    for command in plan.shadowing_commands:
+        print(
+            f"Warning: earlier PATH command may shadow the installed CLI: {command}",
+            file=sys.stderr,
+        )
     print(plan.path_hint)
 
 

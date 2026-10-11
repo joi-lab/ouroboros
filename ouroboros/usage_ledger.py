@@ -1,0 +1,791 @@
+"""Durable append-only usage ledger: the substrate the accounting layer writes on.
+
+ONE job, kept apart from policy: own the bytes. Cross-process locking, atomic
+append + fsync, structural validation of every row and transition, and
+quarantine of a torn tail. It knows what a well-formed ledger row IS; it has no
+opinion about reservations, budgets, pricing, or projections — those live in
+``usage_accounting``, which imports FROM here and is never imported BY here.
+
+The seam is one-way by construction, so the monetary authority (the file) cannot
+be corrupted by a change in accounting policy, and a locking or fsync fix cannot
+silently alter what a reservation means.
+"""
+
+from __future__ import annotations
+
+import base64
+import contextlib
+import errno
+import json
+import logging
+import math
+import os
+import pathlib
+import re
+import threading
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
+
+from ouroboros.utils import append_jsonl, replace_atomic, utc_now_iso
+from ouroboros._usage_money import LiteralFloat, amount, durable_literals
+
+log = logging.getLogger(__name__)
+
+LEDGER_REL = pathlib.Path("state/usage_attempts.jsonl")
+QUARANTINE_REL = pathlib.Path("state/usage_attempts.quarantine.jsonl")
+LOCK_REL = pathlib.Path("state/usage_attempts.lock")  # the ONE monetary lock
+# The ONE directory a baseline header may name. The substrate owns
+# it because the substrate is what decides a row is well formed: a reference
+# out of this directory is corruption, not a reader's problem.
+ARCHIVE_SEGMENT_DIR_REL = pathlib.Path("archive/usage_ledger")
+_ARCHIVE_SEGMENT_PREFIX = ARCHIVE_SEGMENT_DIR_REL.as_posix() + "/"
+_TERMINAL = frozenset({"settled", "unresolved", "released"})
+
+__all__ = (
+    "LEDGER_REL", "LOCK_REL", "QUARANTINE_REL", "UsageAccountingError", "UsageLedgerCorrupt",
+    "UsageLockUnavailable", "UsageNonFiniteMoney", "is_abandoned_settlement",
+)
+
+
+class UsageAccountingError(RuntimeError):
+    """Base error for fail-closed accounting operations."""
+
+
+class UsageLedgerCorrupt(UsageAccountingError):
+    """Raised when durable history is structurally invalid."""
+
+
+class UsageNonFiniteMoney(UsageAccountingError):
+    """Nonfinite monetary evidence: preserve bytes, never quarantine or zero it."""
+
+
+class UsageLockUnavailable(UsageAccountingError):
+    """A named monetary lock was not acquired: the caller's timeout ran out, or
+    the platform refused the lock outright.
+
+    Distinct from corruption and validation failures: display readers may serve
+    their last validated snapshot only for positive contention. Platform refusal
+    and unknown failures propagate; every monetary caller fails closed.
+    """
+
+    def __init__(self, message: str, *, reason: str = "unknown", error_number: int | None = None):
+        super().__init__(message)
+        self.reason = reason
+        self.error_number = error_number
+
+
+def is_abandoned_settlement(row: Dict[str, Any]) -> bool:
+    """An administratively closed attempt whose actual price is still unknown."""
+    return (
+        str(row.get("kind") or "attempt") == "attempt"
+        and row.get("state") == "settled"
+        and row.get("settle_reason") == "abandoned"
+        and row.get("cost_usd") is None
+        and row.get("cost_final") is False
+    )
+
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_CANDIDATE_IDENTITY_FIELDS = (
+    "candidate_raw_sha256", "candidate_raw_size_bytes",
+    "candidate_context_sha256", "candidate_context_size_bytes",
+)
+
+
+def _validate_candidate_facts(row: Dict[str, Any], sequence: int) -> None:
+    if "candidate_payload" in row:
+        raise UsageLedgerCorrupt(f"mutable candidate payload in usage row seq={sequence}")
+    present = "candidate_measurement_kind" in row or any(key in row for key in _CANDIDATE_IDENTITY_FIELDS)
+    if not present:
+        return  # pre-feature/legacy rows
+    kind = row.get("candidate_measurement_kind")
+    if kind not in {"canonical_json_v1", "opaque"}:
+        raise UsageLedgerCorrupt(f"invalid candidate_measurement_kind in usage row seq={sequence}")
+    if kind == "opaque":
+        if any(row.get(key) is not None for key in _CANDIDATE_IDENTITY_FIELDS):
+            raise UsageLedgerCorrupt(f"opaque candidate claims identity in usage row seq={sequence}")
+    else:
+        for key in ("candidate_raw_sha256", "candidate_context_sha256"):
+            if not isinstance(row.get(key), str) or not _SHA256_RE.fullmatch(row[key]):
+                raise UsageLedgerCorrupt(f"invalid {key} in usage row seq={sequence}")
+        for key in ("candidate_raw_size_bytes", "candidate_context_size_bytes"):
+            value = row.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise UsageLedgerCorrupt(f"invalid {key} in usage row seq={sequence}")
+    context = row.get("physical_context")
+    if context is not None:
+        if not isinstance(context, dict):
+            raise UsageLedgerCorrupt(f"invalid physical_context in usage row seq={sequence}")
+        if context.get("profile") not in {"owner_max", "owner_low", "owner_nano", "task_local_low", "task_local_nano"}:
+            raise UsageLedgerCorrupt(f"invalid physical_context profile in usage row seq={sequence}")
+        if context.get("rendered_mode") not in {"max", "low", "nano"} or context.get("measurement_basis") not in {
+            "fresh_route_usage", "fresh_model_usage", "cold_estimate",
+        }:
+            raise UsageLedgerCorrupt(f"invalid physical_context mode/basis in usage row seq={sequence}")
+        for key in ("target_total_tokens", "capacity_total_tokens"):
+            value = context.get(key)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+                raise UsageLedgerCorrupt(f"invalid physical_context {key} in usage row seq={sequence}")
+        if not all(isinstance(context.get(key), bool) for key in ("context_target_miss", "automatic_pass_used")):
+            raise UsageLedgerCorrupt(f"invalid physical_context flags in usage row seq={sequence}")
+        if not all(isinstance(context.get(key), str) for key in ("route_fp", "round_id")):
+            raise UsageLedgerCorrupt(f"invalid physical_context identity in usage row seq={sequence}")
+        density = context.get("measurement_density")  # absent on rows written before the field existed
+        if density is not None and (isinstance(density, bool) or not isinstance(density, (int, float))
+                                    or not math.isfinite(density) or density <= 0):
+            raise UsageLedgerCorrupt(f"invalid physical_context measurement_density in usage row seq={sequence}")
+    manifest_ref = row.get("candidate_manifest_ref")
+    if manifest_ref is not None and (
+        not isinstance(manifest_ref, dict)
+        or manifest_ref.get("call_id") != row.get("attempt_id")
+        or not _SHA256_RE.fullmatch(str(manifest_ref.get("sha256") or ""))
+    ):
+        raise UsageLedgerCorrupt(f"invalid candidate_manifest_ref in usage row seq={sequence}")
+
+
+def valid_archive_rel(value: Any) -> bool:
+    """Whether ``archive_rel`` names a segment INSIDE the archive directory.
+
+    A baseline header is the only ledger row that points at bytes outside its
+    own file, so the reference is bounded HERE, once, instead of at each
+    reader: relative, forward-slash, exactly ``archive/usage_ledger/<name>``,
+    no traversal, no drive letter, no separator inside the name. An absolute
+    path or a ``..`` hop cannot satisfy the prefix, so a tampered header can
+    never point a reader at a file elsewhere on the host and have its
+    ``attempt_id``s counted as archived history.
+    """
+    if not isinstance(value, str) or not value or "\\" in value or "\x00" in value:
+        return False
+    if not value.startswith(_ARCHIVE_SEGMENT_PREFIX):
+        return False
+    name = value[len(_ARCHIVE_SEGMENT_PREFIX):]
+    return bool(name) and name not in {".", ".."} and "/" not in name
+
+
+def _validate_baseline_header(row: Dict[str, Any], sequence: int) -> None:
+    """Provenance checks on the compaction stamp.
+
+    The header claims a summary of bytes that are no longer in this file, so
+    its claim must be checkable WITHOUT reading them: a bounded archive path,
+    a well-formed source hash, a positive epoch, and counts that actually add
+    up to the source row range it names. A header whose numbers do not close
+    cannot be an honest fold of anything, whatever the archive holds.
+    """
+
+    def _count(key: str, minimum: int) -> int:
+        value = row.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise UsageLedgerCorrupt(f"invalid usage baseline {key} seq={sequence}")
+        return value
+
+    _count("compaction_epoch", 1)
+    if not valid_archive_rel(row.get("archive_rel")):
+        raise UsageLedgerCorrupt(f"invalid usage baseline archive_rel seq={sequence}")
+    if not _SHA256_RE.fullmatch(str(row.get("source_sha256") or "")):
+        raise UsageLedgerCorrupt(f"invalid usage baseline source_sha256 seq={sequence}")
+    _count("source_size_bytes", 1)
+    _count("folded_attempt_count", 1)
+    _count("group_count", 1)
+    source_rows = _count("source_row_count", 1)
+    folded_rows = _count("folded_row_count", 1)
+    retained_rows = _count("retained_row_count", 0)
+    if _count("source_first_seq", 1) != 1 or _count("source_last_seq", 1) != source_rows:
+        raise UsageLedgerCorrupt(f"usage baseline source range mismatch seq={sequence}")
+    if folded_rows + retained_rows != source_rows:
+        raise UsageLedgerCorrupt(f"usage baseline row counts do not sum seq={sequence}")
+
+
+def _drive_root(value: pathlib.Path | str | None = None) -> pathlib.Path:
+    if value is not None:
+        if not isinstance(value, (str, pathlib.Path)):
+            raise UsageAccountingError(f"invalid usage accounting drive root type: {type(value).__name__}")
+        resolved = pathlib.Path(value)
+        if not resolved.is_absolute():
+            raise UsageAccountingError(f"usage accounting drive root must be absolute: {resolved}")
+        return resolved
+    configured = str(os.environ.get("OUROBOROS_DATA_DIR") or "").strip()
+    if configured:
+        resolved = pathlib.Path(configured)
+        if not resolved.is_absolute():
+            raise UsageAccountingError(f"OUROBOROS_DATA_DIR must be absolute for usage accounting: {resolved}")
+        return resolved
+    from ouroboros.config import DATA_DIR
+
+    return pathlib.Path(DATA_DIR)
+
+
+@contextlib.contextmanager
+def _named_lock(
+    root: pathlib.Path,
+    filename: str,
+    *,
+    timeout_sec: float,
+    stale_sec: float,
+) -> Iterator[Callable[[], bool]]:
+    """Hold a named monetary lock; yields a heartbeat that renews its age.
+
+    Acquisition is OWNER-AWARE: elapsed time alone never evicts a lock whose
+    writing process is still alive, because a stolen monetary lock means two
+    writers rewriting the same authority.  The yielded callable additionally
+    keeps the lockfile young for acquirers that are not owner-aware (an older
+    build, a foreign helper), and is a no-op cost for holds that never
+    approach ``stale_sec``.
+    """
+    from ouroboros.platform_layer import (
+        acquire_exclusive_file_lock,
+        refresh_exclusive_file_lock,
+        release_exclusive_file_lock,
+    )
+
+    path = root / "state" / filename
+    outcome: dict = {}
+    fd = acquire_exclusive_file_lock(  # ENOLCK is the name tier for ordinary locks; money never runs there
+        path, timeout_sec=timeout_sec, stale_sec=stale_sec, owner_aware_stale=True,
+        refuse_name_tier_errnos=frozenset({errno.ENOLCK}), outcome=outcome,
+    )
+    if fd is None:
+        raise UsageLockUnavailable(f"usage accounting lock unavailable: {path}",
+                                   reason=outcome.get("reason", "unknown"), error_number=outcome.get("errno"))
+    try:
+        yield lambda: refresh_exclusive_file_lock(path, fd)
+    finally:
+        release_exclusive_file_lock(path, fd)
+
+
+USAGE_LOCK_TIMEOUT_SEC = 45.0
+
+
+@contextlib.contextmanager
+def _locked(root: pathlib.Path, *, timeout_sec: float = USAGE_LOCK_TIMEOUT_SEC) -> Iterator[Callable[[], bool]]:
+    # Bounded maintenance and post-response custody. Task-owned pre-send policy
+    # supplies short acquisition slices; it never retries the transaction body.
+    with _named_lock(root, LOCK_REL.name, timeout_sec=timeout_sec, stale_sec=90.0) as heartbeat:
+        yield heartbeat
+
+
+def _append_bytes_fsync(path: pathlib.Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(f"short append to {path}")
+            view = view[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_bytes_atomic_fsync(
+    path: pathlib.Path,
+    payload: bytes,
+    precondition: Optional[Callable[[], bool]] = None,
+) -> bool:
+    """Persist the exact snapshotted bytes without reopening the source.
+
+    ``precondition`` is evaluated once the temp bytes are durable, immediately
+    before EVERY rename attempt — the Windows sharing-violation retry included,
+    because a proof taken before a refused attempt is stale by the next one —
+    the last instant each replace can still be refused. A ``False`` answer
+    cleans up the temp file and returns ``False`` with the destination
+    untouched (the compactor re-proves lock ownership and that the
+    live ledger is still the snapshot it folded, INSIDE the swap, so neither a
+    lost hold nor an append landing between attempts is erased by a rename)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}")
+    fd: Optional[int] = None
+    try:
+        # Windows defaults low-level descriptors to text mode, which would
+        # expand LF bytes and break the archive's immutable source hash.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(tmp), flags, 0o600)
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(f"short write to {tmp}")
+            view = view[written:]
+        os.fsync(fd)
+        os.close(fd)
+        fd = None
+        if not replace_atomic(tmp, path, precondition=precondition):
+            tmp.unlink()
+            return False
+        return True
+    except Exception:
+        if fd is not None:
+            os.close(fd)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _quarantine_tail(root: pathlib.Path, raw: bytes, offset: int, reason: str) -> None:
+    ledger = root / LEDGER_REL
+    row = {
+        "ts": utc_now_iso(),
+        "reason": reason,
+        "source": str(ledger),
+        "raw_base64": base64.b64encode(raw).decode("ascii"),
+    }
+    _append_bytes_fsync(
+        root / QUARANTINE_REL,
+        (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8"),
+    )
+    fd = os.open(str(ledger), os.O_RDWR)
+    try:
+        os.ftruncate(fd, offset)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    log.error("Quarantined corrupt final usage-ledger row: %s", reason)
+    try:
+        append_jsonl(
+            root / "logs" / "events.jsonl",
+            {"type": "usage_ledger_tail_quarantined", "ts": utc_now_iso(), "reason": reason},
+        )
+    except Exception:
+        log.exception("Failed to emit usage-ledger quarantine event")
+
+
+def _validate_records(
+    records: Sequence[Dict[str, Any]],
+    *,
+    start_seq: int = 1,
+    states: Optional[Dict[str, str]] = None,
+    late_receipt_ids: Optional[set[str]] = None,
+) -> None:
+    """Validate row structure, dense sequence, and per-attempt transitions.
+
+    ``start_seq``/``states`` are the ADDITIVE resume seam for incremental tail
+    validation: a caller that already validated a prefix passes the next
+    expected sequence number, per-attempt last states and ids still awaiting a
+    late receipt. Both collections are mutated as the tail validates. The latter
+    preserves the distinction between an abandoned settlement and an ordinary
+    immutable settlement across the incremental boundary.
+
+    Baseline rows (docs/USAGE_COMPACTION.md)
+    are legal ONLY as the leading block of a from-scratch validation: exactly
+    one ``usage_baseline`` header at seq 1, ``usage_baseline_group`` rows
+    joined to it by ``baseline_id``. The compactor rewrites the whole file
+    atomically and never appends, so a baseline row in an incremental tail (or
+    after any non-baseline row) is corruption. The header's own provenance
+    (epoch, bounded archive reference, source hash, closing counts) and the
+    block's agreement with it are checked here too, so a forged stamp fails at
+    the substrate rather than at whichever reader happens to trust it first.
+    """
+    baseline_allowed = int(start_seq) == 1 and not states
+    baseline_id: Optional[str] = None
+    baseline_header: Optional[Dict[str, Any]] = None
+    baseline_groups = 0
+    baseline_attempts = 0
+    baseline_closed = False
+    pre_compaction_seq = 0
+    pre_compaction_closed = False
+
+    def _close_baseline_block() -> None:
+        """Reconcile the header's declared totals with the block that follows."""
+        nonlocal baseline_closed
+        if baseline_closed or baseline_header is None:
+            return
+        baseline_closed = True
+        if baseline_groups != int(baseline_header.get("group_count") or 0):
+            raise UsageLedgerCorrupt("usage baseline group_count does not match the block")
+        if baseline_attempts != int(baseline_header.get("folded_attempt_count") or 0):
+            raise UsageLedgerCorrupt(
+                "usage baseline folded_attempt_count does not match the block"
+            )
+
+    states = {} if states is None else states
+    late_receipt_ids = set() if late_receipt_ids is None else late_receipt_ids
+    expected = int(start_seq)
+    for row in records:
+        try:
+            sequence = int(row.get("seq") or 0) if isinstance(row, dict) else 0
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise UsageLedgerCorrupt(f"invalid usage ledger sequence at {expected}") from exc
+        if not isinstance(row, dict) or sequence != expected:
+            raise UsageLedgerCorrupt(f"usage ledger sequence mismatch at {expected}")
+        expected += 1
+        attempt_id = str(row.get("attempt_id") or "")
+        state = str(row.get("state") or "")
+        kind = str(row.get("kind") or "attempt")
+        if not attempt_id or state not in {"reserved", "dispatched", *_TERMINAL}:
+            raise UsageLedgerCorrupt(f"invalid usage ledger row seq={row.get('seq')}")
+        if row.get("settle_reason") == "abandoned" and not is_abandoned_settlement(row):
+            raise UsageLedgerCorrupt(f"invalid abandoned settlement in usage row seq={sequence}")
+        _validate_candidate_facts(row, sequence)
+        for numeric_field in (
+            "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
+            "max_budget_usd", "global_limit_usd", "root_limit_usd", "billing_group_limit_usd",
+        ):
+            # Nonfinite money is not a torn row. Its distinct error bypasses
+            # tail quarantine, including incremental fallback and compaction.
+            amount(row.get(numeric_field))
+            if row.get(numeric_field) is not None and _number(row.get(numeric_field)) is None:
+                raise UsageLedgerCorrupt(f"invalid {numeric_field} in usage row seq={sequence}")
+        for token_field in (
+            "prompt_tokens", "completion_tokens", "cached_tokens",
+            "cache_write_tokens", "ambiguous_call_count",
+        ):
+            if row.get(token_field) is None:
+                continue
+            try:
+                value = int(row.get(token_field))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise UsageLedgerCorrupt(
+                    f"invalid {token_field} in usage row seq={sequence}"
+                ) from exc
+            if value < 0 or isinstance(row.get(token_field), bool):
+                raise UsageLedgerCorrupt(
+                    f"invalid {token_field} in usage row seq={sequence}"
+                )
+        previous = states.get(attempt_id)
+        if kind in {"usage_baseline", "usage_baseline_group"}:
+            if not baseline_allowed or previous is not None:
+                raise UsageLedgerCorrupt(
+                    f"baseline row outside the leading block at seq={sequence}"
+                )
+            if kind == "usage_baseline":
+                identity = row.get("baseline_id")
+                if baseline_id is not None or sequence != 1 or state != "settled" or not (
+                    isinstance(identity, str) and identity
+                ):
+                    raise UsageLedgerCorrupt(f"invalid usage baseline header seq={sequence}")
+                _validate_baseline_header(row, sequence)
+                baseline_id = identity
+                baseline_header = row
+            else:
+                count = row.get("folded_attempt_count")
+                if (
+                    baseline_id is None
+                    or row.get("baseline_id") != baseline_id
+                    or isinstance(count, bool)
+                    or not isinstance(count, int)
+                    or count < 1
+                    or state not in _TERMINAL
+                ):
+                    raise UsageLedgerCorrupt(f"invalid usage baseline group seq={sequence}")
+                baseline_groups += 1
+                baseline_attempts += count
+            states[attempt_id] = state
+            continue
+        baseline_allowed = False
+        _close_baseline_block()
+        # ``pre_compaction_seq`` is a provenance claim about an epoch that only
+        # a leading header proves happened, and the compactor emits it on the
+        # retained rows in one strictly increasing run before any later append.
+        # The claim also has to name a row the archived source ACTUALLY held:
+        # the header declares that range (``source_first_seq``..
+        # ``source_last_seq``), and a retained row claiming an origin outside
+        # it claims to come from bytes nobody archived.
+        carried = row.get("pre_compaction_seq")
+        if carried is not None:
+            if (
+                baseline_header is None
+                or pre_compaction_closed
+                or isinstance(carried, bool)
+                or not isinstance(carried, int)
+                or carried <= pre_compaction_seq
+                or carried < int(baseline_header.get("source_first_seq") or 0)
+                or carried > int(baseline_header.get("source_last_seq") or 0)
+            ):
+                raise UsageLedgerCorrupt(f"invalid pre_compaction_seq in usage row seq={sequence}")
+            pre_compaction_seq = carried
+        else:
+            pre_compaction_closed = True
+        if kind.startswith("legacy_") or kind in {"external_unmetered", "subscription_session"}:
+            if previous is not None or state not in {"settled", "unresolved"}:
+                raise UsageLedgerCorrupt(f"invalid legacy usage row seq={row.get('seq')}")
+        elif previous is None:
+            if state != "reserved":
+                raise UsageLedgerCorrupt(f"attempt {attempt_id} did not begin reserved")
+        elif previous == "reserved":
+            if state not in {"dispatched", "released"}:
+                raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
+        elif previous == "dispatched":
+            if state not in {"settled", "unresolved", "released"}:
+                raise UsageLedgerCorrupt(f"invalid transition {previous}->{state}")
+            if state == "released" and not str(row.get("reason") or "").startswith(
+                "before_dispatch_failed:"
+            ):
+                raise UsageLedgerCorrupt(
+                    f"dispatched->released requires a typed pre-dispatch reason at seq={row.get('seq')}"
+                )
+        elif kind == "attempt" and attempt_id in late_receipt_ids and (
+            (state == "settled" and (
+                row.get("settle_reason") == "late_receipt"
+                or (previous == "unresolved" and is_abandoned_settlement(row))
+            ))
+            or (state == "released" and str(row.get("reason") or "").startswith("before_dispatch_failed:"))
+        ):
+            pass  # One late receipt replaces uncertainty, never another actual settlement.
+        else:
+            raise UsageLedgerCorrupt(f"attempt {attempt_id} changed after terminal state")
+        states[attempt_id] = state
+        if kind == "attempt" and (state == "unresolved" or is_abandoned_settlement(row)):
+            late_receipt_ids.add(attempt_id)
+        else:
+            late_receipt_ids.discard(attempt_id)
+    _close_baseline_block()
+
+
+def _decode_record(chunk: bytes) -> Optional[Dict[str, Any]]:
+    """One JSONL grammar for full, incremental and unlocked prepared reads.
+
+    Only empty CR/LF lines are empty records. UTF-8 (without BOM), object
+    shape and literal money spelling are identical in every cache state.
+    """
+    raw = chunk.rstrip(b"\r\n")
+    if not raw:
+        return None
+    row = json.loads(raw.decode("utf-8"), parse_float=LiteralFloat)
+    if not isinstance(row, dict):
+        raise ValueError("row is not an object")
+    return row
+
+
+def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
+    path = root / LEDGER_REL
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise UsageAccountingError(f"cannot read usage ledger: {exc}") from exc
+    records: list[Dict[str, Any]] = []
+    record_locations: list[Tuple[int, bytes]] = []
+    chunks = data.splitlines(keepends=True)
+    nonempty = [index for index, chunk in enumerate(chunks) if chunk.rstrip(b"\r\n")]
+    last_nonempty = nonempty[-1] if nonempty else -1
+    offset = 0
+    for index, chunk in enumerate(chunks):
+        try:
+            row = _decode_record(chunk)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            if index == last_nonempty:
+                _quarantine_tail(root, chunk, offset, f"{type(exc).__name__}: {exc}")
+                break
+            raise UsageLedgerCorrupt(f"corrupt usage ledger row before tail: {index + 1}") from exc
+        if row is not None:
+            records.append(row)
+            record_locations.append((offset, chunk))
+        offset += len(chunk)
+    try:
+        _validate_records(records)
+    except UsageLedgerCorrupt:
+        # A final row can be valid JSON yet still be torn structurally (wrong
+        # seq, illegal transition, missing fields). Preserve the validated
+        # history exactly as for a JSON-torn tail; corruption before the final
+        # row remains a hard failure.
+        if not records or not record_locations:
+            raise
+        try:
+            _validate_records(records[:-1])
+        except UsageLedgerCorrupt:
+            raise
+        bad_offset, bad_chunk = record_locations[-1]
+        _quarantine_tail(root, bad_chunk, bad_offset, "structurally invalid final ledger row")
+        records.pop()
+    return records
+
+
+@dataclass
+class LedgerResumeState:
+    """Where a validated read of the ledger ended, for incremental resumption.
+
+    Identity (``st_ino``/``st_dev``), extent (``size`` = byte offset after the
+    last validated row) and ``st_mtime_ns`` fingerprint the file as it was read
+    UNDER THE LOCK; ``row_count``, last-``states`` and ``late_receipt_ids`` seed
+    tail validation so transition rules hold across the resume boundary. A
+    missing ledger is represented as ``st_ino/st_dev = -1`` with ``size = 0``;
+    ``st_ino/st_dev = -2`` marks a deliberately NON-RESUMABLE fingerprint (the
+    file's tail is not row-aligned), which no real inode ever matches, so every
+    subsequent read stays a full replay.
+    """
+
+    st_ino: int
+    st_dev: int
+    size: int
+    st_mtime_ns: int
+    row_count: int
+    states: Dict[str, str] = field(default_factory=dict)
+    late_receipt_ids: set[str] = field(default_factory=set)
+
+
+def _ledger_resume_state(
+    root: pathlib.Path, records: Sequence[Dict[str, Any]]
+) -> LedgerResumeState:
+    """Fingerprint the just-read ledger for incremental resumption.
+
+    Must be called under the same held ledger lock as the read that produced
+    ``records`` (writers append only under that lock, so the stat is consistent
+    with the validated content — including any quarantine truncation the read
+    itself performed)."""
+    states = {str(row.get("attempt_id") or ""): str(row.get("state") or "") for row in records}
+    late_receipt_ids = {
+        attempt_id for attempt_id, row in _final_rows(records).items()
+        if str(row.get("kind") or "attempt") == "attempt"
+        and (row.get("state") == "unresolved" or is_abandoned_settlement(row))
+    }
+    path = root / LEDGER_REL
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        return LedgerResumeState(-1, -1, 0, -1, len(records), states, late_receipt_ids)
+    if stat.st_size > 0:
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(stat.st_size - 1)
+                terminated = handle.read(1) == b"\n"
+        except OSError:
+            terminated = False
+        if not terminated:
+            # A crash-torn final line that is still valid JSON parses in the full
+            # read, but its end is NOT a row boundary: an append landing directly
+            # onto it welds rows into one unparseable line (the #138 guard in
+            # _append_rows_locked repairs the boundary before writing, but reads
+            # before any repair — or after a foreign blind append — must not
+            # resume from a mid-line offset). Refuse until the tail is row-aligned.
+            return LedgerResumeState(-2, -2, stat.st_size, -1, len(records), states, late_receipt_ids)
+    return LedgerResumeState(
+        stat.st_ino, stat.st_dev, stat.st_size, stat.st_mtime_ns, len(records), states, late_receipt_ids
+    )
+
+
+def _read_new_records_locked(
+    root: pathlib.Path, resume: LedgerResumeState, *, private: bool = False
+) -> Optional[Tuple[list[Dict[str, Any]], LedgerResumeState]]:
+    """Incrementally read rows appended after ``resume``; ``None`` = full refold.
+
+    Returns ``(new_records, new_resume)`` when the resume fingerprint still
+    matches and the appended tail parses and validates as a seq-continuous,
+    transition-legal continuation. Returns ``None`` on a detectable break —
+    file replaced (inode/device change), shrunk below the resume offset,
+    rewritten in place at the same size (different mtime), or a
+    torn/structurally invalid tail — so the caller re-reads through the normal
+    ``_read_records_locked``, which OWNS quarantine. Bytes before the offset are
+    never reread: a same-inode rewrite that grows the file can go undetected, so
+    history changes only by atomic replacement. This function never
+    truncates or otherwise mutates the ledger, and must be called under the
+    held ledger lock.
+    """
+    path = root / LEDGER_REL
+    try:
+        stat = os.stat(path)
+    except FileNotFoundError:
+        if resume.row_count == 0 and resume.size == 0:
+            return [], resume
+        return None
+    except OSError:
+        return None
+    if (stat.st_ino, stat.st_dev) != (resume.st_ino, resume.st_dev):
+        return None
+    if stat.st_size < resume.size:
+        return None
+    if stat.st_size == resume.size:
+        return ([], resume) if stat.st_mtime_ns == resume.st_mtime_ns else None
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(resume.size)
+            data = handle.read()
+    except OSError:
+        return None
+    if not data.endswith(b"\n"):
+        # A torn in-flight append (crashed writer). The full reader decides
+        # whether that tail is quarantined; never guess here.
+        return None
+    records: list[Dict[str, Any]] = []
+    for chunk in data.splitlines():
+        try:
+            row = _decode_record(chunk)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+        if row is not None:
+            records.append(row)
+    touched = {str(row.get("attempt_id") or "") for row in records}
+    seeded_states = {key: resume.states[key] for key in touched if key in resume.states}
+    seeded_late_receipt_ids = touched.intersection(resume.late_receipt_ids)
+    try:
+        _validate_records(records, start_seq=resume.row_count + 1, states=seeded_states,
+                          late_receipt_ids=seeded_late_receipt_ids)
+    except UsageLedgerCorrupt:
+        return None
+    states = resume.states if private else dict(resume.states)
+    late_ids = resume.late_receipt_ids if private else set(resume.late_receipt_ids)
+    states.update(seeded_states)
+    late_ids.difference_update(touched)
+    late_ids.update(seeded_late_receipt_ids)
+    return records, LedgerResumeState(
+        stat.st_ino,
+        stat.st_dev,
+        stat.st_size,
+        stat.st_mtime_ns,
+        resume.row_count + len(records),
+        states,
+        late_ids,
+    )
+
+
+def _append_rows_locked(
+    root: pathlib.Path,
+    records: Sequence[Dict[str, Any]],
+    rows: Sequence[Dict[str, Any]],
+    *, resume: Optional[LedgerResumeState] = None,
+) -> list[Dict[str, Any]]:
+    if not rows:
+        return []
+    sequence = len(records)
+    materialized: list[Dict[str, Any]] = []
+    for raw in rows:
+        sequence += 1
+        materialized.append(durable_literals({**raw, "seq": sequence, "ts": str(raw.get("ts") or utc_now_iso())}))
+    if resume is None:
+        _validate_records([*records, *materialized])
+    else:
+        if resume.row_count != len(records):
+            raise UsageLedgerCorrupt("append resume does not match the validated prefix")
+        touched = {str(row.get("attempt_id") or "") for row in materialized}
+        _validate_records(materialized, start_seq=resume.row_count + 1,
+                          states={key: resume.states[key] for key in touched if key in resume.states},
+                          late_receipt_ids=touched.intersection(resume.late_receipt_ids))
+    payload = b"".join(
+        (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+        for row in materialized
+    )
+    # razzant/ouroboros#138: O_APPEND writes payload verbatim after whatever is
+    # already on disk. If a prior writer died mid-append it can have left a
+    # newline-less partial tail; appending straight onto it glues the partial
+    # and the first new row into one unparseable line, and _read_records_locked
+    # would then quarantine BOTH. The validated-tail readers already refuse to
+    # warm-resume from such a file; this guards the raw byte boundary on write
+    # so a torn tail costs at most itself, never the row that follows.
+    ledger_path = root / LEDGER_REL
+    try:
+        with open(ledger_path, "rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    payload = b"\n" + payload
+    except FileNotFoundError:
+        pass
+    _append_bytes_fsync(ledger_path, payload)
+    return materialized
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 and parsed == parsed else None
+
+
+def _final_rows(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(row["attempt_id"]): row for row in records}

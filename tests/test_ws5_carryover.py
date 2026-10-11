@@ -3,303 +3,27 @@
 from __future__ import annotations
 
 
-
-# --- CW1: the P3 scope-review floor is owner-only, not a generic settings write. ---
-# --- Since v6.80.0 the key is DEPRECATED and ENFORCEMENT-INERT: the frozen gateway ---
-# --- surface and the owner-only write path stay, the stored value is preserved, and ---
-# --- scope-review applicability comes solely from the owner context mode.          ---
+# --- CW1 lineage: owner-only settings stay out of the generic settings write.      ---
+# --- ABI 7.0 (owner Q10=A): OUROBOROS_SCOPE_REVIEW_FLOOR and its whole surface are  ---
+# --- REMOVED (see tests/test_abi5_q10_removals.py); scope-review applicability      ---
+# --- comes solely from the owner context mode.                                      ---
 
 def test_context_mode_is_owner_only_not_generic_settings():
     from ouroboros.gateway.settings import _merge_settings_payload
 
     current = {"OUROBOROS_CONTEXT_MODE": "max"}
     merged = _merge_settings_payload(current, {"OUROBOROS_CONTEXT_MODE": "low"})
-    # The generic /api/settings merge must NOT narrow the horizon — and since v6.80.0
-    # the same setting decides whether the blocking scope review applies at all.
+    # The generic /api/settings merge must NOT narrow the horizon: the setting is
+    # the owner's own working window and only the owner endpoint authors it.
     assert merged["OUROBOROS_CONTEXT_MODE"] == "max"
 
 
-def test_scope_review_floor_is_owner_only_not_generic_settings():
-    from ouroboros.gateway.settings import _merge_settings_payload
+# --- CW1: the owner-control mention family and its shared read-carve ---
 
-    current = {"OUROBOROS_SCOPE_REVIEW_FLOOR": "blocking_1m"}
-    merged = _merge_settings_payload(current, {"OUROBOROS_SCOPE_REVIEW_FLOOR": "advisory"})
-    # The generic /api/settings merge must never author an owner-only key, deprecated
-    # or not: it flows ONLY through the dedicated audited owner endpoint.
-    assert merged["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "blocking_1m"
-
-
-def test_stored_scope_review_floor_is_preserved_and_never_consulted(monkeypatch, tmp_path):
-    """The stored value round-trips (an owner customization is never destroyed) and
-    NOTHING in the runtime reads it — there is no floor getter at all. The separately
-    removed degraded-scope opt-in stays inert without breaking settings load."""
-    import json
-
-    import ouroboros.config as cfg
-
-    settings_path = tmp_path / "settings.json"
-    settings_path.write_text(json.dumps({
-        "OUROBOROS_SCOPE_REVIEW_FLOOR": "advisory",
-        "OUROBOROS_SCOPE_REVIEW_DEGRADED": "true",  # removed capability; inert leftover
-    }), encoding="utf-8")
-    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.delenv("OUROBOROS_SCOPE_REVIEW_FLOOR", raising=False)
-
-    loaded = cfg.load_settings()
-
-    assert loaded["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory", "stored value preserved"
-    assert not hasattr(cfg, "get_scope_review_floor"), "no consumer may read the floor"
-    # The degraded key is not a known setting any more; a stale value must not raise.
-    assert cfg.SETTINGS_DEFAULTS.get("OUROBOROS_SCOPE_REVIEW_DEGRADED") is None
-
-
-def test_owner_scope_review_floor_endpoint_validates_persists_and_discloses_deprecation(
-    monkeypatch, tmp_path,
-):
-    import asyncio
-    import json
-
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    # The endpoint writes os.environ directly; pin it via monkeypatch so the
-    # "advisory" it sets is restored after this test (no leak into scope-review tests).
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {})
-    written = {}
-    monkeypatch.setattr(smod, "_owner_write_settings", lambda s, **k: written.update(s))
-    monkeypatch.setattr(smod, "_owner_audit", lambda *a, **k: None)
-
-    class _Req:
-        def __init__(self, body):
-            self._body = body
-
-        async def json(self):
-            return self._body
-
-    bad = json.loads(asyncio.run(smod.api_owner_scope_review_floor(_Req({"floor": "nope"}))).body)
-    assert "must be one of" in (bad.get("error") or "")
-    ok = json.loads(asyncio.run(smod.api_owner_scope_review_floor(_Req({"floor": "advisory"}))).body)
-    assert ok["ok"] is True and ok["scope_review_floor"] == "advisory"
-    assert written["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
-    # ...and the response says plainly that the value decides nothing.
-    notice = str(ok.get("deprecation_notice") or "")
-    assert "deprecated" in notice.lower() and "context mode" in notice.lower()
-
-
-def test_owner_floor_write_changes_no_scope_review_behaviour(monkeypatch, tmp_path):
-    """The floor is ENFORCEMENT-INERT: writing it through the owner endpoint round-trips
-    into settings and leaves scope-review behaviour identical, in BOTH owner context
-    modes. Applicability comes only from get_owner_context_mode()."""
-    import asyncio
-    import os
-
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-    from ouroboros.tools import scope_review as sr
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setenv("OUROBOROS_SCOPE_REVIEW_FLOOR", "blocking_1m")
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {})
-    written = {}
-    monkeypatch.setattr(smod, "_owner_write_settings", lambda s, **k: written.update(s))
-    monkeypatch.setattr(smod, "_owner_audit", lambda *a, **k: None)
-
-    calls: list = []
-    monkeypatch.setattr(sr, "_build_scope_prompt", lambda *a, **k: calls.append("prompt") or ("p", None))
-    monkeypatch.setattr(sr, "_call_scope_llm", lambda *a, **k: calls.append("llm") or ("", None, ""))
-
-    class _Ctx:
-        repo_dir = str(tmp_path)
-        task_id = "floor-inert"
-        pending_events: list = []
-
-        def drive_logs(self):
-            return tmp_path
-
-    class _Req:
-        async def json(self):
-            return {"floor": "advisory"}
-
-    def _probe(owner_mode: str):
-        monkeypatch.setattr(cfg, "get_owner_context_mode", lambda: owner_mode)
-        calls.clear()
-        result = sr.run_scope_review(_Ctx(), "test commit", scope_model="anthropic/claude-fable-5")
-        return sr._scope_review_skipped_in_low_context(), list(calls), result.status
-
-    before_max = _probe("max")
-    before_low = _probe("low")
-
-    asyncio.run(smod.api_owner_scope_review_floor(_Req()))
-    assert written["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
-    assert os.environ["OUROBOROS_SCOPE_REVIEW_FLOOR"] == "advisory"
-
-    assert _probe("max") == before_max, "an advisory floor must not change max-mode behaviour"
-    assert _probe("low") == before_low, "an advisory floor must not change low-mode behaviour"
-    # ...and the gate really did run in max and really was skipped in low.
-    assert before_max[1] and before_max[2] != "skipped_low_context_mode"
-    assert before_low == (True, [], "skipped_low_context_mode")
-
-
-# --- CW1: the scope-review-floor self-lowering shell detector ---
-
-def test_scope_review_floor_self_lowering_detector():
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
-    from ouroboros.tools.shell_guards import shell_has_write_indicator
-
-    def verdict(cmd: str) -> bool:
-        """Judge exactly as the shell guard does: the same `writeish` fact it computes."""
-        return det(cmd.lower(), writeish=shell_has_write_indicator(cmd))
-
-    # Mutation shapes stay blocked — including the ones the write-shape fact alone does
-    # not catch (an HTTP POST, a save_settings call, the settings CLI).
-    assert verdict("curl -X POST http://127.0.0.1:8765/api/owner/scope-review-floor -d '{\"floor\":\"advisory\"}'") is True
-    # v6.80.0: EXECUTABLE access to the owner endpoint is refused STRUCTURALLY, not by
-    # matching an enumeration of write spellings. Every line below names the endpoint
-    # from an interpreter or HTTP client and matched NO entry of the deleted
-    # `_HTTP_WRITE_MARKERS` list, so each one mutated an owner-only setting.
-    assert verdict(
-        "python -c \"import httpx; httpx.request('POST',"
-        "'http://127.0.0.1:8765/api/owner/scope-review-floor',json={'floor':'advisory'})\""
-    ) is True
-    assert verdict(
-        "python3 -c \"import requests; requests.request(method='POST', "
-        "url='http://127.0.0.1:8765/api/owner/scope-review-floor', json={'floor': 'advisory'})\""
-    ) is True
-    assert verdict(
-        "node -e \"fetch('http://127.0.0.1:8765/api/owner/scope-review-floor',"
-        "{method:'POST',body:'{}'})\""
-    ) is True
-    # curl variants: a verb spelled through a long flag, a payload spelled through an
-    # unlisted flag, and a bare invocation with no write spelling at all.
-    assert verdict("curl --request POST http://127.0.0.1:8765/api/owner/scope-review-floor") is True
-    assert verdict(
-        "curl --data-raw '{\"floor\":\"advisory\"}' "
-        "http://127.0.0.1:8765/api/owner/scope-review-floor"
-    ) is True
-    assert verdict(
-        "curl -H 'content-type: application/json' --data-binary @/tmp/f.json "
-        "http://127.0.0.1:8765/api/owner/scope-review-floor"
-    ) is True
-    assert verdict("curl http://127.0.0.1:8765/api/owner/scope-review-floor") is True
-    assert verdict("wget -q -O- --post-data '{\"floor\":\"advisory\"}' http://127.0.0.1:8765/api/owner/scope-review-floor") is True
-    # Encoded forms: percent-encoded hyphens and a double-encoded path.
-    assert verdict("curl -s http://127.0.0.1:8765/api/owner/scope%2Dreview%2Dfloor") is True
-    assert verdict("curl -s http://127.0.0.1:8765/api/owner/scope%252Dreview%252Dfloor") is True
-    assert verdict("curl -s http://127.0.0.1:8765%2Fapi%2Fowner%2Fscope-review-floor") is True
-    # Hiding the client behind a shell or a pipeline does not launder it either.
-    assert verdict(
-        "bash -c \"curl -X post http://127.0.0.1:8765/api/owner/scope-review-floor\""
-    ) is True
-    assert verdict(
-        "echo '{\"floor\":\"advisory\"}' | curl --data @- "
-        "http://127.0.0.1:8765/api/owner/scope-review-floor"
-    ) is True
-    assert verdict(
-        "grep -rn scope-review-floor ouroboros/ && "
-        "python -c \"import httpx; httpx.request('POST','/api/owner/scope-review-floor')\""
-    ) is True
-    assert verdict("python -c \"from ouroboros.config import save_settings; save_settings({'OUROBOROS_SCOPE_REVIEW_FLOOR': 'advisory'})\"") is True
-    assert verdict("ouroboros settings scope-review-floor advisory") is True
-    assert verdict("python -m ouroboros.cli settings scope-review-floor advisory") is True
-    assert verdict("python -c \"json.dump(s, open('data/settings.json','w'))\" OUROBOROS_SCOPE_REVIEW_FLOOR") is True
-    assert verdict("sed -i s/blocking_1m/advisory/ data/settings.json # OUROBOROS_SCOPE_REVIEW_FLOOR") is True
-    # v6.80.0 PRECISION: a pure READ is not an attempt. Before the fix the floor key plus
-    # a bare `settings.json` substring blocked plain inspection.
-    assert verdict("grep OUROBOROS_SCOPE_REVIEW_FLOOR data/settings.json") is False
-    assert verdict("cat data/settings.json | grep OUROBOROS_SCOPE_REVIEW_FLOOR") is False
-    assert verdict("rg -n '/api/owner/scope-review-floor' ouroboros/gateway") is False
-    assert verdict("grep -rn '/api/owner/scope-review-floor' docs/ | head -20") is False
-    assert verdict("git grep -n '/api/owner/scope-review-floor'") is False
-    assert verdict("sudo grep OUROBOROS_SCOPE_REVIEW_FLOOR data/settings.json") is False
-    assert verdict("jq -r .OUROBOROS_SCOPE_REVIEW_FLOOR data/settings.json") is False
-    # Benign mentions (reading docs/logs) must not trip the guard either.
-    assert verdict("grep scope_review_floor data/logs/events.jsonl") is False
-    assert verdict("echo reading about the scope review floor") is False
-    # A caller that cannot supply the write-shape fact stays FAIL-CLOSED.
-    assert det("grep ouroboros_scope_review_floor data/settings.json") is True
-
-
-def test_read_exemption_is_option_aware_not_head_only():
-    """Review round 2: an allowlisted HEAD is not evidence that the command only reads.
-
-    Several allowed heads execute or mutate through their own options (`find -exec`,
-    `-delete`, `rg --pre`, `sort -o`, git's external-diff/textconv helpers), and the
-    environment prefix decides what runs at all (`PATH=`, `LD_PRELOAD=`,
-    `GIT_EXTERNAL_DIFF=`) — dropping it, as the first version did, let a command headed by
-    a read token reach the owner-only endpoint. Membership is now necessary, not
-    sufficient: options are validated per command, assignments are refused rather than
-    stripped, and the executable must resolve to a bare name or a system bin.
-    """
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
-    from ouroboros.tools.shell_guards import shell_has_write_indicator
-
-    def verdict(cmd: str) -> bool:
-        return det(cmd.lower(), writeish=shell_has_write_indicator(cmd))
-
-    # find: execution and deletion under a read head.
-    assert verdict(
-        "find ouroboros -name '*.py' -exec curl "
-        "http://127.0.0.1:8765/api/owner/scope-review-floor ;"
-    ) is True
-    assert verdict("find . -name settings.json -delete # ouroboros_scope_review_floor") is True
-    assert verdict(
-        "find . -name '*.json' -fprintf /tmp/x '%p' # ouroboros_scope_review_floor "
-        "data/settings.json"
-    ) is True
-    assert verdict("fd -x sh -c 'curl http://127.0.0.1:8765/api/owner/scope-review-floor'") is True
-    # git: an external diff / textconv helper is an arbitrary configured program.
-    assert verdict("git diff --ext-diff data/settings.json # ouroboros_scope_review_floor") is True
-    assert verdict("git show --textconv head:data/settings.json # ouroboros_scope_review_floor") is True
-    assert verdict("git grep -o /api/owner/scope-review-floor") is True  # -O opens a pager
-    # Execution-affecting environment assignments are REFUSED, never discarded.
-    assert verdict("git_external_diff=/tmp/x.sh git diff data/settings.json "
-                   "# ouroboros_scope_review_floor") is True
-    assert verdict("path=/tmp/evil grep ouroboros_scope_review_floor data/settings.json") is True
-    assert verdict("ld_preload=/tmp/x.so cat data/settings.json | grep "
-                   "ouroboros_scope_review_floor") is True
-    assert verdict("env git_config_global=/tmp/g git log -1 -- data/settings.json "
-                   "# ouroboros_scope_review_floor") is True
-    assert verdict("env -i grep ouroboros_scope_review_floor data/settings.json") is True
-    # Executable shadowing: an absolute path outside the system bins, or a relative one.
-    assert verdict("/tmp/evil/grep ouroboros_scope_review_floor data/settings.json") is True
-    assert verdict("./grep ouroboros_scope_review_floor data/settings.json") is True
-    assert verdict("../bin/rg /api/owner/scope-review-floor ouroboros/") is True
-    # Other allowlisted heads that write or execute through an option.
-    assert verdict("sort -o /tmp/out data/settings.json # ouroboros_scope_review_floor") is True
-    assert verdict("rg --pre /tmp/evil.sh /api/owner/scope-review-floor ouroboros/") is True
-
-    # The exemption itself SURVIVES: legitimate inspection of the same surface is allowed,
-    # including a trusted absolute path, a benign option and a read-only pipeline.
-    assert verdict("/usr/bin/grep ouroboros_scope_review_floor data/settings.json") is False
-    assert verdict("find ouroboros -name '*.py' -newer /api/owner/scope-review-floor") is False
-    assert verdict("rg -n --no-heading '/api/owner/scope-review-floor' ouroboros/ | sort") is False
-    assert verdict("git diff --stat -- data/settings.json # ouroboros_scope_review_floor") is False
-    assert verdict("git grep -n /api/owner/scope-review-floor") is False
-
-    # Pin the MECHANISM, not just the verdict: the classifier itself must refuse these,
-    # so a future change to the write-shape fact cannot silently mask the exemption hole.
-    from ouroboros.tools.registry import _is_pure_read_inspection as pure
-
-    for hostile in (
-        "find . -name '*.py' -exec sh -c ':' ;",
-        "git diff --ext-diff data/settings.json",
-        "path=/tmp/evil grep floor data/settings.json",
-        "/tmp/evil/grep floor data/settings.json",
-        "sort -o /tmp/out data/settings.json",
-    ):
-        assert pure(hostile) is False, hostile
-    assert pure("/usr/bin/grep floor data/settings.json") is True
-
-
-def test_stored_singular_scope_pin_beats_the_plural_default(monkeypatch, tmp_path):
-    """The owner's stored singular pin must reach get_scope_review_models().
-
-    Before v6.80.0 SETTINGS_DEFAULTS supplied the PLURAL key, which wins over the
-    singular in get_scope_review_models(), so a stored single-model pin was silently
-    ignored. The promotion happens in migrate_legacy_slot_keys — BEFORE defaults."""
+def test_stored_singular_scope_pin_is_ghost_purged(monkeypatch, tmp_path):
+    """ABI 7.0 (ABI-10): both comma spellings are RETIRED settings keys — a
+    stored pin (singular or plural) is ghost-purged on load, never promoted.
+    (The pre-7.0 singular→plural promotion left with the migration read.)"""
     import json
 
     import ouroboros.config as cfg
@@ -311,61 +35,17 @@ def test_stored_singular_scope_pin_beats_the_plural_default(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
+    monkeypatch.delenv("OUROBOROS_SCOPE_REVIEW_MODEL", raising=False)
+    monkeypatch.delenv("OUROBOROS_SCOPE_REVIEW_MODELS", raising=False)
 
     loaded = cfg.load_settings()
-    assert loaded["OUROBOROS_SCOPE_REVIEW_MODELS"] == "anthropic/claude-opus-4.8"
-
-    # An explicit plural is never overwritten by the singular.
-    settings_path.write_text(json.dumps({
-        "OUROBOROS_SCOPE_REVIEW_MODEL": "anthropic/claude-opus-4.8",
-        "OUROBOROS_SCOPE_REVIEW_MODELS": "openai/gpt-5.5",
-    }), encoding="utf-8")
-    assert cfg.load_settings()["OUROBOROS_SCOPE_REVIEW_MODELS"] == "openai/gpt-5.5"
-
-
-# --- CW3: an ephemeral decision turn is barred from durable mutators ---
-
-def test_ephemeral_turn_blocks_durable_mutators(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    from ouroboros.tools.registry import ToolContext, ToolRegistry
-
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=True))
-
-    out = reg.execute("update_identity", {"content": "x"})
-    assert "EPHEMERAL_TURN_RESTRICTED" in out  # failed closed, not executed
-
-    names = {(s.get("function") or {}).get("name") or s.get("name") for s in reg.schemas()}
-    assert "update_identity" not in names and "knowledge_write" not in names
-    assert "toggle_evolution" not in names and "set_tool_timeout" not in names
-    # The decision/answer/steer tools remain available to the ephemeral turn.
-    assert "steer_task" in names and "promote_chat_to_task" in names
-
-
-def test_non_ephemeral_turn_allows_durable_mutators(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    from ouroboros.tools.registry import ToolContext, ToolRegistry
-
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=False))
-    names = {(s.get("function") or {}).get("name") or s.get("name") for s in reg.schemas()}
-    assert "update_identity" in names  # a normal turn sees the durable mutators
-    out = reg.execute("update_identity", {})
-    assert "EPHEMERAL_TURN_RESTRICTED" not in out  # the ephemeral gate did not fire
+    assert "OUROBOROS_SCOPE_REVIEW_MODEL" not in loaded
+    assert "OUROBOROS_SCOPE_REVIEW_MODELS" not in loaded
 
 
 # --- CW4: the external-shell secret guard catches relative interpreter paths ---
 
-def test_secret_guard_catches_relative_interpreter_path():
-    from ouroboros.tools.registry import _subagent_shell_targets_secret
-
-    assert _subagent_shell_targets_secret("python -c \"open('data/settings.json')\"") is True
-    assert _subagent_shell_targets_secret("node -e \"readfilesync('../../data/settings.json')\"") is True
-    assert _subagent_shell_targets_secret("cat ~/.ssh/id_rsa") is True
-    assert _subagent_shell_targets_secret("cat /tmp/notes.txt") is False
-
-
-# --- CW7: the Max gate route honours USE_LOCAL_MAIN ---
+# --- Exact-route context fitting honours USE_LOCAL_MAIN ---
 
 def test_active_main_route_honours_use_local_main():
     from ouroboros.gateway.settings import _active_main_route
@@ -374,37 +54,6 @@ def test_active_main_route_honours_use_local_main():
     assert local["use_local"] is True and local["provider"] == "local"
     remote = _active_main_route({"OUROBOROS_MODEL": "openai/gpt-5.5", "USE_LOCAL_MAIN": False})
     assert remote["use_local"] is False and remote["provider"] != "local"
-
-
-# --- CW2: the Max-mode contract is enforced on the task path, fail-closed ---
-
-def test_active_route_confirms_max_reports_unknown_without_evidence(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-
-    import ouroboros.capability_evidence as capability_evidence
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)  # empty store: no capability evidence
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {"OUROBOROS_MODEL": "openai/gpt-5.5"})
-    # No evidence is UNKNOWN, distinct from positive evidence of a sub-1M route.
-    assert smod._active_route_confirms_max() is None
-    monkeypatch.setattr(
-        capability_evidence,
-        "probe",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            status="confirmed", stale=False, window_tokens=200_000,
-        ),
-    )
-    assert smod._active_route_confirms_max() is False
-    monkeypatch.setattr(
-        capability_evidence,
-        "probe",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            status="confirmed", stale=False, window_tokens=1_000_000,
-        ),
-    )
-    assert smod._active_route_confirms_max() is True
 
 
 # --- CW9: the pacing-interval timeout constant lives in the SETTINGS_DEFAULTS SSOT ---
@@ -417,194 +66,31 @@ def test_pacing_interval_in_settings_defaults():
 
 # === Triad+scope review-fix regressions (v6.34.0) ===
 
-# --- v6.64: known-small routes use Low; unknown routes try Max once ---
-
-def test_maybe_downgrade_max_uses_positive_route_evidence(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
+# Predicted route evidence is measurement input, never a global-mode writer or
+# an initial Max-to-Low authority. Functional fit cases are pinned in the Phase
+# 2 matrix; this carryover suite guards deletion of the old compatibility seam.
+def test_predicted_route_downgrade_seam_stays_deleted():
     from ouroboros import loop as loopmod
 
-    seen = {}
-
-    def _known_small(task, *, allow_fetch=False):
-        seen["model"] = task["model"]
-        seen["use_local"] = task["use_local_model"]
-        return {}, SimpleNamespace(status="confirmed", stale=False, window_tokens=16_384)
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _known_small)
-    # A positively-known small local route selects Low.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "local-model") == "low"
-    assert seen["use_local"] is True and seen["model"] == "local-model"
-    # Missing remote evidence stays Max until a real overflow proves otherwise.
-    monkeypatch.setattr(
-        contextmod,
-        "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="unprobeable", stale=False, window_tokens=0)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", False, "openai/gpt-5.5") == "max"
-    # A non-max mode is returned untouched.
-    assert loopmod._maybe_downgrade_max_unconfirmed("low", True, "x") == "low"
+    assert not hasattr(loopmod, "_maybe_downgrade_max_unconfirmed")
 
 
-def test_maybe_downgrade_max_keeps_max_when_confirmed(monkeypatch):
-    from types import SimpleNamespace
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    monkeypatch.setattr(
-        contextmod, "_context_fit_route",
-        lambda *_a, **_kw: ({}, SimpleNamespace(status="confirmed", stale=False, window_tokens=1_000_000)),
-    )
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "confirmed-local") == "max"
-
-
-def test_maybe_downgrade_max_probe_error_preserves_max(monkeypatch):
-    from ouroboros import context as contextmod
-    from ouroboros import loop as loopmod
-
-    def _boom(*a, **k):
-        raise RuntimeError("probe machinery unavailable")
-
-    monkeypatch.setattr(contextmod, "_context_fit_route", _boom)
-    # Probe failure is unknown and must not fabricate a Low/200K capability.
-    assert loopmod._maybe_downgrade_max_unconfirmed("max", True, "x") == "max"
-
-
-def test_active_route_confirms_max_local_override_reports_unknown(monkeypatch, tmp_path):
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)  # empty store: no evidence on disk
-    monkeypatch.setattr(smod, "_owner_read_settings_raw", lambda: {"OUROBOROS_MODEL": "openai/gpt-5.5"})
-    # Pinning to a local route with no local-health evidence remains UNKNOWN.
-    assert smod._active_route_confirms_max(model="local-x", use_local=True) is None
-
-
-# --- CW3: the ephemeral deny surface is complete (core envelope + non-core mutators) ---
-
-def test_ephemeral_allowlist_excludes_every_mutator_class():
-    from ouroboros.tools.registry import _EPHEMERAL_ALLOWED_TOOLS, _REPO_MUTATION_TOOLS
-
-    # CW3 default-deny: no durable repo/git mutator is in the allowlist...
-    assert not (_REPO_MUTATION_TOOLS & _EPHEMERAL_ALLOWED_TOOLS)
-    # ...nor any review/skill/publish/control mutator (the whack-a-mole denylist kept
-    # missing these), nor run_command (shell is durable-capable).
-    for name in ("fetch_pr_ref", "create_integration_branch", "advisory_review", "skill_review",
-                 "submit_skill_to_hub", "skill_exec", "toggle_skill", "cancel_task",
-                 "task_acceptance_review", "run_command", "switch_model", "update_identity",
-                 "commit_reviewed", "toggle_evolution",
-                 # subagent-only tools must NOT leak in: spawn / blocking-wait / page-interaction
-                 "schedule_subagent", "wait_task", "wait_tasks", "browser_action"):
-        assert name not in _EPHEMERAL_ALLOWED_TOOLS
-    # ...while the read/inspect + decision tools ARE allowed.
-    for name in ("read_file", "query_code", "search_code", "web_search",
-                 "route_to_project", "promote_chat_to_task", "steer_task"):
-        assert name in _EPHEMERAL_ALLOWED_TOOLS
-
-
-def test_ephemeral_core_envelope_is_allowlisted_and_mutators_blocked(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    from ouroboros.tools.registry import ToolContext, ToolRegistry, _EPHEMERAL_ALLOWED_TOOLS
-
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=True))
-
-    # The CORE/initial envelope is allowlisted too (every visible tool is allowed).
-    core_names = {(s.get("function") or {}).get("name") or s.get("name") for s in reg.schemas(core_only=True)}
-    assert core_names <= _EPHEMERAL_ALLOWED_TOOLS
-
-    # A non-allowlisted mutator fails closed at execute() up front (so enabling it via
-    # enable_tools cannot bypass the gate), and get_schema_by_name won't surface it.
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg.execute("fetch_pr_ref", {})
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg.execute("advisory_review", {})
-    assert reg.get_schema_by_name("skill_review") is None  # enable_tools can't surface it
-
-
-def test_switch_model_blocks_sub1m_route_while_max(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
+def test_switch_model_does_not_blanket_gate_on_context_window(monkeypatch, tmp_path):
+    """The loop rebinds/fits the exact route after the override; the tool only selects it."""
     from ouroboros.tools import control
     from ouroboros.tools.registry import ToolContext
 
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["big-model", "small-model"])
-    monkeypatch.setattr(smod, "_active_route_confirms_max",
-                        lambda settings=None, *, model="", use_local=None, allow_fetch=False: model == "big-model")
-
+    monkeypatch.setattr(
+        "ouroboros.llm.LLMClient.available_models",
+        lambda self: ["small-model"],
+    )
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.active_context_mode = "max"
-    # sub-1M route while the transcript is max-sized -> blocked, override NOT applied
+
     out = control._switch_model(ctx, model="small-model")
-    assert "SWITCH_BLOCKED" in out
-    assert ctx.active_model_override is None
-    # a >=1M route -> allowed
-    out2 = control._switch_model(ctx, model="big-model")
-    assert "SWITCH_BLOCKED" not in out2 and ctx.active_model_override == "big-model"
-    # not max (low transcript) -> a sub-1M switch is fine
-    ctx_low = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx_low.active_context_mode = "low"
-    out3 = control._switch_model(ctx_low, model="small-model")
-    assert "SWITCH_BLOCKED" not in out3 and ctx_low.active_model_override == "small-model"
-
-
-def test_switch_model_allows_unknown_route_for_one_max_attempt(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
-    from ouroboros.tools import control
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["unknown-model"])
-    monkeypatch.setattr(smod, "_active_route_confirms_max", lambda **_kwargs: None)
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.active_context_mode = "max"
-
-    out = control._switch_model(ctx, model="unknown-model")
 
     assert "SWITCH_BLOCKED" not in out
-    assert ctx.active_model_override == "unknown-model"
-
-
-def test_switch_model_fails_closed_when_capability_check_errors(monkeypatch, tmp_path):
-    from ouroboros.gateway import settings as smod
-    from ouroboros.tools import control
-    from ouroboros.tools.registry import ToolContext
-
-    monkeypatch.setattr("ouroboros.llm.LLMClient.available_models", lambda self: ["small-model"])
-
-    def _boom(*a, **k):
-        raise RuntimeError("probe down")
-
-    monkeypatch.setattr(smod, "_active_route_confirms_max", _boom)
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    ctx.active_context_mode = "max"
-    # An errored capability check must FAIL CLOSED (block), not apply the override.
-    out = control._switch_model(ctx, model="small-model")
-    assert "SWITCH_BLOCKED" in out
-    assert ctx.active_model_override is None
-
-
-# --- CW3 (claudexor): the ephemeral turn is barred from extension/MCP tools too ---
-
-def test_ephemeral_blocks_extension_and_mcp_tools(tmp_path):
-    from ouroboros.tools.registry import ToolContext, ToolRegistry
-
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=True))
-    # an extension tool (resolved ext_tool) and an MCP tool both fail closed at execute()
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg._ephemeral_block("skill__do", ext_tool={"name": "skill__do"})
-    assert "EPHEMERAL_TURN_RESTRICTED" in reg._ephemeral_block("mcp__srv__x", is_mcp=True)
-    # a normal turn does not block external tools
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=False))
-    assert reg._ephemeral_block("skill__do", ext_tool={"name": "skill__do"}) == ""
-
-
-def test_ephemeral_schemas_omit_extension_and_mcp_surfaces(tmp_path, monkeypatch):
-    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    from ouroboros.tools.registry import ToolContext, ToolRegistry
-
-    reg = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    reg.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, is_ephemeral_turn=True))
-    reg.schemas()  # populates capability_omissions
-    omissions = {(o.get("surface"), o.get("reason")) for o in reg.capability_omissions()}
-    assert ("extensions", "ephemeral_turn") in omissions
-    assert ("mcp", "ephemeral_turn") in omissions
+    assert ctx.active_model_override == "small-model"
 
 
 # --- running_tasks routing context never silently truncates (codex no-[:N] rule) ---
@@ -618,122 +104,119 @@ def test_running_tasks_clip_marker_is_explicit():
     assert "chars omitted]" in clipped  # explicit omission marker, not a silent cut
 
 
-def test_settings_save_probes_review_slots_with_the_needs_ack_contract(monkeypatch, tmp_path):
-    """RS1: a PINNED scope reviewer must have a REACHABLE path to Capability Evidence.
-
-    The Max gate only ever probed the MAIN route, so a pin could never become "known"
-    and silently ran in the conservative sub-floor window. The save-time probe reuses
-    the EXISTING needs_ack:{route, route_fp, evidence} contract, which Settings RENDERS
-    through the same confirm -> owner-capability-ack flow; it is advisory and never
-    rewrites the pin. Only the scope surface is probed (its >=1M evidence is the only
-    one that gates anything) and only on a scope-slot change."""
-    import pathlib
-    from types import SimpleNamespace
-
-    import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
-
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(cfg, "get_scope_review_models", lambda: ["anthropic/claude-opus-4.8"])
-    monkeypatch.setattr(cfg, "get_review_models", lambda: ["openai/gpt-5.6-sol"])
-    seen = []
-
-    def fake_probe(drive_root, **kwargs):
-        seen.append(kwargs["model"])
-        return SimpleNamespace(
-            window_tokens=200_000, status="confirmed", route_fp="fp",
-            to_json=lambda: {"window_tokens": 200_000, "status": "confirmed"},
-        )
-
-    monkeypatch.setattr("ouroboros.capability_evidence.probe", fake_probe)
-
-    notices = smod._review_capability_notices({})
-
-    assert "anthropic/claude-opus-4.8" in seen, "the scope slot's own route must be probed"
-    assert len(notices) == 1
-    notice = notices[0]
-    assert notice["surface"] == "scope_review"
-    assert set(notice["needs_ack"]) >= {"provider", "model", "base_url", "route_fp", "evidence"}
-    assert notice["window_tokens"] == 200_000
-    assert notice["verified"] is True
-    assert "openai/gpt-5.6-sol" not in seen, (
-        "the triad surface never yields a notice, so probing it was network work on "
-        "every settings save whose result was discarded"
-    )
-
-    # The response key must have a CONSUMER: unrendered, the owner sees no prompt and
-    # every commit keeps blocking with SCOPE_REVIEW_SUB_FLOOR telling them to owner-ack
-    # a route the UI never offered.
-    repo = pathlib.Path(__file__).resolve().parent.parent
-    settings_js = (repo / "web" / "modules" / "settings.js").read_text(encoding="utf-8")
-    for needle in (
-        "data.review_capability_notices",
-        "ackReviewCapabilityNotices",
-        "apiClient.ownerCapabilityAck(",
-    ):
-        assert needle in settings_js, needle
-    gateway_src = (repo / "ouroboros" / "gateway" / "settings.py").read_text(encoding="utf-8")
-    assert (
-        'k.startswith("OUROBOROS_SCOPE_REVIEW_MODEL") or k in _REVIEW_ROUTE_BASE_URL_KEYS'
-        in gateway_src
-    ), "the probe must be gated on a ROUTE-affecting change, not run on every save"
-
 
 def test_capability_evidence_is_route_aware_not_model_aware(monkeypatch, tmp_path):
-    """A base-URL change is a NEW ROUTE and must reprobe + renotify.
+    """A base-URL change is a NEW ROUTE and must reprobe.
 
-    Capability is a property of provider+base_url+model, and evidence is stored under
-    that route fingerprint. The lazy scope probe memoised by MODEL NAME and the
-    save-time notice fired only on `OUROBOROS_SCOPE_REVIEW_MODEL*`, so hot-changing
-    `OPENAI_BASE_URL` (or the openai-compatible / cloudru / gigachat equivalents) with an
-    unchanged model produced a route with no evidence, no second probe and no notice —
-    the next scope review fell silently to the conservative sub-floor and the advertised
-    owner-ack path was unreachable."""
-    from types import SimpleNamespace
+    Capability is a property of provider+base_url+model, and evidence is stored
+    under that route fingerprint. A lazy probe memoised by MODEL NAME serves a
+    hot `OPENAI_BASE_URL` change (or the openai-compatible / cloudru / gigachat
+    equivalents) from the previous route's record, so the scope reviewer is sized
+    from a window that belongs to a different endpoint."""
 
     import ouroboros.config as cfg
-    from ouroboros.gateway import settings as smod
+    from ouroboros import capability_evidence as ce
     from ouroboros.tools import scope_review as sr
 
     model = "openai::gpt-5.5-pinned"
     base_urls = {"OPENAI_BASE_URL": "https://route-a.example/v1"}
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
     monkeypatch.setattr(cfg, "load_settings", lambda: dict(base_urls))
-    monkeypatch.setattr(sr, "_LAZY_WINDOW_PROBED", set())
 
     fetched: list = []
 
-    def fake_probe(drive_root, **kwargs):
-        if kwargs.get("allow_fetch"):
-            fetched.append(str(kwargs.get("base_url") or ""))
-        return SimpleNamespace(
-            window_tokens=200_000, status="confirmed", route_fp="fp-" + str(kwargs.get("base_url")),
-            to_json=lambda: {"window_tokens": 200_000, "status": "confirmed"},
-        )
+    # The REAL probe, so what is counted is real network work: a route whose stored
+    # record is current is served from the cache, which is the rate limit — not a
+    # process memo that outlives the record and can never re-source it.
+    def fake_metadata(_provider, _model, base_url, allow_fetch, **_kw):
+        fetched.append(str(base_url or ""))
+        return 200_000
 
-    monkeypatch.setattr("ouroboros.capability_evidence.probe", fake_probe)
+    monkeypatch.setattr(ce, "_provider_metadata_window", fake_metadata)
 
-    sr._scope_reviewer_window(model)
-    sr._scope_reviewer_window(model)
-    assert fetched == ["https://route-a.example/v1"], "one lazy probe per route, not per call"
+    sr._scope_window(model)
+    sr._scope_window(model)
+    assert fetched == ["https://route-a.example/v1"], "one probe per route, not per call"
 
     # Same model, DIFFERENT base URL: a new route, so the lazy probe must run again.
     base_urls["OPENAI_BASE_URL"] = "https://route-b.example/v1"
-    sr._scope_reviewer_window(model)
+    sr._scope_window(model)
     assert fetched == [
         "https://route-a.example/v1", "https://route-b.example/v1",
     ], "a base-URL change is a new route fingerprint and must be probed"
 
-    # ...and the save-time owner-facing notice describes the INCOMING candidate route,
-    # taken from the submitted settings rather than from process env.
-    monkeypatch.setattr(cfg, "get_scope_review_models", lambda: ["anthropic/claude-fable-5"])
-    notices = smod._review_capability_notices({
-        "OUROBOROS_SCOPE_REVIEW_MODELS": model,
+
+def test_no_scope_row_shape_is_asked_to_confirm_a_context_window(monkeypatch, tmp_path):
+    """Owner decision 2026-09-17: window size is not a condition of scope authority.
+
+    Saving a scope row used to probe that row's route and, whenever the reading was
+    below the packet floor or the retrieving floor, return a `needs_ack` notice that
+    Settings turned into "confirm this reviewer's context window" — the only path by
+    which the row could sign a blocking verdict. Scope review now reads the
+    repository itself, and authority rests on the declared required-source manifest
+    and the reads recorded against it, so no scope row of any shape is asked about a
+    window and the save performs no capability probe for one.
+    """
+    import json
+
+    import pytest
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import capability_evidence as ce
+    from ouroboros import config as cfg
+    from ouroboros.gateway import settings as smod
+
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    settings_path = data_dir / "settings.json"
+    settings_path.write_text(json.dumps({"OUROBOROS_MODEL": "openai::gpt-main"}), encoding="utf-8")
+    monkeypatch.setattr(cfg, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cfg, "SETTINGS_PATH", settings_path)
+    monkeypatch.setattr(smod, "apply_runtime_provider_defaults", lambda s: (s, False, []))
+    monkeypatch.setattr(smod, "_start_supervisor_if_needed_for_request", lambda *_a, **_k: False)
+    monkeypatch.setattr(smod, "_apply_settings_to_env", lambda *_a, **_k: None)
+    monkeypatch.setattr(smod, "_apply_settings_save_side_effects", lambda *_a, **_k: None)
+    # The unknown-model-id warning is a catalog lookup, not a window probe; it is
+    # the other consumer of the candidate rows and is out of this test's claim.
+    monkeypatch.setattr(smod, "_unrecognised_review_models", lambda _models: [])
+    monkeypatch.setattr(ce, "probe", lambda *_a, **_kw: pytest.fail(
+        "a settings save probed a reviewer's context window"))
+
+    roster = {"enabled": True, "items": [{
+        "subagent_id": "api-critic", "name": "API critic",
+        "recommended_use": "Bounded inspection episode.",
+        "route": {"kind": "api_model", "target_id": "openai::gpt-critic"}, "effort": "medium",
+    }]}
+    slots = {
+        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai::gpt-triad"}}],
+        "scope": [
+            {"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai::gpt-bare"}},
+            {"slot_id": "s2", "subagent_id": "api-critic"},
+            {"slot_id": "s3", "route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol"}},
+        ],
+    }
+    app = Starlette(routes=[Route("/api/settings", smod.api_settings_post, methods=["POST"])])
+    app.state.drive_root = data_dir
+    app.state.repo_dir = data_dir
+    response = TestClient(app).post("/api/settings", json={
+        "OUROBOROS_SUBAGENTS": json.dumps(roster),
+        "OUROBOROS_REVIEWER_SLOTS": json.dumps(slots),
         "OPENAI_BASE_URL": "https://route-b.example/v1",
     })
-    assert len(notices) == 1
-    assert notices[0]["needs_ack"]["model"] == model
-    assert notices[0]["needs_ack"]["base_url"] == "https://route-b.example/v1"
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "review_capability_notices" not in body, body
+    assert "needs_ack" not in response.text
+    stored = json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"]
+    assert [row.get("slot_id") for row in json.loads(stored)["scope"]] == ["s1", "s2", "s3"]
+    assert not hasattr(smod, "_review_capability_notices")
+    # The generic ack endpoint stays: the main model's own window evidence is
+    # recorded through it (tests/test_owner_settings_write_seam.py
+    # ::test_the_capability_ack_is_not_a_settings_writer drives it end to end).
+    assert callable(smod.api_acknowledge_capability)
 
 
 def test_unrecognised_review_model_ids_are_reported_loudly(monkeypatch):
@@ -757,60 +240,3 @@ def test_unrecognised_review_model_ids_are_reported_loudly(monkeypatch):
     # Without an authoritative catalog nothing may be CLAIMED unknown.
     monkeypatch.setattr(LLMClient, "_CAPABILITIES_FETCH_OK", False, raising=False)
     assert smod._unrecognised_review_models(["-5"]) == []
-
-
-def test_read_exemption_fails_closed_on_nested_execution_constructs():
-    """An allowlisted head may not smuggle a writer inside a command substitution.
-
-    `_is_pure_read_inspection` checks the HEAD of each segment, so `echo "$(curl -X POST
-    .../api/owner/scope-review-floor)"` presented `echo` — allowlisted — while the nested
-    `curl` was never validated as a head at all, and the write-shape detector does not
-    recognise an HTTP POST. The exemption was therefore granted to a command line whose whole
-    purpose was to reach the owner-only endpoint. Nested EXECUTION is now refused outright
-    (`$()`, backticks, process substitution, subshells) rather than enumerated: the writer
-    inside it need not be a shape anybody listed.
-    """
-    from ouroboros.tools.registry import _detect_scope_review_floor_self_lowering as det
-    from ouroboros.tools.registry import _is_pure_read_inspection as pure
-    from ouroboros.tools.shell_guards import shell_has_write_indicator
-
-    ep = "http://127.0.0.1:8765/api/owner/scope-review-floor"
-
-    def verdict(cmd: str) -> bool:
-        return det(cmd.lower(), writeish=shell_has_write_indicator(cmd))
-
-    # Command substitution under three different allowlisted heads, quoted and bare.
-    assert verdict(f'echo "$(curl -X POST {ep} -d floor=off)"') is True
-    assert verdict(f'echo $(curl -X POST {ep} -d floor=off)') is True
-    assert verdict(f'grep "$(curl -X POST {ep} -d floor=off)" data/settings.json') is True
-    assert verdict(f'cat "$(curl -X POST {ep} -d floor=off)"') is True
-    assert verdict(f'sort "$(curl -X POST {ep})"') is True
-    # Backticks and process substitution are the same capability by another spelling.
-    assert verdict(f'echo `curl -X POST {ep} -d floor=off`') is True
-    assert verdict(f'cat <(curl -X POST {ep} -d floor=off)') is True
-    assert verdict(f'grep floor <(curl -X POST {ep})') is True
-    # A subshell is nested execution too.
-    assert verdict(f'(curl -X POST {ep} -d floor=off)') is True
-
-    # Pin the MECHANISM: the classifier must refuse these on its own, so the verdict cannot
-    # come to depend on the write-shape fact noticing an HTTP POST (it does not).
-    for hostile in (
-        f'echo "$(curl -X POST {ep})"',
-        f'grep "$(curl -X POST {ep})" data/settings.json',
-        f'cat `curl -X POST {ep}`',
-        f'cat <(curl -X POST {ep})',
-    ):
-        assert pure(hostile.lower()) is False, hostile
-        assert shell_has_write_indicator(hostile) is False, (
-            "precondition: the write-shape detector does not catch an HTTP POST, which is "
-            "exactly why the read exemption has to fail closed by itself"
-        )
-
-    # The exemption SURVIVES for genuine inspection, including pipes between reads.
-    assert verdict("grep ouroboros_scope_review_floor data/settings.json") is False
-    assert verdict("cat data/settings.json | grep ouroboros_scope_review_floor") is False
-    assert verdict(f"rg -n --no-heading '{ep}' ouroboros/ | sort") is False
-    assert verdict("git grep -n /api/owner/scope-review-floor") is False
-    assert verdict("/usr/bin/grep ouroboros_scope_review_floor data/settings.json") is False
-    assert pure("grep ouroboros_scope_review_floor data/settings.json") is True
-    assert pure("cat data/settings.json | grep floor") is True

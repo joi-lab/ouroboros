@@ -1,22 +1,21 @@
-"""v6.61.0 (Phase 5) — adaptive planning: plan_class + structural escalation,
-class-tiered reviewer docs, and class-framed scouts.
+"""Structural constitutional escalation for ``plan_task`` (formerly v6.61.0 plan_class
+escalation): the ONE path fact ``constitutional`` — declared ``affected_paths`` locators
+(the files the work will CHANGE) resolving under the Ouroboros system repository (owner D29:
+the active binding alone never decides) — with the skill-payload exemption the
+retired ``resolve_plan_class`` applied. Kept from the original file: the
+path-escalation and payload-exemption cases, ported to ``plan_spec.resolve_constitutional``
++ ``plan_review_runtime.plan_payload_roots``; the plan_class / context_level / scout
+framing / doc-tiering cases went with the machinery they pinned.
 """
 from __future__ import annotations
 
-import pathlib
 from types import SimpleNamespace
 
-import pytest
-
-from ouroboros.tools.plan_review import (
-    _build_system_prompt,
-    _planning_scout_framing,
-    _resolve_plan_class,
-    _resolve_plan_context_level,
-)
+from ouroboros.tools.plan_review_runtime import plan_payload_roots
+from ouroboros.tools.plan_spec import resolve_constitutional
 
 
-def _ctx(tmp_path, *, system_repo="sys", active=None):
+def _ctx(tmp_path, *, system_repo="sys", active=None, drive="data"):
     sys_repo = tmp_path / system_repo
     sys_repo.mkdir(exist_ok=True)
     active_dir = tmp_path / active if active else sys_repo
@@ -24,89 +23,91 @@ def _ctx(tmp_path, *, system_repo="sys", active=None):
     ctx = SimpleNamespace(
         repo_dir=sys_repo,
         system_repo_dir=sys_repo,
-        drive_root=tmp_path / "data",
+        drive_root=tmp_path / drive,
     )
     ctx.active_repo_dir = lambda: active_dir
     return ctx
 
 
-# --- 5.1 plan_class + structural escalation ---------------------------------------
-
-def test_plan_class_structural_escalation_on_system_repo_paths(tmp_path):
-    # Active workspace IS the system repo: any files_to_touch => self_mod, even if
-    # the agent declared a softer class.
-    ctx = _ctx(tmp_path)
-    resolved, note = _resolve_plan_class(ctx, "creative", ["ouroboros/loop.py"])
-    assert resolved == "self_mod"
-    assert "escalated" in note
-
-    # Declared self_mod on system-repo paths: no note (nothing to escalate).
-    resolved2, note2 = _resolve_plan_class(ctx, "self_mod", ["ouroboros/loop.py"])
-    assert resolved2 == "self_mod" and note2 == ""
-
-
-def test_plan_class_external_workspace_keeps_declared_class(tmp_path):
-    ctx = _ctx(tmp_path, active="workdir")
-    resolved, note = _resolve_plan_class(ctx, "external", ["src/app.py"])
-    assert (resolved, note) == ("external", "")
-    # Undeclared in an external workspace defaults to external.
-    assert _resolve_plan_class(ctx, "", ["src/app.py"])[0] == "external"
-    # An ABSOLUTE path back into the system repo escalates even from a workspace.
-    abs_sys = str((tmp_path / "sys" / "ouroboros" / "config.py"))
-    resolved3, note3 = _resolve_plan_class(ctx, "external", [abs_sys])
-    assert resolved3 == "self_mod" and "escalated" in note3
-
-
-def test_plan_class_default_self_repo_is_self_mod(tmp_path):
-    ctx = _ctx(tmp_path)
-    assert _resolve_plan_class(ctx, "", [])[0] == "self_mod"
-    assert _resolve_plan_class(ctx, "bogus-class", [])[0] == "self_mod"
-
-
-# --- 5.2 context level default + doc tiering ---------------------------------------
-
-def test_context_level_optional_only_for_non_self_mod():
-    assert _resolve_plan_context_level("", plan_class="external") == "minimal"
-    assert _resolve_plan_context_level("", plan_class="research") == "minimal"
-    with pytest.raises(ValueError):
-        _resolve_plan_context_level("", plan_class="self_mod")
-    # An explicit level always wins, for every class.
-    assert _resolve_plan_context_level("broad", plan_class="creative") == "broad"
-
-
-def test_system_prompt_tiering_note_for_non_self_mod():
-    args = dict(
-        checklist="- item", bible_text="BIBLE BODY", dev_md="DEV BODY",
-        arch_md="ARCH NAV MAP", checklists_md="", context_level="minimal",
+def _resolve(ctx, affected, evidence=()):
+    system = ctx.system_repo_dir
+    active = ctx.active_repo_dir()
+    return resolve_constitutional(
+        active_root=active, system_repo_root=system,
+        affected_paths=list(affected), evidence=list(evidence),
+        payload_roots=plan_payload_roots(ctx, list(affected) + list(evidence)),
     )
-    prompt_ext = _build_system_prompt(plan_class="external", **args)
-    assert "plan_class='external'" in prompt_ext
-    assert "navigation map" in prompt_ext
-    prompt_self = _build_system_prompt(plan_class="self_mod", **args)
-    assert "plan_class=" not in prompt_self  # self_mod: today's prompt, no class note
 
 
-# --- 5.3 class-framed scouts --------------------------------------------------------
+# --- structural escalation on system-repo paths ---------------------------------------
 
-def test_scout_framing_by_class():
-    self_obj, self_con = _planning_scout_framing("self_mod")
-    assert "repo/docs/logs" in self_obj  # historical framing preserved
-    ext_obj, ext_con = _planning_scout_framing("external")
-    assert "external codebase" in ext_obj
-    assert "NOT" in ext_obj and "archaeology" in ext_obj
-    cre_obj, _ = _planning_scout_framing("creative")
-    assert "creative deliverable" in cre_obj
-    res_obj, _ = _planning_scout_framing("research")
-    assert "research question" in res_obj
-    # Constraints stay read-only for every class.
-    assert "Readonly planning only" in self_con and "Readonly planning only" in ext_con
+def test_system_repo_paths_make_the_plan_constitutional(tmp_path):
+    ctx = _ctx(tmp_path)  # active workspace IS the system repo
+    ok, note = _resolve(ctx, ["ouroboros/loop.py"])
+    assert ok and "affected_paths" in note
+    # D29: the binding alone never decides — nothing declared, not constitutional.
+    ok, note = _resolve(ctx, [])
+    assert ok is False and note.startswith("not constitutional")
 
 
-# --- governance docs updated in the same commit -------------------------------------
+def test_external_workspace_paths_stay_non_constitutional_unless_absolute_into_system_repo(tmp_path):
+    ctx = _ctx(tmp_path, active="workdir")
+    assert _resolve(ctx, ["src/app.py"])[0] is False
+    # An ABSOLUTE path back into the system repo escalates even from a workspace.
+    abs_sys = str(tmp_path / "sys" / "ouroboros" / "config.py")
+    ok, note = _resolve(ctx, ["src/app.py", abs_sys])
+    assert ok and "affected_paths" in note
+    # Owner 16=A: a declared EVIDENCE locator under the system repo is a READ, not a change —
+    # it never escalates on its own, existing or not, and the host says which reads it saw
+    # instead of reporting "no locator resolved".
+    (tmp_path / "sys" / "BIBLE.md").write_text("# constitution\n", encoding="utf-8")
+    ok, note = _resolve(ctx, ["src/app.py"], evidence=[str(tmp_path / "sys" / "BIBLE.md")])
+    assert ok is False and "EVIDENCE reads" in note
+    ok, note = _resolve(ctx, ["src/app.py"], evidence=[str(tmp_path / "sys" / "NOPE.md")])
+    assert ok is False and "EVIDENCE reads" in note
 
-def test_development_md_documents_the_tiering_contract():
-    dev = (pathlib.Path(__file__).resolve().parents[1] / "docs" / "DEVELOPMENT.md").read_text(encoding="utf-8")
-    assert "plan_class" in dev
-    assert "navigation map" in dev
-    # The table row reflects the class-tiered ARCHITECTURE contract.
-    assert "lossless **navigation map**" in dev
+
+# --- skill-payload exemption (data plane, never self-modification by itself) ---------
+
+def test_skill_payload_paths_are_exempt(tmp_path):
+    # Reproduction of task 7881ad77902d4d25: a skill task with the system repo as the
+    # active workspace touched only data-plane skill payload files — NOT constitutional.
+    ctx = _ctx(tmp_path)
+    ok, _ = _resolve(ctx, [
+        "data/skills/external/claudexor_quotas/SKILL.md",
+        "data/skills/external/claudexor_quotas/plugin.py",
+        "data/skills/external/claudexor_quotas/widget.js",
+    ])
+    assert ok is False
+
+
+def test_skill_payload_alternate_forms_are_exempt(tmp_path):
+    # The frozen-contract predicate accepts `skills/<bucket>/…` and absolute paths under
+    # the data root; both stay exempt.
+    ctx = _ctx(tmp_path)
+    assert _resolve(ctx, ["skills/external/x/plugin.py"])[0] is False
+    abs_payload = str(tmp_path / "data" / "skills" / "external" / "x" / "plugin.py")
+    assert _resolve(ctx, [abs_payload])[0] is False
+
+
+def test_mixed_repo_and_skill_paths_still_escalate(tmp_path):
+    ctx = _ctx(tmp_path)
+    ok, note = _resolve(ctx, ["ouroboros/loop.py", "data/skills/external/x/plugin.py"])
+    assert ok and "ouroboros/loop.py" in note
+
+
+def test_native_bucket_is_not_exempt(tmp_path):
+    # Native skills are repo-seeded territory — the payload predicate does not admit them.
+    ctx = _ctx(tmp_path)
+    ok, note = _resolve(ctx, ["data/skills/native/x/plugin.py"])
+    assert ok and "affected_paths" in note
+
+
+def test_drive_resolution_failure_skips_the_exemption(tmp_path):
+    # A ctx that cannot resolve the data root skips the exemption entirely: payload
+    # paths under the system repo escalate exactly as any other path.
+    ctx = _ctx(tmp_path)
+    del ctx.drive_root
+    assert plan_payload_roots(ctx, ["data/skills/external/x/plugin.py"]) == []
+    ok, _ = _resolve(ctx, ["data/skills/external/x/plugin.py"])
+    assert ok is True

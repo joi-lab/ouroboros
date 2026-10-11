@@ -20,8 +20,8 @@ from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros import subagent_worktrees as sw
 
 
-def _git(repo, *args, check=True):
-    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=check)
+def _git(repo, *args, check=True, text=True):
+    return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=text, check=check)
 
 
 def _init_repo(path: pathlib.Path, files: dict) -> str:
@@ -38,9 +38,7 @@ def _init_repo(path: pathlib.Path, files: dict) -> str:
     return _git(path, "rev-parse", "HEAD").stdout.strip()
 
 
-# --------------------------------------------------------------------------- #
 # 1. TaskConstraint normalization
-# --------------------------------------------------------------------------- #
 def test_acting_constraint_normalize_forces_invariants():
     c = normalize_task_constraint({
         "mode": "acting_subagent",
@@ -71,9 +69,7 @@ def test_acting_constraint_instance_repins_flags():
     assert c.allow_enable is False and c.allow_review is False and c.parent_only_commit is True
 
 
-# --------------------------------------------------------------------------- #
 # 2. Fail-closed profile (the core safety invariant)
-# --------------------------------------------------------------------------- #
 def _profile_ctx(tmp_path, *, constraint=None, metadata=None):
     repo = tmp_path / "repo"; repo.mkdir(exist_ok=True)
     drive = tmp_path / "data"; drive.mkdir(exist_ok=True)
@@ -110,9 +106,87 @@ def test_profile_normal_task_is_self_modification(tmp_path):
     assert active_tool_profile(ctx) == "self_modification"
 
 
-# --------------------------------------------------------------------------- #
+def _enable_cyber_mode_for_test(monkeypatch):
+    import ouroboros.config as config
+    import ouroboros.runtime_mode_policy as policy
+    import ouroboros.settings_scales as scales
+
+    monkeypatch.setattr(scales, "VALID_RUNTIME_MODES", (*scales.VALID_RUNTIME_MODES, "cyber_pro"))
+    monkeypatch.setattr(config, "VALID_RUNTIME_MODES", (*config.VALID_RUNTIME_MODES, "cyber_pro"))
+    monkeypatch.setitem(policy._RUNTIME_MODE_RANK, "cyber_pro", 3)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+
+
+def test_cyber_acting_child_inherits_owner_resource_matrix(tmp_path, monkeypatch):
+    from ouroboros.tool_access import decide_tool_access
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    assert active_tool_profile(ctx) == "acting_subagent"
+    assert decide_tool_access(
+        profile="acting_subagent", root="user_files", operation="write",
+    ).allow
+    assert decide_tool_access(
+        profile="acting_subagent", root="task_drive", operation="shell",
+    ).allow
+    assert not decide_tool_access(
+        profile="local_readonly_subagent", root="user_files", operation="write",
+    ).allow
+
+
+def test_cyber_acting_child_can_use_owner_credential_file_path(tmp_path, monkeypatch):
+    from ouroboros.tool_access_user_files import user_files_path_block_reason
+
+    _enable_cyber_mode_for_test(monkeypatch)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("OUROBOROS_USER_FILES_ROOT", str(home))
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(mode="acting_subagent", surface="external_workspace"),
+    )
+    credential = home / ".ssh" / "id_rsa"
+    credential.parent.mkdir()
+    credential.write_text("owner key", encoding="utf-8")
+    assert user_files_path_block_reason(ctx, credential, operation="write") == ""
+    readonly_root = tmp_path / "readonly"
+    readonly_root.mkdir()
+    readonly = _profile_ctx(
+        readonly_root,
+        constraint=TaskConstraint(mode="local_readonly_subagent"),
+    )
+    assert user_files_path_block_reason(readonly, credential, operation="write")
+
+
+def test_cyber_acting_registry_exposes_review_skill_and_runtime_tools(tmp_path, monkeypatch):
+    _enable_cyber_mode_for_test(monkeypatch)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = _profile_ctx(
+        tmp_path,
+        constraint=TaskConstraint(
+            mode="acting_subagent", surface="external_workspace", write_root=str(workspace),
+        ),
+    )
+    reg = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+    reg._ctx = ctx
+
+    names = set(reg.initial_tool_names())
+    assert {"review_status", "plan_task", "skill_review", "skill_exec", "toggle_evolution"} <= names
+    assert "commit_reviewed" in names
+    schemas = {
+        item["function"]["name"] for item in reg.schemas()
+        if item.get("function")
+    }
+    assert {"review_status", "plan_task", "skill_review", "skill_exec"} <= schemas
+    assert reg.get_schema_by_name("review_status") is not None
+    assert "TOOL_ACCESS_BLOCKED" not in reg.execute("review_status", {})
+
+
 # 3. Registry gating for acting subagents
-# --------------------------------------------------------------------------- #
 def _acting_registry(tmp_path, *, surface="self_worktree", grant=False, grants=()):
     repo = tmp_path / "repo"; repo.mkdir(exist_ok=True)
     drive = tmp_path / "data"; drive.mkdir(exist_ok=True)
@@ -151,10 +225,7 @@ def test_acting_protected_write_blocked_without_pro_grant(tmp_path):
 
 
 def test_protected_write_guard_covers_redundant_root_prefix(tmp_path, monkeypatch):
-    """v6.35.0 security: repo_path normalizes a redundant root-basename prefix
-    ('repo/BIBLE.md' -> 'BIBLE.md'), so the protected-write guard MUST check the
-    same normalized form — else a redundant-prefix path bypasses the constitution
-    guard. Regression for the T2 path-normalization interaction."""
+    """Redundant repo-basename prefixes must use dispatch's protected-path normalization."""
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
@@ -178,10 +249,7 @@ def test_protected_write_guard_covers_redundant_root_prefix(tmp_path, monkeypatc
 
 
 def test_shrink_guard_covers_redundant_root_prefix(tmp_path, monkeypatch):
-    """v6.35.0 root-fix: the dispatch normalizes args['path'], so the accidental-
-    truncation shrink guard (which checks `git ls-files` tracked status) stays
-    active for a redundant-root-prefix write to an already-tracked file — it must
-    not be silently disabled by the path desync."""
+    """Redundant repo-basename prefixes must preserve the tracked-file shrink guard."""
     import subprocess
 
     from ouroboros.tools.registry import ToolContext, ToolRegistry
@@ -211,9 +279,7 @@ def test_acting_tool_visibility_is_acting_set(tmp_path):
     assert "integrate_subagent_patch" in names
 
 
-# --------------------------------------------------------------------------- #
 # 4. Worktree lifecycle
-# --------------------------------------------------------------------------- #
 def test_worktree_provision_remove(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     head = _init_repo(repo, {"a.txt": "hi\n"})
@@ -264,9 +330,7 @@ def test_worktree_prune_missing(tmp_path):
     assert res["removed"] == 1 and res["kept"] == 0
 
 
-# --------------------------------------------------------------------------- #
 # 5. control._build_acting_constraint
-# --------------------------------------------------------------------------- #
 def test_build_acting_constraint_toggle(monkeypatch):
     from ouroboros.tools.control import _build_acting_constraint
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "false")
@@ -291,9 +355,7 @@ def test_build_acting_external_requires_root(monkeypatch):
     assert isinstance(err, str) and "external_workspace" in err
 
 
-# --------------------------------------------------------------------------- #
 # 6. events._resolve_subagent_constraint (authoritative gate + provisioning)
-# --------------------------------------------------------------------------- #
 def test_resolve_readonly_passthrough(tmp_path):
     from supervisor.events import _resolve_subagent_constraint
     ctx = SimpleNamespace(REPO_DIR=tmp_path / "repo")
@@ -351,9 +413,7 @@ def test_reject_cleans_up_provisioned_worktree(tmp_path, monkeypatch):
     assert not pathlib.Path(wr).exists()  # no leak
 
 
-# --------------------------------------------------------------------------- #
 # 7. integrate_subagent_patch
-# --------------------------------------------------------------------------- #
 def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: str, rel: str, new_content: str, parent_task_id: str = "parent1", surface: str = ""):
     """Produce a real workspace.patch + manifest + lineage task_result for ``rel``."""
     from ouroboros.artifacts import task_artifact_dir_path
@@ -362,7 +422,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     (target_repo / rel).parent.mkdir(parents=True, exist_ok=True)
     original = (target_repo / rel).read_text(encoding="utf-8") if (target_repo / rel).exists() else ""
     (target_repo / rel).write_text(new_content, encoding="utf-8")
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     # revert working tree so the patch can be applied fresh by the tool
     _git(target_repo, "checkout", "--", rel) if original else (target_repo / rel).unlink()
     art = task_artifact_dir_path(drive, child_id, create=True)
@@ -370,7 +430,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     # hash. write_text() would translate "\n" -> "\r\n" on Windows, so the file's
     # sha256 (read back as bytes by the integrate tool) would diverge from the
     # manifest digest and trip INTEGRATE_PATCH_CORRUPT. Binary write keeps parity.
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -383,6 +443,7 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     tr = task_result_path(drive, child_id)
     tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
+        "_schema_version": 1,
         "id": child_id,
         "task_id": child_id,
         "parent_task_id": parent_task_id,
@@ -403,10 +464,10 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
     from hashlib import sha256
 
     (target_repo / rel).unlink()
-    patch = _git(target_repo, "diff", "--binary", "HEAD", "--").stdout
+    patch = _git(target_repo, "diff", "--binary", "HEAD", "--", text=False).stdout
     _git(target_repo, "checkout", "--", rel)
     art = task_artifact_dir_path(drive, child_id, create=True)
-    patch_bytes = patch.encode("utf-8")
+    patch_bytes = patch
     (art / "workspace.patch").write_bytes(patch_bytes)
     digest = sha256(patch_bytes).hexdigest()
     manifest = {
@@ -422,6 +483,7 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
     tr = task_result_path(drive, child_id)
     tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
+        "_schema_version": 1,
         "id": child_id,
         "task_id": child_id,
         "parent_task_id": parent_task_id,
@@ -470,6 +532,50 @@ def test_integrate_apply_happy(tmp_path):
     child = load_effective_task_result(drive, "child1")
     assert child.get("child_result_disposition") == "integrated"
     assert len(str(child.get("child_result_disposition_sha256") or "")) == 64
+
+
+def test_integrate_discloses_capture_excluded_files(tmp_path):
+    """#447 C2: integration success must disclose per-file capture exclusions."""
+    from ouroboros.tools.subagent_integration import _integrate_subagent_patch
+
+    repo = tmp_path / "repo"
+    _init_repo(repo, {"a.txt": "hi\n"})
+    drive = tmp_path / "data"; drive.mkdir()
+    art = _make_child_patch(repo, drive, "child1", "a.txt", "hi\nworld\n")
+    manifest = json.loads((art / "workspace_patch.json").read_text(encoding="utf-8"))
+    manifest["sensitive_blocked"] = [
+        {"path": "token_report.json", "reason": "credential-like filename"},
+    ]
+    manifest["untracked_excluded"] = [
+        {"path": "fixtures/dummy_key.pem", "reason": "private key material"},
+    ]
+    (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    out = _integrate_subagent_patch(_integrate_ctx(repo, drive), task_id="child1", reason="best of N")
+
+    assert "Integrated subagent patch" in out
+    assert "EXCLUDED from this patch by capture policy" in out, out[:400]
+    assert "token_report.json (credential-like filename)" in out
+    assert "fixtures/dummy_key.pem (private key material)" in out
+
+
+def test_reject_branch_also_discloses_exclusions(tmp_path):
+    """#447 R2-B: a run whose ONLY output was excluded files reads as no-changes/rejected - those branches must disclose the exclusions too, or the sole copy vanishes behind an affirmative nothing-happened line."""
+    from ouroboros.tools.subagent_integration import _integrate_subagent_patch
+
+    repo = tmp_path / "repo"
+    _init_repo(repo, {"a.txt": "hi\n"})
+    drive = tmp_path / "data"; drive.mkdir()
+    art = _make_child_patch(repo, drive, "child1", "a.txt", "hi\nworld\n")
+    manifest = json.loads((art / "workspace_patch.json").read_text(encoding="utf-8"))
+    manifest["sensitive_blocked"] = [{"path": "token_report.json", "reason": "credential-like filename"}]
+    (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    out = _integrate_subagent_patch(
+        _integrate_ctx(repo, drive), task_id="child1", decision="reject", reason="not needed",
+    )
+    assert "Rejected subagent patch" in out, out[:300]
+    assert "EXCLUDED from this patch by capture policy" in out, out[:400]
 
 
 def test_integrate_reject_records_verdict(tmp_path):
@@ -522,9 +628,7 @@ def test_mode_allows_protected_write_matrix():
     assert mode_allows_protected_write("light") is False
 
 
-# --------------------------------------------------------------------------- #
 # 8. Adversarial round-1 fixes: ext/MCP schema deny-by-default + top-only target
-# --------------------------------------------------------------------------- #
 def test_acting_schemas_subset_of_acting_set(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path, grants=("mcp_foo",))
     names = {s["function"]["name"] for s in reg.schemas()}
@@ -552,9 +656,7 @@ def test_integrate_acting_rejects_foreign_target_root(tmp_path):
 
 
 def test_integrate_self_worktree_patch_refused_under_external_workspace(tmp_path):
-    """v6.56.0 fail-closed category guard: a self_worktree child's patch targets the
-    Ouroboros SYSTEM repo; an external-workspace parent must not 3-way-apply it into
-    the task workspace (wrong repository)."""
+    """A self-worktree patch targets the system repo, never an external workspace."""
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
     system_repo = tmp_path / "system_repo"
     _init_repo(system_repo, {"a.txt": "hi\n"})
@@ -598,8 +700,8 @@ def test_acting_no_workspace_blocks_live_repo_write_and_shell(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in out
     assert not (repo / "x.txt").exists()
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("run_command", {"cmd": "echo hi > z.txt"})
-    # claude_code_edit is not in the acting tool set -> blocked by the acting hard-block.
-    assert "ACTING_SUBAGENT_BLOCKED" in reg.execute("claude_code_edit", {"cwd": ".", "instructions": "x"})
+    # The retired claude_code_edit no longer exists at all for an acting child.
+    assert "Unknown tool" in reg.execute("claude_code_edit", {"cwd": ".", "instructions": "x"})
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("start_service", {"name": "svc", "cmd": "sleep 1"})
 
 
@@ -780,9 +882,7 @@ def test_integrate_external_workspace_files_derived_from_patch_not_manifest(tmp_
     assert verdict["files"] == ["a.txt"]
 
 
-# --------------------------------------------------------------------------- #
 # 9. Triad+scope round-1 fixes: lineage, strict bool, owner toggle plumbing
-# --------------------------------------------------------------------------- #
 def test_acting_protected_grant_strict_bool():
     # String "false" must NOT grant protected authority (strict parse via normalize).
     c = normalize_task_constraint({"mode": "acting_subagent", "surface": "self_worktree", "protected_paths_grant": "false"})
@@ -801,6 +901,55 @@ def test_allow_mutative_settings_applied(monkeypatch):
     assert get_allow_mutative_subagents() is False
 
 
+def test_allow_mutative_surface_aware_unset_default(monkeypatch):
+    """Q4 sandbox unwind (owner 2026-08-08): unset toggle + light allows the
+    EXTERNAL build surfaces (external_workspace/genesis) and keeps self_worktree
+    off; advanced/pro allow every surface; an explicit owner value applies to
+    every surface in every mode."""
+    from ouroboros.config import get_allow_mutative_subagents
+    monkeypatch.delenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_BOOT_RUNTIME_MODE", raising=False)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    assert get_allow_mutative_subagents("external_workspace") is True
+    assert get_allow_mutative_subagents("genesis") is True
+    assert get_allow_mutative_subagents("self_worktree") is False
+    # A bare query answers "may ANY acting child be scheduled" -> True in light.
+    assert get_allow_mutative_subagents() is True
+    # An unknown surface string fails closed (surface validity gate has its own message).
+    assert get_allow_mutative_subagents("bogus") is False
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    assert get_allow_mutative_subagents("self_worktree") is True
+    # Explicit owner value overrides the surface-aware default in BOTH directions.
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
+    assert get_allow_mutative_subagents("self_worktree") is True
+    monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "false")
+    assert get_allow_mutative_subagents("external_workspace") is False
+
+
+def test_resolve_acting_light_unset_surface_aware(tmp_path, monkeypatch):
+    """The authoritative supervisor gate keys the unset-toggle default on the
+    requested surface: light rejects self_worktree but the reject detail names
+    the external lanes; the surface is validated BEFORE the toggle check."""
+    from supervisor.events import _resolve_subagent_constraint
+    monkeypatch.delenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", raising=False)
+    monkeypatch.delenv("OUROBOROS_BOOT_RUNTIME_MODE", raising=False)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "light")
+    ctx = SimpleNamespace(REPO_DIR=tmp_path / "repo")
+    c, wr, wm, detail = _resolve_subagent_constraint(
+        ctx, tid="t", requested_constraint={"mode": "acting_subagent", "surface": "self_worktree"},
+        workspace_root="", workspace_mode="", base_sha="", parent_task_id="",
+    )
+    assert c["mode"] == "local_readonly_subagent"
+    assert "self_worktree" in detail and "external_workspace" in detail
+    # Invalid surface is rejected with the surface message, not the toggle message.
+    c2, _, _, detail2 = _resolve_subagent_constraint(
+        ctx, tid="t2", requested_constraint={"mode": "acting_subagent", "surface": "bogus"},
+        workspace_root="", workspace_mode="", base_sha="", parent_task_id="",
+    )
+    assert c2["mode"] == "local_readonly_subagent" and "invalid acting write_surface" in detail2
+
+
 def test_integrate_lineage_forbidden_for_non_child(tmp_path):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
     repo = tmp_path / "repo"
@@ -814,9 +963,7 @@ def test_integrate_lineage_forbidden_for_non_child(tmp_path):
     assert (repo / "a.txt").read_text(encoding="utf-8") == "hi\n"  # not applied
 
 
-# --------------------------------------------------------------------------- #
 # 10. Triad+scope round-2/3/4 deep fixes
-# --------------------------------------------------------------------------- #
 def test_integrate_protected_derived_from_patch_not_manifest(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     # A malicious child cannot hide a protected edit by omitting it from the manifest.
@@ -871,23 +1018,22 @@ def test_remove_worktree_path_outside_root_guarded(tmp_path):
     assert outside.exists() and (outside / "k.txt").exists()
 
 
-# --------------------------------------------------------------------------- #
 # 11. Triad+scope round-5 fixes: external_workspace validation + owner-only toggle
-# --------------------------------------------------------------------------- #
-def test_external_workspace_requires_git_outside_repo(tmp_path, monkeypatch):
+def test_external_workspace_accepts_folders_and_preserves_git_geometry(tmp_path, monkeypatch):
     from supervisor.events import _resolve_subagent_constraint
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
     repo = tmp_path / "repo"
     _init_repo(repo, {"a.txt": "hi\n"})
     ctx = SimpleNamespace(REPO_DIR=repo)
-    # A non-git external workspace cannot return a workspace.patch -> rejected.
+    # An ordinary directory is admitted directly, with no invented Git base.
     nogit = tmp_path / "proj"; nogit.mkdir()
     c, wr, wm, detail = _resolve_subagent_constraint(
         ctx, tid="e1",
         requested_constraint={"mode": "acting_subagent", "surface": "external_workspace", "write_root": str(nogit)},
         workspace_root="", workspace_mode="", base_sha="", parent_task_id="p",
     )
-    assert c["mode"] == "local_readonly_subagent" and "git working tree" in detail
+    assert detail == "" and c["mode"] == "acting_subagent" and c["base_sha"] == ""
+    assert wr == str(nogit) and wm == "external_workspace"
     # A git working tree outside repo/data is accepted.
     proj = tmp_path / "gitproj"
     _init_repo(proj, {"x.txt": "y\n"})
@@ -929,9 +1075,11 @@ def test_external_workspace_rejects_stale_base_sha(tmp_path, monkeypatch):
     assert "base_sha is stale" in detail
 
 
-def test_external_workspace_acting_base_sha_blocks_moved_head_artifact(tmp_path, monkeypatch):
+def test_external_workspace_moved_head_does_not_fail_artifact(tmp_path, monkeypatch):
+    """Q11: shared-workspace HEAD movement must preserve capture against base_sha.
+    Integrity belongs to reverse-patch verification in tools/subagent_integration."""
     from supervisor.events import _resolve_subagent_constraint
-    from ouroboros.headless import ARTIFACT_STATUS_FAILED, write_workspace_patch_artifacts
+    from ouroboros.headless import write_workspace_patch_artifacts
 
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
     repo = tmp_path / "repo"
@@ -950,21 +1098,23 @@ def test_external_workspace_acting_base_sha_blocks_moved_head_artifact(tmp_path,
     )
     assert detail == "" and c["base_sha"]
 
-    (proj / "x.txt").write_text("committed by child\n", encoding="utf-8")
+    (proj / "x.txt").write_text("committed mid-flight\n", encoding="utf-8")
     _git(proj, "add", "x.txt")
-    _git(proj, "commit", "-q", "-m", "child commit")
+    _git(proj, "commit", "-q", "-m", "parent commit moves HEAD")
     artifacts, manifest = write_workspace_patch_artifacts(proj, tmp_path / "artifacts", task={"task_constraint": c})
 
     assert wr == str(proj) and wm == "external_workspace"
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
-    assert manifest["errors"][-1]["type"] == "workspace_head_changed"
-    assert manifest["errors"][-1]["expected_head"] == c["base_sha"]
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert manifest["status"] == "ready_with_changes"
+    assert manifest["errors"] == []
+    assert manifest["base_ref"] == c["base_sha"]  # committed delta captured vs admission base
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
-def test_external_workspace_unborn_base_sha_blocks_first_commit_artifact(tmp_path, monkeypatch):
+def test_external_workspace_unborn_first_commit_keeps_artifact(tmp_path, monkeypatch):
+    """Q11: a first commit in a shared unborn tree is captured against the empty
+    tree, not failed as a moved HEAD (the tripwire is self_worktree-only)."""
     from supervisor.events import _resolve_subagent_constraint
-    from ouroboros.headless import ARTIFACT_STATUS_FAILED, write_workspace_patch_artifacts
+    from ouroboros.headless import write_workspace_patch_artifacts
 
     monkeypatch.setenv("OUROBOROS_ALLOW_MUTATIVE_SUBAGENTS", "true")
     repo = tmp_path / "repo"
@@ -993,49 +1143,12 @@ def test_external_workspace_unborn_base_sha_blocks_first_commit_artifact(tmp_pat
     _git(proj, "commit", "-q", "-m", "first commit")
     artifacts, manifest = write_workspace_patch_artifacts(proj, tmp_path / "artifacts", task={"task_constraint": c})
 
-    assert manifest["status"] == ARTIFACT_STATUS_FAILED
-    assert manifest["errors"][-1]["type"] == "workspace_head_changed"
-    assert manifest["errors"][-1]["expected_head"] == "(unborn)"
-    assert not any(item["kind"] == "workspace_patch" for item in artifacts)
+    assert manifest["status"] == "ready_with_changes"
+    assert manifest["errors"] == []
+    assert any(item["kind"] == "workspace_patch" for item in artifacts)
 
 
-def test_mutative_toggle_self_change_detected():
-    from ouroboros.tools.registry import _detect_mutative_toggle_self_change
-    assert _detect_mutative_toggle_self_change('echo true >> data/settings.json # ouroboros_allow_mutative_subagents')
-    assert _detect_mutative_toggle_self_change('save_settings({"ouroboros_allow_mutative_subagents": "true"})')
-    # CLI settings-set path must also be caught.
-    assert _detect_mutative_toggle_self_change("ouroboros settings set ouroboros_allow_mutative_subagents true")
-    assert not _detect_mutative_toggle_self_change("echo hello world")
-
-
-def test_evolution_owner_control_self_change_detected():
-    from ouroboros.tools.registry import _detect_evolution_owner_control_self_change as d
-    assert d('echo true >> data/settings.json # ouroboros_post_task_evolution')
-    assert d('save_settings({"ouroboros_post_task_evolution": "true"})')
-    assert d("ouroboros settings set ouroboros_post_task_evolution true")
-    # The persistent objective is owner-only too (it steers every evolution campaign).
-    # Detector receives pre-lowered text (cmd_lower), mirror that here.
-    assert d('curl -x post 127.0.0.1:8765/api/settings -d \'{"ouroboros_evolution_persistent_objective":"x"}\'')
-    assert d('save_settings({"ouroboros_evolution_persistent_objective": "grab budget"})')
-    assert not d("echo hello world")
-    assert not d("ouroboros_post_task_evolution")  # key alone, no write target
-
-
-def test_post_task_evolution_js_guard():
-    from ouroboros.tools.browser import _blocks_post_task_evolution_js
-    assert _blocks_post_task_evolution_js(
-        "fetch('/api/settings', {method:'POST', body: JSON.stringify({OUROBOROS_POST_TASK_EVOLUTION: true})})"
-    )
-    assert _blocks_post_task_evolution_js('save_settings({"ouroboros_post_task_evolution": true})')
-    assert _blocks_post_task_evolution_js(
-        "fetch('/api/settings', {method:'POST', body: JSON.stringify({OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE: 'x'})})"
-    )
-    assert not _blocks_post_task_evolution_js("document.title")
-
-
-def test_pro_acting_shell_write_outside_surface_blocked(tmp_path):
-    # Even in pro mode, an acting child's write-like shell targeting outside its
-    # isolated surface is blocked (no pro workspace passthrough for acting subagents).
+def test_acting_structured_write_stays_inside_its_selected_surface(tmp_path):
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
     wt = tmp_path / "wt"; wt.mkdir()
@@ -1045,41 +1158,19 @@ def test_pro_acting_shell_write_outside_surface_blocked(tmp_path):
     )
     reg = ToolRegistry(repo_dir=repo, drive_root=drive)
     reg._ctx = ctx
-    block = reg._run_shell_safety_check({"cmd": "echo x > ../outside.txt"}, "pro")
-    assert block and "WORKSPACE_SHELL_BLOCKED" in block
+    block = reg.execute("write_file", {"path": "../outside.txt", "content": "x"})
+    assert "WRITE_FILE_ERROR" in block and "Path traversal is not allowed" in block, block
+    assert not (wt.parent / "outside.txt").exists()
 
 
-def test_subagent_shell_secret_markers_cover_relative_paths():
-    from ouroboros.tools.registry import _subagent_shell_targets_secret
-    assert _subagent_shell_targets_secret("cat .env")
-    assert _subagent_shell_targets_secret("cat .git/config")
-    assert _subagent_shell_targets_secret("cat .git/credentials")
-    assert _subagent_shell_targets_secret("cat ~/.ssh/id_rsa")
-    assert not _subagent_shell_targets_secret("cat src/main.py")
-
-
-def test_acting_read_schema_excludes_system_repo(tmp_path):
+def test_acting_read_schema_includes_parent_read_roots(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     schemas = {s["function"]["name"]: s["function"] for s in reg.schemas()}
     rf = schemas.get("read_file")
     if rf:
         root_enum = rf["parameters"]["properties"].get("root", {}).get("enum")
         if isinstance(root_enum, list):
-            assert "system_repo" not in root_enum  # matches acting _POLICY (no system_repo)
-
-
-def test_acting_subagent_cannot_shell_read_secrets(tmp_path):
-    repo = tmp_path / "repo"; repo.mkdir()
-    drive = tmp_path / "data"; drive.mkdir()
-    wt = tmp_path / "wt"; wt.mkdir()
-    ctx = ToolContext(
-        repo_dir=repo, drive_root=drive, workspace_root=str(wt), workspace_mode="self_worktree",
-        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(wt)),
-    )
-    reg = ToolRegistry(repo_dir=repo, drive_root=drive)
-    reg._ctx = ctx
-    block = reg._run_shell_safety_check({"cmd": "cat ~/Ouroboros/data/settings.json"}, "pro")
-    assert block and "SUBAGENT_SECRET_READ_BLOCKED" in block
+            assert {"system_repo", "user_files", "deliverables", "subagent_projects"} <= set(root_enum)
 
 
 def test_integrate_counts_as_reviewable_effect():
@@ -1088,15 +1179,21 @@ def test_integrate_counts_as_reviewable_effect():
     assert turn_has_reviewable_effects(trace) is True
 
 
-def test_readonly_subagent_cannot_spawn_acting_child(tmp_path):
+def test_readonly_subagent_cannot_spawn_acting_child(tmp_path, monkeypatch):
     from ouroboros.tools.control import _schedule_task
+    from tests._shared import configure_test_subagent
+
+    subagent_id = configure_test_subagent(monkeypatch)
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
     ctx = ToolContext(
         repo_dir=repo, drive_root=drive,
         task_constraint=TaskConstraint(mode="local_readonly_subagent"),
     )
-    out = _schedule_task(ctx, objective="do X", expected_output="Y", write_surface="self_worktree")
+    out = _schedule_task(
+        ctx, subagent_id=subagent_id, objective="do X", expected_output="Y",
+        write_surface="self_worktree",
+    )
     assert "MUTATIVE_SUBAGENTS_DISABLED" in out
 
 
@@ -1112,7 +1209,69 @@ def test_acting_schema_narrows_write_root_and_browser(tmp_path):
     if ba:
         action_enum = ba["parameters"]["properties"].get("action", {}).get("enum")
         if isinstance(action_enum, list):
-            assert "evaluate" not in action_enum
+            assert "evaluate" in action_enum
+
+
+def test_acting_browser_evaluate_runs_and_keeps_resource_targets(tmp_path, monkeypatch):
+    """Page code is not a request; actual target admission remains separate."""
+    from ouroboros.tools import browser as browser_mod
+
+    repo = tmp_path / "repo"; repo.mkdir()
+    drive = tmp_path / "data"; drive.mkdir()
+    worktree = tmp_path / "wt"; worktree.mkdir()
+    ctx = ToolContext(
+        repo_dir=repo,
+        drive_root=drive,
+        workspace_root=str(worktree),
+        workspace_mode="self_worktree",
+        task_constraint=TaskConstraint(
+            mode="acting_subagent", surface="self_worktree", write_root=str(worktree),
+        ),
+    )
+    calls = []
+
+    class FakePage:
+        # Use a literal public address so the URL guard does not perform a
+        # network DNS lookup (which can be unresolved or remapped in CI).
+        url = "https://1.1.1.1/"
+
+        def set_default_timeout(self, ms):
+            calls.append(("default_timeout", ms))
+
+        def evaluate(self, script):
+            calls.append(script)
+            return 2
+
+    page = FakePage()
+    monkeypatch.setattr(browser_mod, "_ensure_browser", lambda ctx, *_args, **_kwargs: (page, ctx.browser_state))
+    registry = ToolRegistry(repo_dir=repo, drive_root=drive)
+    registry.set_context(ctx)
+
+    assert registry.execute("browser_action", {"action": "evaluate", "value": "1 + 1"}) == "2"
+    # The requested expression executes (wrapped in the in-page Promise.race
+    # timeout bound — harness-health O5); the contract is the script REACHES
+    # the page and the result returns, not the exact wrapper bytes.
+    evaluated = [c for c in calls if isinstance(c, str)]
+    assert len(evaluated) == 1 and "1 + 1" in evaluated[0]
+
+    # A dev page can legitimately reuse an owner-shaped relative pathname.
+    ordinary = registry.execute(
+        "browser_action",
+        {
+            "action": "evaluate",
+            "value": "fetch('/api/owner/context-mode', {method:'POST', body: JSON.stringify({mode:'low'})})",
+        },
+    )
+    assert ordinary == "2"
+    from ouroboros.server_entrypoint import bound_service_socket
+    with bound_service_socket(drive, "main", "127.0.0.1", 0) as listener:
+        page.url = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        blocked = registry.execute("browser_action", {"action": "evaluate", "value": "1 + 1"})
+        assert "BROWSER_LOCAL_READONLY_BLOCKED" in blocked
+        ctx.task_constraint = None
+        allowed = registry.execute("browser_action", {"action": "evaluate",
+            "value": "fetch('/api/owner/context-mode', {method:'POST', body: JSON.stringify({mode:'low'})})"})
+        assert allowed == "2"
 
 
 def test_no_workspace_acting_integrate_blocked(tmp_path):
@@ -1128,8 +1287,8 @@ def test_no_workspace_acting_integrate_blocked(tmp_path):
     assert "ACTING_NO_WORKSPACE_BLOCKED" in reg.execute("integrate_subagent_patch", {"task_id": "x"})
 
 
-def test_acting_subagent_cannot_read_secrets(tmp_path):
-    # Acting children may write their surface but must NOT read owner secrets.
+def test_acting_subagent_reads_parent_visible_settings(tmp_path):
+    # Read reach follows the parent; the independent write surface is unchanged.
     from ouroboros.tools.core import _data_read
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
@@ -1139,24 +1298,23 @@ def test_acting_subagent_cannot_read_secrets(tmp_path):
         task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
     )
     out = _data_read(ctx, "settings.json")
-    assert "DATA_READ_BLOCKED" in out and "sk-secret-xyz" not in out
+    assert "sk-secret-xyz" in out and "DATA_READ_BLOCKED" not in out
 
 
 def test_acting_subagent_keeps_workspace_access(tmp_path):
-    # The strict-readonly resource block must NOT restrict acting children's worktree.
-    from ouroboros.tools.core import _local_readonly_resource_block
+    from ouroboros.tools.core import _read_file
     repo = tmp_path / "repo"; repo.mkdir()
     drive = tmp_path / "data"; drive.mkdir()
+    work = tmp_path / "wt"; work.mkdir()
+    (work / "f.txt").write_text("child source", encoding="utf-8")
     ctx = ToolContext(
-        repo_dir=repo, drive_root=drive,
-        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(tmp_path / "wt")),
+        repo_dir=repo, drive_root=drive, workspace_root=work, workspace_mode="external",
+        task_constraint=TaskConstraint(mode="acting_subagent", surface="self_worktree", write_root=str(work)),
     )
-    assert _local_readonly_resource_block(ctx, "active_workspace", tmp_path / "wt" / "f.txt", tmp_path / "wt", action="write") == ""
+    assert "child source" in _read_file(ctx, "f.txt")
 
 
-# --------------------------------------------------------------------------- #
 # 14. v6.21.0: genesis surface, compare helper, unified GC retention
-# --------------------------------------------------------------------------- #
 def test_genesis_is_a_valid_surface():
     assert "genesis" in VALID_WRITE_SURFACES
     c = normalize_task_constraint({"mode": "acting_subagent", "surface": "genesis"})
@@ -1347,9 +1505,7 @@ def test_gc_migration_all_defaults_collapse_to_unified_default(tmp_path, monkeyp
 
 
 def test_select_subagent_constraint_read_only_token_is_readonly():
-    """`write_surface='read_only'` resolves to the SAME read-only constraint as
-    omitting the surface — never an acting self_worktree — giving a read-only audit
-    child an explicit, provider-safe way to name its intent (P5 cancel-storm fix)."""
+    """Explicit read_only surfaces normalize like an omitted surface, never to acting."""
     from ouroboros.tools.control import _select_subagent_constraint
 
     baseline = _select_subagent_constraint("", "", False, [], "")  # omit = read-only
@@ -1359,3 +1515,20 @@ def test_select_subagent_constraint_read_only_token_is_readonly():
         constraint = _select_subagent_constraint(surface, "", False, [], "")
         assert isinstance(constraint, dict), surface
         assert constraint == baseline, surface
+
+
+def test_schedule_subagent_publishes_the_depth_request_and_the_handler_accepts_it():
+    """The canonical schedule schema must accept and describe the depth request."""
+    from ouroboros.tools import control
+
+    props = control.schedule_subagent_properties()
+    row = props["requested_depth"]
+    assert row["type"] == "integer"
+    assert row["default"] == 0
+    # Absolute from the root, and telemetry rather than a cap: both semantics
+    # have to be readable by the model that fills the field in.
+    assert "ABSOLUTELY FROM THE ROOT" in row["description"]
+    assert "never widens or narrows" in row["description"]
+    # The handler's closed keyword set DERIVES from the same schema.
+    assert "requested_depth" in control.schedule_subagent_param_names()
+    assert "requested_depth" not in control.HIDDEN_LEGACY_SCHEDULE_PARAMS

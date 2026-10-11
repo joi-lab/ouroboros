@@ -83,6 +83,62 @@ def test_payload_sidecar_dependencies_override_manifest(tmp_path):
     assert specs == [{"kind": "pip", "package": "ddgs", "bins": [], "mode": "auto"}]
 
 
+def test_stale_clawhub_state_provenance_is_ignored_for_non_clawhub_source(tmp_path):
+    """§2g п.3: the state-plane clawhub record survives bucket transitions, so
+    an external-bucket skill must never inherit its install specs."""
+    skill_dir = tmp_path / "skills" / "external" / "duckduckgo"
+    skill_dir.mkdir(parents=True)
+    stale = tmp_path / "state" / "skills" / "duckduckgo" / "clawhub.json"
+    stale.parent.mkdir(parents=True)
+    stale.write_text(
+        json.dumps(
+            {
+                "source": "clawhub",
+                "slug": "duckduckgo",
+                "install_specs": {"auto": [{"kind": "pip", "package": "stale-package"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = parse_skill_manifest_text(
+        "---\nname: duckduckgo\ntype: extension\nentry: plugin.py\n---\n"
+    )
+    loaded = SimpleNamespace(
+        name="duckduckgo", skill_dir=skill_dir, manifest=manifest, source="external"
+    )
+
+    specs = auto_install_specs_for_skill(tmp_path, loaded)
+
+    assert specs == []
+
+
+def test_clawhub_state_provenance_stays_authoritative_for_clawhub_source(tmp_path):
+    skill_dir = tmp_path / "skills" / "clawhub" / "duckduckgo"
+    skill_dir.mkdir(parents=True)
+    record = tmp_path / "state" / "skills" / "duckduckgo" / "clawhub.json"
+    record.parent.mkdir(parents=True)
+    record.write_text(
+        json.dumps(
+            {
+                "source": "clawhub",
+                "slug": "duckduckgo",
+                "install_specs": {"auto": [{"kind": "pip", "package": "ddgs"}]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest = parse_skill_manifest_text(
+        "---\nname: duckduckgo\ntype: extension\nentry: plugin.py\n---\n"
+    )
+    loaded = SimpleNamespace(
+        name="duckduckgo", skill_dir=skill_dir, manifest=manifest, source="clawhub"
+    )
+
+    specs = auto_install_specs_for_skill(tmp_path, loaded)
+
+    assert specs == [{"kind": "pip", "package": "ddgs"}]
+
+
 # ---------------------------------------------------------------------------
 # normalize_install_specs (pip extras/version ranges) + manifest installspecs
 # ---------------------------------------------------------------------------
@@ -134,6 +190,28 @@ def test_known_transport_secret_is_grantable_when_absent():
 
 def test_ouroboros_internal_settings_are_not_skill_grantable():
     assert "OUROBOROS_RUNTIME_MODE" not in requested_core_setting_keys(["OUROBOROS_RUNTIME_MODE"])
+
+
+def test_requested_core_setting_keys_reads_settings_only_when_keys_are_requested(monkeypatch):
+    """A skill that declares no env keys costs no settings read (the Skills
+    list calls this once per skill); a declared key still classifies against
+    the live settings."""
+    import ouroboros.config as config
+
+    reads: list[int] = []
+
+    def counted_load_settings():
+        reads.append(1)
+        return {}
+
+    monkeypatch.setattr(config, "load_settings", counted_load_settings)
+
+    assert requested_core_setting_keys([]) == []
+    assert requested_core_setting_keys(None) == []  # type: ignore[arg-type]
+    assert reads == []
+
+    assert requested_core_setting_keys(["TELEGRAM_BOT_TOKEN"]) == ["TELEGRAM_BOT_TOKEN"]
+    assert len(reads) == 1
 
 
 # ---------------------------------------------------------------------------

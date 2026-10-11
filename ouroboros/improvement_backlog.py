@@ -136,6 +136,15 @@ def _sanitize(value: Any, limit: int = 300) -> str:
     return text[:limit] + f" ⚠️ OMISSION NOTE: +{len(text) - limit} chars omitted"
 
 
+def _identity_is_known_partial(summary: Any, category: Any, source: Any) -> bool:
+    """Whether semantic comparison would see less than a canonical identity field."""
+    for value, limit in ((summary, 260), (category, 60), (source, 60)):
+        text = re.sub(r"\s+", " ", str(value or "")).strip()
+        if "⚠️ OMISSION NOTE:" in text or len(text) > limit:
+            return True
+    return False
+
+
 def _priority(value: Any) -> str:
     raw = str(value or "med").strip().lower()
     raw = {"medium": "med"}.get(raw, raw)
@@ -203,7 +212,9 @@ def _dedup_candidates(open_items: List[Dict[str, Any]], category: str, source: s
     return [
         {"id": str(it.get("id") or ""), "text": str(it.get("summary") or "")}
         for it in same[:_DEDUP_CANDIDATE_CAP]
-        if it.get("id") and it.get("summary")
+        if it.get("id") and it.get("summary") and not _identity_is_known_partial(
+            it.get("summary"), it.get("category"), it.get("source")
+        )
     ]
 
 
@@ -235,15 +246,24 @@ def _semantic_redirect_fingerprints(
 
     out: List[Dict[str, Any]] = []
     for item in items:
-        summary = _sanitize(item.get("summary", ""), 260)
+        raw_summary = str(item.get("summary") or "")
+        raw_category = str(item.get("category") or "process")
+        raw_source = str(item.get("source") or "task")
+        summary = _sanitize(raw_summary, 260)
         if not summary:
             out.append(item)
             continue
-        category = _sanitize(item.get("category", "process"), 60) or "process"
-        source = _sanitize(item.get("source", "task"), 60) or "task"
-        fingerprint = str(item.get("fingerprint") or _stable_fingerprint(summary, category, source))
+        category = _sanitize(raw_category, 60) or "process"
+        source = _sanitize(raw_source, 60) or "task"
+        fingerprint = str(
+            item.get("fingerprint")
+            or _stable_fingerprint(raw_summary, raw_category, raw_source)
+        )
         if fingerprint in existing_fps:
             out.append(item)  # exact hit — the locked pass bumps it, no LLM needed
+            continue
+        if _identity_is_known_partial(raw_summary, raw_category, raw_source):
+            out.append(item)
             continue
         candidates = _dedup_candidates(open_items, category, source)
         if not candidates:
@@ -292,12 +312,18 @@ def append_backlog_items(drive_root: Any, items: List[Dict[str, Any]]) -> int:
         changed = 0
 
         for item in items:
-            summary = _sanitize(item.get("summary", ""), 260)
+            raw_summary = str(item.get("summary") or "")
+            raw_category = str(item.get("category") or "process")
+            raw_source = str(item.get("source") or "task")
+            summary = _sanitize(raw_summary, 260)
             if not summary:
                 continue
-            category = _sanitize(item.get("category", "process"), 60) or "process"
-            source = _sanitize(item.get("source", "task"), 60) or "task"
-            fingerprint = str(item.get("fingerprint") or _stable_fingerprint(summary, category, source))
+            category = _sanitize(raw_category, 60) or "process"
+            source = _sanitize(raw_source, 60) or "task"
+            fingerprint = str(
+                item.get("fingerprint")
+                or _stable_fingerprint(raw_summary, raw_category, raw_source)
+            )
             if fingerprint in fp_to_key:
                 ex = by_key[fp_to_key[fingerprint]]
                 ex["count"] = str(_count_of(ex) + 1)
@@ -379,10 +405,13 @@ def merge_backlog_text(drive_root: Any, text: str) -> int:
         existing_fps = set()
     fresh: List[Dict[str, Any]] = []
     for it in items:
-        summary = _sanitize(it.get("summary", ""), 260)
-        category = _sanitize(it.get("category", "process"), 60) or "process"
-        source = _sanitize(it.get("source", "task"), 60) or "task"
-        fingerprint = str(it.get("fingerprint") or _stable_fingerprint(summary, category, source))
+        raw_summary = str(it.get("summary") or "")
+        raw_category = str(it.get("category") or "process")
+        raw_source = str(it.get("source") or "task")
+        fingerprint = str(
+            it.get("fingerprint")
+            or _stable_fingerprint(raw_summary, raw_category, raw_source)
+        )
         if fingerprint in existing_fps:
             continue
         fresh.append(it)
@@ -484,72 +513,88 @@ Current backlog items (JSON):
 Return ONLY a JSON array of the items to KEEP. Each object: {{"id","status","priority","kind","summary","category","source","task_id","requires_plan_review","count","created_at","fingerprint","evidence","context","proposed_next_step"}}. Preserve the id/fingerprint/created_at of every kept item. Do NOT invent new work. Do NOT drop a high-priority or high-count item just to hit the cap."""
 
 
+def _needs_verbatim_grooming(item: Dict[str, Any]) -> bool:
+    """True when a modelled overlay cannot preserve the stored block losslessly."""
+    if any(key not in {"id", "_raw", *_ENTRY_KEYS} for key in item):
+        return True
+    seen = set()
+    for line in str(item.get("_raw") or "").splitlines()[1:]:
+        if not line or not line.startswith("- ") or ": " not in line:
+            return True
+        key = line[2:].split(": ", 1)[0].strip()
+        if key not in _ENTRY_KEYS or key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
 def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     """D: best-effort LLM grooming of AUTO-generated (fingerprinted) backlog items —
-    merge near-dupes, mark resolved, re-rank, cap to <=cap. Hand-added
-    (no-fingerprint) items are passed through UNCHANGED (never dropped). Runs on a
-    size-triggered (NOT error-gated) schedule and re-serializes through the locked
-    parser-safe writer. Returns the number of items written, or 0 when nothing was
-    groomed. Fails closed (no write) on a bad/empty/oversized model reply OR if the
-    backlog changed concurrently during the lock-free LLM call (no lost updates)."""
+    merge near-dupes, mark resolved, re-rank, cap to <=cap. Hand-added items and
+    fingerprinted blocks with unmodelled bytes pass through UNCHANGED. Runs on a
+    size trigger and re-serializes through the locked parser-safe writer. Returns
+    the number written, or 0 on a bad/empty/oversized reply or concurrent change;
+    a failed model call raises to the caller (never the 0 of a pass not needed)."""
     import json as _json
 
     path = backlog_path(drive_root)
     if not path.exists():
         return 0
-    with _locked_text_file(path, mode="r", shared=True) as fh:
-        snapshot_text = fh.read()
+    try:
+        with _locked_text_file(path, mode="r", shared=True) as fh:
+            snapshot_text = fh.read()
+    except Exception:
+        return 0
     items = _parse_backlog_items(snapshot_text)
     if len(items) <= cap:
         return 0
-    # Only AUTO-generated (fingerprinted) items are groomable; hand-added items
-    # (no fingerprint) are user-curated and pass through untouched.
-    fp_items = [it for it in items if str(it.get("fingerprint") or "").strip()]
-    nofp_items = [it for it in items if not str(it.get("fingerprint") or "").strip()]
+    # Fingerprinted blocks with unknown fields/freeform bytes cannot be safely
+    # overlaid from the model schema, so preserve them like hand-authored items.
+    fingerprinted = [it for it in items if str(it.get("fingerprint") or "").strip()]
+    fp_items = [it for it in fingerprinted if not _needs_verbatim_grooming(it)]
+    passthrough_items = [
+        it for it in items
+        if not str(it.get("fingerprint") or "").strip() or _needs_verbatim_grooming(it)
+    ]
     if not fp_items:
         return 0
 
+    from ouroboros.config import get_light_model
+    from ouroboros.llm import LLMClient
+    from ouroboros.llm_observability import chat_observed
+
+    # One destructive grooming call sees every complete stored record,
+    # including evidence/context/custom fields and immutable manual items.
+    # If this full prompt cannot be served, the raised failure preserves the
+    # file; there is no smaller second call or prefix-authorized rewrite. The
+    # caller's stage classifies it: an interruption stops later paid post-work.
+    complete = [dict(it) for it in items]
+    prompt = _GROOM_PROMPT.format(cap=cap, items_json=_json.dumps(complete, ensure_ascii=False))
+    resp, usage = chat_observed(
+        LLMClient(),
+        drive_root=pathlib.Path(drive_root),
+        task_id="backlog_groom",
+        call_type="backlog_groom",
+        model_role="light",
+        messages=[{"role": "user", "content": prompt}],
+        model=get_light_model(),
+        reasoning_effort="low",
+        max_tokens=8192,
+    )
+    if usage:
+        try:
+            from supervisor.state import update_budget_from_usage
+
+            update_budget_from_usage(usage)
+        except Exception:
+            pass
+    content = (resp.get("content") or "").strip()
+    start, end = content.find("["), content.rfind("]")
     try:
-        from ouroboros.config import get_light_model
-        from ouroboros.llm import LLMClient
-        from ouroboros.llm_observability import chat_observed
-
-        compact = [
-            {
-                k: it.get(k, "")
-                for k in ("id", "status", "priority", "kind", "summary", "category",
-                          "source", "task_id", "requires_plan_review", "count",
-                          "created_at", "fingerprint")
-            }
-            for it in fp_items
-        ]
-        prompt = _GROOM_PROMPT.format(cap=cap, items_json=_json.dumps(compact, ensure_ascii=False))
-        client = LLMClient()
-        resp, usage = chat_observed(
-            client,
-            drive_root=pathlib.Path(drive_root),
-            task_id="backlog_groom",
-            call_type="backlog_groom",
-            messages=[{"role": "user", "content": prompt}],
-            model=get_light_model(),
-            reasoning_effort="low",
-            max_tokens=8192,
-        )
-        if usage:
-            try:
-                from supervisor.state import update_budget_from_usage
-
-                update_budget_from_usage(usage)
-            except Exception:
-                pass
-        content = (resp.get("content") or "").strip()
-        start, end = content.find("["), content.rfind("]")
-        if start < 0 or end <= start:
-            return 0
-        kept_raw = _json.loads(content[start:end + 1])
-        if not isinstance(kept_raw, list):
-            return 0
-    except Exception:
+        kept_raw = _json.loads(content[start:end + 1]) if 0 <= start < end else None
+    except ValueError:
+        return 0  # a bad reply, like an empty one: the file is preserved
+    if not isinstance(kept_raw, list):
         return 0
 
     # Anti-wipe: every kept item MUST map to an existing fingerprinted item — the
@@ -598,7 +643,7 @@ def groom_backlog(drive_root: Any, *, cap: int = _GROOM_CAP) -> int:
     if not kept_fp or len(kept_fp) > cap or len(kept_fp) < max(1, min(len(fp_items), cap) // 2):
         return 0
 
-    final = kept_fp + nofp_items  # hand-added items always survive, unchanged
+    final = kept_fp + passthrough_items  # unmodelled bytes always survive unchanged
     with _locked_text_file(path, mode="r+") as fh:
         # Abort if the backlog changed during the lock-free LLM call (a concurrent
         # append/close/recurrence) — never overwrite a concurrent update. The next

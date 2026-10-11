@@ -5,6 +5,17 @@ touching the transcript or the round-trip-sensitive metadata."""
 from ouroboros.llm import LLMClient
 
 
+def _recorder(sink):
+    """A progress sink shaped like the real emitter: ``_emit_round_progress``
+    names the round's voice with ``narration=True``, so a bare ``list.append``
+    would only prove the fake's signature."""
+    def emit(text, **meta):
+        sink.append(text)
+        emit.meta.append(meta)
+    emit.meta = []
+    return emit
+
+
 def test_flat_reasoning_string():
     assert LLMClient.extract_display_reasoning({"reasoning": "  thinking about X  "}) == "thinking about X"
 
@@ -15,6 +26,27 @@ def test_reasoning_details_readable_types():
         {"type": "reasoning.summary", "summary": "summary two"},
     ]}
     assert LLMClient.extract_display_reasoning(msg) == "step one\nsummary two"
+
+
+def test_minimax_split_reasoning_narrates_and_leaves_content_parseable():
+    """The direct MiniMax lane asks for ``reasoning_split``, so the thinking arrives as
+    ``reasoning_details`` and ``content`` is the bare verdict — narration reads the one,
+    the review parser reads the other, and no ``<think>`` block has to be stripped."""
+    from ouroboros.triad_review import empty_array_is_verified_clean
+
+    msg = {
+        "role": "assistant",
+        "content": "[]\nNO_FINDINGS",
+        "reasoning_details": [{
+            "type": "reasoning.text",
+            "id": "reasoning-text-1",
+            "format": "MiniMax-response-v1",
+            "index": 0,
+            "text": "checked the diff",
+        }],
+    }
+    assert LLMClient.extract_display_reasoning(msg) == "checked the diff"
+    assert empty_array_is_verified_clean(msg["content"]) is True
 
 
 def test_reasoning_details_encrypted_is_skipped():
@@ -71,3 +103,94 @@ def test_visible_round_text_string_and_list_never_reprs():
     assert _visible_round_text([{"thought": True, "text": "pondering"}, {"text": "the answer"}]) == "the answer"
     assert _visible_round_text(None) == ""
     assert _visible_round_text({"type": "text"}) == ""
+
+
+def test_round_progress_redacts_secret_shaped_model_text_before_trace_and_emit():
+    from ouroboros.loop import _emit_round_progress
+
+    candidate = "sk-" + "A1" * 20
+    visible = f"Removing leaked credential {candidate} before retry."
+    progress = []
+    trace = {"reasoning_notes": []}
+
+    emit = _recorder(progress)
+    _emit_round_progress(visible, {}, emit, trace)
+
+    assert candidate not in progress[0]
+    assert candidate not in trace["reasoning_notes"][0]
+    assert "***REDACTED***" in progress[0]
+    # The round's own text is the turn's voice, so the card may take its title
+    # from it; a redaction never demotes the line to a host note.
+    assert emit.meta == [{"narration": True}]
+
+
+def test_final_text_response_redacts_before_delivery_and_trace():
+    from ouroboros.loop import _handle_text_response
+
+    candidate = "sk-" + "B2" * 20
+    content = f"I removed {candidate} from the payload."
+    trace = {"reasoning_notes": []}
+
+    delivered, _, updated = _handle_text_response(content, trace, {})
+
+    assert candidate not in delivered
+    assert candidate not in updated["reasoning_notes"][0]
+    assert "***REDACTED***" in delivered
+
+
+def test_round_and_final_prose_redact_all_observability_secret_classes():
+    from ouroboros.loop import _emit_round_progress, _handle_text_response
+
+    candidates = [
+        "ghp_" + "D4" * 20,
+        "Bearer " + "E5" * 16,
+        "eyJ" + "F6" * 8 + "." + "G7" * 8 + "." + "H8" * 8,
+        "https://example.test/?access_token=" + "I9" * 16,
+        "api_key = " + "J0" * 16,
+    ]
+    for candidate in candidates:
+        progress = []
+        trace = {"reasoning_notes": []}
+        content = f"Credential evidence: {candidate}"
+
+        _emit_round_progress(content, {}, _recorder(progress), trace)
+        delivered, _, final_trace = _handle_text_response(content, {"reasoning_notes": []}, {})
+
+        assert candidate not in progress[0]
+        assert candidate not in trace["reasoning_notes"][0]
+        assert candidate not in delivered
+        assert candidate not in final_trace["reasoning_notes"][0]
+
+    ordinary = "Edited tool.py and completed a fresh review."
+    progress = []
+    trace = {"reasoning_notes": []}
+    _emit_round_progress(ordinary, {}, _recorder(progress), trace)
+    delivered, _, final_trace = _handle_text_response(ordinary, {"reasoning_notes": []}, {})
+    assert progress == [ordinary]
+    assert trace["reasoning_notes"] == [ordinary]
+    assert delivered == ordinary
+    assert final_trace["reasoning_notes"] == [ordinary]
+
+
+def test_skill_review_projection_redacts_reviewer_secret_prose():
+    from ouroboros.skill_review import SkillReviewOutcome, render_skill_review_block
+
+    candidate = "sk-" + "C3" * 20
+    outcome = SkillReviewOutcome(
+        skill_name="redacted-review",
+        status="blockers",
+        content_hash="a" * 64,
+        reviewer_models=["fake/reviewer"],
+        findings=[{
+            "item": "secret_handling",
+            "verdict": "FAIL",
+            "severity": "critical",
+            "reason": f"Remove {candidate} from the payload.",
+            "model": "fake/reviewer",
+        }],
+    )
+
+    markdown = render_skill_review_block(outcome)
+
+    assert candidate not in markdown
+    assert "***REDACTED***" in markdown

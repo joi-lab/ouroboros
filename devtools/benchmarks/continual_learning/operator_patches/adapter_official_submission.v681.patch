@@ -620,7 +620,7 @@ index 0000000..af9165e
 +            OPENROUTER_API_KEY=os.environ.get("OPENROUTER_API_KEY", ""),
 +            OUROBOROS_RUNTIME_MODE="advanced", OUROBOROS_PRE_PUSH_TESTS="0",
 +            OUROBOROS_POST_TASK_EVOLUTION="true" if self.evolution else "false",
-+            OUROBOROS_MODEL=m, OUROBOROS_MODEL_HEAVY=m, OUROBOROS_MODEL_LIGHT=m, OUROBOROS_MODEL_CODE=m,
++            OUROBOROS_MODEL=m, OUROBOROS_MODEL_LIGHT=m,
 +            OUROBOROS_MODEL_CONSCIOUSNESS=m, OUROBOROS_MODEL_FALLBACK=m, OUROBOROS_MODEL_FALLBACKS=m,
 +            OUROBOROS_MODEL_DEEP_SELF_REVIEW=m, OUROBOROS_REVIEW_MODELS=",".join([m, m, m]),
 +            OUROBOROS_SCOPE_REVIEW_MODEL=m, OUROBOROS_SCOPE_REVIEW_MODELS=m, OUROBOROS_WEBSEARCH_MODEL=m,
@@ -679,7 +679,7 @@ index 0000000..af9165e
 +                   "OUROBOROS_EFFORT_REVIEW", "OUROBOROS_EFFORT_SCOPE_REVIEW",
 +                   "OUROBOROS_SAFETY_MODE", "OUROBOROS_MAX_SUBAGENT_DEPTH",
 +                   "OUROBOROS_MAX_WORKERS", "OUROBOROS_CONTEXT_MODE",
-+                   "OUROBOROS_CONTEXT_MODE_AUTO_LOW"):
++                   "OUROBOROS_CONTEXT_MODE_AUTO_LOW", "OUROBOROS_SUBAGENTS"):
 +            _v = os.environ.get(_k)
 +            if _v:
 +                ov[_k] = _v
@@ -993,7 +993,7 @@ new file mode 100644
 index 0000000..64f9ff1
 --- /dev/null
 +++ b/src/systems/ouroboros/_launcher.py
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,272 @@
 +"""Ouroboros-side glue for the CL-Bench bridge — reuses the devtools `IsolatedServer`.
 +
 +`OuroborosEngine` runs the REAL Ouroboros agent in full isolation (throwaway sub-clone + isolated data
@@ -1170,13 +1170,16 @@ index 0000000..64f9ff1
 +            # absorbing. We measure evolution lift, not ship code — so skip the gate. (off-switch: tools/git.py)
 +            OUROBOROS_PRE_PUSH_TESTS="0",
 +            OUROBOROS_POST_TASK_EVOLUTION="true" if self.evolution else "false",
-+            OUROBOROS_MODEL=m, OUROBOROS_MODEL_HEAVY=m, OUROBOROS_MODEL_LIGHT=m,
-+            OUROBOROS_MODEL_CODE=m, OUROBOROS_MODEL_CONSCIOUSNESS=m,
++            OUROBOROS_MODEL=m, OUROBOROS_MODEL_LIGHT=m,
++            OUROBOROS_MODEL_CONSCIOUSNESS=m,
 +            OUROBOROS_MODEL_FALLBACK=m, OUROBOROS_MODEL_FALLBACKS=m,
 +            OUROBOROS_MODEL_DEEP_SELF_REVIEW=m,
 +            OUROBOROS_REVIEW_MODELS=",".join([m, m, m]),
 +            OUROBOROS_SCOPE_REVIEW_MODEL=m, OUROBOROS_SCOPE_REVIEW_MODELS=m,
 +            OUROBOROS_WEBSEARCH_MODEL=m, CLAUDE_CODE_MODEL=m,
++            # Canonical benchmark actor bytes are authored by run_clb.py through Phase-1A;
++            # this external adapter only transports them into isolated settings.
++            OUROBOROS_SUBAGENTS=os.environ.get("OUROBOROS_SUBAGENTS", ""),
 +        )
 +        if self.evolution:
 +            overrides["OUROBOROS_POST_TASK_EVOLUTION_CADENCE"] = self.cadence  # "llm"=native self-paced; absorb at boundaries

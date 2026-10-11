@@ -1,0 +1,4 @@
+169
+The review-job paragraph states what the UI projection shows for a running job whose
+process is gone or whose heartbeat is stale (interrupted, read-only, persisted by its
+owners) and that the Skills list read heals and syncs nothing.

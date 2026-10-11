@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 from .telegram_api import (
+    TELEGRAM_RETRY_INITIAL_SEC,
     TelegramClient,
     TelegramRequestRejected,
     TelegramTransportError,
+    next_telegram_retry_delay,
 )
 from .telegram_state import (
     _data_dir,
@@ -18,6 +21,13 @@ from .telegram_state import (
     _read_json_file,
     _state_file,
 )
+from ..scripts.telegram_settings import telegram_proxy
+from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID, is_project_chat_id
+from ouroboros import i18n_memory as _memory
+from ouroboros.project_dialogue import OUTCOME_PHASE_HEADLINE
+
+from . import telegram_i18n
+from .telegram_i18n import Index
 
 
 def _notify_enabled(settings: Dict[str, Any], key: str) -> bool:
@@ -44,50 +54,91 @@ def _pinned_chat_id(settings: Dict[str, Any]) -> int:
         return 0
 
 
-async def _push_notification(api, chat_id: int, text: str) -> bool:
+async def _push_notification(
+    api, chat_id: int, text: str, *, trust_env: bool = False,
+) -> Tuple[str, Optional[BaseException]]:
+    """Send one notification; never raises a typed Telegram failure.
+
+    Returns ``("sent", None)`` on delivery, ``("transient", exc)`` when the
+    failure is worth retrying next cycle, and ``("skipped", exc)`` on a
+    permanent rejection: the notification is consumed so one dead send cannot
+    replay forever and exhaust the supervised-restart budget.
+
+    Transient failures log at debug only: the notifier loop's degraded/
+    recovered transition warning (which carries the exception) is the one
+    owner-visible line per episode.
+    """
     protected = api.get_settings(["TELEGRAM_BOT_TOKEN"])
-    client = TelegramClient(protected.get("TELEGRAM_BOT_TOKEN", ""))
+    client = TelegramClient(
+        protected.get("TELEGRAM_BOT_TOKEN", ""), trust_env=trust_env,
+        proxy=telegram_proxy(Path(api.get_state_dir())),
+    )
     try:
         await client.send_message(int(chat_id), text, parse_mode="")
-        return True
+        return "sent", None
     except TelegramTransportError as exc:
-        api.log("error", f"Telegram notify failed: {exc}")
-        return False
+        api.log("debug", f"Telegram notify failed: {exc}")
+        return "transient", exc
     except TelegramRequestRejected as exc:
-        if not exc.transient:
-            raise
-        api.log("error", f"Telegram notify failed: {exc}")
-        return False
+        if exc.transient:
+            api.log("debug", f"Telegram notify failed: {exc}")
+            return "transient", exc
+        api.log("error", f"Telegram notification permanently rejected; skipping it: {exc}")
+        return "skipped", exc
 
 
 _BUDGET_THRESHOLDS = (100, 90, 80)  # checked high → low
 
 
-async def _check_budget_notify(api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str) -> None:
+async def _check_budget_notify(
+    api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str,
+    *, trust_env: bool = False,
+) -> Tuple[Optional[BaseException], bool]:
+    """Returns (transient send failure if any, whether a send was delivered)."""
     if not _notify_enabled(settings, "TELEGRAM_NOTIFY_BUDGET"):
-        return
+        return None, False
     snapshot = await _load_runtime_state(api)
     try:
         spent = float(snapshot["spent_usd"])
         total = float(snapshot["budget_limit"])
         pct = float(snapshot["budget_pct"])
     except (KeyError, TypeError, ValueError):
-        return
+        return None, False
     if total <= 0:
-        return
+        return None, False
     crossed = 0
     for thr in _BUDGET_THRESHOLDS:
         if pct >= thr:
             crossed = thr
             break
     notified = int(state.get("budget_threshold") or 0)
+    delivered = False
     if crossed > notified:
-        msg = (f"⚠️ Бюджет: {pct:.0f}% (${spent:.2f} / ${total:.2f})" if lang == "ru"
-               else f"⚠️ Budget: {pct:.0f}% (${spent:.2f} / ${total:.2f})")
-        if await _push_notification(api, chat_id, msg):
-            state["budget_threshold"] = crossed
+        msg = _NOTIFY[lang].format("budget", pct=f"{pct:.0f}", spent=f"{spent:.2f}", total=f"{total:.2f}")
+        outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
+        if outcome == "transient":
+            return exc, False
+        # "sent" delivered it; "skipped" consumes it (permanent rejection) so
+        # the same send does not replay every cycle forever.
+        delivered = outcome == "sent"
+        state["budget_threshold"] = crossed
     elif crossed < notified:
         state["budget_threshold"] = crossed  # budget raised / spend reset → re-arm
+    return None, delivered
+
+
+def _axis_status(axes: Any, axis: str) -> str:
+    """One `outcome_axes` axis status, tolerating the legacy bare-string shape.
+
+    Canonical rows carry ``{"lifecycle": {"status": "completed"}}``; pre-axes
+    rows carry ``{"lifecycle": "completed"}``. Stringifying the axis itself is
+    what once pushed ``· {'status': 'completed'}`` with a permanent warning
+    icon, so read the status and never the container.
+    """
+    value = axes.get(axis) if isinstance(axes, dict) else None
+    if isinstance(value, dict):
+        value = value.get("status")
+    return str(value or "")
 
 
 def _summary_ids_in_tail(api, limit: int = 200) -> list:
@@ -96,26 +147,93 @@ def _summary_ids_in_tail(api, limit: int = 200) -> list:
         max_entries=limit,
         tail_bytes=256 * 1024,
     )
-    ids = []
+    summaries = {}
     for e in rows:
-        if str(e.get("type") or "") == "task_summary" and e.get("task_id"):
-            ids.append((str(e.get("task_id")), e))
-    return ids
+        if (str(e.get("type") or "") == "task_summary" and e.get("task_id")
+                and e.get("outcome_final") is not False
+                and str(e.get("outcome_phase") or "") != "working"):
+            summaries[str(e.get("task_id"))] = e
+    return list(summaries.items())
 
 
-async def _check_tasks_notify(api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str) -> None:
-    if not _notify_enabled(settings, "TELEGRAM_NOTIFY_TASKS"):
-        return
+# The host's task-phase vocabulary is the SOURCE here, not a copy: this transport
+# lowercases the same words the task card prints, so a new phase or a reworded status
+# can never mean one thing on the card and another on a phone. ``working`` is excluded
+# on purpose — a pre-finalization row is not a finish, and its absence is what makes the
+# legacy axes fallback below fire.
+_PHASE_WORDS = {phase: word.lower() for phase, word in OUTCOME_PHASE_HEADLINE.items() if phase != "working"}
+
+
+def _phase_word(phase: str, lang: str) -> str:
+    """The lowercase status word in the install language: the host's own headline table
+    read by code through the translation memory (the same entry the web card paints)."""
+    source = OUTCOME_PHASE_HEADLINE.get(phase) or OUTCOME_PHASE_HEADLINE["done"]
+    if telegram_i18n.english(lang):
+        return source.lower()
+    found = _memory.tr(f"{_memory.CODE_PREFIX}task.headline.{phase}", lang, source, drive_root=telegram_i18n.drive_root())
+    return str(found or source).lower()
+
+
+# The two push lines this transport composes itself; everything else it relays is the
+# host's own sentence, sent as the host wrote it.
+_NOTIFY = Index("notify", {
+    "task_finished": "{icon} Task {id} {word}{tail}",
+    "budget": "⚠️ Budget: {pct}% (${spent} / ${total})",
+}, "push notifications about finished tasks and the budget")
+_PHASE_ICONS = {"done": "✅", "warn": "⚠️", "error": "❌", "cancelled": "🚫"}
+
+# A finish that is not clean always reaches the owner's phone. Telegram's text bridge is
+# the one owner surface with no task card, so the typed phase and its reason ARE the
+# honesty floor there (owner decision Q8). The opt-in toggle only ADDS the clean
+# finishes; it is not a switch for this floor, and it is not a second producer — one
+# lane and one ledger, so a non-clean task is announced once, never twice.
+_NON_CLEAN_PHASES = frozenset({"warn", "error", "cancelled"})
+# Only a ROOT outcome, and only in a room the owner actually talks in. ``summary_kind``
+# is the typed root fact the host stamps, without which a twelve-child swarm pushes
+# twelve lines; the chat id keeps the hidden partition (Skill Review and headless
+# admissions, HIDDEN_CHAT_ID = 0) and synthetic A2A rooms off the phone. A legacy row
+# that predates either field never triggers this floor.
+_ROOT_SUMMARY_KIND = "terminal_root_projection"
+
+
+def _announce_summary(row: Dict[str, Any], *, notify_all: bool) -> bool:
+    """Does this settled task-summary row deserve a push?"""
+    if notify_all:
+        return True
+    if (str(row.get("summary_kind") or "") != _ROOT_SUMMARY_KIND
+            or str(row.get("outcome_phase") or "") not in _NON_CLEAN_PHASES):
+        return False
+    try:
+        chat_id = int(row.get("chat_id") or 0)
+    except (TypeError, ValueError):
+        return False
+    return chat_id == WEB_UI_CHAT_ID or is_project_chat_id(chat_id)
+
+
+async def _check_tasks_notify(
+    api, settings: Dict[str, Any], chat_id: int, state: Dict[str, Any], lang: str,
+    *, trust_env: bool = False,
+) -> Tuple[Optional[BaseException], bool]:
+    """Returns (last transient send failure if any, whether a send was delivered)."""
+    notify_all = _notify_enabled(settings, "TELEGRAM_NOTIFY_TASKS")
     summaries = _summary_ids_in_tail(api)
     if "notified_task_ids" not in state:
         # First run with task notifications on → treat the existing backlog as seen
         # so enabling the toggle doesn't blast a notification for every old task.
         state["notified_task_ids"] = [tid for tid, _ in summaries][-300:]
-        return
+        return None, False
+    transient: Optional[BaseException] = None
+    delivered = False
     seen = list(state.get("notified_task_ids") or [])
     seen_set = set(seen)
     for tid, e in summaries:
         if tid in seen_set:
+            continue
+        if not _announce_summary(e, notify_all=notify_all):
+            # Not worth a push, but it IS seen: a later toggle flip must not blast a
+            # backlog this lane was never going to announce.
+            seen.append(tid)
+            seen_set.add(tid)
             continue
         parts = []
         rounds = e.get("rounds")
@@ -128,34 +246,101 @@ async def _check_tasks_notify(api, settings: Dict[str, Any], chat_id: int, state
         except (TypeError, ValueError):
             pass
         oa = e.get("outcome_axes")
-        outcome = str(oa.get("lifecycle") or "") if isinstance(oa, dict) else ""
-        if outcome and outcome not in ("completed", "done"):
-            parts.append(outcome)
+        outcome = _axis_status(oa, "lifecycle")
+        degraded = _axis_status(oa, "execution").lower() in ("degraded", "best_effort")
+        # The host stamps one status phase on its own task rows; consume it
+        # instead of re-deriving a third status ladder from the axes: the phase
+        # picks the icon AND the completion word (#538), so a failed or
+        # cancelled task is never announced as "done". Legacy rows and
+        # pre-finalization "working" rows keep the axes rule.
+        phase = str(e.get("outcome_phase") or "")
+        if phase in _PHASE_WORDS:
+            icon, word = _PHASE_ICONS[phase], _phase_word(phase, lang)
+        else:
+            healthy = outcome in ("", "completed", "done") and not degraded
+            icon, word = ("✅" if healthy else "⚠️"), _phase_word("done", lang)
+            if outcome and outcome not in ("completed", "done"):
+                parts.append(outcome)
         tail = (" · " + " · ".join(parts)) if parts else ""
-        icon = "✅" if outcome in ("", "completed", "done") else "⚠️"
-        msg = (f"{icon} Задача {tid[:8]} готова{tail}" if lang == "ru" else f"{icon} Task {tid[:8]} done{tail}")
-        if await _push_notification(api, chat_id, msg):
-            seen.append(tid)
-            seen_set.add(tid)
+        msg = _NOTIFY[lang].format("task_finished", icon=icon, id=tid[:8], word=word, tail=tail)
+        # The card's reason line, exactly as the host composed it for this task's
+        # durable row — never a second sentence written here, and never a second
+        # rendering of the cause table. Relayed in English: the flattened sentence
+        # carries task-control words that stay English by decision and sometimes the
+        # author's own rationale, and a transport has no typed clauses to translate around.
+        reason = str(e.get("reason_detail") or "").strip()
+        if reason:
+            msg += "\n" + reason
+        send_outcome, exc = await _push_notification(api, chat_id, msg, trust_env=trust_env)
+        if send_outcome == "transient":
+            # Stop the batch on the first transient failure: every further
+            # send would burn its full transport timeout against the same dead
+            # network (a long backlog could stall one cycle for minutes before
+            # the backoff even starts). State is already preserved — the
+            # unsent summaries stay unseen and retry next cycle.
+            transient = exc
+            break
+        # "sent" or permanent "skipped": either way this notification is done.
+        delivered = delivered or send_outcome == "sent"
+        seen.append(tid)
+        seen_set.add(tid)
     state["notified_task_ids"] = seen[-300:]
+    return transient, delivered
 
 
-def _make_notifier(api):
+def _notifier_language() -> str:
+    """The install's interface language for proactive pushes — the same reader the poller and the
+    outbound mirror use, never the bridge's retired private setting."""
+    return telegram_i18n.language()
+
+
+def _make_notifier(api, *, trust_env: bool = False):
     """Periodic, file-based proactive notifications (task done / budget threshold).
     Read-only over durable files; sends only when a pinned chat + toggle are set."""
     async def notifier() -> None:
+        retry_delay = TELEGRAM_RETRY_INITIAL_SEC
+        degraded_cause = ""
         while True:
             settings = _load_settings(api)
             chat_id = _pinned_chat_id(settings)
-            want = _notify_enabled(settings, "TELEGRAM_NOTIFY_TASKS") or _notify_enabled(
-                settings,
-                "TELEGRAM_NOTIFY_BUDGET",
-            )
-            if chat_id and want:
-                lang = str(settings.get("TELEGRAM_LANGUAGE") or "en").strip().lower()
+            transient: Optional[BaseException] = None
+            delivered = False
+            # The tasks lane is no longer opt-in (it carries the non-clean floor), and
+            # the budget lane self-gates on its own toggle, so a pinned owner chat is
+            # the only precondition left.
+            if chat_id:
+                lang = _notifier_language()
                 state = _load_notif_state(api)
-                await _check_budget_notify(api, settings, chat_id, state, lang)
-                await _check_tasks_notify(api, settings, chat_id, state, lang)
+                transient, delivered = await _check_budget_notify(
+                    api, settings, chat_id, state, lang, trust_env=trust_env,
+                )
+                if transient is None:
+                    # A transient budget-send failure means the transport is
+                    # down right now: skip the tasks batch entirely instead of
+                    # burning more transport timeouts, and let the backoff
+                    # below pace the retry.
+                    transient, tasks_delivered = await _check_tasks_notify(
+                        api, settings, chat_id, state, lang, trust_env=trust_env,
+                    )
+                    delivered = delivered or tasks_delivered
                 _save_notif_state(api, state)
+            if transient is not None:
+                # Transition logging: one warning entering degraded, one info
+                # on recovery; per-attempt failures stay at debug while the
+                # monotone backoff paces retries.
+                if not degraded_cause:
+                    degraded_cause = type(transient).__name__
+                    api.log("warning", f"Telegram notifier degraded ({degraded_cause}): {transient}")
+                await asyncio.sleep(retry_delay)
+                retry_delay = next_telegram_retry_delay(retry_delay)
+                continue
+            if degraded_cause:
+                # Declare recovery only on an actual delivery; when the pending
+                # work merely evaporated (threshold re-armed, task id rolled out
+                # of the tail, toggle flipped) end the episode silently.
+                if delivered:
+                    api.log("info", f"Telegram notifier recovered after {degraded_cause}.")
+                degraded_cause = ""
+            retry_delay = TELEGRAM_RETRY_INITIAL_SEC
             await asyncio.sleep(30)
     return notifier

@@ -1,16 +1,36 @@
+import json
+import os
+import threading
 from types import SimpleNamespace
 
+import pytest
 
-def test_lifespan_shutdown_kills_executor_foreground_before_services():
-    import inspect
+
+def _stop_restart_watcher(server):
+    """Ordinary server return retires its watcher without inventing a restart."""
+    for thread in threading.enumerate():
+        if thread.name.endswith("(_check_restart)"):
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "restart watcher did not stop"
+    server._restart_requested.clear()
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_lifespan_shutdown_kills_executor_foreground_before_services(monkeypatch, tmp_path, wait):
     import server
 
-    source = inspect.getsource(server.lifespan)
-
-    shell_idx = source.index("kill_all_tracked_subprocesses()")
-    foreground_idx = source.index("kill_all_foreground(lifespan_drive_root)")
-    service_idx = source.index("kill_all_services(lifespan_drive_root)")
-    assert shell_idx < foreground_idx < service_idx
+    order = []
+    def shell_failure():
+        order.append("shell")
+        raise OSError("shell custody unavailable")
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", shell_failure)
+    monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground",
+                        lambda root, **kw: order.append(("foreground", root, kw)))
+    monkeypatch.setattr("ouroboros.tools.services.kill_all_services",
+                        lambda root, **kw: order.append(("services", root, kw)))
+    server._stop_owned_local_processes(tmp_path, wait=wait)
+    assert order == ["shell", ("foreground", tmp_path, {"wait": wait}),
+                     ("services", tmp_path, {"wait": wait})]
 
 
 def test_shutdown_task_cleanup_args_never_reports_crash_storm():
@@ -30,7 +50,379 @@ def test_shutdown_task_cleanup_args_never_reports_crash_storm():
     assert "interrupted" in reason_signal.lower()
 
 
-def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch):
+def test_managed_update_restart_preserves_pending_queue(monkeypatch, tmp_path):
+    import server
+
+    worker_calls = []
+    state = {"owner_chat_id": 0}
+    ctx = SimpleNamespace(
+        load_state=lambda: dict(state),
+        save_state=lambda updated: state.update(updated),
+        safe_restart=lambda **_kwargs: (True, "ok"),
+        kill_workers=lambda **kwargs: worker_calls.append(kwargs),
+        persist_queue_snapshot=lambda **_kwargs: None,
+        # The evolution restart-receipt check reads pending_restart_verify.json
+        # from ctx.DRIVE_ROOT before any restart proceeds.
+        DRIVE_ROOT=tmp_path,
+        REPO_DIR=tmp_path,
+    )
+    monkeypatch.setattr(
+        server,
+        "_managed_update_pending_kwargs",
+        lambda: {"preserve_pending": True},
+    )
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: None)
+
+    server._perform_supervisor_restart(ctx)
+
+    assert worker_calls[0]["preserve_pending"] is True
+    assert worker_calls[0]["terminal_status"] == "cancelled"
+
+
+def test_pre_transaction_update_quiesce_also_preserves_pending(monkeypatch):
+    import server
+    import supervisor.update_merge as update_merge
+    import supervisor.workers as workers
+
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: {})
+    monkeypatch.setattr(workers, "repo_writer_admission_closed", lambda: "managed_update:smart")
+    monkeypatch.setattr(
+        workers,
+        "worker_pool_admission_state",
+        lambda: {"disabled_reason": "managed_update"},
+    )
+
+    assert server._managed_update_pending_kwargs() == {"preserve_pending": True}
+
+
+def test_managed_update_quiesce_passes_owner_wait_handoffs(monkeypatch, tmp_path):
+    import ouroboros.gateway.control as control
+    import ouroboros.owner_wait as owner_wait
+    import ouroboros.delegate_recovery as delegate_recovery
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    captured = {}
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(owner_wait, "prepare_owner_wait_handoffs", lambda *_args: {"waiting"})
+    monkeypatch.setattr(
+        delegate_recovery,
+        "prepare_planned_restart_handoffs",
+        lambda *_args, **kwargs: set(kwargs["additional_task_ids"]),
+    )
+
+    def fake_kill(**kwargs):
+        captured.update(kwargs)
+        return ["worker:still-running"]
+
+    monkeypatch.setattr(workers, "kill_workers_for_update", fake_kill)
+
+    blockers = control._quiesce_repo_writers("smart")
+
+    assert blockers == ["worker:still-running"]
+    assert captured["preserve_running_task_ids"] == {"waiting"}
+
+
+def test_manual_rollback_quiesce_keeps_cancellation_semantics(monkeypatch, tmp_path):
+    """A rollback returns the tree to an OLDER runtime, so no owner wait may be
+    handed to it: the pool stop keeps its ordinary interrupt/cancel semantics."""
+    import ouroboros.gateway.control as control
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.owner_wait as owner_wait
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    captured = {}
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(
+        owner_wait, "prepare_owner_wait_handoffs",
+        lambda *_args: pytest.fail("a rollback must not park an owner wait"),
+    )
+    monkeypatch.setattr(
+        delegate_recovery, "prepare_planned_restart_handoffs",
+        lambda *_args, **_kwargs: pytest.fail("a rollback must not prepare a handoff"),
+    )
+    monkeypatch.setattr(workers, "kill_workers_for_update", lambda **kwargs: captured.update(kwargs) or [])
+    monkeypatch.setattr(
+        "ouroboros.tools.services.kill_all_services", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "ouroboros.process_custody.quiesce_custodied_services", lambda *_a: (True, []))
+
+    assert control._quiesce_repo_writers("manual_rollback") == []
+    assert captured["preserve_running_task_ids"] == set()
+    assert captured["terminal_status"] == "interrupted"
+
+
+def test_failed_owner_wait_handoff_blocks_the_update_instead_of_killing_the_pool(
+    monkeypatch, tmp_path,
+):
+    """Custody preparation is the gate: if it cannot park the wait, the pool is
+    never stopped and repo-writer admission re-opens."""
+    import ouroboros.gateway.control as control
+    import ouroboros.owner_wait as owner_wait
+    import supervisor.git_ops as git_ops
+    import supervisor.workers as workers
+
+    reopened = []
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda _reason: None)
+    monkeypatch.setattr(workers, "drain_repo_writers", lambda: [])
+    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda: reopened.append(True))
+
+    def refuse(*_args):
+        raise OSError("owner wait source bytes are unreadable")
+
+    monkeypatch.setattr(owner_wait, "prepare_owner_wait_handoffs", refuse)
+    monkeypatch.setattr(
+        workers, "kill_workers_for_update",
+        lambda **_kwargs: pytest.fail("the pool must not stop after a failed handoff"),
+    )
+
+    blockers = control._quiesce_repo_writers("smart")
+
+    assert blockers == ["owner_wait_handoff:OSError: owner wait source bytes are unreadable"]
+    assert reopened == [True]
+
+
+def test_managed_update_restart_arms_prepared_transaction_for_direct_reexec(
+    monkeypatch, tmp_path,
+):
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.gateway.control as control
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+    import server
+
+    prepared = {
+        "transaction_id": "tx-owner-wait",
+        "status": "prepared",
+        "supervisor_pid": os.getpid(),
+    }
+    tx_dir = tmp_path / "state" / "delegate_recovery_transactions"
+    tx_dir.mkdir(parents=True)
+    (tx_dir / "active.json").write_text(
+        '{"transaction_id":"tx-owner-wait"}', encoding="utf-8",
+    )
+    (tx_dir / "tx-owner-wait.json").write_text(
+        json.dumps(prepared), encoding="utf-8",
+    )
+    monkeypatch.setattr(git_ops, "DRIVE_ROOT", tmp_path)
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server, "_restart_current_process_impl", lambda *_a, **_kw: None)
+    monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda: ("valid", {"phase": "pending_boot_smoke"}))
+    monkeypatch.delenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, raising=False)
+
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {
+        "request_restart": lambda _self, owner=False: None,
+    })()})()})()
+    response = control._restart_response(request, strategy="auto_merge", plan={})
+
+    assert response.status_code == 200
+    assert delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV not in os.environ
+    server._restart_current_process("127.0.0.1", 8765)
+    assert os.environ[delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV] == "tx-owner-wait"
+
+
+def test_failed_managed_update_restart_disarms_transaction_token(monkeypatch, tmp_path):
+    import ouroboros.delegate_recovery as delegate_recovery
+    import ouroboros.gateway.control as control
+
+    monkeypatch.setenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, "stale-tx")
+    request = type("Request", (), {"app": type("App", (), {"state": type("State", (), {
+        "request_restart": None,
+    })()})()})()
+
+    response = control._restart_response(request, strategy="auto_merge", plan={})
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["status"] == "restart_required"
+    assert delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV not in os.environ
+
+
+def test_ordinary_restart_disarms_orphan_update_intent(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+
+    calls = []
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
+    monkeypatch.setattr(update_merge, "release_update_lock", lambda _lock: None)
+    monkeypatch.setattr(update_merge, "read_update_tx_strict", lambda: ("absent", {}))
+    monkeypatch.setattr(git_ops, "_clear_update_intent", lambda: calls.append("clear") or True)
+
+    ok, message = server._safe_restart_serialized(
+        lambda **_kwargs: (calls.append("restart") or True, "ok"),
+        reason="owner_restart",
+        unsynced_policy="rescue_and_reset",
+    )
+
+    assert (ok, message) == (True, "ok")
+    assert calls == ["clear", "restart"]
+
+
+def test_restart_deferred_while_assisted_merge_is_being_resolved(monkeypatch):
+    """Regression pin for the restart guard: while an assisted managed-update merge is
+    mid-resolution (any assisted phase), _safe_restart_serialized must DEFER the restart
+    instead of running the checkout/reset that would wipe the resolver's worktree."""
+    import server
+    import supervisor.update_merge as update_merge
+
+    monkeypatch.setattr(update_merge, "acquire_update_lock", lambda: object())
+    monkeypatch.setattr(update_merge, "release_update_lock", lambda _lock: None)
+    for phase in ("materializing_assisted", "assisted_resolution", "committing_assisted"):
+        monkeypatch.setattr(
+            update_merge, "read_update_tx_strict",
+            lambda phase=phase: ("valid", {"phase": phase, "task_id": "resolver"}),
+        )
+
+        ok, message = server._safe_restart_serialized(
+            lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("restart must be deferred during assisted resolution")
+            ),
+            reason="owner_restart",
+            unsynced_policy="rescue_and_reset",
+        )
+
+        assert ok is False, phase
+        assert "deferred" in message.lower()
+
+
+def test_supervisor_startup_restores_queue_before_worker_reset():
+    """A fresh process must not overwrite the durable queue with its empty memory."""
+    import inspect
+    import server
+
+    source = inspect.getsource(server._run_supervisor)
+    restore = source.index("restored_pending = restore_pending_from_snapshot(")
+    reset = source.index("kill_workers(preserve_pending=True)")
+    spawn = source.index("spawn_workers(max_workers)")
+    assert restore < reset < spawn
+
+
+def test_update_finalizer_waits_for_real_supervisor_outcome(monkeypatch):
+    """The waiter blocks on the init OUTCOME latch, never on readiness: a failed
+    init is an outcome that must not hang the boot, and it must not have to
+    fake readiness to unblock this waiter (the API would paint Online)."""
+    import server
+
+    calls = []
+    outcome = SimpleNamespace(wait=lambda: calls.append("wait"))
+    monkeypatch.setattr(server, "_supervisor_init_done", outcome)
+    monkeypatch.setattr(server, "_supervisor_ready", threading.Event())  # never set here
+    monkeypatch.setattr(server, "_supervisor_error", None)
+
+    assert server._wait_for_supervisor_update_finalize() is True
+    assert calls == ["wait"]
+    monkeypatch.setattr(server, "_supervisor_error", "Supervisor init failed: boom")
+    assert server._wait_for_supervisor_update_finalize() is False
+    assert calls == ["wait", "wait"]
+
+
+def test_boot_update_check_notifies_the_live_ui():
+    import inspect
+    import server
+
+    source = inspect.getsource(server._boot_managed_update_tasks)
+    assert '"type": "update_status_ready"' in source
+    assert source.index("compute_managed_update_status(fetch=True)") < source.index(
+        '"type": "update_status_ready"'
+    )
+
+
+def test_successful_boot_rollback_requests_restart_and_preserves_queue(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+    import supervisor.workers as workers
+
+    calls = []
+    monkeypatch.setattr(server, "_wait_for_supervisor_update_finalize", lambda: False)
+    monkeypatch.setattr(
+        update_merge, "finalize_managed_update_on_boot",
+        lambda supervisor_ready, **_kwargs: {"finalized": False, "rolled_back": True},
+    )
+    monkeypatch.setattr(update_merge, "active_update_tx", lambda: {"phase": "marker_cleanup_retry"})
+    monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: calls.append(("gate", reason)))
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: calls.append(("restart", "")))
+    monkeypatch.setattr(
+        git_ops, "compute_managed_update_status",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("restarting generation must not check feed")),
+    )
+
+    server._boot_managed_update_tasks()
+
+    assert calls == [
+        ("gate", "managed_update:rollback_restart"),
+        ("restart", ""),
+    ]
+
+
+def test_failed_boot_rollback_does_not_restart(monkeypatch):
+    import server
+    import supervisor.git_ops as git_ops
+    import supervisor.update_merge as update_merge
+
+    calls = []
+    monkeypatch.setattr(server, "_wait_for_supervisor_update_finalize", lambda: False)
+    monkeypatch.setattr(
+        update_merge, "finalize_managed_update_on_boot",
+        lambda supervisor_ready, **_kwargs: {"finalized": False, "rolled_back": False},
+    )
+    monkeypatch.setattr(
+        git_ops, "compute_managed_update_status",
+        lambda fetch: {"available": False, "check_ok": True},
+    )
+    monkeypatch.setattr(server, "_request_restart_exit", lambda: calls.append("restart"))
+    monkeypatch.setattr(server, "broadcast_ws_sync", lambda payload: calls.append(payload["type"]))
+
+    server._boot_managed_update_tasks()
+
+    assert calls == ["update_status_ready"]
+
+
+@pytest.mark.parametrize("intent,marker,starts", [
+    ("automatic", "panic", False),
+    ("automatic", "owner_restart_no_resume", True),
+    ("automatic", None, True),
+    ("owner", "panic", True),
+    (None, "panic", True),
+])
+def test_main_automatic_start_preserves_panic(monkeypatch, tmp_path, capsys, intent, marker, starts):
+    import server
+
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    if intent is None:
+        monkeypatch.delenv("OUROBOROS_LAUNCH_INTENT", raising=False)
+    else:
+        monkeypatch.setenv("OUROBOROS_LAUNCH_INTENT", intent)
+    flag = tmp_path / "state" / "panic_stop.flag"
+    if marker is not None:
+        flag.parent.mkdir()
+        flag.write_text(marker, encoding="utf-8")
+
+    class ReachedStartup(Exception):
+        pass
+
+    def start():
+        raise ReachedStartup()
+
+    monkeypatch.setattr(server, "verify_settings_integrity", start)
+    if starts:
+        with pytest.raises(ReachedStartup):
+            server.main()
+    else:
+        assert server.main() == 0
+        assert "Ouroboros is stopped. Use Start to resume." in capsys.readouterr().out
+    assert flag.exists() is (marker is not None)
+    if marker is not None:
+        assert flag.read_text(encoding="utf-8") == marker
+
+
+def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch, tmp_path):
     import server
 
     cleanup_calls = []
@@ -38,26 +430,38 @@ def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch):
     class FakeServer:
         def __init__(self, _config):
             self.should_exit = False
+            self.stop_watcher_bound = False
 
-        def run(self):
+        def watch_launcher_stop(self):
+            self.stop_watcher_bound = True
+
+        def run(self, *, sockets):
+            assert self.stop_watcher_bound
+            assert len(sockets) == 1 and sockets[0].getsockname()[1] > 0
             return None
 
     monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
-    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=8765))
+    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0, host_explicit=False))
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", None)
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
     monkeypatch.setattr(server, "validate_network_auth_configuration", lambda _host: "")
     monkeypatch.setattr(server, "find_free_port", lambda _host, port: port)
     monkeypatch.setattr(server, "write_port_file", lambda *_a, **_k: None)
     monkeypatch.setattr(server.uvicorn, "Config", lambda *a, **k: object())
-    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     monkeypatch.setattr(server, "_emergency_process_cleanup", lambda: cleanup_calls.append("cleanup"))
+    monkeypatch.setattr(server, "_event_loop", None)  # the watcher's close_all_ws hop needs no loop here
     server._restart_requested.clear()
 
-    assert server.main() == 0
+    try:
+        assert server.main() == 0
+    finally:
+        _stop_restart_watcher(server)
     assert cleanup_calls == []
 
 
-def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch):
+def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch, tmp_path):
     import server
 
     cleanup_calls = []
@@ -65,35 +469,41 @@ def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch):
     class FakeServer:
         def __init__(self, _config):
             self.should_exit = False
+            self.stop_watcher_bound = False
 
-        def run(self):
+        def watch_launcher_stop(self):
+            self.stop_watcher_bound = True
+
+        def run(self, *, sockets):
+            assert self.stop_watcher_bound
+            assert len(sockets) == 1 and sockets[0].getsockname()[1] > 0
             server._restart_requested.set()
             return None
 
-    class ExitCalled(RuntimeError):
-        pass
-
     monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
-    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=8765))
+    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0, host_explicit=False))
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", None)
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
     monkeypatch.setattr(server, "validate_network_auth_configuration", lambda _host: "")
     monkeypatch.setattr(server, "find_free_port", lambda _host, port: port)
     monkeypatch.setattr(server, "write_port_file", lambda *_a, **_k: None)
     monkeypatch.setattr(server.uvicorn, "Config", lambda *a, **k: object())
-    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     monkeypatch.setattr(server, "_LAUNCHER_MANAGED", True)
     monkeypatch.setattr(server, "_emergency_process_cleanup", lambda **kw: cleanup_calls.append(kw))
-    monkeypatch.setattr(server.os, "_exit", lambda code: (_ for _ in ()).throw(ExitCalled(code)))
+    exits = []
+    monkeypatch.setattr(server.os, "_exit", exits.append)
+    monkeypatch.setattr(server, "_event_loop", None)  # the watcher's close_all_ws hop needs no loop here
     server._restart_requested.clear()
 
     try:
         server.main()
-    except ExitCalled:
-        pass
     finally:
-        server._restart_requested.clear()
+        _stop_restart_watcher(server)
 
     assert cleanup_calls == [{"port_sweep": False}]
+    assert exits == [server.RESTART_EXIT_CODE]
 
 
 def test_emergency_cleanup_kills_services_without_log_finalization(monkeypatch):
@@ -160,29 +570,373 @@ def test_panic_stop_kills_services_without_log_finalization(monkeypatch, tmp_pat
     class ExitCalled(RuntimeError):
         pass
 
-    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda: None)
+    monkeypatch.setattr("ouroboros.startup_historical_audit.audit.stop", lambda: None)
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda **kw: None)
     monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground", lambda *a, **k: foreground_calls.append((a, k)))
     monkeypatch.setattr("ouroboros.tools.services.kill_all_services", lambda *a, **k: service_calls.append((a, k)))
-    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda: SimpleNamespace(stop_server=lambda: None))
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {})
-    monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
-    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
-    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
+    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_server=lambda: None))
+    monkeypatch.setattr("ouroboros.claudexor_daemon.get_owned_daemon", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_outcome=lambda: None))
+    monkeypatch.setattr(server_control, "_persist_panic_controls", lambda _data: None)
+    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda **kw: None)
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [SimpleNamespace(pid=4321)])
+    native_calls = []
+    monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
+                        lambda pid, panic_process=None: native_calls.append(pid) or {"requested": True})
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)
     monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: 8767)
     monkeypatch.setattr(server_control.os, "_exit", lambda code: (_ for _ in ()).throw(ExitCalled(code)))
 
+    before = set(threading.enumerate())
     try:
-        server_control.execute_panic_stop(
+        with pytest.raises(ExitCalled):
+            server_control.execute_panic_stop(
             consciousness=SimpleNamespace(stop=lambda: None),
             kill_workers_fn=lambda **kw: worker_calls.append(kw),
             data_dir=tmp_path,
             panic_exit_code=120,
             log=SimpleNamespace(critical=lambda *a, **k: None),
-        )
-    except ExitCalled:
-        pass
+            )
+    finally:
+        for thread in set(threading.enumerate()) - before:
+            if thread.name.startswith("panic-"):
+                thread.join(timeout=5)
+                assert not thread.is_alive()
 
-    assert foreground_calls == [((tmp_path,), {"wait": False})]
-    assert service_calls == [((tmp_path,), {"wait": False})]
-    assert worker_calls == [{"force": True, "archive_service_logs": False}]
+    assert native_calls == [4321]  # physical process request before settlement
+    assert any(k.get("request_only") for _, k in foreground_calls)
+    assert any(k.get("wait") is False for _, k in foreground_calls)
+    assert any(k.get("request_only") for _, k in service_calls)
+    assert any(k.get("wait") is False for _, k in service_calls)
+    assert worker_calls == []  # no root-first cooperative callback dependency
+    assert (tmp_path / "state/panic_stop.flag").read_text(encoding="utf-8") == "panic"
+
+
+# ---------------------------------------------------- shutdown-aware supervisor loop
+
+class _FakeStopEvent:
+    """A stop event whose backoff wait returns at once and records its timeout."""
+
+    def __init__(self):
+        self.flag = False
+        self.waits = []
+
+    def is_set(self):
+        return self.flag
+
+    def set(self):
+        self.flag = True
+
+    def clear(self):
+        self.flag = False
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        return self.flag
+
+
+class _Recorder:
+    def __init__(self):
+        self.alerts = []
+        self.watchdog_stops = []
+        self.steps = []
+        self.stop = _FakeStopEvent()
+        self.restart = None
+        self.ready = None
+        # Snapshot restore reports revived PENDING rows in its return value and
+        # the RUNNING rows it fenced for cancellation custody through the
+        # keyword-only out-parameter; a test can script either.
+        self.restored_pending = 0
+        self.fenced_running: list = []
+
+    def restore(self, *_args, terminalized=None, **_kwargs):
+        if terminalized is not None:
+            terminalized.extend(self.fenced_running)
+        return self.restored_pending
+
+
+def _supervisor_harness(monkeypatch, tmp_path, steps):
+    """Drive the REAL server._run_supervisor with every init/tick collaborator
+    stubbed (no processes, ports, Manager or live data root). The scripted
+    ``steps`` fire from the first call of each tick: ``ok`` = healthy tick,
+    ``raise`` = a crash, ``stop``/``restart`` = set the flag (the loop exits at
+    its next ``while`` check), ``raise_after_stop``/``raise_after_restart`` =
+    the flag is set and the same tick then crashes (the shutdown race)."""
+    import threading
+    import queue as queue_mod
+
+    import server
+    import supervisor.events as events_mod
+    import supervisor.message_bus as bus_mod
+    import supervisor.queue as queue_pkg
+    import supervisor.state as state_mod
+    import supervisor.workers as workers_mod
+
+    rec = _Recorder()
+    rec.steps = list(steps)
+    rec.restart = threading.Event()
+    rec.ready = threading.Event()
+
+    def _tick_head(_data_dir):
+        step = rec.steps.pop(0) if rec.steps else "stop"
+        if step in ("stop", "raise_after_stop"):
+            rec.stop.set()
+        if step in ("restart", "raise_after_restart"):
+            rec.restart.set()
+        if step.startswith("raise"):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    class _Bridge:
+        def __init__(self, _settings):
+            self._broadcast_fn = None
+
+    class _Consciousness:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def stop(self):
+            pass
+
+        def tick(self, now=None):
+            pass
+
+        def notify(self, reason):
+            pass
+
+    import time as time_mod
+
+    noop = lambda *_a, **_k: None  # noqa: E731
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+    # Patch the module's bound name, not the process-wide time.sleep.
+    monkeypatch.setattr(server, "time", SimpleNamespace(
+        sleep=noop, monotonic=time_mod.monotonic, time=time_mod.time,
+        thread_time=time_mod.thread_time))  # the loop samples its OWN thread's CPU per phase stamp
+    monkeypatch.setattr(server, "_supervisor_stop", rec.stop)
+    monkeypatch.setattr(server, "_restart_requested", rec.restart)
+    monkeypatch.setattr(server, "_supervisor_ready", rec.ready)
+    monkeypatch.setattr(server, "_supervisor_error", None)
+    monkeypatch.setattr(server, "_supervisor_thread", None)
+    monkeypatch.setattr(server, "_consciousness", None)
+    monkeypatch.setattr(server, "_apply_settings_to_env", noop)
+    monkeypatch.setattr(server, "ensure_legacy_imported", noop)
+    monkeypatch.setattr(server, "_bootstrap_supervisor_repo", lambda _s: (True, "ok"))
+    monkeypatch.setattr(server, "_runtime_branch_defaults", lambda: ("dev", "stable"))
+    # Startup notices have their own real delivery/state consumer tests. This
+    # harness records supervisor crash alerts and stubs other boot side effects.
+    monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
+    for name in (
+        "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
+        "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
+        # Its own owner notice is another startup side effect, asserted by
+        # tests/test_retired_settings_chat_notice.py; here it would be a
+        # crash alert (this harness's send_with_budget double records every
+        # send, and the boot/crash assertions below own that list).
+        "_startup_retired_settings_notice",
+    ):
+        monkeypatch.setattr(server, name, noop)
+    monkeypatch.setattr(server, "_start_supervisor_liveness_watchdog",
+                        lambda _liveness, stop_event=None: rec.watchdog_stops.append(stop_event))
+    monkeypatch.setattr(server, "_process_bridge_updates", lambda _bridge, offset, _ctx: offset)
+    monkeypatch.setattr(server, "_check_pending_restart_drain", lambda _ctx: True)
+    monkeypatch.setattr(bus_mod, "init", noop)
+    monkeypatch.setattr(bus_mod, "LocalChatBridge", _Bridge)
+    monkeypatch.setattr(bus_mod, "send_with_budget", lambda chat_id, text, **kw: rec.alerts.append((chat_id, text)))
+    monkeypatch.setattr("ouroboros.utils.set_log_sink", noop)
+    monkeypatch.setattr(events_mod, "make_server_log_sink", lambda *_a, **_k: None)
+    monkeypatch.setattr(events_mod, "dispatch_event", noop)
+    monkeypatch.setattr(state_mod, "init", noop)
+    monkeypatch.setattr(state_mod, "init_state", lambda **_k: state_mod.StateRead("current", "primary", {}))
+    monkeypatch.setattr(state_mod, "load_state", lambda: {"owner_chat_id": 7})
+    for name in ("save_state", "update_state", "append_jsonl", "update_budget_from_usage",
+                 "rotate_jsonl_log_if_needed"):
+        monkeypatch.setattr(state_mod, name, noop)
+    monkeypatch.setattr(state_mod, "rotate_chat_log_if_needed", _tick_head)
+    for name in ("enqueue_task", "enforce_task_timeouts", "enqueue_evolution_task_if_needed",
+                 "persist_queue_snapshot", "cancel_task_by_id", "queue_deep_self_review_task",
+                 "sort_pending", "check_scheduled_tasks"):
+        monkeypatch.setattr(queue_pkg, name, noop)
+    monkeypatch.setattr(queue_pkg, "restore_pending_from_snapshot", rec.restore)
+    for name in ("init", "spawn_workers", "kill_workers", "assign_tasks", "ensure_workers_healthy",
+                 "auto_resume_after_restart"):
+        monkeypatch.setattr(workers_mod, name, noop)
+    monkeypatch.setattr(workers_mod, "get_event_q", lambda: queue_mod.Queue())
+    monkeypatch.setattr("ouroboros.delegate_recovery.pre_adopt_planned_handoffs", noop)
+    monkeypatch.setattr("ouroboros.tools.services.prune_service_logs", lambda _root: {})
+    monkeypatch.setattr("ouroboros.consciousness.BackgroundConsciousness", _Consciousness)
+    return rec
+
+
+def _run(rec, server):
+    server._run_supervisor({})
+    assert rec.ready.is_set() or server._supervisor_error  # init reached the loop
+    return rec
+
+
+@pytest.mark.parametrize("restored, fenced, expected", [
+    (0, ["a"], "♻️ Cancelling 1 task that was still running when the server stopped."),
+    (2, ["a", "b"],
+     "♻️ Restored pending queue from snapshot: 2 tasks. "
+     "Cancelling 2 tasks that were still running when the server stopped."),
+])
+def test_boot_notice_states_the_restart_cancellations_as_an_intent(
+        monkeypatch, tmp_path, restored, fenced, expected):
+    """A window closed on live work: the boot line names how many tasks the
+    restart interrupted and says they are BEING cancelled. It cannot claim they
+    ENDED: restore only minted the durable intent, and cancellation custody
+    writes each terminal result a watchdog window later."""
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["stop"])
+    rec.restored_pending = restored
+    rec.fenced_running = list(fenced)
+    _run(rec, server)
+
+    assert [text for _chat, text in rec.alerts if text.startswith("♻️")] == [expected]
+
+
+def test_exception_while_stopping_exits_quietly_without_counting_a_crash(monkeypatch, tmp_path, caplog):
+    """The graceful-shutdown race: the teardown sets the stop flag, then the tick
+    meets the torn-down bus (BrokenPipe). That is not a crash: no owner alarm,
+    readiness untouched, no supervisor error — and the watchdog generation stops."""
+    import logging
+
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["ok", "raise_after_stop"])
+    with caplog.at_level(logging.INFO, logger="server"):
+        _run(rec, server)
+
+    assert rec.alerts == []
+    assert rec.ready.is_set() is True
+    assert server._supervisor_error is None
+    assert rec.watchdog_stops and rec.watchdog_stops[0].is_set()
+    assert server._supervisor_thread is None
+    assert any("exiting on shutdown" in record.getMessage() for record in caplog.records)
+    assert not any(record.levelno >= logging.ERROR for record in caplog.records)
+
+
+def test_exception_while_restarting_exits_quietly_too(monkeypatch, tmp_path):
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["raise_after_restart"])
+    _run(rec, server)
+
+    assert rec.alerts == []
+    assert rec.ready.is_set() is True
+    assert server._supervisor_error is None
+    assert rec.watchdog_stops[0].is_set()
+
+
+def test_three_genuine_consecutive_crashes_still_die_visibly(monkeypatch, tmp_path):
+    """Without a shutdown the contract stays: the third consecutive crash records
+    the error, clears readiness, alerts the owner exactly once, stops the
+    watchdog generation — and the backoff between crashes waits on the stop
+    event (prompt shutdown), never on time.sleep."""
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["raise", "raise", "raise", "ok"])
+    _run(rec, server)
+
+    assert len(rec.alerts) == 1
+    assert rec.alerts[0][0] == 7
+    assert "died after repeated crashes" in rec.alerts[0][1]
+    assert rec.ready.is_set() is False
+    assert "3 consecutive crashes" in str(server._supervisor_error)
+    assert rec.watchdog_stops[0].is_set()
+    assert server._supervisor_thread is None
+    assert rec.stop.waits == [2, 4]
+    assert rec.steps == ["ok"]  # the loop is dead: the next tick never ran
+
+
+def test_healthy_tick_between_crashes_resets_the_count(monkeypatch, tmp_path):
+    import server
+
+    rec = _supervisor_harness(monkeypatch, tmp_path, ["raise", "raise", "ok", "raise", "raise", "stop"])
+    _run(rec, server)
+
+    assert rec.alerts == []
+    assert rec.ready.is_set() is True
+    assert server._supervisor_error is None
+    assert rec.steps == []
+    assert rec.stop.waits == [2, 4, 2, 4]
+
+
+def test_lifespan_teardown_stops_and_joins_the_loop_before_the_bus_goes_down():
+    """Source-order pin (the file's style for lifespan ordering): the stop flag is
+    the FIRST teardown statement, and the bounded join precedes the worker kill,
+    the bridge shutdown and the event-bus shutdown; a fresh lifespan clears the
+    flag before it starts a generation."""
+    import inspect
+    import server
+
+    source = inspect.getsource(server.lifespan)
+    assert source.index("_supervisor_stop.clear()") < source.index("_start_supervisor_if_needed(settings)")
+    finally_idx = source.index("\n    finally:\n") + 1
+    stop_idx = source.index("_supervisor_stop.set()")
+    join_idx = source.index("supervisor_thread.join(timeout=2)")
+    kill_idx = source.index("kill_workers(")
+    bridge_idx = source.index("get_bridge().shutdown()")
+    bus_idx = source.index("_shutdown_supervisor_event_bus()")
+    assert finally_idx < stop_idx < join_idx < kill_idx < bridge_idx < bus_idx
+    # Nothing between `finally:` and the stop flag but whitespace.
+    assert source[finally_idx + len("    finally:\n"):stop_idx].strip() == ""
+
+
+def test_terminal_custody_precedes_every_best_effort_wait_in_the_teardown():
+    """The one IRREVERSIBLE durable write of the teardown goes first.
+
+    An external SIGKILL arrives about ten seconds after SIGTERM, while the
+    extension-reconcile and host-service waits ahead of kill_workers were worth
+    roughly thirty-nine seconds: an interrupted task was simply never
+    terminalized. Order is now stop flag, bounded join, terminal custody, then
+    the optional waits and the kill-all sweeps.
+
+    The diagnostic `server_shutdown` row is one of those best-effort steps and
+    goes AFTER the custody write too: `append_jsonl` waits up to two seconds for
+    the log lock and then does file I/O, so on slow storage or a held lock it can
+    eat the launcher's force-exit budget before a single worker is terminalized.
+    Nothing between the join and `kill_workers` may do I/O."""
+    import inspect
+    import server
+
+    teardown = inspect.getsource(server.lifespan).split("\n    finally:\n", 1)[1]
+    stop_idx = teardown.index("_supervisor_stop.set()")
+    join_idx = teardown.index("supervisor_thread.join(timeout=2)")
+    kill_idx = teardown.index("kill_workers(")
+    append_idx = teardown.index('"server_shutdown"')
+    extension_idx = teardown.index("extension_reconcile_task.cancel()")
+    host_idx = teardown.index("host_service_listener.close()")
+    sweeps_idx = teardown.index("_stop_owned_local_processes(lifespan_drive_root)")
+    assert stop_idx < join_idx < kill_idx < extension_idx < host_idx < sweeps_idx
+    assert kill_idx < append_idx < extension_idx
+
+
+def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):
+    import server
+
+    started = []
+
+    class _Thread:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def start(self):
+            started.append(self.kwargs["target"])
+
+    import threading
+
+    monkeypatch.setattr(server, "has_startup_ready_provider", lambda _s: True)
+    monkeypatch.setattr(server, "_supervisor_thread", None)
+    monkeypatch.setattr(server, "_supervisor_error", "stale")
+    monkeypatch.setattr(server, "threading", SimpleNamespace(Thread=_Thread, Event=threading.Event))
+    server._supervisor_stop.set()
+    try:
+        assert server._start_supervisor_if_needed({}) is True
+        assert server._supervisor_stop.is_set() is False
+        assert started == [server._supervisor_generation]  # the latch-checking thread body (#1142)
+    finally:
+        server._supervisor_stop.clear()

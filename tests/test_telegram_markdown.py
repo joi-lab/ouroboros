@@ -13,21 +13,19 @@ because the original bug had balanced tag *counts* but broken *order*.
 
 from __future__ import annotations
 
-import importlib.util
-from pathlib import Path
 from xml.etree import ElementTree as ET
+
+import pytest
+
+from tests.test_telegram_format_parity import _load_skill
+
+# The shared skill loader replaces its package entries in sys.modules.
+pytestmark = pytest.mark.serial
 
 
 def _load_converter():
-    root = Path(__file__).resolve().parents[1] / "skills" / "telegram"
-    spec = importlib.util.spec_from_file_location(
-        "telegram_bridge_test.telegram_api",
-        root / "lib" / "telegram_api.py",
-    )
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module.markdown_to_telegram_html
+    _plugin, telegram_api = _load_skill()
+    return telegram_api.markdown_to_telegram_html
 
 
 def _assert_well_formed(html: str) -> None:
