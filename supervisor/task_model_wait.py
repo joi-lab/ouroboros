@@ -44,9 +44,13 @@ def handle_task_model_wait(event: dict, ctx: Any) -> None:
                 return
             waits[wait_id] = row
             task["model_waits"] = waits
+            # The row stays visible for any owner (an independent review operation
+            # included); only the author's own owner moves the author's execution clock.
+            # A reviewer's quota or result wait is never an author exclusion (#939).
+            author_clock = payload.get("model_wait_owner_id", "") == str(task.get("model_wait_owner_id") or "")
             previous_clock = meta.get("model_wait_quota_clock") or {}
             clock = payload.get("quota_clock") or {}
-            if int(clock.get("revision") or 0) > int(previous_clock.get("revision") or 0):
+            if author_clock and int(clock.get("revision") or 0) > int(previous_clock.get("revision") or 0):
                 meta["model_wait_quota_clock"] = clock
         else:
             # A finished managed task cannot be resurrected by a late waiter.

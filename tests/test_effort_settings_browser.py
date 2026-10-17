@@ -1,6 +1,4 @@
-"""Rendered Settings keeps reviewer overrides and describes effort as a preference."""
-import json
-
+"""Rendered Settings: a reviewer row's effort select says Auto, and Behavior has no effort section."""
 import pytest
 
 from tests import test_subscription_role_routes_browser as roles
@@ -11,43 +9,41 @@ role_ui = roles.role_ui
 
 
 @pytest.mark.parametrize("width", [1360, 390])
-def test_reviewer_effort_override_caption_and_saved_preference(role_ui, tmp_path, width):
+def test_reviewer_effort_auto_caption_and_saved_preference(role_ui, tmp_path, width):
     ui = role_ui
     roles.configure_mixed(ui)
     ui["settings"]["OUROBOROS_SUBAGENTS"]["items"][0]["effort"] = "high"
-    slots = ui["fixture"]["preview"]["reviewer_slots"]
-    slots["scope"][0]["effort"] = "low"
-    ui["settings"]["OUROBOROS_REVIEWER_SLOTS"] = json.dumps(slots)
+    ui["settings"]["OUROBOROS_EFFORT_TASK"] = "high"
     ui["page"].set_viewport_size({"width": width, "height": 900})
     page = roles.open_agents(ui)
-    row = page.locator('[data-slot-id="scope_1"]')
-    caption = row.locator('.reviewer-slot-meta')
-    assert "preferred effort low" in caption.inner_text()
-    row.locator('[data-slot-effort]').select_option('medium')
-    assert "preferred effort medium" in caption.inner_text()
-    deep = page.locator('[data-deep-review-row]')
-    deep_caption = deep.locator('.reviewer-slot-meta')
-    assert "preferred effort high" in deep_caption.inner_text()
-    deep.locator('[data-deep-review-effort]').select_option('low')
-    assert "preferred effort low" in deep_caption.inner_text()
-    deep.locator('[data-deep-review-effort]').select_option('')
-    assert "preferred effort high" in deep_caption.inner_text()
-    deep.locator('[data-deep-review-effort]').select_option('medium')
-    assert "preferred effort medium" in deep_caption.inner_text()
-    row.scroll_into_view_if_needed()
+    rows = page.locator("[data-subagent-row]")
+    pinned, unset = rows.nth(0), rows.nth(1)
+    # The empty option is Auto: the chat range; a marked row reviews at its top and says so.
+    default = 'option[value=""]'
+    assert pinned.locator(f'[data-subagent-field="effort"] {default}').inner_text() == "Auto (reviews at the top of the chat range)"
+    assert pinned.locator('[data-subagent-field="effort"]').input_value() == "high"
+    facts = unset.locator(f'[data-subagent-field="effort"] {default}')
+    assert facts.inner_text() == "Auto (reviews at the top of the chat range)"
+    unset.locator('[data-subagent-field="review_eligible"]').uncheck()
+    assert facts.inner_text() == "Auto (chat range)", "an unmarked row runs inside the chat range"
+    unset.locator('[data-subagent-field="review_eligible"]').check()
+    unset.locator('[data-subagent-field="effort"]').select_option('medium')
+    unset.scroll_into_view_if_needed()
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
     page.screenshot(path=str(tmp_path / f"effort-reviewer-{width}.png"))
     with page.expect_response('**/api/settings'):
         page.locator('#btn-save-settings').click()
-    saved = [body for path, body in ui["posts"] if path == '/api/settings'][-1]
-    assert json.loads(saved['OUROBOROS_REVIEWER_SLOTS'])['scope'][0]['effort'] == 'medium'
-    assert json.loads(saved['OUROBOROS_REVIEWER_SLOTS'])['deep_review']['effort'] == 'medium'
-    with page.expect_response('**/api/reviewer-slots'):
+    saved = roles.saved_catalog(ui)["items"]
+    assert [row.get("effort") for row in saved[:2]] == ["high", "medium"]
+    body = [body for path, body in ui["posts"] if path == "/api/settings"][-1]
+    assert "OUROBOROS_EFFORT_TASK" not in body, "the range never rides the generic Settings save"
+    with page.expect_response('**/api/review-pool'):
         page.locator('#btn-reload-settings').click()
-    assert "preferred effort medium" in caption.inner_text()
-    assert "preferred effort medium" in deep_caption.inner_text()
+    assert unset.locator('[data-subagent-field="effort"]').input_value() == 'medium'
     page.locator('[data-settings-tab="behavior"]').click()
-    help_text = page.get_by_text('Preferred reasoning effort per task type.', exact=False)
-    assert "Requested, sent and reported effort are recorded in Logs" in help_text.inner_text()
-    help_text.scroll_into_view_if_needed()
+    behavior = page.locator('[data-settings-panel="behavior"]')
+    # The range lives in the composer alone: Behavior has no effort section, line or control.
+    assert behavior.locator('h3', has_text="Reasoning Effort").count() == 0
+    assert page.locator('[data-effort-range-summary]').count() == 0
+    assert page.locator('[data-effort-target^="s-effort-"]').count() == 0, "Behavior has no effort controls left"
     page.screenshot(path=str(tmp_path / f"effort-settings-{width}.png"))

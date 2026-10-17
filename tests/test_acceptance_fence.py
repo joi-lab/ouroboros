@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from tests._store_shared import result_exists, result_signature
 
 
 def _isolated_queue(monkeypatch, tmp_path):
@@ -213,10 +214,11 @@ def test_malformed_acceptance_fence_snapshot_fails_closed_and_terminalizes(monke
     assert load_task_result(tmp_path, "uncertain")["status"] == STATUS_CANCELLED
     events = [
         json.loads(line)
-        for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()
+        for line in (tmp_path / "logs" / "supervisor.jsonl").read_text(encoding="utf-8").splitlines()
     ]
-    assert events[-1]["type"] == "queue_restore_invalid_acceptance_fences"
-    assert events[-1]["action"] == "fail_closed_no_restore"
+    diagnostic = next(event for event in events if event.get("type") == "queue_restore_invalid_acceptance_fences")
+    assert diagnostic["action"] == "fail_closed_no_restore"
+    assert diagnostic["affected_task_ids"] == ["uncertain"]
 
 
 def test_restore_does_not_count_enqueue_admission_rejection(monkeypatch, tmp_path):
@@ -269,8 +271,7 @@ def test_queue_unique_id_wins_over_malformed_depth_replay(monkeypatch, tmp_path)
         delegation_role="root",
         result="keep live work",
     )
-    result_path = tmp_path / "task_results" / f"{task_id}.json"
-    original = result_path.read_bytes()
+    original = result_signature(tmp_path, task_id)
 
     admitted = queue_mod.enqueue_task({
         "id": task_id,
@@ -280,7 +281,7 @@ def test_queue_unique_id_wins_over_malformed_depth_replay(monkeypatch, tmp_path)
     })
 
     assert admitted["_admission_blocked"] == "duplicate_task_id"
-    assert result_path.read_bytes() == original
+    assert result_signature(tmp_path, task_id) == original
     assert load_task_result(tmp_path, task_id)["status"] == STATUS_SCHEDULED
     assert pending == []
 
@@ -307,7 +308,7 @@ def test_restore_terminalizes_invalid_depth_at_task_budget_root(monkeypatch, tmp
     assert result["reason_code"] == "invalid_task_depth"
     assert result["depth"] == 0
     assert result["raw_task_depth"] == -1
-    assert not (tmp_path / "task_results" / f"{task['id']}.json").exists()
+    assert not result_exists(tmp_path, task['id'])
     snapshot = json.loads(queue_mod.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert snapshot["pending"] == []
     events = [

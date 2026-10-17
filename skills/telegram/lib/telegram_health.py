@@ -79,9 +79,8 @@ def _collect_health(api, lang: str = "en") -> str:
     q_icon = "🟢" if (rc + pc) == 0 else "🟡"
     q_state = s["idle"] if (rc + pc) == 0 else s["busy"]
     out.append(f"⚙️ {s['queue']}: {q_icon} {q_state} (RUNNING {rc} · PENDING {pc})")
-    workers = _read_json_file(data / "state" / "worker_pids.json").get("workers")
-    if isinstance(workers, list):
-        out.append(f"👷 {s['workers']}: {len(workers)}")
+    if isinstance(snap.get("worker_total"), int):
+        out.append(f"👷 {s['workers']}: {snap['worker_total']}")
     inc, incidents_limited = _recent_incidents(api)
     if inc:
         parts = [f"{v} {s[f'incident_{k}']}" for k, v in inc.items()]

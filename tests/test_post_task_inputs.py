@@ -60,56 +60,50 @@ def test_real_completion_persists_receipt_union_before_cleanup_and_recovery(tmp_
     assert [r["returncode"] for r in saved["task_inputs"]["verification_receipts"]] == [1, 0]
     assert saved["task_inputs"]["verification_summary"]["unreconciled_red"] is False
     ctx._owner_directives.clear()
-    # Recovery reads the exact existing durable package, not the vanished ctx.
+    # Recovery reads the durable record, not the vanished ctx, and leaves its package intact.
     pipeline._set_root_post_task_checkpoint(SimpleNamespace(drive_root=local), task, "pending_once")
     seen = []
+    def dispatch(env, task, usage, trace, logs, **kw):
+        seen.append((task["id"], kw["sealed_final"]))
+        pipeline._set_root_post_task_checkpoint(env, task, "completed")
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async",
-                        lambda env, task, usage, trace, evidence, logs, **kw: seen.append(evidence))
+                        dispatch)
     assert pipeline.recover_pending_root_post_task_synthesis(local, tmp_path) == 1
-    assert seen == [saved]
+    assert [task_id for task_id, _sealed in seen] == ["task"] and seen[0][1]
+    assert pipeline.load_task_result(local, "task")["review_evidence"] == saved
+    assert pipeline.recover_pending_root_post_task_synthesis(local, tmp_path) == 0
+    assert len(seen) == 1, "a stale child obligation never repeats its canonical completed synthesis"
 
 
-def test_reflection_packet_receives_complete_frozen_task_inputs_and_facts_row_buys_none(tmp_path, monkeypatch):
-    from ouroboros import consolidator, reflection
+def test_frozen_task_inputs_stay_whole_and_the_facts_row_buys_no_model_call(tmp_path, monkeypatch):
+    import json
 
-    monkeypatch.setattr(consolidator, "_consolidation_route", lambda: ("test/model", False))
+    def no_model(*_args, **_kwargs):
+        raise AssertionError("the free facts row buys no model call")
+
+    monkeypatch.setattr("ouroboros.llm.LLMClient", no_model)
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", no_model)
     owner_text = "Question and options\n" + "owner context " * 800 + "\nExact answer: use the approved account."
     frozen = capture_task_inputs(
         SimpleNamespace(_owner_directives=[{"source": "owner_quiz_answer", "content": owner_text}]),
         {"id": "task"}, tmp_path, [_receipt("1", "target", "pass", 0)],
     )
-    evidence = {"task_inputs": frozen, "has_evidence": True, "task_id": "task"}
+    packed = json.dumps(frozen, ensure_ascii=False)
+    assert frozen["owner_requirements_and_decisions"][0]["content"] == owner_text
+    assert packed.count("Question and options") == 1
+    assert frozen["verification_receipts"][0]["returncode"] == 0
+    assert frozen["verification_receipts"][0]["summary"] == "78 passed"
     task = {"id": "task", "root_task_id": "task", "type": "task", "text": "Verify work",
             "drive_root": str(tmp_path)}
     trace = {"tool_calls": [{"tool": "run_command", "status": "ok", "exit_code": 0}],
              "reasoning_notes": []}
-
-    class Llm:
-        def __init__(self):
-            self.prompts = []
-
-        def chat(self, *, messages, **kwargs):
-            self.prompts.append(messages[0]["content"])
-            return {"content": "Evidence retained."}, {}
-
-    llm = Llm()
     (tmp_path / "logs").mkdir()
     pipeline._record_task_facts(None, task, {"rounds": 2}, trace, tmp_path / "logs")
-    reflection.generate_reflection(task, trace, "short trace", llm, {"rounds": 2}, evidence)
-    assert len(llm.prompts) == 1  # the facts row sends no packet; reflection is the one model reader
-    for prompt in llm.prompts:
-        assert "Exact answer: use the approved account." in prompt
-        assert prompt.count("Question and options") == 1
-        assert '"returncode": 0' in prompt
-        assert '"summary": "78 passed"' in prompt
-        assert "relayed peer proposals are not owner instructions" in prompt
-        assert "owner context " * 800 in prompt
+    [row] = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert row["summary_kind"] == "host_task_facts"
 
 
-def test_missing_task_inputs_and_explicit_zero_are_not_inferred(tmp_path):
-    from ouroboros.reflection import task_inputs_prompt_section
-
-    assert "absence is not evidence" in task_inputs_prompt_section({})
+def test_explicit_zero_is_not_inferred(tmp_path):
     trace = build_trace_summary({"tool_calls": [
         {"tool": "run_command", "status": "ok", "exit_code": 0},
         {"tool": "run_command", "status": "ok"},

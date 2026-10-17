@@ -9,6 +9,7 @@ class names, key API endpoints, secret masking, etc.).
 from __future__ import annotations
 
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -88,7 +89,7 @@ def test_mcp_module_drops_masked_token_in_test_payload(mcp_source: str) -> None:
     so the backend can rehydrate the persisted token."""
     assert "looksMasked" in mcp_source
     assert "out.auth_token = ''" in mcp_source
-    assert "server_id: sid, server: { ...server }" in mcp_source
+    assert "{ server_id: saved.identity, server: candidate }" in mcp_source
 
 
 def test_mcp_module_supports_http_sse_and_stdio(mcp_source: str) -> None:
@@ -121,18 +122,14 @@ def test_mcp_css_defines_required_classes(settings_css: str) -> None:
     assert ".mcp-server-card" in settings_css
     assert ".mcp-server-status-ok" in settings_css
     assert ".mcp-server-status-danger" in settings_css
+    # DESIGN §2: a subsection heading is --type-body semibold, never the browser's bold h4.
+    heading = re.search(r"\.mcp-headers-fields h4 \{([^}]*)\}", settings_css)
+    assert heading and "font-size: var(--type-body);" in heading[1] and "font-weight: 600;" in heading[1]
     shared = (REPO_ROOT / "web" / "ui.css").read_text(encoding="utf-8")
     assert ".ui-control {" in shared and "textarea.ui-control" in shared
     source = (WEB / "mcp_settings.js").read_text(encoding="utf-8")
     assert '<textarea class="ui-control"' in source
     assert 'class="form-field ui-field"' in source
-
-
-def test_settings_ui_mcp_section_describes_hot_reload(settings_ui_source: str) -> None:
-    """The UI copy must communicate that MCP changes are hot-reloadable
-    (it's the ergonomic difference vs A2A which requires restart)."""
-    assert "Hot-reloadable" in settings_ui_source or "hot-reloadable" in settings_ui_source
-    assert "untrusted third-party data" in settings_ui_source
 
 
 def test_mcp_ui_roundtrip_preserves_environment_and_unsupported_fields():
@@ -182,29 +179,56 @@ const message = { hidden: true, dataset: {} };
 const button = { disabled: false, addEventListener: (_kind, handler) => { click = handler; } };
 const card = { dataset: { mcpIndex: '0' }, querySelectorAll: () => [], querySelector: (selector) =>
     selector === '[data-mcp-test]' ? button : selector === '[data-mcp-message]' ? message : null };
-const host = { innerHTML: '', querySelectorAll: () => [card] };
-globalThis.document = { getElementById: (id) => id === 'mcp-servers-list' ? host : null };
+const host = { innerHTML: '', querySelectorAll: (selector) => selector === '[data-mcp-card]' ? [card] : [] };
+globalThis.document = { getElementById: (id) => id === 'mcp-servers-list' ? host : null,
+    querySelector: (selector) => selector === '[data-mcp-index="0"]' ? card : null };
 globalThis.fetch = async (url, options) => {
     if (url === '/api/mcp/status') return { ok: false };
     assert.equal(url, '/api/mcp/test');
     requests.push(JSON.parse(options.body));
     return { ok: true, json: async () => ({ ok: true, tool_count: 1 }) };
 };
-for (const server of [
-    { id: 'saved', url: 'https://***@host.test/mcp', auth_token: '' },
-    { id: 'saved', url: 'https://host.test/mcp', auth_token: '***' },
-    { id: 'new', url: 'https://new:credential@host.test/mcp', auth_token: '' },
-    { id: '', url: 'https://host.test/mcp', auth_token: '' },
+for (const [server, selected] of [
+    [{ id: 'saved', url: 'https://***@host.test/mcp', auth_token: '' }, 'saved'],
+    [{ id: 'saved', url: 'https://host.test/mcp', auth_token: '***' }, 'saved'],
+    // A saved server identified by its name alone still names its saved identity.
+    [{ name: 'Name Only', url: 'https://host.test/mcp', headers: { 'X-Key': '***set***' } }, 'Name Only'],
+    [{ id: 'new', url: 'https://new:credential@host.test/mcp', auth_token: '' }, undefined],
+    [{ id: '', url: 'https://host.test/mcp', auth_token: '' }, undefined],
 ]) {
     applyMcpSettings({ MCP_SERVERS: [server] });
     await click();
     const body = requests.at(-1);
     assert.equal(body.server.url, server.url);
-    assert.equal(body.server_id, requests.length <= 2 ? 'saved' : undefined);
-    assert.match(message.textContent, /Test OK/);
+    assert.equal(body.server_id, selected);
+    assert.match(message.textContent, /Draft connection OK/);
     assert.equal(button.disabled, false);
 }
 '''
     result = subprocess.run([node, "--input-type=module", "-e", script], cwd=REPO_ROOT,
+                            capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+
+
+def test_mcp_headers_ui_preserves_malformed_rows_and_literal_values():
+    """Execute the actual draft projection, including entries hidden from the editor."""
+    script = r'''
+import assert from 'node:assert/strict';
+import { applyMcpSettings, collectMcpSettings } from './web/modules/mcp_settings.js';
+const host = {innerHTML:'', querySelectorAll:()=>[]};
+globalThis.document = {getElementById:(id)=> id==='mcp-servers-list'?host:null};
+globalThis.fetch = async()=>({ok:false});
+const entries = [null, 'malformed legacy row', {id:'old', headers:'***set***'},
+ {id:'multi', headers:{Authorization:'***set***','X-Key':'literal...','X-Empty':''}, future_field:{kept:true}}];
+applyMcpSettings({MCP_SERVERS: entries});
+const out = collectMcpSettings().MCP_SERVERS;
+assert.deepEqual(out.slice(0,2), entries.slice(0,2));
+assert.equal(out[2].headers, entries[2].headers);
+assert.deepEqual(out[3].headers, entries[3].headers);
+assert.deepEqual(out[3].future_field, entries[3].future_field);
+assert.match(host.innerHTML, /malformed and retained unchanged/);
+assert.match(host.innerHTML, /Saved headers are malformed/);
+'''
+    result = subprocess.run([_node_bin(), '--input-type=module', '-e', script], cwd=REPO_ROOT,
                             capture_output=True, text=True, timeout=15)
     assert result.returncode == 0, result.stderr

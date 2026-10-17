@@ -8,9 +8,9 @@ from __future__ import annotations
 from typing import Any
 
 try:  # Python 3.11+
-    from typing import Literal, NotRequired, TypedDict  # type: ignore[attr-defined]
+    from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
 except ImportError:  # pragma: no cover - CI supports Python 3.10.
-    from typing_extensions import Literal, NotRequired, TypedDict  # type: ignore[assignment]
+    from typing_extensions import Literal, NotRequired, Required, TypedDict  # type: ignore[assignment]
 
 
 class UiI18nProfile(TypedDict):
@@ -112,7 +112,81 @@ class UiI18nMissingResponse(TypedDict):
     pending: int
 
 
+class UiI18nMemoryDocument(TypedDict, total=False):
+    """A translation memory file (schema 1): what GET /api/ui/i18n/export downloads and POST
+    /api/ui/i18n/import accepts. Import needs a non-English ``language``; ``schema``, when sent,
+    must be 1. Its ``entries`` replace the whole imported layer: owner entries stay and shadow it,
+    generated entries yield, imported entries absent from the new file are dropped. A body
+    without ``entries`` is read as the entries map itself. Unknown top-level keys are kept."""
+
+    schema: int
+    language: Required[str]
+    revision: int
+    created_at: str
+    updated_at: str
+    profile: UiI18nProfile
+    plural_select: dict[str, Any] | None
+    plural_categories: list[str] | None
+    glossary_hash: str
+    entries: dict[str, UiI18nEntry]
+    shadow: dict[str, UiI18nEntry]  # imported entries an owner entry hides
+    refused: dict[str, dict[str, Any]]  # keys the generator gave up on
+    pack: str  # stamped on every imported entry
+    pack_version: str
+
+
+class UiI18nImportResult(TypedDict):
+    added: int
+    replaced: int
+    shadowed: int  # imported entries kept behind an owner entry
+    dropped: int  # earlier imported entries absent from this file
+
+
+class UiI18nImportResponse(TypedDict):
+    """POST /api/ui/i18n/import: the memory's new revision. Every import bumps it."""
+
+    ok: bool
+    language: str
+    revision: int
+    result: UiI18nImportResult
+    stats: UiI18nStats
+
+
+class UiI18nRegenerateRequest(TypedDict, total=False):
+    """POST /api/ui/i18n/regenerate: drop generated entries and refusals, then generate again.
+    An absent or empty ``language`` means the install's current language."""
+
+    language: str
+
+
+class UiI18nRegenerateResponse(TypedDict):
+    ok: bool
+    language: str
+    revision: int
+    removed: int  # generated entries dropped; progress shows in GET /api/ui/i18n stats.pending
+    stats: UiI18nStats
+
+
+class UiLanguageChangedOutbound(TypedDict):
+    """WS frame: the install's interface language was chosen (any client or transport); re-read GET /api/ui/i18n."""
+
+    type: Literal["ui_language_changed"]
+    language: str  # the chosen BCP-47 tag ("" = not chosen)
+
+
+class UiI18nUpdatedOutbound(TypedDict):
+    """WS frame: the translation memory of ``language`` reached ``revision`` (generated, imported or regenerated)."""
+
+    type: Literal["ui_i18n_updated"]
+    language: str
+    revision: int
+    applied: NotRequired[int]  # entries the generator wrote in this batch; absent for import and regenerate
+
+
 __all__ = [
     "UiI18nProfile", "UiI18nEntry", "UiI18nStats", "UiI18nLanguageSummary", "UiI18nGenerator",
     "UiI18nResponse", "UiI18nLanguageRequest", "UiI18nMissingRequest", "UiI18nMissingResponse",
+    "UiI18nMemoryDocument", "UiI18nImportResult", "UiI18nImportResponse",
+    "UiI18nRegenerateRequest", "UiI18nRegenerateResponse",
+    "UiLanguageChangedOutbound", "UiI18nUpdatedOutbound",
 ]

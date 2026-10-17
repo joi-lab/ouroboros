@@ -1,4 +1,10 @@
-"""Reviewed behavior and exact event facts for one presence turn."""
+"""Reviewed behavior and exact event facts for one presence turn.
+
+The framing keeps the event's recorded source text separate from host attachment context and
+states that being shown an event does not establish who its author addresses; the addressee is
+not computed here. Sends are reported only from host delivery receipts, never from tool names
+or from a send having been prepared.
+"""
 
 from __future__ import annotations
 
@@ -84,6 +90,15 @@ def _previous_turn_line(previous: Mapping[str, Any]) -> str:
             work = f" Its deferred work (task {ref}) has no task row."
         else:
             work = f" Work continues as task {ref} (status {status})."
+    if previous.get("continuing"):
+        return (f"Previous turn in this conversation (task {previous.get('task_id')}, yielded {finished}) left the "
+                f"conversation while its result awaits review, outcome so far {previous.get('outcome')}: {body}.{work} "
+                "It is still the responsible author and may reply again after its review.")
+    if previous.get("author_status"):
+        return (f"Previous turn in this conversation (task {previous.get('task_id')}, yielded {finished}) left the "
+                f"conversation while its result awaited review, outcome so far {previous.get('outcome')}: {body}.{work} "
+                f"Its author is no longer live (task status {previous['author_status']}) and will not reply by itself; "
+                "nothing restarts it automatically.")
     return (f"Previous turn in this conversation (task {previous.get('task_id')}, finished {finished}, "
             f"outcome {previous.get('outcome')}, delivery {previous.get('delivery') or 'unknown'}): {body}.{work}")
 
@@ -110,8 +125,7 @@ def _own_work_section(drive_root: Path, value: Mapping[str, Any], task_id: str) 
         preview = " ".join(str(row.get("result_preview") or "").split())[:200]
         lines.append(
             f"- {row.get('task_id')} [{row.get('status') or 'unknown'}"
-            + (f", cancel {row['cancel_state']}" if row.get("cancel_state") else "")
-            + (", its result row is unreadable" if row.get("result_row") == "unreadable" else "") + f"] from {where}: "
+            + (f", cancel {row['cancel_state']}" if row.get("cancel_state") else "") + f"] from {where}: "
             + json.dumps(" ".join(str(row.get("description") or "").split())[:200], ensure_ascii=False)
             + (f"; result preview {json.dumps(preview, ensure_ascii=False)}"
                if preview and row.get("status") in {"completed", "failed", "cancelled"} else "")
@@ -119,8 +133,7 @@ def _own_work_section(drive_root: Path, value: Mapping[str, Any], task_id: str) 
         )
     gap = page.get("read_gap") if isinstance(page.get("read_gap"), Mapping) else {}
     unread = [text for key, text in (
-        ("result_root", "the result root"), ("queue_snapshot", "the queue snapshot (queued work)"),
-        ("unattributed_unreadable_rows", f"{gap.get('unattributed_unreadable_rows')} row(s) no record attributes"),
+        ("result_root", "the task store"), ("queue_snapshot", "the queue snapshot (queued work)"),
     ) if gap.get(key)]
     if unread:
         lines.append("(some results are unreadable now: " + "; ".join(unread)
@@ -137,7 +150,7 @@ def _own_work_section(drive_root: Path, value: Mapping[str, Any], task_id: str) 
         "Independent work this Presence binding started, from this or another of its conversations, "
         "newest first (queued work without a result row leads). Being listed says nothing about whether "
         "its result reached anyone. Where your tools include them, get_task_result(task_id, "
-        "presence_scope=\"own_binding\") reads one exactly, steer_task gives it new facts as this "
+        "presence_scope=\"own_binding\") reads one exactly, tell_task gives it new facts as this "
         "task's own message, and presence_cancel_work requests its cancellation. Work of other "
         "bindings and the owner's own tasks are not addressable from here.\n\n"
         + "\n".join(lines)
@@ -262,6 +275,15 @@ def build_presence_context_section(drive_root: Path, value: Any, task_id: str = 
     previous = value.get("previous_turn")
     if isinstance(previous, Mapping):
         parts.append("## Previous turn (host-authored facts)\n\n" + _previous_turn_line(previous))
+    continuing = value.get("open_turns") if isinstance(value.get("open_turns"), list) else []
+    if continuing:
+        parts.append(
+            "## Continuing turns in this conversation (host-authored facts)\n\n"
+            "These earlier turns yielded the conversation while their results await review. A running one "
+            "stays responsible for its own result and may still reply; any other status means its author is "
+            "no longer live and nothing restarts it. get_task_result reads one where your tools include it.\n\n"
+            + "\n".join(f"- {row.get('task_id')} [{row.get('status') or 'unknown'}]"
+                        for row in continuing if isinstance(row, Mapping)))
     attempt = value.get("previous_attempt")
     if isinstance(attempt, Mapping):
         delivered = attempt.get("delivered")

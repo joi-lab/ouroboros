@@ -110,7 +110,7 @@ def test_historical_supplement_live_reload_reconnect_and_full_source(tmp_path, m
             assert card.locator('[data-review-attempt]').count() == 1
             assert page.locator('.chat-live-line').filter(has_text=headline).count() == 1
             page.evaluate('() => lateEvent("open", {previouslyConnected: true})')
-            page.get_by_text('♻️ Reconnected', exact=True).wait_for()
+            page.get_by_text('Reconnected', exact=True).wait_for()
             assert card.locator('[data-review-attempt]').count() == 1
             assert page.locator('.chat-live-line').filter(has_text=headline).count() == 1
             assert link.is_visible()

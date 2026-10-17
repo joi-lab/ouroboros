@@ -194,14 +194,28 @@ test('review-only subagent projection has no activity and no auto-disclosure fla
 test('a delegated frame yields a small harness chip; an ordinary frame yields none', () => {
     const chip = executorChip({ executor_route: 'codex' });
     assert.equal(chip.harness, 'codex');
-    // ONE honest label — `{harness} · {state}` — never a bare product name: a
-    // hover-only caveat is invisible on touch, to AT, and in copies, so the
-    // run-state qualifier lives in the label itself. Identity (branded name,
-    // mark geometry) comes from the harness_presentation SSOT.
-    // A live frame carries no evidence either way — the label states the
-    // dispatch-plan fact, never an evidence-grade negative (under the
-    // pre-start charter the leaf usually IS running by round 1).
-    assert.equal(chip.label, 'Codex · dispatched');
+    // Quiet label (owner choice #360 A): an assigned route is the bare name of
+    // the selected helper — the card's own phase chip says Working, and the
+    // name never claims the session computes now. The dispatch fact stays in
+    // the detail sentence, which the expanded card prints as text (a
+    // hover-only title is invisible on touch, to AT and in copies). A live
+    // frame carries no evidence either way, so no evidence-grade negative.
+    // Identity (branded name, mark geometry) comes from harness_presentation.
+    assert.equal(chip.label, 'Codex');
+    assert.equal(chip.hasEvidence, false);
+    assert.match(chip.title, /Dispatched to Codex/);
+    for (const status of ['completed', 'failed', 'cancelled', 'rejected_duplicate']) {
+        const terminal = executorChip({ executor_route: 'codex', status });
+        assert.equal(terminal.label, 'Codex · run outcome unknown');
+        assert.equal(terminal.hasEvidence, false);
+        assert.match(terminal.title, /terminal record has no delegated-run evidence/);
+        assert.doesNotMatch(terminal.title, /arrives with the terminal receipt/);
+    }
+    assert.equal(executorChip({ executor_route: 'codex', subagent_event: 'completed' }).label,
+        'Codex · run outcome unknown');
+    assert.equal(executorChip({ executor_route: 'codex', task_terminal_status: 'failed', status: 'running' }).label,
+        'Codex · run outcome unknown');
+    assert.equal(executorChip({ executor_route: 'codex', status: 'interrupted' }).label, 'Codex');
     assert.equal('icon' in chip, false, 'mark geometry belongs to harness_presentation');
     assert.match(chip.title, /Codex/);
     // WHERE it ran is all the chip can see. It has no access to the run's spend, so
@@ -210,9 +224,9 @@ test('a delegated frame yields a small harness chip; an ordinary frame yields no
     // says it — a zero there may mean unknown pricing, never "free").
     assert.ok(!/subscription/i.test(chip.title), chip.title);
     // The opaque `harness=model` spelling prints the HARNESS part only.
-    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'Codex · dispatched');
+    assert.equal(executorChip({ executor_route: 'codex=gpt-5.6-sol' }).label, 'Codex');
     // An unknown harness still gets a chip (a generic mark), never a crash.
-    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'OpenCode · dispatched');
+    assert.equal(executorChip({ executor_route: 'opencode' }).label, 'OpenCode');
     // ABSENT FACT -> no chip at all: no placeholder, no "api" noise on every
     // ordinary bubble (the native path is the unremarkable case).
     assert.equal(executorChip({}), null);
@@ -243,7 +257,7 @@ test('a harness pin the resolution refused reads `{harness} · blocked`, never d
     // A blocked API-model actor names no route: no harness chip is invented.
     assert.equal(executorChip({ reason_code: 'subagent_executor_unavailable' }), null);
     // Any other reason code keeps the ordinary layered truth.
-    assert.equal(executorChip({ executor_route: 'codex', reason_code: 'tool_failure' }).label, 'Codex · dispatched');
+    assert.equal(executorChip({ executor_route: 'codex', reason_code: 'tool_failure' }).label, 'Codex');
 });
 
 test('the chip is layered truth: decision before evidence, receipt only from evidence', () => {
@@ -251,7 +265,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     // that — never "Ran on your ... account", a receipt nothing has issued yet.
     // The claude harness prints its product name (owner decision: "Claude Code").
     const dispatched = executorChip({ executor_route: 'claude' });
-    assert.equal(dispatched.label, 'Claude Code · dispatched');
+    assert.equal(dispatched.label, 'Claude Code');
     assert.match(dispatched.title, /Dispatched to Claude Code/);
     assert.match(dispatched.title, /run evidence arrives with the terminal receipt/);
     assert.match(dispatched.title, /itself runs on the API/);
@@ -268,13 +282,16 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: 0.0, harness_models: ['claude-sonnet'],
         },
     });
-    // Owner dictionary (plan D9): the label counts OK runs, not settled totals.
-    assert.equal(delegated.label, 'Claude Code · 1 ok');
+    // Every settled run ok is the quiet case: the bare name, still an
+    // evidence-grade receipt for sticky precedence; the owner dictionary
+    // (plan D9) keeps its counts in the detail.
+    assert.equal(delegated.label, 'Claude Code');
+    assert.equal(delegated.hasEvidence, true);
     assert.match(delegated.title, /Delegated to your Claude Code account — 1 run settled \(1 ok\), \$0\.00 subscription/);
 
-    // ALL-FAILED runs must never read as success: the failure count rides the
-    // LABEL, not only the tooltip (delegated_runs_failed was previously unread
-    // and two failed runs rendered as a clean "2 run(s)" receipt).
+    // ALL-FAILED runs must never read as success: the failure rides the LABEL,
+    // not only the detail (delegated_runs_failed was previously unread and two
+    // failed runs rendered as a clean "2 run(s)" receipt).
     const allFailed = executorChip({
         executor_route: 'codex',
         execution_evidence: {
@@ -283,7 +300,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             subscription_cost_usd: null, harness_models: [],
         },
     });
-    assert.equal(allFailed.label, 'Codex · 0 ok, 2 failed');
+    assert.equal(allFailed.label, 'Codex · 2 of 2 runs failed');
     assert.match(allFailed.title, /2 failed/);
 
     // STARTED but none settled: as far as the durable rows know, the run is
@@ -299,13 +316,13 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
     // Evidence is terminal-frame material: started-but-unsettled means the
     // run(s) never settled — a present-tense "running" on a finished card
     // would be a lie (adversarial wave B-ADV-4).
-    assert.equal(inFlight.label, 'Codex · 1 started, none settled');
+    assert.equal(inFlight.label, 'Codex · not settled');
     assert.match(inFlight.title, /1 run\(s\) started, none settled/);
 
     // ACCESS + UNVERIFIED (harness-health O13): the requested write surface and
-    // the engine-disclosed applied access ride the tooltip; runs whose
+    // the engine-disclosed applied access ride the detail; runs whose
     // work-order coverage never verified are discounted from ok AND named in
-    // the label — a short ok-count with no visible cause reads as a bug.
+    // the label — never as a physical failure the counts do not prove.
     const withAccess = executorChip({
         executor_route: 'codex',
         write_surface: 'external_workspace',
@@ -317,7 +334,7 @@ test('the chip is layered truth: decision before evidence, receipt only from evi
             applied_access_profiles: ['workspace_write'],
         },
     });
-    assert.match(withAccess.label, /1 unverified/);
+    assert.equal(withAccess.label, 'Codex · 1 of 2 runs unverified');
     assert.match(withAccess.title, /unverified work-order coverage/);
     assert.match(withAccess.title, /write surface external_workspace/);
     assert.match(withAccess.title, /access applied: workspace_write/);
@@ -475,8 +492,8 @@ test('historical frames without the failed counter reconstruct it from succeeded
             delegated_runs_succeeded: 0, subscription_cost_usd: null,
         },
     });
-    assert.equal(historical.label, 'Codex · 0 ok, 2 failed');
-    // A frame with NEITHER counter stays plain — exactly as wide as disclosed.
+    assert.equal(historical.label, 'Codex · 2 of 2 runs failed');
+    // A frame with NEITHER counter disclosed no outcome split: never quiet-clean.
     const bare = executorChip({
         executor_route: 'codex',
         execution_evidence: {
@@ -484,7 +501,66 @@ test('historical frames without the failed counter reconstruct it from succeeded
             subscription_cost_usd: null,
         },
     });
-    assert.equal(bare.label, 'Codex · 1 run');
+    assert.equal(bare.label, 'Codex · run outcome unknown');
+    assert.match(bare.title, /1 run settled, subscription spend undisclosed/);
+});
+
+test('#360 A: the quiet label names the helper; every exception stays one visible phrase', () => {
+    const settledChip = (counts, extra = {}) => executorChip({
+        executor_route: 'codex', ...extra,
+        execution_evidence: { subscription_cost_usd: null, harness_models: [], ...counts },
+    });
+    // Clean: bare name, the receipt facts in the detail sentence.
+    const clean = settledChip({ delegated_runs_started: 2, delegated_runs_settled: 2,
+        delegated_runs_succeeded: 2, delegated_runs_failed: 0, subscription_cost_usd: 0.25 });
+    assert.equal(clean.label, 'Codex');
+    assert.match(clean.title, /2 runs settled \(2 ok\), \$0\.25 subscription/);
+    // One success does not make a mixed delegation quiet-clean.
+    const mixed = settledChip({ delegated_runs_started: 3, delegated_runs_settled: 3,
+        delegated_runs_succeeded: 2, delegated_runs_failed: 1 });
+    assert.equal(mixed.label, 'Codex · 1 of 3 runs failed');
+    assert.match(mixed.title, /3 runs settled \(2 ok, 1 failed\)/);
+    assert.equal(settledChip({ delegated_runs_started: 1, delegated_runs_settled: 1,
+        delegated_runs_succeeded: 0, delegated_runs_failed: 1 }).label, 'Codex · run failed');
+    // The aggregate failed count includes source-unverified runs: the phrase
+    // never turns them into physical failures, and a mix names both.
+    assert.equal(settledChip({ delegated_runs_started: 1, delegated_runs_settled: 1, delegated_runs_succeeded: 0,
+        delegated_runs_failed: 1, delegated_runs_source_unresolved: 1 }).label, 'Codex · run unverified');
+    // The same run may both fail physically and have incomplete source coverage.
+    // Equal counts alone do not distinguish it from a coverage-only non-success.
+    for (const states of [['failed', 'source_incomplete'], ['cancelled', 'source_incomplete']]) {
+        const overlapping = settledChip({ delegated_runs_started: 1, delegated_runs_settled: 1,
+            delegated_runs_succeeded: 0, delegated_runs_failed: 1, delegated_runs_source_unresolved: 1,
+            delegated_run_failure_states: states });
+        assert.equal(overlapping.label, 'Codex · run failed or unverified');
+        assert.match(overlapping.title, /1 run settled \(0 ok, 1 failed or unverified\)/);
+    }
+    assert.equal(settledChip({ delegated_runs_started: 1, delegated_runs_settled: 1,
+        delegated_runs_succeeded: 0, delegated_runs_failed: 1, delegated_runs_source_unresolved: 1,
+        delegated_run_failure_states: ['source_incomplete'] }).label, 'Codex · run unverified');
+    const both = settledChip({ delegated_runs_started: 3, delegated_runs_settled: 3, delegated_runs_succeeded: 1,
+        delegated_runs_failed: 2, delegated_runs_source_unresolved: 1 });
+    assert.equal(both.label, 'Codex · 2 of 3 runs failed or unverified');
+    assert.doesNotMatch(both.label, /retry|recovered|then/);
+    // The detail counts the same aggregate the phrase names, never a second failure.
+    assert.match(both.title, /3 runs settled \(1 ok, 2 failed or unverified\)/);
+    assert.match(both.title, /1 run\(s\) settled with unverified work-order coverage/);
+    // A malformed frame naming more unverified runs than failures still reads unverified.
+    assert.equal(settledChip({ delegated_runs_started: 1, delegated_runs_settled: 1, delegated_runs_succeeded: 1,
+        delegated_runs_failed: 0, delegated_runs_source_unresolved: 1 }).label, 'Codex · run unverified');
+    // Runs started but never settled beside settled successes stay visible.
+    const partly = settledChip({ delegated_runs_started: 3, delegated_runs_settled: 2,
+        delegated_runs_succeeded: 2, delegated_runs_failed: 0 });
+    assert.equal(partly.label, 'Codex · 1 of 3 runs not settled');
+    assert.match(partly.title, /1 more run\(s\) started, not settled/);
+    // Every evidence branch stays evidence-grade; the counts never leave the detail.
+    for (const chip of [clean, mixed, both, partly]) {
+        assert.equal(chip.hasEvidence, true);
+        assert.doesNotMatch(chip.label, /\bok\b|dispatched|subscription|\$/);
+    }
+    // The frozen refusal wording is untouched.
+    assert.equal(executorChip({ executor_route: 'codex', reason_code: 'subagent_executor_unavailable' }).label,
+        'Codex · blocked');
 });
 
 test('an evidence-bearing chip is marked so sticky rendering can refuse downgrades', () => {

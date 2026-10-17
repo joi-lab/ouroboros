@@ -19,7 +19,7 @@ from ouroboros.owner_mailbox import (
     write_owner_message,
     write_task_message,
 )
-from tests.test_acceptance_async_loop import ANSWER, full_loop as _full_loop
+from tests.test_acceptance_async_loop import ANSWER, full_loop as _full_loop, keep
 from tests.test_acceptance_semantic_subject import case as _semantic_case
 
 full_loop = _full_loop
@@ -135,9 +135,14 @@ def test_real_loop_terminal_admission_distinguishes_settlement_from_owner(full_l
     def main(_llm, messages, *_a, **_kw):
         f.model_inputs.append(copy.deepcopy(messages))
         f.model_step += 1
-        assert f.model_step <= 2, f.progress
+        assert f.model_step <= 3, f.progress
         if f.model_step == 1:
             return {"content": ANSWER}, 0.0
+        if f.model_step == 2:
+            # G1 (#1737/#1741): the settled PASS reaches Main before its decision.
+            assert any(source.get("settled") for message in messages
+                       for source in message.get("review_feedback", []))
+            return keep(f), 0.0
         assert arrival == "owner", "a system settlement must not force another Main round"
         assert owner_text in str(messages)
         # The new owner turn must run before finalization. Its subsequent
@@ -148,12 +153,12 @@ def test_real_loop_terminal_admission_distinguishes_settlement_from_owner(full_l
     if arrival == "owner":
         with pytest.raises(OwnerInputReceived):
             f.run()
-        assert f.model_step == 2 and len(f.review_sends) == 1
+        assert f.model_step == 3 and len(f.review_sends) == 1
         assert any("owner follow-up arrived" in text for text in f.progress)
         return
     result, _usage, trace = f.run()
     assert result == ANSWER and len(f.review_sends) == 1
-    assert f.model_step == 1
+    assert f.model_step == 2
     assert not f.ctx.owner_message_admission_agent._accepting_owner_messages
     assert trace["acceptance_decision"]["status"] == "accepted"
     assert not any("owner follow-up arrived" in text for text in f.progress)

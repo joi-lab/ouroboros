@@ -22,11 +22,12 @@ def test_rollback_to_version_force_syncs_remote_when_diverged(monkeypatch, tmp_p
     calls = []
     network_calls = []
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, **kwargs):
         calls.append(cmd)
         if cmd == ["git", "rev-parse", "--verify", "targetsha^{commit}"]:
             return 0, "abc123def456", ""
         if cmd == ["git", "reset", "--hard", "abc123def456"]:
+            assert kwargs == {"repair_index": False}
             return 0, "", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "HEAD...origin/ouroboros"]:
             return 0, "1 1", ""
@@ -68,10 +69,11 @@ def test_rollback_to_version_returns_warning_when_remote_sync_fails(monkeypatch,
         lambda cmd: (1, "", "rejected"),
     )
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, **kwargs):
         if cmd == ["git", "rev-parse", "--verify", "targetsha^{commit}"]:
             return 0, "abc123def456", ""
         if cmd == ["git", "reset", "--hard", "abc123def456"]:
+            assert kwargs == {"repair_index": False}
             return 0, "", ""
         if cmd == ["git", "rev-list", "--left-right", "--count", "HEAD...origin/ouroboros"]:
             return 0, "2 0", ""
@@ -102,11 +104,12 @@ def test_rollback_to_version_skips_remote_sync_without_remote(monkeypatch, tmp_p
 
     calls = []
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, **kwargs):
         calls.append(cmd)
         if cmd == ["git", "rev-parse", "--verify", "targetsha^{commit}"]:
             return 0, "abc123def456", ""
         if cmd == ["git", "reset", "--hard", "abc123def456"]:
+            assert kwargs == {"repair_index": False}
             return 0, "", ""
         raise AssertionError(cmd)
 
@@ -132,11 +135,12 @@ def test_rollback_to_version_skips_remote_sync_for_unknown_branch(monkeypatch, t
 
     calls = []
 
-    def fake_git_capture(cmd):
+    def fake_git_capture(cmd, **kwargs):
         calls.append(cmd)
         if cmd == ["git", "rev-parse", "--verify", "targetsha^{commit}"]:
             return 0, "abc123def456", ""
         if cmd == ["git", "reset", "--hard", "abc123def456"]:
+            assert kwargs == {"repair_index": False}
             return 0, "", ""
         raise AssertionError(cmd)
 

@@ -353,13 +353,17 @@ def _git_source_snapshot(repo_dir: pathlib.Path, ref: str) -> Iterator[tuple[pat
                 raise ValueError(f"gated source at {ref} must be a regular file: {path}")
             entries.append((path, object_id))
 
-        batch = subprocess.run(
-            ["git", "cat-file", "--batch"],
-            cwd=root,
-            check=True,
-            input=b"".join(object_id + b"\n" for _path, object_id in entries),
-            capture_output=True,
-        ).stdout
+        # Avoid the observed parent/Git mutual pipe-write wait; blob validation stays below.
+        with tempfile.TemporaryFile() as source_ids:
+            source_ids.write(b"".join(object_id + b"\n" for _path, object_id in entries))
+            source_ids.seek(0)
+            batch = subprocess.run(
+                ["git", "cat-file", "--batch"],
+                cwd=root,
+                check=True,
+                stdin=source_ids,
+                capture_output=True,
+            ).stdout
         cursor = 0
         paths: list[str] = []
         for path, expected_id in entries:
@@ -1077,6 +1081,84 @@ def size_headroom_lines(
     if len(functions_by_size) > limit:
         lines.append(f"{len(functions_by_size) - limit} more functions omitted.")
     return lines
+
+
+DIFF_PULSE_QUESTION = (
+    "Question: does each touched file still read as one coherent thought, and is all of this growth "
+    "needed, or could the same behaviour live in fewer concepts, branches or state?"
+)
+
+
+def _untracked_lines(path: pathlib.Path) -> int:
+    """Lines of an untracked file; 0 when unreadable or not UTF-8 text, as Git counts no lines of a binary."""
+    try:
+        return len(path.read_bytes().decode("utf-8").splitlines())
+    except (OSError, UnicodeDecodeError):
+        return 0
+
+
+def diff_pulse(
+    repo_dir: pathlib.Path, paths: Iterable[str] | None = None, *, staged: bool = False, limit: int = 5,
+) -> str:
+    """A change's size since its contribution base as one fact line, the touched books'
+    balance, then one fixed question; ``""`` when Git cannot measure the checkout.
+
+    The base is the book balance's (``reference_books.contribution_base``), so a branch's
+    earlier commits stay in the totals and the files they created stay listed as new;
+    without a cached official ref the line says so and measures from HEAD. ``staged``
+    reads the index (what a commit or a review subject holds), otherwise the worktree and
+    its untracked files. ``paths`` names the modules and books shown (an edit's files);
+    omitted, every changed path is. A fact for the mind, never a gate: one shape and one
+    question for any size, and the list bounds are presentation only, counting the rest.
+    """
+    from ouroboros.reference_books import _git_bytes, book_balance_note, contribution_base
+
+    root = pathlib.Path(repo_dir)
+    upstream, merge_base = contribution_base(root)
+
+    def diff(*options: str) -> bytes | None:
+        return _git_bytes(root, "--no-optional-locks", "diff", *(("--cached",) if staged else ()),
+                          "--no-renames", "-z", *options, merge_base or "HEAD")
+
+    numstat, created = diff("--numstat"), diff("--name-only", "--diff-filter=A")
+    if numstat is None or created is None:
+        return ""
+    changed: dict[str, tuple[int, int]] = {}
+    for row in numstat.decode("utf-8", "replace").split("\0"):
+        plus, _, rest = row.partition("\t")
+        minus, _, path = rest.partition("\t")
+        if path:  # a binary file's "-" counts no lines
+            changed[path] = (int(plus) if plus.isdigit() else 0, int(minus) if minus.isdigit() else 0)
+    new = [path for path in created.decode("utf-8", "replace").split("\0") if path]
+    if not staged:
+        untracked = _git_bytes(root, "--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z")
+        for path in (untracked or b"").decode("utf-8", "replace").split("\0"):
+            if path:
+                changed[path] = (_untracked_lines(root / path), 0)
+                new.append(path)
+    shown = list(dict.fromkeys(str(path) for path in paths)) if paths is not None else list(changed)
+    modules: list[tuple[GatedModule, int, int]] = []
+    for path in shown:
+        try:
+            modules.extend((module, *changed.get(module.path, (0, 0)))
+                           for module in iter_gated_modules(root, repo_paths=[path]))
+        except (OSError, ValueError):  # deleted, outside the checkout or not UTF-8 text: no size to show
+            continue
+    # Most grown first, then the largest: where the change put its weight.
+    modules.sort(key=lambda row: (row[2] - row[1], -row[0].line_count, row[0].path))
+
+    def listed(items: list[str]) -> str:
+        more = f" (+{len(items) - limit} more)" if len(items) > limit else ""
+        return ", ".join(items[:limit]) + more if items else "none"
+
+    added, deleted = sum(plus for plus, _ in changed.values()), sum(minus for _, minus in changed.values())
+    since = (f"{upstream.removeprefix('refs/remotes/')} merge-base {merge_base[:12]}" if merge_base
+             else "HEAD (contribution base unavailable)")
+    sizes = [f"{module.path} {module.line_count} (+{plus}/-{minus})" for module, plus, minus in modules]
+    fact = (f"Diff pulse since {since}: files {len(changed)}, lines +{added}/-{deleted} (net {added - deleted:+d}); "
+            f"new files: {listed(new)}; module lines (target {TARGET_MODULE_LINES}, cap {MAX_MODULE_LINES}): "
+            f"{listed(sizes)}.")
+    return "\n".join(part for part in (fact, book_balance_note(root, shown), DIFF_PULSE_QUESTION) if part)
 
 
 def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any]:

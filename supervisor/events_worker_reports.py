@@ -24,14 +24,22 @@ from ouroboros.cost_projection import live_root_cost_projection
 
 
 def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
+    """Liveness stamp and live frame for one running task; a no-op once it left RUNNING.
+
+    Mutates the RUNNING entry IN PLACE (the ``_handle_llm_usage`` rule): a
+    write-back would resurrect a task a cross-thread cancel popped between the
+    get and the write. The root cost figure is the stale-allowed projection,
+    so a heartbeat never reads the current task-result store on the drain.
+    """
     task_id = str(evt.get("task_id") or "")
     if task_id and task_id in ctx.RUNNING:
-        meta = ctx.RUNNING.get(task_id) or {}
+        meta = ctx.RUNNING.get(task_id)
+        if not isinstance(meta, dict):
+            return
         meta["last_heartbeat_at"] = time.time()
         phase = str(evt.get("phase") or "")
         if phase:
             meta["heartbeat_phase"] = phase
-        ctx.RUNNING[task_id] = meta
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
         runtime_sec = round(max(0.0, time.time() - started_at), 1) if started_at > 0 else None
@@ -176,7 +184,14 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
-    """Forward live events; persist durable task checkpoints."""
+    """Address and forward one live frame; persist the one nested kind whose producer owns no row.
+
+    A ``task_checkpoint`` arrives already durable: its producer appended the
+    events.jsonl row (and the progress.jsonl row of a System checkpoint) before
+    queueing the frame (``loop_messages._emit_checkpoint_event``, owner 1A(3)),
+    with lineage and chat stamped by value, so this handler — which under the
+    two-lane bus may run after the task left RUNNING — only addresses and pushes.
+    """
     data = evt.get("data")
     if not isinstance(data, dict):
         return
@@ -191,11 +206,9 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
         log.debug("Failed to forward live log event", exc_info=True)
     # task_start_settings_reload_failed is a durable owner disclosure (#285):
     # without persistence the fact evaporates on the next page load.
-    if data.get("type") in ("task_checkpoint", "task_start_settings_reload_failed"):
+    if data.get("type") == "task_start_settings_reload_failed":
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
-            if payload.get("system_type") == "task_checkpoint":
-                ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "progress.jsonl", payload)
         except Exception:
             log.debug("Failed to persist %s event to events.jsonl", data.get("type"), exc_info=True)
 
@@ -238,6 +251,8 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
             token=token,
             root_task_id=str(evt.get("root_task_id") or ""),
             task_id=str(evt.get("task_id") or ""),
+            # A legacy event without it keeps the unattributed (pre-#1183) begin.
+            pooled_owner=evt.get("pooled_owner") if isinstance(evt.get("pooled_owner"), dict) else None,
             outcome=str(evt.get("outcome") or ""),
             expected_generation=(
                 int(evt["expected_generation"])

@@ -688,7 +688,7 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     responses = iter([
         "Initial complete draft.", _finish_response("Controlled answer v1."),
         _finish_response("Free-form improvement v2."), _finish_response("Free-form improvement v3."),
-        stale_envelope, _finish_response(decoded),
+        stale_envelope, _finish_response(decoded), _finish_response(decoded),
     ])
     model_calls = []
     acceptance_inputs = []
@@ -704,6 +704,9 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     def fake_call(_llm, request_messages, *_args, **_kwargs):
         model_calls.append([dict(row) for row in request_messages])
         response = next(responses)
+        observer = _kwargs.get("model_context_observer")
+        if callable(observer):  # like the real transport: a returned request reports what Main received
+            observer(request_messages)
         return ({"role": "assistant", **response} if isinstance(response, dict)
                 else {"role": "assistant", "content": response}), 0.0
 
@@ -758,12 +761,15 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
     monkeypatch.setattr(loop, "call_llm_with_retry", fake_call)
     monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", first_nudge_only)
     monkeypatch.setattr(loop, "_execute_task_acceptance_panel", fake_panel)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "auto")
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "required")
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "4")
     monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "10")
     from tests.test_loop_acceptance_gate import _seed_acceptance_root
     _seed_acceptance_root(tmp_path, "issue-449", SimpleNamespace())
+    # Required reviews retained produced material, never the expected_output (#1731).
+    from ouroboros.artifacts import store_task_artifact_bytes
+    store_task_artifact_bytes(tmp_path, "issue-449", "deliverable.md", b"Produced deliverable.")
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.is_direct_chat = False
     registry._ctx.task_contract = {
@@ -794,7 +800,11 @@ def test_multi_improvement_explicit_selection_binds_exact_answer_before_single_d
         )
         for call in model_calls
     ]
-    assert len(model_calls) == 6
+    # Six authored rounds plus the one in which the settled PASS reached Main before
+    # its kept decoded answer was delivered (G1 #1737/D12); no further panel was paid.
+    assert len(model_calls) == 7
+    assert any(source.get("settled") and source.get("binding_hash") == trace["review_runs"][-1]["binding_hash"]
+               for row in model_calls[-1] for source in row.get("review_feedback") or [])
     assert prompt_counts[0] == 0 and all(count >= 1 for count in prompt_counts[1:])
     assert all(
         "[DELIVERY_CONTROL_REPAIR]" not in str(row.get("content") or "")

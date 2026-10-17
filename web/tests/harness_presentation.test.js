@@ -253,7 +253,8 @@ test('a subagent row offers its account under the name the Accounts tab gives it
     });
     const option = html.match(/<option value="codex-default"[^>]*>([^<]*)<\/option>/);
     assert.ok(option, 'the pinned account is offered');
-    assert.equal(option[1], 'Account: native@example.com · codex-default (pinned)');
+    // The field is labelled Account, so the option names the account alone.
+    assert.equal(option[1], 'native@example.com · codex-default (pinned)');
 });
 
 test('configured identity ignores stale daemon labels until the catalog read is proven', () => {
@@ -287,8 +288,8 @@ test('configured identity ignores stale daemon labels until the catalog read is 
     assert.match(provenHtml, />Stale daemon label · agent<\/span>/);
 });
 
-test('Chat, Logs, onboarding, and reviewer lanes consume the same mark owner', () => {
-    const modules = ['chat_activity.js', 'logs.js', 'onboarding_agents_step.js', 'reviewer_slots.js'];
+test('Chat, Logs, onboarding, and the subagent catalog consume the same mark owner', () => {
+    const modules = ['chat_activity.js', 'logs.js', 'onboarding_agents_step.js', 'subagents_settings.js'];
     for (const name of modules) {
         const source = readFileSync(new URL(`../modules/${name}`, import.meta.url), 'utf8');
         assert.match(source, name === 'chat_activity.js' ? /executorIdentityMarkup/ : /harnessIdentityMarkup/, `${name} bypasses harness presentation SSOT`);
@@ -299,14 +300,28 @@ test('Chat, Logs, onboarding, and reviewer lanes consume the same mark owner', (
     assert.doesNotMatch(events, /['"](?:◇|✳|▸|◆)['"]/);
 });
 
-test('#516 the card meta line separates its parts with real text, not a CSS gap', () => {
+test('#516 the card meta line separates its parts with real text, not a CSS gap', (t) => {
+    // The browser's text serializer, as utils.escapeHtmlText reads it back.
+    const priorDocument = globalThis.document;
+    globalThis.document = { createElement: () => ({ set textContent(value) {
+        this.innerHTML = String(value).replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+    } }) };
+    t.after(() => { globalThis.document = priorDocument; });
     const chip = { harness: 'claudexor', label: 'Claudexor', title: 'route', observedModels: ['opus'] };
     const markup = executorIdentityMarkup(chip, { agentModel: 'sonnet' });
     // Chip, coordinator model and observed models are three parts of one line,
     // and every boundary between them carries the separator itself — a copied
-    // line and a screen reader get it, which a flex gap never provided.
-    assert.equal([...markup.matchAll(/ · /g)].length, 2);
+    // line and a screen reader get it, which a flex gap never provided. The
+    // chip's detail sentence (#360 A) is a fourth part whose separator lives
+    // inside its own wrapper, shown only on the expanded card.
+    assert.equal([...markup.matchAll(/ · /g)].length, 3);
+    assert.match(markup, /<\/span><span class="chat-live-executor-detail"> · <span class="chat-live-meta-text">route<\/span><\/span> · /);
     assert.match(markup, /<\/span> · <span class="chat-live-meta-text">Coordinator: sonnet<\/span> · /);
+    // No detail sentence, no wrapper; a detail is escaped text, never markup, in the
+    // text serializer's own form (quotes stay quotes), so the line round-trips.
+    assert.doesNotMatch(executorIdentityMarkup({ harness: 'codex', label: 'Codex' }), /executor-detail/);
+    assert.match(executorIdentityMarkup({ harness: 'codex', label: 'Codex', title: '<b>x</b> & "y"' }),
+        /executor-detail"> · <span class="chat-live-meta-text">&lt;b&gt;x&lt;\/b&gt; &amp; "y"<\/span>/);
     // A missing part takes its separator with it: no leading or doubled dots.
     assert.equal(executorIdentityMarkup(null, { agentModel: 'sonnet' }),
         '<span class="chat-live-meta-text">Agent model: sonnet</span>');
@@ -314,14 +329,14 @@ test('#516 the card meta line separates its parts with real text, not a CSS gap'
     assert.equal(joinMetaParts(['a', '', 'b']), `a${META_PART_SEPARATOR}b`);
     assert.equal(META_PART_SEPARATOR, ' · ');
 
-    // The renderer joins the executor block with the rest through that same rule,
-    // instead of concatenating it onto the first fact.
+    // The renderer joins the executor block with the rest through the meta line's one joiner (each separator
+    // rides inside the part before it), instead of concatenating it onto the first fact.
     const activitySource = readFileSync(new URL('../modules/chat_activity.js', import.meta.url), 'utf8');
     const renderer = activitySource.slice(
         activitySource.indexOf('export function renderLiveCardMeta'),
         activitySource.indexOf('export function ownLiveActionsEl'),
     );
-    assert.match(renderer, /joinMetaParts\(\[\s*executorIdentityMarkup\(/);
+    assert.match(renderer, /metaLineHtml\(\[\s*executorIdentityMarkup\(/);
     assert.doesNotMatch(renderer, /\.join\(' · '\)/);
     // The visual-only spacing that stood in for the separator is gone.
     const css = readFileSync(new URL('../style.css', import.meta.url), 'utf8');

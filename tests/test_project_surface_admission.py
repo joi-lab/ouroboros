@@ -12,6 +12,7 @@ from ouroboros.task_results import load_task_result
 from supervisor import queue, workers
 from tests.test_swarm_host_admission import host as host_fixture
 from tests.test_project_authority_outages import _uncertain_child
+from tests._store_shared import result_signature
 from tests.test_project_hold_recovery import accepted, worker
 
 host = host_fixture
@@ -74,7 +75,7 @@ def test_project_api_inactive_room_keeps_the_admission_owners_typed_refusal(host
 
 def test_queue_gateway_preserves_child_wait_and_recovery_without_root_census_inflation(host, tmp_path, monkeypatch):
     accepted(host, tmp_path, tid="sibling")
-    child, original = _uncertain_child(host, monkeypatch)
+    child, original, unreadable = _uncertain_child(host, monkeypatch)
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ["sibling"]
@@ -91,7 +92,8 @@ def test_queue_gateway_preserves_child_wait_and_recovery_without_root_census_inf
     assert queue.QUEUE_SNAPSHOT_PATH.read_bytes() == before  # passive projection
     host.running.clear()
     workers.WORKERS[0].busy_task_id = None
-    (host.root / "task_results" / "held.json").write_bytes(original)
+    unreadable["on"] = False  # the committed receipt is readable again
+    assert result_signature(host.root, "held") == original
     workers.assign_tasks()
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ["sibling", "held"]

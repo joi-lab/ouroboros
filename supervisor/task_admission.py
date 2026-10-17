@@ -1,10 +1,17 @@
-"""Atomic admission transitions for the managed task queue."""
+"""Atomic admission transitions for the managed task queue.
+
+Ingress ids are guarded by token-owned reservations: ``reserve_task_admission``
+runs before the caller creates drives, attachments or workspace artifacts, a
+different token on a live id is refused as ``duplicate_task_id``, and only the
+owning token can release it. A retry cannot therefore create a second task.
+"""
 
 from __future__ import annotations
 
 import logging
 import pathlib
 import uuid
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
 
 from ouroboros.depth_evidence import parse_task_depth
@@ -17,8 +24,14 @@ from ouroboros.task_results import (
     write_task_result,
 )
 from ouroboros.utils import utc_now_iso
+from ouroboros.store import StoreError, acquisition_budget
 
 log = logging.getLogger(__name__)
+
+# The requested row's preparation claim (``supervisor/workspace_preparation.py``):
+# its token, owner, phase and owned resource handle. A row carrying another
+# token's claim is owned by that preparation, never by a new arrival.
+WORKSPACE_PREPARATION_FIELD = "workspace_preparation"
 
 
 def coerce_queue_order(value: Any, default: int = 0) -> int:
@@ -127,6 +140,8 @@ def parse_schedule_task_depth(
     expected_output: str,
     constraints: str,
     task_context: str,
+    preparation: Any = None,
+    defer_contention: bool = False,
 ) -> tuple[int, bool]:
     """Parse depth after an atomic final freshness check.
 
@@ -134,13 +149,16 @@ def parse_schedule_task_depth(
     concurrent reservation or queue assignment can arrive before parsing.  The
     final check below shares the queue lock with those writers and keeps the
     malformed-result write under that lock, so an invalid replay cannot steal
-    custody between the probe and rejection.
+    custody between the probe and rejection. A preparation claim reads its own
+    reservation and marker as its own, never as a replay.
     """
     from supervisor import queue
 
-    with queue._queue_lock:
+    with acquisition_budget(0), queue._queue_lock:
         if tid and subagent_schedule_preflight(
             ctx, evt, chat_id, delegation_role=delegation_role,
+            admission_token=getattr(preparation, "token", ""),
+            defer_contention=defer_contention,
         ):
             return 0, True
         try:
@@ -150,6 +168,7 @@ def parse_schedule_task_depth(
 
             _reject_schedule_task(
                 ctx,
+                preparation=preparation,
                 tid=tid,
                 chat_id=chat_id,
                 delegation_role=delegation_role,
@@ -334,6 +353,10 @@ def restored_handoff_unproven(task: dict, existing: Optional[dict], *, ancestor_
     An unreadable ancestor is neither interruption nor permission: both wait.
     """
     existing = existing or {}
+    if "_working_recovery" in task:
+        from supervisor import queue
+
+        return ancestor_unknown or not _working_resume_granted(task, queue.DRIVE_ROOT, existing=existing)
     possible = (bool(existing.get("started_at")) or existing.get("admitted_dispatch", "none") != "none"
                 or ancestor_unknown)
     if task.get("project_id"):
@@ -400,17 +423,32 @@ def enqueue_with_admission_receipt(task: Dict[str, Any], *, receipt_required: bo
 
 
 def record_project_dispatch_possible(task: dict) -> bool:
-    """Persist possible handoff for scope-verifiable work beside admitted_dispatch.
+    """Persist possible handoff for scoped work and every saved-work successor (alone)."""
+    projection = project_dispatch_projection(task)
+    return projection is None or commit_dispatch_marks(task, [projection]) is True
+
+
+def project_dispatch_projection(task: dict) -> Optional[SimpleNamespace]:
+    """The Project half of a launch's dispatch mark, for scoped work and every saved-work
+    successor; None when it does not apply (``commit_dispatch_marks`` writes it).
 
     Assignment reads back 'possible' before handoff, so even an older PENDING
-    snapshot cannot overrule it if the best-effort RUNNING mirror fails. This
-    result fact never becomes 'none'; fresh admission's positive 'none' lives
+    snapshot cannot overrule it if the best-effort RUNNING mirror fails. Its
+    attempt mark never decreases; fresh admission's positive 'none' lives
     on the queue row. No early result may preempt the admission receipt owner.
+    Only the governing continuation's own check applies (``governing_continuation``).
     """
-    if not task.get("project_id") and task.get("_project_scope_none") is not True:
-        return True
+    if not task.get("project_id") and task.get("_project_scope_none") is not True and "_working_recovery" not in task:
+        return None
     from supervisor import queue
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+
+    attempt = task.get("_attempt") or 1
+    if type(attempt) is not int or attempt < 1:
+        return SimpleNamespace(project=lambda current, incoming: None, verify=lambda stored: False)
+    governing = governing_continuation(task)
+    source = _working_source(task, queue.DRIVE_ROOT) if governing == "working" else None
+    mark = uuid.uuid4().hex[:12]  # this commit's own: an earlier mark of the same attempt never verifies it
 
     def project(current, _incoming):
         if (current.get("status") in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}
@@ -418,23 +456,153 @@ def record_project_dispatch_possible(task: dict) -> bool:
             if current.get("_owner_hold"):
                 task["_owner_hold"] = current["_owner_hold"]
             return None
-        return {"admitted_dispatch": "possible", "status": current.get("status") or STATUS_REQUESTED}
+        marked = current.get("admitted_dispatch_attempt")
+        if (marked is not None and (type(marked) is not int or marked < 1 or marked > attempt)
+                or "admitted_dispatch_attempt" in current and marked is None
+                or governing == "owner_wait" and not _owner_wait_current(task, current)
+                or governing == "exact_pause" and not _exact_resume_granted(task, queue.DRIVE_ROOT, existing=current)
+                or source is not None and not _working_attempt_unstarted(task, current, source)):
+            return None
+        return {"admitted_dispatch": "possible", "admitted_dispatch_attempt": attempt,
+                "admitted_dispatch_mark": mark, "status": current.get("status") or STATUS_REQUESTED}
 
-    try:
-        written = write_task_result(queue.DRIVE_ROOT, task["id"], STATUS_REQUESTED,
-                                    _field_projector=project, strict_existing_dict=True)
-        if written is False:
-            return False
-        stored = load_task_result(queue.DRIVE_ROOT, task["id"], strict=True) or {}
+    def verify(stored):
         return (stored.get("admitted_dispatch") == "possible"
+                and type(stored.get("admitted_dispatch_attempt")) is int
+                and stored["admitted_dispatch_attempt"] == attempt and stored.get("admitted_dispatch_mark") == mark
                 and stored.get("status") not in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}
                 and not stored.get("_owner_hold"))
-    except Exception:
-        log.warning("Project dispatch evidence unavailable for %s", task.get("id"), exc_info=True)
+
+    return SimpleNamespace(project=project, verify=verify)
+
+
+def commit_dispatch_marks(task: dict, projections: list) -> Optional[bool]:
+    """ONE task-result write carrying every applicable owner's dispatch mark (Project, schedule).
+
+    Each projection keeps its owner's predicate and any refusal writes nothing; a
+    later projection wins a shared field (the schedule receipt's ``running``), so the
+    document is the one the owners' separate writes produced. True: committed and
+    read back. False: positively not written (a refusal, or a transaction whose
+    rollback was confirmed for another cause). None: a commit may have landed (an
+    exception without confirmed rollback, an unreadable or disagreeing readback) —
+    never replayable. Confirmed-rollback contention re-raises: nothing was written,
+    and the caller's contention classifier (``schedule_occurrence.contention``)
+    defers the same first dispatch, as demand rather than a refusal.
+    """
+    from supervisor import queue
+
+    refused = [False]
+
+    def compose(current, incoming):
+        fields: Dict[str, Any] = {}
+        for projection in projections:
+            projected = projection.project(current, incoming)
+            if projected is None:
+                refused[0] = True
+                return None
+            fields.update(projected)
+        refused[0] = False
+        return fields
+
+    try:
+        write_task_result(queue.DRIVE_ROOT, task["id"], STATUS_REQUESTED, _field_projector=compose,
+                          strict_existing_dict=True)
+    except Exception as exc:
+        if getattr(exc, "rollback_confirmed", None) is True:
+            from supervisor.schedule_occurrence import contention
+
+            if contention(exc):
+                raise
+            log.info("Dispatch evidence for %s was not written (%s)", task.get("id"), type(exc).__name__)
+            return False
+        log.warning("Dispatch evidence for %s may have committed", task.get("id"), exc_info=True)
+        return None
+    if refused[0]:
         return False
+    try:
+        stored = load_task_result(queue.DRIVE_ROOT, task["id"], strict=True) or {}
+    except Exception:
+        log.warning("Committed dispatch evidence for %s could not be read back", task.get("id"), exc_info=True)
+        return None
+    return True if all(projection.verify(stored) for projection in projections) else None
 
 
-def _exact_resume_granted(task: dict, drive_root: Any) -> bool:
+def governing_continuation(task: dict) -> str:
+    """Name the ONE carrier the loop resumes: owner wait, then exact pause, then saved work.
+
+    The loop loads the first present carrier and never falls back when it fails,
+    so admission validates that carrier alone. A later carrier legitimately
+    retains the earlier saved-work locator; a valid newer one never reads it, and
+    an invalid one never falls back to it. Null snapshot fields are absent.
+    """
+    if task.get("_owner_wait_resume"):
+        return "owner_wait"
+    if task.get("_budget_pause_resume"):
+        return "exact_pause"
+    return "working" if "_working_recovery" in task else ""
+
+
+def _owner_wait_current(task: dict, stored: dict) -> bool:
+    """The handoff names the result's still-waiting wait; restart authority stays with restore."""
+    handoff, wait = task.get("_owner_wait_resume"), stored.get("owner_wait")
+    return (isinstance(handoff, dict) and isinstance(wait, dict) and wait.get("state") == "waiting"
+            and bool(wait.get("wait_id")) and wait.get("wait_id") == handoff.get("wait_id"))
+
+
+def _working_source(task: dict, drive_root: Any) -> dict:
+    from ouroboros.working_checkpoint import recovery_source_for_task
+
+    try:
+        return recovery_source_for_task(pathlib.Path(task.get("budget_drive_root") or drive_root), task)
+    except (OSError, ValueError, TypeError, KeyError):
+        log.warning("Saved work source could not authorize dispatch for %s", task.get("id"), exc_info=True)
+        return {}
+
+
+def _working_attempt_unstarted(task: dict, stored: dict, source: dict) -> bool:
+    """An exact source permits its next attempt only before that attempt's handoff.
+
+    New launchers stamp the attempt BEFORE put, including when the RUNNING
+    mirror later fails. An old source with no addressed mark proves no such
+    protocol; retain it rather than guess. Earlier attempt marks never reset.
+    A direct first launch stores 0 (agent), while its checkpoint names 1
+    (owner_wait). Only that unmarked, owner-bound launch uses the source's 1.
+    """
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+
+    if (not source or stored.get("task_id") != task.get("id")
+            or not stored.get("status") or stored.get("admission_outcome") == "never_admitted"
+            or stored.get("status") in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}):
+        return False
+    target = task["_attempt"]  # the exact-source reader validated this integer
+    marked = stored.get("admitted_dispatch_attempt")
+    if "admitted_dispatch_attempt" in stored:
+        if type(marked) is not int or not 0 < marked < target:
+            return False
+    elif (type(source.get("retained_work_dispatch_protocol")) is not int
+          or source["retained_work_dispatch_protocol"] != 1):
+        return False
+    observed = stored.get("task_attempt")
+    owner = stored.get("execution_owner")
+    if (type(observed) is int and observed == 0 and target == 2 and source.get("task_attempt") == 1
+            and "admitted_dispatch_attempt" not in stored and isinstance(owner, dict)
+            and owner.get("kind") == "direct"
+            and type(owner.get("task_attempt")) is int and owner["task_attempt"] == 0):
+        observed = 1
+    return ("task_attempt" not in stored
+            or type(observed) is int and 0 < observed < target)
+
+
+def _working_resume_granted(task: dict, drive_root: Any, *, existing: Optional[dict] = None) -> bool:
+    source = _working_source(task, drive_root)
+    if not source:
+        return False
+    stored = existing if existing is not None else load_task_result(
+        pathlib.Path(task.get("budget_drive_root") or drive_root), str(task.get("id") or ""), strict=True) or {}
+    return _working_attempt_unstarted(task, stored, source)
+
+
+def _exact_resume_granted(task: dict, drive_root: Any, *, existing: Optional[dict] = None) -> bool:
     """Whether the owner's single-use exact Resume grant is this row's handoff authority.
 
     A mid-run pause was dispatched, so it never has first-dispatch 'none'. Its
@@ -448,8 +616,8 @@ def _exact_resume_granted(task: dict, drive_root: Any) -> bool:
     handoff = task.get("_budget_pause_resume")
     if not isinstance(handoff, dict) or not str(handoff.get("grant_id") or ""):
         return False
-    root = pathlib.Path(task.get("budget_drive_root") or drive_root)
-    stored = load_task_result(root, str(task.get("id") or ""), strict=True) or {}
+    stored = existing if existing is not None else load_task_result(
+        pathlib.Path(task.get("budget_drive_root") or drive_root), str(task.get("id") or ""), strict=True) or {}
     pause = stored.get("budget_pause") if isinstance(stored.get("budget_pause"), dict) else {}
     grant = pause.get("grant") if isinstance(pause.get("grant"), dict) else {}
     return (pause.get("state") == STATE_RESUME_GRANTED
@@ -479,15 +647,19 @@ def revalidate_project_holds() -> None:
     )
     from supervisor import queue
     from supervisor.queue_snapshot import _descends_from, _interrupted_ancestors, _fence_snapshot_running_rows, _exact_pause_row
-    from supervisor.schedule_occurrence import restore_allowed
+    from supervisor.schedule_occurrence import first_dispatch_unsent, restore_allowed
     from supervisor.update_merge import assisted_resume_authorizes
     from ouroboros.projects_registry import _load_bindings, project_binding_for_task
+    from ouroboros.project_placement import pending_placement, refresh_pending_placement
     from ouroboros.owner_wait import restore_owner_wait_allowed
+    from ouroboros.delegate_recovery import planned_handoff_resume_allowed
+    from supervisor.events_budget import BUDGET_HOLD_KEY, HOLD_RESTORE_REFUSED_PREFIX, budget_hold_fact
 
     held = [task for task in queue.PENDING if task.get("_project_admission_restore_hold")]
     if not held:
         return
-    effects = ("_project_admission_restore_hold", "_terminalization_retry", "_owner_hold")
+    effects = ("_project_admission_restore_hold", "_terminalization_retry", "_owner_hold",
+               "_owner_wait_resume", "_budget_pause", "_budget_pause_resume", BUDGET_HOLD_KEY)
     before = [copy.deepcopy({key: task[key] for key in effects if key in task}) for task in held]
     counts = Counter(row.get("id") for row in queue.PENDING)
     # Restore's parent rule, re-read at release: exact continuations are saved work.
@@ -514,12 +686,40 @@ def revalidate_project_holds() -> None:
             if tid in queue.RUNNING or tid in queue.ADMISSION_RESERVATIONS or counts[tid] != 1:
                 raise ValueError("Another queue owner holds this task id; recovery remains closed.")
             deadline = queue._task_deadline_ts(task)
-            if deadline and time.time() >= deadline:
-                raise ProjectAdmissionError("deadline", "The task deadline elapsed while waiting for its Project.")
-            owner_resume = restore_owner_wait_allowed(queue.DRIVE_ROOT, task, strict=True)
-            if task.get("_owner_wait_resume") and not owner_resume:
+            expired = bool(deadline and time.time() >= deadline)
+            # An owner-wait continuation is judged on its exact authority apart from that
+            # deadline (#939): unreadable keeps custody (raises), refused takes the shutdown custody.
+            owner_resume = restore_owner_wait_allowed(queue.DRIVE_ROOT, task, strict=True, expiring=expired)
+            if task.get("_owner_wait_resume") and (
+                    task["_owner_wait_resume"].get("reason") == "owner_pause" or not owner_resume):
+                from supervisor.restart_retention import (
+                    park_saved_pause, saved_sleep_hold_reason, pause_ids, unseen_pause, _latch_unseen_pause)
+
+                before_pause = pause_ids(task)
+                parked = park_saved_pause(task, int(task.get("_attempt") or 1), queue.DRIVE_ROOT,
+                    pause_source="project_hold_owner_wait", sleep_hold_reason=saved_sleep_hold_reason(queue.DRIVE_ROOT))
+                if parked is not None:
+                    task.update(parked)
+                    if "_owner_wait_resume" not in parked:
+                        task.pop("_owner_wait_resume", None)
+                    if unseen_pause(task, before_pause):
+                        _latch_unseen_pause(task)
+                    continue  # retained pause, or its failed conversion; never a Stop
+                if (budget_hold_fact(task) or {}).get("reason") == HOLD_RESTORE_REFUSED_PREFIX + "owner_wait_source_unavailable":
+                    from ouroboros.cancel_intents import has_active_intent
+
+                    wait = (load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}).get("owner_wait") or {}
+                    if (wait.get("state") == "waiting" and wait.get("wait_id") == task["_owner_wait_resume"].get("wait_id")
+                            and not has_active_intent(queue.DRIVE_ROOT, tid, strict=True)):
+                        continue  # only the unavailable live source keeps this retention hold
                 _fence_snapshot_running_rows([{"id": tid}], restored_ids=set())
                 continue  # the same shutdown custody as an unresumable restore
+            if expired:
+                from supervisor.queue_timeouts import pending_deadline_expirable
+
+                if not pending_deadline_expirable(task):
+                    continue  # Pause and unconfirmed dispatch keep their own custody.
+                raise ProjectAdmissionError("deadline", "The task deadline elapsed while waiting for its Project.")
             if any(task is child for child in children):
                 if _descends_from(task, interrupted, pending_by_id):
                     task["_terminalization_retry"] = {
@@ -530,13 +730,19 @@ def revalidate_project_holds() -> None:
                     continue
                 if _descends_from(task, lineage_unknown, pending_by_id):
                     raise ValueError("The parent task's state is unreadable; automatic recovery is not authorized.")
-            # Status and missing started_at alone cannot prove no handoff: the
-            # old RUNNING mirror was best-effort. Fresh queue admission supplies
-            # positive 'none'; canonical possible handoff always vetoes that row.
             stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
-            granted = owner_resume or _exact_resume_granted(task, queue.DRIVE_ROOT) or assisted_resume_authorizes(task, stored)
+            governing = governing_continuation(task)  # the final dispatch's selection, no fallback
+            granted = (owner_resume if governing == "owner_wait"
+                       else _exact_resume_granted(task, queue.DRIVE_ROOT) if governing == "exact_pause"
+                       else governing == "working" and _working_resume_granted(task, queue.DRIVE_ROOT, existing=stored)
+                       ) or assisted_resume_authorizes(task, stored)
+            # Planned authority never replaces a governing loop carrier, valid or invalid.
+            granted = granted or (not governing and planned_handoff_resume_allowed(queue.DRIVE_ROOT, task))
+            # A first-attempt schedule receipt that still proves no handoff outranks an
+            # earlier launcher's Project mark of that attempt (``first_dispatch_unsent``).
+            unsent = not governing and first_dispatch_unsent(task)
             if (stored.get("admission_outcome") == "never_admitted"
-                    or not granted and (
+                    or not granted and not unsent and (
                         stored.get("status") != STATUS_SCHEDULED or stored.get("started_at")
                         or task.get("admitted_dispatch") != "none"
                         or "admitted_dispatch" in stored and stored["admitted_dispatch"] != "none")):
@@ -554,6 +760,19 @@ def revalidate_project_holds() -> None:
             fence = queue.ACCEPTANCE_FENCES.get(str(task.get("root_task_id") or ""))
             if isinstance(fence, dict) and fence.get("status") in {"active", "sealed"}:
                 raise ValueError("The task's root is in acceptance review; dispatch remains closed.")
+            if not host_unscoped(task) and read_error is not None:
+                raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
+            if bindings is None and bindings_error is None:
+                try:
+                    bindings = _load_bindings(queue.DRIVE_ROOT, strict=True)["bindings"]
+                except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                    bindings_error = exc
+            if bindings_error is not None:
+                raise ValueError("Task scope information is unreadable; recovery will be checked automatically when it is readable.") from bindings_error
+            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True, bindings_snapshot=bindings)
+            placement = pending_placement(queue.DRIVE_ROOT, task, bindings_snapshot=bindings)
+            if placement and not refresh_pending_placement(queue.DRIVE_ROOT, task, binding=placement):
+                raise ValueError("The committed placement cannot be readmitted yet.")
             basis = task.get("_project_admission")
             unscoped = host_unscoped(task)
             if not unscoped and (not isinstance(basis, dict) or basis.get("legacy_basis")
@@ -569,17 +788,6 @@ def revalidate_project_holds() -> None:
                     or unscoped and str(stored.get("workspace_root") or "") != str(task.get("workspace_root") or "")
                     or stored.get("workspace_root") and stored["workspace_root"] != task.get("workspace_root")):
                 raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")
-            if not unscoped and read_error is not None:
-                raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
-            if bindings is None and bindings_error is None:
-                try:
-                    bindings = _load_bindings(queue.DRIVE_ROOT, strict=True)["bindings"]
-                except (OSError, ValueError, TypeError, RuntimeError) as exc:
-                    bindings_error = exc
-            if bindings_error is not None:
-                raise ValueError("Task scope information is unreadable; recovery will be checked automatically when it is readable.") from bindings_error
-            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True, bindings_snapshot=bindings)
-            # Conversion owns the durable binding; its older result is a projection.
             if (stored.get("project_id") and stored["project_id"] != task.get("project_id")
                     and not (binding and binding["project_id"] == task.get("project_id"))):
                 raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")
@@ -605,7 +813,10 @@ def revalidate_project_holds() -> None:
                         raise ValueError("The original prepared task drive is unavailable.")
                 # Preserve independent Pause/budget/restart holds in the row.
                 task.pop("_project_admission_restore_hold")
-                released.append((task, hold))
+                released.append((task, {"_project_admission_restore_hold": hold,
+                                        **({"admitted_dispatch": task.get("admitted_dispatch")} if unsent else {})}))
+                if unsent:  # restore's own correction, read now that the receipt is readable
+                    task["admitted_dispatch"] = "none"
         except (OSError, ValueError, TypeError, RuntimeError) as exc:
             reason = getattr(exc, "reason", "project_routing_fence_lookup_failed")
             if reason in {"project_routing_fence", "project_routing_fence_changed", "deadline"}:
@@ -619,46 +830,105 @@ def revalidate_project_holds() -> None:
     changed = any(prior != {key: task[key] for key in effects if key in task}
                   for prior, task in zip(before, held))
     persisted = not changed or queue.persist_queue_snapshot(reason="project_hold_revalidated") is True
-    for task, hold in released:
+    for task, prior in released:
         if persisted:
             task.pop("_managed_update_resume", None)  # a spent resolver resume never reaches a worker
         else:
-            task["_project_admission_restore_hold"] = hold
+            task.update(prior)
 
 
 def persist_never_admitted_refusal(
-    drive_root: Any, task_id: str, *, admission_token: str = "", **fields: Any,
+    drive_root: Any, task_id: str, /, *, admission_token: str = "", **fields: Any,
 ) -> Dict[str, Any]:
     """Publish a proved refusal before cleanup, without taking another id owner.
+
+    The root and id are positional-only: a subagent's result fields carry their
+    own ``drive_root`` (its child drive), which must reach the row, not collide.
 
     Queue refusal can release its reservation before the producer resumes. Check
     custody again under Q and establish a durable id owner before freeing drives.
     A strict exact receipt is required even if a writer raises after replacement.
+    A token's own requested row is its emitted promote stub, or, for a
+    preparation refusal carrying that token's marker, the requested child the
+    claim marks (or, before that marker, its reservation holds); any other row
+    keeps its owner.
     """
     from supervisor import queue
     from ouroboros.routing_wait import is_own_admission_stub
 
-    receipt = uuid.uuid4().hex
-    with queue._queue_lock:
+    receipt = str(fields.get("_admission_refusal_token") or "") if admission_token else ""
+    receipt = receipt or uuid.uuid4().hex
+    with acquisition_budget(0), queue._queue_lock:
         reservation = queue.ADMISSION_RESERVATIONS.get(task_id)
         if ((reservation and reservation != admission_token) or task_id in queue.RUNNING
                 or any(row.get("id") == task_id for row in queue.PENDING if isinstance(row, dict))):
             raise RuntimeError("Refusal settlement lost task-id ownership; resources retained")
         current = load_task_result(pathlib.Path(drive_root), task_id, strict=True) or {}
+        recorded_claim = current.get(WORKSPACE_PREPARATION_FIELD)
+        if (admission_token and current.get("status") == STATUS_FAILED
+                and current.get("_admission_refusal_token") == receipt
+                and isinstance(recorded_claim, dict) and recorded_claim.get("token") == admission_token):
+            queue.release_task_admission(task_id, admission_token)
+            return current  # this same refusal committed before its contended readback
         own_stub = bool(admission_token and is_own_admission_stub(current, admission_token))
-        if current and not own_stub and not (not admission_token and current.get("status") == STATUS_REQUESTED):
+        claim = fields.get(WORKSPACE_PREPARATION_FIELD)
+        own_claim = bool(admission_token and isinstance(claim, dict) and claim.get("token") == admission_token
+                         and own_requested_child(current, admission_token, reservation))
+        if current and not own_stub and not own_claim and not (
+                not admission_token and current.get("status") == STATUS_REQUESTED):
             raise RuntimeError("Refusal settlement found an existing result owner; resources retained")
         try:
             write_task_result(pathlib.Path(drive_root), task_id, STATUS_FAILED,
                               **{**fields, "admission_outcome": "never_admitted",
                                  "_admission_refusal_token": receipt, "strict_existing_dict": True})
-        except Exception:
+        except Exception as exc:
+            from supervisor.workspace_preparation import store_contention
+            if store_contention(exc):
+                raise
             log.warning("Refusal write raised for %s; checking its exact receipt", task_id, exc_info=True)
         stored = load_task_result(pathlib.Path(drive_root), task_id, strict=True) or {}
         if stored.get("_admission_refusal_token") != receipt or stored.get("status") != STATUS_FAILED:
             raise RuntimeError("Refusal persistence unconfirmed; resources retained")
         queue.release_task_admission(task_id, admission_token)
         return stored
+
+
+def own_requested_child(current: Dict[str, Any], token: str, reservation: Any = None) -> bool:
+    """Whether ``current`` is still the requested child this preparation token claimed."""
+    if not token or str(current.get("status") or "") != STATUS_REQUESTED:
+        return False
+    claim = current.get(WORKSPACE_PREPARATION_FIELD)
+    if isinstance(claim, dict):
+        return str(claim.get("token") or "") == token
+    return reservation == token
+
+
+def claim_requested_child(ctx: Any, task_id: str, token: str) -> bool:
+    """Reserve the producer's REQUESTED child for one preparation token, before any effect.
+
+    The existing reservation map is the claim: another token, queued/progressed
+    work or a foreign marker is not claimable. The same token may finish a
+    contended queued-marker readback. An unreadable read takes no new reservation.
+    """
+    from supervisor import queue
+
+    tid = str(task_id or "")
+    with acquisition_budget(0), queue._queue_lock:
+        reserved = queue.ADMISSION_RESERVATIONS.get(tid)
+        if not tid or not token or reserved and reserved != token:
+            return False
+        pending = getattr(ctx, "PENDING", queue.PENDING)
+        if tid in getattr(ctx, "RUNNING", queue.RUNNING) or any(
+                isinstance(row, dict) and str(row.get("id") or "") == tid for row in pending):
+            return False
+        current = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+        marker = current.get(WORKSPACE_PREPARATION_FIELD)
+        if current and (str(current.get("status") or "") != STATUS_REQUESTED
+                        or marker is not None and (not isinstance(marker, dict)
+                                                  or marker.get("token") != token or marker.get("phase") != "queued")):
+            return False
+        queue.ADMISSION_RESERVATIONS[tid] = token
+        return True
 
 
 def scheduled_admission_rejection(
@@ -737,22 +1007,29 @@ def scheduled_admission_rejection(
 
 
 def subagent_schedule_owned(
-    ctx: Any, task_id: str, *, pending_ref: Any = None,
+    ctx: Any, task_id: str, *, pending_ref: Any = None, admission_token: str = "",
 ) -> bool:
-    """Return whether an exact child id already has queue/lifecycle custody."""
+    """Return whether an exact child id already has queue/lifecycle custody.
+
+    ``admission_token`` is a preparation claim's own token: its reservation and
+    marker are not another owner, while its lost marker or reservation is.
+    """
     from supervisor import queue
 
     tid = str(task_id or "")
-    with queue._queue_lock:
+    with acquisition_budget(0), queue._queue_lock:
         pending = pending_ref if isinstance(pending_ref, list) else getattr(
             ctx, "PENDING", queue.PENDING,
         )
         running = getattr(ctx, "RUNNING", queue.RUNNING)
-        if queue.ADMISSION_RESERVATIONS.get(tid):
+        reserved = queue.ADMISSION_RESERVATIONS.get(tid)
+        if reserved and reserved != admission_token:
             return True
-        status = str((load_task_result(
-            ctx.DRIVE_ROOT, tid, strict=True,
-        ) or {}).get("status") or "")
+        current = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+        status = str(current.get("status") or "")
+        claim = current.get(WORKSPACE_PREPARATION_FIELD)
+        foreign_claim = (str((claim or {}).get("token") or "") != admission_token
+                         if isinstance(claim, dict) else bool(admission_token))
         return (
             tid in running
             or any(
@@ -760,6 +1037,7 @@ def subagent_schedule_owned(
                 for row in pending
             )
             or status not in {"", STATUS_REQUESTED}
+            or foreign_claim
         )
 
 
@@ -769,6 +1047,8 @@ def subagent_schedule_preflight(
     chat_id: int,
     *,
     delegation_role: str = "subagent",
+    admission_token: str = "",
+    defer_contention: bool = False,
 ) -> bool:
     """Stop an owned or unreadable exact task id before parsing or side effects.
 
@@ -781,8 +1061,13 @@ def subagent_schedule_preflight(
     if not tid:
         return False
     try:
-        return subagent_schedule_owned(ctx, tid)
-    except (OSError, ValueError):
+        # A claim names its token; the historical call shape stays for every other caller.
+        return subagent_schedule_owned(
+            ctx, tid, **({"admission_token": admission_token} if admission_token else {}))
+    except (OSError, ValueError, StoreError) as exc:
+        from supervisor.workspace_preparation import store_contention
+        if (admission_token or defer_contention) and store_contention(exc):
+            raise  # the existing preparation owner waits only after Q unwinds
         from supervisor.events import _reject_schedule_task
 
         label = "Subagent" if delegation_role == "subagent" else "Task"
@@ -790,7 +1075,7 @@ def subagent_schedule_preflight(
             ctx, tid=tid, chat_id=chat_id, delegation_role=delegation_role,
             parent_id=evt.get("parent_task_id"),
             root_task_id=str(evt.get("root_task_id") or evt.get("parent_task_id") or tid),
-            role=str(evt.get("role") or "researcher"), result_fields={},
+            role=str(evt.get("role") or "").strip(), result_fields={},
             detail=(
                 f"{label} not scheduled: the existing durable result for this task id "
                 "is unreadable, so its identity authority was preserved."
@@ -809,6 +1094,10 @@ def enqueue_subagent_with_scheduled_result(
     admitted_depth_provenance: Dict[str, Any],
     direct_child_count: Any,
     pending_ref: list[Any],
+    preparation: Any = None,
+    recheck_child_admission: Optional[Callable[[], tuple[str, str, Any]]] = None,
+    defer_contention: bool = False,
+    transition_id: str = "",
 ) -> tuple[Any, str, str, bool]:
     """Enqueue a child only together with its first durable authority row.
 
@@ -816,11 +1105,31 @@ def enqueue_subagent_with_scheduled_result(
     therefore remove this exact still-pending object before a worker observes
     it.  A late observer exception after atomic file replacement keeps the
     already-authoritative admission instead of compensating a committed row.
+
+    A prepared child first commits its ``admitting`` phase, the positive
+    boundary recovery reads: an earlier retained phase proves this interlock
+    was never entered. Only the token still owning the claim, in its still-open
+    generation, consumes the reservation; the receipt closes the marker.
+    The schedule owner's count-dependent rights/caps recheck shares this same
+    interlock, so an independently admitted readonly sibling cannot spend the
+    last slot between validation and append. Storage contention never waits on Q.
     """
     from supervisor import queue
 
     tid = str(task.get("id") or "")
-    transition_id = uuid.uuid4().hex
+    transition_id = str(transition_id or uuid.uuid4().hex)
+    token = ""
+    if preparation is not None:
+        crossed = preparation.enter_admission()
+        if crossed is False:
+            return (task, "scheduled_event_replay",
+                    "Subagent schedule ignored: its prepared request no longer belongs to this preparation.", False)
+        if crossed is None:  # this token never entered the queue below
+            return (task, "preparation_marker_unwritable",
+                    "Subagent not scheduled: its admission boundary could not be recorded durably, "
+                    "so it was never admitted.", True)
+        token = preparation.token
+        task = {**task, "_admission_token": token}
 
     def _committed(record: Any) -> bool:
         admission = record.get("delegation_admission") if isinstance(record, dict) else None
@@ -832,93 +1141,155 @@ def enqueue_subagent_with_scheduled_result(
             and str(admission.get("transition_id") or "") == transition_id
         )
 
-    with queue._queue_lock:
-        try:
-            previous = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
-            already_owned = subagent_schedule_owned(
-                ctx, tid, pending_ref=pending_ref,
-            )
-        except (OSError, ValueError):
-            log.warning(
-                "Subagent schedule authority is unreadable for %s", tid,
-                exc_info=True,
-            )
-            return (
-                task,
-                "scheduled_result_authority_unknown",
-                "Subagent not scheduled: the existing durable result for this "
-                "task id is unreadable, so the host cannot prove that the id is "
-                "fresh. The existing result was preserved.",
-                False,
-            )
-        if already_owned:
-            log.info("Ignoring replayed schedule event for task %s", tid)
-            return (
-                task,
-                "scheduled_event_replay",
-                "Subagent schedule replay ignored: this task id is already owned by "
-                "an existing queue or durable lifecycle row.",
-                False,
-            )
-        admitted = ctx.enqueue_task(task)
-        if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-            if admitted.get("_admission_blocked") == "task_id_lookup_failed":
-                return (
-                    task, "scheduled_result_authority_unknown",
-                    "Subagent not scheduled: the exact task-result authority became "
-                    "unreadable during admission and was preserved.", False,
+    handoff_started = False
+
+    def once():
+        nonlocal handoff_started, direct_child_count
+        with acquisition_budget(0), queue._queue_lock:
+            try:
+                previous = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+                already_owned = subagent_schedule_owned(
+                    ctx, tid, pending_ref=pending_ref, **({"admission_token": token} if token else {}),
                 )
-            return admitted, "", "", False
-        if "_project_admission" in admitted:
-            result_fields["_project_admission"] = admitted["_project_admission"]
-        result_fields["task_contract"] = admitted_task_contract
-        result_fields["depth_provenance"] = admitted_depth_provenance
-        result_fields["delegation_admission"] = {
-            "status": "accepted",
-            "direct_child_count": direct_child_count,
-            "transition_id": transition_id,
-        }
-        try:
-            write_task_result(ctx.DRIVE_ROOT, tid, STATUS_SCHEDULED, **result_fields,
-                              result="Subagent accepted and scheduled.")
-        except Exception:
-            log.warning("Scheduled subagent receipt write raised for %s; reading its token", tid, exc_info=True)
-        try:
-            current = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
-        except (OSError, ValueError):
-            # A committed receipt may exist. Preserve queue/resource custody and
-            # never quarantine unreadable bytes or infer permission to resend.
-            admitted["_admission_uncertain"] = "Subagent admission receipt could not be checked; resources retained."
-            return admitted, "", "", False
-        if _committed(current):
-            return admitted, "", "", False
-        # Q has remained held since append: no worker observed this refused
-        # scheduled-result transition, and strict readback established absence.
-        for index, row in enumerate(pending_ref):
-            if row is admitted:
-                pending_ref.pop(index)
-                break
-        prior_status = str(previous.get("status") or "")
-        current_status = str(current.get("status") or "")
-        if any(
-            status not in {"", STATUS_REQUESTED}
-            for status in (prior_status, current_status)
-        ):
+            except (OSError, ValueError, StoreError) as exc:
+                from supervisor.workspace_preparation import store_contention
+                if (preparation is not None or defer_contention) and store_contention(exc):
+                    raise
+                log.warning(
+                    "Subagent schedule authority is unreadable for %s", tid,
+                    exc_info=True,
+                )
+                return (
+                    task,
+                    "scheduled_result_authority_unknown",
+                    "Subagent not scheduled: the existing durable result for this "
+                    "task id is unreadable, so the host cannot prove that the id is "
+                    "fresh. The existing result was preserved.",
+                    False,
+                )
+            if already_owned:
+                log.info("Ignoring replayed schedule event for task %s", tid)
+                return (
+                    task,
+                    "scheduled_event_replay",
+                    "Subagent schedule replay ignored: this task id is already owned by "
+                    "an existing queue or durable lifecycle row.",
+                    False,
+                )
+            if preparation is not None and preparation.generation.closed():
+                # A closed generation's callback never enqueues into its successor.
+                return (task, "preparation_interrupted_by_generation_exit",
+                        "Subagent not scheduled: the supervisor generation that prepared its workspace "
+                        "ended before admission; it was never admitted.", True)
+            if recheck_child_admission is not None:
+                reason, detail, direct_child_count = recheck_child_admission()
+                if reason:
+                    return task, reason, detail, True
+            handoff_started = True
+            admitted = ctx.enqueue_task(task)
+            if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                if ((preparation is not None or defer_contention) and admitted.get("_admission_never_admitted")
+                        and admitted.get("_admission_blocked") == "contention"):
+                    # A context-manager exit can fail AFTER append, despite
+                    # that refusal flag. Outer Q never left: inspect actual
+                    # custody before restoring only this still-unsent token.
+                    if (tid not in queue.RUNNING and not any(
+                            isinstance(row, dict) and str(row.get("id") or "") == tid for row in pending_ref)
+                            and queue.ADMISSION_RESERVATIONS.get(tid) in (None, token)):
+                        from ouroboros.store import StoreBusy
+                        if preparation is not None:
+                            queue.ADMISSION_RESERVATIONS[tid] = token
+                        handoff_started = False
+                        raise StoreBusy("prepared child admission is contended", reason="contention")
+                    admitted.pop("_admission_blocked", None)
+                    admitted.pop("_admission_never_admitted", None)
+                    admitted["_admission_uncertain"] = "Subagent admission changed before its contended outcome; custody retained."
+                    return admitted, "", "", False
+                if admitted.get("_admission_blocked") == "task_id_lookup_failed":
+                    return (
+                        task, "scheduled_result_authority_unknown",
+                        "Subagent not scheduled: the exact task-result authority became "
+                        "unreadable during admission and was preserved.", False,
+                    )
+                return admitted, "", "", False
+            if "_project_admission" in admitted:
+                result_fields["_project_admission"] = admitted["_project_admission"]
+            result_fields["task_contract"] = admitted_task_contract
+            result_fields["depth_provenance"] = admitted_depth_provenance
+            result_fields["delegation_admission"] = {
+                "status": "accepted",
+                "direct_child_count": direct_child_count,
+                "transition_id": transition_id,
+            }
+            if preparation is not None:
+                result_fields[WORKSPACE_PREPARATION_FIELD] = preparation.marker("admitted")
+            receipt_error = None
+            try:
+                write_task_result(ctx.DRIVE_ROOT, tid, STATUS_SCHEDULED, **result_fields,
+                                  result="Subagent accepted and scheduled.")
+            except Exception as exc:
+                receipt_error = exc
+                log.warning("Scheduled subagent receipt write raised for %s; reading its token", tid, exc_info=True)
+            try:
+                current = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+            except (OSError, ValueError, StoreError):
+                # A committed receipt may exist. Preserve queue/resource custody and
+                # never quarantine unreadable bytes or infer permission to resend.
+                admitted["_admission_uncertain"] = "Subagent admission receipt could not be checked; resources retained."
+                return admitted, "", "", False
+            if _committed(current):
+                return admitted, "", "", False
+            # Q has remained held since append: no worker observed this refused
+            # scheduled-result transition, and strict readback established absence.
+            removed = False
+            for index, row in enumerate(pending_ref):
+                if row is admitted:
+                    pending_ref.pop(index)
+                    removed = True
+                    break
+            prior_status = str(previous.get("status") or "")
+            current_status = str(current.get("status") or "")
+            if any(
+                status not in {"", STATUS_REQUESTED}
+                for status in (prior_status, current_status)
+            ):
+                return (
+                    admitted,
+                    "scheduled_result_conflict",
+                    "Subagent not scheduled: another durable result already owns this "
+                    "task id, so the new queue admission was rolled back without "
+                    "overwriting that result.",
+                    False,
+                )
+            from supervisor.workspace_preparation import store_contention
+            if (preparation is not None or defer_contention) and store_contention(receipt_error):
+                if (removed and tid not in queue.RUNNING and not any(
+                        isinstance(row, dict) and str(row.get("id") or "") == tid for row in pending_ref)
+                        and queue.ADMISSION_RESERVATIONS.get(tid) in (None, token)):
+                    if preparation is not None:
+                        queue.ADMISSION_RESERVATIONS[tid] = token
+                    # Exact compensation under the same Q hold proves this
+                    # request still unsent. Its existing owner waits off-lock.
+                    handoff_started = False
+                    raise receipt_error
+                admitted["_admission_uncertain"] = "Subagent receipt rollback could not prove absent queue ownership; custody retained."
+                return admitted, "", "", False
             return (
                 admitted,
-                "scheduled_result_conflict",
-                "Subagent not scheduled: another durable result already owns this "
-                "task id, so the new queue admission was rolled back without "
-                "overwriting that result.",
-                False,
+                "scheduled_result_persist_failed",
+                "Subagent not scheduled: its durable scheduled-result receipt could not "
+                "be persisted, so queue admission was rolled back.",
+                True,
             )
-        return (
-            admitted,
-            "scheduled_result_persist_failed",
-            "Subagent not scheduled: its durable scheduled-result receipt could not "
-            "be persisted, so queue admission was rolled back.",
-            True,
-        )
+
+    try:
+        return (once() if preparation is None else preparation.store_gate(
+            once, retryable=lambda: not handoff_started))
+    except StoreError as exc:
+        from supervisor.workspace_preparation import store_contention
+        if defer_contention and not handoff_started and store_contention(exc):
+            return task, "schedule_observation_pending", "", False
+        raise
 
 
 def reserve_task_admission(

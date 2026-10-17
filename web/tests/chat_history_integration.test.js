@@ -89,6 +89,45 @@ function readUp(f) {
     for (const handler of f.messages.listeners.get('wheel')) handler({ type: 'wheel', deltaY: -1, target: f.messages, timeStamp: 0 });
 }
 
+function recordRenderedMarkup(t) {
+    const query = ElementStub.prototype.querySelector;
+    ElementStub.prototype.querySelector = function (selector) {
+        const direct = query.call(this, selector);
+        if (direct) return direct;
+        for (const child of this.children) { const found = child.querySelector(selector); if (found) return found; }
+        return null;
+    };
+    t.after(() => { ElementStub.prototype.querySelector = query; });
+    const descriptor = Object.getOwnPropertyDescriptor(ElementStub.prototype, 'innerHTML'), markup = [];
+    Object.defineProperty(ElementStub.prototype, 'innerHTML', { ...descriptor,
+        set(value) { markup.push(String(value)); descriptor.set.call(this, value); } });
+    t.after(() => Object.defineProperty(ElementStub.prototype, 'innerHTML', descriptor));
+    return markup;
+}
+
+test('R3 a terminal census before first history preserves source narration and its chronological anchor', async t => {
+    const text = 'Retained authored evidence from the original task';
+    const progress = row('progress:11', text, { task_id: 'closed-before-history', is_progress: true, narration: true });
+    const markup = recordRenderedMarkup(t);
+    const f = fixture(t, page([progress, row('chat:12', 'A newer conversation row', { ts: '2026-09-12T12:01:00Z' })]));
+    f.instance.hydrateStateSnapshot({ active_chat_activities: [{ activity_id: progress.task_id, chat_id: 2,
+        kind: 'managed_task', phase: 'working', status: 'cancelled' }], active_chat_activities_complete: true,
+        supervisor_ready: true });
+    await f.refresh();
+    const card = walkCard(f.messages, progress.task_id);
+    assert.ok(card);
+    assert.equal(card.querySelector('[data-live-title]').textContent, text);
+    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Cancelled');
+    assert.equal(card.querySelector('[data-live-phase]').dataset.motion, '0');
+    assert.equal(card.dataset.finished, '1');
+    assert.equal(card.dataset.ts, String(Date.parse(progress.ts)));
+    assert.ok(markup.some(value => value.includes(text) && value.includes('chat-live-line')), 'the retained source row is rendered');
+    assert.ok(f.messages.children.indexOf(card) < f.messages.children.findIndex(node => node.dataset.historyId === 'chat:12'));
+    await f.refresh();
+    assert.equal(walkCard(f.messages, progress.task_id), card);
+    assert.equal(card.querySelector('[data-live-phase]').textContent, 'Cancelled', 'replay without a terminal row keeps the known census outcome');
+});
+
 // One saved message and nothing else: every page below it is empty down to the
 // archive floor. This is the sparse Project room that grew a 64-click pill.
 const sparseRoom = (t, floor = 5) => fixture(t,
@@ -147,6 +186,42 @@ test('reading to the oldest page hides the button; ↓ returns to the present wi
     assert.deepEqual(f.calls.slice(4), [null], '↓ returns to the present by one latest read');
     const ids = [...f.messages.querySelectorAll('[data-history-id]')].map(node => node.dataset.historyId);
     assert.equal(new Set(ids).size, ids.length, 'a replayed page mounts no duplicate row');
+});
+
+test('a Project final whose page was released mounts again with its Project reference; a mounted one absorbs a retry', async (t) => {
+    offScreen(t);
+    // The Project reference sits after the message (`Element.after`), which this stub lacks.
+    ElementStub.prototype.after = function (node) {
+        this.parentNode?.insertBefore(node, this.parentNode.children[this.parentNode.children.indexOf(this) + 1] || null);
+    };
+    t.after(() => { delete ElementStub.prototype.after; });
+    const final = row('chat:800', 'Launch › Ship · Completed', { role: 'system', system_type: 'project_completion_summary',
+        completion_answer: 'Done: PR #7 merged.', project_id: 'launch', project_name: 'Launch', task_id: 'final-task',
+        delivery_id: 'completion:final-task', ts: '2026-09-12T11:00:00.000Z' });
+    const pages = [page([row('chat:900', 'Newest saved message')], 'page:recent', 'before:1'), page([final], 'page:1', 'before:2'),
+        ...[2, 3, 4].map(index => page([row(`chat:${500 - index}`, `Older ${index}`)], `page:${index}`, index < 4 ? `before:${index + 1}` : null))];
+    const f = fixture(t, pages[0], (cursor) => pages[Number(cursor.split(':')[1])]);
+    const finals = () => f.bubbles().filter(node => node.dataset.deliveryId === final.delivery_id);
+    await f.refresh();
+    await scrollEdge(f);
+    assert.equal(finals().length, 1);
+    for (let n = 0; n < 3; n += 1) await scrollEdge(f);
+    assert.deepEqual(f.calls, [null, 'before:1', 'before:2', 'before:3', 'before:4']);
+    assert.equal(finals().length, 0, 'four older pages released the page holding the final');
+    globalThis.document.byId.get('chat-scroll-bottom').click();
+    for (let n = 0; n < 20; n += 1) await new Promise(resolve => setTimeout(resolve, 0));
+    await scrollEdge(f);
+    assert.deepEqual(f.calls.slice(5), [null, 'before:1'], 'the return reads the final page back');
+    const [again] = finals();
+    assert.ok(again, 'the read-back page mounts its final again');
+    assert.match(again.innerHTML, /Done: PR #7 merged\./);
+    const actions = again.querySelector('.system-message-actions');
+    assert.equal(actions.children.length, 1);
+    assert.equal(actions.children[0].dataset.intent, 'open-project');
+    // A transport retry of the mounted delivery is the same bubble at its original time.
+    f.emit({ ...final, content: final.text, history_id: undefined, ts: '2026-09-12T11:05:00.000Z' });
+    assert.deepEqual(finals(), [again]);
+    assert.equal(again.dataset.ts, String(Date.parse(final.ts)));
 });
 
 test('Load more history only ever reads older pages, however deep the reader goes', async (t) => {
@@ -209,7 +284,9 @@ test('a refresh while the reader reads older history leaves the next press readi
     for (let n = 0; n < 20; n += 1) await new Promise(resolve => setTimeout(resolve, 0));
     await f.refresh(page([row('chat:700', 'Newest again')], 'page:recent', 'before:700'));
     for (let n = 0; n < 20; n += 1) await new Promise(resolve => setTimeout(resolve, 0));
-    assert.deepEqual(f.calls.slice(4), [null, null], 'a reader following the newest message gets the re-anchored chain');
+    assert.deepEqual(f.calls.slice(4), [null], 'a reader following the newest message re-anchors at that read, read once');
+    await f.clickOlder();
+    assert.equal(f.calls.at(-1), 'before:700', 'the re-anchored chain goes on straight below the read it started from');
 });
 
 test('the return to the present lets go of the windows kept while reading, leaving no unnoted hole', async (t) => {
@@ -274,9 +351,40 @@ test('live message adopts its physical history identity without replacing the vi
     assert.deepEqual(f.bubbles().filter((node) => node.innerHTML.includes('A useful answer')), [live]);
 });
 
+for (const systemType of ['reminder', 'skill_notice']) for (const historyFirst of [false, true]) {
+    test(`${systemType} retains one node across ${historyFirst ? 'history then live' : 'live then history'} and repeats`, async t => {
+        const message = row('chat:100', 'A scheduled notice', {
+            role: 'system', system_type: systemType, source: 'Ouroboros',
+        });
+        const live = { role: message.role, content: message.text, ts: message.ts,
+            system_type: message.system_type, source: message.source };
+        const f = fixture(t, page(historyFirst ? [message] : []));
+        await f.refresh();
+        if (!historyFirst) f.emit(live);
+        assert.equal(f.bubbles().length, 1);
+        const original = f.bubbles()[0];
+        if (historyFirst) f.emit(live);
+        else await f.refresh(page([message]));
+        for (let repeat = 0; repeat < 2; repeat += 1) {
+            assert.equal(f.bubbles().length, 1, 'the live frame and saved row describe one occurrence');
+            assert.equal(f.bubbles()[0], original, 'joining the row preserves the original node');
+            assert.equal(original.dataset.historyId, 'chat:100');
+            assert.equal(original.dataset.historySource, 'chat:rotation-1');
+            assert.equal(original.dataset.historyOffset, '100');
+            const saved = sessionStorage.getItem('ouro_chat:2');
+            f.emit(live);
+            assert.equal(sessionStorage.getItem('ouro_chat:2'), saved, 'a late live copy is not persisted again');
+            await f.refresh(page([message]));
+        }
+        assert.equal(f.bubbles().length, 1);
+        assert.equal(f.bubbles()[0], original);
+    });
+}
+
 test('repeated physical history identity updates the routing annotation on the same user bubble', async (t) => {
     const message = row('chat:200', 'Please investigate this', {
         role: 'user', client_message_id: 'owner-message', chat_annotation: { status: 'pending' },
+        source: 'web', sender_session_id: 'another-tab',
     });
     const f = fixture(t, page([message]));
     await f.refresh();
@@ -294,6 +402,42 @@ test('repeated physical history identity updates the routing annotation on the s
     assert.equal(bubble.dataset.chatAnnotationStatus, 'delivered');
     assert.notEqual(note.textContent, 'Choosing the right destination…');
     assert.match(note.textContent, /Investigation/);
+    const annotationText = note.textContent, metadata = { ...bubble.dataset };
+    const saved = sessionStorage.getItem('ouro_chat:2');
+    f.emit({ role: message.role, content: message.text, ts: message.ts,
+        client_message_id: message.client_message_id, source: message.source,
+        sender_session_id: message.sender_session_id });
+    assert.equal(f.bubbles().length, 1, 'a remote owner echo does not append a second bubble');
+    assert.equal(f.bubbles()[0], bubble);
+    assert.equal(bubble.querySelector('.msg-routing-annotation'), note);
+    assert.equal(note.textContent, annotationText, 'the live echo cannot clear the saved routing receipt');
+    assert.deepEqual(bubble.dataset, metadata);
+    assert.equal(sessionStorage.getItem('ouro_chat:2'), saved);
+});
+
+test('a live echo preserves the projected saved-context note and origin metadata', async t => {
+    const origin = row('chat:210', 'Original request', {
+        role: 'user', source: 'web', sender_session_id: 'another-tab',
+        history_id: undefined, history_position: undefined,
+        origin_projected: true, origin_id: 'binding-source-ref',
+    });
+    const f = fixture(t, page([origin]));
+    await f.refresh();
+    assert.equal(f.bubbles().length, 1);
+    const original = f.bubbles()[0], note = original.querySelector('.saved-project-context');
+    assert.ok(note);
+    assert.equal(original.dataset.originId, origin.origin_id);
+    assert.equal(original.dataset.originProjected, '1');
+    const metadata = { ...original.dataset }, noteText = note.textContent;
+    const saved = sessionStorage.getItem('ouro_chat:2');
+    f.emit({ role: origin.role, content: origin.text, ts: origin.ts,
+        source: origin.source, sender_session_id: origin.sender_session_id });
+    assert.equal(f.bubbles().length, 1);
+    assert.equal(f.bubbles()[0], original);
+    assert.equal(original.querySelector('.saved-project-context'), note);
+    assert.equal(note.textContent, noteText);
+    assert.deepEqual(original.dataset, metadata);
+    assert.equal(sessionStorage.getItem('ouro_chat:2'), saved);
 });
 
 test('a replayed refusal receipt shows the host cause and a later scheduled receipt patches the same note', async (t) => {
@@ -324,8 +468,9 @@ test('a replayed refusal receipt shows the host cause and a later scheduled rece
     assert.equal(bubble.querySelector('.msg-routing-actions'), null, 'the current Project is already displayed');
 });
 
-test('two physical rows with identical timestamp and body remain two messages across refresh', async (t) => {
-    const rows = [row('chat:300', 'Same words'), row('chat:400', 'Same words')];
+test('two physical rows with one full legacy key remain two messages after refresh and late live delivery', async (t) => {
+    const metadata = { role: 'system', system_type: 'reminder', source: 'Ouroboros' };
+    const rows = [row('chat:300', 'Same words', metadata), row('chat:400', 'Same words', metadata)];
     const f = fixture(t, page(rows));
     await f.refresh();
     const bubbles = f.bubbles().filter((node) => node.innerHTML.includes('Same words'));
@@ -333,6 +478,28 @@ test('two physical rows with identical timestamp and body remain two messages ac
     assert.deepEqual(bubbles.map((node) => node.dataset.historyId), ['chat:300', 'chat:400']);
     await f.refresh(page(rows));
     assert.deepEqual(f.bubbles().filter((node) => node.innerHTML.includes('Same words')), bubbles);
+    assert.equal(bubbles[0].dataset.messageKey, bubbles[1].dataset.messageKey);
+    f.emit({ ...metadata, content: 'Same words', ts: TS });
+    assert.equal(f.bubbles().length, 2, 'the matching live copy cannot become a third physical row');
+    assert.equal(f.bubbles()[0], bubbles[0]);
+    assert.equal(f.bubbles()[1], bubbles[1]);
+    assert.deepEqual(bubbles.map(node => node.dataset.historyId), ['chat:300', 'chat:400']);
+});
+
+test('standalone notice joins still distinguish source, text and timestamp', async t => {
+    const message = row('chat:500', 'A scheduled notice', {
+        role: 'system', system_type: 'reminder', source: 'Ouroboros',
+    });
+    const f = fixture(t, page([message]));
+    await f.refresh();
+    const original = f.bubbles()[0];
+    const live = { role: message.role, content: message.text, ts: message.ts,
+        system_type: message.system_type, source: message.source };
+    for (const difference of [{ source: 'Calendar skill' }, { content: 'A different notice' },
+        { ts: '2026-09-12T12:00:01.000Z' }]) f.emit({ ...live, ...difference });
+    assert.equal(f.bubbles().length, 4, 'each changed field identifies another standalone message');
+    assert.equal(new Set(f.bubbles().map(node => node.dataset.messageKey)).size, 4);
+    assert.equal(f.bubbles().find(node => node.dataset.historyId === message.history_id), original);
 });
 
 test('one older-navigation action crosses a sparse page and displays the next physical row', async (t) => {
@@ -359,6 +526,9 @@ test('retained history nodes still dedupe after navigation exceeds the live key 
     for (let i = 0; i < 16; i += 1) await f.clickOlder();
     const mounted = f.bubbles().length;
     assert.ok(mounted < 1000, 'distant pages actually evicted rather than all remaining protected');
+    f.emit({ role: 'assistant', content: 'Retained answer 2499', ts: TS });
+    assert.equal(f.bubbles().length, mounted, 'the mounted node suppresses a late frame after FIFO turnover');
+    assert.equal(f.bubbles().find(node => node.dataset.historyId === 'chat:2499'), recent);
     await f.refresh(pack(0));
     assert.deepEqual(f.bubbles().filter(node => node.dataset.historyId === 'chat:2499'), [recent]);
     assert.equal(f.bubbles().length, mounted, 'refresh adds no duplicate retained recent page');

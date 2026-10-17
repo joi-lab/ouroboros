@@ -24,10 +24,10 @@ from devtools.e2e_live import run_live_lanes, scenarios, traces  # noqa: E402
 FAKE_KEY = "sk-or-v1-e2e-live-traces-test-key-never-printed-0123456789"
 STUB_KEY = "stub-key-not-a-credential"
 FORK = "state/headless_tasks/t1/data"
-TRACED = ["logs/events.jsonl", "logs/server.log", "logs/server.log.1", "logs/tools.jsonl", "task_results/t1.json",
-          "state/advisory_review.json", "state/usage_attempts.jsonl", "state/queue_snapshot.json",
+TRACED = ["logs/events.jsonl", "logs/server.log", "logs/server.log.1", "logs/tools.jsonl", "state/current.sqlite",
+          "state/advisory_review.json", "state/usage.sqlite", "state/usage_attempts.jsonl", "state/queue_snapshot.json",
           "observability/calls/t1/llm_1.json", f"{FORK}/logs/events.jsonl", f"{FORK}/state/advisory_review.json",
-          f"{FORK}/task_results/t1.json"]
+          f"{FORK}/state/current.sqlite"]
 NOT_TRACED = ["settings.json", f"{FORK}/settings.json", "memory/identity.md", "observability/blobs/abc.prompt.gz",
               "state/auth_secret.key", "state/state.json", "logs/nested/old.jsonl"]
 
@@ -109,13 +109,13 @@ def test_an_oversized_bundle_keeps_the_newest_tail_of_each_journal_and_says_so(t
     big = "".join(json.dumps({"seq": i, "pad": "x" * 40}) + "\n" for i in range(400))
     _write(root / "logs" / "events.jsonl", big)
     _write(root / "logs" / "chat.jsonl", '{"small": true}\n')
-    _write(root / "task_results" / "t1.json", json.dumps({"status": "failed", "pad": "y" * 300}))
+    _write(root / "state" / "current.sqlite", json.dumps({"status": "failed", "pad": "y" * 300}))
     limit = 4000
     fact = traces.publish_lane_traces(root.parent, root, {}, limit=limit)
     bundle = _bundle(root.parent)
     assert fact["published"] is True and fact["limit_bytes"] == limit
     assert bundle["logs/chat.jsonl"] == b'{"small": true}\n'                          # under its share: whole
-    assert bundle["task_results/t1.json"] == (root / "task_results" / "t1.json").read_bytes()   # JSON never cut
+    assert bundle["state/current.sqlite"] == (root / "state" / "current.sqlite").read_bytes()   # the store is never cut
     lines = bundle["logs/events.jsonl"].decode().splitlines()
     head = json.loads(lines[0])["trace_truncated"]
     assert head["path"] == "logs/events.jsonl" and head["original_bytes"] == len(big) and head["limit_bytes"] == limit
@@ -127,18 +127,18 @@ def test_an_oversized_bundle_keeps_the_newest_tail_of_each_journal_and_says_so(t
 
 def test_a_rotated_server_log_backup_travels_and_is_cut_like_a_journal(tmp_path):
     """server.py rotates server.log at 2 MiB into server.log.1..3: the older history of a long lane lives there.
-    Over the bound a backup keeps its newest tail like any journal; a JSON file stays whole."""
+    Over the bound a backup keeps its newest tail like any journal; the store file stays whole."""
     root = tmp_path / "lane" / "data"
     lines = "".join(f"line {i:04d} " + "x" * 40 + "\n" for i in range(200))
     _write(root / "logs" / "server.log", lines)
     _write(root / "logs" / "server.log.1", lines)
-    _write(root / "task_results" / "t1.json", json.dumps({"pad": "y" * 3000}))
+    _write(root / "state" / "current.sqlite", json.dumps({"pad": "y" * 3000}))
     fact = traces.publish_lane_traces(root.parent, root, {}, limit=8000)
     bundle = _bundle(root.parent)
-    assert sorted(bundle) == ["logs/server.log", "logs/server.log.1", "task_results/t1.json"], sorted(bundle)
+    assert sorted(bundle) == ["logs/server.log", "logs/server.log.1", "state/current.sqlite"], sorted(bundle)
     assert sorted(cut["path"] for cut in fact["truncated"]) == ["logs/server.log", "logs/server.log.1"], fact
     assert bundle["logs/server.log.1"].decode().splitlines()[-1] == lines.splitlines()[-1]
-    assert bundle["task_results/t1.json"] == (root / "task_results" / "t1.json").read_bytes()
+    assert bundle["state/current.sqlite"] == (root / "state" / "current.sqlite").read_bytes()
 
 
 class _NoopServer:

@@ -19,6 +19,7 @@ from ouroboros.gateways.claudexor import ClaudexorUnavailable
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
 from ouroboros.model_wait import ModelWaitInterrupted
 from ouroboros.tools.control_runtime import _switch_model
+from tests._usage_store_testing import attempt_rows_in_start_order
 from tests.test_llm_claudexor import MODEL, ROUTE, ledger, result
 from tests.test_llm_claudexor import setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
@@ -141,11 +142,11 @@ def test_native_loop_fallback_then_symbolic_return_uses_real_role_account_and_fi
                          f"{attempt}_model_request.json").read_text(encoding="utf-8"))
                          for attempt in gateway.creates]
     assert [manifest["model_role"] for manifest in request_manifests] == [role, "fallback:0", role]
-    rows = ledger(ctx.drive_root)
-    assert [row["state"] for row in rows] == [
-        "reserved", "dispatched", "unresolved", "reserved", "dispatched", "settled",
-        "reserved", "dispatched", "settled"]
-    dispatched = [row for row in rows if row["state"] == "dispatched"]
+    # One current row per attempt, in start order; each keeps its dispatch context.
+    rows = attempt_rows_in_start_order(ctx.drive_root)
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4), ("settled", 3), ("settled", 3)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
+    dispatched = rows
     assert len({row["attempt_id"] for row in dispatched}) == 3
     assert [row["physical_context"]["capacity_total_tokens"] for row in dispatched] == [900_000, 240_000, 900_000]
     assert [row["physical_context"]["route_fp"] for row in dispatched] == [
@@ -191,7 +192,7 @@ def test_accepted_get_404_recovers_same_native_operation_for_both_turns(live_wai
     assert message == result()["message"]
     assert observed_reads == ["op-0"] * 3
     assert len(gateway.uploads) == len(gateway.creates) == len(gateway.accepted_operations) == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    assert [(row["state"], row["revision"]) for row in ledger(root)] == [("settled", 3)]
     assert len(usage["ledger_attempt_ids"]) == 1 and not gateway.cancels
     events = [json.loads(line) for line in (root / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any(event.get("detail") == "same_model_operation_rejoined" for event in events)
@@ -241,7 +242,8 @@ def test_lost_create_reply_without_operation_id_cannot_authorize_new_generation(
     assert set(gateway.creates) == {original_key[0]}
     assert gateway.uploads[0][0]["account"] == {"mode": "pin", "profileId": "account-a"}
     rows = ledger(ctx.drive_root)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved"]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
     assert len({row["attempt_id"] for row in rows}) == 1
     assert not gateway.acks
 
@@ -403,10 +405,116 @@ def test_primary_choice_survives_shared_cold_continuation(main_call, monkeypatch
     assert inner._route_facts_pending == "dated refusal fact" and effort == "high"
 
 
-@pytest.mark.parametrize("wire,status,ending", [
+_REFUSAL_CASES = [
     (wire, status, ending) for wire in ("managed", "http", "sse")
     for status in (429, 503, 529) for ending in ("answer", "stop", "deadline")
-] + [("managed", 503, "wrap")])
+] + [("managed", 503, "wrap")]
+
+# All wire/status, wire/ending and status/ending pairs. The complete table below
+# proves that each wire/status becomes the same refusal policy before an ending
+# is applied; these cases additionally compose it with the loop and real ledger.
+_REFUSAL_LOOP_CASES = [
+    (wire, status, ("answer", "stop", "deadline")[(wire_index + status_index) % 3])
+    for wire_index, wire in enumerate(("managed", "http", "sse"))
+    for status_index, status in enumerate((429, 503, 529))
+] + [("managed", 503, "wrap")]
+
+
+def _wire_refusal(wire, status):
+    if wire == "managed":
+        return llm_claudexor.ClaudexorModelError(json.loads(json.dumps({
+            "code": "provider_failed", "message": "Upstream refused", "retryable": True,
+            "context": {"httpStatus": status}})), model_role="main", route=ROUTE)
+    if wire == "sse":
+        from ouroboros.llm_stream import ChatAccumulator, ProviderStreamError
+
+        with pytest.raises(ProviderStreamError) as raised:
+            ChatAccumulator().accept("message", json.dumps({
+                "error": {"code": status, "message": "Temporary refusal"}}))
+        return raised.value
+    return httpx.HTTPStatusError("Temporary refusal",
+        request=httpx.Request("POST", "https://fixture.invalid"), response=httpx.Response(status))
+
+
+@pytest.mark.parametrize("wire,status,ending", _REFUSAL_CASES)
+def test_primary_refusal_policy_preserves_every_wire_status_and_ending(tmp_path, monkeypatch, wire, status, ending):
+    from datetime import datetime, timezone
+    from ouroboros.loop_llm_call import classify_llm_exception
+    from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
+    from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
+
+    refusal = classify_llm_exception(_wire_refusal(wire, status))
+    assert (refusal.kind, refusal.retry_same_request, refusal.status_code) == ("provider_transient", True, status)
+    if wire == "managed":
+        payload = llm_claudexor._request({"source": ROUTE["source"], "resolved_model": ROUTE["model"]},
+            [{"role": "user", "content": "Keep waiting on the primary."}], None,
+            {"model_role": "main", "model_account_override": "account-a", "prospective": True})
+        assert json.loads(json.dumps(payload))["account"] == {"mode": "pin", "profileId": "account-a"}
+    ctx = SimpleNamespace(route_wait_on_primary=True, is_direct_chat=ending != "wrap", task_metadata={})
+    assert not loop_transport.fallback_chain_allowed(ctx, refusal.kind, None)
+    ctx.route_wait_on_primary = False
+    assert loop_transport.fallback_chain_allowed(ctx, refusal.kind, None)
+    ctx.route_wait_on_primary = True
+    now, waits, notes = [1000.0], [], []
+    monkeypatch.setattr(loop_transport, "time", SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0]))
+
+    def sleep(seconds, _wake):
+        waits.append(seconds)
+        now[0] += seconds
+        return False
+
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", sleep)
+    common = {"drive_logs": tmp_path, "task_id": "task-one", "model": MODEL,
+              "emit_progress": lambda text, **_kw: notes.append(text)}
+    episode = loop_transport.reconcile_transport_wait(None, ctx, msg_present=False, error_kind=refusal.kind, **common)
+    assert episode.wait_cause == refusal.kind and episode.interactive is (ending != "wrap")
+    step = {**common, "tools": SimpleNamespace(_ctx=ctx), "drive_root": None,
+            "incoming_messages": None, "owner_msg_seen": set()}
+    assert loop_transport.transport_wait_step(episode, error_kind=refusal.kind, **step)
+    assert waits == [4.0]
+    if ending == "answer":
+        # Another real refusal preserves this episode: it cannot reset its
+        # pacing or claim that an available catalog was a recovered generation.
+        assert loop_transport.reconcile_transport_wait(episode, ctx, msg_present=False,
+                                                       error_kind=refusal.kind, **common) is episode
+        assert loop_transport.transport_wait_step(episode, error_kind=refusal.kind, **step)
+        assert waits == [4.0, 8.0] and episode.redials == 2
+        assert loop_transport.reconcile_transport_wait(episode, ctx, msg_present=True,
+                                                       error_kind="", **common) is None
+    else:
+        control = {"stop": REASON_OWNER_STOPPED_DIRECT_TURN, "wrap": REASON_OWNER_REQUESTED_FINALIZATION}.get(ending, "")
+
+        def terminal(**facts):
+            assert facts["error_kind"] == facts["wait_cause"] == refusal.kind
+            assert facts["control_reason"] == control
+            return loop_transport.provider_terminal_fallback_text(
+                {"_last_llm_error_kind": refusal.kind, "_last_llm_status_code": status},
+                is_context_overflow=False, is_transport_wait=True, is_deadline_exhausted=ending == "deadline",
+                waited_sec=facts["waited_sec"], interactive=facts["interactive"],
+                control_reason=facts["control_reason"], wait_cause=facts["wait_cause"])
+
+        if ending == "deadline":
+            ctx.task_metadata["deadline_at"] = datetime.fromtimestamp(now[0] - 1, timezone.utc).isoformat()
+            assert not loop_transport.transport_wait_step(episode, error_kind="deadline_exhausted", **step)
+            notice = terminal(error_kind=refusal.kind, wait_cause=episode.wait_cause,
+                              waited_sec=episode.waited_sec, interactive=episode.interactive, control_reason="")
+        else:
+            notice = loop_transport.finalize_now_transport_terminal(episode, drive_logs=tmp_path,
+                task_id="task-one", model=MODEL, handle_provider_unavailable=terminal, control_reason=control)
+        assert "No new summary request was sent" in notice
+        assert "provider connection was unavailable" not in notice and "$0" not in notice
+        assert "refusing requests" in notice
+        assert waits == [4.0] and episode.redials == 1
+    assert any("primary provider temporarily refused" in note for note in notes)
+    assert not any("$0" in note or "connection restored" in note.lower() for note in notes)
+    if ending == "wrap":
+        assert any(note.endswith("Stop cancels.") for note in notes)
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert events[0]["detail"] == refusal.kind
+    assert events[-1]["phase"] == ("recovered" if ending == "answer" else "ended")
+
+
+@pytest.mark.parametrize("wire,status,ending", _REFUSAL_LOOP_CASES)
 def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
         main_call, monkeypatch, wire, status, ending):
     from datetime import datetime, timedelta, timezone
@@ -490,8 +598,8 @@ def test_primary_refusal_wait_paces_real_requests_without_catalog_recovery(
     assert not owner.waits  # no immediate resource_available row/new paid call loop
     if wire == "managed":
         assert all(payload["account"] == {"mode": "pin", "profileId": "account-a"} for payload, _ in gateway.uploads)
-    rows = ledger(ctx.drive_root)
-    assert sum(row["state"] == "dispatched" for row in rows) == attempts
+    rows = ledger(ctx.drive_root)  # one current row per attempt: every sent attempt
+    assert sum(row["state"] in {"dispatched", "settled", "unresolved"} for row in rows) == attempts
     assert not any(row["state"] == "released" for row in rows)
     assert any("primary provider temporarily refused" in note for note in notes)
     assert not any("$0" in note or "connection restored" in note.lower() for note in notes)

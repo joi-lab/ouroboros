@@ -62,8 +62,8 @@ const final = (patch = {}) => ({ task_id: TASK, role: 'assistant', content: 'Not
 test('the sender line signs a wake-up final and leaves every other bubble alone', () => {
     assert.equal(senderLabel('assistant', false, '', { initiator: 'consciousness' }), 'Ouroboros · Consciousness');
     assert.equal(senderLabel('assistant', false, '', {}), 'Ouroboros');
-    assert.equal(senderLabel('assistant', true, '', { initiator: 'consciousness' }), '💬 Thought');
-    assert.equal(senderLabel('system', false, 'task_summary', { initiator: 'consciousness' }), '📋 Task Summary');
+    assert.equal(senderLabel('assistant', true, '', { initiator: 'consciousness' }), 'Thought');
+    assert.equal(senderLabel('system', false, 'task_summary', { initiator: 'consciousness' }), 'Task Summary');
     assert.equal(senderLabel('user', false, '', { initiator: 'consciousness' }), 'You');
 });
 

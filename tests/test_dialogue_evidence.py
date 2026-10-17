@@ -6,6 +6,7 @@ from ouroboros.memory_inventory import open_room_rows
 from ouroboros.project_dialogue import build_owner_message_ref
 from ouroboros.projects_registry import bind_task_to_project, create_project
 from ouroboros.utils import append_jsonl, atomic_write_json
+from tests._store_shared import seed_result
 
 
 def test_full_room_includes_rotated_consolidated_dialogue_and_child_lineage(tmp_path):
@@ -143,12 +144,10 @@ def test_room_source_signs_old_outgoing_rows_by_the_activation_lineage_epoch(tmp
     """Before the chronicle is active every lineage-free outgoing row reads as mine, as it always
     did. Once the activation records the lineage epoch, a row before it is mine only by its task
     result; rows after it, and the reader's other rows, keep their signature."""
-    import json
 
     from ouroboros.chronicle_store import ChronicleStore
     from ouroboros.dialogue_evidence import read_room_source
     from ouroboros.task_result_schema import SCHEMA_VERSION_KEY, TASK_RESULT_SCHEMA_VERSION
-    from ouroboros.task_results import task_result_path
 
     out = {"chat_id": 1, "direction": "out"}
     for row in (
@@ -163,9 +162,8 @@ def test_room_source_signs_old_outgoing_rows_by_the_activation_lineage_epoch(tmp
         append_jsonl(tmp_path / "logs" / "chat.jsonl", row)
     for task_id, fields in (("root0001", {}), ("kid00002", {"parent_task_id": "root0001", "root_task_id": "root0001",
                                                              "delegation_role": "subagent"})):
-        task_result_path(tmp_path, task_id).write_text(json.dumps({
-            SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id, "status": "completed", **fields}),
-            encoding="utf-8")
+        seed_result(tmp_path, task_id, {
+            SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id, "status": "completed", **fields})
 
     def authors():
         return [row["author"] for row in read_room_source(tmp_path, 1)["rows"]]

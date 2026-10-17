@@ -200,7 +200,7 @@ def test_non_openrouter_payload_strips_reasoning_roundtrip_metadata(monkeypatch)
     assert messages[1]["reasoning_details"] == [{"type": "reasoning.text", "text": "read first"}]
 
 
-def test_openrouter_payload_keeps_reasoning_roundtrip_metadata(monkeypatch):
+def test_openrouter_payload_keeps_full_details_without_duplicate_flat_reasoning(monkeypatch):
     client = LLMClient()
     monkeypatch.setattr(client, "_get_supported_parameters", lambda _model_id: None)
     messages = [
@@ -226,9 +226,10 @@ def test_openrouter_payload_keeps_reasoning_roundtrip_metadata(monkeypatch):
     )
 
     assistant_msg = kwargs["messages"][1]
-    assert assistant_msg["reasoning"] == "read first"
+    assert "reasoning" not in assistant_msg
     assert assistant_msg["reasoning_details"] == [{"type": "reasoning.text", "text": "read first"}]
     assert assistant_msg["response_id"] == "gen-123"
+    assert messages[1]["reasoning"] == "read first"
 
 
 def test_system_message_placement_demotes_late_notices_preserving_tool_adjacency():

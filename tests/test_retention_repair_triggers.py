@@ -7,6 +7,7 @@ import pytest
 
 from ouroboros import artifacts, headless, observability, source_retention, task_custody
 from ouroboros.task_results import load_task_result, write_task_result
+from tests._store_shared import result_signature
 
 
 @pytest.mark.parametrize("count", [1, 26])
@@ -342,13 +343,12 @@ def test_immutable_artifact_failure_reuses_observation_and_reopens_on_exact_repa
     generation, copies, original = object(), [], artifacts.copy_artifact_file
     monkeypatch.setattr(artifacts, "copy_artifact_file", lambda *a, **kw: (copies.append(a), original(*a, **kw))[1])
     assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["pending"] == [task]
-    row_path = parent / "task_results" / f"{task}.json"
-    before, first = row_path.read_bytes(), len(copies)
+    before, first = result_signature(parent, task), len(copies)
     failure = load_task_result(parent, task)["child_ref_promotion"]["pending_refs"][0]
     assert failure["failure_kind"] == "immutable_identity_mismatch"
     assert task_custody.settle_child_drive(parent, task, child, live=lambda _: False)["status"] == "retained"
     assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["unchanged"] == [task]
-    assert len(copies) == first and row_path.read_bytes() == before and child.exists()
+    assert len(copies) == first and result_signature(parent, task) == before and child.exists()
     target = source if repair_at == "source" else Path(failure["canonical_path"])
     target.write_bytes(exact)
     assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["completed"] == [task]
@@ -419,3 +419,96 @@ def test_in_place_call_inventory_repair_reopens_unavailable_observation(tmp_path
     call.write_text(json.dumps(manifest), encoding="utf-8")
     assert call.parent.stat().st_mtime_ns == before
     assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["completed"] == [task]
+
+
+# ---------------------------------------------------------------------------
+# Owner Q2=A (14 Oct): what was found unresolvable is not rechecked until its source changes.
+# The 14 Oct stall: five tasks re-promoted every 300 s (10-20 min passes) because a review
+# attachment placed under ``review_inputs/request-*`` was refused and the refusal was never
+# remembered. The placement is owned now; any other deterministic contract refusal is
+# remembered by basis, while transient I/O and contention stay retryable.
+# ---------------------------------------------------------------------------
+
+def _acceptance_checkpoint(child, task, contract):
+    raw = json.dumps({"request": {"surface": "task_acceptance", "task_id": task,
+                                  "evidence": {"task_contract": contract}}}).encode("utf-8")
+    return artifacts.store_actor_source_bytes(child, task, category="context_checkpoints",
+                                              source_id="acceptance", data=raw, extension="json")
+
+
+def test_review_input_attachment_copies_are_owned_sources(tmp_path):
+    from ouroboros.review_source_closure import retain_review_request_sources
+    from ouroboros.review_substrate import ReviewRequest
+
+    parent, task = tmp_path / "canonical", "att-snapshot-task"
+    child = headless.prepare_task_drive(parent, task, "empty")
+    image = tmp_path / "screen.png"
+    image.write_bytes(b"fake-png-bytes")
+    contract = artifacts.attachment_manifest_projection(
+        child, task, artifacts.stage_task_attachments(child, task, [str(image)]))
+    write_task_result(child, task, "running", result="answer", task_contract=contract)
+    write_task_result(parent, task, "running", child_drive_root=str(child))
+    request = ReviewRequest(surface="task_acceptance", task_id=task, goal="check image", subject="answer",
+                            evidence={"task_contract": contract}, retry_key="img-review")
+    retain_review_request_sources(request, source_root=child, custody_root=parent)
+    placed = request.evidence["task_contract"]
+    assert "source_handles/review_inputs/request-" in Path(placed["attachment_manifest"][0]["abs_path"]).as_posix()
+    captured = _acceptance_checkpoint(child, task, placed)  # the persisted request names the placement
+    write_task_result(child, task, "completed", result="answer", artifact_status="ready",
+                      task_contract=contract, review_evidence={"source_refs": [captured]})
+    headless.copy_child_task_result(parent, {"id": task, "drive_root": str(child)})
+    result = headless.retry_child_task_refs(parent, child, task)
+    assert result["child_ref_promotion"]["status"] == "complete"
+    assert result["child_ref_promotion"]["pending_refs"] == []
+
+
+def _unowned_attachment(tmp_path):
+    """A captured checkpoint whose contract names an attachment outside every owned root."""
+    parent, task = tmp_path / "canonical", "unowned-attachment"
+    child = headless.prepare_task_drive(parent, task, "empty")
+    outside = tmp_path / "elsewhere" / "screen.png"
+    outside.parent.mkdir()
+    outside.write_bytes(b"fake-png-bytes")
+    row = {"status": "ok", "abs_path": str(outside), "size": outside.stat().st_size, "sha256": "a" * 64}
+    captured = _acceptance_checkpoint(child, task, {"attachment_manifest": [row]})
+    write_task_result(child, task, "completed", result="answer", artifact_status="ready",
+                      review_evidence={"source_refs": [captured]})
+    headless.copy_child_task_result(parent, {"id": task, "drive_root": str(child)})
+    return parent, child, task, outside
+
+
+def test_a_deterministic_contract_refusal_is_walked_once_per_unchanged_basis(tmp_path, monkeypatch):
+    parent, _child, task, outside = _unowned_attachment(tmp_path)
+    counts, generation = _observe(monkeypatch), object()
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["pending"] == [task]
+    refused = [row for row in load_task_result(parent, task)["child_ref_promotion"]["pending_refs"]
+               if row.get("failure_kind") == "invalid_source"]
+    assert refused and refused[0]["watched_paths"] == [str(outside)]
+    assert refused[0]["reason"].endswith("review attachment has no captured owner-bound source")
+    first = dict(counts)
+    for _ in range(2):  # the next passes of the same generation: no walk, no read, no event
+        report = observability.retry_pending_child_ref_promotions(parent, generation=generation)
+        assert report["unchanged"] == [task] and not report["retried"] and counts == first
+    outside.write_bytes(b"different bytes")  # a file the verdict read changed: walk it again
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["retried"] == [task]
+    assert counts["reads"] > first["reads"]
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["unchanged"] == [task]
+
+
+def test_a_transient_failure_of_the_same_source_stays_retryable(tmp_path, monkeypatch):
+    parent, _child, task, _outside = _unowned_attachment(tmp_path)
+    generation, real, failed = object(), source_retention.RetentionWalk._source, []
+
+    def flaky(self, node, raw):
+        if not failed:
+            failed.append(node["ref"]["path"])
+            raise OSError("transient retention write failure")
+        return real(self, node, raw)
+
+    monkeypatch.setattr(source_retention.RetentionWalk, "_source", flaky)
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["pending"] == [task]
+    pending = load_task_result(parent, task)["child_ref_promotion"]["pending_refs"]
+    assert failed and not any(row.get("failure_kind") for row in pending), "no negative observation"
+    # Transient I/O is walked again; the real refusal behind it is then remembered.
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["retried"] == [task]
+    assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["unchanged"] == [task]

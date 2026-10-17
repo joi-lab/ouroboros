@@ -6,7 +6,7 @@ live in the per-project store (``data/projects/<id>/``), which generic data
 tools cannot reach (``project_store_access_block``) — these scoped tools are
 the only write path, exactly like project knowledge.
 
-Tools resolve the project from the CURRENT task (``ctx.project_id``); an
+Tools resolve the project from the CURRENT task's durable placement; an
 explicit ``project_id`` argument lets the main-chat agent annotate a specific
 project (e.g. when curating from the штаб).
 """
@@ -21,7 +21,9 @@ from contextlib import nullcontext
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.project_facts import (
+    placed_project_id,
     project_journal_path,
+    project_reflections_path,
     project_workpad_path,
     sanitize_project_id,
     explicit_project_id_ok,
@@ -39,6 +41,10 @@ from ouroboros.utils import (
 log = logging.getLogger(__name__)
 
 _JOURNAL_KINDS = ("start", "checkpoint", "blocked", "done", "note")
+# journal_read's closed sources: the milestone journal, or the project's reflection-log
+# rows (historical automatic reflections and host rows, otherwise unreachable: generic
+# file tools refuse the project store).
+_READ_SOURCES = {"journal": project_journal_path, "reflections": project_reflections_path}
 _MAX_TEXT_CHARS = 4000
 _WORKPAD_MAX_BYTES = 256 * 1024
 
@@ -68,7 +74,7 @@ def _scope_authority(ctx: ToolContext) -> tuple[str, Dict[str, Any]]:
 
 
 def _resolve_project_id(ctx: ToolContext, explicit: Any, *, write: bool = False) -> tuple[str, str]:
-    own_value = getattr(ctx, "project_id", "")
+    own_value = placed_project_id(ctx)
     if own_value not in (None, "") and not isinstance(own_value, str):
         return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
     if explicit not in (None, "") and not isinstance(explicit, str):
@@ -152,7 +158,7 @@ def append_journal_milestone(
     short); an automatic milestone MUST be recorded, so when the composed text
     exceeds ``_MAX_TEXT_CHARS`` it is bounded with a VISIBLE pointer instead of
     being silently sliced or dropped (the full text always survives in the task's
-    task_results and the consciousness digest). Centralizing here keeps every
+    task_results). Centralizing here keeps every
     project-journal append on one bounded path (no raw append_jsonl elsewhere)."""
     pid = sanitize_project_id(project_id)
     if not pid:
@@ -173,7 +179,7 @@ def append_journal_milestone(
         return
     if len(body) > _MAX_TEXT_CHARS:
         keep = _MAX_TEXT_CHARS - 80
-        body = body[:keep] + f"… [+{len(body) - keep} chars; full text in this task's task_results / digest]"
+        body = body[:keep] + f"… [+{len(body) - keep} chars; full text in this task's task_results]"
     path = project_journal_path(pid)
     path.parent.mkdir(parents=True, exist_ok=True)
     append_jsonl(path, {
@@ -337,11 +343,13 @@ def mirror_tree_coordination_to_journal(project_id: str, root_id: str, task_id: 
         append_journal_milestone(pid, journal_kind, f"[swarm {kind}] ({who}): {text}", task_id=task_id)
 
 
-def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
+def _journal_snapshot(source: Dict[str, Any], project_id: str, stream: str = "journal") -> str:
     payload = {
         "schema_version": 1,
         "project_id": project_id,
         "source": source,
+        # A reflections cursor is bound to its stream; a journal cursor keeps its old bytes.
+        **({"stream": stream} if stream != "journal" else {}),
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -350,6 +358,7 @@ def _journal_snapshot(source: Dict[str, Any], project_id: str) -> str:
 def _journal_snapshot_rows(
     path: pathlib.Path,
     project_id: str,
+    stream: str = "journal",
 ) -> tuple[List[Dict[str, Any]], str, bool, int]:
     """Capture one stateless journal generation, retrying one concurrent append."""
     rows: List[Dict[str, Any]] = []
@@ -381,7 +390,7 @@ def _journal_snapshot_rows(
         except OSError:
             unreadable += 1
         after = jsonl_generation_signature(path)
-        snapshot = _journal_snapshot(after, project_id)
+        snapshot = _journal_snapshot(after, project_id, stream)
         if before and before == after:
             return rows, snapshot, True, unreadable
     return rows, snapshot, False, unreadable
@@ -394,21 +403,27 @@ def _journal_read(
     limit: int = 30,
     offset: int = 0,
     snapshot: str = "",
+    source: str = "journal",
 ) -> str:
+    source = "journal" if source in (None, "") else source  # an empty value asks for the default
+    if not isinstance(source, str) or source not in _READ_SOURCES:
+        return (f"⚠️ TOOL_ARG_ERROR (journal_read): source={source!r} is not one of "
+                f"{sorted(_READ_SOURCES)}; omit it for the journal.")
     pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
     if scope_error:
         return scope_error + " (journal_read)"
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_read): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
-    path = project_journal_path(pid)
+    path = _READ_SOURCES[source](pid)
     if not path.is_file():
         if str(snapshot or "").strip():
             return (
                 "JOURNAL_READ_SNAPSHOT_CHANGED: the journal source is no longer "
                 "available; no mixed page was returned; restart with offset=0 and no snapshot."
             )
-        return f"(journal for project {pid} is empty)"
+        return f"(journal for project {pid} is empty)" if source == "journal" else (
+            f"(no reflection-log rows for project {pid})")
     try:
         take = max(1, min(int(limit or 30), 200))
     except (TypeError, ValueError):
@@ -417,7 +432,7 @@ def _journal_read(
         skip = max(0, int(offset or 0))
     except (TypeError, ValueError):
         skip = 0
-    rows, current_snapshot, stable, unreadable = _journal_snapshot_rows(path, pid)
+    rows, current_snapshot, stable, unreadable = _journal_snapshot_rows(path, pid, source)
     requested_snapshot = str(snapshot or "").strip().lower()
     if not stable:
         return (
@@ -447,12 +462,17 @@ def _journal_read(
             f"JOURNAL_READ_GAP: coverage is partial; {unreadable} non-empty physical "
             "row(s) were malformed or non-object JSON. Valid rows remain pageable."
         )
+    selector = "" if source == "journal" else f"source='{source}', "
     if remaining:
         lines.append(
             "Next older page: "
-            f"journal_read(project_id='{pid}', limit={take}, "
+            f"journal_read(project_id='{pid}', {selector}limit={take}, "
             f"offset={skip + len(page)}, snapshot='{current_snapshot}')"
         )
+    if source == "reflections":
+        # Whole recorded rows, dated by their own ts: history, not current understanding.
+        lines.extend(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in page)
+        return f"## Project reflection log ({pid})\n\n" + "\n".join(lines)
     for row in page:
         lines.append(
             f"[{str(row.get('ts') or '')[:19]}] {str(row.get('kind') or 'note').upper()}: "
@@ -619,7 +639,7 @@ def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
     # what the provider was allowed to omit).
     if isinstance(source_ref, dict) and str(source_ref.get("reader") or "") in ("journal_read", "workpad_read") \
             and not str(source_ref.get("project_id") or "").strip():
-        own_project = str(getattr(ctx, "project_id", "") or "").strip()
+        own_project = str(placed_project_id(ctx) or "").strip()
         if own_project:
             source_ref = {**source_ref, "project_id": own_project}
     from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
@@ -767,12 +787,12 @@ def get_tools() -> List[ToolEntry]:
             {
                 "name": "update_focus",
                 "description": (
-                    "Optionally publish one short line on what this live root is working on, for the OTHER "
-                    "live roots: their roster note and live_roots show it, dated, while this task is unsettled "
-                    "(waits included) until you publish a newer one; once it settles it is only history on its "
-                    "task result. It is task-scoped, not a project-level record; journal/workpad writes do not "
-                    "publish it and nothing refreshes it. source_ref names a reader whose current answer is "
-                    "kept as the evidence. Awareness, never an owner directive."
+                    "Optionally publish one short line about this live root's work. Your context facts repeat "
+                    "its dated text as working thought, never an owner directive; revise it when your focus changes. "
+                    "OTHER live roots see it while this task is unsettled (waits included), until replaced; "
+                    "after settlement it is history. It is task-scoped, not a project-level record; "
+                    "journal/workpad writes do not publish it and nothing refreshes it. source_ref names a "
+                    "reader whose current answer is retained as evidence."
                 ),
                 "parameters": {
                     "type": "object",
@@ -828,10 +848,20 @@ def get_tools() -> List[ToolEntry]:
             "journal_read",
             {
                 "name": "journal_read",
-                "description": "Read the tail of the current project's journal (newest last).",
+                "description": (
+                    "Read the tail of the current project's journal (newest last). source='reflections' "
+                    "pages the project's reflection log instead: dated rows earlier versions' automatic "
+                    "post-task reviews wrote, and late review settlements, each whole."
+                ),
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "source": {
+                            "type": "string",
+                            "enum": sorted(_READ_SOURCES),
+                            "default": "journal",
+                            "description": "journal (default) or reflections.",
+                        },
                         "limit": {"type": "integer", "default": 30, "description": "Max entries (<=200)."},
                         "offset": {
                             "type": "integer",
@@ -847,8 +877,8 @@ def get_tools() -> List[ToolEntry]:
                     },
                 },
             },
-            lambda ctx, limit=30, offset=0, snapshot="", project_id="": _journal_read(
-                ctx, project_id, limit, offset, snapshot,
+            lambda ctx, limit=30, offset=0, snapshot="", project_id="", source="journal": _journal_read(
+                ctx, project_id, limit, offset, snapshot, source,
             ),
             timeout_sec=15,
         ),

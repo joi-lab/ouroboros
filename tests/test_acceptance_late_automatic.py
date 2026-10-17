@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.test_acceptance_late_consumers import late as late, delivered
+from tests._cancel_intents_shared import DeliveryBus
 from tests.test_acceptance_history import _caller, _source, _request
 from tests.test_review_operation_collection import _send_ctx, fresh_sends as fresh_sends
 from tests.test_review_operation_lifetime import until
@@ -118,14 +119,13 @@ def postwork(f, monkeypatch):
     from ouroboros import agent_task_pipeline as pipeline
     from ouroboros.post_task_checkpoint import post_task_synthesis_in_flight
     observed = []
-    for name in ('_record_task_facts', '_run_scratchpad_consolidation',
-                 '_run_reflection', '_update_improvement_backlog'):
+    for name in ('_record_task_facts', '_run_scratchpad_consolidation'):
         monkeypatch.setattr(pipeline, name, lambda *_a, _name=name, **_k: observed.append(_name))
     monkeypatch.setattr('ouroboros.post_task_evolution.maybe_promote', lambda *_a, **_k: observed.append('promotion'))
     task = {**f.task, 'drive_root': str(f.root)}
     task.pop('_skip_post_task_synthesis', None)
     env = SimpleNamespace(drive_root=f.root, repo_dir=f.tmp_path)
-    pipeline._run_post_task_processing_async(env, task, {}, {}, {}, f.root / 'logs', blocking=True)
+    pipeline._run_post_task_processing_async(env, task, {}, {}, f.root / 'logs', blocking=True)
     assert not post_task_synthesis_in_flight(f.root, f.tid)
     assert load_task_result(f.root, f.tid)['root_phase_checkpoint']['post_task_synthesis'] == 'completed'
     assert 'promotion' in observed
@@ -140,7 +140,7 @@ def test_receipt_after_entire_postwork_starts_once_through_sender_or_outbox(late
     monkeypatch.setattr(task_queue, 'DRIVE_ROOT', f.root)
     postwork(f, monkeypatch)
     before = copy.deepcopy(load_task_result(f.root, f.tid))
-    sends, events = [], queue.Queue()
+    sends, events = [], DeliveryBus()  # replay admits a copy only through the bus's membership
     if replay:
         monkeypatch.setattr(terminal_delivery, '_REPLAY_MIN_AGE_SEC', 0)
         assert terminal_delivery.replay_pending_deliveries(f.root, event_queue=events) == [f.event['delivery_id']]
@@ -447,7 +447,7 @@ def test_duplicate_sender_leaves_held_collection_to_maintenance(late, tmp_path, 
     from tests.test_server_control_panic_daemon import _run_panic
 
     f = delivered(tmp_path, monkeypatch, receipt='owed')
-    outbox = queue.Queue()
+    outbox = DeliveryBus()  # replay admits a copy only through the bus's membership
     monkeypatch.setattr(terminal_delivery, '_REPLAY_MIN_AGE_SEC', 0)
     assert terminal_delivery.replay_pending_deliveries(f.root, event_queue=outbox) == [f.event['delivery_id']]
     replay_event = outbox.get_nowait()  # queued before a competing delivery wins

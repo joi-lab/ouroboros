@@ -221,9 +221,13 @@ def _cost_from_pricing(pricing: tuple, prompt_tokens: int, completion_tokens: in
 
 
 def infer_api_key_type(model: str, provider: Optional[str] = None) -> str:
-    """Infer which API key is used based on model name."""
+    """Infer which API key is used: an explicit provider first, else the model name.
+
+    ``claudexor`` is explicit route evidence (#1578): a session's seat or observed
+    model text never relabels it as an OpenRouter or Anthropic key, empty model included."""
     provider_name = str(provider or "").strip().lower()
-    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat", "minimax", "deepseek", "zai"}:
+    if provider_name in {"local", "openrouter", "openai", "anthropic", "openai-compatible", "cloudru", "gigachat",
+                         "minimax", "deepseek", "zai", "claudexor"}:
         return provider_name
     raw_model = str(model or "").strip()
     direct_provider = provider_for_model(raw_model)
@@ -335,7 +339,10 @@ def emit_llm_usage_event(
                 parent_task_id = str(scope.parent_task_id or "")
         except Exception:
             pass
-        resolved_provider = provider or ("local" if str(model or "").endswith(" (local)") else "openrouter")
+        from ouroboros.event_usage import event_token_counts
+
+        resolved_provider = provider or str(usage.get("provider") or "") or (
+            "local" if str(model or "").endswith(" (local)") else "openrouter")
         event_queue.put_nowait({
             "type": "llm_usage",
             "ts": utc_now_iso(),
@@ -347,11 +354,10 @@ def emit_llm_usage_event(
             "model_category": infer_model_category(model),
             "provider": resolved_provider,
             "source": source,
-            **{key: usage[key] for key in ("llm_call_id", "execution_id", "round_id", "round") if key in usage},
-            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
-            "completion_tokens": int(usage.get("completion_tokens") or 0),
-            "cached_tokens": int(usage.get("cached_tokens") or 0),
-            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+            **{key: usage[key] for key in ("llm_call_id", "execution_id", "round_id", "round", "session_id")
+               if key in usage},
+            # #1578: each counter is reported, a measured 0, or null — never an invented zero.
+            **event_token_counts(usage),
             "prompt_cache_ttl": str(usage.get("prompt_cache_ttl") or ""),
             "cost": cost,
             "cost_estimated": (

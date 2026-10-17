@@ -1,0 +1,352 @@
+/* The room's work status (DESIGN "Room work status"; web/modules/room_work.js). The status control is a
+   status sentence right after the room's title in its bar; in every room its list is one Shade, the bar's
+   own material unfolding from the bar's bottom edge. The control's tone comes with its word from one
+   producer (chat_activity.js: live, queued, wait for the owner's question, held for a pause, an access wait or
+   a hold, unknown, and the connection's own). A row's tone comes from the presenter's facts, never from text,
+   always beside a word and a dot:
+     live       confirmed motion: the accent ink, three moving dots
+     wait       the owner's turn, a pause, an access or Project wait: the warn ink, one amber dot
+     queued     neutral, three still dots;   unknown: neutral, a hollow ring
+     done / caution / failed   a known outcome in its status foreground, one dot
+   Names stay --text-primary at 400; local dimensions are variables on .rw-surface, never a type size. */
+
+/* ---- the status control ---------------------------------------------------------------------------
+   The short word in its status ink, then one mark (three dots or one), as on the sidebar's rows; nothing is
+   filled. Pressing is the only fill: a neutral tint on hover and while open.
+   It follows the title, so a longer word takes the title's room, never a neighbour's; it stays whole until the
+   title reaches its floor, and is said whole in the control's name either way. */
+.rw-trigger {
+    --rw-dot: var(--text-disabled);
+    gap: var(--space-2);
+    min-width: 0;
+    max-width: 100%;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-meta);
+    font: inherit;
+    font-size: var(--type-meta);
+    cursor: pointer;
+    transition: background 120ms ease;
+}
+.rw-trigger[hidden] { display: none; }
+.rw-trigger:disabled { cursor: default; opacity: 1; }
+.rw-trigger:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+/* The status follows the room's title in its bar. The status never shrinks while the title can: the title
+   yields its ellipsis first and keeps a 5ch floor, because the status may never take more than the row less 5ch;
+   only past that floor does the status word ellipsize inside its cap. Neither moves the bar's other controls: the
+   bar decides its rows by the title block's basis, never by these words. */
+:is(.chat-page-header, .project-panel-bar) .app-page-title-row > .rw-trigger {
+    flex: 0 0 auto; min-width: 0; max-width: calc(100% - 5ch); margin-left: var(--space-1); padding-inline: 10px;
+}
+:is(.chat-page-header, .project-panel-bar) .app-page-title-row > .app-page-title {
+    flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.project-panel-bar .app-page-title-block { flex: 1 1 0; min-width: 0; }
+/* The real badge (setStatus writes it) is bare text inside the control. */
+.rw-trigger .status-badge {
+    display: block;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    animation: none;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 500;
+}
+/* (0,5,0) outranks the light theme's connection colours (0,4,0): the tone below owns the word's ink. */
+:root .rw-trigger[data-tone] .status-badge.status-badge { color: inherit; }
+/* Tones (one producer, chat_activity.js): crimson is live work, amber only the owner's own question, green the
+   room at rest; a pause, an access wait, a hold, starting and reconnecting are neutral facts. */
+.rw-trigger[data-tone="live"] { --rw-dot: var(--accent); color: var(--accent-light); }
+.rw-trigger[data-tone="wait"] { --rw-dot: var(--amber); color: var(--status-warn-fg); }
+.rw-trigger:is([data-tone="queued"], [data-tone="held"], [data-tone="starting"]) { --rw-dot: var(--text-meta); color: var(--text-meta); }
+.rw-trigger[data-tone="unknown"] { color: var(--status-neutral-fg); }
+.rw-trigger[data-tone="online"] { --rw-dot: var(--green); color: var(--status-ok-fg); }
+.rw-trigger[data-tone="offline"] { color: var(--text-secondary); }
+.rw-trigger:not(:disabled):hover { background: rgba(var(--neutral-rgb), 0.07); }
+.rw-trigger[data-open="1"] { background: rgba(var(--neutral-rgb), 0.11); }
+
+/* ---- marks shared by the control and the rows ------------------------------------------------------ */
+.rw-lead, .rw-mark { flex: none; box-sizing: border-box; width: 7px; height: 7px; border-radius: 50%; background: var(--rw-dot); }
+.rw-lead[hidden], .rw-mark[hidden], .rw-caret[hidden], .rw-secondary[hidden], .rw-where[hidden], .rw-chev[hidden] { display: none; }
+.rw-trigger[data-tone="unknown"] .rw-mark,
+.rw-row:is([data-tone="unknown"], [data-tone="ended"]) .rw-lead { background: transparent; border: 1.5px solid currentColor; }
+/* The status's one mark follows its word; a question waiting for the owner turns that mark amber (the word keeps its
+   ink), so live work with a question shows amber moving dots, never a second mark. */
+.rw-trigger[data-wait="1"] { --rw-dot: var(--amber); }
+.rw-trigger[data-wait="1"] .rw-dots { color: var(--amber); }
+.rw-caret, .rw-chev { flex: none; display: inline-flex; width: 10px; height: 10px; align-items: center; justify-content: center; }
+.rw-caret::before, .rw-chev::before {
+    content: '';
+    width: 5px;
+    height: 5px;
+    margin-top: -3px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg);
+    transition: transform 140ms ease;
+}
+.rw-trigger[data-open="1"] .rw-caret::before,
+.rw-row[data-open="1"] .rw-chev::before { margin-top: 2px; transform: rotate(-135deg); }
+.rw-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.rw-sr[hidden] { display: none; }
+
+/* ---- surfaces ---------------------------------------------------------------------------------------- */
+.rw-surface {
+    --rw-more: 28px;
+    --rw-pill-h: 26px;
+    --rw-gap: var(--space-2);
+    --rw-hover: var(--menu-item-hover);
+    color: var(--text-primary);
+}
+.rw-surface[hidden] { display: none; }
+/* A pointer open lands on the list itself: a landing point, not a control, so no ring is drawn there. */
+.rw-surface:focus { outline: none; }
+@keyframes rw-unfold { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: none; } }
+/* Project: the Shade. A zero-height anchor under the bar lets it follow the bar's real height. */
+.rw-shade-anchor { position: relative; flex: 0 0 0; height: 0; z-index: 30; }
+.rw-shade {
+    --rw-hover: var(--menu-item-hover);
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    box-sizing: border-box;
+    max-height: min(60svh, 28rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* The bar's own shell ink: one surface unfolding, not a card on cards. */
+    background: rgb(var(--shell-rgb));
+    border-bottom: 1px solid var(--surface-border, rgba(var(--neutral-rgb), 0.14));
+    border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+    box-shadow: var(--chrome-shade-shadow);
+    animation: rw-unfold 170ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+/* The bar's hairline moves to the foot of the Shade while it is open. */
+.project-panel[data-rw-open] .project-panel-bar { border-bottom-color: transparent; }
+/* Main: the header floats over the transcript, so its anchor hangs from the header's bottom edge and the
+   Shade takes the same material without a Project tint. While open the header keeps opaque page ink to its
+   edge, so the bar and its Shade read as one surface unfolding, as in a Project. */
+.chat-page-header > .rw-shade-anchor { position: absolute; left: 0; right: 0; top: 100%; height: 0; z-index: 30; }
+.chat-page-header .rw-shade {
+    --rw-hover: var(--menu-item-hover);
+    background: rgb(var(--shell-rgb));
+    border-bottom-color: var(--surface-border, rgba(var(--neutral-rgb), 0.14));
+}
+.chat-page-header .rw-shade .rw-list { padding-left: var(--page-header-padding-x); padding-right: var(--page-header-padding-x); }
+.chat-page-header[data-rw-open]::before { -webkit-mask-image: none; mask-image: none; inset: 0; background: rgb(var(--shell-rgb)); }
+/* The Project status bar keeps the room's history note; without one it takes no room. */
+.chat-panel-statusbar:not(:has(> :not([hidden]))) { display: none; }
+
+/* ---- the list and its rows ------------------------------------------------------------------------- */
+.rw-list { display: flex; flex-direction: column; gap: 2px; box-sizing: border-box; width: 100%; min-width: 0; padding: 6px var(--space-2) 10px; }
+.rw-shade .rw-list { padding: var(--space-1) var(--space-2) var(--space-3); }
+.rw-group { padding: var(--space-3) 6px var(--space-1); font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
+.rw-row {
+    --rw-dot: var(--text-disabled);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto var(--rw-more);
+    grid-template-areas: "main verb more" "detail detail detail";
+    column-gap: var(--rw-gap);
+    align-items: center;
+    padding-right: var(--space-1);
+    border-radius: var(--radius-md);
+    /* A calm arrival each time the list opens: rows settle 24ms apart (none under reduced motion). */
+    animation: rw-row-in 200ms cubic-bezier(0.2, 0.7, 0.2, 1) backwards;
+    animation-delay: calc(var(--rw-i, 0) * 24ms);
+}
+.rw-row:hover { background: var(--rw-hover); }
+@keyframes rw-row-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.rw-main {
+    grid-area: main;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 2px;
+    align-items: center;
+    min-width: 0;
+    padding: 9px var(--space-1) 9px var(--space-2);
+    border-radius: var(--radius-sm);
+    cursor: default;
+    -webkit-user-select: text;
+    user-select: text;
+}
+.rw-main:is([data-target="card"], [data-target="history"], [data-target="details"]) { cursor: pointer; }
+/* The one standard ring, flush inside; where :has() exists it frames the whole row. */
+.rw-main:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+@supports selector(:has(*)) {
+    .rw-main:focus-visible { outline: none; }
+    .rw-row:has(> .rw-main:focus-visible) { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+}
+.rw-name {
+    grid-column: 1;
+    grid-row: 1;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    font-size: var(--type-body);
+    font-weight: 400;
+    line-height: var(--line-title);
+    color: var(--text-primary);
+}
+/* Keyboard focus on the row (room_work.js marks it) or open details show the whole name; only that row grows. */
+.rw-row:is([data-reading="1"], [data-open="1"]) .rw-name { -webkit-line-clamp: 99; line-clamp: none; }
+.rw-row[data-settled="1"] .rw-name { color: var(--text-secondary); }
+.rw-state {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    column-gap: 6px;
+    min-width: 0;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+}
+/* One flow: every row says its state under its name, so a long phase never starves the name. */
+.rw-row .rw-state { grid-column: 1 / -1; grid-row: 2; }
+.rw-word { font-weight: 400; }
+/* An outcome's quieter second fact (Finalizing…, a wait beside Failed), one accessible status with it. */
+.rw-secondary { color: var(--text-meta); }
+.rw-secondary::before { content: '· '; }
+/* Where a press found its message is said in the row's details; only the chevron shows, beside the state. */
+.rw-where { display: inline-flex; align-items: center; gap: 6px; }
+.rw-chev { color: var(--text-primary); }
+.rw-row[data-tone="live"] { --rw-dot: var(--accent); }
+.rw-row:is([data-tone="wait"], [data-tone="caution"]) { --rw-dot: var(--amber); }
+.rw-row[data-tone="done"] { --rw-dot: var(--green); }
+.rw-row[data-tone="failed"] { --rw-dot: var(--red); }
+.rw-row[data-tone="live"] :is(.rw-word, .rw-row-dots) { color: var(--accent-light); }
+.rw-row[data-tone="live"] .rw-word { font-weight: 500; }
+.rw-row:is([data-tone="wait"], [data-tone="caution"]) .rw-word { color: var(--status-warn-fg); font-weight: 500; }
+.rw-row[data-tone="done"] .rw-word { color: var(--status-ok-fg); font-weight: 500; }
+.rw-row[data-tone="failed"] .rw-word { color: var(--status-error-fg); font-weight: 500; }
+.rw-row[data-tone="ended"] .rw-state { color: var(--text-secondary); }
+
+/* ---- verbs and the bare ⋯ ---------------------------------------------------------------------------- */
+.rw-verb { grid-area: verb; display: inline-flex; align-items: center; gap: var(--space-1); }
+.rw-more-slot { grid-area: more; display: inline-flex; align-items: center; justify-content: center; width: var(--rw-more); }
+.rw-detail { grid-area: detail; }
+.rw-row .rw-pill {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    height: var(--rw-pill-h);
+    min-height: 0;
+    padding: 0 var(--space-3);
+    border-radius: var(--pill-radius);
+    border: 1px solid transparent;
+    font: inherit;
+    font-size: var(--button-font-size);
+    font-weight: 500;
+    line-height: 1;
+    white-space: nowrap;
+    cursor: pointer;
+    transform: none;
+    box-shadow: none;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.rw-row .rw-pill:is(:hover, :active) { transform: none; box-shadow: none; }
+.rw-row .rw-pill:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.rw-row .rw-pill:disabled { opacity: 0.55; cursor: default; }
+/* View question is warm: it is the owner's turn. It goes to the question and never answers it. */
+.rw-row .rw-pill-question { background: var(--status-warn-bg); border-color: var(--status-warn-border); color: var(--status-warn-fg); font-weight: 600; }
+.rw-row .rw-pill-question:hover { background: var(--status-warn-bg); border-color: var(--status-warn-fg); }
+/* Resume is neutral: safe, and not urgent. */
+.rw-row .rw-pill-resume { background: rgba(var(--neutral-rgb), 0.05); border-color: rgba(var(--neutral-rgb), 0.16); color: var(--text-primary); }
+.rw-row .rw-pill-resume:hover { background: rgba(var(--neutral-rgb), 0.1); border-color: rgba(var(--neutral-rgb), 0.26); }
+.rw-more {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--rw-more);
+    height: var(--rw-more);
+    padding: 0;
+    border: 0;
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--text-primary);
+    cursor: pointer;
+}
+.rw-more-glyph { fill: currentColor; }
+.rw-more:hover { background: rgba(var(--neutral-rgb), 0.1); }
+.rw-more[aria-expanded="true"] { background: rgba(var(--neutral-rgb), 0.14); }
+.rw-more:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+
+/* ---- details (an explicit press, Enter or Space; never hover) ------------------------------------------ */
+.rw-detail {
+    margin: 0 var(--space-1) var(--space-2) var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    background: rgba(var(--neutral-rgb), 0.05);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+}
+.rw-detail[hidden] { display: none; }
+.rw-detail-line { margin: 0; }
+.rw-detail-line + .rw-detail-line { margin-top: var(--space-1); }
+.rw-detail-label { margin-right: 6px; color: var(--text-primary); font-weight: 600; }
+.rw-note { margin: 0; padding: var(--space-1) 14px 10px; font-size: var(--type-meta); line-height: var(--line-meta); color: var(--text-meta); }
+.rw-note[hidden] { display: none; }
+
+/* ---- Back to reading: the same baseline as ↓ "Scroll to latest message", both quiet navigation -------- */
+.rw-back {
+    position: absolute;
+    z-index: 6;
+    left: 0;
+    bottom: calc(100% + var(--space-2));
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px var(--space-3);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--pill-radius);
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--type-meta);
+    box-shadow: var(--chrome-navigation-shadow);
+    cursor: pointer;
+}
+.rw-back[hidden] { display: none; }
+.rw-back:hover { background: var(--bg-hover); }
+.rw-back:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.rw-back-glyph { display: inline-flex; }
+
+/* A coarse pointer (a phone) raises the list's own targets with the header family (ui.css). */
+@media (pointer: coarse) {
+    .rw-surface { --rw-more: var(--touch-target-min); --rw-pill-h: var(--chrome-control-h); }
+    .rw-back { min-height: var(--touch-target-min); }
+}
+@media (max-width: 900px) {
+    .rw-shade { max-height: min(62svh, 28rem); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .rw-shade, .rw-row { animation: none; }
+    .rw-caret::before, .rw-chev::before { transition: none; }
+}
+
+/* ---- Airy dopamine (DESIGN.md design bible): the Shade is a floating sheet; its controls are the shared capsule tones -- */
+:root[data-theme] .rw-shade, :root[data-theme] .chat-page-header .rw-shade {
+    border-bottom-color: transparent;
+    border-radius: 0 0 var(--radius-sheet) var(--radius-sheet);
+}
+:root[data-theme] .rw-row { border-radius: var(--radius-inner); }
+:root[data-theme] .rw-row .rw-pill {
+    border-color: transparent; border-radius: var(--pill-radius);
+    transition: var(--motion-tone);
+}
+:root[data-theme] .rw-row .rw-pill:not(:disabled):active { transform: none; filter: var(--press); }
+:root[data-theme] .rw-row .rw-pill-question { background: var(--tone-amber); color: var(--status-warn-fg); box-shadow: var(--elev-rest); }
+:root[data-theme] .rw-row .rw-pill-question:not(:disabled):hover { background: var(--tone-amber-hover); }
+:root[data-theme] .rw-row .rw-pill-resume { background: var(--surface-capsule); color: var(--text-primary); box-shadow: var(--elev-rest); }
+:root[data-theme] .rw-row .rw-pill-resume:not(:disabled):hover { background: var(--surface-capsule-hover); box-shadow: var(--elev-rest); }
+:root[data-theme] .rw-row .rw-pill:disabled { box-shadow: none; }

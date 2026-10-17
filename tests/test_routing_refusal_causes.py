@@ -45,7 +45,7 @@ REFUSAL_REASONS = (
     "routing_annotation_persist_failed", "source_continuation_publish_failed",
     "confirmation_timeout",
     # steer (supervisor/steering.py)
-    "target_unknown", "direct_chat_turn", "subagent_target", "chat_mismatch",
+    "target_unknown", "direct_chat_turn", "subagent_target",
     "cancel_pending", "target_closed", "target_finished", "acceptance_fence_sealed",
     "mailbox_write_failed",
     # ensure_project_scope (worker_promotion, events_project_routing)
@@ -84,6 +84,8 @@ EXEMPT = {
     "answered_option", "claimed_option",
     # internal wait/transport outcomes that never reach an owner surface
     "client_message_id_missing", "event_serialization_failed", "handler_returned_no_outcome",
+    # StoreBusy's acquisition cause; the same unsent owner retries it off-lock.
+    "contention",
 }
 
 
@@ -163,7 +165,7 @@ def test_producer_literals_are_all_covered_or_exempt():
 
 def test_origin_addressed_notice_types_cover_admission_and_steering():
     assert ORIGIN_ADDRESSED_NOTICE_TYPES == frozenset({
-        "task_not_started", "task_start_unconfirmed", "steer_not_delivered",
+        "task_not_started", "task_start_unconfirmed", "steer_not_delivered", "relay_reply",
     })
 
 
@@ -172,9 +174,9 @@ def test_origin_addressed_notice_rows_stay_in_the_owners_chat(notice_type):
     """R12: the refused task id is bound to the project it never started in, so
     binding lineage would move the notice out of Main into that project on
     reload. The notice is addressed to the chat the OWNER wrote in."""
-    bindings = {"refused-task": 77}
-    main = room_membership(1, {77}, [], bindings)
-    project = room_membership(77, {77}, [], bindings)
+    rooms = lambda task_id, parent="", root="": 77 if "refused-task" in (task_id, parent, root) else 0  # noqa: E731
+    main = room_membership(1, {77}, [], rooms)
+    project = room_membership(77, {77}, [], rooms)
     notice = {"direction": "system", "type": notice_type, "task_id": "refused-task", "chat_id": 1}
 
     assert main(1, notice) is True

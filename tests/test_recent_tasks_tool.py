@@ -1,8 +1,8 @@
 import json
-import os
 from types import SimpleNamespace
 
 from ouroboros.tools.recent_tasks import _handle_recent_tasks
+from tests._store_shared import seed_result, unreadable_result
 
 
 def _ctx(tmp_path):
@@ -10,11 +10,10 @@ def _ctx(tmp_path):
 
 
 def _write_task(root, name, *, result="done", ts="2026-01-01T00:00:00Z", **extra):
-    path = root / "task_results" / f"{name}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = {
         "task_id": name,
         "ts": ts,
+        "updated_at": ts,
         "status": "completed",
         "description": f"task {name}",
         "cost_usd": 1.25,
@@ -22,8 +21,7 @@ def _write_task(root, name, *, result="done", ts="2026-01-01T00:00:00Z", **extra
         "result": result,
         **extra,
     }
-    path.write_text(json.dumps(data), encoding="utf-8")
-    return path
+    seed_result(root, name, data)
 
 
 def test_recent_tasks_empty_drive(tmp_path):
@@ -77,11 +75,9 @@ def test_recent_tasks_include_results_and_traces(tmp_path):
     assert data["tasks"][0]["trace_summary"] == "trace"
 
 
-def test_recent_tasks_sorted_by_mtime(tmp_path):
-    older = _write_task(tmp_path, "older")
-    newer = _write_task(tmp_path, "newer")
-    os.utime(older, (100, 100))
-    os.utime(newer, (200, 200))
+def test_recent_tasks_sorted_by_latest_update(tmp_path):
+    _write_task(tmp_path, "older", updated_at="2026-01-01T00:00:00Z")
+    _write_task(tmp_path, "newer", updated_at="2026-01-02T00:00:00Z")
 
     data = json.loads(_handle_recent_tasks(_ctx(tmp_path)))
 
@@ -90,26 +86,24 @@ def test_recent_tasks_sorted_by_mtime(tmp_path):
 
 def test_recent_tasks_limit_is_clamped(tmp_path):
     for idx in range(25):
-        path = _write_task(tmp_path, f"task{idx}")
-        os.utime(path, (idx, idx))
+        _write_task(tmp_path, f"task{idx}", updated_at=f"2026-01-01T00:00:{idx:02d}Z")
 
     data = json.loads(_handle_recent_tasks(_ctx(tmp_path), limit=99))
 
     assert len(data["tasks"]) == 20
 
 
-def test_recent_tasks_reports_malformed_json(tmp_path):
+def test_recent_tasks_reports_unreadable_row(tmp_path, monkeypatch):
     _write_task(tmp_path, "good")
-    bad = tmp_path / "task_results" / "bad.json"
-    bad.write_text("{not json", encoding="utf-8")
-    os.utime(bad, (999, 999))
+    _write_task(tmp_path, "bad")
+    unreadable_result(monkeypatch, "bad", root=tmp_path)
 
     data = json.loads(_handle_recent_tasks(_ctx(tmp_path), limit=10))
 
     assert [row["task_id"] for row in data["tasks"]] == ["good"]
     assert len(data["unreadable_tasks"]) == 1
-    assert data["unreadable_tasks"][0]["path"].endswith("bad.json")
-    assert "JSONDecodeError" in data["unreadable_tasks"][0]["error"]
+    assert data["unreadable_tasks"][0]["task_id"] == "bad"
+    assert "StoreError" in data["unreadable_tasks"][0]["error"]
 
 
 def test_recent_tasks_reports_running_queue(tmp_path):

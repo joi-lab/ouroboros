@@ -209,7 +209,7 @@ def test_rollback_resume_after_restore_keeps_owner_work(tmp_path, monkeypatch):
         "stash_sha": "z" * 40, "stash_restored": True,
     })
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort", lambda expected_reason="": True)
 
     ok, message = update_merge.rollback_managed_update("resume-test")
 
@@ -304,7 +304,7 @@ def test_rollback_restores_stashed_local_work(tmp_path, monkeypatch):
         "merge_commit": target, "stash_sha": stash_sha,
     })
     monkeypatch.setattr(workers, "close_repo_writer_admission", lambda reason: True)
-    monkeypatch.setattr(workers, "open_repo_writer_admission", lambda expected_reason="": True)
+    monkeypatch.setattr(workers, "open_repo_writer_admission_after_update_abort", lambda expected_reason="": True)
 
     ok, message = update_merge.rollback_managed_update("test")
 

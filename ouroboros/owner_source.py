@@ -39,7 +39,8 @@ def resolve_owner_source(ctx: Any, source: Any) -> dict[str, Any]:
         # adding caller fields cannot turn one owner message into two grants.
         actual_ref = build_owner_message_ref(chat_id=row.get("chat_id", 1),
             client_message_id=row.get("client_message_id"), ts=row["ts"], text=row["text"])
-        return {"kind": kind, "ref": actual_ref, "ts": row["ts"], "text": row["text"]}
+        return {"kind": kind, "ref": actual_ref, "ts": row["ts"], "text": row["text"],
+                "attachments": list(row.get("attachments") or [])}
     if not task_id or source.get("task_id") != task_id:
         return {}
     if kind == "quiz":
@@ -51,11 +52,13 @@ def resolve_owner_source(ctx: Any, source: Any) -> dict[str, Any]:
         index = row.get("answered_index")
         options = row.get("options") or []
         label = options[index] if type(index) is int and 0 <= index < len(options) else ""
-        text = "\n".join(str(value) for value in (row.get("question"), label, row.get("comment")) if value)
+        from ouroboros.owner_quiz import late_answer_owner_text, recorded_answer_frame
+        text = late_answer_owner_text(row)
         if not label and not str(row.get("comment") or "").strip():
             return {}
         return {"kind": kind, "task_id": task_id, "quiz_id": row["quiz_id"],
-                "request_id": row["request_id"], "ts": row.get("answered_at"), "text": text}
+                "request_id": row["request_id"], "ts": row.get("answered_at"), "text": text,
+                "question_frame": recorded_answer_frame(row)}
     if kind == "mailbox":
         from ouroboros.owner_mailbox import KIND_OWNER_TEXT, drain_owner_entries
 

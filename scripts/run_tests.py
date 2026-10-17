@@ -3,13 +3,16 @@
 
     python scripts/run_tests.py                  full battery (node lane + every default-lane test)
     python scripts/run_tests.py --sequential     full battery exactly as the commit gate and CI split it
+    python scripts/run_tests.py --selected --base HEAD  commit/PR floor + affected tests, with both lanes
+    python scripts/run_tests.py --node            only the complete Node lane (CI runs it as its own step)
+    python scripts/run_tests.py --evidence-dir DIR  pytest diagnostics in DIR/<phase>, passed by argv
     python scripts/run_tests.py tests/test_x.py  focused run; every argument is forwarded to pytest
 
 A bare call always means the FULL battery — it never skips a test on the
 strength of an earlier run. The default mode is one xdist run in which the
 `serial` tests are pinned to a few file-sharded groups (`--serial-shards`,
-tests/conftest.py) and therefore overlap the parallel tests instead of waiting
-for them; `--sequential` keeps the marker split and xdist flags of
+tests/conftest.py; a file's group is a stable hash of its path) and therefore
+overlap the parallel tests instead of waiting for them; `--sequential` keeps the marker split and xdist flags of
 `ouroboros.preflight_runner` and `.github/workflows/ci.yml` in two passes.
 The reviewed-commit gate and CI stay the authority: this script is feedback.
 
@@ -20,11 +23,13 @@ isolation is `tests/conftest.py`'s job and is not repeated either.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -36,16 +41,15 @@ _PYTEST_EXIT_NO_TESTS = 5
 
 
 def _workers() -> int:
-    """What `-n auto` will resolve to: the operator override, else xdist's own count."""
-    raw = os.environ.get("OUROBOROS_PREFLIGHT_TEST_WORKERS", "").strip()
-    if raw.isdigit():
-        return max(2, int(raw))
+    """Keep xdist's CPU default within the physical and inherited allocation."""
+    from ouroboros.test_parallelism import worker_budget
+
     try:  # xdist prefers physical cores whenever psutil is importable
         import psutil
         physical = psutil.cpu_count(logical=False)
     except Exception:
         physical = None
-    return max(2, physical or os.cpu_count() or 2)
+    return worker_budget(physical or os.cpu_count() or 1)
 
 
 def serial_shards(workers: int) -> int:
@@ -80,13 +84,36 @@ def battery_commands(sequential: bool) -> list[tuple[str, list[str]]]:
 
 
 def _run(label: str, argv: list[str], cwd: pathlib.Path) -> int:
+    from ouroboros.preflight_node import node_environment
+    from ouroboros.process_containment import ProcessContainer
+    from ouroboros.test_parallelism import NESTED_WORKERS_ENV, bounded_test_command
+
     print(f"\n=== {label}: {shlex.join(argv[2:] if argv[0] == sys.executable else argv)}", flush=True)
     started = time.monotonic()
-    env = dict(os.environ)
-    override = env.get("OUROBOROS_PREFLIGHT_TEST_WORKERS", "").strip()
-    if override.isdigit():  # the gate steers `-n auto` the same way (preflight_runner._preflight_env)
-        env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(max(2, int(override)))
-    code = subprocess.call(argv, cwd=str(cwd), env=env)
+    env = node_environment(os.environ)
+    env["PYTEST_XDIST_AUTO_NUM_WORKERS"] = str(_workers())
+    env[NESTED_WORKERS_ENV] = env["PYTEST_XDIST_AUTO_NUM_WORKERS"]
+    container = ProcessContainer(lifeline=True, overload=True)
+    proc = None
+    try:
+        proc = container.spawn(bounded_test_command(argv, env), cwd=str(cwd), env=env)
+        code = proc.wait()
+    except KeyboardInterrupt:
+        code = 130
+    finally:
+        try:
+            diagnostic = container.reap()
+            if proc is not None:
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    diagnostic = "; ".join(filter(None, [diagnostic, "test root did not exit after reap"]))
+            if diagnostic:
+                print(f"=== {label}: {diagnostic}", file=sys.stderr, flush=True)
+        finally:
+            container.close()
+    if diagnostic and code in (0, _PYTEST_EXIT_NO_TESTS):
+        code = 1
     print(f"=== {label}: exit {code} in {time.monotonic() - started:.0f}s", flush=True)
     return code
 
@@ -107,24 +134,137 @@ def _node_lane() -> int:
         print(f"\n=== node: NOT_RUN — {found}; the web lane needs node >= {floor}, so this is not the full "
               "battery: install node or pass focused targets", flush=True)
         return 1
-    return _run("node", [node, "--test", *files], REPO / WEB_DIR)
+    return _run("node", [node, "--test", f"--test-concurrency={_workers()}", *files], REPO / WEB_DIR)
+
+
+def _selected(args, evidence) -> int:
+    from ouroboros.preflight_inventory import inventory_problem, read_inventory, selection_passes
+    from ouroboros.preflight_runner import _probe_dir, _install_worker_probe
+    from ouroboros.test_selection import select_tests
+
+    try:
+        selection = select_tests(REPO, base=args.base or "HEAD", extra_tests=args.extra_test,
+                                 full_tests=args.full_tests, test_reason=args.test_reason)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"selection failed: {exc}", file=sys.stderr)
+        return 2
+    print(f"=== {selection.tier}: {len(selection.files)}/{selection.available} Python modules; "
+          f"{selection.record()['rule']}; base {selection.base}; complete Node lane", flush=True)
+    # Retained diagnostics; process ownership belongs to _run, as in the full CLI.
+    root = evidence or pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-selected-"))
+    root.mkdir(parents=True, exist_ok=True)
+    record = selection.record()
+    record["inventory"] = {}
+    record["outcomes"] = {"parallel": "skipped", "serial": "skipped"}
+    output = root / "selection.json"
+    output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    print(f"=== selection evidence: {output}", flush=True)
+    if args.defer_full and selection.tier == "full":
+        selection = _defer_full(selection)
+        record = {**selection.record(), "inventory": {}, "outcomes": record["outcomes"], "deferred_full": True}
+        output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    code = _node_lane()
+    previous = os.environ.get("PYTHONPATH")
+    completed = False
+    os.environ["PYTHONPATH"] = os.pathsep.join(filter(None, (str(_probe_dir(root)), previous)))
+    try:
+        probe = _install_worker_probe(root)
+        for spec in selection_passes(selection, probe_module=probe, temp_root=root) if code == 0 else []:
+            command = [sys.executable, "-m", "pytest", *spec.args,
+                       "--ci-evidence-dir", str(root / spec.label)]
+            code = _run(spec.label, command, REPO)
+            inventory, problem = read_inventory(root, spec.label)
+            record["inventory"][spec.label] = inventory
+            record["outcomes"][spec.label] = "success" if code in (0, _PYTEST_EXIT_NO_TESTS) and not problem else "failure"
+            output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            if code not in (0, _PYTEST_EXIT_NO_TESTS):
+                break
+            code = int(bool(problem))
+            if problem:
+                print(f"inventory failed: {problem}", file=sys.stderr)
+                break
+        if code == 0 and (problem := inventory_problem(selection, record["inventory"])):
+            print(problem, file=sys.stderr)
+            code = 1
+        completed = True
+    finally:
+        if previous is None:
+            os.environ.pop("PYTHONPATH", None)
+        else:
+            os.environ["PYTHONPATH"] = previous
+        record["outcome"] = "success" if completed and code == 0 else "failure"
+        output.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        if destination := os.environ.get("GITHUB_OUTPUT"):
+            with open(destination, "a", encoding="utf-8") as stream:
+                for label, outcome in record["outcomes"].items():
+                    stream.write(f"{label}_outcome={outcome}\n")
+    print(f"=== {selection.tier} battery: {'GREEN' if code == 0 else 'RED'}", flush=True)
+    return code
+
+
+def _defer_full(selection):
+    """A full escalation this leg cannot finish (Windows runs full in four landed shards).
+
+    The leg still runs the PR minimum, the contract floor and the Node lane, and says
+    what it left to the landed matrix.
+    """
+    import dataclasses
+
+    from ouroboros.test_selection import FLOOR_TESTS
+
+    why = "; ".join(f"{path}: {reason}" for path, reason in selection.reasons
+                    if reason == "verification apparatus changed" or reason.startswith("author requested full"))
+    note = f"full scope deferred to the landed matrix; this leg runs the contract floor and the Node lane ({why})"
+    print(f"=== {note}", flush=True)
+    if destination := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(destination, "a", encoding="utf-8") as stream:
+            stream.write(f"**{note}**\n")
+    return dataclasses.replace(selection, tier="selected", files=tuple(sorted(FLOOR_TESTS)))
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--sequential", action="store_true", help="two passes, exactly as the commit gate and CI")
+    parser.add_argument("--selected", action="store_true", help="floor + affected tests and complete Node lane")
+    parser.add_argument("--base", help="Git base for --selected; defaults to HEAD")
+    parser.add_argument("--extra-test", action="append", default=[], help="widen selection with a test module")
+    parser.add_argument("--full-tests", action="store_true", help="widen --selected to the full battery")
+    parser.add_argument("--test-reason", default="", help="reason for authored widening")
+    parser.add_argument("--defer-full", action="store_true",
+                        help="with --selected: on a full escalation run only the floor and Node lane, and say so")
+    parser.add_argument("--node", action="store_true", help="only the complete Node lane, owned like every pass")
+    parser.add_argument("--evidence-dir", type=pathlib.Path,
+                        help="write pytest diagnostics under DIR/<phase>; never inherited by nested pytest",
+                        metavar="DIR")
     args, pytest_args = parser.parse_known_args(argv)
+    evidence = args.evidence_dir.resolve() if args.evidence_dir is not None else None
     if not (REPO / "tests" / "conftest.py").is_file():
         print(f"{REPO} is not an Ouroboros checkout (no tests/conftest.py)", file=sys.stderr)
         return 2
+    if args.node:
+        if args.selected or args.sequential or pytest_args:
+            parser.error("--node runs only the Node lane")
+        return _node_lane()
+    if args.selected:
+        if pytest_args:
+            parser.error("--selected cannot be combined with arbitrary pytest arguments")
+        return _selected(args, evidence)
+    if args.base or args.extra_test or args.full_tests or args.test_reason or args.defer_full:
+        parser.error("--base, --defer-full and widening options require --selected")
     if pytest_args:
         if args.sequential:
             parser.error("--sequential selects the full two-pass battery; drop it or drop the pytest arguments")
+        if evidence is not None:
+            pytest_args = ["--ci-evidence-dir", str(evidence / "focused"), *pytest_args]
         return _run("focused", [sys.executable, "-m", "pytest", *pytest_args], REPO)
     started = time.monotonic()
+    print(f"=== full: {sum(1 for _ in (REPO / 'tests').rglob('test_*.py'))} Python modules; "
+          "full default suite; complete Node lane", flush=True)
     code = _node_lane()
     ran = 0
     for label, command in battery_commands(args.sequential) if code == 0 else []:
+        if evidence is not None:
+            command = [*command, "--ci-evidence-dir", str(evidence / label)]
         code = _run(label, command, REPO)
         if code == _PYTEST_EXIT_NO_TESTS:
             code = 0

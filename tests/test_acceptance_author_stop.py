@@ -37,7 +37,7 @@ def _fail_panel_result():
     )
 
 
-def _run_stop_loop(tmp_path, monkeypatch, responses, *, stop_services):
+def _run_stop_loop(tmp_path, monkeypatch, responses, *, stop_services, produced=False, mode="required"):
     """A real loop: real tool round, real nomination, real host acceptance pass.
 
     Only the model, the reviewer panel and the service teardown are substituted.
@@ -48,7 +48,7 @@ def _run_stop_loop(tmp_path, monkeypatch, responses, *, stop_services):
     from ouroboros.tools.registry import ToolRegistry
     from tests.test_loop_acceptance_gate import _seed_acceptance_root
 
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "required")
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", mode)
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
     monkeypatch.setenv("OUROBOROS_MAX_ROUNDS", "12")
@@ -99,6 +99,9 @@ def _run_stop_loop(tmp_path, monkeypatch, responses, *, stop_services):
     ctx = registry._ctx
     task_id = "stop-root"
     _seed_acceptance_root(data, task_id, ctx)
+    if produced:
+        from ouroboros.artifacts import store_task_artifact_bytes
+        store_task_artifact_bytes(data, task_id, "export.txt", b"Export implementation under review.\n")
     ctx.is_direct_chat = False
     ctx.task_attempt = 1
     ctx.current_chat_id = 1
@@ -143,7 +146,7 @@ def test_informed_advisory_finish_allows_successful_schema_bookkeeping(tmp_path,
         reply["tool_calls"].insert(0, {"id": "schema", "type": "function", "function": {
             "name": bookkeeping, "arguments": json.dumps(arguments)}})
     run = _run_stop_loop(tmp_path, monkeypatch, ["The export endpoint ships.", reply,
-        _finish_tool_call(answer), _finish_tool_call(answer), _finish_tool_call(answer)], stop_services=False)
+        _finish_tool_call(answer), _finish_tool_call(answer), _finish_tool_call(answer)], stop_services=False, produced=True)
     assert len(run.model_inputs) == 2 and len(run.panels) == 1
     assert run.result == answer
     assert run.trace["acceptance_decision"]["reason"] == "author_finish"
@@ -152,19 +155,29 @@ def test_informed_advisory_finish_allows_successful_schema_bookkeeping(tmp_path,
 
 
 @pytest.mark.parametrize("front_door", ["finish_task", "task_acceptance_review"])
-def test_a_stop_survives_service_teardown_without_another_model_round(tmp_path, monkeypatch, front_door):
+@pytest.mark.parametrize("mode", ["auto", "required", "off"])
+def test_a_stop_survives_service_teardown_without_another_model_round(tmp_path, monkeypatch, front_door, mode):
     """A selected stop survives teardown without purchasing another author or critic."""
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.project_dialogue import _completion_verdict, completion_status_label
 
     run = _run_stop_loop(tmp_path, monkeypatch, [
         _stop_tool_call(front_door),
-    ], stop_services=True)
+    ], stop_services=True, mode=mode)
     assert len(run.model_inputs) == 1, "teardown must not buy another author reply for a stop"
     assert run.teardowns >= 1
     assert [event["kind"] for event in run.trace.get("verification_events") or []] == ["services_stopped"]
     assert run.trace["task_completion"]["action"] == "stop"
     assert run.panels == [], "an explicit stop must never buy a reviewer panel"
+    # #1602: the acknowledgement is a control fact, not a review that never ran.
+    from ouroboros.outcomes import build_verification_ledger
+    from ouroboros.review_projection import compact_review_projection
+
+    assert not run.trace.get("review_runs")
+    assert compact_review_projection(run.trace.get("review_runs"))["panels"] == []
+    ledger = build_verification_ledger(task={"id": "stop-root"}, loop_outcome={"outcome_axes": {}},
+                                       llm_trace=run.trace, artifact_bundle={})
+    assert [row for row in ledger["entries"] if row["kind"] == "task_acceptance_review"] == []
     decision = run.trace["acceptance_decision"]
     assert decision["reason"] == "author_stop" and decision["author_action"] == "stop"
     assert decision["author_disposition"]["action"] == "stop"
@@ -194,7 +207,7 @@ def test_the_same_teardown_round_still_buys_the_panel_for_a_finish(tmp_path, mon
         _finish_tool_call("The export endpoint ships."),
         _finish_tool_call("The export endpoint ships."),
         _finish_tool_call("The export endpoint ships."),
-    ], stop_services=True)
+    ], stop_services=True, produced=True)
     assert run.panels, "a finish bound to stale evidence must still be reviewed"
     assert run.trace["acceptance_decision"]["reason"] != "author_stop"
 
@@ -212,7 +225,8 @@ def _finality_pass(tmp_path, monkeypatch):
                                drive_root=str(tmp_path), _owner_directives=[])
     _seed_acceptance_root(tmp_path, "author-root", tools_ctx)
     tools = SimpleNamespace(_ctx=tools_ctx)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}}]}
+    # An observed write (its outcome recorded): Required reviews production, never a bare argument.
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}, "is_error": False}]}
     messages = [{"role": "user", "content": "Solve the task."}]
     calls: list = []
 
@@ -308,7 +322,7 @@ def test_a_stop_after_an_earlier_panel_finishes_without_a_keep_round(tmp_path, m
     run = _run_stop_loop(tmp_path, monkeypatch, [
         "The export endpoint ships.",                       # reviewed: FAIL, capsule fed back
         _stop_tool_call(),                                  # action-only stop after the feedback
-    ], stop_services=False)
+    ], stop_services=False, produced=True)
     assert len(run.model_inputs) == 2
     assert run.panels == ["The export endpoint ships."], "an honoured stop must never buy a second panel"
     decision = run.trace["acceptance_decision"]
@@ -420,7 +434,7 @@ def test_evidence_changing_after_an_honoured_stop_neither_reopens_nor_replaces_i
 
     monkeypatch.setattr(loop, "_project_child_result_dispositions", project)
     first = ["The export endpoint ships."] if earlier_panel else []
-    run = _run_stop_loop(tmp_path, monkeypatch, [*first, _stop_tool_call()], stop_services=False)
+    run = _run_stop_loop(tmp_path, monkeypatch, [*first, _stop_tool_call()], stop_services=False, produced=earlier_panel)
     assert len(run.model_inputs) == len(first) + 1
     assert late and run.panels == first, "evidence after a stop must never buy a panel"
     decision = run.trace["acceptance_decision"]
@@ -521,7 +535,7 @@ def test_a_local_preparation_stop_after_a_fail_panel_keeps_its_finality(tmp_path
             })},
         }]},                                              # request a new review; assembly fails
         _stop_tool_call(),                                 # the informed author stops
-    ], stop_services=False)
+    ], stop_services=False, produced=True)
     assert len(run.model_inputs) == 3
     assert late, "the change must land after the stop was selected"
     assert run.panels == ["The export endpoint ships."], "a local-preparation stop must never buy a panel"

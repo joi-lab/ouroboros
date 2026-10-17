@@ -15,7 +15,7 @@ SYSTEM, BIBLE and the common identity/narrative core remain caller-owned.
 from __future__ import annotations
 
 import pathlib
-from typing import Any, List
+from typing import Any, List, Mapping
 
 from ouroboros.reference_books import ReferenceBook, compose_book, load_reference_book, overview_book
 
@@ -89,6 +89,74 @@ def generate_doc_nav_map(text: str, *, title: str, rel_path: str, instructions: 
         indent = "  " * (level - 2)
         out.append(f"{indent}- {htitle} — lines {lineno}-{end}")
     return "\n".join(out)
+
+
+def design_navigation(text: str | None, *, source: str) -> str:
+    """Index canonical DESIGN bytes, without representing headings as rules read."""
+    locator = f"Source: {source}."
+    if text is None:
+        return f"## DESIGN.md source unavailable\n\n{locator} No DESIGN content or navigation delivered."
+    return (
+        generate_doc_nav_map(text, title="DESIGN.md", rel_path="docs/DESIGN.md", instructions=False)
+        + f"\n\n{locator} Use this exact source path when reading; relative paths may address a candidate. "
+        "Ranges are inclusive. Navigation only: DESIGN content is not inlined; "
+        "availability is not evidence of reading or application. Select relevant original sections; "
+        "a participant without source-reading tools needs those excerpts in its packet."
+    )
+
+
+def task_design_source(ctx: Any, task: Mapping[str, Any]) -> pathlib.Path | None:
+    """Select the author's body source by the same identity as workspace/review tools.
+
+    A default false self-body flag cannot hide a recognized body. Conversely an
+    explicit true flag never turns a known foreign workspace into Ouroboros.
+    Folderless self-body work can address system_repo without reclassifying scratch.
+    """
+    from ouroboros import body_candidate
+    from ouroboros.context_input_selection import _explicit_self_body_docs_flag
+    from ouroboros.review_body_fact import BODY_FALSE, BODY_TRUE, body_fact
+    from ouroboros.tool_access_roots import folderless_scratch_dir
+    from ouroboros.tools.tool_resolution import active_repo_dir_for, system_repo_dir_for
+    from ouroboros.workspace_copies import copy_binding, same_directory
+
+    active, system = active_repo_dir_for(ctx), system_repo_dir_for(ctx)
+    binding = copy_binding(task) or copy_binding(ctx)
+    if binding and binding.get("source_is_system_repo") is not False and any(
+            same_directory(parent, binding.get("execution_root")) for parent in (active, *active.parents)):
+        return pathlib.Path(binding["execution_root"])
+    # A false copy flag means a separate Git directory, not necessarily a foreign
+    # project: body_fact also recognizes the configured upstream/fork chain.
+    if body_candidate.is_bound(ctx) and folderless_scratch_dir(ctx) is not None:
+        # Explicit preparation/restoration selects the body while scratch stays
+        # the default cwd. A foreign workspace/room still follows its own identity.
+        return pathlib.Path(body_candidate.descriptor(ctx)["path"])
+    fact = body_fact(active, system_repo=system,
+                     data_dir=getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None))
+    if fact.body == BODY_TRUE:
+        if fact.how == "dir":
+            return system
+        # Read-only investigators may start below a body's Git worktree root.
+        # Identity is already established; Git metadata locates its document.
+        return next((parent for parent in (active, *active.parents)
+                     if (parent / ".git").exists()), active)
+    if fact.body == BODY_FALSE:
+        return None
+    if _explicit_self_body_docs_flag(dict(task)) is True and folderless_scratch_dir(ctx) is not None:
+        return system
+    return None
+
+
+def task_design_navigation(ctx: Any, task: Mapping[str, Any]) -> str:
+    """Capture once before context fitting; the task-specific root stays out of A'."""
+    root = task_design_source(ctx, task)
+    if root is None:
+        return ""
+    path = root / "docs/DESIGN.md"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        text = None
+    return design_navigation(text, source=f"`{path}`")
 
 
 def book_navigation(book: ReferenceBook, *, instructions: bool = True) -> str:
@@ -166,15 +234,15 @@ def reference_doc_sections(
     architecture_text: str | None = None,
     development_text: str | None = None,
     books: tuple[ReferenceBook, ...] = (),
-) -> List[str]:
-    """Render one captured book pair; missing bodies remain named and readable.
+) -> tuple[List[str], str]:
+    """Return common reference sections and the optional separate Max handbook.
 
-    Max's handbook inclusion follows the caller's active-repository decision.
+    Max's common sections do not depend on the caller's handbook inclusion.
     Compact modes orient the mind to both books and retain exact physical
     pointers; they never turn a composed-book line into a file address.
     """
     parts: List[str] = []
-    on_demand: List[str] = []
+    development = ""
     by_id = {book.book_id: book for book in books}
 
     arch_section = architecture_context_section(
@@ -204,19 +272,18 @@ def reference_doc_sections(
             parts.append(book_navigation(development_book) if development_book is not None
                          else generate_doc_nav_map(dev_text, title="DEVELOPMENT.md", rel_path="docs/DEVELOPMENT.md"))
         elif include_development:
-            parts.append("## DEVELOPMENT.md\n\n" + dev_text)
-        else:
-            on_demand.append("docs/DEVELOPMENT.md")
+            development = "## DEVELOPMENT.md\n\n" + dev_text
 
     # README (user-facing) and CHECKLISTS (reviewers load their own copy) are not
     # inlined in the agent context in any mode.
-    on_demand.extend(["README.md", "docs/CHECKLISTS.md"])
-
-    if on_demand:
-        listing = ", ".join(f"`{p}`" for p in on_demand)
-        parts.append(
-            "## Reference docs available on demand\n\n"
-            f"Not inlined in the working context: {listing}. "
-            "Read them in full (untruncated) with `read_file(root=\"system_repo\", path=...)` when relevant."
-        )
-    return parts
+    books_note = (
+        "Reference books: `docs/ARCHITECTURE.md`, `docs/DEVELOPMENT.md`. "
+        "If a book is not inlined, read it on demand. "
+        if context_mode not in {"low", "nano"} else ""
+    )
+    parts.append(
+        "## Reference docs available on demand\n\n" + books_note
+        + "Not inlined in the working context: `README.md`, `docs/CHECKLISTS.md`. "
+        "Read them in full (untruncated) with `read_file(root=\"system_repo\", path=...)` when relevant."
+    )
+    return parts, development

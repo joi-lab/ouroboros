@@ -11,14 +11,15 @@ default would silently swallow ``"unlimited"``. ``review_max_cycles()`` returns
 
 Per-gate meaning of the ONE number — on every gate it counts PAID cycles, and
 identical material is never re-reviewed for pay unless the mind sends it with
-answers (a plan re-ask addressed by ``review_disposition`` items is one paid cycle):
+answers:
 
-* plan review — paid reviewer-panel cycles per task (the engine consumes the
-  getter; this module only exposes it);
+* plan asks are OUTSIDE this cap (owner batch 2, Q3=A): the planning organ
+  (``tools/plan_ask``) dispatches an ask whenever the mind asks, and only its
+  budget gate and deadline bound it; nothing here counts plan asks;
 * task acceptance — paid panel runs per task. The last paid result still
   permits an author response; only an explicit task-local improvement-pass
   limit bounds author work, independently of this paid ceiling;
-* commit gate — paid triad+scope cycles per ROOT task (the whole task tree
+* commit gate — paid review-wave cycles per ROOT task (the whole task tree
   shares one ceiling; a manual session is its own task; a follow-up task is a
   fresh root). The paid fact is recorded on the attempt row AT DISPATCH and
   the count is derived from the attempt ledger; the ceiling counts MONEY —

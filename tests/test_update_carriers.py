@@ -375,8 +375,8 @@ def test_rollback_restores_pre_update_sha_after_carrier_resolved_apply(tmp_path,
         lambda reason: gate_calls.append(("close", reason)),
     )
     monkeypatch.setattr(
-        workers, "open_repo_writer_admission",
-        lambda expected_reason="": gate_calls.append(("open", expected_reason)),
+        workers, "open_repo_writer_admission_after_update_abort",
+        lambda expected_reason="": gate_calls.append(("open", expected_reason)) or True,
     )
 
     ok, message = update_merge.rollback_managed_update("carrier_test_rollback")
@@ -471,8 +471,6 @@ def test_one_shared_resolver_serves_all_three_insertion_points():
         encoding="utf-8"
     )
     assert "resolve_carrier_conflicts" not in parent_source
-    engine_doc = update_carriers.__doc__ or ""
-    assert "OLD updater" in engine_doc and "steady state" in engine_doc
 
 
 def test_resolver_rejects_an_unknown_preference(tmp_path):

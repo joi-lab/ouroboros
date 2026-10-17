@@ -1,0 +1,22 @@
+# A static host for a copy of the interface files: the builtin web/ tree or
+# your own build laid out like it. It serves / and /static/* and nothing else;
+# it holds no core code, settings or data. The address names no host: the front
+# proxy passes the visitor's Host header through, and any host must match.
+
+http://:{$OUROBOROS_INTERFACE_PORT:8080} {
+	bind {$OUROBOROS_INTERFACE_BIND:127.0.0.1}
+	root * {$OUROBOROS_INTERFACE_ROOT}
+	log
+	header Cache-Control "no-cache, must-revalidate"
+
+	handle / {
+		rewrite * /index.html
+		file_server
+	}
+	handle_path /static/* {
+		file_server
+	}
+	handle {
+		respond 404
+	}
+}

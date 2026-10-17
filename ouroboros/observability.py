@@ -21,6 +21,10 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ouroboros.finalization_timing import (  # noqa: F401 — compatibility exports
+    emit_finalization_timing, mark_last_answer, stamp_finalization_enqueue,
+    task_timing, task_timing_scope, timed_phase, without_finalization_timing,
+)
 from ouroboros.secret_masking import SECRET_TOKEN_PATTERNS
 from ouroboros.utils import (
     atomic_write_json,
@@ -287,7 +291,7 @@ def write_blob(drive_root: pathlib.Path, payload: Any, *, kind: str = "json") ->
     if not path.exists():
         tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
         try:
-            with gzip.open(tmp, "wb") as fh:
+            with gzip.open(tmp, "wb", compresslevel=1) as fh:
                 fh.write(raw)
             _chmod_private(tmp)
             replace_atomic(tmp, path)
@@ -325,40 +329,23 @@ def read_blob_ref(
     ref: Dict[str, Any],
     *,
     expected_kind: str = "json",
+    max_bytes: int | None = None,
+    raw_bytes: bool = False,
+    admit: Callable[[pathlib.Path], None] | None = None,
 ) -> Any:
-    """Read and verify one content-addressed blob below this drive root."""
-    if not isinstance(ref, dict):
-        raise ValueError("observability blob ref must be an object")
-    kind = str(ref.get("kind") or "")
-    if kind != expected_kind or ref.get("encoding") != "gzip":
-        raise ValueError("observability blob ref has an unexpected kind or encoding")
-    expected_sha = str(ref.get("sha256") or "")
-    try:
-        expected_size = int(ref["size"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("observability blob ref has no valid size") from exc
-    if not expected_sha:
-        raise ValueError("observability blob ref has no sha256")
+    """Read and verify one content-addressed blob below this drive root (loose, else its
+    evidence pack; retained child roots the ref names are tried the same way). Only a bounded
+    read (``max_bytes``) accepts a ref without a recorded size; ``raw_bytes`` returns the bytes.
+    ``admit`` sees every physical file before it is opened (``evidence_packs.blob_bytes``)."""
+    from ouroboros.evidence_packs import blob_bytes, blob_ref_fields
 
-    path = _blob_ref_path(drive_root, ref)
-    def read(candidate):
-        with gzip.open(candidate, "rb") as handle:
-            raw = handle.read()
-        if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha:
-            raise ValueError("observability blob ref failed size or sha256 verification")
-        return json.loads(raw.decode("utf-8")) if kind == "json" else raw.decode("utf-8", errors="replace")
-    try:
-        return read(path)
-    except (OSError, ValueError) as original_error:
-        from ouroboros.source_retention import retained_child_root
-
-        original = pathlib.Path(str(ref.get("path") or ""))
-        suffix = (OBSERVABILITY_DIR, "blobs", f"{expected_sha}.{kind}.gz")
-        if original.is_absolute() and original.parts[-3:] == suffix:
-            child = pathlib.Path(*original.parts[:-3])
-            if original != path and retained_child_root(pathlib.Path(drive_root), child):
-                return read(_blob_ref_path(child, ref))
-        raise original_error
+    _sha256, kind, size = blob_ref_fields(ref)
+    if size < 0 and max_bytes is None:
+        raise ValueError("observability blob ref has no valid size")
+    raw = blob_bytes(drive_root, ref, expected_kind=expected_kind, max_bytes=max_bytes, admit=admit)
+    if raw_bytes:
+        return raw
+    return json.loads(raw.decode("utf-8")) if kind == "json" else raw.decode("utf-8", errors="replace")
 
 
 def _ref_path(drive_root: pathlib.Path, ref: dict, relative: pathlib.Path) -> pathlib.Path:
@@ -419,14 +406,17 @@ def _blob_ref_path(drive_root: pathlib.Path, ref: dict) -> pathlib.Path:
 def read_call_manifest_ref(drive_root: pathlib.Path, ref: dict, *, task_id: str) -> dict:
     """Read one exact task/call manifest, including a retired store alias."""
     call_id = str(ref.get("call_id") or "")
-    if not call_id or any(re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
-                          or value in {".", ".."} for value in (str(task_id), call_id)):
+    # System scopes (system:ui_translation, system:update_letter) use the
+    # same writer, whose filename is sanitized but whose identity stays exact.
+    safe_task = call_manifest_path(drive_root, str(task_id), call_id).parent.name
+    if not call_id or not task_id or any(re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None
+                          or value in {".", ".."} for value in (safe_task, call_id)):
         raise ValueError("observability call manifest task/call identity mismatch")
     expected_sha = str(ref.get("sha256") or "")
     if not expected_sha:
         raise ValueError("observability call manifest ref has no sha256")
     try:
-        path = _ref_path(drive_root, ref, pathlib.Path("calls") / task_id / f"{call_id}.json")
+        path = _ref_path(drive_root, ref, pathlib.Path("calls") / safe_task / f"{call_id}.json")
         raw = path.read_bytes()
         if hashlib.sha256(raw).hexdigest() != expected_sha:
             raise ValueError("observability call manifest ref failed sha256 verification")
@@ -495,22 +485,23 @@ def promote_call_manifest_ref(source_drive_root, canonical_drive_root, ref, *, t
     return _retain_single_ref(source_drive_root, canonical_drive_root, ref, task_id=task_id)
 
 
-_PUBLISHED_CHILD_REF_FIELDS = frozenset(
-    {
-        "trace_refs",
-        "loop_outcome",
-        "review_evidence",
-        "review_projection",
-        "completion_observations",
-        "acceptance_debt",
-        "owner_wait",
-        "verification_ledger",
-        "root_phase_checkpoint",
-        "plan_review_state",
-        "artifacts",
-        "artifact_bundle",
-        "task_contract", "attachment_manifest", "attachment_manifest_ref",
-    }
+# A tuple in written order, never a set: every process walks these fields in the
+# same order (a frozenset of str follows the per-process hash seed).
+_PUBLISHED_CHILD_REF_FIELDS = (
+    "trace_refs",
+    "loop_outcome",
+    "review_evidence",
+    "review_projection",
+    "completion_observations",
+    "acceptance_debt",
+    "owner_wait",
+    "verification_ledger",
+    "root_phase_checkpoint",
+    "plan_review_state",
+    "plan_record",
+    "artifacts",
+    "artifact_bundle",
+    "task_contract", "attachment_manifest", "attachment_manifest_ref",
 )
 _SOURCE_HANDLES_SUBDIR = "source_handles"
 _TASK_SOURCE_MARKERS = ("FULL_RESULT_SOURCE_JSON=", "PRODUCER_RESULT_SOURCE_JSON=")
@@ -553,6 +544,49 @@ def _typed_unavailable_ref(ref: Any, reason: str) -> Dict[str, Any]:
     }
 
 
+def restore_recorded_task_source_gaps(value: Any, promotion: Any, owner_task_id: str) -> Any:
+    """Give a legacy path-less task_source gap the address its own row recorded.
+
+    Retention once replaced whole ``task_source`` carriers with the
+    ``_typed_unavailable_ref`` shape while the promotion fact kept the path. A gap
+    regains its compact handle only when this owner's ``unavailable_refs`` record
+    exactly one relative path for its sha256 and size; the ordinary reader then
+    verifies the bytes. Nothing is guessed, scanned or written here, and ``value``
+    itself returns when the row records no candidate path.
+    """
+    facts = promotion.get("unavailable_refs") if isinstance(promotion, dict) else None
+    recorded: Dict[tuple, set] = {}
+    for fact in facts if isinstance(facts, list) else ():
+        try:
+            if (fact.get("kind") == "task_source" and fact.get("sha256") and fact.get("path")
+                    and str(fact.get("owner_task_id") or "") == str(owner_task_id)
+                    and not pathlib.PurePosixPath(str(fact["path"])).is_absolute()):
+                recorded.setdefault((str(fact["sha256"]), int(fact["size"])), set()).add(str(fact["path"]))
+        except (AttributeError, KeyError, TypeError, ValueError):
+            continue  # a malformed fact records no address
+    if not recorded:
+        return value
+
+    def restore(item: Any) -> Any:
+        if isinstance(item, list):
+            return [restore(child) for child in item]
+        if not isinstance(item, dict):
+            return item
+        if (item.get("kind") != "task_source" or item.get("availability") != "unavailable"
+                or item.get("source") != "child_task_storage" or item.get("path")):
+            return {key: restore(child) for key, child in item.items()}
+        try:
+            paths = recorded.get((str(item.get("sha256") or ""), int(item["size"])), set())
+        except (KeyError, TypeError, ValueError):
+            paths = set()
+        if len(paths) != 1:
+            return item  # no recorded path, or several: the gap stays a gap
+        return {"kind": "task_source", "root": item.get("root") or "artifact_store",
+                "path": next(iter(paths)), "size": int(item["size"]), "sha256": item["sha256"]}
+
+    return restore(value)
+
+
 def _is_blob_ref(value: Any) -> bool:
     return bool(
         isinstance(value, dict)
@@ -576,20 +610,6 @@ def _is_manifest_ref(value: Any) -> bool:
 def _is_task_source_ref(value: Any) -> bool:
     return bool(isinstance(value, dict) and value.get("kind") == "task_source"
                 and value.get("availability") != "unavailable")
-
-
-def _task_source_contract_valid(ref: Dict[str, Any]) -> bool:
-    read = ref.get("read") if isinstance(ref.get("read"), dict) else {}
-    arguments = (
-        read.get("arguments") if isinstance(read.get("arguments"), dict) else {}
-    )
-    path = str(ref.get("path") or "")
-    return bool(
-        ref.get("root") == "artifact_store"
-        and read.get("tool") == "read_file"
-        and arguments.get("root") == ref.get("root")
-        and str(arguments.get("path") or "") == path
-    )
 
 
 def _task_source_failure_reason(exc: Exception) -> str:
@@ -649,7 +669,7 @@ def _rewrite_service_result(
     return text if walk is not None and walk.discovering else prefix + json.dumps(parsed, ensure_ascii=False, indent=2)
 
 
-def _rewrite_task_source_markers(
+def _retain_task_source_markers(
     text: str,
     parent_root: pathlib.Path,
     child_root: pathlib.Path,
@@ -657,44 +677,29 @@ def _rewrite_task_source_markers(
     state: Dict[str, Any],
     *, tool_call_id: str,
 ) -> str:
-    """Promote only the host tool envelope's own call-bound result sources."""
+    """Retain only the host tool envelope's own call-bound result sources.
 
-    rewritten_lines: List[str] = []
+    The text returns byte-identical: a marker carries the reference exactly as
+    its producer wrote it (spacing, key order, line ending), never re-serialized.
+    """
     for line in str(text).splitlines(keepends=True):
         body = line.rstrip("\r\n")
         marker = next((prefix for prefix in _TASK_SOURCE_MARKERS if body.startswith(prefix)), None)
         if marker is None:
-            rewritten_lines.append(line)
             continue
         try:
             ref = json.loads(body[len(marker):])
         except (TypeError, ValueError):
-            rewritten_lines.append(line)
             continue
         # Text alone is not authority. The enclosing host tool message binds
         # this envelope to the source writer's exact task/call identity. A
         # marker quoted by another call, user, assistant or argument is data.
         source_id = tool_call_id + (".producer" if marker == "PRODUCER_RESULT_SOURCE_JSON=" else "")
         source_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_id).strip("._")[:160]
-        if (not _is_task_source_ref(ref) or not tool_call_id
-                or ref.get("path") != f"source_handles/tool_results/{source_id}-{ref.get('sha256')}.txt"):
-            rewritten_lines.append(line)
-            continue
-        promoted = _promote_task_source_ref(
-            parent_root, child_root, task_id, ref, state
-        )
-        rewritten_lines.append(
-            marker
-            + json.dumps(
-                promoted,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + line[len(body):]
-        )
-    from ouroboros.source_retention import active_walk
-    return text if active_walk() and active_walk().discovering else "".join(rewritten_lines)
+        if (_is_task_source_ref(ref) and tool_call_id
+                and ref.get("path") == f"source_handles/tool_results/{source_id}-{ref.get('sha256')}.txt"):
+            _promote_task_source_ref(parent_root, child_root, task_id, ref, state)
+    return text
 
 
 def _rewrite_service_payload(
@@ -745,7 +750,7 @@ def _rewrite_child_ref_tree(
         return _promote_task_source_ref(parent_root, child_root, task_id, value, state)
     if isinstance(value, dict):
         if carrier == "message" and value.get("role") == "tool" and isinstance(value.get("content"), str):
-            return {**value, "content": _rewrite_task_source_markers(value["content"], parent_root,
+            return {**value, "content": _retain_task_source_markers(value["content"], parent_root,
                 child_root, task_id, state, tool_call_id=str(value.get("tool_call_id") or ""))}
         if carrier == "contract":
             original = value.get("attachment_manifest_ref")
@@ -800,8 +805,10 @@ def promote_child_task_refs(
             if key in rewritten:
                 from ouroboros.review_source_closure import source_carrier
 
+                # A legacy gap regains the address its own facts recorded; the walk verifies the bytes.
                 rewritten[key] = _rewrite_child_ref_tree(
-                    rewritten[key], parent_root, child_root, task_id, state,
+                    restore_recorded_task_source_gaps(rewritten[key], child_result.get("child_ref_promotion"), task_id),
+                    parent_root, child_root, task_id, state,
                     carrier=source_carrier(rewritten, key, 'task_result'),
                 )
         artifacts = rewritten.get("artifacts")
@@ -892,7 +899,8 @@ def retry_pending_child_ref_promotions(
     the maintenance generation's close, asked before every item and again at each
     publication's commit: a closed generation leaves the rest ``deferred``."""
 
-    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    from ouroboros.obligations import members
+    from ouroboros.task_custody import own_child_drives
     from ouroboros.task_status import SETTLED_STATUSES
     from ouroboros.task_results import load_task_result, validate_task_id
     from ouroboros.source_retention import (
@@ -902,12 +910,16 @@ def retry_pending_child_ref_promotions(
 
     parent = pathlib.Path(parent_drive_root)
     report: Dict[str, Any] = {"scanned": 0, "retried": [], "completed": [], "pending": [], "errors": [], "deferred": [], "unchanged": []}
-    directories = [(path, path / suffix) for base, suffix in
-                   ((parent / HEADLESS_TASKS_DIR, "data"), (parent / TASK_DRIVES_DIR, ""))
-                   if base.is_dir() for path in sorted(base.iterdir()) if path.is_dir()]
-    begin_retention_retries(parent, {path.name for path, _child in directories}, generation)
-    for task_dir, child_root in directories:
-        task_id = task_dir.name
+    candidates = members(parent, "promotions")
+    begin_retention_retries(parent, set(candidates), generation)
+    for task_id, facts in candidates.items():
+        child_root = next((pathlib.Path(facts[key]) for key in ("headless_child_drive_root", "child_drive_root")
+                           if facts.get(key)), None)
+        if child_root is None:
+            child_root = next((path for path in own_child_drives(parent, task_id) if path.is_dir()), None)
+        if child_root is None:
+            report["errors"].append({"task_id": task_id, "error": "child_drive_missing"})
+            continue
         report["scanned"] += 1
         try:
             validate_task_id(task_id)
@@ -965,7 +977,7 @@ def call_manifest_path(drive_root: pathlib.Path, task_id: str, call_id: str) -> 
 
 
 def read_call_payload(drive_root: pathlib.Path, *, task_id: str, call_id: str) -> tuple:
-    """Read one exact call and its complete digest-verified existing CAS body."""
+    """Verify a call's CAS body and restore an omitted identical send history."""
     path = call_manifest_path(drive_root, task_id, call_id)
     if not path.exists():
         from ouroboros.source_retention import retained_task_roots
@@ -978,6 +990,8 @@ def read_call_payload(drive_root: pathlib.Path, *, task_id: str, call_id: str) -
     if not isinstance(manifest, dict) or manifest.get("task_id") != task_id or manifest.get("call_id") != call_id:
         raise ValueError("observability call identity mismatch")
     payload = read_blob_ref(drive_root, manifest.get("full_payload_ref"))
+    if manifest.get("call_type") == "llm_request" and isinstance(payload, dict) and "messages" in payload:
+        payload.setdefault("send_messages", payload["messages"])
     ref = {"call_id": call_id, "manifest_ref": {"path": str(path), "call_id": call_id,
            "sha256": hashlib.sha256(raw).hexdigest()},
            "redacted_projection_ref": manifest.get("redacted_projection_ref"),
@@ -993,6 +1007,7 @@ def write_call_manifest(
     manifest: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Write the small per-call manifest with refs into the private ledger."""
+    from ouroboros import evidence_packs, store
 
     path = call_manifest_path(drive_root, task_id, call_id or new_call_id("call"))
     safe_call = path.stem
@@ -1007,7 +1022,12 @@ def write_call_manifest(
         "call_id": safe_call,
         **dict(manifest or {}),
     }
-    atomic_write_json(path, payload, trailing_newline=True)
+    # The packer's deletion sections and other manifests hold this lock briefly; a model call
+    # waits for them rather than failing its task (issue #1754).
+    with store.name_lock(pathlib.Path(drive_root), evidence_packs.PUBLICATION_LOCK_NAME,
+                         timeout_sec=evidence_packs.PUBLICATION_WAIT_SEC):
+        evidence_packs.note_manifest_publication(drive_root, payload)
+        atomic_write_json(path, payload, trailing_newline=True)
     _chmod_private(path)
     try:
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1245,11 +1265,11 @@ def latest_llm_response_text(drive_root: pathlib.Path, task_id: str) -> str:
     for manifest_path in manifests:
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            blob_path = pathlib.Path(str((manifest.get("full_payload_ref") or {}).get("path") or ""))
-            if not blob_path.is_file():
+            from ouroboros.evidence_packs import blob_bytes
+            try:
+                payload = json.loads(blob_bytes(drive_root, manifest.get("full_payload_ref")).decode("utf-8", errors="replace"))
+            except (OSError, ValueError):
                 continue
-            with gzip.open(blob_path, "rb") as fh:
-                payload = json.loads(fh.read().decode("utf-8", errors="replace"))
             message = payload.get("message") if isinstance(payload, dict) else None
             content = message.get("content") if isinstance(message, dict) else None
             text = str(content or "").strip()

@@ -70,7 +70,7 @@ def test_backend_receipt_owns_custody_after_local_handler_unwinds(tmp_path, monk
     assert result.code != 'TOOL_ERROR', result
     assert not load_task_result(tmp_path, 'root').get('launch_handoffs')
     _assert_consumers(tmp_path, registry, queue, workers, backend != 'completed')
-    records = executor._iter_process_records(tmp_path)
+    records = executor._owned_process_records(tmp_path, 'foreground')
     assert bool(records) == (backend != 'completed')
     if records:
         assert records[0][1]['task_id'] == records[0][1]['root_task_id'] == 'root'
@@ -142,7 +142,7 @@ def test_control_event_receipt_survives_unwind_and_reconciles_exact_identity(tmp
         return 'OK'  # Business success cannot erase the pending host receipt.
     registry.override_handler('knowledge_read', body)
     registry.execute_result('knowledge_read', {'topic': 'x'})
-    claim = next(iter(load_task_result(tmp_path, 'root')['launch_handoffs'].values()))
+    claim = next(iter(load_task_result(tmp_path, 'root').get('launch_handoffs', {}).values()))
     assert claim['state'] == 'returned' and claim['control_receipts'][0]['routing_token'] == 'exact-token'
     assert cold_blockers(registry._ctx)
     write_task_result(tmp_path, 'promoted', 'scheduled',
@@ -168,13 +168,13 @@ def test_logical_timeout_does_not_close_a_physically_running_handler(tmp_path, m
     try:
         assert entered.wait(5)
         thread.join(.01)  # Only the logical caller stopped waiting.
-        assert thread.is_alive() and load_task_result(tmp_path, 'root')['launch_handoffs']
+        assert thread.is_alive() and load_task_result(tmp_path, 'root').get('launch_handoffs', {})
         assert cold_blockers(registry._ctx)
     finally:
         release.set()
         thread.join(5)
     assert not thread.is_alive()
-    assert not load_task_result(tmp_path, 'root')['launch_handoffs']
+    assert not load_task_result(tmp_path, 'root').get('launch_handoffs', {})
     assert not cold_blockers(registry._ctx)
 
 
@@ -212,12 +212,12 @@ def test_real_owner_restart_retires_exact_worker_invocation(tmp_path, monkeypatc
     try:
         slot = workers.Worker(0, child, stdqueue.Queue(), busy_task_id='root')
         monkeypatch.setattr(workers, 'WORKERS', {0: slot})
-        worker_pool_lifecycle._record_worker_pids()
+        worker_pool_lifecycle._record_worker_processes()
         end = time.monotonic() + 20
         while not (tmp_path / 'inside').exists() and child.is_alive() and time.monotonic() < end:
             time.sleep(.02)
         assert (tmp_path / 'inside').exists()
-        claim_id, before = next(iter(load_task_result(tmp_path, 'root')['launch_handoffs'].items()))
+        claim_id, before = next(iter(load_task_result(tmp_path, 'root').get('launch_handoffs', {}).items()))
         assert before['local_owner'] == {'pid': child.pid, 'process_birth': slot.process_birth, 'task_attempt': 3}
         monkeypatch.setattr(workers, '_reconcile_confirmed_dead_review_owner', lambda *_a: None)
         if door == 'pool_restart':
@@ -231,7 +231,7 @@ def test_real_owner_restart_retires_exact_worker_invocation(tmp_path, monkeypatc
         child.join(5)
         assert not child.is_alive() and child.exitcode is not None
         row = load_task_result(tmp_path, 'root')
-        assert not row['launch_handoffs']
+        assert not row.get('launch_handoffs', {})
         assert row['retired_tool_invocations'][claim_id]['effect_outcome'] == 'unknown'
         assert row['retired_tool_invocations'][claim_id]['replay_authorized'] is False
         observed = registry.execute_result('get_task_result', {'task_id': 'root'})
@@ -314,8 +314,8 @@ def test_death_retires_only_attributed_local_invocation(tmp_path, monkeypatch, e
     with workers._queue_lock:
         worker_health._retire_dead_model_consumers(job)
     after = load_task_result(tmp_path, job['task_id'])
-    assert ('matching' not in after['launch_handoffs']) == (evidence == 'exact')
-    assert after['launch_handoffs']['independent'] == independent
+    assert ('matching' not in after.get('launch_handoffs', {})) == (evidence == 'exact')
+    assert after.get('launch_handoffs', {})['independent'] == independent
     workers.RUNNING.clear()
     from supervisor import queue
     assert any(x['kind'] == 'tool_handoff' for x in conflicting_writers(queue, job['task_id']))

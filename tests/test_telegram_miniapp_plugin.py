@@ -353,3 +353,20 @@ def test_registration_status_becomes_stale_without_companion(
     stale = plugin._read_status(api)
     assert stale["state"] == "stale"
     assert stale["reason_code"] == "heartbeat_stale"
+
+
+def test_status_pid1_is_never_a_live_companion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """process_alive(1) is now true for a bare container server; the companion
+    itself is always the server's child, so a status naming PID 1 stays stale."""
+    api = FakeAPI(tmp_path)
+    plugin.register(api)
+    monkeypatch.setattr(plugin, "process_alive", lambda _pid: True)
+    status = {"state": "ready", "message": "ok", "public_url": "https://abc.trycloudflare.com/",
+              "pid": 1, "updated_at_epoch": int(time.time())}
+    path = api.state_dir / plugin._STATUS_NAME
+    path.write_text(json.dumps(status), encoding="utf-8")
+    assert plugin._read_status(api)["state"] == "stale"
+    plugin._seed_starting_status(api)
+    assert json.loads(path.read_text(encoding="utf-8"))["reason_code"] == "registered"

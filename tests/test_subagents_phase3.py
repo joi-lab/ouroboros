@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import queue
+from tests._store_shared import read_result
 
 
 def test_no_lane_fans_out_and_depth_does_not_downgrade(monkeypatch):
@@ -85,8 +85,7 @@ def test_schedule_subagent_emits_intent_only_and_no_task_group(monkeypatch, tmp_
     assert event["subagent_envelope"]["status"] == STATUS_REQUESTED
     assert event["subagent_envelope"]["lineage"]["root_task_id"] == "root1"
 
-    path = tmp_path / "task_results" / f"{event['task_id']}.json"
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = read_result(tmp_path, event['task_id'])
     assert data["requested_model_lane"] == "auto"
     assert data["configured_subagent"]["selected_subagent_id"] == subagent_id
     assert data["parent_model_lane"] == "main"

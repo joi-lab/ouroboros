@@ -122,49 +122,6 @@ def test_incomplete_or_unreadable_cas_keeps_custody_without_redispatch(completed
     assert len(calls) == 1
 
 
-from tests.test_plan_review_engine import harness, _call, _control, _patch_health, _state, CLEAN  # noqa: E402,F401
-
-
-def test_public_plan_owner_reloads_wave_and_reaggregates_without_paid_cycle(harness, monkeypatch):  # noqa: F811 - imported pytest fixture
-    from ouroboros.tools import plan_review_runtime
-    release, finished = threading.Event(), threading.Event()
-    calls, completions = [], []
-    class Slow:
-        def chat(self, **kwargs):
-            calls.append(kwargs["model"])
-            assert release.wait(10)
-            return {"content": CLEAN}, {"prompt_tokens": 2, "completion_tokens": 1}
-    original = custody._settle_review_attempt
-    def settle(*args, **kwargs):
-        original(*args, **kwargs)
-        completions.append(1)
-        if len(completions) == 3:
-            finished.set()
-    monkeypatch.setattr(plan_review_runtime, "LLMClient", Slow)
-    monkeypatch.setattr(custody, "_settle_review_attempt", settle)
-    monkeypatch.setattr(custody, "_logical_timeout", lambda *_: 0.03)
-    _patch_health(monkeypatch, lambda _slots: {})
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
-    try:
-        first = _call(harness.make_ctx())
-        assert _control(first) == {"outcome": "DEGRADED", "closed": False}
-        original_wave = _state(harness)["waves"][-1]
-        release.set()
-        assert finished.wait(10)
-        # A brand-new ToolContext cannot borrow the old process-local actor cache.
-        second = _call(harness.make_ctx())
-        assert _control(second) == {"outcome": "GREEN", "closed": True}
-        state = _state(harness)
-        assert state["cycles_paid"] == 1
-        assert state["waves"][-1]["retry_key"] == original_wave["retry_key"]
-        assert [row["operation_id"] for row in state["waves"][-1]["actors"]] == [row["operation_id"] for row in original_wave["actors"]]
-        assert len(calls) == 3
-        assert _control(_call(harness.make_ctx())) == {"outcome": "GREEN", "closed": True}
-        assert len(calls) == 3
-    finally:
-        release.set()
-
-
 @pytest.mark.parametrize("completed_late", ["FAIL"], indirect=True)
 def test_late_fail_keeps_its_full_source_and_veto(completed_late):
     result = recover(completed_late)
@@ -172,3 +129,60 @@ def test_late_fail_keeps_its_full_source_and_veto(completed_late):
     assert result.actors[0]["raw_text"] == completed_late[4]
     assert result.actors[0]["operation_state"] == "late_settled"
     assert len(completed_late[3]) == 1
+
+
+# The roster_hash the pre-#1609 producer (d00559d7f, before ReviewSlot.session_access
+# existed) recorded for these rosters, computed by running that producer's own code.
+PRE_FIELD_ROSTER_HASH = {
+    "api": "a8c84df55e7932facf7da821a9133ecaf5fedb8a5f273a20c043dfa81a3ef82b",
+    "api+session": "e1b45dd5faf476416405b5802d32bd4b1a491e27ea90a50f9bfb6108378be269",
+}
+
+
+def _roster_hash(*slots):
+    from ouroboros.review_dispatch import review_reconciliation_identity
+
+    return review_reconciliation_identity(_request(), list(slots), root_task_id="root", contract="c")["roster_hash"]
+
+
+def test_read_only_seats_keep_the_roster_identity_recorded_before_seats_carried_rights():
+    from ouroboros.review_records import ReviewRouteKind
+
+    api = ReviewSlot("row-a", "fake/model", timeout_sec=0.03)
+    session = dict(route=ReviewRouteKind.AGENT_SESSION, session_target="codex=gpt-5", session_profile="p1")
+    assert _roster_hash(api) == PRE_FIELD_ROSTER_HASH["api"]
+    for access in ("", "readonly"):
+        assert _roster_hash(api, ReviewSlot("row-s", "codex=gpt-5", session_access=access, **session)) \
+            == PRE_FIELD_ROSTER_HASH["api+session"], access
+    writable = {_roster_hash(api, ReviewSlot("row-s", "codex=gpt-5", session_access=access, **session))
+                for access in ("workspace_write", "full")}
+    assert len(writable) == 2 and PRE_FIELD_ROSTER_HASH["api+session"] not in writable  # rights are identity
+
+
+@pytest.fixture
+def pre_field_late(monkeypatch, request):
+    """``completed_late`` produced as before seats carried rights: the real producer
+    serializes every ReviewSlot without the ``session_access`` field."""
+    import dataclasses
+
+    real = dataclasses.asdict
+
+    def pre_field(obj, *args, **kwargs):
+        values = real(obj, *args, **kwargs)
+        if isinstance(obj, ReviewSlot):
+            values.pop("session_access")
+        return values
+
+    with monkeypatch.context() as patch:
+        patch.setattr(dataclasses, "asdict", pre_field)
+        return request.getfixturevalue("completed_late")
+
+
+def test_a_paid_result_recorded_before_the_upgrade_is_collected_after_it(pre_field_late):
+    root, _slot, row, calls, text = pre_field_late
+    _manifest, payload, _ = read_call_payload(root, task_id="late-cas", call_id=row["operation_id"] + "_response")
+    assert payload["producer_outcome"]["recovery_binding"]["roster_hash"] == PRE_FIELD_ROSTER_HASH["api"]
+    result = recover(pre_field_late)
+    assert result.aggregate_signal == "PASS"
+    assert result.actors[0]["operation_state"] == "late_settled" and result.actors[0]["raw_text"] == text
+    assert len(calls) == 1  # collected, never bought again

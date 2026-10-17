@@ -5,6 +5,7 @@ Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
 
 from __future__ import annotations
 
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.config import runtime_setting
 
 import hashlib
@@ -17,6 +18,7 @@ import queue
 
 from typing import Any, Dict, List, Optional, Tuple
 from ouroboros.llm import LLMClient
+from ouroboros.observability import timed_phase
 from ouroboros.loop_llm_call import _emit_live_log
 from ouroboros.utils import sanitize_tool_result_for_log
 
@@ -52,20 +54,37 @@ def _emit_checkpoint_event(
     task_id: str,
     drive_logs: Optional[pathlib.Path],
     data: Dict[str, Any],
-) -> bool:
-    """Emit a checkpoint; an explicit System row also projects to chat history."""
-    payload = {"type": "task_checkpoint", "task_id": task_id, **data}
-    if event_queue is not None:
-        _emit_live_log(event_queue, payload)
-    elif drive_logs:
+) -> None:
+    """Emit one checkpoint: the producer's own durable rows first, then the one live frame.
+
+    The worker writes its intermediate logs itself (owner decision 1A(3), 14 Oct
+    2026): the row lands in ``events.jsonl`` — and in ``progress.jsonl`` when it
+    is an explicit System row (``system_type == "task_checkpoint"``), which is
+    what projects it into chat history — with the producer's own ``ts``, before
+    the live ``log_event`` frame is queued. The supervisor's nested log branch
+    only addresses and pushes that frame; the worker log sink suppresses the
+    append's copy, so one checkpoint is one row set and one frame. The task's
+    event endpoint (``log_addressing.TurnEventQueue``) stamps lineage and chat
+    by value onto the row before it is written, so the durable copy is
+    attributed the way the live one is. A row that could not be written is
+    logged and the frame still goes out: the owner sees the fact, the file
+    does not.
+    """
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    payload = {"ts": utc_now_iso(), "type": "task_checkpoint", "task_id": task_id, **data}
+    stamp = getattr(event_queue, "stamp", None)
+    if callable(stamp):
+        stamp({"type": "log_event", "data": payload})
+    if drive_logs:
         try:
-            from ouroboros.utils import append_jsonl, utc_now_iso
-            payload = {"ts": utc_now_iso(), **payload}
             append_jsonl(drive_logs / "events.jsonl", payload)
             if payload.get("system_type") == "task_checkpoint":
                 append_jsonl(drive_logs / "progress.jsonl", payload)
         except Exception:
-            pass
+            log.debug("Checkpoint row of %s not written; the live frame still goes out", task_id, exc_info=True)
+    if event_queue is not None:
+        _emit_live_log(event_queue, payload)
 
 
 def _extract_plain_text_from_content(content: Any) -> str:
@@ -296,6 +315,23 @@ def owner_source_sha256(ctx: Any) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def owner_input_revision(ctx: Any) -> int:
+    """How many of the owner's own rows this run has admitted (``initial_text`` and peers are not theirs)."""
+    from ouroboros.owner_words import OWNER_SOURCES
+
+    return sum(isinstance(row, dict) and row.get("source") in OWNER_SOURCES
+               for row in getattr(ctx, "_owner_directives", None) or [])
+
+
+def owner_reply_owed(ctx: Any) -> bool:
+    """Owner rows arrived after this run's latest LIVE text send (``tools/owner_delivery.py``).
+
+    A failed or deferred send discharges nothing; queue admission is not a read receipt, and
+    whether a sent line answered completely remains the author's judgment, not the host's.
+    """
+    return owner_input_revision(ctx) > int(getattr(ctx, "_owner_reply_revision", None) or 0)
+
+
 def queue_inspection_unknown(ctx: Any, exc: BaseException) -> Dict[str, Any]:
     """The one typed stamp for a queue inspection that could not be read.
 
@@ -451,6 +487,7 @@ def _record_acceptance_source_ack(ctx: Any, ack: AcceptanceAck, *, observed: Any
     return ack
 
 
+@timed_phase("source_ack")
 def acknowledge_acceptance_observation(ctx: Any, source_sha256: str) -> AcceptanceAck:
     """Advance only consumed ingress, never criteria or the review verdict.
 
@@ -568,3 +605,333 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
             emit_progress(sanitize_tool_result_for_log(display_reasoning), narration=True)
+
+
+# ---------------------------------------------------------------------------
+# The per-round context facts line (owner decisions 5A and 11 Oct 1A): one host
+# row of room, money, time, nanny and tool facts, appended as the newest tail
+# before the model call — the one every-round carrier, with no advice.
+# ---------------------------------------------------------------------------
+
+
+CONTEXT_FACTS_HEADER = "[CONTEXT_FACTS]"
+CONTEXT_FACTS_NAME = "ouroboros_context_facts"
+
+
+def context_facts_line(ctx: Any, *, money: Optional[Dict[str, Any]] = None,
+                       measured: bool = True, focus_fact: str = "") -> str:
+    """One line of this round's facts for the actor, no advice (owner decisions 5A, 11 Oct 1A).
+
+    Reads the measurement the round already recorded (``_remember_main_fit`` facts),
+    the window's free room and the owner target's room or excess apart, each known or
+    unknown (free room is never the smaller of window and target), the largest resident
+    units from the existing unit reader, the task's own recorded cost, and a tariff only
+    when the exact route's catalog is cached (no fetch, no price table). ``money`` carries
+    the round's observation (``wallet``, ``tree``, ``cost_ceiling``, ``quota``;
+    ``task_pacing.round_money_observation``), each bound named. Time comes from the Time
+    clock owners (``context_runtime_facts.round_clock_fact``); a nanny's burn names its
+    anchors (``nanny_pacing.nanny_burn_fact``); tool counts are the observed results.
+    ``measured=False`` names the input as unmeasured instead of reusing stale numbers.
+    """
+    from ouroboros.context_runtime_facts import round_clock_fact
+    from ouroboros.nanny_pacing import nanny_burn_fact
+
+    usage = ctx.accumulated_usage
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    estimate = usage.get("_context_prompt_estimate") if measured else None
+    reserve = usage.get("_context_reply_allowance_tokens")
+    capacity = usage.get("_context_capacity_total_tokens") if measured else None
+    target = usage.get("_context_target_total_tokens") if measured else None
+    basis = str(usage.get("_context_measurement_basis") or "cold_estimate")
+    parts = [_round_fact(ctx, tool_ctx), f"mode {ctx.active_context_mode}", f"model {ctx.active_model}"]
+    parts.append("window unknown" if capacity is None else f"window {int(capacity):,}")
+    if target is not None:
+        parts.append(f"target {int(target):,}")
+    if estimate is None:
+        parts.append("input unmeasured")
+    else:
+        parts.append(f"input ~{int(estimate):,} before this line ({basis}) + reply {int(reserve or 0):,}")
+        # Free room is the window's; the economy target is its own fact, measured with the reply floor.
+        parts.append(f"free {int(capacity) - int(estimate) - int(reserve or 0):,}" if capacity is not None
+                     else "free unknown")
+        if target is not None:
+            floor = int(usage.get("_context_response_reserve_tokens") or reserve or 0)
+            excess = int(estimate) + floor - int(target)
+            parts.append((f"over target {excess:,}" if excess > 0 else f"target room {-excess:,}")
+                         + (f" (reply floor {floor:,})" if floor != int(reserve or 0) else ""))
+    components = _context_components(ctx, measured=measured)
+    if components:
+        parts.append("largest " + ", ".join(f"{label} ~{tokens:,}" for label, tokens in components))
+    previous = usage.get("_last_round_cache_usage") or {}
+    read, total = previous.get("cached_tokens"), previous.get("prompt_tokens")
+    share = (f"{int(read):,}/{int(total):,} tokens ({100 * read / total:.1f}%)"
+             if read is not None and total is not None and total > 0 else "unknown")
+    cache = f"previous usable input cache {share}"
+    if previous:
+        cache += f" [round {previous['round']}, {previous.get('provider') or 'provider unknown'}, {previous.get('model') or 'model unknown'}]"
+        written = previous.get("cache_write_tokens")
+        cache += f"; write {int(written):,} tokens" if written is not None else "; write unknown"
+    parts.append(cache)
+    cost = usage.get("cost")
+    parts.append((f"own recorded cost ${float(cost):.2f}" + (" (total not final)" if usage.get("cost_final") is False else ""))
+                 if cost is not None else "own cost unknown")
+    facts = dict(money or {})
+    parts.extend(_money_facts(facts))
+    parts.append(f"quota {facts['quota']}" if facts.get("quota") is not None else "quota unknown")
+    parts.append(_cached_tariff_text(ctx))
+    if tool_ctx is not None:
+        try:  # a facts row never takes the round down: an unreadable clock is said, not raised
+            parts.append(round_clock_fact(tool_ctx))
+            parts.extend(part for part in (nanny_burn_fact(tool_ctx), _final_answer_fact(tool_ctx)) if part)
+        except Exception:
+            log.debug("time/nanny facts unavailable for the facts line", exc_info=True)
+            parts.append("time and nanny facts unavailable")
+    parts.append(_tool_results_fact(usage))
+    if focus_fact:
+        parts.append(focus_fact)
+    return f"{CONTEXT_FACTS_HEADER} " + " | ".join(parts)
+
+
+def _round_fact(ctx: Any, tool_ctx: Any) -> str:
+    """The round and the round limit that binds first (``loop._resolve_loop_max_rounds``)."""
+    try:
+        limit = _loop()._resolve_loop_max_rounds(tool_ctx)
+    except Exception:
+        log.debug("round limit unavailable for the facts line", exc_info=True)
+        return f"round {ctx.round_idx} (round limit unknown)"
+    return f"round {ctx.round_idx}" + (" (no round limit)" if limit is None else f" of {int(limit)} max")
+
+
+def _money_facts(facts: Dict[str, Any]) -> list:
+    """Each money bound under its own name, as known, unknown or absent; nothing summed.
+
+    The shared wallet is unreserved and moves with every task's spending; the hard
+    tree cap and an in-task ceiling bound THIS tree; tree spend is known (settled)
+    spend with open holds beside it and its ledger snapshot's age."""
+    from ouroboros import task_pacing
+
+    parts = []
+    wallet = facts.get("wallet")
+    status = wallet.get("status") if isinstance(wallet, dict) else ""
+    if status == "known":
+        limit = wallet.get("limit_usd")
+        parts.append(f"shared wallet ${float(wallet['remaining_usd']):.2f} known headroom"
+                     + (f" of ${float(limit):.2f} limit" if limit is not None else "")
+                     + " (unreserved; shared with other tasks)")
+    elif status == "no_global_limit":
+        parts.append("shared wallet: no global limit")
+    else:
+        reason = wallet.get("reason") if isinstance(wallet, dict) else ""
+        parts.append(f"shared wallet unknown ({reason or 'not observed'})")
+    ceiling = facts.get("cost_ceiling")
+    ceiling = ceiling if isinstance(ceiling, task_pacing.CostCeiling) else None
+    cap = ceiling.root_cap_usd if ceiling is not None else None
+    tree = facts.get("tree")
+    degraded = isinstance(tree, dict) and bool(tree.get("integrity_degraded"))
+    group = isinstance(tree, dict) and tree.get("accounting_basis") == "billing_group"
+    tree_line = ("" if not isinstance(tree, dict) or degraded
+                 else _whole_work_line(tree) if group else task_pacing.tree_spend_line(tree, ceiling))
+    if cap is not None and not tree_line and not group:  # a rendered tree line already names the cap
+        parts.append(f"hard tree cap ${float(cap):.2f}")
+    if ceiling is not None and ceiling.state == task_pacing.COST_CEILING_ACTIVE and ceiling.ceiling_usd is not None:
+        parts.append(f"in-task cost ceiling ${float(ceiling.ceiling_usd):.2f} ({ceiling.basis})")
+    elif ceiling is not None and ceiling.state == task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
+        parts.append("in-task cost ceiling exhausted (no room above the planning margin)")
+    elif ceiling is not None and ceiling.state == task_pacing.COST_CEILING_UNKNOWN:
+        parts.append("in-task cost ceiling unknown")
+    if degraded:
+        parts.append("task tree spend unknown (ledger integrity degraded)")
+    elif tree_line:
+        age = tree.get("age_sec")
+        parts.append(tree_line + (f"; ledger snapshot {float(age):.0f} s old" if isinstance(age, (int, float)) else ""))
+    elif cap is not None:
+        parts.append("task tree spend unknown")
+    return parts
+
+
+def _whole_work_line(tree: Dict[str, Any]) -> str:
+    """A Continue's whole-work group reading: group known spend, the room left on the
+    binding axis and both axes, as ``usage_admission.task_money_snapshot`` observed them."""
+    if tree.get("settled_usd") is None:
+        return ""
+
+    def axis(name: str) -> str:
+        row = tree.get(f"{name}_axis") if isinstance(tree.get(f"{name}_axis"), dict) else {}
+        spent, limit = row.get("settled_usd"), row.get("limit_usd")
+        spent_text = "unknown" if spent is None else f"~${float(spent):.2f}"
+        return f"{name} {spent_text} of " + ("no cap" if limit is None else f"${float(limit):.2f}")
+
+    known = float(tree["settled_usd"])
+    holds = max(0.0, float(tree.get("accounted_usd") or known) - known)
+    room = tree.get("remaining_known_usd")
+    left = ("no cap binds" if room is None
+            else f"${float(room):.2f} left ({tree.get('binding_axis') or 'unknown'} cap binds)")
+    return (f"whole-work group spend ~${known:.2f} known (+${holds:.2f} open holds not counted), {left}; "
+            f"{axis('root')}, {axis('group')}")
+
+
+def _final_answer_fact(tool_ctx: Any) -> str:
+    """Under the answer protocol only: whether a FINAL ANSWER line is latched (``_latch_final_answer_marker``)."""
+    from ouroboros.contracts.task_contract import answer_protocol_active
+
+    try:
+        if not answer_protocol_active(tool_ctx):
+            return ""
+    except Exception:
+        return ""
+    trace = getattr(tool_ctx, "_execution_trace", None)
+    if not isinstance(trace, dict) or not trace.get("best_valid_final_answer"):
+        return "FINAL ANSWER line latched: none"
+    later = len(trace.get("tool_calls") or []) - int(trace.get("best_valid_final_answer_tools") or 0)
+    return (f"FINAL ANSWER line latched earlier, not current ({later} later tool calls)"
+            if later > 0 else "FINAL ANSWER line latched: yes, current")
+
+
+def _tool_results_fact(usage: Dict[str, Any]) -> str:
+    """Counts of the delivered tool results this loop observed (``task_pacing.record_tool_activity``)."""
+    activity = usage.get("_pacing_tool_activity")
+    rows = [row for row in activity.values() if isinstance(row, dict)] if isinstance(activity, dict) else []
+    calls = sum(int(row.get("calls") or 0) for row in rows)
+    errors = sum(int(row.get("error_calls") or 0) for row in rows)
+    return f"observed tool results {calls} ({errors} errored)"
+
+
+def _context_components(ctx: Any, *, measured: bool) -> list:
+    """Largest blocks, complete units and schemas, on the same calibrated basis."""
+    from ouroboros.context_compaction import context_units
+    from ouroboros.context_fit import estimate_context_prompt_tokens
+
+    density = float(ctx.accumulated_usage.get("_context_measurement_density") or 1.0) if measured else 1.0
+    units = context_units(ctx.messages, scope="dialogue", measurement_density=density)
+    covered = {i for unit in units for i in range(unit.start, unit.end + 1)}
+    sizes = [(unit.unit_id, unit.context_size_tokens) for unit in units]
+    for i, message in enumerate(ctx.messages):
+        if i in covered:
+            continue
+        content = message.get("content")
+        chunks = [{**message, "content": [block]} for block in content] if message.get("role") == "system" and isinstance(content, list) else [message]
+        for j, chunk in enumerate(chunks):
+            sizes.append((f"{message.get('role', 'message')}[{i}:{j}]", int(estimate_context_prompt_tokens([chunk]) * density)))
+    sizes.append(("tool schemas", int(estimate_context_prompt_tokens([], ctx.tool_schemas) * density)))
+    return sorted(sizes, key=lambda item: item[1], reverse=True)[:3]
+
+
+def _cached_tariff_text(ctx: Any) -> str:
+    """Quote fresh exact-model endpoint rates when they agree; never invent a tariff."""
+    try:
+        from ouroboros.pricing import get_pricing
+        from ouroboros.provider_models import normalize_model_identity
+
+        model = normalize_model_identity(str(ctx.active_model or ""))
+        provider = str(getattr(ctx.context_fit_plan, "provider", "") or "")
+        catalog = get_pricing(provider=provider, model=model if provider == "openrouter" else "", allow_live_fetch=False)
+        rows = list(catalog.values()) if provider == "openrouter" else [catalog[model]] if model in catalog else []
+        quoted = []
+        prompt = ctx.accumulated_usage.get("_context_prompt_estimate")
+        for row in rows:
+            rates = row
+            if getattr(row, "tiers", ()) and prompt is None:
+                return "tariff unknown (input tier unmeasured)"
+            for threshold, tier in getattr(row, "tiers", ()):
+                if int(prompt or 0) >= threshold:
+                    rates = tier
+            if len(rates) != 4 or rates[0] is None or rates[3] is None:
+                return "tariff unknown"
+            quoted.append(tuple(rates))
+        if quoted and all(row == quoted[0] for row in quoted):
+            rates = quoted[0]  # pricing SSOT already uses dollars per MILLION tokens.
+            cache = "unknown" if rates[1] is None else f"${rates[1]:.2f}/M"
+            return f"cached catalog tariff ${rates[0]:.2f}/M in, ${rates[3]:.2f}/M out, cache read {cache} (estimated input tier)"
+    except Exception:
+        log.debug("cached tariff unavailable for the facts line", exc_info=True)
+    return "tariff unknown"
+
+
+def _own_focus_fact(ctx: Any) -> Tuple[str, str]:
+    """Observe one physical task result, never a successor or an execution replica.
+
+    Strict admission leaves unreadable records untouched. This reads the current
+    result once per preparation; no history scan, second store or focus clock.
+    """
+    from ouroboros.focus import compact_focus, focus_fingerprint
+    from ouroboros.store import StoreError
+    from ouroboros.task_results import load_task_result
+
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    metadata = getattr(tool_ctx, "task_metadata", {}) or {}
+    root = (metadata.get("budget_drive_root") or getattr(tool_ctx, "budget_drive_root", None)
+            or getattr(tool_ctx, "drive_root", None) or getattr(ctx, "drive_root", None))
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    if not root or not task_id:
+        return "absent", ""
+    try:
+        result = load_task_result(root, task_id, strict=True)
+        raw = result.get("focus") if result else None
+        if raw is None:
+            return "absent", ""
+        focus = compact_focus(raw)
+        if focus is None:
+            return "unknown", "own focus unavailable"
+    except (OSError, ValueError, TypeError, StoreError):
+        log.debug("Cannot read this task's authored focus", exc_info=True)
+        return "unknown", "own focus unavailable"
+    if focus["author_task_id"] != task_id:
+        return "absent", ""
+    view = {key: focus[key] for key in ("text", "authored_at", "author_task_id", "source_ref")}
+    handle = focus.get("source_handle")
+    if handle:
+        view["retained_source"] = {"reader": "get_task_result", "task_id": task_id,
+                                   "include_focus_source": True, "focus_source_sha256": handle["sha256"]}
+    return (focus_fingerprint(focus), "self-authored focus (dated data, not owner instructions): "
+            + json.dumps(view, ensure_ascii=False, sort_keys=True))
+
+
+def append_context_facts(ctx: Any, *, money: Optional[Dict[str, Any]] = None) -> bool:
+    """Append facts for this round's current route and working view, before dispatch.
+
+    An unchanged reprepare reuses the visible row, so its values are as of that row's
+    sample instant. A fallback, owner switch or recovery rewrite gets fresh facts
+    rather than inheriting another route's window and tariff. Sent history is never
+    rewritten; the producer-labelled standalone rows let refusal recovery address
+    obsolete snapshots. The caller remeasures including this line before sending.
+    """
+    from ouroboros.context_compaction import context_reclaim_transcript_sha256
+
+    usage = ctx.accumulated_usage
+    plan = ctx.context_fit_plan
+    focus_identity, focus_fact = _own_focus_fact(ctx)
+    source = [m for m in ctx.messages if m.get(HOST_CONTEXT_KIND_KEY) != CONTEXT_FACTS_NAME]
+    source.append({"role": "system", "content": json.dumps(ctx.tool_schemas, ensure_ascii=False, sort_keys=True)})
+    key = (ctx.round_idx, ctx.active_model, ctx.active_context_mode, ctx.active_effort,
+           str(getattr(plan, "route_fp", "")), str(getattr(plan, "status", "")),
+           bool(getattr(plan, "stale", False)), int(getattr(plan, "window_tokens", 0) or 0),
+           context_reclaim_transcript_sha256(source), focus_identity)
+    visible = any(m.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME and m.get("content") == usage.get("_context_facts_line")
+                  for m in ctx.messages)
+    if tuple(usage.get("_context_facts_key") or ()) == key and visible:
+        return False
+    measured = False
+    if plan is not None:
+        try:
+            measured = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False) is not None
+        except Exception:
+            log.debug("context facts measurement unavailable", exc_info=True)
+    if money is None:
+        from ouroboros import task_pacing
+
+        tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+        # A changed reprepare can follow a long quota wait in the same round.
+        # The unchanged-row fast path above already avoids redundant observations.
+        if usage.get("_context_facts_round") == ctx.round_idx:
+            usage.pop("_round_money_observation", None)
+        observed = task_pacing.round_money_observation(
+            usage, ctx.round_idx, tree_reader=lambda: _loop()._loop_tree_accounting(
+                refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC))
+        money = {"wallet": observed["wallet"], "tree": observed["tree"],
+                 "cost_ceiling": getattr(tool_ctx, "_cost_ceiling", None)}
+    line = context_facts_line(ctx, money=money, measured=measured, focus_fact=focus_fact)
+    ctx.messages.append({"role": "user", HOST_CONTEXT_KIND_KEY: CONTEXT_FACTS_NAME, "content": line})
+    usage["_context_facts_round"] = ctx.round_idx
+    usage["_context_facts_key"] = key
+    usage["_context_facts_line"] = line
+    return True

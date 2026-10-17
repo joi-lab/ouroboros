@@ -1,8 +1,6 @@
 """Readiness exhaustion closes admission without destroying an unsettled task."""
 
 import queue as stdqueue
-import json
-import sys
 import threading
 from types import SimpleNamespace
 
@@ -35,6 +33,7 @@ def pool(tmp_path, monkeypatch):
     for name in ("ADMISSION_RESERVATIONS", "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES"):
         monkeypatch.setattr(queue, name, {})
     monkeypatch.setattr(workers, "WORKERS", slots)
+    monkeypatch.setattr(workers, "MAX_WORKERS", 1)
     monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr(workers, "repo_writer_admission_closed", lambda: "")
     monkeypatch.setattr(workers, "_reconcile_confirmed_dead_review_owner", lambda _pid: None)
@@ -55,7 +54,7 @@ def pool(tmp_path, monkeypatch):
 
     monkeypatch.setattr(worker_pool_lifecycle, "kill_worker_tree", kill)
     monkeypatch.setattr(workers, "kill_worker_tree", kill)
-    slot = workers.Worker(0, Process(50001), stdqueue.Queue(), reaping=True)
+    slot = workers.Worker(0, Process(50001), stdqueue.Queue(), reaping=True, booting=True)
     slots[0] = slot
     return SimpleNamespace(root=tmp_path, slot=slot, events=events)
 
@@ -89,6 +88,7 @@ def test_unexhausted_reservation_remains_a_queue_target(pool, healthy_state):
     workers.WORKERS[1] = workers.Worker(
         1, Process(50002, alive=healthy_state != "temporary_reaping"), stdqueue.Queue(),
         reaping=healthy_state != "working", busy_task_id="busy" if healthy_state == "working" else None,
+        booting=healthy_state == "booting",
     )
     exhaust(pool)
     assert workers.WORKERS[0] is pool.slot and pool.slot.readiness_exhausted
@@ -185,21 +185,3 @@ def test_repository_writer_policy_stays_separate_from_execution_capacity(pool, m
     assert not workers.worker_pool_admission_state()["available"]
     assert workers._worker_pool_execution_state()["available"]
     assert task_admission.reserve_task_admission("resolver", "t", require_worker_pool=True)["status"] == "reserved"
-
-
-@pytest.mark.parametrize("shared_group", [False, True])
-def test_orphan_worker_cleanup_reuses_selective_tree_and_spares_retained_group(pool, monkeypatch, shared_group):
-    from ouroboros import platform_layer
-
-    pidfile = pool.root / "old-workers.json"
-    pidfile.write_text(json.dumps({"workers": [{"pid": 111}]}))
-    monkeypatch.setattr(worker_pool_lifecycle, "_worker_pids_path", lambda: pidfile)
-    monkeypatch.setattr(platform_layer, "process_command", lambda pid: sys.executable + " multiprocessing")
-    monkeypatch.setattr(platform_layer, "process_group_id", lambda pid: 111 if pid == 111 or shared_group else pid)
-    monkeypatch.setattr(queue, "_retained_daemon_pids", lambda: {222})
-    trees, groups = [], []
-    monkeypatch.setattr(worker_pool_lifecycle, "kill_worker_tree", trees.append)
-    monkeypatch.setattr(platform_layer, "kill_process_group_id", groups.append)
-    assert worker_pool_lifecycle.reap_orphaned_workers() == 1
-    assert trees == [111]
-    assert groups == ([] if shared_group else [111])

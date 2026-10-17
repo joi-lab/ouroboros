@@ -355,14 +355,14 @@ def test_model_role_resolves_the_consciousness_slots_and_falls_back_to_main():
     meta = {"model_role": "consciousness"}
     assert task_model_binding({"metadata": meta})[0] == "consciousness"
     assert task_model_binding({"metadata": {}})[0] == "main"
-    with mock.patch.dict(os.environ, {"OUROBOROS_MODEL_CONSCIOUSNESS": "", "OUROBOROS_EFFORT_CONSCIOUSNESS": "low",
+    with mock.patch.dict(os.environ, {"OUROBOROS_MODEL_CONSCIOUSNESS": "", "OUROBOROS_EFFORT_MAX": "xhigh",
                                       "OUROBOROS_EFFORT_TASK": "medium", "USE_LOCAL_CONSCIOUSNESS": ""}):
         assert model_role_slot_override(meta) is None  # an empty slot is Main
-        assert _initial_effort_for({"metadata": meta}, "task") == "low"
+        # A wake starts at the top of the owner's effort range; an ordinary turn at its recommended level.
+        assert _initial_effort_for({"metadata": meta}, "task") == "xhigh"
         assert _initial_effort_for({"metadata": {}}, "task") == "medium"
-    # An empty EFFORT slot is Main's effort too (owner decision 16.09, 1=A): the wake shares
-    # Main's request shape; a set value is honored.
-    with mock.patch.dict(os.environ, {"OUROBOROS_MODEL_CONSCIOUSNESS": "", "OUROBOROS_EFFORT_CONSCIOUSNESS": "",
+    # The range's top is never below the recommended level (the tolerant read).
+    with mock.patch.dict(os.environ, {"OUROBOROS_MODEL_CONSCIOUSNESS": "", "OUROBOROS_EFFORT_MAX": "",
                                       "OUROBOROS_EFFORT_TASK": "xhigh"}):
         assert _initial_effort_for({"metadata": meta}, "task") == "xhigh"
     # An empty model slot still honors the role's OWN local flag when the owner set it and it
@@ -411,7 +411,10 @@ def test_handle_task_ledger_category_comes_from_usage_category(monkeypatch, tmp_
 
     monkeypatch.setattr(usage_accounting, "usage_scope", fake_scope)
     monkeypatch.setattr(model_wait, "task_model_wait_scope", lambda **kw: contextlib.nullcontext())
-    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose", lambda *a, **k: None)
+    from ouroboros.settings_integrity import task_settings_snapshot
+
+    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *a, **k: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(config, "task_settings_scope", lambda snapshot: contextlib.nullcontext())
     monkeypatch.setattr(agent_module.OuroborosAgent, "_handle_task_scoped", lambda self, task: [])
     agent = object.__new__(agent_module.OuroborosAgent)
@@ -477,7 +480,8 @@ def test_consciousness_status_answers_the_caller_only_with_sourced_persisted_fac
     assert facts["stored_next_wake_at"] == "2026-09-26T10:00:00+00:00"
     assert facts["last_wake_ended_at"] == "2026-09-26T09:00:00+00:00"
     assert facts["configured_bounds_sec"] == {"min": 120, "max": 600, "source": "owner settings, not the state file"}
-    assert "last_wake_outcome" not in facts and "pending early-wake reason" in facts["notes"][1]
+    assert "last_wake_outcome" not in facts and "early-wake" not in facts["notes"][1]
+    assert "no event moves it" in facts["notes"][0]
 
     def unpublished():
         raise AssertionError("status must not be published")
@@ -608,10 +612,12 @@ def test_wake_affordances_describe_the_real_alarm_and_the_status_audience():
     schemas = {entry.name: entry.schema for entry in get_tools()}
     wake = schemas["set_next_wakeup"]["description"]
     for phrase in ("after a wake-up ends", "OUROBOROS_BG_WAKEUP_MIN/MAX", "already pending keeps its time",
-                   "stored for later", "failed wake-up doubles the interval (up to MAX)",
-                   "pending event brings the next wake-up forward", "retries after MIN",
-                   "exhausted allowance waits for its reset", "sooner than MIN after the last wake-up, boot or skip"):
+                   "stored for later", "failed wake-up doubles the interval (up to MAX)", "retries after MIN",
+                   "exhausted allowance waits for its reset", "sooner than MIN after the last wake-up, boot or skip",
+                   "Events never bring a wake-up forward"):
         assert phrase in wake
+    # #1603 (owner 12 Oct): only the scheduled time; no event pulls the alarm earlier
+    assert "brings the next wake-up forward" not in wake and "pending event" not in wake
     assert len(wake) < 600, "an operational paragraph, not the alarm's whole algorithm"
     assert "answered to you only" in schemas["toggle_consciousness"]["description"]
 

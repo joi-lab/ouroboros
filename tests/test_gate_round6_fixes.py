@@ -44,6 +44,8 @@ from ouroboros.task_results import (
     load_task_result,
     write_task_result,
 )
+from tests._shared import write_queue_document
+from tests._store_shared import result_signature
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -120,12 +122,11 @@ def test_gr6_1_cancel_kills_a_settled_tasks_live_worker_and_keeps_the_result(
     the shared-drive shape — so the settled row is exposed to the kill path's
     child-copy/finalize mutations and the byte-identity assertion actually
     catches them (a drive-less row made the mutating block a silent no-op)."""
-    from ouroboros.task_results import task_result_path
     from supervisor import workers
 
     task_id = "burn1"
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     emitted: list = []
     monkeypatch.setattr(
         qenv.q, "_emit_cancel_task_done", lambda *a, **kw: emitted.append(kw),
@@ -137,7 +138,7 @@ def test_gr6_1_cancel_kills_a_settled_tasks_live_worker_and_keeps_the_result(
     }
     write_task_result(qenv.drive, task_id, STATUS_COMPLETED, chat_id=6,
                       result="the finished answer")
-    row_bytes_before = task_result_path(qenv.drive, task_id).read_bytes()
+    row_bytes_before = result_signature(qenv.drive, task_id)
 
     assert qenv.tl.task_has_live_ownership(task_id) is True
     minted = ci.request_cancel(qenv.drive, task_id, reason="stop spending",
@@ -151,7 +152,7 @@ def test_gr6_1_cancel_kills_a_settled_tasks_live_worker_and_keeps_the_result(
     stored = load_task_result(qenv.drive, task_id)
     assert stored["status"] == STATUS_COMPLETED, "completion wins: no overwrite"
     assert stored["result"] == "the finished answer"
-    assert task_result_path(qenv.drive, task_id).read_bytes() == row_bytes_before, (
+    assert result_signature(qenv.drive, task_id) == row_bytes_before, (
         "GR7-2: the settled terminal row survives the kill BYTE-IDENTICAL"
     )
     assert task_id not in qenv.q.RUNNING
@@ -181,11 +182,11 @@ def test_gr6_1_live_ownership_predicates(qenv, tmp_path):
     snap = tmp_path / "state" / "queue_snapshot.json"
     snap.parent.mkdir(parents=True, exist_ok=True)
     # A FRESH snapshot (GR7-1a): only a fresh one may prove a dead worker.
-    snap.write_text(json.dumps({
+    write_queue_document(snap, {
         "ts": utc_now_iso(),
         "running": [{"id": "own-s", "task": {"id": "own-s"}}],
         "pending": [{"id": "own-p", "task": {"id": "own-p"}}],
-    }), encoding="utf-8")
+    })
     assert task_has_live_queue_ownership(tmp_path, "own-s") is True
     assert task_has_live_queue_ownership(tmp_path, "own-p") is False, (
         "a queued row is not physical ownership (no process to kill)"
@@ -203,8 +204,12 @@ def test_gr6_1_every_ingress_passes_the_live_ownership_fact():
 
     gw = (REPO_ROOT / "ouroboros" / "gateway" / "tasks.py").read_text(encoding="utf-8")
     assert "task_has_live_ownership as _live_ownership" in gw
-    assert "allow_settled=live_own" in gw
-    assert "allow_settled_target=bool(cascade_scope or allow_settled)" in gw
+    assert "allow_settled_target=bool(cascade or live_own)" in gw  # graceful ingress
+    # HTTP Stop: a target the intent request found settled is re-requested with
+    # the live-ownership fact (cascade: also its live subtree).
+    assert "return task_has_live_ownership(task_id) or (cascade and task_subtree_is_live(task_id))" in gw
+    assert ('if intent.get("already_settled") and still_owned():\n'
+            '        intent = record(allow_settled_target=True)') in gw
 
     qt = (REPO_ROOT / "supervisor" / "queue_transitions.py").read_text(encoding="utf-8")
     assert qt.count("allow_settled_target=task_has_live_ownership(task_id)") == 2, (
@@ -244,7 +249,7 @@ def test_gr6_1_project_delete_over_settled_live_root_mints_and_converges(
 
     done = _patch_project_registry(monkeypatch)
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
 
     root_id = "pd-root"
@@ -325,7 +330,7 @@ def test_gr6_1_quiescence_defers_for_a_settled_root_winding_down(
 
     done = _patch_project_registry(monkeypatch)
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
 
     root_id = "pd-wind"
@@ -367,7 +372,7 @@ def test_gr6_2_mid_tree_cascade_digest_lists_grandchildren(tmp_path, monkeypatch
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     write_task_result(tmp_path, "orig-root", STATUS_RUNNING, chat_id=9, result="alive")
     write_task_result(tmp_path, "mid6", STATUS_CANCELLED, chat_id=9, result="mid down",
                       parent_task_id="orig-root", root_task_id="orig-root")
@@ -524,11 +529,14 @@ def test_gr6_4_unreadable_custody_log_is_typed_unknown_not_clean(qenv, monkeypat
     assert dc.custody_log_unreadable(qenv.drive) is False
     assert qenv.tl._reconcile_delegated_runs_on_kill(qenv.q, "au6") == []
 
-    # EXISTING but unreadable: event_log_path resolves to a directory, whose
-    # open(rb) raises OSError on every platform (the injected unreadability).
-    unreadable = qenv.drive / "unreadable-log"
-    unreadable.mkdir()
-    monkeypatch.setattr(dc, "event_log_path", lambda root: unreadable)
+    # EXISTING but unreadable: a directory where the custody store should be makes
+    # the store raise its typed unreadable on every platform (the injected unreadability).
+    from ouroboros.store import STORE_REL
+
+    unreadable = qenv.drive / STORE_REL
+    if unreadable.exists():
+        unreadable.unlink()
+    unreadable.mkdir(parents=True)
     assert dc.custody_log_unreadable(qenv.drive) is True
 
     still = qenv.tl._reconcile_delegated_runs_on_kill(qenv.q, "au6")

@@ -18,8 +18,12 @@ Lifecycle belongs to the installation, not the process that first needed it:
   worker's death nor a server generation change ends the daemon's paid runs;
 * ATTACH-IF-ALIVE: a live daemon serving our config dir is attached to. A
   custodied startup without a reachable control endpoint is joined across
-  managers/processes; caller wait expiry reports ``daemon_starting`` and never
-  kills it. Engine writer election owns the concurrent first-launch race;
+  managers/processes; caller wait expiry (``daemon_starting``; a silent live listener:
+  ``daemon_not_answering``) never kills it. Engine writer election owns the first-launch race;
+* ATTACH-ONLY (``review_run_isolation.attach_home``, the isolated contributor
+  review, which starts no engine unattached): another data plane's running engine,
+  by marker, loopback descriptor and handshake — never started, prepared, rotated,
+  claimed or stopped; a missing or dead one is a typed refusal. Own runs stay cancellable;
 * STOP-ONLY-WHAT-IS-PROVABLY-OURS: ``stop`` (Panic) terminates the child THIS
   manager spawned and ledger roots confirmed by our marker and measured
   custody fingerprint, with an authenticated endpoint, a typed transport
@@ -63,6 +67,7 @@ from ouroboros.claudexor_startup_failure import (
     start_failure_label,
     start_failure_row,
 )
+from ouroboros.review_run_isolation import attach_home, run_cap_from_env
 from ouroboros.config import (
     CLAUDEXOR_STARTUP_WAIT_SEC as _SPAWN_WAIT_SEC,
     CLAUDEXOR_STARTUP_POLL_SEC as _SPAWN_POLL_SEC,
@@ -123,6 +128,25 @@ def owned_config_dir() -> pathlib.Path:
     from ouroboros.config import DATA_DIR
 
     return pathlib.Path(DATA_DIR) / _OWNED_DIR_NAME
+
+
+def attached_endpoint(home: pathlib.Path) -> Any:
+    """The attach-only home's engine (``review_run_isolation.attach_home``), provenance first."""
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable, discover_daemon_at
+
+    try:
+        marker = json.loads((home / OWNERSHIP_MARKER).read_text(encoding="utf-8"))
+        marked = pathlib.Path(str(marker.get("data_dir") or "")) if isinstance(marker, dict) else None
+        if (not isinstance(marker, dict) or marker.get("owner") != "ouroboros" or marked is None
+                or not marked.is_absolute() or (marked / _OWNED_DIR_NAME).resolve() != home.resolve()):
+            raise ValueError("marker does not name this home as an Ouroboros-owned engine home")
+    except (OSError, ValueError, RuntimeError) as exc:  # RuntimeError: a symlink loop in resolve()
+        raise ClaudexorUnavailable(
+            "attach_provenance_refused",
+            f"attach-only engine home {home} has no matching ownership marker "
+            f"({type(exc).__name__}: {exc}); nothing is started in its place",
+        ) from exc
+    return discover_daemon_at(home)
 
 
 def owned_descriptor_path() -> pathlib.Path:
@@ -347,6 +371,7 @@ class OwnedClaudexorDaemon:
         # successful handshake writes it, so a failed probe cannot retract it.
         self._proven_engine_version = ""
         self._engine_build_sha = ""
+        self._silent_listener = False  # last probe: a listener accepted, then sent no answer
         self._generation = 0
         self._stopping = False
         self._panic_requested = False
@@ -385,9 +410,9 @@ class OwnedClaudexorDaemon:
         )
         import httpx
 
+        self._silent_listener = False
         if not owned_daemon_provisioned():
-            self._engine_version = ""
-            self._engine_build_sha = ""
+            self._engine_version = self._engine_build_sha = ""
             return None, "not_provisioned", ""
         try:
             endpoint = discover_daemon_at(owned_config_dir())
@@ -409,8 +434,8 @@ class OwnedClaudexorDaemon:
                 # question answered by `ensure_owned_gateway`'s own handshakes.
             return endpoint, "running", ""
         except ClaudexorUnavailable as exc:
-            self._engine_version = ""
-            self._engine_build_sha = ""
+            self._engine_version = self._engine_build_sha = ""
+            self._silent_listener = isinstance(exc.__cause__, (httpx.ReadTimeout, httpx.ReadError, httpx.RemoteProtocolError))
             status = int(getattr(exc, "status_code", 0) or 0)
             if status in (401, 403):
                 return None, "foreign_daemon", (
@@ -457,7 +482,8 @@ class OwnedClaudexorDaemon:
         return endpoint
 
     def status_dict(self) -> Dict[str, Any]:
-        """UI status projection. Read-only: never spawns."""
+        """UI status projection; observes capacity without starting the daemon."""
+        from ouroboros.claudexor_exit_facts import engine_status_facts
         endpoint, state, detail = self._classify_liveness()
         if detail:
             self._last_error = detail
@@ -481,6 +507,7 @@ class OwnedClaudexorDaemon:
             # Typed foreign-home disclosure ('' = ours): a marker naming another
             # data plane means we display, and manage, NOTHING here.
             "ownership_problem": ownership_problem or None,
+            **engine_status_facts(endpoint if state == "running" and not ownership_problem else None, self._engine_version, self._engine_build_sha),
         }
 
     # -- lifecycle ----------------------------------------------------------
@@ -569,8 +596,8 @@ class OwnedClaudexorDaemon:
     def clear_start_failure_latch(self, *, cleared_by: str) -> bool:
         """Release the spawn latch; True when one was set (a durable row names who released it).
 
-        Callers: the periodic sweep and the owner's Refresh (the two retriers),
-        and a successful attach. Restart/Panic clear it by constructing a new manager.
+        The sweep, owner Refresh and successful attach call this; Restart/Panic build a new manager.
+        Another caller may spawn between release and retry; the retry joins that child.
         """
         with self._lock:
             record, self._last_start_failure = self._last_start_failure, None
@@ -618,6 +645,8 @@ class OwnedClaudexorDaemon:
         from ouroboros.claudexor_runtime import ClaudexorRuntimeError, get_runtime_manager
         from ouroboros.gateways.claudexor import SHORT_POLL_TIMEOUT_SEC, ClaudexorUnavailable
 
+        if attach_home() is not None or run_cap_from_env() is not None:  # attached, or an isolated review
+            raise ClaudexorUnavailable("attach_only_engine", "an isolated review never starts or prepares an engine")
         with self._lock:
             generation = self._generation
             self._check_start_generation(generation)
@@ -668,18 +697,18 @@ class OwnedClaudexorDaemon:
         """Publish our own startup through the existing marker and process custody."""
         config_dir = owned_config_dir()
         config_dir.mkdir(parents=True, exist_ok=True)
-        env = dict(os.environ)
+        from ouroboros.process_scope import shed_scopes
+        # Inheritance is not a lifetime transfer: the installation-owned daemon keeps the installation marker
+        # and sheds the spawning worker's task and engine-run markers, or the first task to need it would end it.
+        env = shed_scopes(dict(os.environ))
         env["CLAUDEXOR_CONFIG_DIR"] = str(config_dir)
-        # Loopback-only ephemeral port is the engine default; explicitly
-        # scrub any operator-level overrides that would cross homes.
+        # Loopback-only ephemeral port is the engine default; scrub operator-level overrides that cross homes.
         for crossing in ("CLAUDEXOR_DAEMON_SOCK", "CLAUDEXOR_CONTROL_PORT"):
             env.pop(crossing, None)
         command_bin = pathlib.Path(command[0]).parent
         if command_bin.is_dir():
-            # Windows materializes os.environ with its native "Path" key; a
-            # plain dict lookup of "PATH" misses it and would hand the child
-            # a PATH holding only the Node bin dir (the engine then reports
-            # git_missing). Prepend onto whichever key the host actually has.
+            # Windows materializes os.environ with its native "Path" key: a plain "PATH" lookup misses it and would
+            # hand the child only the Node bin dir as PATH (the engine reports git_missing); prepend onto the host's key.
             path_key = next((k for k in env if k.upper() == "PATH"), "PATH")
             # An EMPTY PATH component means the CURRENT WORKING DIRECTORY on
             # POSIX. A host with no PATH (a scrubbed service manager, a bare
@@ -750,12 +779,11 @@ class OwnedClaudexorDaemon:
         self._check_start_generation(generation)
         pids = self._startup_pids()
         detail = self._startup_diagnostic(pids)
-        if pids:
-            self._last_error = f"daemon_starting: {detail}"
-            raise ClaudexorUnavailable(
-                "daemon_starting", f"owned daemon is still starting after this {wait:.1f}s wait; "
-                f"retry joins the same startup; {detail}", status_code=503,
-            )
+        if pids:  # a live listener that accepted and stayed silent is not answering, not starting
+            code, said = (("daemon_not_answering", f"process is alive but did not answer in this {wait:.1f}s wait; retry joins the same daemon")
+                          if self._silent_listener else ("daemon_starting", f"is still starting after this {wait:.1f}s wait; retry joins the same startup"))
+            self._last_error = f"{code}: {detail}"
+            raise ClaudexorUnavailable(code, f"owned daemon {said}; {detail}", status_code=503)
         with self._lock:
             self._check_start_generation(generation)
         failure = self._settle_exited_child()
@@ -851,7 +879,7 @@ class OwnedClaudexorDaemon:
         provisioning, a bare except, and no read-back — so a race with the
         daemon's startup "serving recovery only" window failed it forever,
         attach paths never patched at all, and a harness discovered later was
-        never covered. This runs on EVERY ``ensure_owned_gateway`` instead
+        never covered. This runs on EVERY owned ``ensure_owned_gateway`` instead
         (owner decision 5=A, literal: no read-path TTL — each ensure does the
         GET, computes the missing set and POSTs conditionally), against the
         gateway that ensure just handshook:
@@ -1211,19 +1239,22 @@ def owned_engine_version() -> str:
     return get_owned_daemon().engine_version
 
 
-def read_owned_gateway() -> Any:
+def read_owned_gateway(*, timeout_sec: Optional[float] = None) -> Any:
     """Connect to the owned engine for metadata, without starting or repairing it.
 
     Discovery is explicitly owned-only, including on unprovisioned installs.
     Callers own close(); discovery/handshake failures retain their typed refusal.
+    An attach-only selection reads the selected home and records no stop target.
     """
     from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
 
-    endpoint = discover_daemon_at(owned_config_dir())
+    home = attach_home()
+    endpoint = attached_endpoint(home) if home is not None else discover_daemon_at(owned_config_dir())
     gateway = ClaudexorGateway(endpoint)
     try:
-        gateway.handshake()
-        get_owned_daemon()._remember_stop_targets(endpoint)
+        gateway.handshake(**({"timeout_sec": timeout_sec} if timeout_sec is not None else {}))
+        if home is None:
+            get_owned_daemon()._remember_stop_targets(endpoint)
     except Exception:
         gateway.close()
         raise
@@ -1236,8 +1267,8 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
 
     This is the explicit start/probe seam — the ONE funnel every consumer
     (delegation, review sessions, account surfaces, login) passes through,
-    which is why the rotation reconcile rides it: spawn AND attach paths are
-    both covered, on every ensure, best-effort (see ``reconcile_rotation``).
+    which is why the rotation reconcile rides it: spawn AND owned-attach paths,
+    on every ensure, best-effort (see ``reconcile_rotation``); never attach-only.
     The gateway transport itself stays pure I/O; callers own ``close()`` (or
     use it as a context manager). ``stop()`` owns the separate marker, transport
     and process-identity checks for stopping an attached daemon.
@@ -1257,8 +1288,8 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
     recovering daemon is an immediate typed refusal there, and the initial
     handshake below is read-bounded by the same small window. The wait bounds
     admission only. ``startup_wait_sec`` separately narrows the caller's control
-    readiness wait, whose default lives in ``config.CLAUDEXOR_STARTUP_WAIT_SEC``;
-    its expiry retains live startup custody and returns ``daemon_starting``.
+    readiness wait (default ``config.CLAUDEXOR_STARTUP_WAIT_SEC``); its expiry keeps
+    live startup custody: ``daemon_starting``, or ``daemon_not_answering`` for a silent listener.
     Ordinary attach probes retain their transport ceiling; runtime preparation
     is separate from both waits. Neither zero-wait parameter promises zero
     total latency or permission to stop the process.
@@ -1272,8 +1303,12 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
     wait = _ADMISSION_WAIT_SEC if admission_wait_sec is None else max(
         0.0, float(admission_wait_sec))
     daemon = get_owned_daemon()
-    endpoint = (daemon.ensure_running() if startup_wait_sec is None
-                else daemon.ensure_running(startup_wait_sec=startup_wait_sec))
+    home = attach_home()
+    if home is not None:  # attach-only: no start, no runtime pin, no ownership claim
+        endpoint = attached_endpoint(home)
+    else:
+        endpoint = (daemon.ensure_running() if startup_wait_sec is None
+                    else daemon.ensure_running(startup_wait_sec=startup_wait_sec))
     gateway = ClaudexorGateway(endpoint)
     try:
         # Read-bounded: a daemon that accepts the socket but withholds the
@@ -1312,6 +1347,9 @@ def ensure_owned_gateway(*, admission_wait_sec: Optional[float] = None,
     except Exception:
         gateway.close()
         raise
+    if home is not None:  # the proven version feeds request-shape floors; host engine settings stay untouched
+        daemon._proven_engine_version = str(gateway.engine_version or "")
+        return gateway
     daemon.reconcile_rotation(gateway)
     return gateway
 

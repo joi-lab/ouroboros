@@ -18,6 +18,7 @@ from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, ACTING_SUBAGENT_TO
 from ouroboros.runtime_mode_policy import mode_allows_protected_write
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros import subagent_worktrees as sw
+from tests._store_shared import read_result, seed_result
 
 
 def _git(repo, *args, check=True, text=True):
@@ -417,7 +418,6 @@ def test_reject_cleans_up_provisioned_worktree(tmp_path, monkeypatch):
 def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: str, rel: str, new_content: str, parent_task_id: str = "parent1", surface: str = ""):
     """Produce a real workspace.patch + manifest + lineage task_result for ``rel``."""
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.task_results import task_result_path
     from hashlib import sha256
     (target_repo / rel).parent.mkdir(parents=True, exist_ok=True)
     original = (target_repo / rel).read_text(encoding="utf-8") if (target_repo / rel).exists() else ""
@@ -440,8 +440,6 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
         "diffstat": f"{rel} | 1 +",
     }
     (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
-    tr = task_result_path(drive, child_id)
-    tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "_schema_version": 1,
         "id": child_id,
@@ -453,14 +451,13 @@ def _make_child_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: 
     }
     if surface:
         result["task_constraint"] = {"mode": "acting_subagent", "surface": surface}
-    tr.write_text(json.dumps(result), encoding="utf-8")
+    seed_result(drive, child_id, result)
     return art
 
 
 def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, child_id: str, rel: str, parent_task_id: str = "parent1", surface: str = ""):
     """Produce a real workspace.patch that deletes ``rel``."""
     from ouroboros.artifacts import task_artifact_dir_path
-    from ouroboros.task_results import task_result_path
     from hashlib import sha256
 
     (target_repo / rel).unlink()
@@ -480,8 +477,6 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
         "diffstat": f"{rel} | 1 -",
     }
     (art / "workspace_patch.json").write_text(json.dumps(manifest), encoding="utf-8")
-    tr = task_result_path(drive, child_id)
-    tr.parent.mkdir(parents=True, exist_ok=True)
     result = {
         "_schema_version": 1,
         "id": child_id,
@@ -493,18 +488,16 @@ def _make_child_delete_patch(target_repo: pathlib.Path, drive: pathlib.Path, chi
     }
     if surface:
         result["task_constraint"] = {"mode": "acting_subagent", "surface": surface}
-    tr.write_text(json.dumps(result), encoding="utf-8")
+    seed_result(drive, child_id, result)
     return art
 
 
 def _record_child_workspace_root(drive: pathlib.Path, child_id: str, workspace: pathlib.Path) -> None:
-    from ouroboros.task_results import task_result_path
 
-    child_result_path = task_result_path(drive, child_id)
-    child_result = json.loads(child_result_path.read_text(encoding="utf-8"))
+    child_result = read_result(drive, child_id)
     child_result["workspace_root"] = str(workspace)
     child_result.setdefault("task_constraint", {})["write_root"] = str(workspace)
-    child_result_path.write_text(json.dumps(child_result), encoding="utf-8")
+    seed_result(drive, child_id, child_result)
 
 
 def _integrate_ctx(target_repo, drive, **constraint_kw):
@@ -777,29 +770,30 @@ def test_integrate_external_workspace_rejects_existing_but_mismatched_files(tmp_
     assert verdict["applied"] is False
 
 
-def test_integrate_external_workspace_requires_parent_active_workspace(tmp_path):
+def test_integrate_external_workspace_verifies_without_parent_active_workspace(tmp_path, monkeypatch):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
 
     system_repo = tmp_path / "system"
     _init_repo(system_repo, {"README.md": "system\n"})
     workspace = tmp_path / "project"
     _init_repo(workspace, {"a.txt": "hi\n"})
-    drive = tmp_path / "data"; drive.mkdir()
+    drive = tmp_path / "state"; drive.mkdir()
     _make_child_patch(workspace, drive, "ext-project", "a.txt", "hi\nexternal\n", parent_task_id="parent-ext", surface="external_workspace")
     (workspace / "a.txt").write_text("hi\nexternal\n", encoding="utf-8")
     _record_child_workspace_root(drive, "ext-project", workspace)
     ctx = ToolContext(repo_dir=system_repo, drive_root=drive, task_id="parent-ext")
 
+    monkeypatch.setattr("ouroboros.tool_access._user_files_root", lambda: tmp_path)
     out = _integrate_subagent_patch(ctx, task_id="ext-project")
 
-    assert "INTEGRATE_EXTERNAL_WORKSPACE_PARENT_MISSING" in out
+    assert "Verified external_workspace child" in out, out
     verdict = json.loads((drive / "task_results" / "artifacts" / "parent-ext" / "subagent_patch_verdict_ext-project.json").read_text(encoding="utf-8"))
-    assert verdict["outcome"] == "shared_workspace_parent_missing"
-    assert verdict["target_root"] == str(system_repo.resolve(strict=False))
+    assert verdict["outcome"] == "verified_shared_workspace"
+    assert verdict["target_root"] == str(workspace.resolve(strict=False))
     assert (workspace / "a.txt").read_text(encoding="utf-8") == "hi\nexternal\n"
 
 
-def test_integrate_external_workspace_rejects_child_root_outside_parent_workspace(tmp_path):
+def test_integrate_external_workspace_verifies_assigned_child_root_outside_parent_workspace(tmp_path):
     from ouroboros.tools.subagent_integration import _integrate_subagent_patch
 
     system_repo = tmp_path / "system"
@@ -822,11 +816,11 @@ def test_integrate_external_workspace_rejects_child_root_outside_parent_workspac
 
     out = _integrate_subagent_patch(ctx, task_id="ext-other")
 
-    assert "INTEGRATE_EXTERNAL_WORKSPACE_TARGET_MISMATCH" in out
+    assert "Verified external_workspace child" in out, out
     assert (parent_workspace / "a.txt").read_text(encoding="utf-8") == "parent\n"
     verdict = json.loads((drive / "task_results" / "artifacts" / "parent-ext" / "subagent_patch_verdict_ext-other.json").read_text(encoding="utf-8"))
-    assert verdict["outcome"] == "shared_workspace_target_mismatch"
-    assert verdict["target_root"] == str(parent_workspace.resolve(strict=False))
+    assert verdict["outcome"] == "verified_shared_workspace"
+    assert verdict["target_root"] == str(child_workspace.resolve(strict=False))
 
 
 def test_integrate_external_workspace_verifies_deletions(tmp_path):
@@ -1527,8 +1521,8 @@ def test_schedule_subagent_publishes_the_depth_request_and_the_handler_accepts_i
     assert row["default"] == 0
     # Absolute from the root, and telemetry rather than a cap: both semantics
     # have to be readable by the model that fills the field in.
-    assert "ABSOLUTELY FROM THE ROOT" in row["description"]
-    assert "never widens or narrows" in row["description"]
+    assert "absolute nesting depth from root=0" in row["description"]
+    assert "never changes configured caps" in row["description"]
     # The handler's closed keyword set DERIVES from the same schema.
     assert "requested_depth" in control.schedule_subagent_param_names()
     assert "requested_depth" not in control.HIDDEN_LEGACY_SCHEDULE_PARAMS

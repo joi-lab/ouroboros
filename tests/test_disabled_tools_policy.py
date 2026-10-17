@@ -10,7 +10,6 @@ and subagent inheritance via the parent-contract spread.
 """
 from __future__ import annotations
 
-import json
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -21,6 +20,7 @@ from ouroboros.contracts.task_contract import (
     normalize_disabled_tools,
 )
 from ouroboros.tools.registry import ToolContext, ToolRegistry
+from tests._store_shared import read_result
 
 WEB_TOOLS = ["web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query"]
 
@@ -71,7 +71,7 @@ def test_api_tasks_create_carries_disabled_tools(tmp_path, monkeypatch):
     assert captured[0]["metadata"]["disabled_tools"] == WEB_TOOLS
     assert captured[0]["task_contract"]["disabled_tools"] == WEB_TOOLS
     # survives to the persisted task result contract too
-    result = json.loads((data / "task_results" / f"{task_id}.json").read_text(encoding="utf-8"))
+    result = read_result(data, task_id)
     assert result["task_contract"]["disabled_tools"] == WEB_TOOLS
 
 
@@ -98,7 +98,7 @@ def test_api_tasks_create_carries_acceptance_claims(tmp_path, monkeypatch):
     task_id = resp.json()["task_id"]
     assert captured[0]["acceptance_claims"][0]["id"] == "answer"
     assert captured[0]["metadata"]["acceptance_claims"][0]["claim"] == "final answer is exact"
-    result = json.loads((data / "task_results" / f"{task_id}.json").read_text(encoding="utf-8"))
+    result = read_result(data, task_id)
     assert result["task_contract"]["acceptance_claims"][0]["support"] == "exact receipt"
 
 
@@ -222,7 +222,7 @@ def test_registry_arg_aliases_and_public_tool_arg_errors(tmp_path):
 
     result = reg.execute("list_skills", {"foo": "bar"})
     assert "TOOL_ARG_ERROR (list_skills)" in result
-    assert "Accepted parameters: none" in result
+    assert "Accepted parameters: name, offset, snapshot" in result
     assert "_kwargs" not in result
 
 

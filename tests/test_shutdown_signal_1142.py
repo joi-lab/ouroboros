@@ -111,7 +111,9 @@ def test_main_server_bounds_the_graceful_drain_from_the_shared_constant():
 
     source = inspect.getsource(server.main)
     assert "timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC" in source
-    assert "_SignalStopServer(config)" in source
+    # The stop watcher starts before the port wait; the bounded config follows the port choice.
+    assert "_SignalStopServer(None)" in source and "server.config = uvicorn.Config(" in source
+    assert source.index("server.watch_launcher_stop()") < source.index("find_free_port(")
     # The drain plus the lifespan's bounded supervisor join must leave the launcher budget room
     # for the terminal-custody write itself.
     assert SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC + 2 < LAUNCHER_STOP_GRACE_SEC
@@ -323,7 +325,7 @@ for reader in readers:
 (root / "finished.json").write_text(json.dumps({
     "should_exit": server.should_exit, "exit_latched": state._exit_signalled.is_set(),
     "supervisor_stopped": state._supervisor_stop.is_set(), "reader_alive": any(t.is_alive() for t in readers),
-    "private_closed": all(stream.closed for stream in opened),
+    "private_closed": all(stream.closed for stream in opened), "source": state.server_stop_source(),
 }), encoding="utf-8")
 '''
 
@@ -353,8 +355,11 @@ def _launch_pipe_owner_probe(tmp_path, mode):
 
 
 @pytest.mark.serial
-@pytest.mark.parametrize("message,stopped", [(b"quit\n", True), (b"", False), (b"other", False)])
-def test_launcher_pipe_only_an_explicit_quit_stops_the_server(tmp_path, message, stopped):
+@pytest.mark.parametrize("message,source", [(b"quit\n", "launcher_quit"), (b"", "launcher_gone"),
+                                            (b"other", "launcher_gone")])
+def test_launcher_pipe_quit_or_launcher_exit_stops_the_server(tmp_path, message, source):
+    """Quit is the ordinary stop; EOF means the launcher is gone, so the opt-in server stops
+    too instead of serving on as an orphan (every platform, not only under a Windows Job)."""
     proc, ready = _launch_pipe_owner_probe(tmp_path, "receive")
     try:
         assert ready["inherited_stdin_eof"], "ordinary children must not read the open control pipe"
@@ -366,8 +371,8 @@ def test_launcher_pipe_only_an_explicit_quit_stops_the_server(tmp_path, message,
         stdout, stderr = proc.communicate(input=message, timeout=10)
         assert proc.returncode == 0, (stdout, stderr)
         finished = json.loads((tmp_path / "finished.json").read_text(encoding="utf-8"))
-        assert finished == {"should_exit": stopped, "exit_latched": stopped, "supervisor_stopped": stopped,
-                            "reader_alive": False, "private_closed": True}
+        assert finished == {"should_exit": True, "exit_latched": True, "supervisor_stopped": True,
+                            "reader_alive": False, "private_closed": True, "source": source}
     finally:
         if proc.poll() is None:
             proc.kill()

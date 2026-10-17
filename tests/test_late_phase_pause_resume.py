@@ -65,8 +65,7 @@ class Light:
                     return {"content": "", "tool_calls": [{"id": "list", "type": "function", "function": {
                         "name": "knowledge_list", "arguments": "{}"}}]}, usage
                 if kind == "scratchpad":
-                    return {"content": json.dumps({"knowledge_entries": [],
-                                                   "compressed_block": f"compressed-{len(light.sends)}"})}, usage
+                    return {"content": json.dumps({"compressed_block": f"compressed-{len(light.sends)}"})}, usage
                 return {"content": f"{kind}-{len(light.sends)}"}, usage
 
             return execute_physical_attempt(
@@ -98,8 +97,8 @@ def late(tmp_path, monkeypatch, fit):  # noqa: F811
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path, drive_path=lambda rel: tmp_path / rel)
     light = Light(monkeypatch)
     stages: list = []
-    # Reflection/promotion are real stages; this root has nothing to reflect on.
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: stages.append("reflection"))
+    # Promotion is a real stage; its chooser is off for this root and only records that it ran.
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a, **k: stages.append("promotion"))
     return SimpleNamespace(root=tmp_path, q=q, workers=workers, task=task, env=env, light=light, stages=stages,
                            pipeline=pipeline)
 
@@ -124,7 +123,7 @@ def _start(f, *, blocking=False, cap=3.0):
                        root_limit_usd=cap, root_limit_source="task_admission")
     with usage_scope(scope):
         return _spawned(lambda: f.pipeline._run_post_task_processing_async(
-            f.env, f.task, {"rounds": 1}, {"tool_calls": []}, {}, f.root / "logs", blocking=blocking))[1]
+            f.env, f.task, {"rounds": 1}, {"tool_calls": []}, f.root / "logs", blocking=blocking))[1]
 
 
 def _resume(f):
@@ -207,6 +206,7 @@ def test_pause_after_delivery_saves_the_remainder_and_soft_resume_reassesses_cur
     assert "chat_consolidation" not in record["remaining_stages"]
     payload = json.loads(read_actor_source_bytes(f.root, ROOT, record["payload_ref"]))
     assert payload["drafts"] == {}  # no stage keeps a draft any more
+    assert payload["review_evidence"] == {}  # an earlier version's resume indexes it after consuming its grant
     assert payload["money_scope"]["root_limit_usd"] == 3.0
     assert "calls" not in payload  # no request replay cache
     assert read_fence(f.root, ROOT)["state"] == "paused"
@@ -240,7 +240,7 @@ def test_pause_after_delivery_saves_the_remainder_and_soft_resume_reassesses_cur
         assert send["scope"].root_limit_usd == 3.0 and send["scope"].root_limit_source == "task_admission"
     assert len(list_task_results(f.root)) == tasks_before
     assert _row(f)["result"] == ANSWER
-    assert len(_facts_rows(f)) == 1 and f.stages == ["reflection"]
+    assert len(_facts_rows(f)) == 1 and f.stages == ["promotion"]
     assert _scratch(f)[0]["content"] == "compressed-3" and len(_scratch(f)) == 3
     assert read_fence(f.root, ROOT)["state"] == "released" and ROOT not in f.q.BUDGET_ROOT_FENCES
     assert ROOT not in _census(f)
@@ -248,6 +248,25 @@ def test_pause_after_delivery_saves_the_remainder_and_soft_resume_reassesses_cur
     # A duplicate Resume cannot spend again.
     again = _resume(f)
     assert not again.get("ok") and f.light.kinds() == kinds
+
+
+def test_paused_remainder_is_named_in_activity_and_never_readdressed_as_current_chat_work(late):
+    """The census keeps the answered root (Resume/Stop stay reachable) and names its work and
+    answer time for Activity; history no longer addresses it as current conversation, which
+    minted a timestamp-free card below the newest message once its own rows left the page."""
+    f = late
+    from ouroboros.gateway.state import _chat_activities_snapshot_safe, current_work_in_room
+    from ouroboros.projects_registry import task_presentation_name
+    from ouroboros.terminal_time import terminal_time_fact
+
+    _pause_during_read(f)
+    [row] = [r for r in _chat_activities_snapshot_safe(f.root, {}, direct_turns=[]) if r["activity_id"] == ROOT]
+    assert row["phase"] == "budget_paused" and row["pause_cause"] == "owner"
+    result = _row(f)
+    assert row["late_work"]["title"] == task_presentation_name(result)
+    # Only the executor's own terminal fact dates the answer; generic ts never does.
+    assert row["late_work"]["answered_at"] == (terminal_time_fact(result).get("occurred_at") or "")
+    assert ROOT not in current_work_in_room(f.root, {}, lambda *_: True)
 
 
 def test_fully_finished_root_reports_pause_inapplicable_and_buys_nothing(late):
@@ -420,38 +439,41 @@ def test_a_live_continue_successor_refuses_late_resume_until_it_ended(late):
 
 
 def test_completed_effects_inside_a_paused_stage_do_not_repeat_and_the_rest_is_rethought(late, monkeypatch):
-    """Promotion: the free backlog append happened before the Pause and is never appended
-    again; the paid chooser it was inside is re-thought on Resume against the current backlog."""
+    """Promotion: the scratchpad stage finished before the Pause and is never run again;
+    the paid chooser the Pause stopped is re-thought on Resume against the CURRENT authored
+    backlog, which the acting mind revised while the phase was paused."""
     f = late
     from ouroboros import post_task_evolution
-    from ouroboros.improvement_backlog import _count_of, load_backlog_items
+    from ouroboros.improvement_backlog import authored_backlog_text
+    from ouroboros.knowledge import read_knowledge_note, resolve_knowledge_address
+    from ouroboros.tools.knowledge import _knowledge_write
+    from ouroboros.tools.registry import ToolContext
+    from supervisor.owner_pause_control import request_owner_pause
 
-    from ouroboros.memory import Memory
-
-    Memory(f.root).mutate_scratchpad_blocks(lambda _blocks: [])  # nothing to consolidate: promotion is the stage
-    entry = {"reflection": "lesson", "memory_actions": [],
-             "backlog_candidates": [{"summary": "Make late work resumable", "category": "process"}]}
-    monkeypatch.setattr(f.pipeline, "_run_reflection", lambda *a, **k: (f.stages.append("reflection"), entry)[1])
+    ctx = ToolContext(repo_dir=f.root, drive_root=f.root, task_id="mind")
+    assert "✅" in _knowledge_write(ctx, "improvement-backlog", "- Make late work resumable", scope="global")
     chooser = []
 
-    def maybe_promote(env, task, reflection_entry, llm_client):
-        chooser.append([item["summary"] for item in load_backlog_items(env.drive_root)])
+    def maybe_promote(env, task, sealed_final, llm_client):
+        chooser.append(authored_backlog_text(env.drive_root))
         for _ in range(2):  # a two-call chooser
             llm_client.chat(messages=[{"role": "user", "content": "choose a promotion"}], model_role="light")
 
     monkeypatch.setattr(post_task_evolution, "maybe_promote", maybe_promote)
-    from supervisor.owner_pause_control import request_owner_pause
-
     f.light.hooks["other"] = [lambda: request_owner_pause(ROOT, request_id="promotion-pause")]
     _join(_start(f))
-    assert _phase(f) == "paused" and f.light.kinds() == ["other"]
-    items = load_backlog_items(f.root)
-    assert len(items) == 1 and _count_of(items[0]) == 1
+    assert _phase(f) == "paused" and f.light.kinds() == ["scratchpad", "scratchpad", "other"]
+    compressed = _scratch(f)
+    assert compressed[0]["content"] == "compressed-2"
+    # While paused, the acting mind revises its backlog by an ordinary revision-checked edit.
+    revision = read_knowledge_note(resolve_knowledge_address(f.root, "improvement-backlog", "global")).revision
+    assert "✅" in _knowledge_write(ctx, "improvement-backlog", "- Make late work resumable once", scope="global",
+                                   mode="edit", old_str="- Make late work resumable", expected_revision=revision)
     assert _resume(f)["ok"]
-    assert _phase(f) == "completed" and f.light.kinds() == ["other", "other", "other"]
-    items = load_backlog_items(f.root)
-    assert len(items) == 1 and _count_of(items[0]) == 1  # the applied append was not repeated
-    assert f.stages == ["reflection"] and len(chooser) == 2 and chooser[1] == ["Make late work resumable"]
+    assert _phase(f) == "completed"
+    assert f.light.kinds() == ["scratchpad", "scratchpad", "other", "other", "other"]  # the scratchpad stage is not rerun
+    assert _scratch(f) == compressed
+    assert len(chooser) == 2 and "resumable once" not in chooser[0] and "resumable once" in chooser[1]
 
 
 def test_restart_between_grant_and_start_revokes_the_unused_grant_and_resume_spends_once(late, monkeypatch):

@@ -1,72 +1,26 @@
-"""A growing room cannot mint a paid cycle during exact replay/collection."""
+"""The own-room dialogue a plan ask carries (``plan_dialogue``): the numbered inline
+conversation, its per-seat fit with the exact omitted range named, the room-read fact on the
+plan row, related rooms as pointers only, the budget priced on the inputs actually fitted, the
+plan record's sources surviving a child's promotion, and the recorded snapshot a
+``chat:<id>@<sha256>`` locator reads."""
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
-from tests.test_plan_review_engine import harness as _harness, _call, _state, CLEAN
+import pytest
 
-harness = _harness
-from tests.test_plan_review_reconciliation import _collect, _install_barrier_substrate
 from ouroboros.artifacts import read_actor_source_bytes
 from ouroboros.tools.plan_dialogue import plan_chat_reader
+from ouroboros.tools.plan_packet import PLAN_REPLY_CONTRACT
 from ouroboros.utils import append_jsonl
+from tests._review_substrate_shared import user_text
+from tests.test_plan_task_tool import CLEAN, _write
+from tests.test_plan_task_tool import harness as _plan_task_harness
 
+harness = _plan_task_harness
 
-def test_room_growth_reuses_snapshot_until_author_changes_plan(harness):
-    substrate = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    ctx = harness.make_ctx()
-    ctx.current_chat_id = 1
-    chat = harness.drive / "logs" / "chat.jsonl"
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "text": "Owner chooses A"})
-    append_jsonl(chat, {"direction": "out", "chat_id": 1, "text": "A costs less; B keeps options"})
-    _call(ctx)
-    first = _state(harness)["waves"][-1]
-    source = read_actor_source_bytes(harness.drive, ctx.task_id, first["dialogue_source_ref"])
-    append_jsonl(chat, {"direction": "out", "chat_id": 1, "text": "Panel complete, collecting"})
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "text": "Actually keep B as well"})
-    replay_text = _call(ctx)
-    replay = _state(harness)["waves"][-1]
-    from ouroboros.tools.plan_review_artifacts import read_wave
-    own = read_wave(harness.drive, ctx.task_id, first["wave_artifact"])["evidence_manifest_full"]["own_dialogue"]
-    assert first["dialogue_source_ref"]["sha256"] in replay_text
-    assert first["dialogue_source_ref"]["path"] in replay_text and own["captured_at"] in replay_text
-    assert "Later messages are not claimed reviewed" in replay_text
-    assert "Snapshot coverage" in replay_text
-    assert replay["request_fingerprint"] == first["request_fingerprint"]
-    assert _state(harness)["cycles_paid"] == 1 and len(substrate.calls) == 1
-    exact = plan_chat_reader(harness.drive, ctx.task_id)(f"1@{first['dialogue_source_ref']['sha256']}")
-    assert exact["text"].encode() == source and "Actually keep B" not in exact["text"]
-    _call(ctx, plan="Revise the outline to keep both A and B.")
-    revised = _state(harness)["waves"][-1]
-    assert revised["dialogue_source_ref"] != first["dialogue_source_ref"]
-    assert b"Actually keep B as well" in read_actor_source_bytes(harness.drive, ctx.task_id, revised["dialogue_source_ref"])
-    assert _state(harness)["cycles_paid"] == 2 and len(substrate.calls) == 2
-
-
-def test_free_collection_keeps_exact_range_after_progress_and_mailbox_growth(harness, monkeypatch):
-    calls = []
-    _install_barrier_substrate(monkeypatch, calls)
-    ctx = harness.make_ctx()
-    ctx.current_chat_id = 1
-    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1, "text": "Before dispatch"})
-    _call(ctx)
-    first = _state(harness)["waves"][-1]
-    append_jsonl(harness.drive / "logs" / "progress.jsonl", {"chat_id": 1, "content": "Panel done"})
-    _collect(ctx, first["request_fingerprint"])
-    collected = _state(harness)["waves"][-1]
-    assert collected["dialogue_source_ref"] == first["dialogue_source_ref"]
-    assert [row["reconcile_only"] for row in calls] == [False, True]
-    assert _state(harness)["cycles_paid"] == 1
-    from ouroboros.tools.plan_evidence import resolve_evidence
-    ref = first["dialogue_source_ref"]
-    locator = f"chat:1@{ref['sha256']}::lines=2-2"
-    selected = resolve_evidence([locator], active_root=harness.workspace, allowed_roots=[],
-                               resolve_chat=plan_chat_reader(harness.drive, ctx.task_id))["attached"][0]
-    assert json.loads(selected["text"])["text"] == "Before dispatch"
-    from ouroboros.task_results import _compact_plan_review_wave
-    compact = _compact_plan_review_wave(collected)
-    assert compact["dialogue_source_ref"] == ref
-    assert compact["author_request_fingerprint"] == collected["author_request_fingerprint"]
+_ASK = "plan-ask-task-1-a1"  # the request id plan_ask.prepare_ask gives a task's first ask
 
 
 def test_inline_view_is_the_numbered_conversation(harness):
@@ -90,7 +44,7 @@ def test_inline_view_is_the_numbered_conversation(harness):
     append_jsonl(chat, {"direction": "system", "chat_id": 1, "ts": "2026-09-01T10:04:00Z", "type": "task_summary", "text": "HOST SUMMARY ROW"})
     for step in ("Reading notes", "Drafting slide 1", "Drafting slide 2"):
         append_jsonl(harness.drive / "logs" / "progress.jsonl", {"chat_id": 1, "ts": "2026-09-01T10:05:00Z", "content": f"PROGRESS {step}"})
-    manifest = attach_own_dialogue(ctx, harness.drive, {}, "a" * 64, persist=True)
+    manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     own = manifest["own_dialogue"]
     view, facts = dialogue_view(own)
     packet = render_dialogue(manifest)
@@ -117,7 +71,8 @@ def test_inline_view_is_the_numbered_conversation(harness):
     assert "Explicit gap: own room source unavailable (own_room_unavailable)" in gap_view and gap_facts["conversation_rows"] == 0
 
 
-def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkeypatch):
+@pytest.mark.parametrize("native_hint", [100_000, 1_000])
+def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkeypatch, native_hint):
     from types import SimpleNamespace
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.tools.plan_dialogue import attach_own_dialogue, dialogue_slot_inputs, render_dialogue
@@ -132,7 +87,7 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1,
                  "text": "LATEST CHOICE"})
     append_jsonl(harness.drive / "logs" / "progress.jsonl", {"chat_id": 1, "content": "PROGRESS ROW " * 50})
-    manifest = attach_own_dialogue(ctx, harness.drive, {}, "a" * 64, persist=True)
+    manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     own = manifest["own_dialogue"]
     packet = render_dialogue(manifest)
     assert "PROGRESS ROW" not in packet  # never inline, for any route
@@ -145,10 +100,11 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     declarations = []
     def bound(*a, **kwargs):
         declarations.append(kwargs)
-        return 100000
+        return native_hint
     monkeypatch.setattr(review_native_episode, "review_native_transcript_bound", bound)
     delivery = dialogue_slot_inputs(slots, system_prompt="governance", user_content=packet,
-                                   session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id)
+                                   session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id,
+                                   output_contract=PLAN_REPLY_CONTRACT)
     small = json.dumps(delivery["slot_messages"]["small"], ensure_ascii=False)
     large = json.dumps(delivery["slot_messages"]["large"], ensure_ascii=False)
     assert "LATEST CHOICE" in small and "exact omitted prefix" in small
@@ -157,7 +113,14 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     assert coverage["small"]["conversation_inline_rows"] == 1 and coverage["small"]["conversation_first_inline_line"] == 3
     assert coverage["large"]["conversation_inline_rows"] == 2 and coverage["large"]["delivery"] == "packet"
     native = delivery["slot_session_tasks"]["native"]
-    assert "LATEST CHOICE" in native and "exact omitted prefix" in native and coverage["native"]["delivery"] == "native_retrieving"
+    assert "exact omitted prefix" in native and coverage["native"]["delivery"] == "native_retrieving"
+    if native_hint == 100_000:
+        assert "LATEST CHOICE" in native
+    else:
+        # An irreducible first send is retained above the hint, with its source.
+        assert delivery["slot_prompt_chars"]["native"] > native_hint
+        assert own["source_ref"]["path"] in native
+        assert Path(own["file"]).read_text(encoding="utf-8") == own["text"]
     assert declarations[0]["mandatory_read_chars"] == len(packet)
     delegated = delivery["slot_session_tasks"]["delegated"]
     # The delegated session gets the same inline conversation (no invented window) plus the pointer.
@@ -167,8 +130,7 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
         "root": "artifact_store", "path": own["source_ref"]["path"], "file": own["file"],
         **source_text_identity(own["text"].encode("utf-8"))}]
     # Every slot's send ends with ITS OWN panel seat: a shared packet cannot say "your".
-    from tests.test_plan_review_engine import _user_text
-    last_user = {sid: _user_text(delivery["slot_messages"][sid][-1]["content"]) for sid in ("small", "large")}
+    last_user = {sid: user_text(delivery["slot_messages"][sid][-1]["content"]) for sid in ("small", "large")}
     seat = {sid: f"\n## YOUR PANEL SEAT\n\n`{sid}`\n" for sid in last_user}
     assert all(last_user[sid].endswith(seat[sid]) for sid in last_user)
     assert last_user["large"].removesuffix(seat["large"]) == packet  # the seat is the only addition
@@ -178,7 +140,8 @@ def test_mixed_delivery_keeps_full_file_and_exact_overflow_range(harness, monkey
     assert len(source) > 120000 and source.decode() == own["text"]
     import re
     match = re.search(r'::lines=2-(\d+)', native)
-    assert match and int(match[1]) == 2  # the OLDER row (line 2) is the exact omitted prefix
+    # The ordinary hint omits only OLDER; the tiny one addresses the whole snapshot.
+    assert match and int(match[1]) == (2 if native_hint == 100_000 else own["lines"])
     assert not (harness.workspace / ".ouroboros-review").exists()
 
 
@@ -195,68 +158,66 @@ def test_a_session_with_an_asserted_window_is_fitted_and_without_one_is_whole(ha
     ctx.current_chat_id = 1
     append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1, "text": "OLDER " + "discussion " * 22000})
     append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1, "text": "LATEST CHOICE"})
-    manifest = attach_own_dialogue(ctx, harness.drive, {}, "b" * 64, persist=True)
+    manifest = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)
     packet = render_dialogue(manifest)
     session = SimpleNamespace(slot_id="delegated", model="cursor=grok", role_hint="plan reviewer", use_local=False,
                               session_profile="", route=ReviewRouteKind.AGENT_SESSION, retrieves=True, native_retrieval=False)
     monkeypatch.setattr(model_slots, "model_role_option", lambda key, role: 40_000 if role == "reviewer:delegated" else 0)
     fitted = dialogue_slot_inputs([session], system_prompt="g", user_content=packet, session_task=packet, manifest=manifest,
-                                  slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id)
+                                  slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id,
+                                  output_contract=PLAN_REPLY_CONTRACT)
     task = fitted["slot_session_tasks"]["delegated"]
     assert "LATEST CHOICE" in task and "OLDER " not in task and "1 earlier conversation rows before line 3" in task
     assert fitted["dialogue_delivery"]["delegated"]["window"] == "asserted"
     monkeypatch.setattr(model_slots, "model_role_option", lambda key, role: 0)
     whole = dialogue_slot_inputs([session], system_prompt="g", user_content=packet, session_task=packet, manifest=manifest,
-                                 slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id)
+                                 slot_messages={}, native_mandatory_chars=len(packet), session_root=str(harness.workspace), task_id=ctx.task_id,
+                                 output_contract=PLAN_REPLY_CONTRACT)
     assert "OLDER " in whole["slot_session_tasks"]["delegated"] and whole["dialogue_delivery"]["delegated"]["window"] == "unasserted"
 
 
-def test_a_session_reviewers_room_read_rides_its_actor_row_and_the_verdict_text():
-    """The observed-source fold reaches the wave as a fact: attestation `harness_observed`,
-    `room_read_coverage` on the actor row and record, and one clause in the rendered verdict;
-    a session with no fold stays `unobserved` with no coverage key."""
+def test_a_session_reviewers_room_read_rides_its_plan_row():
+    """The observed-source fold reaches the plan row a reply settles from as a fact: attestation
+    `harness_observed` and `room_read_coverage`; a session with no fold stays `unobserved`
+    with no coverage key."""
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewSlot
-    from ouroboros.tools.plan_render import _render_wave
-    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor, plan_wave_actor_record
+    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor
 
     slot = ReviewSlot(slot_id="s1", model="cursor=grok", route=ReviewRouteKind.AGENT_SESSION)
     usage = {"read_provenance": "harness_observed", "native_read_coverage": {"status": "complete", "sources": [
         {"root": "artifact_store", "path": "plan-dialogue-1.jsonl", "status": "complete", "covered_chars": 120, "complete_chars": 120}]}}
-    actor = {"slot_id": "s1", "model": "cursor=grok", "status": "ok", "raw_text": "[]\nNO_FINDINGS", "usage": usage,
+    actor = {"slot_id": "s1", "model": "cursor=grok", "status": "ok", "raw_text": CLEAN, "usage": usage,
              "operation_id": "op-s1", "operation_state": "settled"}
     row = _plan_row_from_actor(actor, slot)
     coverage = {"status": "complete", "covered_chars": 120, "complete_chars": 120, "provenance": "harness_observed"}
     assert row["host_file_read_attestation"] == "harness_observed" and row["room_read_coverage"] == coverage
-    record = plan_wave_actor_record(row, ok=True, error="", disclosures=[], raw_text_preview_chars=10)
-    assert record["room_read_coverage"] == coverage
-    text = _render_wave({"aggregate": "GREEN", "closed": True, "request_fingerprint": "f" * 64, "actors": [record],
-                         "findings": [], "counts": {}, "reasons": []}, cap=2, cycles_paid=1, enforcement="advisory")
-    assert "host_file_read: harness_observed · room snapshot read 120/120 chars (harness_observed) · ok" in text
     plain = _plan_row_from_actor({**actor, "usage": {}}, slot)
     assert plain["host_file_read_attestation"] == "unobserved" and "room_read_coverage" not in plain
 
 
-def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
-    from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive, retry_child_task_refs
-    from ouroboros.task_results import write_task_result, load_plan_review_state
-    from ouroboros.tools.plan_review_artifacts import authority_wave
+def test_plan_record_sources_survive_real_child_promotion_and_cleanup(harness):
+    """A plan written and asked in a child's execution drive: once the child's result is
+    promoted and its drive removed, the parent reads every revision's exact text and every
+    participant's exact delivery (with the room as it was shown) and reply."""
+    from ouroboros import plan_record
+    from ouroboros.headless import copy_child_task_result, prepare_task_drive, remove_subagent_task_drive, retry_child_task_refs
+    from ouroboros.review_ledger import read_source
+    from ouroboros.task_results import write_task_result
 
     ctx = harness.make_ctx(task_id="source")
     parent = harness.drive
     child = prepare_task_drive(parent, "source", "empty")
     ctx.drive_root = child
     ctx.current_chat_id = 1
-    from tests.test_plan_review_engine import _finding
-    from ouroboros.tools import plan_review as pr
-    harness.install({"s1": json.dumps([_finding("note", "note")]), "s2": CLEAN, "s3": CLEAN})
+    harness.install({})
     append_jsonl(child / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1, "text": "Must survive cleanup"})
-    _call(ctx)
-    first = load_plan_review_state(child, "source")["waves"][-1]
-    raw = read_actor_source_bytes(child, "source", first["dialogue_source_ref"])
-    predecessor = first["wave_artifact"]
-    pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": first["request_fingerprint"],
-        "items": [{"finding_id": "s1:note", "decision": "defer", "rationale": "Later cosmetic work"}]})
+    _write(ctx, ask="council")
+    record = plan_record.load_plan_record(child, "source")
+    seats = record["asks"][0]["participants"]
+    exact = {"revision": read_actor_source_bytes(child, "source", record["revisions"][0]["text_ref"]),
+             **{(p["seat_id"], role): read_source(child, "source", p[role]) for p in seats for role in ("delivery_ref", "reply_ref")}}
+    assert all(b"Must survive cleanup" in exact[(p["seat_id"], "delivery_ref")] for p in seats)
     write_task_result(child, "source", "completed")
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
     assert copied["child_ref_promotion"]["status"] == "incomplete"
@@ -264,14 +225,12 @@ def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
-    wave = load_plan_review_state(parent, "source")["waves"][-1]
-    assert read_actor_source_bytes(parent, "source", wave["dialogue_source_ref"]) == raw
-    restored = authority_wave(parent, "source", wave)
-    assert restored["evidence_manifest_full"]["own_dialogue"]["file"].startswith(str(parent))
-    from ouroboros.tools.plan_review_artifacts import read_wave
-    exact = read_wave(parent, "source", wave["wave_artifact"])
-    assert exact["supersedes_wave_artifact"]["sha256"] == predecessor["sha256"]
-    assert read_wave(parent, "source", exact["supersedes_wave_artifact"])["plan_prose"]
+    promoted = plan_record.load_plan_record(parent, "source")
+    assert [r["content_sha256"] for r in promoted["revisions"]] == [r["content_sha256"] for r in record["revisions"]]
+    assert read_actor_source_bytes(parent, "source", promoted["revisions"][0]["text_ref"]) == exact["revision"]
+    for p in promoted["asks"][0]["participants"]:
+        for role in ("delivery_ref", "reply_ref"):
+            assert read_source(parent, "source", p[role]) == exact[(p["seat_id"], role)], (p["seat_id"], role)
 
 
 def test_same_root_sibling_rooms_are_pointers_and_unrelated_rooms_stay_private(harness):
@@ -291,9 +250,8 @@ def test_same_root_sibling_rooms_are_pointers_and_unrelated_rooms_stay_private(h
 
 
 def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
-    from ouroboros.tools import plan_review as pr, review_synthesis
     from ouroboros import usage_accounting as ua
-    from tests.test_plan_review_engine import _user_text
+    from ouroboros.tools import review_synthesis
     from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS
 
     ctx = harness.make_ctx()
@@ -302,15 +260,16 @@ def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
         'direction': 'out', 'chat_id': 1, 'text': 'Prior substantive discussion. ' * 20000})
     monkeypatch.setattr(review_synthesis, 'per_slot_input_token_limits',
                         lambda models, **kw: {slot.slot_id: 10000 for slot in kw['slots']})
-    substrate = harness.install({'s1': CLEAN, 's2': CLEAN, 's3': CLEAN})
+    substrate = harness.install({})
     captured = []
-    monkeypatch.setattr(pr, 'review_wave_budget_gate', lambda *a, **kw: captured.append(kw))
-    _call(ctx)
+    monkeypatch.setattr('ouroboros.tools.review_helpers.review_wave_budget_gate', lambda *a, **kw: captured.append(kw))
+    _write(ctx, ask='council')
     request = substrate.calls[0]['request']
     slots = substrate.calls[0]['slots']
-    actual = [sum(len(_user_text(message['content'])) for message in request.slot_messages[slot.slot_id]) for slot in slots]
+    actual = [sum(len(user_text(message['content'])) for message in request.slot_messages[slot.slot_id]) for slot in slots]
     assert captured[0]['prompt_chars'] == actual
     assert captured[0]['max_completion_tokens'] == PLAN_REVIEW_MAX_TOKENS
+    assert captured[0]['models'] == [slot.model for slot in slots]
     # Illustrative price replaces only vendor lookup, not the admission math.
     monkeypatch.setattr(ua, 'estimate_cost_optional', lambda model, prompt, completion, **kw: prompt / 100000)
     admission = ua.review_wave_admission(root_task_id='budget-probe', models=[slot.model for slot in slots],
@@ -322,221 +281,39 @@ def test_budget_prices_the_actual_window_fitted_inputs(harness, monkeypatch):
     assert len(substrate.calls) == 1
 
 
-def test_free_collection_reuses_policy_after_live_exploration_changes(harness, monkeypatch):
-    from tests.test_plan_review_event_route import _install_real_substrate, _wait_until, _mailbox_entries
-    from ouroboros.tools import plan_review_runtime
-    from tests.test_plan_review_engine import _control
-    live = ['Read the initial discussion.']
-    monkeypatch.setattr(plan_review_runtime, 'root_exploration_log', lambda _ctx: live[0])
-    executor = _install_real_substrate(monkeypatch)  # Only the model executor is fake; custody is real.
-    ctx = harness.make_ctx()
-    ctx.current_chat_id = 1
-    try:
-        _call(ctx)
-        first = _state(harness)['waves'][-1]
-        from ouroboros.tools.plan_review_artifacts import read_wave
-        sent = read_wave(harness.drive, ctx.task_id, first['wave_artifact'])
-        assert sent['request_policy']['native_mandatory_read_chars'] > 0
-        assert _wait_until(lambda: executor.execute_calls == 3)
-        live[0] += ' Processed an owner clarification and waited for the panel.'
-        executor.release.set()
-        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) == 1)
-        collected = _collect(ctx, first['request_fingerprint'])
-        assert _control(collected) == {'outcome': 'GREEN', 'closed': True}
-        assert executor.execute_calls == 3 and _state(harness)['cycles_paid'] == 1
-        assert 'custody is unavailable' not in collected
-        settled = read_wave(harness.drive, ctx.task_id, _state(harness)['waves'][-1]['wave_artifact'])
-        assert settled['request_policy'] == sent['request_policy']
-        assert settled['slot_prompt_chars'] == sent['slot_prompt_chars']
-        assert [row['request_messages'] for row in settled['reviewer_outputs']] == [row['request_messages'] for row in sent['reviewer_outputs']]
-    finally:
-        executor.release.set()
-
-
-def test_missing_recorded_policy_does_not_infer_current_paid_contract():
-    import pytest
-    from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs, PlanReviewSourceUnavailable
-    with pytest.raises(PlanReviewSourceUnavailable, match='original request policy/fit was not recorded'):
-        frozen_delivery_inputs({'reviewer_outputs': []}, [])
-
-
-def test_requested_related_room_replay_keeps_one_physical_panel_per_cycle(harness, monkeypatch):
-    from ouroboros.review_execution import ReviewAttemptResult
-    from ouroboros.projects_registry import create_project, bind_task_to_project
-    from tests.test_plan_review_engine import _finding, _slots
-    from tests.test_plan_review_event_route import _HeldExecutor, _wait_until, _mailbox_entries
-    from ouroboros.tools import review_synthesis
-
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
-    project = create_project(harness.drive, "own", name="Own room")
-    ctx = harness.make_ctx()
-    bind_task_to_project(harness.drive, ctx.task_id, project["id"], origin={"absent": "system"})
-    append_jsonl(harness.drive / "logs/chat.jsonl", {"chat_id": 1, "text": "Main premise"})
-    harness.state["slots"] = _slots(("s1", "m/a"))
-    monkeypatch.setattr(review_synthesis, "per_slot_input_token_limits",
-                        lambda models, *, slots, **kw: {slot.slot_id: 800000 for slot in slots})
-
-    class Executor(_HeldExecutor):
-        def execute(self):
-            super().execute()  # held: the send settles only once the test releases it
-            answer = (json.dumps([_finding("main", "need_evidence", locator="chat:1")])
-                      if self.execute_calls == 1 else CLEAN)
-            return ReviewAttemptResult(message={"content": answer}, raw_text=answer,
-                usage={"prompt_tokens": 10, "completion_tokens": 5, "physical_attempt_state": "settled"})
-
-    executor = Executor()
-    monkeypatch.setattr("ouroboros.review_substrate._review_route_executor", lambda *a, **k: executor)
-
-    def dispatch():
-        # A send that settles before the dispatch barrier registers the released
-        # roster is returned inline and writes no mailbox frame; hold each send
-        # until its dispatching call has returned at the barrier.
-        executor.release.clear()
-        try:
-            return _call(ctx)
-        finally:
-            executor.release.set()
-
-    for cycle in (1, 2):
-        dispatch()
-        wave = _state(harness)["waves"][-1]
-        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= cycle)
-        _collect(ctx, wave["request_fingerprint"])
-    second = _state(harness)["waves"][-1]
-    replay = dispatch()
-    current = _state(harness)["waves"][-1]
-    if current["request_fingerprint"] != second["request_fingerprint"]:
-        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= 3)
-        _collect(ctx, current["request_fingerprint"])
-    assert "cached exact review" in replay
-    assert current["request_fingerprint"] == second["request_fingerprint"]
-    assert executor.execute_calls == 2 and _state(harness)["cycles_paid"] == 2
-    # A real update to requested evidence still earns the existing W3 refresh.
-    append_jsonl(harness.drive / "logs/chat.jsonl", {"chat_id": 1, "text": "Main premise changed"})
-    dispatch()
-    changed = _state(harness)["waves"][-1]
-    assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) >= 3)
-    _collect(ctx, changed["request_fingerprint"])
-    assert changed["request_fingerprint"] != second["request_fingerprint"]
-    assert executor.execute_calls == 3 and _state(harness)["cycles_paid"] == 3
-
-
 def test_snapshot_qualified_room_keeps_original_gap_disclosure(harness):
+    """`chat:<id>@<sha256>` names an exact recorded room snapshot (an earlier-schema wave
+    records one): it reads the recorded bytes with their original gap disclosure, whatever
+    the room says later, and a line range selects from those bytes. The unqualified
+    `chat:<id>` and a new ask read the room as it is now."""
+    from ouroboros.task_results import _compact_plan_review_wave
+    from ouroboros.tools.plan_dialogue import attach_own_dialogue
     from ouroboros.tools.plan_evidence import resolve_evidence
+    from tests._legacy_plan_shared import seed_plan_review_state, v2_state, wave
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     chat = harness.drive / "logs/chat.jsonl"
     append_jsonl(chat, {"chat_id": 1, "text": "Retained explanation"})
     with chat.open("a") as stream:
         stream.write("{unreadable history row\n")
-    _call(ctx)
-    wave = _state(harness)["waves"][-1]
-    ref = wave["dialogue_source_ref"]
+    ref = attach_own_dialogue(ctx, harness.drive, {}, _ASK, persist=True)["own_dialogue"]["source_ref"]
+    recorded = wave(dialogue_source_ref=ref, dialogue_chat_id=1)
+    seed_plan_review_state(harness.drive, ctx.task_id, v2_state(recorded))
+    assert _compact_plan_review_wave(recorded)["dialogue_source_ref"] == ref  # an old compacted wave still names it
     original = read_actor_source_bytes(harness.drive, ctx.task_id, ref)
     append_jsonl(chat, {"chat_id": 1, "text": "Later room growth"})
     reader = plan_chat_reader(harness.drive, ctx.task_id)
     exact = reader(f"1@{ref['sha256']}")
-    assert exact["text"].encode() == original
+    assert exact["text"].encode() == original and "Later room growth" not in exact["text"]
     assert exact["coverage"]["chat"]["gaps"] and exact["coverage"]["chat"]["snapshot_stable"]
     manifest = resolve_evidence([f"chat:1@{ref['sha256']}::lines=2-2"],
         active_root=harness.workspace, allowed_roots=[], resolve_chat=reader)
     assert json.loads(manifest["attached"][0]["text"])["text"] == "Retained explanation"
     assert any(row["reason"].startswith("chat_history_gap:") for row in manifest["omissions"])
-
-
-def test_the_seat_line_follows_the_cache_stable_prefix_on_every_api_slot(harness, monkeypatch):
-    """The per-slot seat is appended AFTER `## ROOT EXPLORATION LOG` (the cache-stable prefix
-    stays byte-identical across api slots) and each slot gets its own id; reverted, no seat."""
-    from types import SimpleNamespace
-    from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.tools import plan_spec, review_synthesis
-    from ouroboros.tools.plan_dialogue import dialogue_slot_inputs
-    from ouroboros.tools.plan_packet import build_plan_review_user_content, plan_user_stable_len
-    from tests.test_plan_review_engine import DECK_SPEC, _user_text
-
-    spec, _ = plan_spec.normalize_spec({**DECK_SPEC, "goal": "Ship the deck"})
-    packet = build_plan_review_user_content(
-        objective="o", goal=spec["goal"], plan_prose="p", spec=spec,
-        manifest={"declared": [], "attached": [], "omissions": []},
-        prior_cycles=[], dispositions=[], spec_delta=None, root_exploration_log="ran: ls")
-    def slot(name):
-        return SimpleNamespace(slot_id=name, model="same/model", role_hint="plan reviewer", use_local=False,
-                               session_profile=name, route=ReviewRouteKind.API_CHAT, retrieves=False, native_retrieval=False)
-    monkeypatch.setattr(review_synthesis, "per_slot_input_token_limits", lambda *a, **k: {"a": 200000, "b": 200000})
-    delivery = dialogue_slot_inputs([slot("a"), slot("b")], system_prompt="governance", user_content=packet,
-                                    session_task=packet, manifest={}, slot_messages={}, native_mandatory_chars=len(packet),
-                                    session_root=str(harness.workspace), task_id="task-1")
-    sent = {sid: _user_text(delivery["slot_messages"][sid][-1]["content"]) for sid in ("a", "b")}
-    boundary = plan_user_stable_len(packet)
-    assert boundary > 0 and sent["a"][:boundary] == sent["b"][:boundary] == packet[:boundary]
-    assert sent["a"].endswith("\n## YOUR PANEL SEAT\n\n`a`\n") and sent["b"].endswith("\n## YOUR PANEL SEAT\n\n`b`\n")
-    assert sent["a"].index("## YOUR PANEL SEAT") > sent["a"].index("## ROOT EXPLORATION LOG")
-    # The recorded cache split is the same boundary: stable block, then the dynamic tail with the seat.
-    blocks = delivery["slot_messages"]["a"][-1]["content"]
-    assert isinstance(blocks, list) and blocks[0]["text"] == packet[:boundary] and blocks[-1]["text"].endswith("`a`\n")
-
-
-def test_author_plan_and_historical_producer_closure_survive_copyback(harness, monkeypatch):
-    from ouroboros import artifacts, observability
-    from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive
-    from ouroboros.task_results import write_task_result, load_plan_review_state
-    from ouroboros.tools.plan_review_artifacts import (
-        current_author_plan, persist_historical_result, record_plan_review_supplement,
-    )
-    from tests.test_plan_review_engine import DECK_SPEC
-    from tests.test_plan_review_reconciliation import _install_two_turn_substrate
-
-    parent, task = harness.drive, 'source'
-    child = prepare_task_drive(parent, task, 'empty')
-    ctx = harness.make_ctx(task_id=task)
-    ctx.drive_root, ctx.current_chat_id = child, 1
-    calls = []
-    _install_two_turn_substrate(monkeypatch, calls, pending_ids={'s3'})
-    append_jsonl(child / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1, 'text': 'Exact owner premise'})
-    _call(ctx)
-    wave = load_plan_review_state(child, task)['waves'][-1]
-    result = _call(ctx, {**DECK_SPEC, 'acceptance_claims': ['Revised author claim']}, plan='Revised author plan.',
-        review_disposition={'review_fingerprint': wave['request_fingerprint'], 'items': [], 'author_action': 'stop',
-                            'author_disposition': {'disposition': 'partial', 'rationale': 'Retain the unfinished plan.'}})
-    assert 'Current author plan saved' in result and len(calls) == 1
-    unselected = artifacts.store_actor_source_bytes(child, task, category='tool_results',
-        source_id='unselected', data=b'PLAN CANARY UNREAD', extension='txt')
-    prompt = observability.persist_call(child, task_id=task, call_id='op-s3_prompt', call_type='plan_review_prompt',
-        payload={'request': {'surface': 'plan_review', 'subject': {'source_ref': unselected}}, 'slot': {'slot_id': 's3'}})
-    response = observability.persist_call(child, task_id=task, call_id='op-s3_response', call_type='plan_review_response',
-        payload={'message': {'source_ref': unselected, 'text': CLEAN}})
-    late = {'slot_id': 's3', 'operation_id': 'op-s3', 'operation_state': 'late_settled', 'text': CLEAN,
-            'prompt_ref': prompt['manifest_ref'], 'response_ref': response['manifest_ref'],
-            'unknown': {'dialogue_source_ref': unselected}}
-    ref = persist_historical_result(child, task, wave, late)
-    assert record_plan_review_supplement(child, task, wave=wave, result=late, source_ref=ref)
-    raw = read_actor_source_bytes(child, task, ref)
-    read = artifacts.read_actor_source_bytes
-
-    def guard(root, owner, source):
-        assert source != unselected, 'author/reviewer data acquired plan-source authority'
-        return read(root, owner, source)
-
-    monkeypatch.setattr(artifacts, 'read_actor_source_bytes', guard)
-    write_task_result(child, task, 'completed', artifact_status='ready')
-    copied = copy_child_task_result(parent, {'id': task, 'drive_root': str(child)})
-    assert copied['child_ref_promotion']['pending_refs']
-    from ouroboros.headless import retry_child_task_refs
-
-    copied = retry_child_task_refs(parent, child, task)
-    assert not copied['child_ref_promotion']['pending_refs'] and not copied['child_ref_promotion']['unavailable_refs']
-    assert remove_subagent_task_drive(parent, task, live=lambda _: False)
-    state = load_plan_review_state(parent, task)
-    assert current_author_plan(parent, task, state)['plan_prose'] == 'Revised author plan.'
-    promoted = state['waves'][0]['historical_supplements'][0]['source_ref']
-    saved = json.loads(read_actor_source_bytes(parent, task, promoted))
-    assert read_actor_source_bytes(parent, task, ref) == raw  # original identity retained beside rebased view
-    assert saved['result']['unknown'] == late['unknown']
-    for key, expected in [('prompt_ref', 'request'), ('response_ref', 'message')]:
-        manifest = observability.read_call_manifest_ref(parent, saved['result'][key], task_id=task)
-        assert expected in observability.read_blob_ref(parent, manifest['full_payload_ref'])
-    original_wave = json.loads(read_actor_source_bytes(parent, task, saved['original_wave_artifact']))
-    assert b'Exact owner premise' in read_actor_source_bytes(parent, task, original_wave['dialogue_source_ref'])
-    assert not (artifacts.task_artifact_dir_path(parent, task) / unselected['path']).exists()
+    assert "Later room growth" in reader("1")["text"]
+    later = harness.make_ctx(task_id="task-2")
+    later.current_chat_id = 1
+    substrate = harness.install({})
+    _write(later, ask="council")
+    assert "Later room growth" in user_text(substrate.calls[0]["request"].slot_messages["s1"][-1]["content"])

@@ -56,7 +56,7 @@ def test_docker_executor_stop_failure_preserves_service_handle(tmp_path, monkeyp
             return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="permission denied")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
         raise AssertionError(cmd)
 
@@ -371,9 +371,9 @@ def test_docker_executor_stop_success_without_terminal_kill_preserves_handle(tmp
             return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             # The stop shell itself returned success, but the subsequent
-            # kill-0 confirmation still observes a live backend.
+            # process-group confirmation still observes a live backend.
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
         raise AssertionError(cmd)
 
@@ -392,7 +392,7 @@ def test_docker_executor_stop_success_without_terminal_kill_preserves_handle(tmp
     failed = workspace_executor.stop_service(ctx, "svc")
 
     assert failed and failed["stop_failed"] is True
-    assert "kill-0" in failed["stop_error"]
+    assert "process-group" in failed["stop_error"]
     assert workspace_executor.service_status(ctx, "svc") is not None
 
 
@@ -427,7 +427,7 @@ def test_docker_executor_stop_unknown_probe_preserves_handle(tmp_path, monkeypat
             return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 
@@ -535,7 +535,7 @@ def test_docker_executor_global_cleanup_unknown_state_keeps_handle(tmp_path, mon
             return subprocess.CompletedProcess(cmd, 0, stdout="12345\n", stderr="")
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 
@@ -584,7 +584,7 @@ def test_docker_durable_cleanup_keeps_record_until_kill_zero_terminal(tmp_path, 
     def fake_run(cmd, **kwargs):
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="running\n", stderr="")
         raise AssertionError(cmd)
 
@@ -620,7 +620,7 @@ def test_docker_durable_cleanup_keeps_record_on_unknown_kill_zero(tmp_path, monk
     def fake_run(cmd, **kwargs):
         if cmd[:2] == ["docker", "exec"] and "kill -TERM" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
-        if cmd[:2] == ["docker", "exec"] and "kill -0" in str(cmd[-1]):
+        if cmd[:2] == ["docker", "exec"] and "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 7, stdout="", stderr="daemon unavailable")
         raise AssertionError(cmd)
 

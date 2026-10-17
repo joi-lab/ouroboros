@@ -15,6 +15,7 @@ import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 from ouroboros.tool_policy import (
     BUILTIN_NAMESPACE,
     CAPABILITY_OMISSION_HEADER,
@@ -154,7 +155,8 @@ def enable_tools(
     """Load permitted schemas that are not resident; answer every other name honestly."""
     names = [n.strip() for n in str(tools or "").split(",") if n.strip()]
     if not names:
-        return "No tools specified."
+        return _publish_tool_result(ctx, ToolResult(
+            status="error", code="TOOL_ARG_ERROR", text="No tools specified."))
     resident_names = None if resident is None else {schema["function"]["name"] for schema in resident}
     enabled, hidden, not_found = [], [], []
     for name in names:
@@ -188,7 +190,12 @@ def enable_tools(
         pointer = (" list_available_tools shows the current callable names."
                    if registry.get_schema_by_name("list_available_tools") is not None else "")
         parts.append(f"❌ Not found: {', '.join(not_found)}.{pointer}")
-    return "\n".join(parts)
+    text = "\n".join(parts)
+    if not enabled:
+        return _publish_tool_result(ctx, ToolResult(
+            status="blocked" if hidden else "error",
+            code="ACCESS_BLOCKED" if hidden else "UNKNOWN_TOOL", text=text))
+    return text
 
 
 def bind_resident_schemas(registry: "ToolRegistry", resident: List[Dict[str, Any]]) -> set:
@@ -207,13 +214,15 @@ def bind_resident_schemas(registry: "ToolRegistry", resident: List[Dict[str, Any
 
 def _list_available_tools(ctx: ToolContext, namespace: str = "", **kwargs) -> str:
     if _registry is None:
-        return "Tool discovery not available in this context."
+        return _publish_tool_result(ctx, ToolResult(
+            status="unavailable", code="LEGACY_UNAVAILABLE", text="Tool discovery not available in this context."))
     return list_available_tools(_registry, ctx, None, namespace)
 
 
 def _enable_tools(ctx: ToolContext, tools: str = "", **kwargs) -> str:
     if _registry is None:
-        return "Tool enablement not available in this context."
+        return _publish_tool_result(ctx, ToolResult(
+            status="unavailable", code="LEGACY_UNAVAILABLE", text="Tool enablement not available in this context."))
     return enable_tools(_registry, ctx, tools, None)
 
 

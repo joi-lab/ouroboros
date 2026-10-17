@@ -2,6 +2,30 @@
   "purpose": "One status-word family across the browser and the host. Every case is a terminal-or-not task record read by log_events.js (taskDoneIsTerminal + taskTerminalPhase + taskPresentation) and by ouroboros.project_dialogue (outcome_phase + OUTCOME_PHASE_HEADLINE + _completion_verdict). Every typed cause with an owner sentence carries a case here, so the two TASK_CAUSE_PHRASES twins cannot drift apart unnoticed. A new axis, reason or acceptance status is added to both sides in the same commit, with a row here.",
   "cases": [
     {
+      "name": "earlier approval never replaces the execution-axis failure behind final_message",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "degraded", "reason_code": "tool_failure"}, "review": {"status": "pass", "acceptance_decision": {"status": "accepted", "reason": "previous_revision_accepted"}}}},
+      "phase": "warn", "headline": "Done with warnings",
+      "acceptance_clause": "A tool this task used failed and nothing recovered it · The reviewers approved an earlier version of this answer; the current version was not re-reviewed."
+    },
+    {
+      "name": "receipt caveat and material grounding warning coexist without changing health",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok"}, "objective": {"status": "pass", "warning": "receipt_absent", "warnings": ["receipt_absent", "expected_output_ungrounded"]}}},
+      "phase": "warn", "headline": "Done with warnings",
+      "acceptance_clause": "No host verification receipt was recorded; this does not establish whether other checks ran · The declared output has no recorded tool work or structured final answer to support it."
+    },
+    {
+      "name": "partial result remains visible beside earlier approval",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok"}, "objective": {"status": "best_effort", "source": "task_acceptance_review"}, "review": {"status": "pass", "acceptance_decision": {"status": "accepted", "reason": "previous_revision_accepted"}}}},
+      "phase": "warn", "headline": "Done with warnings",
+      "acceptance_clause": "The result is partial; remaining work is described in task details · The reviewers approved an earlier version of this answer; the current version was not re-reviewed."
+    },
+    {
+      "name": "bypass sentence already states the rail",
+      "record": {"status": "completed", "reason_code": "round_limit", "outcome_axes": {"execution": {"status": "best_effort", "reason_code": "round_limit"}, "objective": {"status": "best_effort", "deferred_count": 1}, "review": {"status": "degraded", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "acceptance_bypassed_round_limit"}}}},
+      "phase": "warn", "headline": "Done with warnings",
+      "acceptance_clause": "The task hit its round limit before the answer could be reviewed · Some sub-task results were deferred instead of being folded into this answer."
+    },
+    {
       "name": "accounting wait expiry is an infrastructure failure with a readable cause",
       "record": {
         "status": "failed", "reason_code": "accounting_wait_expired",
@@ -85,7 +109,7 @@
       },
       "phase": "cancelled",
       "headline": "Cancelled",
-      "acceptance_clause": ""
+      "acceptance_clause": "Some result files are missing or could not be preserved."
     },
     {
       "name": "legacy cancel_requested event spelling",
@@ -185,14 +209,14 @@
       "acceptance_clause": ""
     },
     {
-      "name": "an objective warning is a warning even when every status word is clean",
+      "name": "an objective warning is stated even when every status word is clean",
       "record": {
         "status": "completed",
         "outcome_axes": {"execution": {"status": "ok"}, "objective": {"status": "pass", "warning": "partial coverage"}}
       },
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": ""
+      "acceptance_clause": "partial coverage."
     },
     {
       "name": "an open custody debt names the rail cause and the debt in one line",
@@ -204,7 +228,7 @@
       },
       "phase": "error",
       "headline": "Failed",
-      "acceptance_clause": "The model provider stopped answering, so the task could not finish · Some delegated work was never reconciled."
+      "acceptance_clause": "The task could not get a usable model answer, so it could not finish · Some delegated work was never reconciled."
     },
     {
       "name": "a healed custody debt names the current execution cause alone",
@@ -216,7 +240,7 @@
       },
       "phase": "error",
       "headline": "Failed",
-      "acceptance_clause": "The model provider stopped answering, so the task could not finish."
+      "acceptance_clause": "The task could not get a usable model answer, so it could not finish."
     },
     {
       "name": "a record carrying no debt list states nothing about the debt",
@@ -227,7 +251,7 @@
       },
       "phase": "error",
       "headline": "Failed",
-      "acceptance_clause": "The model provider stopped answering, so the task could not finish."
+      "acceptance_clause": "The task could not get a usable model answer, so it could not finish."
     },
     {
       "name": "acceptance reason author_finish says its own sentence",
@@ -454,18 +478,18 @@
       "acceptance_clause": "Not every plan reviewer had answered when the task ended."
     },
     {
-      "name": "an awaited plan review on a card that is amber for another reason states no cause",
+      "name": "an awaited plan review does not hide residual tool errors",
       "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "objective": {"status": "not_evaluated", "warning": "residual_tool_errors_without_review"}, "review": {"status": "skipped"}}},
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": ""
+      "acceptance_clause": "Tool errors remain in the record and the result has not been evaluated."
     },
     {
-      "name": "an awaited plan review on a card that is red for another reason states no cause",
+      "name": "an awaited plan review does not hide missing artifacts",
       "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "artifacts": {"status": "missing"}, "review": {"status": "skipped"}}},
       "phase": "error",
       "headline": "Failed",
-      "acceptance_clause": ""
+      "acceptance_clause": "Some result files are missing or could not be preserved."
     },
     {
       "name": "an acceptance panel that was only awaited is Done under the author's own finish",
@@ -718,7 +742,7 @@
       "record": {"status": "completed", "reason_code": "child_results_deferred", "terminal_plan_review_open": true, "outcome_axes": {"execution": {"status": "degraded", "reason_code": "child_results_deferred"}, "objective": {"status": "best_effort", "source": "child_result_disposition", "deferred_count": 1}, "review": {"status": "degraded", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "review_skipped_deadline_reserve"}}}},
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": "There was not enough time left to review the answer · Some sub-task results were deferred instead of being folded into this answer · The plan review was still open when this answer was delivered."
+      "acceptance_clause": "Some sub-task results were deferred instead of being folded into this answer · There was not enough time left to review the answer · The plan review was still open when this answer was delivered."
     },
     {
       "name": "deferred sub-task results speak in the owner's words",
@@ -753,7 +777,7 @@
       "record": {"status": "completed", "reason_code": "budget_exhausted", "outcome_axes": {"execution": {"status": "degraded", "reason_code": "budget_exhausted"}, "review": {"status": "degraded", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "acceptance_preparation_failed", "acceptance_incident": {"incident_id": "acceptance-preparation:1f2e3d4c", "status": "failed", "stage": "preparation", "attempts": 1, "source_known": true, "failure_kind": "UnicodeDecodeError"}}}}},
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": "Ouroboros could not assemble the evidence for this answer's review, so this preparation attempt dispatched no new reviewers; the work itself is kept · The task ran out of budget before it could finish cleanly."
+      "acceptance_clause": "The task ran out of budget before it could finish cleanly · Ouroboros could not assemble the evidence for this answer's review, so this preparation attempt dispatched no new reviewers; the work itself is kept."
     },
     {
       "name": "a RESOLVED acceptance incident states nothing beside the answer",
@@ -817,6 +841,20 @@
       "phase": "error",
       "headline": "Failed",
       "acceptance_clause": "The task made no progress for too long."
+    },
+    {
+      "name": "a rail also names current delegated custody",
+      "record": {"status": "completed", "reason_code": "round_limit", "delegated_runs_unreconciled": ["run-1"], "outcome_axes": {"execution": {"status": "best_effort", "reason_code": "round_limit"}}},
+      "phase": "warn",
+      "headline": "Done with warnings",
+      "acceptance_clause": "The task hit its round limit before it could finish cleanly · Some delegated work was never reconciled."
+    },
+    {
+      "name": "a rail does not resurrect healed custody",
+      "record": {"status": "completed", "reason_code": "round_limit", "delegated_runs_unreconciled": [], "outcome_axes": {"execution": {"status": "best_effort", "reason_code": "round_limit"}, "objective": {"warnings": ["delegated_custody_unreconciled"]}}},
+      "phase": "warn",
+      "headline": "Done with warnings",
+      "acceptance_clause": "The task hit its round limit before it could finish cleanly."
     },
     {
       "name": "a provider failure says its own sentence",

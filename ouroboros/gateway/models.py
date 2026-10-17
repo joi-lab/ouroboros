@@ -19,6 +19,7 @@ from ouroboros.provider_models import (
     ALL_PROVIDER_CREDENTIAL_KEYS,
     ACTIVE_MODEL_SETTING_KEYS,
     DEEPSEEK_BASE_URL,
+    compatible_endpoint,
     resolve_zai_base_url,
     DIRECT_PROVIDER_DEFAULTS,
     MINIMAX_REGION_ENDPOINTS,
@@ -291,9 +292,9 @@ def _provider_specs(
             ),
         ))
 
-    compatible_api_key = str(settings.get("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-    compatible_base_url = str(settings.get("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-    legacy_base_url = str(settings.get("OPENAI_BASE_URL", "") or "").strip()
+    # The compatible lane's one endpoint/key pair (``compatible_endpoint``): never another pair's key.
+    compatible_api_key, compatible_base_url = compatible_endpoint(
+        lambda key: str(settings.get(key, "") or "").strip())
     if compatible_base_url:
         specs.append((
             "openai-compatible",
@@ -303,17 +304,6 @@ def _provider_specs(
                 "OpenAI Compatible",
                 compatible_api_key,
                 compatible_base_url,
-            ),
-        ))
-    elif legacy_base_url:
-        specs.append((
-            "openai-compatible",
-            lambda client: _fetch_openai_compatible_model_catalog(
-                client,
-                "openai-compatible",
-                "OpenAI Compatible",
-                compatible_api_key or openai_api_key,
-                legacy_base_url,
             ),
         ))
 

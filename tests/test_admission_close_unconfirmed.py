@@ -328,7 +328,10 @@ def test_an_advisory_author_finish_survives_a_silent_supervisor_but_not_a_refusa
     ctx = _acceptance_ctx(tmp_path)
     ctx.tools._ctx._owner_directives = [{"source": "initial_user", "content": "goal"}]
     binding = ctx.review_binding["binding_hash"]
+    # The author read this SETTLED verdict (G1: the wait is the default; only settled,
+    # delivered feedback informs an Advisory finish).
     ctx.llm_trace["review_runs"] = [{"authority": "host_root", "feedback_delivered": True,
+                                     "settled_feedback_delivered": True,
                                      "binding_hash": binding, "aggregate_signal": "FAIL"}]
     ctx.llm_trace["review_decision"] = {}
     ctx.llm_trace["acceptance_decision"] = {

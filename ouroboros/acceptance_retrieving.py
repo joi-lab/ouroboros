@@ -13,7 +13,7 @@ first send would not hold the packet — or whose packet overflowed the shared
 budget — gets a compact first send and the complete packet as ONE exact,
 write-once source at an address this row's own reader resolves: the task
 artifact store for a native episode, the retained file's absolute path for a
-session using its ordinary read-only file tools. Both use existing host-owned
+session using its ordinary file tools. Both use existing host-owned
 custody, without workspace copies or attachment capability gates. Missing or
 changed source bytes are a typed refusal; an actual session read failure remains
 an explicit evidence gap, never proof that the source does not exist.
@@ -110,20 +110,18 @@ def _source_path(root: Any, task_id: str, ref: Dict[str, Any]) -> str:
 def _session_address(path: str) -> str:
     """An exact file read under existing authority, not an extra-root grant."""
     return (f'read the immutable packet file at absolute path {json.dumps(path, ensure_ascii=False)} '
-            'with your ordinary read-only file tools, in ranges. The host authorizes reading this exact '
+            'with your ordinary file tools, in ranges. The host authorizes reading this exact '
             'source even when it is outside your workspace; keep the task workspace as your root')
 
 
 def _first_send_fits(request: Any, slot: Any, text: str, *, session: bool) -> tuple[bool, int, int]:
-    """Measure the wrapper; session preparation is preliminary, dispatch rechecks."""
+    """Measure initial layout; only a session bound can refuse dispatch."""
     from ouroboros.review_native_episode import (
         native_episode_transcript_bound,
         native_first_send_chars,
         native_landing_at,
     )
-    from ouroboros.tools.scope_review_session import (
-        SESSION_INLINE_DIFF_CEILING_CHARS,
-    )
+    from ouroboros.tools.review_brief_coupling import SESSION_INLINE_DIFF_CEILING_CHARS
 
     if session:
         from ouroboros.review_execution import (
@@ -132,7 +130,8 @@ def _first_send_fits(request: Any, slot: Any, text: str, *, session: bool) -> tu
         from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
         route = session_route_for_review_slot(slot)
         invocation = SessionInvocation(task_id=request.task_id, surface=request.surface, slot_id=slot.slot_id,
-                                       timeout_sec=604800, output_schema=review_session_output_schema(request.surface))
+                                       timeout_sec=604800, output_schema=review_session_output_schema(request.surface),
+                                       access=str(getattr(slot, "session_access", "") or ""))
         wire = prepare_review_session_request(invocation, route,
             prompt=render_review_session_prompt(request, slot, text), root=request.session_root,
             thread_id="", schema_asked=True)
@@ -158,7 +157,8 @@ def _measure_delivery(request: Any, slot: Any, text: str, *, session: bool,
         return None
 
 
-_SESSION_INTRO = "You review as a read-only agent session in the task workspace."
+_SESSION_INTRO = ("You review as an agent session over the task workspace (read-only, or from your own private "
+                  "checking folder when your seat holds write access; its checking instructions say what it holds).")
 _NATIVE_INTRO = ("You review as a bounded read-only native inspection episode; the host data root at the "
                  "pointers is readable.")
 
@@ -229,7 +229,8 @@ def acceptance_retrieving_work_order(
         receipts = artifacts_dir / "verification_receipts.jsonl"
     pointer_rows = (
         f"- task workspace — the active tree the task worked in (your root): {session_root}",
-        f"- task result record (contract, status, children): {root / 'task_results' / (task_id + '.json')}",
+        f"- task result record (contract, status, children): get_task_result(task_id='{task_id}') "
+        f"(a row of the current-facts store, not a file)",
         f"- task artifacts named by the packet's `artifacts` manifest: {artifacts_dir}/",
         f"- host-attested verification receipts: {receipts}",
         f"- tool trajectory log (rows with task_id={task_id}; one call's start / settlement / wait-ended rows "
@@ -296,8 +297,9 @@ def acceptance_retrieving_work_order(
         if fits and not overflow:
             request.slot_source_delivery[slot.slot_id] = delivery
             continue
-        why = ("the packet overflowed the shared evidence budget" if overflow
-               else "the whole first send does not fit this row")
+        why = ("the packet overflowed the shared evidence budget" if overflow else
+               "the whole first send does not fit this row" if session else
+               "the whole first send exceeds this row's initial layout hint")
         address: Dict[str, Any] = {"error": stored.get("error", "")}
         if not stored.get("error"):
             address = ({"address": _session_address(_source_path(root, task_id, stored["ref"])),
@@ -316,9 +318,12 @@ def acceptance_retrieving_work_order(
             continue
         compact_fits, compact_chars, _ceiling = measured_fit
         ref = stored["ref"]
+        # Native sizing selects inline versus paged delivery, never source
+        # availability: the exact packet is still readable above that hint.
+        available = compact_fits or not session
         request.slot_source_delivery[slot.slot_id] = {
-            **delivery, "status": "paged" if compact_fits else "unavailable",
-            "reason": why if compact_fits else "complete compact first send exceeds this row's bound",
+            **delivery, "status": "paged" if available else "unavailable",
+            "reason": why if available else "complete compact first send exceeds this row's bound",
             "first_send_chars": compact_chars, "inline_first_send_chars": measured, "source": dict(ref),
             **({"source_path": address["source_path"]} if session else {})}
 

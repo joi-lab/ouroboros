@@ -105,7 +105,7 @@ def test_a_slow_custody_block_never_holds_the_loop_tick(quiet_tick, monkeypatch)
         assert tick < 2.0, f"the loop tick waited {tick:.1f}s for the custody block"
         assert not release.is_set(), "the block is still in flight"
         sm._periodic_supervisor_maintenance([0.0], [time.time()])
-        assert len(threads) == 1, [thread.name for thread in threads]
+        assert len([t for t in threads if t.name == "custody-maintenance"]) == 1, [t.name for t in threads]
     finally:
         release.set()
         for thread in threads:
@@ -153,30 +153,32 @@ def test_the_reaper_reads_its_candidates_before_it_reads_liveness(tmp_path, monk
 def test_the_delegated_reconciler_reads_its_candidates_before_it_reads_liveness(
     tmp_path, monkeypatch,
 ):
-    """The same rule on the delegated surface: `open_runs` replays the custody log
-    for seconds, and a run whose owner was admitted during that replay is not an
+    """The same rule on the delegated surface: current custody reads may wait,
+    and a run whose owner was admitted during that read is not an
     orphan. A set still means the same thing; None still means touch nothing."""
     from ouroboros import delegate_custody as dc
+    from ouroboros import delegate_custody_current as current
     from ouroboros import delegate_custody_reconcile as dcr
 
     live: set[str] = set()
     run = SimpleNamespace(task_id="late-task", run_id="run-1", settled=False)
     seen: list = []
 
-    def replaying_the_log(root, state=None):
-        live.add("late-task")  # admitted while the custody log is replayed
-        return [run]
+    def reading_candidates(root, where="", params=()):
+        assert (where, params) == ("state=?", ("held",))
+        live.add("late-task")  # admitted while current candidates are read
+        return {run.run_id: run}
 
     monkeypatch.setattr(dc, "pending_invocations", lambda root, rows=None: [])
     monkeypatch.setattr(dcr, "_reconcile_each", lambda root, runs, factory, **kwargs:
                         seen.append([c.run_id for c in runs]) or [])
 
-    monkeypatch.setattr(dc, "open_runs", replaying_the_log)
+    monkeypatch.setattr(current, "runs", reading_candidates)
     dc.reconcile_orphaned_runs(tmp_path, running_task_ids=lambda: set(live))
-    assert seen == [[]], "a run whose owner was admitted during the replay is spared"
+    assert seen == [[]], "a run whose owner was admitted during the read is spared"
 
     live.clear()
-    monkeypatch.setattr(dc, "open_runs", lambda root, state=None: [run])
+    monkeypatch.setattr(current, "runs", lambda root, where="", params=(): {run.run_id: run})
     dc.reconcile_orphaned_runs(tmp_path, running_task_ids=lambda: set(live))
     assert seen[-1] == ["run-1"], "a genuinely orphaned run is still reconciled"
 
@@ -367,13 +369,14 @@ def test_a_slow_reconcile_block_never_holds_the_loop_tick(quiet_tick, monkeypatc
     held the drain, the fence acks and assignment for its whole walk. The tick that
     STARTS it now returns at once; a tick while it is busy SKIPS (one thread, no queue);
     the marker is stamped only when the pass ENDS; the latch opens in ``finally``; and
-    the orphan-heal notification reaches the alarm clock from the maintenance thread."""
+    the orphan heal itself runs on the maintenance thread."""
     sm = quiet_tick
     threads = _track_threads(monkeypatch)
     entered, release = threading.Event(), threading.Event()
     done, healed = [], []
 
     def slow_heal(root, **kwargs):
+        healed.append(threading.current_thread().name)
         entered.set()
         assert release.wait(5), "the test must release the reconcile block"
         return 2
@@ -382,22 +385,20 @@ def test_a_slow_reconcile_block_never_holds_the_loop_tick(quiet_tick, monkeypatc
     marker = [0.0]
     try:
         started = time.monotonic()
-        sm._periodic_supervisor_maintenance(
-            [time.time()], marker,
-            on_orphans_healed=lambda count: healed.append((count, threading.current_thread().name)))
+        sm._periodic_supervisor_maintenance([time.time()], marker)
         tick = time.monotonic() - started
         assert entered.wait(5), "the reconcile block really ran"
         assert tick < 2.0, f"the loop tick waited {tick:.1f}s for the reconcile block"
         assert marker[0] == 0.0, "not stamped until the pass ENDS (issue #1230)"
         sm._periodic_supervisor_maintenance([time.time()], marker)
-        assert [thread.name for thread in threads] == ["reconcile-maintenance"], "busy => skipped"
+        assert [thread.name for thread in threads if thread.name not in {"cold-custody", "schedule-admission"}] == ["reconcile-maintenance"], "busy => skipped"
         assert threads[0].daemon and threads[0].is_alive()
     finally:
         release.set()
         for thread in threads:
             thread.join(5)
     assert all(not thread.is_alive() for thread in threads)
-    assert healed == [(2, "reconcile-maintenance")]
+    assert healed == ["reconcile-maintenance"]
     assert [name for name, _ in done] == ["review_jobs", "projects", "deletions", "child_refs"]
     assert {thread for _, thread in done} == {"reconcile-maintenance"}
     assert marker[0] > 0.0 and not sm._RECONCILE_SWEEP_LOCK.locked(), "stamped, then released"
@@ -421,7 +422,7 @@ def test_child_ref_promotion_retries_left_the_cancel_sweep(quiet_tick, monkeypat
     sm._periodic_supervisor_maintenance([time.time()], [time.time()])  # the 20 s sweep alone
     for thread in threads:
         thread.join(5)
-    assert [name for name, _ in done] == ["cancel", "delivery", "usage"], "no history-sized step"
+    assert sorted(name for name, _ in done) == ["cancel", "delivery", "usage"], "no history-sized step"
     assert not sm._CANCEL_INTENT_SWEEP_LOCK.locked()
 
     done.clear()
@@ -429,7 +430,7 @@ def test_child_ref_promotion_retries_left_the_cancel_sweep(quiet_tick, monkeypat
     for thread in threads:
         thread.join(5)
     assert [name for name, _ in done] == ["review_jobs", "orphans", "projects", "deletions", "child_refs"]
-    assert [thread.name for thread in threads] == ["terminal-maintenance", "reconcile-maintenance"]
+    assert [thread.name for thread in threads if thread.name not in {"cold-custody", "schedule-admission"}] == ["cancel_intent_sweep", "terminal_delivery_replay", "question_delivery_replay", "pause_notice_replay", "abandoned_usage_reconciliation", "post_task_synthesis_recovery", "reconcile-maintenance"]
 
 
 def test_a_closed_generation_stops_the_reconcile_block_before_its_next_mutation(quiet_tick, monkeypatch):
@@ -503,9 +504,8 @@ def test_a_reconcile_thread_that_cannot_start_releases_its_latch_and_waits_a_cad
 
 
 def test_startup_custody_still_runs_inline_and_starts_no_maintenance_thread(tmp_path, monkeypatch):
-    """Startup custody is once-per-generation and synchronous by contract: the loop's
-    readiness follows it. The off-loop move touched only the tick; the startup sweep
-    still runs every step on the caller's thread and starts nothing."""
+    """Startup reconciles addressed custody inline; historical refresh and bulk
+    state housekeeping belong to the later maintenance pass."""
     from ouroboros import process_custody as pc
     from ouroboros import server_maintenance as sm
 
@@ -526,7 +526,7 @@ def test_startup_custody_still_runs_inline_and_starts_no_maintenance_thread(tmp_
     threads = _track_threads(monkeypatch)
 
     sm._startup_custody_sweep()
-    assert [name for name, _ in order] == ["reap", "reconcile", "backfill", "cursor", "replay", "delegate_state"]
+    assert [name for name, _ in order] == ["reap", "reconcile", "backfill", "replay"]
     assert {thread for _, thread in order[:2]} == {threading.current_thread().name}
     assert threads == [], "startup custody never hands its work to a maintenance thread"
 
@@ -538,6 +538,8 @@ def test_drive_custody_rides_the_reconcile_pass_bounded_and_never_startup(tmp_pa
     the startup sweep copies and hashes no child store (readiness waits on nothing)."""
     from ouroboros import headless, server_maintenance as sm
     from ouroboros.task_results import load_task_result, write_task_result
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
 
     monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
     monkeypatch.setattr(sm, "_DRIVE_PRUNE_CURSOR", {"headless": "", "direct": ""})

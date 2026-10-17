@@ -43,6 +43,7 @@ from typing import Any, Dict, List
 from ouroboros.consciousness_authority import consciousness_origin_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.dialogue_provenance import presence_caller_binding, presence_root_carrier
+from ouroboros.settings_scales import EFFORT_SCALE, requested_effort
 from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolContext, ToolEntry
 
@@ -172,13 +173,14 @@ def get_tools() -> List[ToolEntry]:
                     "when you wrote it and when it was due. A note is right when its text will still be true "
                     "at that time; if the words depend on what happens by then, schedule a wake-up instead. "
                     "Explicitly choose related work (original "
-                    "verified money/deadline and Stop controls) or independent work. Root tasks only; subagents report "
-                    "the proposed follow-up to their parent. Supply exactly one trigger: run_at "
+                    "verified money/deadline and Stop controls) or independent work; a task of either relation may "
+                    "read this task's task_drive/artifact_store (read-only, one hop), so name the paths it needs. "
+                    "Root tasks only; subagents report the proposed follow-up to their parent. Supply exactly one "
+                    "trigger: run_at "
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
                     "in your own words — it becomes each future task's text verbatim. The "
-                    "record is durable in state/scheduled_tasks.json, and the owner can "
-                    "disable or delete it from the Schedules surface. A task may hold at "
+                    "owner can disable or delete the record from the Schedules surface. A task may hold at "
                     f"most {_MAX_PENDING_FOLLOWUPS} pending follow-ups."
                 ),
                 "parameters": {
@@ -215,6 +217,12 @@ def get_tools() -> List[ToolEntry]:
                                 "Optional context the future task should start from (facts, ids, paths; "
                                 f"max {_MAX_CONTEXT_CHARS} chars; longer is a typed refusal, never truncated)."
                             ),
+                        },
+                        "reasoning_effort": {
+                            "type": "string", "enum": list(EFFORT_SCALE),
+                            "description": "Optional: the reasoning effort each future task starts on; applied in "
+                                           "Cyber Pro only — otherwise the task starts at my human's recommended "
+                                           "level and the result says so. Omit for that level.",
                         },
                     },
                     "required": ["objective", "relation"],
@@ -392,6 +400,25 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"ERROR: FOLLOWUP_TEXT_TOO_LONG: context is {len(context)} chars; the limit is "
             f"{_MAX_CONTEXT_CHARS}. Shorten it — nothing was truncated and nothing was scheduled.")))
         )
+    effort = ""
+    if params.get("reasoning_effort") is not None and notify:
+        timezone_note += " " + ignored_argument_note(
+            "reasoning_effort", params["reasoning_effort"], "a note wakes no model") + "."
+    elif params.get("reasoning_effort") is not None:
+        try:
+            effort = requested_effort(params["reasoning_effort"])
+        except ValueError as exc:
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(
+                f"ERROR: FOLLOWUP_EFFORT_INVALID: {exc}. Nothing was scheduled.")))
+        from ouroboros.runtime_mode_policy import effort_range_binds
+        from ouroboros.settings_scales import effort_range
+
+        if effort_range_binds():  # a root Ouroboros creates itself starts at the recommended level
+            timezone_note += " " + ignored_argument_note(
+                "reasoning_effort", effort,
+                "outside Cyber Pro a future task I schedule starts at my human's recommended level "
+                f"({effort_range()['recommended']})") + "."
+            effort = ""
     from ouroboros.tool_access import canonical_data_root
     from supervisor.queue import schedule_transaction
 
@@ -422,7 +449,8 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
                 return _register_note(ctx, task_id, drive_root, objective, trigger, cron, timezone,
                                       timezone_note, origin, relation)
             return _register_followup(ctx, task_id, drive_root, objective, context,
-                                      trigger, cron, timezone, timezone_note, origin, relation)
+                                      trigger, cron, timezone, timezone_note, origin, relation,
+                                      reasoning_effort=effort)
     except ScheduleStoreUnreadable as exc:
         # A missed table lock (ScheduleLockTimeout) or an unparseable table: the
         # follow-up was NOT registered, and the refusal says so in the text ABI
@@ -519,7 +547,8 @@ def _register_note(ctx: ToolContext, task_id: str, drive_root: Any, objective: s
 
 def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
                        objective: str, context: str, trigger: Dict[str, Any], cron: str,
-                       timezone: str, timezone_note: str, origin: dict, relation: dict) -> str:
+                       timezone: str, timezone_note: str, origin: dict, relation: dict,
+                       *, reasoning_effort: str = "") -> str:
     """The cap read, the record build and the write — all under the schedule lock."""
     from supervisor.queue import upsert_scheduled_task
 
@@ -549,6 +578,7 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
             "text": objective,
             "description": objective,
             **({"context": context} if context else {}),
+            **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
             **({"project_id": project_id} if project_id else {}),
             "metadata": {
                 "source": FOLLOWUP_SOURCE,
@@ -574,14 +604,17 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
     # The same Presence carrier a promote keeps: a speaker's metadata, or the binding a
     # promoted descendant root acts for; the ceiling rides by value and no Project is chosen.
     # A new root authors its own objective, context and acceptance premises;
-    # only the origin's authority and general constraints survive by value.
+    # only the origin's authority and general constraints survive by value. The
+    # origin's own predecessor is not this root's: it reads its direct origin
+    # only (``tool_access.scheduled_origin``, #1488), never a second hop.
     contract = getattr(ctx, "task_contract", None)
     carrier = presence_root_carrier(metadata_src, task_contract=contract)
     if carrier and isinstance(contract, dict):
         record["task"]["metadata"].update(carrier)
         record["task"]["task_contract"] = {
             key: value for key, value in contract.items()
-            if key not in {"objective", "context", "expected_output", "acceptance_claims", "success_criteria"}}
+            if key not in {"objective", "context", "expected_output", "acceptance_claims", "success_criteria",
+                           "predecessor_authority"}}
         record["task"].pop("project_id", None)
     from supervisor.queue import ScheduleRefused, ScheduleStoreUnreadable
 

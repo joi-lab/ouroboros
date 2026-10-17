@@ -5,6 +5,7 @@
 // always had, because hiding it would lose the fact.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { createChatInstance } from '../modules/chat.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
 
@@ -363,4 +364,262 @@ test('cold bounded receipt history renders canonical truth in a new Chat', {
         assert.doesNotMatch(markup().join('\n'), /merge: queued/);
         assert.equal(phasedLines(walkCard(replay.messages(), 'merge-task'), 'result').length, 1);
     } finally { replay.instance.destroy(); restoreDom(replay.prior); }
+});
+
+// A row's task_id names its target, not its speaker or its end. A routing notice
+// for a child is the issuing chat's own System row; the child's typed words are
+// lines of its card and conclude nothing; only its final does; its photo stands
+// alone. Words said again are said again: another line, live as on reload.
+// tests/test_project_child_words_placement.py supplies the exact frames and
+// history rows its real producers and the real history endpoint wrote.
+const KID = { subagent_task_id: 'kid-1', root_task_id: 'root-1', parent_task_id: 'root-1',
+    delegation_role: 'subagent', subagent_role: 'researcher' };
+const childWords = () => {
+    if (process.env.CHILD_WORDS_PROJECTION) {
+        return JSON.parse(readFileSync(process.env.CHILD_WORDS_PROJECTION, 'utf8'));
+    }
+    const ts = (second) => `2026-10-11T12:00:${String(second).padStart(2, '0')}+00:00`;
+    const said = (content) => ({ content, markdown: true, system_type: 'proactive_message', task_id: 'kid-1', ...KID });
+    const live = [
+        { is_progress: true, content: 'Reading the brief.', task_id: 'root-1', cancelable: true },
+        { content: 'ROOT_ANSWER: the scout is on it.', task_id: 'root-1' },
+        { is_progress: true, content: 'Listing the repository root.', task_id: 'kid-1', ...KID },
+        // The same words again, right away and later on, as the producer test sends them.
+        ...['CHILD_WORDS_1: halfway through.', 'CHILD_WORDS_2: found the README.', 'CHILD_WORDS_2: found the README.',
+            'CHILD_WORDS_1: halfway through.'].map(said),
+        { role: 'system', content: 'Task · Not delivered: that task is a helper of another task',
+            system_type: 'steer_not_delivered', task_id: 'kid-1' },
+        { content: 'CHILD_FINAL: root listed.', task_id: 'kid-1', ...KID },
+    ].map((frame, index) => ({ type: 'chat', role: 'assistant', is_progress: false, narration: false, ...frame, ts: ts(index) }));
+    const stored = ({ type, content, chat_id, ...row }, offset) => ({ ...row, text: content, system_type: row.system_type || '',
+        history_id: `${row.is_progress ? 'progress' : 'chat'}:${offset}`,
+        history_position: { source: row.is_progress ? 'progress' : 'chat', offset } });
+    const photo = { role: 'assistant', is_progress: false, system_type: 'photo', msg_type: 'photo', mime: 'image/png',
+        text: 'CHILD_PHOTO', caption: 'CHILD_PHOTO', download_url: '/api/tasks/kid-1/artifacts/chat-media-x',
+        task_id: 'kid-1', ...KID, ts: ts(live.length - 1), history_id: 'chat:99', history_position: { source: 'chat', offset: 99 } };
+    return { live, history: [...live.map(stored), photo], running_history: live.slice(0, -1).map(stored) };
+};
+const feedBubbles = (messages, text) => messages.children.filter((node) => node.classList.contains('chat-bubble')
+    && String(node.innerHTML).includes(text));
+// The DOM stub mounts no media gallery; a photo is checked never to become a card line.
+const lineKeysOf = (history, test) => history.filter(test)
+    .map((row) => `history-${row.history_id.replace(/[^A-Za-z0-9_-]/g, '-')}`);
+const isPhoto = (row) => row.msg_type === 'photo';
+const isWords = (row) => row.system_type === 'proactive_message';
+// The child's words each mounted line of its card shows, in order, read from the markup
+// last built for the line's key.
+const wordsOn = (card, markup) => {
+    const latest = new Map();
+    for (const html of markup()) {
+        for (const part of html.split('data-live-line-key="').slice(1)) latest.set(part.slice(0, part.indexOf('"')), part);
+    }
+    return timelineLines(card).map((line) => /CHILD_WORDS_\d: [^<]*/.exec(latest.get(line.dataset.liveLineKey) || '')?.[0])
+        .filter(Boolean);
+};
+
+for (const ordering of ['history-first/live', 'live/history/redelivery']) {
+    test(`child words: ${ordering} keeps one line per occurrence while the child is running`, async () => {
+        const { live, history, running_history } = childWords();
+        const frames = live.filter(isWords).map((frame) => ({ ...frame, chat_id: 2 }));
+        const said = frames.map((frame) => frame.content);
+        const sourceIds = running_history.filter(isWords).map((row) => row.history_id);
+        assert.equal(new Set(sourceIds).size, said.length, 'each send has its own stored source row');
+        assert.equal(new Set(frames.map((frame) => frame.ts)).size, said.length);
+        let page = running_history;
+        const { prior, instance, handlers, messages } = openCardChat(async (url) => ({ ok: true, json: async () =>
+            (String(url).startsWith('/api/chat/history') ? { messages: page } : { active_direct_turns: [] }) }));
+        try {
+            const markup = captureRenderedLines();
+            if (ordering.startsWith('live/')) {
+                for (const frame of live.filter((row) => row.is_progress)) handlers.get('chat')({ ...frame, chat_id: 2 });
+                for (const frame of frames) handlers.get('chat')(frame);
+            }
+            await instance.refreshHistory({ revision: 1 });
+            const kid = walkCard(messages(), 'kid-1');
+            expand(kid);
+            assert.equal(kid.dataset.finished, '0', 'the read observes a running child');
+            assert.deepEqual(wordsOn(kid, markup), said);
+            const lines = timelineLines(kid);
+            const adoptedIds = () => timelineLines(kid).map((line) => line.dataset.historyId)
+                .filter((id) => sourceIds.includes(id));
+            assert.deepEqual(adoptedIds(), sourceIds, 'source identity survives live adoption as well as history insertion');
+            for (let delivery = 0; delivery < 2; delivery += 1) {
+                for (const frame of frames) handlers.get('chat')({ ...frame });
+                assert.deepEqual(wordsOn(kid, markup), said, 'the delayed or redelivered frame is the same occurrence');
+                assert.deepEqual(timelineLines(kid), lines, 'redelivery preserves the mounted lines');
+                assert.equal(kid.dataset.finished, '0');
+            }
+            await instance.refreshHistory({ revision: 2 });
+            assert.deepEqual(wordsOn(kid, markup), said);
+            assert.deepEqual(adoptedIds(), sourceIds);
+            const final = live.find((frame) => String(frame.content).startsWith('CHILD_FINAL'));
+            handlers.get('chat')({ ...final, chat_id: 2 });
+            assert.equal(kid.dataset.finished, '1', 'only the final concludes it');
+            assert.deepEqual(wordsOn(kid, markup), said, 'the final stands beside every occurrence');
+            assert.ok(markup().some((html) => html.includes('CHILD_FINAL')));
+            page = history;
+            await instance.refreshHistory({ revision: 3 });
+            const concludedLines = timelineLines(kid).length;
+            for (const frame of frames) handlers.get('chat')({ ...frame });
+            assert.deepEqual(wordsOn(kid, markup), said);
+            assert.equal(timelineLines(kid).length, concludedLines);
+            assert.equal(kid.dataset.finished, '1');
+            assert.equal(feedBubbles(messages(), 'CHILD_WORDS').length, 0);
+        } finally { instance?.destroy(); restoreDom(prior); }
+    });
+}
+
+test('child words: a routing notice for a running child is neither its words nor its end', () => {
+    const { live } = childWords();
+    const frames = live.map((frame) => ({ ...frame, chat_id: 2 }));
+    const { prior, instance, handlers, messages } = openCardChat();
+    try {
+        for (const frame of frames.filter((row) => row.is_progress)) handlers.get('chat')(frame);
+        const kid = walkCard(messages(), 'kid-1');
+        assert.ok(kid, 'the child\'s progress minted its card');
+        expand(kid);
+        const lines = timelineLines(kid).length;
+        handlers.get('chat')(frames.find((row) => row.system_type === 'steer_not_delivered'));
+        assert.equal(kid.dataset.finished, '0', 'the refused child is still working');
+        assert.equal(timelineLines(kid).length, lines, 'and its card gained nothing');
+        assert.equal(feedBubbles(messages(), 'Not delivered').length, 1, 'the notice is the issuing chat\'s own row');
+        assert.ok(systemBubbles(messages()).some((node) => node.innerHTML.includes('Not delivered')));
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+test('child words: live, then a reconnect, keep a routing notice alone and the child\'s words in its card', async () => {
+    const { live, history } = childWords();
+    const frames = live.map((frame) => ({ ...frame, chat_id: 2 }));
+    const at = (token) => frames.findIndex((frame) => String(frame.content).includes(token));
+    const { prior, instance, handlers, messages } = openCardChat(async (url) => ({ ok: true, json: async () =>
+        (String(url).startsWith('/api/chat/history') ? { messages: history } : { active_direct_turns: [] }) }));
+    const deliver = (from, to) => frames.slice(at(from), to ? at(to) : undefined)
+        .forEach((frame) => handlers.get('chat')(frame));
+    try {
+        const markup = captureRenderedLines();
+        deliver('Reading the brief', 'CHILD_WORDS_1');
+        const kid = walkCard(messages(), 'kid-1');
+        assert.ok(kid, 'the child\'s progress minted its card');
+        expand(kid);
+        const lines = timelineLines(kid).length;
+        const said = frames.filter(isWords).length;
+        deliver('CHILD_WORDS_1', 'Not delivered');
+        assert.equal(kid.dataset.finished, '0', 'the child\'s words conclude nothing');
+        assert.equal(timelineLines(kid).length, lines + said, 'each of its words is a line of its card');
+        assert.ok(['CHILD_WORDS_1', 'CHILD_WORDS_2'].every((token) => markup().some((html) => html.includes(token))));
+        assert.equal(feedBubbles(messages(), 'CHILD_WORDS').length, 0, 'and none is a conversation bubble');
+        deliver('Not delivered', 'CHILD_FINAL');
+        assert.equal(feedBubbles(messages(), 'Not delivered').length, 1, 'the notice is the issuing chat\'s own row');
+        assert.ok(systemBubbles(messages()).some((node) => node.innerHTML.includes('Not delivered')));
+        assert.equal(kid.dataset.finished, '0', 'and it borrows nothing from the child it names');
+        assert.equal(timelineLines(kid).length, lines + said);
+        deliver('CHILD_FINAL');
+        assert.equal(kid.dataset.finished, '1', 'only the child\'s final concludes its card');
+        // This stream carries chat frames only, no task_done log frame: a reconnect adds the
+        // child's stored terminal status as its lifecycle line, and nothing else.
+        const content = (card) => timelineLines(card)
+            .filter((line) => !String(line.dataset.liveLineKey).startsWith('terminal-subagent-lifecycle-'));
+        const settled = content(kid).length;
+        await instance.refreshHistory({ revision: 2 });
+        const reread = walkCard(messages(), 'kid-1');
+        expand(reread);
+        assert.equal(content(reread).length, settled, 'the stored rows adopt their live lines');
+        assert.equal(reread.dataset.finished, '1');
+        assert.equal(feedBubbles(messages(), 'Not delivered').length, 1, 'the notice is drawn once');
+        assert.equal(feedBubbles(messages(), 'CHILD_WORDS').length, 0);
+        const photo = lineKeysOf(history, isPhoto);
+        assert.equal(photo.length, 1);
+        assert.ok(!timelineLines(reread).some((line) => photo.includes(line.dataset.liveLineKey)),
+            'the child\'s photo is never a line of its card');
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+test('child words: words delivered after the child\'s final keep a line of their own, not its result', async () => {
+    // The final-answer shortcut may ship a child's final ahead of its still-buffered words.
+    const { live, history } = childWords();
+    const frames = live.map((frame) => ({ ...frame, chat_id: 2 }));
+    const late = frames.find((frame) => String(frame.content).startsWith('CHILD_WORDS_2'));
+    const { prior, instance, handlers, messages } = openCardChat(async (url) => ({ ok: true, json: async () =>
+        (String(url).startsWith('/api/chat/history') ? { messages: history } : { active_direct_turns: [] }) }));
+    try {
+        for (const frame of frames.filter((row) => row !== late)) handlers.get('chat')(frame);
+        const kid = walkCard(messages(), 'kid-1');
+        expand(kid);
+        assert.equal(kid.dataset.finished, '1');
+        const lines = timelineLines(kid).length;
+        handlers.get('chat')(late);
+        assert.equal(timelineLines(kid).length, lines + 1, 'a line of its own, beside the kept result and the same words said later');
+        assert.equal(kid.dataset.finished, '1', 'the child stays concluded');
+        assert.equal(feedBubbles(messages(), 'CHILD_WORDS').length, 0);
+        const content = (card) => timelineLines(card)
+            .filter((line) => !String(line.dataset.liveLineKey).startsWith('terminal-subagent-lifecycle-'));
+        const settled = content(kid).length;
+        await instance.refreshHistory({ revision: 2 });
+        const reread = walkCard(messages(), 'kid-1');
+        expand(reread);
+        assert.equal(content(reread).length, settled, 'a reconnect draws nothing twice');
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+test('child words: a reload places the same rows the same way', async () => {
+    const { history } = childWords();
+    const { prior, instance, messages } = await replayChat(history.map((row) => ({ ...row, chat_id: 1 })));
+    try {
+        await instance.refreshHistory({ revision: 1 });
+        const kid = walkCard(messages(), 'kid-1');
+        assert.ok(kid, 'the replayed child kept its card');
+        expand(kid);
+        const words = lineKeysOf(history, (row) => String(row.text).startsWith('CHILD_WORDS'));
+        assert.equal(words.length, 4);
+        assert.deepEqual(timelineLines(kid).map((line) => line.dataset.liveLineKey).filter((key) => words.includes(key)),
+            words, 'each stored word is one line of the child\'s card');
+        assert.equal(feedBubbles(messages(), 'CHILD_WORDS').length, 0, 'never a conversation bubble');
+        assert.equal(kid.dataset.finished, '1', 'the stored final concludes the child');
+        assert.equal(feedBubbles(messages(), 'Not delivered').length, 1, 'the notice stays a row of its own');
+        assert.ok(systemBubbles(messages()).some((node) => node.innerHTML.includes('Not delivered')));
+        const photo = lineKeysOf(history, isPhoto);
+        assert.ok(!timelineLines(kid).some((line) => photo.includes(line.dataset.liveLineKey)),
+            'the child\'s photo is never a line of its card');
+        assert.equal(feedBubbles(messages(), 'ROOT_ANSWER').length, 1);
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
+test('child words: the same words said again are another line, live as on reload; a frame delivered again is not', async () => {
+    const { live, history } = childWords();
+    const frames = live.map((frame) => ({ ...frame, chat_id: 2 }));
+    const said = frames.filter(isWords).map((frame) => String(frame.content).trim());
+    assert.ok(new Set(said).size < said.length, 'the child said some of its words again');
+    const final = frames.find((frame) => String(frame.content).startsWith('CHILD_FINAL'));
+    const { prior, instance, handlers, messages } = openCardChat(async (url) => ({ ok: true, json: async () =>
+        (String(url).startsWith('/api/chat/history') ? { messages: history } : { active_direct_turns: [] }) }));
+    try {
+        const markup = captureRenderedLines();
+        for (const frame of frames.filter((row) => row !== final)) handlers.get('chat')(frame);
+        const kid = walkCard(messages(), 'kid-1');
+        expand(kid);
+        assert.deepEqual(wordsOn(kid, markup), said, 'each time it spoke is one line, in the order it spoke');
+        const lines = timelineLines(kid).length;
+        for (const frame of frames.filter(isWords)) handlers.get('chat')({ ...frame });
+        assert.equal(timelineLines(kid).length, lines, 'the same frame delivered again is no new words');
+        handlers.get('chat')(final);
+        assert.equal(kid.dataset.finished, '1');
+        assert.deepEqual(wordsOn(kid, markup), said, 'its final keeps every line it spoke');
+        const content = (card) => timelineLines(card)
+            .filter((line) => !String(line.dataset.liveLineKey).startsWith('terminal-subagent-lifecycle-'));
+        const settled = content(kid).length;
+        await instance.refreshHistory({ revision: 2 });
+        const reread = walkCard(messages(), 'kid-1');
+        expand(reread);
+        assert.equal(content(reread).length, settled, 'each stored row adopts its own live line');
+        assert.deepEqual(wordsOn(reread, markup), said);
+    } finally { instance?.destroy(); restoreDom(prior); }
+    const reload = await replayChat(history.map((row) => ({ ...row, chat_id: 1 })));
+    try {
+        await reload.instance.refreshHistory({ revision: 1 });
+        const kid = walkCard(reload.messages(), 'kid-1');
+        expand(kid);
+        const words = lineKeysOf(history, isWords);
+        assert.equal(timelineLines(kid).filter((line) => words.includes(line.dataset.liveLineKey)).length, said.length,
+            'a reload draws as many lines as were drawn live');
+    } finally { reload.instance.destroy(); restoreDom(reload.prior); }
 });

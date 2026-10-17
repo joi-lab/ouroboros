@@ -5,6 +5,7 @@ import json
 
 from ouroboros import deep_self_review as deep
 from ouroboros.artifacts import read_actor_source_bytes
+from ouroboros.tools import review_helpers
 from tests.test_deep_review_slot import _native_row, _ScriptedLLM, _tool_call
 
 
@@ -35,7 +36,7 @@ def _required(root, rel):
 
 
 
-def test_the_deep_task_inlines_the_review_protocol_and_navigates_the_books(tmp_path):
+def test_the_deep_task_inlines_the_review_protocol_and_navigates_the_books(tmp_path, monkeypatch):
     """The deep surface reviews no change, so the governance tiers yield the
     standing rules and nothing change-relative: the standing disclosures and
     the review protocol this reviewer executes arrive in full, every reference
@@ -43,6 +44,7 @@ def test_the_deep_task_inlines_the_review_protocol_and_navigates_the_books(tmp_p
     inline like every other surface's tier-1 governance."""
     repo, data = tmp_path / "repo", tmp_path / "data"
     _corpus(repo)
+    monkeypatch.setattr(review_helpers, "REPO_ROOT", repo)
     (repo / "docs" / "CHECKLISTS_ARCHIVE.md").write_text(
         "# Standing archive\n\nSTANDING DISCLOSURE: the archive body.\n", encoding="utf-8")
     (repo / "docs" / "DESIGN.md").write_text("# Design\n\nThe design system body.\n", encoding="utf-8")
@@ -70,6 +72,7 @@ def test_the_deep_task_inlines_the_review_protocol_and_navigates_the_books(tmp_p
 def test_retrieving_book_navigation_uses_only_physical_chapter_addresses(tmp_path, monkeypatch):
     repo, data = tmp_path / "repo", tmp_path / "data"
     _corpus(repo)
+    monkeypatch.setattr(review_helpers, "REPO_ROOT", repo)
     # This legacy mapper must not be fed a composed book with invented entrypoint lines.
     # The deep-review task reads the chapter-addressed view (context_layout.book_navigation);
     # the legacy monolith mapper is no longer imported here at all.
@@ -112,6 +115,7 @@ def test_legacy_line_evidence_stays_explicit_and_unsent_reads_never_complete_it(
 def test_native_deep_review_reports_exact_chapter_gap_without_changing_the_finding(tmp_path, monkeypatch):
     repo, data = tmp_path / "repo", tmp_path / "data"
     _corpus(repo)
+    monkeypatch.setattr(review_helpers, "REPO_ROOT", repo)
     monkeypatch.setenv("OPENROUTER_API_KEY", "fixture-only")
     report = "Read: Constitution.\n\nCRITICAL: a real consumer violates the contract."
     llm = _ScriptedLLM([

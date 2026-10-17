@@ -62,8 +62,8 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
     from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.peer_roster import maybe_append_roster_note
     from ouroboros.project_facts import resolve_project_id
-    from ouroboros.tools.control import _steer_task
-    from ouroboros.tools.control_routing import _promote_chat_to_task
+    from ouroboros.tools.control import _tell_task
+    from ouroboros.tools.control_routing import _start_task
     from ouroboros.tools.followup import _handle_schedule_followup, _manage_schedules
     from ouroboros.tools.project_journal import _scope_authority
     from ouroboros.tools.recent_tasks import _restricted_actor
@@ -102,8 +102,8 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
             put_nowait=lambda event: emitted.append(event) or _handle_promote_chat_to_task(event, handler_ctx)),
     )
 
-    out = _promote_chat_to_task(child_ctx, "Compile the full audit", project_name="Widened",
-                                workspace_root=str(tmp_path / "elsewhere"), source="api", predecessor_task_id="")
+    out = _start_task(child_ctx, "Compile the full audit", title="Full audit", project_name="Widened",
+                                workspace_root=str(tmp_path / "elsewhere"), source="api")
 
     authority = {"binding_id": BINDING}
     [evt], [root] = emitted, pending
@@ -125,8 +125,8 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
     assert "PRESENCE_CAPABILITY_BLOCKED" not in registry.execute("get_task_result", {"task_id": root["id"]})
     stranger, _stranger = _registry(tmp_path, binding=OTHER)
     assert "PRESENCE_CAPABILITY_BLOCKED" in stranger.execute("get_task_result", {"task_id": root["id"]})
-    steered = _steer_task(_steering_turn(tmp_path, _supervisor(tmp_path, pending=[root]), []), root["id"], "Q2 is in.")
-    assert "written to its mailbox" in steered and len(drain_owner_entries(tmp_path, root["id"])) == 1
+    steered = _tell_task(_steering_turn(tmp_path, _supervisor(tmp_path, pending=[root]), []), root["id"], "Q2 is in.")
+    assert "Message written to" in steered and len(drain_owner_entries(tmp_path, root["id"])) == 1
 
     # A follow-up of that root keeps the same carrier and ceiling, never a Project.
     # The root now acts as a worker, publishing the admitted queue metadata.
@@ -155,7 +155,8 @@ def test_a_presence_childs_promote_and_follow_up_stay_its_bindings_work_under_th
     plain_ctx = types.SimpleNamespace(**{**vars(child_ctx), "task_id": plain["id"], "task_metadata": _worker_metadata(plain),
                                          "task_contract": plain["task_contract"],
                                          "event_queue": types.SimpleNamespace(put_nowait=plain_events.append)})
-    _promote_chat_to_task(plain_ctx, "Owner-side work", project_name="Chosen", predecessor_task_id="")
+    _start_task(plain_ctx, "Owner-side work", title="Owner-side work",
+                          project_name="Chosen")
     assert not {"presence", "presence_binding_authority"} & set(plain_events[0])
     assert plain_events[0]["project_name"] == "Chosen"
 
@@ -176,7 +177,7 @@ def test_supervisor_steering_follows_the_canonical_binding_over_a_stale_queue_ro
     import supervisor.queue as queue
     from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.tools.control import _tell_task
     from supervisor.events import _handle_steer_task
 
     monkeypatch.setattr(queue, "DRIVE_ROOT", str(tmp_path))
@@ -195,11 +196,11 @@ def test_supervisor_steering_follows_the_canonical_binding_over_a_stale_queue_ro
     turn = _steering_turn(tmp_path, supervisor_ctx, [])
 
     for target in ("mine-pending", "legacy-pending"):  # own pending work stays steerable (owner Q2)
-        assert "written to its mailbox" in _steer_task(turn, target, "New figures."), target
+        assert "Message written to" in _tell_task(turn, target, "New figures."), target
         assert len(drain_owner_entries(tmp_path, target)) == 1
     for target in ("theirs-pending", "theirs-running", "torn-carrier"):
-        refused = _steer_task(turn, target, "stop")
-        assert "STEER_REJECTED" in refused and "presence_work_not_related" in refused, target
+        refused = _tell_task(turn, target, "stop")
+        assert "TELL_REJECTED" in refused and "presence_work_not_related" in refused, target
         assert drain_owner_entries(tmp_path, target) == []
 
     def stamped(stamp, token):  # the entries this one event adds

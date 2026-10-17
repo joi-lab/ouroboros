@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ouroboros"
-version = "7.6.0"
+version = "7.7.0"
 description = "Self-creating AI agent with constitution, background consciousness, and persistent identity"
 readme = "README.md"
 license = {text = "MIT"}
@@ -54,7 +54,7 @@ dependencies = [
     # dependencies because the packaged hermetic commit gate invokes them.
     "pytest-xdist>=3.5",
     "pytest-timeout>=2.1",
-    "mcp>=1.6,<2.0",
+    "mcp>=1.10,<2.0",
     "PyYAML>=6.0",
     "croniter",
     # Upper-bounded: tree-sitter 0.25.x + language-pack 1.x changed the grammar/
@@ -110,6 +110,8 @@ python_functions = ["test_*"]
 # Default local pytest excludes token-burning integration/browser suites.
 addopts = "-q --tb=short -m 'not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet' --durations=25 --durations-min=1.0"
 markers = [
+    "required_provider: required live canaries, derived from ProviderCanary.credential_required",
+    "optional_provider: optional live qualification, outside release prerequisites",
     "integration: real external-surface suites excluded from default local runs — the CI provider-contract lane (requires real provider API keys: OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY / MINIMAX_API_KEY / DEEPSEEK_API_KEY / CLOUDRU_FOUNDATION_MODELS_API_KEY / GIGACHAT_CREDENTIALS; opt in via `pytest -m integration`) AND the KEYLESS tests/system_e2e/ scenario lane (real isolated servers, no provider keys; additionally env-gated on OUROBOROS_E2E_DEEP)",
     "browser: launches real Playwright Chromium; excluded from default local runs, opt in via `pytest -m browser`",
     "ui_browser: launches the real Ouroboros web UI in host/direct mode; excluded from default local runs",

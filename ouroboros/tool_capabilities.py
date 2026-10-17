@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Any, Optional
 
 OWNER_DELIVERY_TOOL_NAMES: frozenset[str] = frozenset({
     "send_user_message", "send_photo", "send_video", "send_file", "send_links",
@@ -25,10 +26,11 @@ COGNITIVE_MEMORY_TOOL_NAMES: frozenset[str] = frozenset({
 })
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
+    "inspect_harness", "maintain_harness",
     "finish_task",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
-    "search_code", "query_code", "plan_task",
+    "search_code", "query_code", "query_data", "plan_task",
     "run_command", "run_script",
     "start_service", "service_status", "service_logs", "stop_service",
     "vcs_status", "vcs_diff", "vcs_commit_reviewed", "commit_reviewed",
@@ -43,8 +45,8 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "wait_task", "wait_tasks", "get_task_result",
     # Serial addressed turns: wait for an unread mailbox entry without spending
     # model rounds (slot held, clamped to the per-call ceiling, delivers nothing).
-    "await_messages",
-    # D#7 soft-join child controls (siblings of steer_task): inspect/decide a child's fate
+    "await_messages", "continue_in_background", "pause_task", "resume_task", "continue_task",
+    # D#7 soft-join child controls (siblings of tell_task): inspect/decide a child's fate
     # before finalizing (peek = pure read, discard = explicit abandon, cancel = real stop).
     "cancel_task", "peek_task", "discard_child_result", "override_delegation_constraint",
     # The same family (#1196, owner Q9): a resumed parent selects each of its OWN
@@ -59,19 +61,21 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     # (kept in the core envelope so the anti-freeze ephemeral turn never needs an
     # enable_tools detour to route — though initial_tool_schemas exposes the full
     # set today, this makes the coupling explicit).
-    "list_projects", "route_to_project", "promote_chat_to_task", "steer_task",
-    "ensure_project_scope",
+    "list_projects", "start_task", "tell_task",
+    "move_to_project",
     *COGNITIVE_MEMORY_TOOL_NAMES,
     "chronicle_write",
     "recent_tasks", "live_roots", "update_focus",
     "web_search",
     "browse_page", "browser_action", "analyze_screenshot", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
+    "generate_image", "list_image_models", "recover_image",
     *OWNER_DELIVERY_TOOL_NAMES,
     "escalate",
     "switch_model",
-    "request_restart", "promote_to_stable",
-    "preflight_review", "advisory_review", "review_status", "task_acceptance_review", "verify_and_record",
+    "request_restart", "promote_to_stable", "prepare_self_change",
+    "preflight_review", "advisory_review", "review_change", "review_status", "task_acceptance_review",
+    "verify_and_record",
     # Skill discovery and review are core authoring capabilities.
     "list_skills", "skill_review", "skill_preflight",
     "submit_skill_to_hub",
@@ -88,12 +92,13 @@ LOCAL_READONLY_SUBAGENT_MODE: str = "local_readonly_subagent"
 # knowledge notes, memory marks and chronicle drafts below. Browser interaction remains available
 # by explicit product decision, so this mode is not a remote website sandbox.
 LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    "inspect_harness",
     "finish_task",
     # switch_model changes COGNITIVE POWER, not authority: a child that started on
     # the cheap lane and finds the work harder raises itself instead of failing or
     # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
     "switch_model",
-    "read_file", "list_files", "search_code", "query_code",
+    "read_file", "list_files", "search_code", "query_code", "query_data",
     "vcs_status", "vcs_diff",
     # Memory: a child reads, writes knowledge notes and marks in its own name (the
     # host signs both with its focus) and publishes chronicle pages and parts only as
@@ -119,11 +124,11 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     # updates the existing child result through join_ledger's lineage/hash authority.
     # It has no repo/control-plane effect, so remains valid for read-only subagents.
     "tree_note", "tree_read", "override_delegation_constraint",
-    # Nanny verbs. The child gets no shell — it gets the right to ASK the host to run a
-    # session, and the host derives the access profile from THIS task's authority, so a
-    # read-only child can only ever host a read-only session. delegate_answer and
-    # delegate_message speak only to a run this task already owns (custody-gated
-    # like cancel); a message is placed into the run's live turn, never a shell.
+    # Nanny verbs grant no native child shell. A hosted session uses captured rights
+    # in an evidence-only investigation copy when the task has no product-write
+    # authority; explicit readonly, Observe and Presence ceilings still narrow it.
+    # delegate_answer/message address only this task's owned run (like cancel);
+    # speaking to its live turn grants neither shell nor candidate-apply authority.
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
     "delegate_message",
     "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
@@ -131,7 +136,7 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     # Reads this child's own callable catalog (the name-miss answer points here);
     # it grants nothing, unlike enable_tools, which stays Nano schema selection.
-    "list_available_tools",
+    "list_available_tools", "list_image_models",
 })
 
 ACTING_SUBAGENT_MODE: str = "acting_subagent"
@@ -148,12 +153,13 @@ ACTING_SUBAGENT_MODE: str = "acting_subagent"
 # integrates and is the sole committer. Extension / MCP tools are denied unless
 # explicitly granted per-child via TaskConstraint.external_tool_grants.
 ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
+    "inspect_harness",
     "finish_task",
     # switch_model changes COGNITIVE POWER, not authority: a child that started on
     # the cheap lane and finds the work harder raises itself instead of failing or
     # asking the parent to respawn it (BIBLE P5). Nothing about the sandbox changes.
     "switch_model",
-    "read_file", "list_files", "search_code", "query_code",
+    "read_file", "list_files", "search_code", "query_code", "query_data",
     "vcs_status", "vcs_diff",
     "write_file", "edit_text",
     "apply_patch", "edit_batch",
@@ -177,7 +183,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "integrate_delegated_patch",
     "web_search", "browse_page", "browser_action", "analyze_screenshot", "vlm_query", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
-    "list_available_tools",
+    "list_available_tools", "list_image_models", "generate_image", "recover_image",
 })
 
 def schema_selection_tools_for_context(ctx: object) -> frozenset[str]:
@@ -199,8 +205,9 @@ def acting_tool_names_for_context(ctx: object, registered_names: Iterable[str]) 
 
 
 READ_ONLY_PARALLEL_TOOLS: frozenset[str] = frozenset({
+    "inspect_harness",
     "read_file", "list_files",
-    "search_code", "query_code", "recent_tasks",
+    "search_code", "query_code", "query_data", "recent_tasks",
     "web_search", "chat_history",
     "vcs_status", "vcs_diff", "service_status", "service_logs",
     "get_task_result", "list_projects", "memory_read",
@@ -219,7 +226,11 @@ STATEFUL_BROWSER_TOOLS: frozenset[str] = frozenset({
     "browse_page", "browser_action",
 })
 
-# Full outputs are semantic (review verdicts, advisory findings, status).
+# Results whose complete text is semantic (review verdicts, advisory findings,
+# status). CLASSIFICATION ONLY: the Main loop no longer exempts any tool name or
+# path from the measured first-show projection (`tool_result_delivery`) -- a
+# verdict the frame cannot hold is delivered head+tail with its exact source,
+# never silently whole. Readers of these sets are tests and documentation.
 UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "commit_reviewed",
     "vcs_commit_reviewed",
@@ -227,6 +238,7 @@ UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "task_acceptance_review",
     "preflight_review",
     "advisory_review",
+    "review_change",
     "skill_review",
     "skill_owner_action",
     "review_status",
@@ -238,7 +250,8 @@ UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "memory_mark",
 })
 
-# Cognitive artifacts must not be truncated.
+# Governance sources (the required-resident books stay whole in the system
+# prompt; a tool READ of one is an ordinary result under the measured frame).
 UNTRUNCATED_REPO_READ_PATHS: frozenset[str] = frozenset({
     "BIBLE.md",
     "README.md",
@@ -247,20 +260,25 @@ UNTRUNCATED_REPO_READ_PATHS: frozenset[str] = frozenset({
     "docs/DEVELOPMENT.md",
 })
 
-# Whole DIRECTORIES whose repository reads keep the same guarantee: the runtime
-# prompts, and the two reference books' chapters. A prefix rather than a list
-# of the current chapter filenames, because a hand-maintained population is
-# exactly what goes stale when a book gains, splits or renames a chapter -- and
-# a silently capped chapter read is a partial governance source that reads like
-# a complete one. Four chapters exceed the 80,000-char `read_file` result cap.
+# Whole DIRECTORIES of the same class: the runtime prompts and the two reference
+# books' chapters. A prefix rather than a list of the current chapter filenames,
+# because a hand-maintained population is exactly what goes stale when a book
+# gains, splits or renames a chapter. Several chapters exceed 80,000 chars; a
+# chapter read the frame cannot hold is a range with an exact source, which is
+# disclosed, not a silently capped source that reads like a complete one.
 UNTRUNCATED_REPO_READ_PREFIXES: tuple[str, ...] = (
     "prompts/",
     "docs/architecture/",
     "docs/development/",
 )
 
-# Per-tool char caps; omitted tools use DEFAULT_TOOL_RESULT_LIMIT.
+# Per-tool PRODUCER page sizes; omitted tools use DEFAULT_TOOL_RESULT_LIMIT.
+# These bound what a self-paging producer emits per call (JSON pages that must
+# stay parseable, continuation cursors). They are NOT an outer cap on what Main
+# receives: the loop's first-show projection is measured per batch.
 TOOL_RESULT_LIMITS: dict[str, int] = {
+    "inspect_harness": 80_000,
+    "maintain_harness": 80_000,
     "read_file": 80_000,
     "recent_tasks": 80_000,
     "knowledge_read": 80_000,
@@ -268,6 +286,7 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     "run_script": 80_000,
     "search_code": 80_000,
     "query_code": 80_000,
+    "query_data": 80_000,
     "service_logs": 80_000,
     # Best-of-N patch comparison shows several candidate diffs side by side; the
     # default 15k cap would truncate after the first one and defeat the tool.
@@ -299,14 +318,72 @@ DEFAULT_TOOL_RESULT_LIMIT: int = 15_000
 
 
 def tool_result_limit(tool_name: str) -> int:
-    """The char budget a tool's result is delivered under.
+    """The chars a self-paging producer emits per call (always a positive int).
 
-    Read by the truncator AND by producers that must fit inside it: a tool whose payload
-    is structured JSON has to bound itself, because outer head-truncation cuts mid-string
-    and destroys the document. Both sides asking the same function is what keeps a
-    producer's idea of "small enough" from drifting away from the cap actually applied.
+    Read by producers that page themselves at the source (chat history, journal,
+    memory, delegated output, catalog pages): a structured JSON page bounds itself
+    here so its continuation cursor stays truthful. The Main loop's own delivery
+    no longer cuts at this number -- a result the measured frame cannot hold is
+    shown head+tail with its exact source by ``tool_result_delivery`` -- so a
+    producer that emits more than this is not cut mid-document by its name.
     """
     return TOOL_RESULT_LIMITS.get(str(tool_name or ""), DEFAULT_TOOL_RESULT_LIMIT)
+
+
+# Explicit first-view request a call may carry: how many chars of the head and
+# of the tail to show when the complete result cannot be delivered whole. The
+# complete result is kept as an exact source either way; these only shape the
+# first view, so every handler accepts them and none reinterprets them.
+RESULT_VIEW_HEAD_ARG = "view_head_chars"
+RESULT_VIEW_TAIL_ARG = "view_tail_chars"
+# The one schema fragment the process tools splice into their parameters.
+RESULT_VIEW_PARAMS: dict[str, dict[str, Any]] = {
+    RESULT_VIEW_HEAD_ARG: {"type": "integer", "minimum": 0, "description": (
+        "Chars of the output's head to show in this turn when the complete output cannot be "
+        "delivered whole (pair with view_tail_chars). The complete output is kept as an exact, "
+        "readable source either way; this only shapes the first view.")},
+    RESULT_VIEW_TAIL_ARG: {"type": "integer", "minimum": 0,
+                           "description": "Chars of the output's tail to show in this turn (see view_head_chars)."},
+}
+
+# Declared range parameters whose presence means the caller chose the result's
+# form (a page, a window, a cursor): such a result is a REQUESTED form that may
+# use the free room of the frame, not an unsolicited body sharing the eighth.
+EXPLICIT_RANGE_ARGS: frozenset[str] = frozenset({
+    RESULT_VIEW_HEAD_ARG, RESULT_VIEW_TAIL_ARG,
+    "max_chars", "max_lines", "start_char", "start_line",
+    "source_start_char", "source_end_char", "offset", "limit",
+})
+
+# Tools whose own affordance IS paging: selects the recovery WORDING of a
+# partial view only; it exempts nothing from source persistence.
+PAGEABLE_TOOL_RESULTS: frozenset[str] = frozenset({
+    "read_file", "chat_history", "journal_read", "tree_read", "recent_tasks", "query_code", "query_data",
+})
+
+
+def requested_result_view(tool_args: Any) -> Optional[tuple[Optional[int], Optional[int]]]:
+    """What form the call asked its result to take: ``None`` when unsolicited.
+
+    ``(head, tail)`` when the call named a head/tail view (either may be 0);
+    ``(None, None)`` when it chose a range or page through other declared range
+    parameters, so the produced form itself is the requested one.
+    """
+    if not isinstance(tool_args, dict):
+        return None
+    head, tail = tool_args.get(RESULT_VIEW_HEAD_ARG), tool_args.get(RESULT_VIEW_TAIL_ARG)
+    if head is not None or tail is not None:
+        return (_view_chars(head), _view_chars(tail))
+    if EXPLICIT_RANGE_ARGS & {str(key) for key in tool_args}:
+        return (None, None)
+    return None
+
+
+def _view_chars(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 # Reviewed mutative tools must not end with ambiguous executor timeouts.
@@ -315,12 +392,13 @@ REVIEWED_MUTATIVE_TOOLS: frozenset[str] = frozenset({
     "vcs_commit_reviewed",
 })
 
-# Foreground mutative tools may keep editing files after Python future timeout;
-# the loop must wait for terminal completion instead of returning while they run.
-# D10 retired the SDK edit gateway; publication is now the foreground mutator
-# whose remote branch/commit/PR effects must settle before control returns.
+# Foreground mutative tools may keep mutating after their soft timeout; the loop
+# joins them to terminal completion instead of returning while they still run, so
+# a file editor settles before a later call can target the same bytes. Only a
+# worker kill (Stop now, the deadline reaper, Panic) ends a hung one.
 FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
     "submit_skill_to_hub",
+    "write_file", "edit_text", "edit_batch", "apply_patch",
 })
 
 
@@ -336,10 +414,9 @@ FOREGROUND_MUTATIVE_TOOLS: frozenset[str] = frozenset({
 # verb rides the same receipt rail (``ensure_project_scope`` moves THIS task;
 # its receipt is the Started annotation and the project pointer).
 ROUTING_VERBS: dict[str, frozenset[str]] = {
-    "promote_chat_to_task": frozenset({"promote_chat_to_task"}),
-    "route_to_project": frozenset({"promote_chat_to_task", "routing_manual_target"}),
-    "steer_task": frozenset({"steer_task"}),
-    "ensure_project_scope": frozenset({"ensure_project_scope"}),
+    "start_task": frozenset({"promote_chat_to_task"}),
+    "tell_task": frozenset({"steer_task"}),
+    "move_to_project": frozenset({"ensure_project_scope"}),
 }
 
 
@@ -357,15 +434,19 @@ def routing_action_for_tool(name: object) -> str:
 # HERE, next to the routing family it extends. The registry's own
 # ``mutates_worktree`` marker is the second source for the same fact —
 # tests/test_consciousness_authority.py pins that every entry carrying it is
-# named below, so the table cannot drift away from the catalog. Publication
-# (``FOREGROUND_MUTATIVE_TOOLS``) joins the set at the authority module.
+# named below, so the table cannot drift away from the catalog. The foreground
+# set (``FOREGROUND_MUTATIVE_TOOLS``: publication and the file editors) joins it
+# at the authority module.
 OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
-    # starting or steering work (steer_task stays: the nanny of a running campaign)
-    "promote_chat_to_task", "schedule_subagent", "schedule_followup", "plan_task",
-    "route_to_project", "ensure_project_scope", "delegate_start", "initiate_presence",
+    "pause_task", "resume_task", "continue_task",
+    "maintain_harness",
+    # starting or steering work (tell_task stays: the nanny of a running campaign)
+    "start_task", "schedule_subagent", "schedule_followup", "plan_task",
+    "move_to_project", "delegate_start", "initiate_presence",
     "cancel_task", "resume_child_task", "override_delegation_constraint", "request_deep_self_review",
     # writing files, running processes, integrating patches
     "write_file", "edit_text", "apply_patch", "edit_batch",
+    "generate_image", "recover_image",
     "run_command", "run_script", "start_service", "stop_service", "verify_and_record",
     "skill_exec",  # an enabled skill's script
     # repository refs the catalog marks mutates_worktree

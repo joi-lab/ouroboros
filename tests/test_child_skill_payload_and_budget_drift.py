@@ -304,7 +304,6 @@ class TestBudgetDriftOpenRouterOnly:
         }
         import ouroboros.usage_accounting as ua
 
-        monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_a, **_k: None)
         monkeypatch.setattr(ua, "usage_writer_snapshot", lambda *_a, **_k: dict(breakdown))
         return sup_state
 

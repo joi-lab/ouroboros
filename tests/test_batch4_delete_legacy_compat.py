@@ -25,6 +25,7 @@ from supervisor.worker_assignment import _claim_worker_launch
 from tests.test_g1_followup_policy import (  # noqa: F401
     world, register, row, restore, stop, ORIGIN, BINDING, DEADLINE, _assignment_world,
 )
+from tests._store_shared import delete_result
 
 pytestmark = pytest.mark.serial
 PAST = '2000-01-01T00:00:00+00:00'
@@ -171,7 +172,7 @@ def test_a_pending_delete_is_not_kept_forever_by_collected_history(world, monkey
     assert _delete(root, sid)['status'] == 'delete_deferred'
     path = root / 'task_results' / (task['id'] + '.json')
     if result == 'collected':
-        path.unlink()  # retention removed settled history; no queue holds the task
+        delete_result(root, task['id'])  # retention removed settled history; no queue holds the task
     else:
         path.write_text('{torn')  # unknown stays unknown
     queue.check_scheduled_tasks()

@@ -14,9 +14,10 @@ resolve a live direct turn through — so a turn the task list shows as
 running is addressable, and custody stops it COOPERATIVELY (the finalize
 control on the canonical owner mailbox; there is no worker process to kill).
 
-The two ``orphan`` cases at the top keep the honest legacy envelope for a
-durable running row that NOTHING owns (no queue row, no worker, no live
-chat turn): that is still 404, because there is nothing to stop.
+The two ``orphan`` cases at the top pin the Stop of a durable running row
+that NOTHING owns (no queue row, no worker, no live chat turn): the intent is
+recorded first and custody's miss lane settles the stuck row ``cancelled``,
+as the agent's ``cancel_task`` does — never a 404 that leaves it running.
 """
 
 from __future__ import annotations
@@ -97,13 +98,17 @@ def _mailbox_kinds(tmp_path, task_id=TURN_ID):
     return [json.loads(line).get("kind") for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-# --- the honest residual: a running row that nothing owns ----------------------
+# --- a running row that nothing owns is stuck, and Stop settles it -------------
 
 @pytest.mark.parametrize("snapshot", ["absent", "fresh_without_row"])
-def test_orphaned_running_row_keeps_the_404_envelope(tmp_path, monkeypatch, snapshot):
+def test_orphaned_running_row_is_settled_cancelled_by_stop(tmp_path, monkeypatch, snapshot):
     """No queue row, no worker slot, no live chat turn: listed by the durable
-    mirror (until the orphan projection catches it) but there is nothing to
-    stop, so the cancel ingress keeps its legacy 404."""
+    mirror (until the orphan projection catches it) with nothing behind it.
+    Stop records its intent first and custody's miss lane settles the row
+    ``cancelled`` (the agent tool's behaviour), instead of a 404 that left it
+    listed as running."""
+    from ouroboros.cancel_intents import active_intent
+
     _isolate_queue(monkeypatch, tmp_path)
     write_task_result(tmp_path, TURN_ID, "running", chat_id=0, description="orphan")
     if snapshot == "fresh_without_row":
@@ -114,7 +119,10 @@ def test_orphaned_running_row_keeps_the_404_envelope(tmp_path, monkeypatch, snap
         cancel = client.post(f"/api/tasks/{TURN_ID}/cancel")
 
     assert [row["task_id"] for row in listed["tasks"]] == [TURN_ID]
-    assert cancel.status_code == 404
+    assert cancel.status_code == 200, cancel.text
+    assert cancel.json() == {"ok": True, "task_id": TURN_ID}
+    assert load_task_result(tmp_path, TURN_ID)["status"] == "cancelled"
+    assert not active_intent(tmp_path, TURN_ID)
 
 
 def test_running_row_present_in_queue_is_cancellable(tmp_path, monkeypatch):
@@ -198,11 +206,11 @@ def test_stop_now_finalizes_the_direct_turn_cooperatively_and_answers_ok(tmp_pat
     assert not active_intent(tmp_path, TURN_ID)
 
 
-def test_stop_now_on_a_turn_inside_a_long_step_answers_still_live_and_keeps_the_stop_armed(tmp_path, monkeypatch):
+def test_stop_now_on_a_turn_inside_a_long_step_answers_pending_and_keeps_the_stop_armed(tmp_path, monkeypatch):
     """A turn that has not reached a round boundary within the wait bound:
-    503 "still live", the durable row is NOT rewritten as cancelled (the
-    miss finalizer must never run for a live turn), the control stays in
-    the mailbox and the intent stays open for the sweep's next custody pass."""
+    202 pending, the durable row is NOT rewritten as cancelled (the miss
+    finalizer must never run for a live turn), the control stays in the
+    mailbox and the intent stays open for the sweep's next custody pass."""
     import ouroboros.config as config
 
     _isolate_queue(monkeypatch, tmp_path)
@@ -215,13 +223,13 @@ def test_stop_now_on_a_turn_inside_a_long_step_answers_still_live_and_keeps_the_
     with _client(tmp_path) as client:
         cancel = client.post(f"/api/tasks/{TURN_ID}/cancel", json={"stop_policy": "immediate"})
 
-    assert cancel.status_code == 503, cancel.text
-    assert "still live" in cancel.json()["error"]
+    assert cancel.status_code == 202, cancel.text
+    assert cancel.json()["cancel_state"] == "pending"
     assert load_task_result(tmp_path, TURN_ID)["status"] == "running"
     assert "finalize_now" in _mailbox_kinds(tmp_path)
     from ouroboros.cancel_intents import active_intent
 
-    assert active_intent(tmp_path, TURN_ID)
+    assert active_intent(tmp_path, TURN_ID)["request_id"] == cancel.json()["request_id"]
 
 
 def test_wrap_up_arms_the_owner_stop_episode_for_the_direct_turn(tmp_path, monkeypatch):
@@ -346,7 +354,7 @@ def test_stop_now_on_a_turn_that_already_ended_arms_nothing_and_answers_already_
 
     def _turn_ends_after_custody_captured(task_id=""):
         reads["n"] += 1
-        if reads["n"] == 3:  # ownership predicate, custody capture, then the lane's re-check
+        if reads["n"] == 2:  # custody capture, then the lane's re-check (no pre-probe: the row is unsettled)
             write_task_result(tmp_path, TURN_ID, "completed", chat_id=0, description="modify yourself")
             agent._busy = False
         return real_reader(task_id)
@@ -406,8 +414,8 @@ def test_settled_row_does_not_hide_a_still_busy_direct_turn_from_custody(tmp_pat
     """Scope-review finding: the pipeline persists the terminal BEFORE post-task
     cognition, so a direct turn can be settled on disk and still busy (and
     spending). Custody must not take the settled fast path past a live turn:
-    it arms the stop and answers "still live" until the agent is really done,
-    then settles already_settled against the stored terminal."""
+    it arms the stop and answers pending until the agent is really done, then
+    settles already_settled against the stored terminal."""
     import ouroboros.config as config
 
     _isolate_queue(monkeypatch, tmp_path)
@@ -417,7 +425,8 @@ def test_settled_row_does_not_hide_a_still_busy_direct_turn_from_custody(tmp_pat
     monkeypatch.setattr(config, "get_direct_turn_stop_wait_sec", lambda: 0.3)
     with _client(tmp_path) as client:
         first = client.post(f"/api/tasks/{TURN_ID}/cancel", json={"stop_policy": "immediate"})
-        assert first.status_code == 503, first.text          # armed, still busy
+        assert first.status_code == 202, first.text          # armed, still busy
+        assert first.json()["cancel_state"] == "pending"
         assert "finalize_now" in _mailbox_kinds(tmp_path)
         agent._busy = False                                    # the turn ends; no synthesis in flight
         second = client.post(f"/api/tasks/{TURN_ID}/cancel", json={"stop_policy": "immediate"})
@@ -536,16 +545,14 @@ def _inflight_synthesis(monkeypatch, tmp_path, task_id=TURN_ID):
             if name == "scratchpad_consolidation":
                 arrived.set()
                 assert release.wait(30), "stage gate never released"
-            return {"reflection": "x", "backlog_candidates": [], "memory_actions": []} if name == "reflection" else None
+            return None
         return _f
 
     monkeypatch.setattr(llm_mod, "LLMClient", lambda *a, **k: object())
     for name, attr in (("scratchpad_consolidation", "_run_scratchpad_consolidation"),
-                       ("facts", "_record_task_facts"), ("reflection", "_run_reflection"),
-                       ("promotion", "_update_improvement_backlog")):
+                       ("facts", "_record_task_facts")):
         monkeypatch.setattr(pipeline, attr, _stage(name))
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *a, **k: None)
-    monkeypatch.setattr(pte, "maybe_promote", lambda *a, **k: None)
+    monkeypatch.setattr(pte, "maybe_promote", _stage("promotion"))
     spawned = []
     _real_thread = threading.Thread
 
@@ -556,7 +563,7 @@ def _inflight_synthesis(monkeypatch, tmp_path, task_id=TURN_ID):
 
     monkeypatch.setattr(pipeline.threading, "Thread", CapturingThread)
     pipeline._run_post_task_processing_async(
-        env, task, {"rounds": 3, "cost": 0.01}, {"tool_calls": [], "reasoning_notes": []}, {}, tmp_path / "logs")
+        env, task, {"rounds": 3, "cost": 0.01}, {"tool_calls": [], "reasoning_notes": []}, tmp_path / "logs")
     assert arrived.wait(30), "the synthesis never reached its first paid stage"
     return SimpleNamespace(thread=spawned[0], release=release, calls=calls)
 
@@ -583,7 +590,7 @@ def test_live_ownership_holds_through_the_inflight_synthesis_and_ends_with_its_c
 def test_stop_now_during_the_inflight_synthesis_is_accepted_and_stops_the_remaining_paid_stages(tmp_path, monkeypatch):
     """The audit-point-4 class, end to end over the UI's endpoint: the turn's
     answer has landed and only its paid synthesis is running. Stop-now is
-    ACCEPTED (typed 503 "still live", the durable immediate intent minted and
+    ACCEPTED (typed 202 pending, the durable immediate intent minted and
     left open by custody — never 404), the pipeline's per-stage gate then
     skips every remaining paid stage and discloses them; the next stop after
     the checkpoint settled answers the honest 404 with the intent drained."""
@@ -599,8 +606,8 @@ def test_stop_now_during_the_inflight_synthesis_is_accepted_and_stops_the_remain
     try:
         with _client(tmp_path) as client:
             first = client.post(f"/api/tasks/{TURN_ID}/cancel", json={"stop_policy": "immediate"})
-            assert first.status_code == 503, first.text
-            assert "still live" in first.json()["error"], first.text
+            assert first.status_code == 202, first.text
+            assert first.json()["cancel_state"] == "pending", first.text
             intent = active_intent(tmp_path, TURN_ID) or {}
             assert intent.get("state") == INTENT_REQUESTED, intent
             assert "post-task synthesis" in str(intent.get("last_error") or ""), intent
@@ -618,7 +625,7 @@ def test_stop_now_during_the_inflight_synthesis_is_accepted_and_stops_the_remain
     checkpoint = stored["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded", checkpoint
     assert checkpoint["post_task_stop_reason"] == (
-        "owner_stopped:skipped=reflection,promotion"), checkpoint
+        "owner_stopped:skipped=promotion"), checkpoint
     assert not active_intent(tmp_path, TURN_ID)
 
 
@@ -627,8 +634,8 @@ def test_cascade_stop_now_during_the_inflight_synthesis_keeps_the_intent_open_an
     audit-point-4 state must hold over the CASCADE path too: the turn's answer
     landed (stored ``completed``, no queue row, no busy agent) and only its paid
     synthesis is running. The cascade's PHYSICAL postcondition must see the
-    in-flight synthesis as live — the answer is the single lane's typed 503
-    "still live", the cascade-scope immediate intent stays OPEN for the
+    in-flight synthesis as live — the answer is the typed 202 pending, the
+    cascade-scope immediate intent stays OPEN for the
     pipeline's per-stage gate, and the remaining paid stages are skipped.
     (rc.15 review MAJOR 1: the postcondition re-judged custody's refusal
     against the stored ``completed`` alone, settled the intent and answered
@@ -647,8 +654,8 @@ def test_cascade_stop_now_during_the_inflight_synthesis_keeps_the_intent_open_an
     try:
         with _client(tmp_path) as client:
             first = client.post(f"/api/tasks/{TURN_ID}/cancel", json=body)
-            assert first.status_code == 503, first.text
-            assert "still live" in first.json()["error"], first.text
+            assert first.status_code == 202, first.text
+            assert first.json()["cancel_state"] == "pending", first.text
             intent = active_intent(tmp_path, TURN_ID) or {}
             assert intent.get("state") == INTENT_REQUESTED, intent
             assert intent.get("scope") == SCOPE_CASCADE, intent
@@ -668,5 +675,5 @@ def test_cascade_stop_now_during_the_inflight_synthesis_keeps_the_intent_open_an
     checkpoint = stored["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded", checkpoint
     assert checkpoint["post_task_stop_reason"] == (
-        "owner_stopped:skipped=reflection,promotion"), checkpoint
+        "owner_stopped:skipped=promotion"), checkpoint
     assert not active_intent(tmp_path, TURN_ID)

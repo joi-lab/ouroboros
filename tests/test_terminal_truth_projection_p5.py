@@ -52,7 +52,7 @@ def test_both_real_are_stated_in_one_line_separated_by_a_middle_dot() -> None:
         delegated_runs_unreconciled=["run-a1", "run-b2"],
         outcome_axes={"execution": {"status": "failed", "reason_code": "provider_unavailable"}},
     )
-    assert _completion_verdict(both, {}) == f"The model provider stopped answering, so the task could not finish · {CUSTODY_SENTENCE}"
+    assert _completion_verdict(both, {}) == f"The task could not get a usable model answer, so it could not finish · {CUSTODY_SENTENCE}"
 
 
 def test_a_healed_debt_with_no_execution_cause_states_nothing() -> None:
@@ -116,7 +116,7 @@ def test_a_healed_debt_is_never_resurrected_by_its_own_frozen_warning() -> None:
     railed = _row(outcome_axes=custody_debt_axes(
         {"execution": {"status": "failed", "reason_code": "provider_unavailable"}}),
         delegated_runs_unreconciled=[])
-    assert _completion_verdict(railed, {}) == "The model provider stopped answering, so the task could not finish."
+    assert _completion_verdict(railed, {}) == "The task could not get a usable model answer, so it could not finish."
 
 
 _DEFERRED_BESIDE_PLAN = {
@@ -148,7 +148,7 @@ def test_an_open_plan_review_is_stated_beside_the_child_fact() -> None:
         "review": {"status": "degraded", "acceptance_decision": {
             "status": "finalized_unaccepted", "reason": "review_skipped_deadline_reserve"}}}}
     assert _completion_verdict(reviewed, {}) == (
-        f"{TASK_CAUSE_PHRASES['review_skipped_deadline_reserve'][:-1]} · {_CHILD_CLAUSE} · "
+        f"{_CHILD_CLAUSE} · {TASK_CAUSE_PHRASES['review_skipped_deadline_reserve'][:-1]} · "
         f"{TASK_CAUSE_PHRASES['terminal_plan_review_open']}.")
 
 
@@ -207,7 +207,7 @@ def test_a_held_task_never_says_the_work_went_on(source, reason, sentence) -> No
     other = {"status": "failed", "reason_code": "provider_unavailable",
              "outcome_axes": {"execution": {"status": "failed", "reason_code": "provider_unavailable"},
                               "objective": {"status": "fail", "source": "task_acceptance_review"}}}
-    assert _completion_verdict(other, {}) == "The model provider stopped answering, so the task could not finish."
+    assert _completion_verdict(other, {}) == "The task could not get a usable model answer, so it could not finish."
 
 
 def test_the_event_and_the_row_render_one_reason_line_over_the_shared_fixture() -> None:
@@ -230,7 +230,7 @@ def test_the_event_and_the_row_render_one_reason_line_over_the_shared_fixture() 
     fixture = (pathlib.Path(__file__).resolve().parents[1]
                / "web" / "tests" / "fixtures" / "outcome_phase_parity.json")
     cases = json.loads(fixture.read_text(encoding="utf-8"))["cases"]
-    asserted = [case for case in cases if case.get("acceptance_clause")]
+    asserted = [case for case in cases if "acceptance_clause" in case]
     assert len(asserted) >= 5, "the fixture lost its cause-line cases"
     for case in asserted:
         record, clause = case["record"], case["acceptance_clause"]

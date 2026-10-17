@@ -15,6 +15,9 @@ from typing import Any, Dict, Optional
 
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.git_plumbing import _sanitize_git_error
+from ouroboros.tools.tool_result import (
+    ToolResult, _publish_tool_result, _published_tool_result, _replace_tool_result,
+)
 
 log = logging.getLogger("ouroboros.tools.git")
 
@@ -305,10 +308,10 @@ def _preserve_evolution_orphan(
             "The index and worktree were left untouched for lossless recovery."
         )
     except Exception as exc:
-        return (
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(
             "⚠️ EVOLUTION_ORPHAN_CONTAINMENT_FAILED: normal publication remains blocked, "
             f"but the active ref could not be reset safely ({_sanitize_git_error(str(exc))})."
-        )
+        )))
 
 
 def _record_evolution_commit_receipt(
@@ -352,6 +355,23 @@ def _record_evolution_commit_receipt(
     return message
 
 
+def _evolution_test_publication_stop(ctx: ToolContext, commit_sha: str, test_warning: str) -> str:
+    """Withhold an evolution push that lacks full green proof of this exact commit.
+
+    Unlike lost authority this keeps the reviewed commit's provenance and settles the
+    attempt; only publication waits, and adoption still refuses the commit without it.
+    """
+    if str(ctx.current_task_type or "") != "evolution":
+        return ""
+    from ouroboros.preflight_qualification import full_proof_error
+
+    error = test_warning or full_proof_error(ctx, ctx.repo_dir, commit_sha)
+    if not error:
+        return ""
+    ctx.last_push_succeeded = False
+    return f" [EVOLUTION_PUBLICATION_STOPPED: {error.strip()}; the reviewed commit stays local, nothing was pushed]"
+
+
 def _evolution_publication_stopped_result(
     ctx: ToolContext, commit_message: str, commit_sha: str, test_warning: str,
     created_tag: str = "", started_at: float = 0.0,
@@ -386,4 +406,9 @@ def _evolution_publication_stopped_result(
         scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
         degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
     )
+    # Preserve the containment producer's native fault through the publication
+    # wrapper; an authority refusal alone remains blocked after partial effects.
+    containment_result = _published_tool_result(ctx, None)
+    if isinstance(containment_result, ToolResult) and containment_result.text == containment:
+        return _publish_tool_result(ctx, _replace_tool_result(containment_result, text=message))
     return message

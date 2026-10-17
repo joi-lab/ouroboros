@@ -23,8 +23,10 @@ NOTICE = "Plan review remained open.\n\n⚠️ Deferred child result: child1."
 # The owner's incident decision, fed to the real producer
 # (ouroboros/owner_hurry.py plan_review_disclosure) rather than to a copied string.
 ADVISORY_PLAN_DECISION = {
-    "required": True, "status": "open", "outcome": "DEGRADED",
-    "enforcement": "advisory", "allow": True,
+    "required": True, "status": "objections_open", "enforcement": "advisory", "allow": True,
+    "open_objections": [{"seat_id": "triad_a", "id": "o1", "text": "the bar is too low", "holds": True,
+                         "not_adjudicated": False, "ask_id": "a1", "revision": 1}],
+    "holding": ["triad_a:o1"], "pending_asks": [], "asks_dispatched": 1, "force_plan_met": True, "revision": 1,
 }
 
 
@@ -165,6 +167,10 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
         )
 
     monkeypatch.setattr(rs, "run_review_request", review)
+    # Auto reviews the author's typed nomination, never the declared expected_output (#1731).
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
+
+    _nominate_acceptance(trace, task_id="parent1", subject=ANSWER)
 
     def finalize():
         result = loop._no_tool_final_answer(ANSWER, ctx, trace, tools, queue.Queue(), set(), lambda _t: None)
@@ -174,7 +180,12 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
         return result
 
     first = finalize()
-    assert (first is None) is (verdict == "FAIL")  # A real FAIL still requests its ordinary improvement.
+    # A real FAIL still requests its ordinary improvement; a clean PASS also reaches
+    # the author once before delivery (G1 #1737/D12: review before decision).
+    assert first is None
+    from ouroboros.acceptance_settlement import expose_acceptance_feedback
+
+    expose_acceptance_feedback(trace, ctx.messages, "parent1")  # the next Main request carried it
     candidate = tools._ctx._delivery_candidate
     assert finalize() is not None  # An unchanged answer reuses the verdict; its notice cannot demand a rewrite.
     binding = dict(candidate.acceptance_binding)

@@ -168,6 +168,16 @@ def _bound_project_id(task_id: str) -> str:
         return ""
 
 
+def placed_project_id(ctx: Any) -> Any:
+    """Resolve the current memory room without changing execution context fields."""
+    from ouroboros.projects_registry import project_id_for_task
+    from ouroboros.tool_access import canonical_data_root
+
+    tid = str(getattr(ctx, "task_id", "") or "")
+    bound = project_id_for_task(canonical_data_root(ctx), tid, strict=True) if tid else ""
+    return bound or getattr(ctx, "project_id", "")
+
+
 def resolve_project_id(task: Dict[str, Any]) -> str:
     """Resolve a task's project id (S7): the DURABLE binding wins (owner decision
     B4=A - a "turn into project" conversion never reaches a running worker, so the

@@ -60,7 +60,7 @@ def test_ceiling_compiles_exact_tools_scripts_resources_and_digest():
 
     # The profile selected chat_history and one script; the cognitive baseline
     # (own memory, no new authority) and the own-work baseline (this binding's
-    # readers, host-bound to its scope, and steer_task) are compiled in beside them.
+    # readers, host-bound to its scope, and tell_task) are compiled in beside them.
     assert [grant.name for grant in ceiling.tool_grants] == [
         "chat_history",
         "get_task_result",
@@ -71,16 +71,16 @@ def test_ceiling_compiles_exact_tools_scripts_resources_and_digest():
         "memory_read",
         "recent_tasks",
         "skill_exec",
-        "steer_task",
+        "tell_task",
         "update_identity",
         "update_scratchpad",
     ]
     scoped = {grant.name: [(item.argument_path, item.static_value) for item in grant.bindings]
-              for grant in ceiling.tool_grants if grant.name in {"get_task_result", "recent_tasks", "steer_task"}}
+              for grant in ceiling.tool_grants if grant.name in {"get_task_result", "recent_tasks", "tell_task"}}
     assert scoped == {
         "get_task_result": [(("presence_scope",), "own_binding")],
         "recent_tasks": [(("presence_scope",), "own_binding")],
-        "steer_task": [],
+        "tell_task": [],
     }
     script = next(grant for grant in ceiling.tool_grants if grant.name == "skill_exec")
     assert [(item.argument_path, item.static_value) for item in script.bindings] == [
@@ -251,7 +251,7 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
         "memory_mark",
         "memory_read",
         "recent_tasks",
-        "steer_task",
+        "tell_task",
         "update_identity",
         "update_scratchpad",
     }
@@ -278,7 +278,7 @@ def test_registry_filters_schema_dispatch_and_resolved_targets(tmp_path):
     )
     assert registry.execute(
         "read_file", {"root": "active_workspace", "path": "shared/allowed.txt"}
-    ).endswith("\nok")
+    ).endswith("\tok")
 
 
 def test_presence_argument_bindings_override_model_supplied_values(tmp_path):

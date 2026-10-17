@@ -29,6 +29,7 @@ from tests._skill_review_shared import (
     _pass_array_for_script_skill,
     _patch_review,
 )
+from tests.review_pool_rosters import set_review_pool
 
 
 def test_review_skill_prompt_includes_rebuttal_and_history(tmp_path, monkeypatch):
@@ -65,32 +66,10 @@ def test_review_skill_prompt_includes_rebuttal_and_history(tmp_path, monkeypatch
 
 
 def test_review_skill_quorum_failure_on_one_responder(tmp_path, monkeypatch):
-    import ouroboros.skill_review_prompt as skill_review_prompt
-
     skills_root = _build_skill(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setattr(
-        "ouroboros.config.get_review_models",
-        lambda: [
-            "openai/gpt-5.5",
-            "google/gemini-3.5-flash",
-            "anthropic/claude-opus-4.6",
-        ],
-    )
+    set_review_pool(monkeypatch, ["openai/gpt-5.5", "google/gemini-3.5-flash", "anthropic/claude-opus-4.6"])
     ctx = _make_ctx(tmp_path)
-    advisory_evidence = {
-        "status": "completed",
-        "model": "claude-opus",
-        "session_id": "sess-skill",
-        "raw_result": "advisory raw",
-    }
-    # The advisory pre-review moved to the prompt owner with the per-attempt
-    # assembly that calls it; patch it where that caller reads it.
-    monkeypatch.setattr(
-        skill_review_prompt,
-        "_run_skill_advisory_pre_review",
-        lambda *args, **kwargs: dict(advisory_evidence),
-    )
     prior_hash = compute_content_hash(skills_root / "weather")
     save_review_state(
         ctx.drive_root,
@@ -127,7 +106,7 @@ def test_review_skill_quorum_failure_on_one_responder(tmp_path, monkeypatch):
         outcome = review_skill(ctx, "weather")
     assert outcome.status == "pending"
     assert "quorum" in outcome.error.lower()
-    assert outcome.advisory_result == advisory_evidence
+    assert outcome.advisory_result == {}  # no advisory critic feeds the skill reviewer (3A)
     persisted = load_review_state(ctx.drive_root, "weather")
     assert persisted.status == "clean"
     assert persisted.content_hash == prior_hash
@@ -159,12 +138,11 @@ def test_review_skill_missing_skill_returns_pending_with_error(tmp_path, monkeyp
 
 
 def test_review_skill_malformed_reviewer_slots_block_before_any_reviewer(tmp_path, monkeypatch):
-    """#116: a malformed OUROBOROS_REVIEWER_SLOTS keeps the skill honestly
-    PENDING with the precise parse error — the reviewer wave is never
-    dispatched on the silently projected default panel."""
+    """#116: a malformed catalog (the review pool's SSOT) keeps the skill honestly
+    PENDING with the precise parse error — the reviewer wave is never dispatched."""
     skills_root = _build_skill(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
-    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", "{broken")
+    monkeypatch.setenv("OUROBOROS_SUBAGENTS", "{broken")
     ctx = _make_ctx(tmp_path)
 
     with patch(
@@ -174,7 +152,7 @@ def test_review_skill_malformed_reviewer_slots_block_before_any_reviewer(tmp_pat
         outcome = review_skill(ctx, "weather")
 
     assert outcome.status == "pending"
-    assert "invalid reviewer-slot configuration blocks skill review" in outcome.error
+    assert "invalid review pool configuration blocks skill review" in outcome.error
     assert "not valid JSON" in outcome.error
 
 
@@ -365,14 +343,19 @@ def test_skill_review_does_not_block_text_by_scary_filename(tmp_path):
     assert descriptor is None
 
 
-def test_skill_review_session_prompt_allows_binary_inspection():
-    """X4/В21 leg 3: the agent_session reviewer's retrieval assignment tells it
-    that descriptor-only binary files may be inspected with its own tools."""
-    from ouroboros.skill_review_passes import _SESSION_RETRIEVAL
+def test_skill_review_retrieving_assignment_allows_binary_inspection():
+    """X4/В21 leg 3: a retrieving reviewer is told that a binary file is only its
+    descriptor in the pack or index and that the frozen copy lets it inspect the
+    file itself — a descriptor never claims its bytes were inspected."""
+    from ouroboros.skill_review_passes import _PAYLOAD_INLINE, _PAYLOAD_SOURCES, _SESSION_RETRIEVAL
 
-    assert "{path,size,mime_from_name,sha256}" in _SESSION_RETRIEVAL
-    assert "your own read/search tools" in _SESSION_RETRIEVAL
-    assert "judge by the descriptor" in _SESSION_RETRIEVAL
+    assert "{{path,size,mime_from_name,sha256}}" in _PAYLOAD_INLINE
+    assert "{path,size,mime_from_name,sha256}" in _PAYLOAD_INLINE.format(
+        content_hash="h", address="the copy")
+    assert "may be inspected there" in _PAYLOAD_INLINE and "inspect it there" in _PAYLOAD_SOURCES
+    assert "say in the finding which you did" in _PAYLOAD_INLINE
+    assert "never the mutable skill_dir path" in _PAYLOAD_SOURCES
+    assert "Read the governance and host-contract sources in {repository}" in _SESSION_RETRIEVAL
 
 
 
@@ -493,8 +476,13 @@ def test_review_skill_prompt_loads_core_governance_artifacts(tmp_path, monkeypat
     """DEVELOPMENT.md 'When adding a new reasoning flow' rule requires
     ARCHITECTURE.md and DEVELOPMENT.md to appear in the assembled skill
     review prompt. Regression guard for Phase 3 round 6 finding."""
+    from tests.review_pool_rosters import pool_roster, pool_seat
+
     skills_root = _build_skill(tmp_path)
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
+    # One natively retrieving seat beside one packet seat: both deliveries are asserted.
+    set_review_pool(monkeypatch, pool_roster(pool_seat("review-1", "openai/gpt-5.5", delivery="native"),
+                                             pool_seat("review-2", "google/gemini-3.5-flash")))
     ctx = _make_ctx(tmp_path)
 
     captured = {}
@@ -528,10 +516,15 @@ def test_review_skill_prompt_loads_core_governance_artifacts(tmp_path, monkeypat
     assert "BIBLE.md" in prompt, (
         "skill review prompt must cite BIBLE.md for constitutional context"
     )
-    session_task = captured["delivery"]["session_task"]
-    assert prompt[captured["stable_prefix_len"]:] in session_task
-    assert "## Governance context — docs/ARCHITECTURE.md" not in session_task
-    assert "docs/CHECKLISTS.md" in session_task and "docs/CREATING_SKILLS.md" in session_task
+    # Every retrieving seat gets its own task: the dynamic tail with the whole
+    # payload (it fits), never the inlined books, plus the reading it is owed.
+    plan = captured["delivery"].get("row_plan") or {}
+    session_tasks = [task for task in plan.get("session_tasks") or [] if task]
+    assert len(session_tasks) == sum(bool(flag) for flag in plan.get("retrieves") or []) > 0
+    for session_task in session_tasks:
+        assert prompt[captured["stable_prefix_len"]:] in session_task
+        assert "## Governance context — docs/ARCHITECTURE.md" not in session_task
+        assert "docs/CHECKLISTS.md" in session_task and "docs/CREATING_SKILLS.md" in session_task
     # Minimal content-presence check: Section 10 key-invariants header is
     # referenced by label, and the actual body should appear (shipping
     # repo has the canonical text there).
@@ -628,3 +621,23 @@ def test_skill_governance_discloses_unavailable_book_without_partial_body(tmp_pa
     assert "OMISSION" in text and "docs/ARCHITECTURE.md" in text
     assert "runtime.md" in text
     assert "Entrypoint body must not stand in" not in text
+
+
+def test_skill_review_prompt_includes_minimal_host_context(tmp_path):
+    import ouroboros.skill_review as skill_review
+
+    prompt, _stable_len = skill_review._build_review_prompt(
+        "demo",
+        tmp_path / "demo",
+        "{}",
+        "hash",
+        "plugin.py\nprint('ok')",
+    )
+
+    assert "docs/CREATING_SKILLS.md" in prompt
+    assert "ouroboros/contracts/plugin_api.py" in prompt
+    assert "ouroboros/extension_ui_validation.py" in prompt
+    assert "### ouroboros/extension_loader.py" not in prompt
+    assert "### web/modules/widgets.js" not in prompt
+    # No advisory critic feeds the skill reviewer, so no advisory evidence block exists.
+    assert "Advisory Pre-Review" not in prompt

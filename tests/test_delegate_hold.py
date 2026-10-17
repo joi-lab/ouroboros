@@ -24,6 +24,7 @@ from ouroboros.delegate_shared import _fail, delegate_result
 from ouroboros.delegate_supervision import read_unknown_hold, write_unknown_hold
 from ouroboros.loop import run_llm_loop
 from ouroboros.tools.registry import ToolRegistry
+from tests.test_subscription_main_wait import _without_context_facts
 
 
 def _wake(payload):
@@ -64,12 +65,14 @@ def _quiet_probe(monkeypatch):
 
     monkeypatch.setattr(daemon_mod, "ensure_owned_gateway",
                         lambda **_k: SimpleNamespace(close=lambda: None), raising=False)
+    monkeypatch.setattr(daemon_mod, "read_owned_gateway",  # the loop exit attaches only
+                        lambda **_k: SimpleNamespace(close=lambda: None), raising=False)
     monkeypatch.setattr(
         progress_mod, "bounded_poll",
         lambda _gw, _run, _sec, **_k: {"summary": {"state": "running"}, "lastSeq": 1},
     )
     released = []
-    monkeypatch.setattr(custody, "release_task_runs", lambda root, tid: released.append(tid))
+    monkeypatch.setattr(custody, "release_task_runs", lambda root, tid, **_k: released.append(tid))
     yield released
 
 
@@ -124,8 +127,8 @@ def test_unknown_with_live_leaf_holds_and_resumes_with_wake(tmp_path, monkeypatc
                         lambda _ctx, delivered=None: acks.append(delivered) or True)
 
     def check(messages, accumulated_usage):
-        assert "[DELEGATED LEAF WAKE / UNKNOWN-HOLD RESUME]" in messages[-1]["content"]
-        assert "run-leaf" in messages[-1]["content"]
+        assert "[DELEGATED LEAF WAKE / UNKNOWN-HOLD RESUME]" in _without_context_facts(messages)[-1]["content"]
+        assert "run-leaf" in _without_context_facts(messages)[-1]["content"]
         accumulated_usage.pop("_last_llm_error_kind", None)
         return {"role": "assistant", "content": "integrated"}, 0.0
 
@@ -630,7 +633,7 @@ def test_transport_dead_observation_keeps_the_hold_instead_of_a_refused_exit(
     monkeypatch.setattr(gateway_module, "ClaudexorGateway", lambda: _Gateway())
 
     def check(messages, accumulated_usage):
-        assert "[DELEGATED LEAF WAKE / UNKNOWN-HOLD RESUME]" in messages[-1]["content"]
+        assert "[DELEGATED LEAF WAKE / UNKNOWN-HOLD RESUME]" in _without_context_facts(messages)[-1]["content"]
         accumulated_usage.pop("_last_llm_error_kind", None)
         return {"role": "assistant", "content": "integrated"}, 0.0
 

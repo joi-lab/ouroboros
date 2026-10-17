@@ -482,10 +482,11 @@ def test_supervisor_sweep_wiring_passes_a_zero_wait_factory(monkeypatch):
     captured: dict = {}
 
     def fake_reconcile(
-        drive_root, *, running_task_ids, gateway_factory, recoverable_task_ids,
+        drive_root, *, running_task_ids, gateway_factory, recoverable_task_ids, replay_pending,
     ):
         captured["factory"] = gateway_factory
         captured["recoverable_task_ids"] = set(recoverable_task_ids)
+        captured["replay_pending"] = replay_pending
         return []
 
     ensure_calls: list = []
@@ -502,3 +503,4 @@ def test_supervisor_sweep_wiring_passes_a_zero_wait_factory(monkeypatch):
     with pytest.raises(ClaudexorUnavailable):
         captured["factory"]()
     assert ensure_calls == [0]  # the sweep's posture: skip until the next tick
+    assert captured["replay_pending"]() is True  # an admitted sweep may replay an ended task's pending start

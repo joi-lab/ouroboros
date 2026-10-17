@@ -16,8 +16,11 @@ import json
 from types import SimpleNamespace
 
 from ouroboros.gateway.tasks import api_task_get, api_tasks_list
+from ouroboros.store_import import ensure_current_store
 from ouroboros.task_results import write_task_result
 from ouroboros.utils import utc_now_iso
+from tests._shared import write_queue_document
+from tests._store_shared import delete_result, seed_result
 
 
 def _request(data, **params):
@@ -36,19 +39,15 @@ def _get_tasks(data, **params):
 def _write_raw(data, task_id, **fields):
     results = data / "task_results"
     results.mkdir(parents=True, exist_ok=True)
-    (results / f"{task_id}.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": task_id, **fields}), encoding="utf-8"
-    )
+    seed_result(data, task_id, {"_schema_version": 1, "task_id": task_id, **fields})
 
 
 def _seed_queue_snapshot(data):
-    # A FRESH ``ts``: an empty snapshot only proves a running row is orphaned
+    # A FRESH liveness stamp: an empty snapshot only proves a running row is orphaned
     # while it is still current — an undated or out-of-date snapshot fails open
     # toward liveness (GR7-1a), and the orphan projection would never run.
     (data / "state").mkdir(parents=True, exist_ok=True)
-    (data / "state" / "queue_snapshot.json").write_text(
-        json.dumps({"ts": utc_now_iso(), "pending": [], "running": []}), encoding="utf-8"
-    )
+    write_queue_document(data / "state" / "queue_snapshot.json", {"ts": utc_now_iso(), "pending": [], "running": []})
 
 
 def test_default_limit_50_cap_500_and_limit_0_returns_all(tmp_path):
@@ -104,82 +103,37 @@ def test_rows_without_raw_ts_sort_last_with_filename_tiebreak(tmp_path):
     assert all_rows == ["with-ts", "nots-b", "nots-a"]
 
 
-def test_malformed_result_file_is_quarantined_not_silently_dropped(tmp_path):
-    """ABI-2 (Ф3.1 fix-round-2 pin): a filename whose bytes fail to parse is a
-    CANDIDATE, not noise — the sort scan hands it to the same admission reader
-    as every other row, so it is quarantined with the ``malformed`` reason and
-    counted in the ONE batched scan event instead of being silently dropped
-    before schema admission ever saw it. (This replaces the pre-fix clause
-    that pinned the silent drop as 'torn-write tolerance': a genuinely torn
-    CONCURRENT write stays safe because the quarantine primitive re-checks
-    under the row's own write lock and keeps a row the writer just made
-    admissible.) The name is never memoized: after quarantine a fresh write
-    reclaims it with its real ts."""
+def test_inadmissible_files_are_quarantined_at_the_import_door_before_the_first_list(tmp_path):
+    """ABI-2 in the store era: the door is the import, not the list scan. Files whose bytes
+    fail to parse, unstamped pre-7.0 history and a future stamp move byte-unchanged under
+    ``task_results/quarantine/`` on the root's first touch, counted in ONE batched durable
+    event (6.3=B); the list then shows only admitted rows, and a fresh write reclaims a
+    quarantined name with its real ts."""
     data = tmp_path / "data"
-    _write_raw(data, "good", status="completed", result="ok", ts="2026-01-01T01:00:00Z")
     results = data / "task_results"
+    results.mkdir(parents=True)
+    (results / "good.json").write_text(json.dumps({"_schema_version": 1, "task_id": "good", "status": "completed",
+                                                   "result": "ok", "ts": "2026-01-01T01:00:00Z"}), encoding="utf-8")
     (results / "torn.json").write_text("{torn", encoding="utf-8")
+    (results / "old.json").write_text(json.dumps({"task_id": "old", "status": "completed"}), encoding="utf-8")
+    (results / "future.json").write_text(json.dumps({"_schema_version": 99, "task_id": "future",
+                                                     "status": "completed"}), encoding="utf-8")
 
+    ensure_current_store(data)  # the boot door's real import; a list never imports
     assert [row["task_id"] for row in _get_tasks(data)["tasks"]] == ["good"]
-    assert [p.name for p in (results / "quarantine").glob("*.json")] == ["torn.json"]
+    assert sorted(p.name for p in (results / "quarantine").glob("*.json")) == ["future.json", "old.json", "torn.json"]
     events = [
         json.loads(line)
         for line in (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
     quarantine_events = [e for e in events if e.get("type") == "task_results_quarantined"]
-    assert len(quarantine_events) == 1
-    assert quarantine_events[0]["reasons"] == {"malformed": 1}
+    assert len(quarantine_events) == 1, "one batched event for the whole import"
+    assert quarantine_events[0]["count"] == 3
+    assert quarantine_events[0]["reasons"] == {"malformed": 1, "unstamped_pre_7_0": 1, "future_schema": 1}
 
-    # The name was NOT committed to the memo: a fresh write reclaims it and
-    # the next request sees the row with its real (newer) ts.
     _write_raw(data, "torn", status="completed", result="ok", ts="2026-01-01T02:00:00Z")
     assert [row["task_id"] for row in _get_tasks(data)["tasks"]] == ["torn", "good"]
-
-
-def test_malformed_candidate_beyond_the_slice_window_is_still_quarantined(tmp_path):
-    """ABI-2 (Ф3.1 fix-round-2 pin, the REAL slice boundary): with more rows
-    than ``limit``, a malformed candidate — which would sort oldest and fall
-    outside the window — is STILL routed through the admission reader: its
-    bytes move to quarantine and it is counted in the same single batched
-    event as the in-window quarantines. Disclosed residual (docstring of
-    ``_tasks_list_payload``): a PARSEABLE inadmissible row beyond the window
-    is not classified by this sliced request; the next full/filtered scan
-    quarantines it."""
-    data = tmp_path / "data"
-    for i in range(4):
-        _write_raw(
-            data, f"t{i}", status="completed", result="ok",
-            ts=f"2026-01-01T0{i}:00:00Z",
-        )
-    results = data / "task_results"
-    (results / "broken.json").write_text("not json at all", encoding="utf-8")
-    # An in-window inadmissible row too, so the batch event provably spans
-    # both sides of the boundary in ONE event.
-    (results / "unstamped.json").write_text(
-        json.dumps({"task_id": "unstamped", "status": "completed",
-                    "ts": "2026-01-01T09:00:00Z"}),
-        encoding="utf-8",
-    )
-
-    payload = _get_tasks(data, limit=2)
-
-    # Raw-ts window of 2 = [unstamped(09:00), t3]; the in-window inadmissible
-    # row is quarantined (its slot is not backfilled this request), the
-    # malformed one never sat in the window at all — and BOTH are quarantined.
-    assert [row["task_id"] for row in payload["tasks"]] == ["t3"]
-    assert sorted(p.name for p in (results / "quarantine").glob("*.json")) == [
-        "broken.json", "unstamped.json",
-    ]
-    events = [
-        json.loads(line)
-        for line in (data / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    quarantine_events = [e for e in events if e.get("type") == "task_results_quarantined"]
-    assert len(quarantine_events) == 1, "one batched event for the whole scan"
-    assert quarantine_events[0]["count"] == 2
-    assert quarantine_events[0]["reasons"] == {"malformed": 1, "unstamped_pre_7_0": 1}
 
 
 def test_deleted_result_file_drops_out_of_list_and_memo(tmp_path):
@@ -189,48 +143,12 @@ def test_deleted_result_file_drops_out_of_list_and_memo(tmp_path):
 
     assert [row["task_id"] for row in _get_tasks(data)["tasks"]] == ["gone", "keep"]
 
-    (data / "task_results" / "gone.json").unlink()
+    delete_result(data, "gone")
     assert [row["task_id"] for row in _get_tasks(data)["tasks"]] == ["keep"]
 
 
-def test_unfiltered_list_slice_is_admission_aware_with_one_batched_event(tmp_path):
-    """ABI-2 (Ф3.1 fix-round pin): the sliced fast path quarantines inadmissible
-    rows exactly like the list_task_results fail-soft scan — the row never
-    reaches the response, its bytes move under task_results/quarantine/, and
-    the whole scan reports ONE batched durable event (6.3=B), never one per
-    file."""
-    data = tmp_path / "data"
-    _write_raw(data, "good", status="completed", result="ok", ts="2026-01-01T01:00:00Z")
-    results = data / "task_results"
-    # Two inadmissible rows: unstamped pre-7.0 history and a future stamp.
-    (results / "old.json").write_text(
-        json.dumps({"task_id": "old", "status": "completed", "ts": "2026-01-01T02:00:00Z"}),
-        encoding="utf-8",
-    )
-    (results / "future.json").write_text(
-        json.dumps({"_schema_version": 99, "task_id": "future", "status": "completed"}),
-        encoding="utf-8",
-    )
-
-    payload = _get_tasks(data)  # unfiltered request = the sliced fast path
-
-    assert [row["task_id"] for row in payload["tasks"]] == ["good"]
-    quarantine = results / "quarantine"
-    assert sorted(p.name for p in quarantine.glob("*.json")) == ["future.json", "old.json"]
-    events_path = data / "logs" / "events.jsonl"
-    events = [
-        json.loads(line)
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    quarantine_events = [e for e in events if e.get("type") == "task_results_quarantined"]
-    assert len(quarantine_events) == 1  # one batched event for the whole scan
-    assert quarantine_events[0]["count"] == 2
-    assert quarantine_events[0]["reasons"] == {"unstamped_pre_7_0": 1, "future_schema": 1}
-
-
 def test_queue_only_returns_queue_without_scanning_task_results(tmp_path, monkeypatch):
-    import ouroboros.gateway.tasks as gateway_tasks
+    from ouroboros import queue_observation
 
     data = tmp_path / "data"
     _write_raw(data, "t1", status="completed", result="ok", ts="2026-01-01T01:00:00Z")
@@ -240,16 +158,16 @@ def test_queue_only_returns_queue_without_scanning_task_results(tmp_path, monkey
     )
 
     reads = []
-    real = gateway_tasks.read_json_dict
+    real = queue_observation.read_json_dict
     monkeypatch.setattr(
-        gateway_tasks, "read_json_dict", lambda path: reads.append(str(path)) or real(path)
+        queue_observation, "read_json_dict", lambda path: reads.append(str(path)) or real(path)
     )
 
     payload = _get_tasks(data, queue_only=1)
 
     assert payload["tasks"] == []
     assert payload["queue"]["pending"][0]["id"] == "queued-task"
-    assert reads == [str(data / "state" / "queue_snapshot.json")]  # no task-results scan
+    assert reads == [str(data / "state" / name) for name in ("queue_snapshot.json", "queue.alive")]  # no task-results scan
 
 
 def test_list_rows_are_compact_while_detail_keeps_bulk_fields(tmp_path):

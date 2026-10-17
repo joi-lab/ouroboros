@@ -16,6 +16,7 @@ import pathlib
 import re
 import sys
 import threading
+import time
 from contextlib import nullcontext
 from typing import Callable
 
@@ -29,6 +30,7 @@ DATA_DIR = pathlib.Path(os.environ.get("OUROBOROS_DATA_DIR",
 
 
 log = logging.getLogger("server")
+PROCESS_STARTED_MONOTONIC = time.monotonic()  # the boot clock's zero: this module loads first in the server
 
 
 _restart_requested = threading.Event()
@@ -62,10 +64,14 @@ def capture_server_source_baseline(repo_dir: pathlib.Path) -> str:
 
     This is the startup baseline, not a claim about every lazy/hot-loaded module.
     An unreadable initial identity stays unknown; later disk HEAD cannot replace it.
+    ``server.py`` runs this at import, so the server and every worker importing it as
+    ``__mp_main__`` also pin their executing bytes here (``preflight_receipts``).
     """
     from ouroboros.gateway.state import _git_checkout_identity
+    from ouroboros.preflight_receipts import capture_executing_source_baseline
 
     global _source_baseline
+    capture_executing_source_baseline()
     with _applied_settings_lock:
         if _source_baseline is None:
             _source_baseline = _git_checkout_identity(repo_dir)[1]
@@ -233,9 +239,11 @@ def service_binding_is_live(binding: dict) -> bool:
 
 
 def _port_file_value(drive_root: pathlib.Path) -> int | None:
-    """The integer port the last main server wrote, or None when absent/unreadable."""
+    """The integer port the last main server of ``drive_root`` wrote, or None when absent/unreadable."""
+    from ouroboros.config import resolve_port_file
+
     try:
-        text = (pathlib.Path(drive_root) / "state" / "server_port").read_text(encoding="utf-8").strip()
+        text = resolve_port_file(drive_root, hosting_data_dir=DATA_DIR).read_text(encoding="utf-8").strip()
     except OSError:
         return None
     return int(text) if text.isdigit() else None
@@ -361,10 +369,10 @@ class _SignalStopServer(uvicorn.Server):
     the loop, and the lifespan ``finally`` still sets the event on every path.
     """
 
-    def request_shutdown(self) -> None:
+    def request_shutdown(self, source: str = "launcher_quit") -> None:
         """The same irreversible stop for OS signals and the launcher's owned pipe."""
         global _stop_source
-        _stop_source = "launcher_quit"
+        _stop_source = source
         _exit_signalled.set()
         _supervisor_stop.set()
         self.should_exit = True
@@ -378,12 +386,16 @@ class _SignalStopServer(uvicorn.Server):
         super().handle_exit(sig, frame)
 
     def watch_launcher_stop(self) -> None:
-        """Windows has no SIGTERM handler path; consume its launcher's private stdin.
+        """Consume the opt-in private stdin of a launcher-managed server, on every platform.
 
-        Opt-in only: direct servers retain their stdin. EOF is not a Quit command.
-        Retain a private raw descriptor, then give ordinary children null stdin:
-        inheriting the control pipe can strand Windows Git's output readers at boot.
-        Raw I/O also avoids a daemon thread holding sys.stdin's buffered shutdown lock.
+        ``quit\n`` is the launcher's ordinary stop; EOF means the launcher is gone, so the
+        same stop follows (``launcher_gone``) instead of an orphan serving on. Either one
+        latches the stop at once — before the port wait and the lifespan when it arrives
+        early — and arms an independent backstop exit after the launcher's own grace.
+        Opt-in only: a direct server (a container PID 1 included) keeps its stdin, and
+        EOF there is no stop. Retain a private raw descriptor, then give ordinary children
+        null stdin: inheriting the control pipe can strand Windows Git's output readers at
+        boot. Raw I/O also avoids a daemon thread holding sys.stdin's buffered shutdown lock.
         """
         if os.environ.pop("OUROBOROS_LAUNCHER_STOP_STDIN", "") != "1":
             return
@@ -411,14 +423,29 @@ class _SignalStopServer(uvicorn.Server):
             raise
 
         def receive() -> None:
+            source = "launcher_gone"
             with private:
                 try:
-                    if private.readline(5) == b"quit\n":
-                        self.request_shutdown()
+                    while line := private.readline(64):
+                        if line == b"quit\n":
+                            source = "launcher_quit"
+                            break
                 except (OSError, ValueError):
-                    log.warning("Launcher stop pipe closed without a Quit request", exc_info=True)
+                    log.warning("Launcher stop pipe failed; treating it as the launcher's end", exc_info=True)
+            self.request_shutdown(source)
+            from ouroboros.runtime_limits import LAUNCHER_STOP_GRACE_SEC
+
+            backstop = threading.Timer(LAUNCHER_STOP_GRACE_SEC + 5, _launcher_stop_backstop, args=(source,))
+            backstop.daemon = True
+            backstop.start()
 
         threading.Thread(target=receive, name="launcher-stop", daemon=True).start()
+
+
+def _launcher_stop_backstop(source: str) -> None:
+    """The ordinary stop outlived the launcher's own grace: nobody else will end this process."""
+    log.critical("Ordinary stop (%s) did not finish within the launcher grace; exiting", source)
+    os._exit(1)
 
 
 def _embedded_uvicorn_server(config: "uvicorn.Config") -> "uvicorn.Server":

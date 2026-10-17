@@ -34,6 +34,7 @@ from tests.test_llm_claudexor import setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
 from tests.test_model_wait_controls import _loop_tools
 from tests.test_subscription_main_wait import main_call as main_call_fixture
+from tests._usage_store_testing import dispatched_attempts
 
 setup = gateway_fixture
 live_wait = wait_fixture
@@ -494,14 +495,16 @@ def test_owner_selected_account_rebinds_fallback_before_physical_send(main_call,
     assert [upload[0]["account"] for upload in gateway.uploads] == [
         {"mode": "pin", "profileId": "account-a"},
         {"mode": "pin", "profileId": "account-b"}]
-    rows = ledger(ctx.drive_root)
-    dispatched = [row for row in rows if row["state"] == "dispatched"]
+    dispatched = dispatched_attempts(ctx.drive_root)
     assert [row["physical_context"]["route_fp"] for row in dispatched] == [
         "capacity-account-a", "capacity-account-b"]
     assert dispatched[-1]["physical_context"]["capacity_total_tokens"] == 240_000
     assert plan.route_fp == "capacity-account-b" and plan.window_tokens == 240_000
     # completed tools are not replayed; the answered send's clock line follows them
-    assert ctx.messages[-3:-1] == original[-2:] and ctx.messages[-1]["content"].startswith(CLOCK_NOTE_PREFIX)
+    from tests.test_subscription_main_wait import _without_context_facts
+
+    canonical = _without_context_facts(ctx.messages)
+    assert canonical[-3:-1] == original[-2:] and canonical[-1]["content"].startswith(CLOCK_NOTE_PREFIX)
     assert len(gateway.accepted_operations) == 2
 
 
@@ -556,7 +559,7 @@ def test_owner_selected_account_rebinds_primary_before_physical_send(main_call, 
     assert [upload[0]["account"] for upload in gateway.uploads] == [
         {"mode": "pin", "profileId": "account-a"},
         {"mode": "pin", "profileId": "account-b"}]
-    dispatched = [row for row in ledger(ctx.drive_root) if row["state"] == "dispatched"]
+    dispatched = dispatched_attempts(ctx.drive_root)
     assert dispatched[-1]["physical_context"]["route_fp"] == "capacity-account-b"
     assert dispatched[-1]["physical_context"]["capacity_total_tokens"] == 240_000
     assert plan.route_fp == "capacity-account-b" and plan.window_tokens == 240_000

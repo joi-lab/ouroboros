@@ -30,18 +30,19 @@ class _ProcessGateway:
 def _settle_shared_project_process(root, run_id, removals, replay_barrier):
     from pathlib import Path
     from ouroboros import delegate_custody as dc
-    from ouroboros import delegate_custody_usage as usage
+    from ouroboros import delegate_custody_current as current
 
-    original = usage.complete_custody_rows
+    original = current.runs
 
     def synchronized_replay(*args, **kwargs):
         try:
-            replay_barrier.wait(timeout=0.5)
+            if len(args) > 1 and args[1] == "project_id=?":
+                replay_barrier.wait(timeout=0.5)
         except Exception:
             pass
         return original(*args, **kwargs)
 
-    usage.complete_custody_rows = synchronized_replay
+    current.runs = synchronized_replay
     row = dc.replay(Path(root))[run_id]
     dc.settle_run(
         Path(root), _ProcessGateway(removals), row,
@@ -303,7 +304,7 @@ def test_concurrent_final_siblings_retire_shared_project_once(tmp_path):
 
     for run_id, task_id in (("run-a", "task-a"), ("run-b", "task-b")):
         dc.record_started(tmp_path, dc.RunCustody(
-            run_id=run_id, task_id=task_id, route_id="r", model="m",
+            run_id=run_id, task_id=task_id, route_id="r", model="m", source="review_substrate",
             project_id="project-race", project_owned=True, ledger_root=str(tmp_path),
         ))
         dc.emit(tmp_path, dc.SETTLED, {"run_id": run_id, "task_id": task_id, "route": "r"})
@@ -340,7 +341,7 @@ def test_concurrent_live_settlements_publish_before_last_sibling_retirement(
     rows = []
     for run_id, task_id in (("run-live-a", "task-live-a"), ("run-live-b", "task-live-b")):
         row = dc.RunCustody(
-            run_id=run_id, task_id=task_id, route_id="r", model="m",
+            run_id=run_id, task_id=task_id, route_id="r", model="m", source="review_substrate",
             project_id="project-live-race", project_owned=True,
             ledger_root=str(tmp_path), ledger_recorded=True,
         )
@@ -382,7 +383,7 @@ def test_cross_process_settlements_retire_shared_project_once(tmp_path):
     dc._CUSTODY.clear()
     for run_id, task_id in (("run-proc-a", "task-proc-a"), ("run-proc-b", "task-proc-b")):
         dc.record_started(tmp_path, dc.RunCustody(
-            run_id=run_id, task_id=task_id, route_id="r", model="m",
+            run_id=run_id, task_id=task_id, route_id="r", model="m", source="review_substrate",
             project_id="project-process-race", project_owned=True,
             ledger_root=str(tmp_path), ledger_recorded=True,
         ))

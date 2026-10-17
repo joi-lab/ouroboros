@@ -30,7 +30,7 @@ from devtools.benchmarks.common.manifests import (
 )
 from devtools.benchmarks.common.model_slots import (
     runtime_actor_snapshot,
-    single_model_subagents_setting,
+    fixed_model_roster_mismatches,
 )
 from devtools.benchmarks.common.official_commands import programbench_command_for_manifest
 from devtools.benchmarks.common.result_index import append_result_index, task_result_row
@@ -61,8 +61,8 @@ from devtools.benchmarks.programbench.schemas import PROGRAMBENCH_TIMEOUT_SEC
 from ouroboros.configured_subagents import normalize_configured_subagents
 from ouroboros.provider_models import migrate_model_value
 
-# Model-carrying slots only; the OUROBOROS_EFFORT_* entries in ACTIVE_MODEL_SLOT_KEYS are
-# effort levels, not model ids. Role account/window JSON is route metadata too.
+# Text-model slots only. Image generation uses the engine's separate image-operation
+# route, not the chat provider-ID migration that this preflight checks.
 _MODEL_ID_SLOT_KEYS = tuple(
     key for key in ACTIVE_MODEL_SLOT_KEYS if not key.startswith("OUROBOROS_EFFORT_")
     and key not in MODEL_ROUTE_OPTION_KEYS
@@ -172,15 +172,17 @@ def preflight_model_slots(settings_path: pathlib.Path, *, solve_model: str = "")
             "OUROBOROS_MODEL"
         )
     else:
-        expected_subagents = single_model_subagents_setting(measured_model)
         try:
-            _, normalized_subagents = normalize_configured_subagents(
+            config, _normalized_subagents = normalize_configured_subagents(
                 settings.get("OUROBOROS_SUBAGENTS")
             )
         except ValueError as exc:
             problems.append(f"OUROBOROS_SUBAGENTS: {exc}")
         else:
-            if normalized_subagents != expected_subagents:
+            # The roster carries the actor AND the review pool (its marked
+            # rows): the exact one-model actor plus packet seats on the
+            # measured model, any seat count.
+            if fixed_model_roster_mismatches(config, measured_model):
                 problems.append(
                     "OUROBOROS_SUBAGENTS does not contain the exact one-model "
                     f"ProgramBench actor for {measured_model!r}"

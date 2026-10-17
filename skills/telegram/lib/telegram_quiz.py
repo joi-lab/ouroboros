@@ -21,8 +21,8 @@ goes out first as ordered plain messages through the client's existing chunker,
 and a compact message with the project line, the numbered option labels, the
 hint and the keyboard follows last. Only that last message is remembered, so a
 tap, a reply to it and the answered-edit keep working exactly as for a short
-card; a reply to one of the earlier explanation parts is an ordinary owner
-message, deliberately without per-part bookkeeping. An open question (no
+card; a reply to an earlier explanation part is an ordinary owner message
+carrying the bridge's host-row reference. An open question (no
 options) is the same card without a keyboard; its hint asks for a reply.
 """
 
@@ -64,6 +64,7 @@ _TEXTS_EN = {
     "resumed": "The task continued; an answer is still accepted.",
     "expired_terminal": "The task finished; a late answer is accepted as your message.",
     "superseded": "Replaced by a newer question.",
+    "closed": "Question closed.",
     "project": "Project",
     "question": "Question",
     "stake": "At stake",
@@ -74,7 +75,9 @@ _TEXTS = Index("quiz", _TEXTS_EN, "the question cards sent to the owner's phone:
 
 # A remembered card's lifecycle only moves forward, as on the web card: a closed
 # wait or an expiry never reopens a settled card, and nothing downgrades an answer.
-_LIFECYCLE_RANK = {"open": 0, "expired_terminal": 1, "superseded": 2, "answered": 3}
+# An answer and a closure are both final, and neither replaces the other: closure is never an answer.
+_LIFECYCLE_RANK = {"open": 0, "expired_terminal": 1, "superseded": 2, "answered": 3, "closed": 3}
+_FINAL_STATES = ("answered", "closed")
 
 # The host publishes ``chat.quiz`` and ``chat.quiz_state`` as independent
 # coroutines on the extension loop, so a fact could outrun the card's own send
@@ -276,6 +279,8 @@ def _outcome_text(status: int, payload: Dict[str, Any], lang: str) -> str:
     if status == 404:
         return texts["gone"]
     if status == 409:
+        if str(payload.get("state") or "") == "closed":
+            return texts["closed"]
         answered = payload.get("answered_index") is not None or str(payload.get("state") or "") == "answered"
         return texts["already"] if answered else texts["expired"]
     return texts.format("failed", status=status)
@@ -297,20 +302,26 @@ def lifecycle_edit(
     """The (text, keyboard) edit a host ``chat.quiz_state`` fact asks of a sent card.
 
     ``None`` when the fact changes nothing here: a state this card cannot show, an
-    ``open`` that does not close a wait, or a fact older than the card's own state.
+    ``open`` that does not close a wait, a fact older than the card's own state, or
+    the other final state.
     The card mirrors the web one (``web/modules/question_presentation.js``): an
     answer settles it on the recorded option and/or the owner's own words; a closed
     wait drops the waiting line; an expired card stays answerable, because a late
     answer is still accepted as the owner's message (В17a=A); a superseded card is
-    a read-only record. An answer is always re-applied — the edit is idempotent.
+    a read-only record, and so is a closed question, which states its closure and the
+    stated reason, never an answer. A final state is always re-applied — the edit is idempotent.
     """
     state = str(event.get("state") or "")
+    held = str(record.get("state") or "open")
     if state not in _LIFECYCLE_RANK or (state == "open" and event.get("wait_for_answer") is not False):
         return None
-    if _LIFECYCLE_RANK[state] < _LIFECYCLE_RANK.get(str(record.get("state") or "open"), 0):
+    if _LIFECYCLE_RANK[state] < _LIFECYCLE_RANK.get(held, 0) or (held in _FINAL_STATES and state != held):
         return None
     texts = _texts(lang)
     base = str(record.get("text") or "")
+    if state == "closed":
+        reason = str(event.get("closed_reason") or "").strip()
+        return f"{base}\n{texts['closed']}" + (f"\n{_echo(reason)}" if reason else ""), []
     if state == "answered":
         options = list(record.get("options") or [])
         index = event.get("answered_index")
@@ -394,8 +405,12 @@ async def follow_lifecycle(api, event: Dict[str, Any], lang: str, *, client_fact
         await _apply_fact(api, token, event, lang, client_factory)
 
 
-async def apply_retained_fact(api, token: str, lang: str, *, client_factory) -> None:
-    """Right after ``remember_quiz``, under the same lock: the fact that outran creation."""
+async def apply_retained_fact(api, token: str, lang: str, *, client_factory, published=None) -> None:
+    """Right after ``remember_quiz``, under the same lock: the fact that outran creation,
+    or the settled state the ``chat.quiz`` event itself carries (a queued ask can land
+    after its question was answered or closed); the higher-ranked of the two applies."""
+    if published and str(published.get("state") or "open") != "open":
+        _retain_fact(token, published)
     event = _RETAINED_FACTS.pop(token, None)
     if event is not None:
         await _apply_fact(api, token, event, lang, client_factory)
@@ -414,6 +429,13 @@ async def _mark_answered(api, client, record: Dict[str, Any], answer: str, lang:
         await client.edit_message_text_with_inline_keyboard(
             int(record.get("chat_id") or 0), message_id, _answered_text(record, answer, lang), [], parse_mode="",
         )
+
+
+async def _settle_closed(api, client, record: Dict[str, Any], payload: Dict[str, Any], lang: str) -> None:
+    """A refusal naming the question closed settles the card on that host fact, never on an answer."""
+    if str(payload.get("state") or "") == "closed":
+        fact = {**payload, "task_id": record.get("task_id"), "quiz_id": record.get("quiz_id")}
+        await follow_lifecycle(api, fact, lang, client_factory=lambda: client)
 
 
 async def answer_from_callback(
@@ -437,6 +459,8 @@ async def answer_from_callback(
         # Settle the card on the RECORDED option (a first-wins loser learns the winner).
         chosen = recorded if isinstance(recorded, int) and 0 <= recorded < len(options) else index
         await _mark_answered(api, client, record, f"{chosen + 1}. {options[chosen]}", lang)
+    elif status == 409:
+        await _settle_closed(api, client, record, payload, lang)
 
 
 async def answer_from_reply(
@@ -448,3 +472,5 @@ async def answer_from_reply(
     await client.send_message(chat_id, _outcome_text(status, payload, lang))
     if status < 400:
         await _mark_answered(api, client, record, _echo(answer_text), lang)
+    elif status == 409:
+        await _settle_closed(api, client, record, payload, lang)

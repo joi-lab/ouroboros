@@ -98,7 +98,7 @@ def test_later_refusal_keeps_prior_effect_unknown_but_closes_local_invocation(tm
     assert launched == [["issue", "comment"]]
     assert "GH_TARGET_" in result.text and result.status != "ok", result
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
     _park(tmp_path, monkeypatch, queue, workers)
     assert queue.resume_budget_paused_task("root")["ok"]
 
@@ -123,7 +123,7 @@ def test_returned_unknown_gh_outcome_preserves_error_without_ghost_invocation(tm
 
     assert launched == [["issue", "comment"]] and result.status != "ok", result
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
     _park(tmp_path, monkeypatch, queue, workers)
     assert queue.resume_budget_paused_task("root")["ok"]
 

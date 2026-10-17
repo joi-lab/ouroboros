@@ -109,14 +109,17 @@ def test_headless_facade_reexports_every_moved_identity():
 
 
 def test_headless_extraction_size_bounds_have_meaningful_headroom():
+    from ouroboros.size_ratchet_manifest import BAND_PATHS
+
     counts = {
         module.__name__: len(
             pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
         )
         for module in (headless, *_LEAVES)
     }
-    assert counts["ouroboros.headless"] <= 1000
-    assert all(count <= 1000 for count in counts.values())
+    assert counts["ouroboros.headless"] <= 1000 or (
+        counts["ouroboros.headless"] <= 1500 and BAND_PATHS.get("ouroboros/headless.py", "").strip())
+    assert all(counts[module.__name__] <= 1000 for module in _LEAVES)
     assert counts["ouroboros.workspace_patch_capture"] <= 1000
 
 

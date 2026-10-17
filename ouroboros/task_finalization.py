@@ -12,8 +12,8 @@ the live queue, and synthesis receives the delivered outcome as ground truth
 Terminal provenance extends the same custody rule. A provider outage is an
 infrastructure failure even when useful text survived. A complete current
 model candidate remains Ouroboros's byte-exact answer and host outage facts
-become a separate System incident; stale/last-response/deterministic fallback
-bytes are host salvage, preserved durably but never promoted to speech. The
+become a separate System incident; stale/last-response model bytes are host
+salvage and a notice the host wrote alone is a host notice, neither speech. The
 provider rail may recover a compacted transcript from persisted LLM output,
 and forced finalization still retains its original semantics: owner-stop gets
 one logical model call because steering is fenced, while the generic rail may
@@ -33,6 +33,7 @@ import stat
 from typing import Any, Dict, List
 
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
+from ouroboros.observability import stamp_finalization_enqueue
 
 log = logging.getLogger(__name__)
 
@@ -88,10 +89,11 @@ def terminal_custody_notice_text(result: Dict[str, Any]) -> str:
     Issue #1006: the custody fact is a typed row of the task card, so the live
     send and the outbox replay carry it as its own field instead of folding it
     into the host notice's text. Single-body transports keep the joined text.
+    That row is read by the owner, so it omits empty categories (#1403).
     """
     from ouroboros.delegate_terminal import terminal_custody_notice
 
-    return terminal_custody_notice(result)
+    return terminal_custody_notice(result, owner_row=True)
 
 
 def terminal_notice_text(result: Dict[str, Any]) -> str:
@@ -104,8 +106,9 @@ def terminal_notice_text(result: Dict[str, Any]) -> str:
 def send_provider_death_notice(
     ctx: Any, chat_id: int, task_id: Any, final_result: Dict[str, Any],
 ) -> bool:
-    """Send the secondary incident, unless the primary is already the receipt."""
-    if str(final_result.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE:
+    """Send the secondary incident, unless the primary is already the receipt
+    (any host-authored primary carries this notice itself: a second row would repeat it)."""
+    if str(final_result.get("terminal_origin") or "") in HOST_AUTHORED_TERMINAL_ORIGINS:
         return False
     plan_note = (
         f"\n\n{TERMINAL_PLAN_REVIEW_NOTE}"
@@ -131,20 +134,25 @@ def provider_terminal_body(text: str, notice: str) -> str:
     return (text + "\n\n" if text else "") + "[Host status]\n" + notice
 
 
-def host_operation_reply_kwargs(source_ref: Any, terminal_status: str = "") -> Dict[str, Any]:
+def host_operation_reply_kwargs(
+    source_ref: Any, terminal_status: str = "", client_message_id: str = "",
+) -> Dict[str, Any]:
     """Correlate a host-accepted reply without inventing a durable task result.
 
     Callers supply the host-captured source, never a transport's arbitrary
     metadata. An empty status marks an acknowledgement, not completion.
+    ``client_message_id`` names the owner submission a System row answers, so the
+    live frame settles that submission's ``Sending...`` and no other; it is not
+    persisted and confers no finality.
     """
     from ouroboros.project_dialogue import owner_message_ref_is_valid
 
-    if not owner_message_ref_is_valid(source_ref):
-        return {}
-    meta = {"origin_message_ref": dict(source_ref)}
-    if terminal_status:
-        meta["task_terminal_status"] = terminal_status
-    return {"progress_meta": meta}
+    meta: Dict[str, Any] = {"client_message_id": str(client_message_id)} if client_message_id else {}
+    if owner_message_ref_is_valid(source_ref):
+        meta["origin_message_ref"] = dict(source_ref)
+        if terminal_status:
+            meta["task_terminal_status"] = terminal_status
+    return {"progress_meta": meta} if meta else {}
 
 
 def stamp_root_final_phase(
@@ -176,6 +184,13 @@ def prepare_terminal_send_event(
     *, presence: bool,
 ) -> Dict[str, Any]:
     """Preserve raw host salvage, then build the one live/replay projection."""
+    timing = usage.get("_finalization_timing")
+    if timing and not presence:
+        timing.update(task_attempt=task.get("_attempt"), task_type=task.get("type"),
+                      is_direct_chat=bool(task.get("_is_direct_chat")),
+                      delegation_role=task.get("delegation_role", ""),
+                      initiator=(task.get("metadata") or {}).get("initiator", ""))
+        send_event["_finalization_timing"] = timing
     if model_execution := model_execution_projection(usage):
         send_event.setdefault("progress_meta", {})["model_execution"] = model_execution
     if not presence and task.get("_is_direct_chat") and (task.get("metadata") or {}).get("_host_operation"):
@@ -237,6 +252,8 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     path = str(usage.get("terminal_salvage_path") or "")
     if path:
         fields["terminal_salvage_path"] = path
+    if usage.get("wake_silent") is True:
+        fields["wake_silent"] = True
     if usage.get("terminal_plan_review_open") is True:
         fields["terminal_plan_review_open"] = True
     for key in ("terminal_provider_notice", "terminal_host_notice"):
@@ -250,9 +267,15 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
 
 def deliver_final_message_live(
     event_queue: Any, pending_events: List[Dict[str, Any]], task_id: str,
-    *, drive_root: Any = None,
+    *, drive_root: Any = None, register: bool = True,
 ) -> bool:
     """Send the buffered FINAL ``send_message`` through the live worker queue.
+
+    Returns True only when the live ``put`` actually succeeded; a missing final
+    frame or a refused transport answers False (the buffered copy still exists).
+    ``register=False`` is the answer-first pipeline's word that it already owed
+    this frame (``register_final_answer_owed`` ran just before): the row is not
+    registered a second time.
 
     The buffer can also hold proactive ``send_user_message`` events that fell
     back to deferred delivery mid-task (live-first frames stamp ``task_id``
@@ -294,7 +317,7 @@ def deliver_final_message_live(
     if not str(final.get("delivery_id") or "").strip():
         digest = hashlib.sha256(str(final.get("text") or "").encode("utf-8")).hexdigest()[:16]
         final["delivery_id"] = f"final:{tid}:{digest}"
-    if drive_root is not None and str(drive_root).strip() and final.get("chat_id"):
+    if register and drive_root is not None and str(drive_root).strip() and final.get("chat_id"):
         # OWED before ENQUEUED. Rows without a chat id are not registered (the
         # replay could never send them, so they would only age into a false
         # "delivery gave up" disclosure), and an EMPTY root is refused rather
@@ -306,7 +329,7 @@ def deliver_final_message_live(
         except Exception:
             log.debug("final-answer owed registration failed for %s", tid, exc_info=True)
     try:
-        event_queue.put(dict(final))
+        event_queue.put(stamp_finalization_enqueue(dict(final)))
     except Exception:
         log.warning(
             "Live final-answer delivery failed; keeping buffered delivery",
@@ -316,46 +339,57 @@ def deliver_final_message_live(
     return True
 
 
+OWED_REGISTERED, OWED_UNREGISTERED, OWED_SKIPPED = "registered", "unregistered", "skipped"
+
+
 def register_final_answer_owed(
     task: Dict[str, Any], send_event: Dict[str, Any], *, env_drive_root: Any,
-) -> None:
+) -> str:
     """GR2-5 (§8-A2, ONE outbox for EVERY root): owe the final answer durably.
 
-    Called immediately BEFORE durable result persistence for every
-    ROOT (``agent_task_pipeline.emit_task_results`` registers, then stores), so a
-    crash in that window leaves an owed row the boot replay delivers instead of
-    a persisted result nobody was told about — the cancel lanes are the ones that
-    write first and owe before they SETTLE the intent. Registration happens
-    regardless of the blocking/nonblocking post-task split: the nonblocking
-    lane used to buffer the send with NO delivery_id and NO owed registration,
-    so a worker crash before the buffered drain lost the owner's answer with
-    nothing to replay. Mints the canonical ``final:<tid>:<digest>`` id onto the
-    buffered event and registers it in the durable outbox; the registry's
-    delivery_id dedupe keeps the normal path single-send
-    (``deliver_final_message_live`` re-registers idempotently and the send
-    handler suppresses the second copy). Fail-soft: registration is crash
-    insurance, never a gate on the send. Rows without a chat id are skipped
-    (the replay could never send them), and an EMPTY canonical root is refused
-    rather than resolved relative to the process CWD (AR2-4).
+    Called as soon as the final frame is built, BEFORE the live send and before
+    durable result persistence for every ROOT (``agent_task_pipeline.emit_task_results``
+    owes, sends, then stores), so a crash in that window leaves an owed row the
+    boot replay delivers instead of a persisted result nobody was told about — the
+    cancel lanes are the ones that write first and owe before they SETTLE the
+    intent. Registration happens regardless of the blocking/nonblocking post-task
+    split: the nonblocking lane used to buffer the send with NO delivery_id and NO
+    owed registration, so a worker crash before the buffered drain lost the
+    owner's answer with nothing to replay. Mints the canonical
+    ``final:<tid>:<digest>`` id onto the buffered event and registers it in the
+    durable outbox; the registry's delivery_id dedupe keeps the normal path
+    single-send (the live put passes ``register=False`` to
+    ``deliver_final_message_live`` and the send handler suppresses the second
+    copy). Fail-soft: registration is crash insurance, never a gate on the send.
+    Rows without a chat id are skipped (the replay could never send them), and an
+    EMPTY canonical root is refused rather than resolved relative to the process
+    CWD (AR2-4).
+
+    Returns the typed disposition: ``registered`` (newly owed, already owed or
+    already delivered — the answer is durably tracked), ``unregistered`` (a
+    disclosed write failure: the send still happens, without crash insurance)
+    or ``skipped`` (no chat id / no canonical root: nothing to owe).
     """
     if not send_event.get("chat_id"):
-        return
+        return OWED_SKIPPED
     try:
         # The CANONICAL data root the supervisor's boot/tick replay reads: the
         # parent/budget root for split children, the task's own drive for an
         # ordinary root (whose ``budget_drive_root`` is legitimately empty).
         outbox_root = str(task.get("budget_drive_root") or env_drive_root or "").strip()
         if not outbox_root:
-            return
+            return OWED_SKIPPED
         from supervisor.terminal_delivery import register_pending_delivery
 
         tid = str(task.get("id") or "")
         if not str(send_event.get("delivery_id") or "").strip():
             digest = hashlib.sha256(str(send_event.get("text") or "").encode("utf-8")).hexdigest()[:16]
             send_event["delivery_id"] = f"final:{tid}:{digest}"
-        register_pending_delivery(pathlib.Path(outbox_root), dict(send_event))
+        registered = register_pending_delivery(pathlib.Path(outbox_root), dict(send_event))
     except Exception:
         log.debug("final-answer owed registration failed for %s", task.get("id"), exc_info=True)
+        return OWED_UNREGISTERED
+    return OWED_REGISTERED if registered else OWED_UNREGISTERED
 
 
 def build_completion_observations(drive_root: Any, task: Dict[str, Any], trace: Dict[str, Any]) -> Dict[str, Any]:
@@ -470,16 +504,25 @@ def focus_source_projection(
     if wanted and (not isinstance(handle, dict) or str(handle.get("sha256") or "") != wanted):
         if len(wanted) != 64 or any(c not in "0123456789abcdef" for c in wanted):
             return {**unavailable, "reason": "source_ref_invalid"}
-        try:
+        from fnmatch import fnmatch
+        from ouroboros.evidence_packs import handle_info, packed_handle_names
+        try:  # loose handles and this task's packed ones answer the same selector
             store = task_artifact_dir_path(drive_root, str(task_id), create=False) / "source_handles" / "context_checkpoints"
-            matches = sorted(p for p in store.glob(f"focus_source_*-{wanted}.md") if not p.is_symlink())
+            matches = {p.name for p in store.glob(f"focus_source_*-{wanted}.md") if not p.is_symlink()}
+            matches.update(n for n in packed_handle_names(drive_root, str(task_id)) if fnmatch(n, f"focus_source_*-{wanted}.md"))
         except (OSError, ValueError):
-            matches = []
+            matches = set()
         if len(matches) != 1:
             return {**unavailable, "reason": "source_unavailable", "requested_sha256": wanted}
-        handle = {"kind": "task_source", "root": "artifact_store",
-                  "path": f"source_handles/context_checkpoints/{matches[0].name}",
-                  "size": matches[0].stat().st_size, "sha256": wanted}
+        selected_handle_path = f"source_handles/context_checkpoints/{matches.pop()}"
+        try:
+            info = handle_info(drive_root, str(task_id), selected_handle_path) or {}
+        except ValueError:
+            return {**unavailable, "reason": "source_identity_mismatch"}
+        except OSError:
+            return {**unavailable, "reason": "source_unavailable"}
+        handle = {"kind": "task_source", "root": "artifact_store", "path": selected_handle_path,
+                  "size": info.get("size", 0), "sha256": wanted}
         focus = None  # a historical selector carries no current source_ref/authored_at claim
     if not isinstance(handle, dict):
         return {**unavailable, "reason": "source_unavailable"}
@@ -510,7 +553,7 @@ def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
     or this raises. The model's ``review_source_sha256`` reader and the owner's
     record download (``gateway.task_archive.serve_task_source``) share it.
     """
-    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.source_retention import retained_task_roots
 
     if len(digest) != 64 or digest.strip("0123456789abcdef"):
@@ -518,13 +561,13 @@ def host_acceptance_source(drive_root: Any, task_id: str, digest: str) -> tuple:
     path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
     # The selector addresses exact bytes, not their current placement. Only
     # this author's known retained drives can supply a not-yet-canonical file.
+    from ouroboros.evidence_packs import handle_info
+
     roots = [drive_root, *retained_task_roots(drive_root, task_id)]
-    stored = next((candidate for root in roots
-                   if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
+    stored = next((info for root in roots if (info := handle_info(root, task_id, path)) is not None), None)
     if stored is None:
         raise FileNotFoundError(path)
-    ref = {"kind": "task_source", "root": "artifact_store", "path": path,
-           "size": stored.stat().st_size, "sha256": digest}
+    ref = {"kind": "task_source", "root": "artifact_store", "path": path, "size": stored["size"], "sha256": digest}
     raw = read_actor_source_bytes(drive_root, task_id, ref)
     run = json.loads(raw)
     request = run.get("request") if isinstance(run, dict) else None
@@ -596,6 +639,8 @@ def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, An
         "completion_observations": row.get("completion_observations") or {"status": "unavailable"},
         **({"terminal_host_notice": terminal_host_notice_text(row)} if terminal_host_notice_text(row) else {}),
     }
+    if row.get("wake_silent") is True:  # no model words were submitted; the retained ones are not speech
+        package.update(final_result_text="", wake_silent=True, internal_terminal_text=str(row.get("result") or ""))
     if is_presence_task(row):
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         # Remember the event-time body, not today's replay policy: a historical
@@ -646,6 +691,11 @@ def sealed_final_prompt_section(sealed_final: Dict[str, Any] | None) -> str:
     )
     heading, presence_facts, internal_text = "Final result text (submitted for delivery):\n", "", ""
     presence = sealed_final.get("presence_delivery")
+    if sealed_final.get("wake_silent") is True:
+        heading, final_text = "Final result text:\n", "(none: the wake finished silently; no model words were submitted)"
+        if raw := str(sealed_final.get("internal_terminal_text") or ""):
+            internal_text = "Internal wake result (retained, never sent to the owner):\n" + truncate_review_artifact(
+                raw, limit=_SEALED_FINAL_TEXT_PROMPT_CHARS) + "\n"
     if isinstance(presence, dict):
         introduction = (
             "The recorded automatic-reply body was prepared for the Presence adapter;\n"
@@ -795,31 +845,11 @@ def model_execution_projection(usage: Dict[str, Any]) -> Dict[str, Any] | None:
 
 
 def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | None:
-    """Compact derived swarm-efficiency rollup: observed fan-out, or the
-    zero-fanout disclosure block for a host-attested Swarm-intent task.
+    """Observed fan-out from the root row, plus current subtree depth.
 
-    (Moved verbatim from ``agent_task_pipeline`` — that module sits at its
-    line ceiling; this is the same finalization-time rollup.)
-
-    Computed from the durable ``swarm_fanout`` telemetry this task already emits
-    (control.py:_emit_swarm_fanout): the number of children, the number of fan-out
-    emissions, the summed wall-clock intervals between them, and the set of model lanes REQUESTED —
-    fanout events are written before any child starts, so effective lanes are not
-    knowable here; they live on each child's own dispatch record.
-    Returns None for a plain task (no fan-out), so the block only appears on real
-    swarms — with ONE exception: a task admitted with host-attested Swarm intent
-    (typed metadata ``force_plan_source == "swarm"``, never prompt inspection) that
-    fanned out NOTHING returns a minimal ``no_fanout_observed`` block instead of
-    disappearing, so a Swarm-button task that spawned zero children is
-    distinguishable from a plain task. ``planned`` in that block is null — never
-    inferred as 0 from the absence of events; a real planned figure exists only as
-    the emissions' ``requested_count`` sum, surfaced under that exact name on
-    swarm-intent rollups.
-
-    OMITTED (no reliable structured source today): ``observed_max_concurrency`` —
-    child task results carry only ``ts``/``updated_at``, not a per-child running-start
-    vs finish timestamp, so true overlap cannot be derived honestly here — and
-    ``parent_blocked_wait_sec`` (wait_task returns prose, not a typed duration).
+    Swarm intent with no observed fan-out stays explicit; requested counts and
+    lanes never claim actual concurrency, dispatch lanes or child-wait time.
+    Legacy rows catch up once; later calls decode only the unconsumed suffix.
     """
     task_id = str(task.get("id") or task.get("task_id") or "")
     if not task_id:
@@ -827,52 +857,16 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     swarm_intent = metadata.get("force_plan_source") == "swarm"
     try:
-        from ouroboros.utils import iter_jsonl_chain_objects
+        from ouroboros.swarm_rollup import load_swarm_rollup
 
         drive_root = getattr(env, "drive_root", None)
         if drive_root is None:
             return None
-        events_path = pathlib.Path(drive_root) / "logs" / "events.jsonl"
-        child_ids: set[str] = set()
-        fanout_count = 0
-        requested_count_total = 0
-        fanout_interval_total = 0.0
-        lanes: list[str] = []
-        # Read the FULL per-task events stream (not a tail window): the swarm_fanout
-        # events can occur EARLY in a long fan-out task, so a bounded tail would
-        # silently undercount emissions/children (P1 no-silent-loss). This runs once at
-        # finalization (not a hot path), for fan-out and Swarm-intent tasks.
-        # Chain-aware (CPL4-C1): early fan-out events may already have rotated
-        # into archive/events_*.jsonl by finalization time.
-        for ev in iter_jsonl_chain_objects(events_path):
-            if ev.get("type") != "swarm_fanout":
-                continue
-            if str(ev.get("parent_task_id") or ev.get("task_id") or "") != task_id:
-                continue
-            fanout_count += 1
-            try:
-                requested_count_total += int(ev.get("requested_count") or 0)
-            except (TypeError, ValueError):
-                pass
-            for tid in ev.get("task_ids") or []:
-                if str(tid or "").strip():
-                    child_ids.add(str(tid))
-            try:
-                fanout_interval_total += float(ev.get("fanout_interval_sec", ev.get("inter_wave_latency_sec")) or 0.0)
-            except (TypeError, ValueError):
-                pass
-            # The lane a fan-out ASKED for. A fan-out event is written before any child
-            # starts, so it cannot know what they ran on — that is a per-child
-            # dispatch fact and lives on each child's own record.
-            lane = str(ev.get("requested_model_lane") or "").strip()
-            if lane and lane not in lanes:
-                lanes.append(lane)
+        facts = load_swarm_rollup(drive_root, task_id)
+        child_ids = facts.get("child_ids", [])
         if not child_ids:
             if swarm_intent:
-                # The owner asked for a swarm and nothing fanned out: say so instead
-                # of vanishing — this is the zero-fan-out visibility the block exists
-                # for. ``planned`` is null because no requested counts were ever
-                # recorded; 0 would be an inference from absence, not an observation.
+                # Absence proves neither a planned count nor a plain-task intent.
                 return {
                     "intent_source": "swarm",
                     "planned": None,
@@ -882,16 +876,12 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
             return None
         rollup: Dict[str, Any] = {
             "subagent_count": len(child_ids),
-            "fanout_count": fanout_count,
-            "fanout_interval_sec_total": round(fanout_interval_total, 3),
-            "lanes_requested": lanes,
+            "fanout_count": facts.get("fanout_count", 0),
+            "fanout_interval_sec_total": round(facts.get("fanout_interval_sec_total", 0), 3),
+            "lanes_requested": facts.get("lanes_requested", []),
         }
         try:
-            # Depth is the one swarm fact the root could not see: its own
-            # contract carries the request, the subtree carries what was
-            # actually reached. Its own try/except — the enclosing one returns
-            # None for the WHOLE rollup, and a subtree read failure must not
-            # erase the fan-out numbers.
+            # A depth read failure must not erase observed fan-out.
             from ouroboros.depth_evidence import build_depth_summary
             from ouroboros.task_status import find_child_tasks
 
@@ -907,9 +897,7 @@ def build_swarm_efficiency(env: Any, task: Dict[str, Any]) -> Dict[str, Any] | N
             log.debug("swarm depth summary failed", exc_info=True)
         if swarm_intent:
             rollup["intent_source"] = "swarm"
-            # The planned figure under its existing event name — the emissions'
-            # requested_count sum, no synonyms (rc-phaseC, fable 2.3 disposition).
-            rollup["requested_count"] = requested_count_total
+            rollup["requested_count"] = facts.get("requested_count", 0)
         return rollup
     except Exception:
         log.debug("swarm efficiency rollup failed", exc_info=True)

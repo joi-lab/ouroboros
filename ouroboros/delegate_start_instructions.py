@@ -23,6 +23,15 @@ HOST_INSTRUCTIONS = (
     "state your assumption and continue."
 )
 
+# Owner 3B: the ONE host-facts sentence for a session that runs with a scoped native-state
+# home (delegated runs, reviewer agent sessions); never a raw API prompt, which has no shell
+# HOME. It names the two facts the engine provides WHEN PRESENT and lists no commands.
+HOST_FACTS_INSTRUCTION = (
+    " Your HOME may be a scoped native-state home your engine selected rather than the "
+    "operator's; when present, CLAUDEXOR_OPERATOR_HOME names the operator's home and "
+    "PLAYWRIGHT_BROWSERS_PATH the operator's existing browser cache."
+)
+
 UNPROVEN_BOUNDARY_INSTRUCTION = (
     " An OS-enforced filesystem boundary was REQUESTED for this run but is NOT guaranteed: "
     "your engine applies one only where it has a mechanism for this host, and your host "
@@ -58,7 +67,15 @@ ACCESS_INSTRUCTIONS = {
 }
 
 
-def access_instruction(access: str) -> str:
+INVESTIGATION_INSTRUCTION = (
+    " PURPOSE: this is an evidence-only investigation. Your private copy exists so you can run the "
+    "checks you judge useful (tests, scripts, fixtures, temporary files); nothing in it is applied to "
+    "the reviewed or researched tree or creates an obligation to apply it. Put any file worth keeping "
+    "under .review-evidence/: the host retains that folder and the copy's other changes as evidence."
+)
+
+
+def access_instruction(access: str, *, investigation: bool = False) -> str:
     """The ONE canonical sentence for a run's typed access profile, or "".
 
     A parent's prose ban ("Read-only no edits/commands...") in a work order once
@@ -70,7 +87,8 @@ def access_instruction(access: str) -> str:
     defect. The parent's prose is never parsed, only outranked. An unrecognized
     profile renders nothing rather than inventing a rule.
     """
-    return ACCESS_INSTRUCTIONS.get(str(access or "").strip(), "")
+    line = ACCESS_INSTRUCTIONS.get(str(access or "").strip(), "")
+    return line + (INVESTIGATION_INSTRUCTION if investigation and line and access != "readonly" else "")
 
 
 def execution_binding_instruction(execution_root: str, authority_root: str) -> str:

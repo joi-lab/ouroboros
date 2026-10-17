@@ -339,6 +339,65 @@ test('a settled gesture ends only the scrolls it owed, not those a newer gesture
     assert.equal(f.reading.stick, true, 'End\'s own settle still ends what it owed');
 });
 
+test('a resize while a downward key still animates neither writes under it nor ends it; it lays out once the scrolls rest', t => {
+    const f = fixture(t);
+    const body = f.feed.ownerDocument.body;
+    f.reading.bindGestures(() => {});
+    f.reading.cancel();
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+    f.gesture({ type: 'pointerdown', target: { inFeed: true } });
+    // End has only begun to move the feed when an image loads; the composer grows near its end.
+    f.gesture({ type: 'keydown', key: 'End', target: body }); f.feed.scrollTop = 150; f.frame();
+    const restored = f.restored();
+    f.reading.reflow();
+    for (const top of [400, 580]) { f.feed.scrollTop = top; f.reading.scroll(); f.frame(); }
+    f.reading.reflow();
+    assert.deepEqual([f.feed.scrollTop, f.restored()], [580, restored], 'nothing writes under the animated scroll: a write stops it short');
+    f.feed.scrollTop = 600; f.reading.scroll();
+    assert.equal(f.reading.stick, true, 'its own last scroll still reaches the live edge: follow');
+    f.feed.scrollHeight = 1040;
+    f.gesture({ type: 'scrollend' }); f.frame();
+    assert.equal(f.feed.scrollTop, 600, 'not before a frame passes without another scroll');
+    f.frame();
+    assert.equal(f.feed.scrollTop, 1040, 'once its scrolls rest, the resize lays out at the live edge it follows');
+    f.feed.scrollTop = 300; f.reading.scroll();
+    assert.equal(f.reading.stick, true, 'the resize is no part of the gesture: a later scroll decides nothing');
+    // An engine without scrollend: once the owed scrolls rest, the resize ends them.
+    f.gesture({ type: 'keydown', key: 'PageUp', target: body }); f.feed.scrollTop = 500; f.frame();
+    f.gesture({ type: 'keydown', key: 'PageDown', target: body }); f.feed.scrollTop = 520; f.frame();
+    f.feed.scrollTop = 560; f.reading.scroll();
+    f.reading.reflow(); f.frame(); f.frame();
+    assert.equal(f.restored(), restored + 1, 'resting short of the live edge, the place is kept');
+    f.feed.scrollTop = 640; f.reading.scroll();
+    assert.equal(f.reading.stick, false, 'a resize-driven scroll after it decides nothing');
+});
+
+test('a resize that waited on the owed scrolls keeps where they end; at rest it keeps the place read before it', t => {
+    const previous = globalThis.requestAnimationFrame, frames = [];
+    globalThis.requestAnimationFrame = callback => frames.push(callback);
+    t.after(() => { globalThis.requestAnimationFrame = previous; });
+    const frame = () => frames.splice(0).forEach(callback => callback());
+    const heard = new Map(), listen = (type, fn) => heard.set(type, fn);
+    const ownerDocument = { body: {}, documentElement: {}, addEventListener: listen, removeEventListener() {} };
+    const feed = { scrollTop: 100, scrollHeight: 1000, clientHeight: 400, clientWidth: 400, ownerDocument,
+        addEventListener() {}, removeEventListener() {}, contains: node => node === feed || Boolean(node?.inFeed) };
+    // The anchor is the place read: restoring it puts the feed back there.
+    const reading = createChatReadingPosition({ feed, visible: () => true, alive: () => true, ready: () => true,
+        anchors: { capture: () => ({ top: feed.scrollTop }), restore: anchor => { feed.scrollTop = anchor.top; return true; },
+            serialize: () => null }, changed() {}, afterWrite() {}, activity() {}, updateButton() {} });
+    reading.bindGestures(() => {});
+    reading.remember(true);
+    heard.get('pointerdown')({ type: 'pointerdown', target: { inFeed: true } });
+    heard.get('keydown')({ type: 'keydown', key: 'PageDown', target: ownerDocument.body }); feed.scrollTop = 150; frame();
+    feed.clientWidth = 380; reading.reflow(); // the window narrows while PageDown animates
+    for (const top of [300, 450]) { feed.scrollTop = top; reading.scroll(); frame(); }
+    frame(); frame();
+    assert.equal(feed.scrollTop, 450, 'not pulled back to where the resize found the reader');
+    feed.clientWidth = 360; feed.scrollTop = 470; reading.scroll(); // narrowed at rest: its rewrap moved the feed
+    reading.reflow();
+    assert.equal(feed.scrollTop, 450, 'at rest a resize keeps the place read before it');
+});
+
 test('reading inside a box ends what an earlier feed gesture still owes, not a scrollbar still held', t => {
     const f = fixture(t);
     f.feed.ownerDocument.defaultView = { getComputedStyle: node => ({ overflowY: node.overflowY || 'visible' }) };
@@ -400,6 +459,27 @@ test('a box gesture supersedes a ↓ still awaiting history; with nothing pendin
     f.gesture({ type: 'wheel', deltaY: 1, target: text, timeStamp: 3000 });
     f.frame(); f.frame();
     assert.equal(f.feed.scrollTop, f.feed.scrollHeight, 'the sent message is still followed');
+});
+
+test('an unread opening still owed yields to a box gesture after its claim reached the present, and lands only its own', t => {
+    const f = fixture(t);
+    f.feed.ownerDocument.defaultView = { getComputedStyle: node => ({ overflowY: node.overflowY || 'visible' }) };
+    const body = { inFeed: true, parentElement: f.feed, overflowY: 'auto', scrollTop: 200, scrollHeight: 1000, clientHeight: 400 };
+    const text = { inFeed: true, parentElement: body };
+    f.reading.bindGestures(() => {});
+    f.reading.cancel();
+    Object.assign(f.feed, { scrollHeight: 1000, scrollTop: 100, clientHeight: 400 });
+    f.reading.claim(true);
+    const stale = f.reading.arriving;
+    f.reading.claim(true);  // opened again
+    const token = f.reading.arriving;
+    f.reading.land(() => -50, stale);
+    assert.equal(f.reading.arriving, token, 'a superseded opening spends nothing');
+    f.reading.followAfterLayout(); f.frame(); f.frame();  // the opening's ↓ reached the present
+    f.gesture({ type: 'wheel', deltaY: 1, target: text, timeStamp: 1000 }); f.frame();
+    assert.equal(f.reading.arriving, null, 'reading inside a box ends the opening still owed');
+    f.feed.scrollTop = 100; f.reading.land(() => -50, token);
+    assert.equal(f.feed.scrollTop, 100, 'its later landing moves no one');
 });
 
 test('saved Review readiness distinguishes pending/error from confirmed absence and trails revisions', async () => {

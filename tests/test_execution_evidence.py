@@ -71,6 +71,29 @@ class TestCustodyAggregation:
         evidence = custody.task_execution_evidence(drive, "child-1")
         assert evidence["applied_access_profiles"] == ["workspace_write"]
 
+    def test_inherited_source_debt_counts_for_the_continuing_task(self, tmp_path):
+        """A continuation that adopted a partial-source predecessor's snapshot carries
+        that source debt (``inherited_sources``) even when its own brief was complete,
+        so the task's evidence must not count the run as a clean success."""
+        drive = _drive(tmp_path)
+        inherited = {
+            "work_order_source_request": {"schema": 1, "kind": "complete_work_order",
+                                          "coverage": "partial", "complete_chars": 100,
+                                          "complete_sha256": "0" * 64},
+            "work_order_fingerprint": "f" * 64, "work_order_coverage": "partial",
+            "verified_source_ranges": [[0, 40]],
+        }
+        for run_id, request in (("run-plain", {}), ("run-cont", {"inherited_sources": [inherited]})):
+            assert custody.emit(drive, custody.STARTED, {
+                "run_id": run_id, "task_id": "child-1", "route": "claude", "model": "",
+                "max_seconds": 300, "work_order_coverage": "complete",
+                "work_order_source_request": request,
+            })
+            _emit_settled(drive, run_id)
+        evidence = custody.task_execution_evidence(drive, "child-1")
+        assert evidence["delegated_runs_source_unresolved"] == 1
+        assert evidence["delegated_runs_succeeded"] == 1  # the plain run stays a success
+
     def test_no_rows_is_zero_runs_not_an_error(self, tmp_path):
         drive = _drive(tmp_path)
         evidence = custody.task_execution_evidence(drive, "child-1")
@@ -195,9 +218,10 @@ class TestCustodyAggregation:
         assert evidence["delegate_start_attempted"] is True
 
     def test_a_reviewers_settlement_that_outlived_its_start_names_itself(self, tmp_path):
-        """After log rotation the SETTLED row may be all that survives — it
-        carries its own ``source``, so it is still the panel's, not the task's.
-        A settled row WITHOUT a source keeps counting as this task's run."""
+        """A SETTLED event of a run no STARTED row bound (a start the store refused, or
+        a chain an old body rotated) still names its run; it carries its own ``source``,
+        so a reviewer's is still the panel's, not the task's. A settled row WITHOUT a
+        source keeps counting as this task's run."""
         drive = _drive(tmp_path)
         assert custody.emit(drive, custody.SETTLED, {
             "run_id": "run-review", "task_id": "child-1", "route": "codex",
@@ -359,13 +383,11 @@ class TestActualSubstrate:
         # those zeros are UNKNOWN, so the envelope must not classify them as
         # native_only, must not add the delegated_substrate_unused reduction,
         # and the durable result must carry no top-level substrate fields.
-        from ouroboros import delegate_custody as custody
+        from ouroboros.store import STORE_REL
         from ouroboros.subagents import substrate_result_fields
 
         drive = _drive(tmp_path)
-        log_path = custody.event_log_path(drive)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.mkdir()  # a directory where the file should be -> OSError
+        (drive / STORE_REL).mkdir(parents=True)  # a directory where the store should be -> typed unreadable
         task = _subagent_task(drive, capability_delta={"reduced": False, "reason": ""})
         envelope = envelope_from_task(task, status="completed")
         assert envelope["execution_evidence"]["evidence_read_failed"] is True
@@ -421,26 +443,23 @@ def test_evidence_is_json_serializable(tmp_path):
 
 class TestEvidenceReadHonesty:
     def test_unreadable_log_is_flagged_not_zero(self, tmp_path):
-        # Scope finding (a2a6253e gate lineage): an EXISTING but unreadable
-        # canonical log must not collapse into "zero attempts established" —
-        # a directory at the log path forces the open() OSError portably.
+        # Scope finding (a2a6253e gate lineage): custody that cannot be READ must not
+        # collapse into "zero attempts established" — a directory at the store path
+        # makes the store raise its typed unreadable, portably.
         from ouroboros import delegate_custody as custody
+        from ouroboros.store import STORE_REL
 
-        log_path = custody.event_log_path(tmp_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.mkdir()  # a directory where the file should be
+        (tmp_path / STORE_REL).mkdir(parents=True)
         evidence = custody.task_execution_evidence(tmp_path, "t1")
         assert evidence["evidence_read_failed"] is True
         assert evidence["delegated_runs_started"] == 0
 
     def test_nanny_never_accuses_on_unreadable_evidence(self, tmp_path):
         from types import SimpleNamespace
-        from ouroboros import delegate_custody as custody
         from ouroboros.loop import _maybe_inject_finalization_nudges
+        from ouroboros.store import STORE_REL
 
-        log_path = custody.event_log_path(tmp_path)
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.mkdir()
+        (tmp_path / STORE_REL).mkdir(parents=True)
         ctx = SimpleNamespace(_nanny_route_dispatched=True, _nanny_finalization_injected=False,
                               drive_root=tmp_path)
         tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["delegate_start"])

@@ -1,5 +1,12 @@
-import { apiFetch } from './api_client.js';
-/** WebSocket manager; connect after modules register listeners. */
+import { apiFetch, openSignIn } from './api_client.js';
+/** WebSocket manager; connect after modules register listeners.
+ *
+ * Outbound messages sent while the socket is down are queued in memory (at most
+ * 100; the oldest is dropped and announced as `outbound_dropped`) and flushed on
+ * the next open; `send(..., {queue: false})` skips the queue. A watchdog checks
+ * every 10 s and closes a socket that has delivered no inbound message for 45 s,
+ * which enters the normal reconnect path.
+ */
 
 // Consecutive healthy /api/state probes tolerated while the socket stays down
 // before recovery forces a reload (at most one per disconnect episode) — the
@@ -13,7 +20,7 @@ const POST_OPEN_RETRY_MAX_MS = 30000;
 
 /**
  * SSOT for the served-SHA reload decision, shared by the post-open state
- * refresh and the socket-down recovery probe.
+ * refresh and the socket-down recovery probe through decideServedPage below.
  *
  * A client that never connected has nothing to reconcile: keep the page.
  * After a connection existed, an equal SHA keeps the page; a different SHA
@@ -40,6 +47,43 @@ export function decide(prevSha, servedSha, previouslyConnected) {
     if (!served || !prev) return 'reload_unknown';
     return prev === served ? 'keep' : 'reload_changed';
 }
+
+// The core marks only the built-in page it serves itself, per response: never
+// in the shipped bytes, never on a custom directory's or another host's page.
+const PAGE_OWNER_META = 'ouroboros-ui-owner';
+
+export function pageOwnedByCore(doc = globalThis.document) {
+    return doc?.querySelector?.(`meta[name="${PAGE_OWNER_META}"]`)?.getAttribute('content') === 'core';
+}
+
+/**
+ * Who refreshes this page when the core behind it changes. `served_ui` on
+ * /api/state is the interface the core actually serves (an unusable directory
+ * reports builtin with its error), fixed until the core restarts.
+ *
+ * - No `served_ui` — a core older than the interface choice: decide(), exactly.
+ * - The core's own built-in page while it still serves built-in: decide().
+ * - The core's own page after a restart applied a directory or none: reload once,
+ *   even on an unchanged SHA. A fresh page never reloads before its first
+ *   connection, so a marked page cannot loop.
+ * - Any unmarked page under such a core: its directory or host owns its refresh;
+ *   a core change only reconnects and resynchronizes it.
+ *
+ * @param {*} prevSha last remembered served SHA
+ * @param {*} state parsed /api/state body (may be absent/malformed)
+ * @param {boolean} previouslyConnected whether this client ever had an open socket
+ * @param {boolean} coreOwnedPage whether this page carries the core's marker
+ * @returns {'keep'|'reload_changed'|'reload_unknown'|'reload_source'}
+ */
+export function decideServedPage(prevSha, state, previouslyConnected, coreOwnedPage) {
+    const servedUi = state?.served_ui;
+    if (servedUi === undefined) return decide(prevSha, state?.sha, previouslyConnected);
+    if (!coreOwnedPage) return 'keep';
+    if (servedUi?.source === 'builtin') return decide(prevSha, state.sha, previouslyConnected);
+    return previouslyConnected ? 'reload_source' : 'keep';
+}
+
+const RELOAD_REASONS = { reload_changed: 'sha-change', reload_unknown: 'sha-unknown', reload_source: 'ui-source' };
 
 export class WS {
     constructor(url) {
@@ -109,8 +153,9 @@ export class WS {
         window.location.replace(this._freshWindowUrl(reason));
     }
 
-    _applyShaDecision(servedSha, previouslyConnected, storeServedSha) {
-        const decision = decide(this._lastSha, servedSha, previouslyConnected);
+    _applyServedDecision(state, previouslyConnected, storeServedSha) {
+        const decision = decideServedPage(this._lastSha, state, previouslyConnected, pageOwnedByCore());
+        const servedSha = state?.sha;
         // Only the post-open refresh remembers the served SHA. A pre-connect
         // recovery probe must never adopt a restarted server's SHA: doing so
         // would make the eventual post-open compare a self-fulfilling "keep"
@@ -122,10 +167,11 @@ export class WS {
         return decision;
     }
 
-    _reloadForShaDecision(decision) {
+    _reloadForDecision(decision) {
         // Reload on SHA change so PyWebView picks up new JS/CSS after restart;
-        // an unproveable SHA after a reconnect is treated the same way.
-        this._refreshWindow(decision === 'reload_changed' ? 'sha-change' : 'sha-unknown');
+        // an unproveable SHA after a reconnect is treated the same way, and so
+        // is the core's own page once the core serves another interface.
+        this._refreshWindow(RELOAD_REASONS[decision]);
     }
 
     _scheduleUiRecovery(reason, delay = 15000) {
@@ -147,9 +193,14 @@ export class WS {
             let rearm = false;
             try {
                 let healthy = false;
-                let servedSha;
+                let signedOut = false;
+                let served;
                 try {
                     const resp = await apiFetch('/api/state', { cache: 'no-store' });
+                    // The gate refuses an unauthenticated socket before accepting
+                    // it, which reaches this page as an ordinary close (1006,
+                    // never 4401): the state read is where the refusal is legible.
+                    signedOut = resp.status === 401;
                     if (resp.ok) {
                         // Healthy requires an OK status AND a parseable object
                         // body: a captive portal / interposed proxy answering
@@ -160,7 +211,7 @@ export class WS {
                             const body = await resp.json();
                             if (body && typeof body === 'object') {
                                 healthy = true;
-                                servedSha = body.sha;
+                                served = body;
                             }
                         } catch {}
                     }
@@ -175,10 +226,14 @@ export class WS {
                     // the post-open refresh owns the SHA decision now.
                     return;
                 }
+                if (signedOut) {
+                    openSignIn();
+                    return;
+                }
                 if (healthy) {
-                    const decision = this._applyShaDecision(servedSha, this._wasConnected, false);
+                    const decision = this._applyServedDecision(served, this._wasConnected, false);
                     if (decision !== 'keep') {
-                        this._reloadForShaDecision(decision);
+                        this._reloadForDecision(decision);
                         return;
                     }
                     this._recoveryHealthyProbes += 1;
@@ -257,13 +312,13 @@ export class WS {
         apiFetch('/api/state', { cache: 'no-store' }).then(async (resp) => {
             if (this.ws !== socket) return;
             if (!resp.ok) { retry(); return; }
-            let servedSha;
+            let served;
             try {
-                servedSha = (await resp.json())?.sha;
+                served = await resp.json();
             } catch {}
             if (this.ws !== socket) return;
-            const decision = this._applyShaDecision(servedSha, previouslyConnected, true);
-            if (decision !== 'keep') this._reloadForShaDecision(decision);
+            const decision = this._applyServedDecision(served, previouslyConnected, true);
+            if (decision !== 'keep') this._reloadForDecision(decision);
         }, retry).catch(() => {});
     }
 

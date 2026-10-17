@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
 
 import supervisor.git_ops as git_ops
 
@@ -467,6 +468,46 @@ def test_ensure_official_update_remote_blank_configured_source_defaults(monkeypa
     assert git_ops.managed_update_remote_url({"managed_remote_url": "   "}) == (
         git_ops.OFFICIAL_UPDATE_REMOTE_URL)
     assert git_ops.managed_update_remote_url({}) == git_ops.OFFICIAL_UPDATE_REMOTE_URL
+
+
+@pytest.mark.parametrize("legacy", [
+    "https://github.com/joi-lab/ouroboros-desktop",  # what builds before v6.8.0 store
+    "https://github.com/joi-lab/ouroboros-desktop.git",
+    "https://github.com/joi-lab/ouroboros",
+    "git@github.com:joi-lab/ouroboros.git",
+    "ssh://git@github.com/joi-lab/ouroboros.git",
+    "https://github.com/joi-lab/ouroboros-desktop.git/",
+    "HTTPS://GitHub.com/Joi-Lab/Ouroboros-Desktop/",
+])
+def test_former_official_home_updates_from_the_official_repository(monkeypatch, legacy):
+    """Owner 2026-10-11 №3=A: an archived former official home is the project's
+    own retired address, so every repin targets the official repository."""
+    captured = []
+    monkeypatch.setattr(git_ops, "_read_managed_repo_meta", lambda: {
+        "managed_remote_name": "managed",
+        "managed_remote_url": legacy,
+    })
+    monkeypatch.setattr(git_ops, "_list_remotes", lambda: ["managed"])
+    monkeypatch.setattr(git_ops, "git_capture", lambda cmd: captured.append(cmd) or (0, "", ""))
+    for _ in range(2):
+        ok, _msg = git_ops.ensure_official_update_remote()
+        assert ok
+    assert captured == [["git", "remote", "set-url", "managed", git_ops.OFFICIAL_UPDATE_REMOTE_URL]] * 2
+
+
+@pytest.mark.parametrize("configured", [
+    "https://github.com/joi-lab/ouroboros-joi",  # another repository of the same organisation
+    "https://github.com/joi-lab/OuroborosHub",
+    "https://github.com/joi-lab/ouroboros-desktop-fork",
+    "https://github.com/someone/ouroboros",
+    "https://gitlab.com/joi-lab/ouroboros",
+    "joi-lab/ouroboros",  # not a GitHub URL
+    "https://github.com/joi-lab/ouroboros/tree/main",  # a page inside the repository, not its URL
+    "/srv/mirrors/joi-lab/ouroboros.git",
+])
+def test_only_the_exact_former_homes_are_mapped(configured):
+    """The W2-F2 rule stays intact for every other configured source."""
+    assert git_ops.managed_update_remote_url({"managed_remote_url": configured}) == configured
 
 
 def test_dependency_sync_never_installs_into_an_interpreter_under_test(monkeypatch, tmp_path):

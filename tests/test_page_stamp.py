@@ -23,6 +23,7 @@ from ouroboros.chronicle_store import ChronicleStore
 from ouroboros.terminal_projection import _project_row, part_stamp, stamp_facts
 from ouroboros.tools.chronicle import _chronicle_write, host_stamp, page_covers
 from ouroboros.tools.registry import ToolContext
+from tests._store_shared import result_signature, seed_result, unreadable_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 ORIGINAL_KEYS = {"task_id", "status", "outcome", "outcome_phase", "source", "result_ref", "review_verdict"}
@@ -143,8 +144,7 @@ def test_host_stamp_keeps_its_original_order_and_format_for_all_four_sources(tmp
     rows, found = four_sources(tmp_path)
     ids = found["covers"]["task_ids"]
     assert ids == ["both", "facts", "fromfile", "nowhere", "kid1"]
-    result_file = tmp_path / "task_results" / "fromfile.json"
-    before = result_file.read_bytes()
+    before = result_signature(tmp_path, "fromfile")
     stamp = host_stamp(tmp_path, ids, rows=found["rows"])
     assert set(stamp) == {"tasks", "computed_at"}
     old = original_host_stamp(tmp_path, ids, rows=found["rows"])
@@ -161,7 +161,7 @@ def test_host_stamp_keeps_its_original_order_and_format_for_all_four_sources(tmp
     assert by_task["facts"]["source_address"] == addr(rows[4]) and by_task["facts"]["reason_code"] == "tool_budget"
     # 3: the strict task result; the file is where it was, byte for byte.
     assert by_task["fromfile"]["source"] == "task_results" and by_task["fromfile"]["status"] == "completed"
-    assert result_file.read_bytes() == before
+    assert result_signature(tmp_path, "fromfile") == before
     assert "outcome_final" not in by_task["fromfile"] and "source_address" not in by_task["fromfile"]
     # 4: nothing anywhere.
     assert by_task["nowhere"] == {"task_id": "nowhere", "status": "not_recorded"}
@@ -195,12 +195,13 @@ def test_stamp_facts_keys_tasks_in_the_order_asked_once_each(tmp_path):
     assert all(fact["task_id"] == task for task, fact in facts.items())
 
 
-def test_a_strict_refusal_is_not_recorded_and_leaves_the_file_in_place(tmp_path):
-    path = tmp_path / "task_results" / "broken.json"
-    path.parent.mkdir(parents=True)
-    path.write_text("{not json", encoding="utf-8")
+def test_a_strict_refusal_is_not_recorded_and_leaves_the_row_in_place(tmp_path, monkeypatch):
+    seed_result(tmp_path, "broken", {"task_id": "broken", "status": "completed"})
+    before = result_signature(tmp_path, "broken")
+    unreadable = unreadable_result(monkeypatch, "broken")
     assert stamp_facts(tmp_path, ["broken"])["broken"] == {"task_id": "broken", "status": "not_recorded"}
-    assert path.read_text(encoding="utf-8") == "{not json"
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "broken") == before
 
 
 # --- optional facts: copied, never interpreted ---------------------------------------------------

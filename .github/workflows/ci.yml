@@ -1,11 +1,12 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
-# Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests
-# Tier 2 (Full):        Every PR and every ouroboros push → Windows/macOS; stable / manual / tag → full 3-OS matrix
-# Tier 2.5 (Integration): Manual / tag (branch pushes: provider-canary-push.yml)       → Real-provider tests, reusable provider-canary.yml (~2 min)
-# Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
+# Tier 1 (Quick):       Manual                                                        → Ubuntu-only tests
+# Tier 2 (Full):        Manual / tag                                                   → Full 3-OS matrix
+# Tier 1.5 (SQLite floor): Manual                                                      → store modules on ubuntu-22.04's system SQLite 3.37.2
+# Tier 2.5 (Integration): Manual / tag                                                 → Real-provider tests, reusable provider-canary.yml
+# Tier 2.6 (Skill smoke): Manual / tag                                                 → LIVE OuroborosHub install smoke + review/grant/enable checks (paid)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
-# Opt-in (System E2E):    Manual / tag (no schedule)                                     → KEYLESS tests/system_e2e/ scenario lane (Ubuntu, ≤40 min)
+# Opt-in (System E2E):    Manual / tag (no schedule)                                     → KEYLESS tests/system_e2e/ scenario lane (Ubuntu, ≤60 min)
 # Manual (Live E2E):      Dispatch input e2e_live=true only (no schedule)                → PAID devtools/e2e_live stand, $30 cap, OUROBOROS_E2E_LIVE_OPENROUTER_KEY (skipped honestly without it)
 #
 # Tier 2.5 requires OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY.
@@ -15,23 +16,17 @@
 
 name: CI
 
-# The code workflow runs on every push to the three shared branches and on
-# every `v*` tag, with no path filter: tests and builds read prompts, skills,
-# the Makefile, the spec and the requirements too, and a path list silently
-# leaves a new top-level path untested. The paid provider canaries keep their
-# own path list in `provider-canary-push.yml`, and the browser lane's push
-# entry stays `ui-browser-push.yml`, which calls the SAME reusable
-# `ui-browser.yml` lane this workflow calls for pull requests, manual runs and
-# tags.
+# Ordinary cloud tests run by request and on every `v*` release tag, not on
+# branch pushes or PRs (owner choice, 2026-10-16). Local tests and independent
+# review remain; cross-platform failures may surface only at qualification.
+# Tags-only push filtering intentionally excludes ALL branches. Manual/tag
+# runs retain the complete release graph, with no path filter. The UI/provider
+# wrappers remain available for focused manual runs; Claudexor integration
+# and non-test publishing workflows keep their own triggers.
 on:
   push:
-    branches: [main, ouroboros, ouroboros-stable]
     tags:
       - 'v*'
-  # Fork-safe PR validation: no provider secrets and no pull_request_target.
-  # Only fork-safe jobs match pull_request refs, including full host UI proof.
-  pull_request:
-    branches: [ouroboros]
   # Plain dispatch retains the provider and skill-review jobs and can spend
   # money. The separate paid e2e-live stand additionally requires its opt-in
   # input (`-f e2e_live=true`); all other dispatch gates stay unchanged.
@@ -46,28 +41,31 @@ on:
   # scheduled run would report the DEFAULT BRANCH in github.ref, which is why
   # the paid lanes below keep their `!= 'schedule'` guards.
 
-# Read-only is sufficient for tests and fork PRs. The release job overrides
+# Read-only is sufficient for the test jobs. The release job overrides
 # this narrowly with contents: write when publishing a tag.
 permissions:
   contents: read
 
-# A new push to a pull request cancels the run for its previous head. Every other
-# event, and every re-run, gets a group of its own: GitHub keeps one pending run per
-# group, so a shared group would let a re-run of an old head displace the new one,
-# and a release, a scheduled or a landed-commit run must never be cancelled.
+# Each manual/tag run and re-run has its own group, so it cannot displace another
+# qualification. The dormant PR branch is retained alongside the job predicates;
+# it does not enable a PR trigger.
 concurrency:
   group: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-run-{0}-{1}', github.run_id, github.run_attempt) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' && github.run_attempt == 1 }}
 
 jobs:
   # ──────────────────────────────────────────────────────────────────
-  # Tier 1: Quick tests on Ubuntu (push to ouroboros or PR targeting it)
+  # Tier 1: Quick tests on Ubuntu (manual dispatch)
   # ──────────────────────────────────────────────────────────────────
   quick-test:
     if: |
       (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
       || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
       || github.event_name == 'workflow_dispatch'
+    # The growth-mode step reads the pull request's label events.
+    permissions:
+      contents: read
+      pull-requests: read
     runs-on: ubuntu-latest
     env:
       # This job installs pytest-xdist/pytest-timeout below, so the preflight
@@ -111,9 +109,8 @@ jobs:
       # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
       # keeping the step here keeps gate and CI mirrored in both directions.
       - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
-        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' }}
-        shell: bash
-        run: cd web && node --test tests/*.test.js
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' && github.event_name != 'pull_request' }}
+        run: python scripts/run_tests.py --node
       # ESLint `no-undef` is the second, independent layer of the browser no-undef
       # gate (owner decision D-13): the hermetic commit gate keeps the dependency-free
       # acorn walker in the suite above; this layer is CI-only, lockfile-frozen
@@ -129,18 +126,40 @@ jobs:
       # observed platform: the serial pass has no per-test timeout (the commit gate's
       # serial pass has none either), so the ceiling is what bounds a hang there. Its
       # expiry fails that step, and with it the job, without cancelling the job: the
-      # evidence step below still names the test. On Linux and macOS the killed step's
-      # pytest can linger beside the later steps until the runner cleans up the job.
+      # evidence step below still names the test. `scripts/run_tests.py` owns each pass
+      # (lifeline guardian, overload stop), so a killed step leaves no tree behind.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
         id: tests_parallel
         timeout-minutes: 90
-        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && github.event_name != 'pull_request' }}
+        run: python scripts/run_tests.py tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
         id: tests_serial
         timeout-minutes: 60
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && github.event_name != 'pull_request' }}
+        run: python scripts/run_tests.py tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+      - name: Run PR tests (contract floor + affected modules and complete Node lane)
+        id: tests_selected
+        timeout-minutes: 150
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' && github.event_name == 'pull_request' }}
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+        run: python scripts/run_tests.py --selected --base "$PR_BASE" --sequential --evidence-dir="${{ runner.temp }}/ci-evidence"
+      # Whom the reference-book rule binds (scripts/book_growth_mode.py): the size
+      # lane below blocks, warns or passes a grown book by this mode.
+      - name: Decide the reference-book growth mode
+        id: book_mode
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          EVENT: ${{ github.event_name }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: python scripts/book_growth_mode.py
       # OFFICIAL-CI-ONLY enforcement of the repository size gates: manifest
       # exactness against this tree plus the pairwise base-vs-tip shrink-only
       # transition. Local runs exclude the `size_ratchet` marker and surface
@@ -157,6 +176,7 @@ jobs:
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          OURO_BOOK_GROWTH_MODE: ${{ steps.book_mode.outputs.mode }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
@@ -169,7 +189,63 @@ jobs:
         uses: ./.github/actions/test-evidence
         with:
           name: quick-test
-          passes: parallel=${{ steps.tests_parallel.outcome }} serial=${{ steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
+          passes: parallel=${{ github.event_name == 'pull_request' && (steps.tests_selected.outputs.parallel_outcome || steps.tests_selected.outcome) || steps.tests_parallel.outcome }} serial=${{ github.event_name == 'pull_request' && (steps.tests_selected.outputs.serial_outcome || steps.tests_selected.outcome) || steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
+
+  # ──────────────────────────────────────────────────────────────────
+  # Pull requests on Windows and macOS: the same selected scope as quick-test
+  # (contract floor, affected modules, complete Node lane), so a platform break
+  # in the changed area shows before the merge. The full matrix runs after it;
+  # on Windows a full escalation runs the floor and leaves the rest to its four landed shards (--defer-full).
+  # ──────────────────────────────────────────────────────────────────
+  pr-selected-os:
+    if: ${{ github.event_name == 'pull_request' && github.base_ref == 'ouroboros' }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      OUROBOROS_PREFLIGHT_REQUIRE_PLUGINS: "1"
+      OUROBOROS_PREFLIGHT_REQUIRE_NODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/setup-python-env
+        id: setup_python
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ !cancelled() }}
+        id: setup_node
+        with:
+          node-version: '22'
+      - name: Set up Windows POSIX test utilities
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        id: posix_tools
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MSYS
+          release: false
+          update: true
+          install: rsync
+      - name: Select Windows POSIX test utilities
+        id: select_posix_tools
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.posix_tools.outcome == 'success' }}
+        shell: pwsh
+        run: '"${{ steps.posix_tools.outputs.msys2-location }}\usr\bin" >> $env:GITHUB_PATH'
+      - name: Run PR tests (contract floor + affected modules and complete Node lane)
+        id: tests_selected
+        timeout-minutes: 150
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
+        run: python scripts/run_tests.py --selected --base ${{ github.event.pull_request.base.sha }} --sequential --evidence-dir="${{ runner.temp }}/ci-evidence" ${{ runner.os == 'Windows' && '--defer-full' || '' }}
+      - name: Publish test evidence
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
+        continue-on-error: true
+        uses: ./.github/actions/test-evidence
+        with:
+          name: pr-selected-${{ matrix.os }}
+          passes: parallel=${{ steps.tests_selected.outputs.parallel_outcome || steps.tests_selected.outcome }} serial=${{ steps.tests_selected.outputs.serial_outcome || steps.tests_selected.outcome }}
 
   # ──────────────────────────────────────────────────────────────────
   # Benchmark methodology tests (owner decision R42). The devtools/benchmarks
@@ -207,23 +283,56 @@ jobs:
         run: python -m pytest tests/test_devtools_benchmarks.py devtools/benchmarks -m "not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" --timeout=300 --timeout-method=thread -q --tb=short
 
   # ──────────────────────────────────────────────────────────────────
-  # Tier 2: Windows/macOS for every PR and every landed `ouroboros` push (Ubuntu is
-  # quick-test there); full 3-OS matrix for stable, manual runs and tags. The landed
-  # push is what tells a later PR that a Windows/macOS failure is inherited. It runs
-  # in this repository only: an install that pushes its own commits to a private copy
-  # would pay Windows and macOS minutes for every self-modification.
+  # Tier 1.5: the SQLite floor. A store file written by the bundled engine must
+  # open on the oldest engine an install may run it with: ubuntu-22.04's system
+  # libsqlite3 3.37.2. setup-python's interpreter bundles a newer SQLite, so this
+  # job builds the locked dependency venv on the runner's /usr/bin/python3 and
+  # runs the store modules there through the stdlib boundary launcher.
   # ──────────────────────────────────────────────────────────────────
-  full-test:
+  sqlite-floor:
+    if: |
+      (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')
+      || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
+      || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.12.1'
+      - name: Build the locked dependency venv on the system interpreter (system libsqlite3)
+        run: |
+          set -euo pipefail
+          uv sync --locked --extra browser --group dev --no-install-project --python /usr/bin/python3
+          .venv/bin/python -c "import sqlite3, sys; print(sys.version, sqlite3.sqlite_version); assert sqlite3.sqlite_version == '3.37.2'"
+      - name: Run the store modules on SQLite 3.37.2
+        run: /usr/bin/python3 -I -S scripts/safe_test.py --temp-parent "${{ runner.temp }}" -- .venv/bin/python -m pytest tests/test_store.py tests/test_store_import.py tests/test_store_switch.py tests/test_custody_store_rows.py tests/test_store_cutover.py tests/test_store_activation.py -q --tb=short --timeout=300 --timeout-method=thread
+
+  # ──────────────────────────────────────────────────────────────────
+  # Tier 2: Full 3-OS matrix on manual runs and release tags. Branch/PR cases
+  # in the predicates below remain dormant without a corresponding trigger.
+  # ──────────────────────────────────────────────────────────────────
+  full-test-runs:
     if: |
       github.ref == 'refs/heads/ouroboros-stable'
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
-      || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
       || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros' && github.repository == 'razzant/ouroboros')
+    # The growth-mode step reads the pull request's label events.
+    permissions:
+      contents: read
+      pull-requests: read
     strategy:
       fail-fast: false
       matrix:
-        os: ${{ fromJSON((github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/ouroboros')) && '["windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
+        os: ${{ fromJSON((github.event_name == 'push' && github.ref == 'refs/heads/ouroboros') && '["macos-latest"]' || '["ubuntu-latest","macos-latest"]') }}
+        shard: [0]  # Unsharded macOS/Ubuntu; Windows alone is split by whole file.
+        include:
+          - {os: windows-latest, shard: 1}
+          - {os: windows-latest, shard: 2}
+          - {os: windows-latest, shard: 3}
+          - {os: windows-latest, shard: 4}
     runs-on: ${{ matrix.os }}
     env:
       # Same contract as quick-test: this job provisions the parallel-pass
@@ -258,32 +367,64 @@ jobs:
         shell: pwsh
         run: '"${{ steps.posix_tools.outputs.msys2-location }}\usr\bin" >> $env:GITHUB_PATH'
       # Independent checks keep running after a red sibling; setup outcomes suppress cascaded noise.
-      # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
-      # `shell: bash` keeps the glob working on the Windows runner too.
+      # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py).
       - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
-        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
-        shell: bash
-        run: cd web && node --test tests/*.test.js
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) && matrix.shard <= 1 }}
+        run: python scripts/run_tests.py --node
       # ESLint `no-undef` is the second, independent layer of the browser no-undef
       # gate (owner decision D-13): the hermetic commit gate keeps the dependency-free
       # acorn walker in the suite above; this layer is CI-only, lockfile-frozen
       # (`npm ci` on web/package-lock.json) and exact-pinned in web/package.json.
       - name: Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)
-        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) && matrix.shard <= 1 }}
         shell: bash
         run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
+      # Independent unsharded witnesses, in fresh processes on Windows shard 1.
+      # These and the two executed passes have identical marker expressions.
+      - name: Collect the Windows parallel manifest
+        id: manifest_parallel
+        timeout-minutes: 20
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.shard == 1 && steps.setup_python.outcome == 'success' && steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success' }}
+        run: >-
+          python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet"
+          --collect-only -q --default-suite-manifest
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/default-manifest/parallel"
+      - name: Collect the Windows serial manifest
+        id: manifest_serial
+        timeout-minutes: 20
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.shard == 1 && steps.setup_python.outcome == 'success' && steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success' }}
+        run: >-
+          python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet"
+          --collect-only -q --default-suite-manifest
+          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/default-manifest/serial"
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
-      # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
+      # marker-lane exclusions and AND them with the serial split. --timeout guards hangs;
+      # `scripts/run_tests.py` passes the arguments through and owns the process tree.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
         id: tests_parallel
         timeout-minutes: 90
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
-        run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel"
+        run: python scripts/run_tests.py tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/parallel" ${{ runner.os == 'Windows' && format('--default-suite-shard={0}/4', matrix.shard) || '' }}
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
         id: tests_serial
         timeout-minutes: 60
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
-        run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial"
+        run: python scripts/run_tests.py tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/serial" ${{ runner.os == 'Windows' && format('--default-suite-shard={0}/4', matrix.shard) || '' }}
+      # Whom the reference-book rule binds (scripts/book_growth_mode.py): the size
+      # lane below blocks, warns or passes a grown book by this mode.
+      - name: Decide the reference-book growth mode
+        id: book_mode
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && matrix.shard <= 1 }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          EVENT: ${{ github.event_name }}
+          ASSOCIATION: ${{ github.event.pull_request.author_association }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+          REF: ${{ github.ref }}
+        run: python scripts/book_growth_mode.py
       # Same size-ratchet enforcement contract as quick-test (see its comment).
       # PRs carry their base SHA; branch pushes carry event.before; dispatch runs leave
       # the env empty and tag pushes carry an all-zeros before — both degrade to
@@ -292,13 +433,108 @@ jobs:
       - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
         id: tests_size
         timeout-minutes: 20
-        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) && matrix.shard <= 1 }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          OURO_BOOK_GROWTH_MODE: ${{ steps.book_mode.outputs.mode }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short --ci-evidence-dir="${{ runner.temp }}/ci-evidence/size"
       - name: Guard extracted transport imports stay out of core
-        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) && matrix.shard <= 1 }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
+      # The owner-attachment path on real Windows (confined handle reads behind
+      # `/api/files/download?upload=`): this one module's Chromium cases on the Windows
+      # leg of THIS matrix — no second matrix, and the complete UI lane stays in
+      # ui-browser.yml. Nothing skips: the smoke switch is set, an engine that cannot
+      # launch fails, and a run in which no case ran or any case skipped is refused.
+      # The browser fixture runs its candidate only from an interpreter that cannot import
+      # an INSTALLED ouroboros (tests/candidate_checkout.py), and this job's shared env has
+      # the checkout installed. So these steps own a dependency-only env from the same
+      # reviewed lock and the shared env's own base interpreter (the setup action's test
+      # profile with --no-install-project, as the UI lane's); the shared env and every
+      # other step of this job stay as they are.
+      - name: Install the dependency-only env and Chromium for the Windows owner-attachment browser test
+        id: attachment_browser_install
+        timeout-minutes: 20
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.setup_python.outcome == 'success' && steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success' && matrix.shard <= 1 }}
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/attachment-browsers
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/attachment-env
+        run: |
+          base="$(python -c 'import sys; print(sys._base_executable, end="")')"
+          uv sync --locked --extra browser --group dev --no-install-project --python "$base"
+          "$UV_PROJECT_ENVIRONMENT/Scripts/python.exe" -m playwright install chromium
+      - name: Run the owner-attachment browser test on Windows (Chromium)
+        id: attachment_browser
+        timeout-minutes: 30
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.attachment_browser_install.outcome == 'success' && matrix.shard <= 1 }}
+        shell: bash
+        env:
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/attachment-browsers
+          ATTACHMENT_PYTHON: ${{ runner.temp }}/attachment-env/Scripts/python.exe
+        run: |
+          "$ATTACHMENT_PYTHON" -I -S scripts/safe_test.py -- "$ATTACHMENT_PYTHON" -m pytest tests/test_chat_attachments_browser.py -m ui_browser -k chromium -q --tb=short -rs --junitxml="$RUNNER_TEMP/ci-private/attachment-browser.xml"
+          python -c "import sys, xml.etree.ElementTree as E; s = next(E.parse(sys.argv[1]).getroot().iter('testsuite')); n, k = int(s.get('tests')), int(s.get('skipped')); print(f'{n} ran, {k} skipped'); sys.exit(n == 0 or k > 0)" "$RUNNER_TEMP/ci-private/attachment-browser.xml"
+      # The message field's sizing (tests/test_chat_input_sizing_browser.py) where scrollbars
+      # take width, in the same env and Chromium, under the same no-skip rule. Its geometry
+      # and screenshots are the evidence, so a run that wrote none fails. Chromium on Windows,
+      # not the packaged WebView2 window.
+      - name: Run the message-field sizing browser test on Windows (Chromium)
+        id: composer_browser
+        timeout-minutes: 20
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.attachment_browser_install.outcome == 'success' && matrix.shard <= 1 }}
+        shell: bash
+        env:
+          OUROBOROS_RUN_UI_SMOKE: "1"
+          OUROBOROS_UI_EVIDENCE_DIR: ${{ runner.temp }}/ci-evidence/composer
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/attachment-browsers
+          ATTACHMENT_PYTHON: ${{ runner.temp }}/attachment-env/Scripts/python.exe
+        run: |
+          "$ATTACHMENT_PYTHON" -I -S scripts/safe_test.py -- "$ATTACHMENT_PYTHON" -m pytest tests/test_chat_input_sizing_browser.py -m ui_browser -k chromium -q --tb=short -rs --junitxml="$RUNNER_TEMP/ci-private/composer-browser.xml"
+          python -c "import sys, xml.etree.ElementTree as E; s = next(E.parse(sys.argv[1]).getroot().iter('testsuite')); n, k = int(s.get('tests')), int(s.get('skipped')); print(f'{n} ran, {k} skipped'); sys.exit(n == 0 or k > 0)" "$RUNNER_TEMP/ci-private/composer-browser.xml"
+          python -c "import os, sys; sys.exit(os.path.getsize(sys.argv[1]) == 0)" "$OUROBOROS_UI_EVIDENCE_DIR/composer-sizing-chromium.json"
+      - name: Upload the Windows message-field sizing evidence (geometry, screenshots)
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.attachment_browser_install.outcome == 'success' && matrix.shard <= 1 }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: composer-sizing-windows
+          overwrite: true
+          path: ${{ runner.temp }}/ci-evidence/composer/
+          if-no-files-found: warn
+          retention-days: 30
+      # Mandatory Windows proof; the ordinary diagnostic upload below remains advisory.
+      - name: Require both Windows shard projections
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        shell: bash
+        run: |
+          test -s "${{ runner.temp }}/ci-evidence/parallel/results.json"
+          test -s "${{ runner.temp }}/ci-evidence/serial/results.json"
+      - name: Upload the Windows shard proof
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: default-ci-shard-${{ matrix.shard }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ci-evidence/parallel/
+            ${{ runner.temp }}/ci-evidence/serial/
+          retention-days: 30
+          if-no-files-found: error
+      - name: Require both Windows manifest projections
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.shard == 1 }}
+        shell: bash
+        run: |
+          test -s "${{ runner.temp }}/ci-evidence/default-manifest/parallel/results.json"
+          test -s "${{ runner.temp }}/ci-evidence/default-manifest/serial/results.json"
+      - name: Upload the Windows manifests
+        if: ${{ !cancelled() && runner.os == 'Windows' && matrix.shard == 1 }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: default-ci-manifest-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci-evidence/default-manifest/
+          retention-days: 30
+          if-no-files-found: error
       # Names the failed, crashed and in-flight tests in the job summary and as
       # annotations; a killed step still reports through its incremental journal.
       - name: Publish test evidence
@@ -306,10 +542,58 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/test-evidence
         with:
-          name: full-test-${{ matrix.os }}
+          name: full-test-${{ matrix.os }}${{ runner.os == 'Windows' && format('-shard-{0}', matrix.shard) || '' }}
           passes: parallel=${{ steps.tests_parallel.outcome }} serial=${{ steps.tests_serial.outcome }} size=${{ steps.tests_size.outcome }}
 
-  # Fork-safe PR proof for the one native secret-scanner dependency. This job
+  # Preserve the release contract: full-test is green only after every OS/shard
+  # succeeded AND the two Windows passes reconcile against independent collections.
+  full-test:
+    needs: full-test-runs
+    if: ${{ !cancelled() && needs.full-test-runs.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Require every full-test matrix leg
+        env:
+          MATRIX_RESULT: ${{ needs.full-test-runs.result }}
+        shell: bash
+        run: |
+          if [[ "$MATRIX_RESULT" != success ]]; then
+            echo "::error::Full-test matrix did not succeed: $MATRIX_RESULT"
+            exit 1
+          fi
+      - uses: actions/checkout@v4
+        if: ${{ !cancelled() }}
+      - name: Download the Windows manifests
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: default-ci-manifest-${{ github.sha }}-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/default-proof/manifest
+      - name: Download every Windows shard proof
+        if: ${{ !cancelled() }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: default-ci-shard-*-${{ github.sha }}-${{ github.run_id }}-*
+          path: ${{ runner.temp }}/default-proof/shards
+      - name: Reconcile the Windows parallel pass
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 -I -S tests/ci_evidence.py reconcile-shards --lane default_parallel
+          --manifest "${{ runner.temp }}/default-proof/manifest"
+          --shards "${{ runner.temp }}/default-proof/shards"
+          --count 4 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
+          --summary "$GITHUB_STEP_SUMMARY"
+      - name: Reconcile the Windows serial pass
+        if: ${{ !cancelled() }}
+        run: >-
+          python3 -I -S tests/ci_evidence.py reconcile-shards --lane default_serial
+          --manifest "${{ runner.temp }}/default-proof/manifest"
+          --shards "${{ runner.temp }}/default-proof/shards"
+          --count 4 --sha "${{ github.sha }}" --run-id "${{ github.run_id }}"
+          --summary "$GITHUB_STEP_SUMMARY"
+
+  # Manual proof for the one native secret-scanner dependency. This job
   # carries no provider or repository secret: it exercises the explicit pinned
   # installer, managed resolver, license/version checks, and redaction-safe real
   # scanner smoke on each supported desktop OS family.
@@ -351,13 +635,12 @@ jobs:
   # Tier 2.5: Integration tests against real provider APIs
   # The job body is the reusable `provider-canary.yml`. This workflow calls it
   # for manual runs and `v*` tags, where `release-preflight` requires its
-  # result. Branch pushes are deliberately NOT matched here:
-  # `provider-canary-push.yml` owns that trigger and shares the job, so a
-  # provider outage on a landed commit never reddens this workflow.
-  # Confirmed provider-contract failures block release-preflight. A
-  # quota/rate-limit/5xx/timeout outcome is a typed inconclusive skip: a manual
-  # run on a branch reports it, and on a `v*` tag in the official repository the shared
-  # job's release floor fails unless every required canary passed.
+  # result. `provider-canary-push.yml` is a standalone manual all-canary
+  # entry; it does not start a second paid run when a tag is pushed.
+  # Required failures block release-preflight; optional qualification is a separate
+  # strict job outside that dependency graph, never a forgiven mixed producer exit.
+  # Required inconclusive skips fail the official tag floor. Before tagging a branch
+  # qualified by dispatch, inspect every required canary, not aggregate workflow status.
   # ──────────────────────────────────────────────────────────────────
   integration-test:
     # A scheduled run is neither a manual run nor a tag. The leading guard keeps
@@ -368,6 +651,30 @@ jobs:
       && (github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v'))
     uses: ./.github/workflows/provider-canary.yml
+    with:
+      scope: required
+    secrets:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
+      CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
+      GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
+    permissions:
+      contents: read
+
+  # Same paid matrix, disjoint subset. Its real failures stay visible and may make
+  # this workflow red; never add this job to release-preflight/release dependencies.
+  integration-optional:
+    if: |
+      github.event_name != 'schedule'
+      && (github.event_name == 'workflow_dispatch'
+      || startsWith(github.ref, 'refs/tags/v'))
+    uses: ./.github/workflows/provider-canary.yml
+    with:
+      scope: optional
     secrets:
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -522,9 +829,8 @@ jobs:
           grep -q "tests/test_smoke.py" /tmp/size-ratchet-collect.txt
           grep -q "tests/test_repo_health_smoke.py" /tmp/size-ratchet-collect.txt
 
-  # Pushes are deliberately NOT matched here: `.github/workflows/ui-browser-push.yml`
-  # owns that trigger and shares this job, so a landed push gets one browser
-  # lane under its own result.
+  # The complete reusable lane serves manual/tag qualification. The separate
+  # manual wrapper offers diagnostics without narrowing this release dependency.
   ui-smoke:
     if: |
       github.event_name == 'pull_request'
@@ -595,11 +901,14 @@ jobs:
     # (owner decision, batch №13 item 4, 2026-09-02).
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # 94 scenarios plus the cancellation E-suite measured ~45 min end to end (2026-10-12).
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
         id: setup_python
+        with:
+          install-project: 'false'  # candidate servers must import their own checkout (#1644)
       # -o addopts="" replaces the pyproject default markexpr wholesale: the
       # lane's own `integration` marker is exactly what that default excludes.
       - name: Run the keyless system E2E scenario lane (real isolated servers)
@@ -1259,18 +1568,28 @@ jobs:
               fh.write(f"is_prerelease={'true' if is_prerelease else 'false'}\n")
               fh.write("tag_valid=true\n")
           PY
+      # Owner decision 2026-10-17: only the official v7.7.0 tag may continue after
+      # full-test or system E2E concluded red (failed or timed out); integration
+      # stays required. The release proof records every actual result.
       - name: Require test prerequisites for publication
         if: ${{ !cancelled() }}
         env:
           FULL_TEST_RESULT: ${{ needs.full-test.result }}
           INTEGRATION_RESULT: ${{ needs.integration-test.result }}
           SYSTEM_E2E_RESULT: ${{ needs.system-e2e-mock.result }}
+          V7_7_0_OWNER_EXCEPTION: ${{ github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' }}
         shell: bash
         run: |
           set -euo pipefail
+          RESULTS="full-test=$FULL_TEST_RESULT integration-test=$INTEGRATION_RESULT system-e2e-mock=$SYSTEM_E2E_RESULT"
           if [[ "$FULL_TEST_RESULT" != success || "$INTEGRATION_RESULT" != success || "$SYSTEM_E2E_RESULT" != success ]]; then
-            echo "Required release prerequisites did not all succeed: full-test=$FULL_TEST_RESULT integration-test=$INTEGRATION_RESULT system-e2e-mock=$SYSTEM_E2E_RESULT" >&2
-            exit 1
+            if [[ "${V7_7_0_OWNER_EXCEPTION:-}" == true && "$INTEGRATION_RESULT" == success &&
+                  "$FULL_TEST_RESULT" =~ ^(success|failure|cancelled)$ && "$SYSTEM_E2E_RESULT" =~ ^(success|failure|cancelled)$ ]]; then
+              echo "::warning::v7.7.0 owner exception: continuing with $RESULTS; the release proof discloses them."
+            else
+              echo "Required release prerequisites did not all succeed: $RESULTS" >&2
+              exit 1
+            fi
           fi
 
 
@@ -1306,6 +1625,11 @@ jobs:
             syft_sha256: 815ee6973ec5dff6a671d7f41b0e78835a8c45b91d5a39f4743ea1cee833d3be
             syft_binary: syft.exe
     runs-on: ${{ matrix.os }}
+    # Build workers have no signing Environment. Signing uses a separate
+    # fresh Windows runner after this worker has exited. The runner drops
+    # empty outputs, so only the Windows leg sets this one.
+    outputs:
+      windows_archive_sha256: ${{ matrix.os == 'windows-latest' && steps.release_asset.outputs.sha256 || '' }}
     env:
       OUROBOROS_RELEASE_TAG: ${{ github.ref_name }}
       # Only non-secret booleans are job-wide. Credential values are exposed
@@ -1491,12 +1815,25 @@ jobs:
         shell: pwsh
         run: .\build_windows.ps1
 
-      # The proof chain begins at the final archive, after the build scripts
-      # have finished signing, notarizing, and packaging it.
       - name: Locate final release archive
         id: release_asset
         shell: bash
         run: python scripts/release_proof.py locate --directory dist --github-output "$GITHUB_OUTPUT"
+
+      # Unprivileged handoff, never a release asset: windows-sign signs and
+      # repacks it when ESIGNER_CERT_SHA1 is set, otherwise windows-proof
+      # proves it as the explicitly unsigned release ZIP. Both check the
+      # job-output digest before extracting. Seven days, so a signing stop
+      # that waits for the owner can resume with a rerun of the failed job.
+      - name: Transfer unsigned Windows archive
+        if: matrix.os == 'windows-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-unsigned-archive
+          path: ${{ steps.release_asset.outputs.path }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Smoke final macOS DMG
         id: smoke_macos
@@ -1520,6 +1857,9 @@ jobs:
           test -x "$MOUNT/Install CLI.command"
           APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$MOUNT/Ouroboros.app/Contents/Info.plist")"
           lipo -archs "$MOUNT/Ouroboros.app/Contents/MacOS/$APP_EXECUTABLE" | tr ' ' '\n' | grep -qx arm64
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          HOME="$HOME_DIR" "$MOUNT/Ouroboros.app/Contents/Frameworks/python-standalone/bin/python3" -I -B -c \
+            'import webview, objc, AppKit, WebKit, PyObjCTools.AppHelper'
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$MOUNT/Ouroboros.app/Contents/Resources/bin/ouroboros" --help >/dev/null
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
@@ -1558,6 +1898,9 @@ jobs:
           test -f "$SMOKE_ROOT/Ouroboros/_internal/repo_bundle_manifest.json"
           python scripts/fetch_claudexor_runtime.py --verify-only \
             --output-dir "$SMOKE_ROOT/Ouroboros/_internal/claudexor-runtime"
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          HOME="$HOME_DIR" "$SMOKE_ROOT/Ouroboros/_internal/python-standalone/bin/python3" -I -B -c \
+            'import webview'
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
             "$SMOKE_ROOT/Ouroboros/bin/ouroboros" --help >/dev/null
           HOME="$HOME_DIR" XDG_CACHE_HOME="$HOME_DIR/.cache" \
@@ -1725,40 +2068,8 @@ jobs:
           echo "artifact_path=$APPIMAGE" >> "$GITHUB_OUTPUT"
           echo "sbom_path=$APPDIR" >> "$GITHUB_OUTPUT"
 
-      - name: Smoke final Windows archive
-        id: smoke_windows
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $SmokeRoot = Join-Path $env:RUNNER_TEMP "ouroboros-windows-$env:GITHUB_RUN_ATTEMPT"
-          $HomeDir = Join-Path $env:RUNNER_TEMP "ouroboros-smoke-home"
-          New-Item -ItemType Directory -Force -Path $SmokeRoot, $HomeDir | Out-Null
-          Expand-Archive -Path "${{ steps.release_asset.outputs.path }}" -DestinationPath $SmokeRoot
-          # PyInstaller 6 onedir puts datas under _internal\ (the runtime resolves
-          # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
-          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo.bundle")) { throw "repo.bundle missing" }
-          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
-          python scripts/fetch_claudexor_runtime.py --verify-only --output-dir "$SmokeRoot\Ouroboros\_internal\claudexor-runtime"
-          if ($LASTEXITCODE -ne 0) { throw "embedded Claudexor runtime verification failed: $LASTEXITCODE" }
-          $env:HOME = $HomeDir
-          $env:USERPROFILE = $HomeDir
-          $env:LOCALAPPDATA = Join-Path $HomeDir "AppData\Local"
-          $env:APPDATA = Join-Path $HomeDir "AppData\Roaming"
-          $env:HOMEDRIVE = Split-Path -Qualifier $HomeDir
-          $env:HOMEPATH = $HomeDir.Substring($env:HOMEDRIVE.Length)
-          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA, $env:APPDATA | Out-Null
-          & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
-          $env:OUROBOROS_DATA_DIR = Join-Path $env:RUNNER_TEMP "ouroboros-claudexor-smoke"
-          $env:OUROBOROS_BUNDLE_DIR = "$SmokeRoot\Ouroboros\_internal"
-          python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
-          if ($LASTEXITCODE -ne 0) { throw "packaged Claudexor runtime smoke failed: $LASTEXITCODE" }
-          python scripts/betterleaks_platform_smoke.py --bundle-root "$SmokeRoot\Ouroboros\_internal"
-          if ($LASTEXITCODE -ne 0) { throw "packaged Betterleaks runtime smoke failed: $LASTEXITCODE" }
-          Add-Content -Path $env:GITHUB_OUTPUT -Value "sbom_path=$SmokeRoot"
-
       - name: Record packaged artifact smoke
+        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
           EXTRA_CHECKS=()
@@ -1794,6 +2105,7 @@ jobs:
             --check clean_shutdown --check shared_libraries
 
       - name: Install digest-pinned Syft
+        if: matrix.os != 'windows-latest'
         id: syft
         shell: bash
         env:
@@ -1817,9 +2129,10 @@ jobs:
           echo "path=$TOOL_DIR/$SYFT_BINARY" >> "$GITHUB_OUTPUT"
 
       - name: Generate CycloneDX SBOM from packaged payload
+        if: matrix.os != 'windows-latest'
         shell: bash
         env:
-          SBOM_PATH: ${{ steps.smoke_macos.outputs.sbom_path || steps.smoke_linux.outputs.sbom_path || steps.smoke_windows.outputs.sbom_path }}
+          SBOM_PATH: ${{ steps.smoke_macos.outputs.sbom_path || steps.smoke_linux.outputs.sbom_path }}
         run: |
           set -euo pipefail
           "${{ steps.syft.outputs.path }}" "dir:$SBOM_PATH" \
@@ -1834,11 +2147,13 @@ jobs:
             --output cyclonedx-json=dist/sbom-linux-appimage-x86_64.cdx.json
 
       - name: Attest build provenance
+        if: matrix.os != 'windows-latest'
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: ${{ steps.release_asset.outputs.path }}
 
       - name: Attest SBOM
+        if: matrix.os != 'windows-latest'
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
         with:
           subject-path: ${{ steps.release_asset.outputs.path }}
@@ -1951,6 +2266,7 @@ jobs:
       # match nothing on macOS and Windows, which is fine — `error` fires only
       # when the whole path set is empty.
       - name: Upload build artifact
+        if: matrix.os != 'windows-latest'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ouroboros-${{ matrix.os }}
@@ -1971,6 +2287,202 @@ jobs:
             dist/sbom-linux-deb-amd64.cdx.json
             dist/sbom-linux-rpm-x86_64.cdx.json
             dist/sbom-linux-rpm-red80-x86_64.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  # Windows signing is selected by configuration. With ESIGNER_CERT_SHA1 unset
+  # (forks, repositories without a certificate) no job binds the signing
+  # Environment and windows-proof proves the build's ZIP as explicitly
+  # unsigned. Once it is set, signing is required: any failure here, a
+  # malformed thumbprint or a missing secret included, blocks the whole
+  # release. Build and sign never share a runner.
+  windows-sign:
+    if: ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && vars.ESIGNER_CERT_SHA1 != '' && needs.build.result == 'success' && needs.release-preflight.result == 'success' && needs.release-preflight.outputs.tag_valid == 'true' }}
+    needs: [build, release-preflight]
+    runs-on: windows-latest
+    environment: windows-release-signing
+    # Only this job holds the eSigner secrets: no OIDC token and no attestation
+    # right here; the secret-free windows-proof job attests the signed ZIP.
+    permissions:
+      contents: read
+      artifact-metadata: write
+    outputs:
+      archive_sha256: ${{ steps.release_asset.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.10'
+      - name: Download unsigned Windows archive (never a release asset)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: windows-unsigned-archive
+          path: unsigned
+      - name: Check unsigned archive digest before extraction
+        id: unsigned_asset
+        shell: bash
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.windows_archive_sha256 }}
+        run: python scripts/release_proof.py locate --directory unsigned --expect-sha256 "$EXPECTED_SHA256" --github-output "$GITHUB_OUTPUT"
+      - name: Sign, verify and package Windows executable
+        shell: pwsh
+        env:
+          ESIGNER_USERNAME: ${{ secrets.ESIGNER_USERNAME }}
+          ESIGNER_PASSWORD: ${{ secrets.ESIGNER_PASSWORD }}
+          ESIGNER_CREDENTIAL_ID: ${{ secrets.ESIGNER_CREDENTIAL_ID }}
+          ESIGNER_TOTP_SECRET: ${{ secrets.ESIGNER_TOTP_SECRET }}
+          ESIGNER_CERT_SHA1: ${{ vars.ESIGNER_CERT_SHA1 }}
+          UNSIGNED_ARCHIVE: ${{ steps.unsigned_asset.outputs.path }}
+        run: .\scripts\sign_windows_release.ps1 -UnsignedArchive $env:UNSIGNED_ARCHIVE
+      - name: Locate final release archive
+        id: release_asset
+        shell: bash
+        run: python scripts/release_proof.py locate --directory dist --github-output "$GITHUB_OUTPUT"
+      - name: Transfer signed Windows archive (not yet release proof)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-signed-archive
+          path: ${{ steps.release_asset.outputs.path }}
+          overwrite: true
+          if-no-files-found: error
+          retention-days: 7
+
+  # No eSigner secrets on this fresh runner, in either mode: it checks the
+  # final ZIP against its producer's job-output digest before extracting,
+  # verifies the signature when signing is configured, smokes the packaged
+  # app, then records the proof, SBOM and attestations for the release asset.
+  windows-proof:
+    if: ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.build.result == 'success' && (vars.ESIGNER_CERT_SHA1 == '' || needs.windows-sign.result == 'success') }}
+    needs: [build, windows-sign]
+    runs-on: windows-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      WINDOWS_SIGNER_THUMBPRINT: ${{ vars.ESIGNER_CERT_SHA1 }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/setup-python-env
+      - name: Download final Windows archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ vars.ESIGNER_CERT_SHA1 != '' && 'windows-signed-archive' || 'windows-unsigned-archive' }}
+          path: dist
+      - name: Check final archive digest before extraction
+        id: release_asset
+        shell: bash
+        env:
+          SIGNED_SHA256: ${{ needs.windows-sign.outputs.archive_sha256 }}
+          UNSIGNED_SHA256: ${{ needs.build.outputs.windows_archive_sha256 }}
+        run: |
+          EXPECTED_SHA256="$UNSIGNED_SHA256"
+          if [ -n "$WINDOWS_SIGNER_THUMBPRINT" ]; then EXPECTED_SHA256="$SIGNED_SHA256"; fi
+          python scripts/release_proof.py locate --directory dist --expect-sha256 "$EXPECTED_SHA256" --github-output "$GITHUB_OUTPUT"
+      - name: Smoke final Windows archive
+        id: smoke_windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $SmokeRoot = Join-Path $env:RUNNER_TEMP "ouroboros-windows-$env:GITHUB_RUN_ATTEMPT"
+          $HomeDir = Join-Path $env:RUNNER_TEMP "ouroboros-smoke-home"
+          New-Item -ItemType Directory -Force -Path $SmokeRoot, $HomeDir | Out-Null
+          Expand-Archive -Path "${{ steps.release_asset.outputs.path }}" -DestinationPath $SmokeRoot
+          if ($env:WINDOWS_SIGNER_THUMBPRINT) {
+              $Signer = & .\scripts\verify_windows_signature.ps1 -Executable "$SmokeRoot\Ouroboros\Ouroboros.exe" -ExpectedThumbprint $env:WINDOWS_SIGNER_THUMBPRINT
+              Add-Content -Path $env:GITHUB_OUTPUT -Value "signer_thumbprint=$($Signer.Thumbprint)", "signer_publisher=$($Signer.Publisher)"
+          }
+          # PyInstaller 6 onedir puts datas under _internal\ (the runtime resolves
+          # the bundle root itself — packaged_cli walks Resources/Frameworks/_internal).
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo.bundle")) { throw "repo.bundle missing" }
+          if (-not (Test-Path "$SmokeRoot\Ouroboros\_internal\repo_bundle_manifest.json")) { throw "repo bundle manifest missing" }
+          python scripts/fetch_claudexor_runtime.py --verify-only --output-dir "$SmokeRoot\Ouroboros\_internal\claudexor-runtime"
+          if ($LASTEXITCODE -ne 0) { throw "embedded Claudexor runtime verification failed: $LASTEXITCODE" }
+          $env:HOME = $HomeDir
+          $env:USERPROFILE = $HomeDir
+          $env:LOCALAPPDATA = Join-Path $HomeDir "AppData\Local"
+          $env:APPDATA = Join-Path $HomeDir "AppData\Roaming"
+          $env:HOMEDRIVE = Split-Path -Qualifier $HomeDir
+          $env:HOMEPATH = $HomeDir.Substring($env:HOMEDRIVE.Length)
+          New-Item -ItemType Directory -Force -Path $env:LOCALAPPDATA, $env:APPDATA | Out-Null
+          # Source handoff uses this interpreter, not the launcher's frozen imports.
+          & "$SmokeRoot\Ouroboros\_internal\python-standalone\python.exe" -I -B -c "import clr_loader, pythonnet, webview"
+          if ($LASTEXITCODE -ne 0) { throw "packaged source-handoff desktop imports failed: $LASTEXITCODE" }
+          & "$SmokeRoot\Ouroboros\bin\ouroboros.cmd" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged CLI smoke failed: $LASTEXITCODE" }
+          $env:OUROBOROS_DATA_DIR = Join-Path $env:RUNNER_TEMP "ouroboros-claudexor-smoke"
+          $env:OUROBOROS_BUNDLE_DIR = "$SmokeRoot\Ouroboros\_internal"
+          python scripts/claudexor_platform_smoke.py --managed-runtime --lane fixture --max-seconds 300
+          if ($LASTEXITCODE -ne 0) { throw "packaged Claudexor runtime smoke failed: $LASTEXITCODE" }
+          python scripts/betterleaks_platform_smoke.py --bundle-root "$SmokeRoot\Ouroboros\_internal"
+          if ($LASTEXITCODE -ne 0) { throw "packaged Betterleaks runtime smoke failed: $LASTEXITCODE" }
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "sbom_path=$SmokeRoot"
+
+      - name: Record packaged artifact smoke
+        shell: bash
+        env:
+          SIGNER_THUMBPRINT: ${{ steps.smoke_windows.outputs.signer_thumbprint }}
+          SIGNER_PUBLISHER: ${{ steps.smoke_windows.outputs.signer_publisher }}
+        run: |
+          SIGNED=()
+          if [ -n "$WINDOWS_SIGNER_THUMBPRINT" ]; then
+            SIGNED=(--authenticode-thumbprint "$SIGNER_THUMBPRINT" --authenticode-publisher "$SIGNER_PUBLISHER"
+                    --check authenticode_signer --check timestamp --check signed_payload_archive_match)
+          fi
+          python scripts/release_proof.py record-smoke \
+            --proof-id windows-x64 --artifact "${{ steps.release_asset.outputs.path }}" \
+            --output dist/release-smoke-windows-x64.json \
+            --commit "$GITHUB_SHA" --tag "$GITHUB_REF_NAME" \
+            --check embedded_repo_bundle --check embedded_claudexor_runtime \
+            --check embedded_betterleaks_runtime --check packaged_cli_help "${SIGNED[@]}"
+      - name: Install digest-pinned Syft
+        id: syft
+        shell: bash
+        env:
+          SYFT_VERSION: 1.50.0
+          SYFT_ARCHIVE: syft_1.50.0_windows_amd64.zip
+          SYFT_SHA256: 815ee6973ec5dff6a671d7f41b0e78835a8c45b91d5a39f4743ea1cee833d3be
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/$SYFT_ARCHIVE"
+          TOOL_DIR="$RUNNER_TEMP/syft-$SYFT_VERSION"
+          curl --fail --location --silent --show-error \
+            "https://github.com/anchore/syft/releases/download/v$SYFT_VERSION/$SYFT_ARCHIVE" \
+            --output "$ARCHIVE"
+          python -c 'import hashlib,sys; p,e=sys.argv[1:]; a=hashlib.sha256(open(p,"rb").read()).hexdigest(); raise SystemExit(0 if a == e else f"Syft digest mismatch: {a} != {e}")' \
+            "$ARCHIVE" "$SYFT_SHA256"
+          mkdir -p "$TOOL_DIR"
+          python -c 'import shutil,sys; shutil.unpack_archive(sys.argv[1], sys.argv[2])' \
+            "$ARCHIVE" "$TOOL_DIR"
+          test -f "$TOOL_DIR/syft.exe"
+          echo "path=$TOOL_DIR/syft.exe" >> "$GITHUB_OUTPUT"
+      - name: Generate CycloneDX SBOM from final Windows payload
+        shell: bash
+        run: |
+          "${{ steps.syft.outputs.path }}" "dir:${{ steps.smoke_windows.outputs.sbom_path }}" \
+            --output cyclonedx-json=dist/sbom-windows-x64.cdx.json
+      - name: Attest Windows build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.release_asset.outputs.path }}
+      - name: Attest Windows SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.release_asset.outputs.path }}
+          sbom-path: dist/sbom-windows-x64.cdx.json
+      - name: Upload Windows release asset and proof
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ouroboros-windows-latest
+          overwrite: true
+          path: |
+            ${{ steps.release_asset.outputs.path }}
+            dist/release-smoke-windows-x64.json
+            dist/sbom-windows-x64.cdx.json
           if-no-files-found: error
           retention-days: 30
 
@@ -2033,13 +2545,19 @@ jobs:
   # Release: Create GitHub Release with all artifacts
   # ──────────────────────────────────────────────────────────────────
   release:
+    # Owner decision 2026-10-17: only the official v7.7.0 tag may continue after
+    # full-test, system E2E or the UI lane concluded (not skipped) red; every
+    # other job and tag stays strict. That tag stops at a verified draft.
     if: >-
       ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
-          needs.build.result == 'success' && needs.release-preflight.result == 'success' &&
-          needs.marker-guards.result == 'success' && needs.ui-smoke.result == 'success' &&
+          needs.build.result == 'success' && needs.windows-proof.result == 'success' && needs.release-preflight.result == 'success' &&
+          needs.integration-test.result == 'success' && needs.marker-guards.result == 'success' &&
           needs.docker-ui-smoke.result == 'success' && needs.docker-portable-test.result == 'success' &&
-          needs.skill-smoke.result == 'success' }}
-    needs: [build, android-build, release-preflight, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
+          needs.skill-smoke.result == 'success' &&
+          ((needs.full-test.result == 'success' && needs.system-e2e-mock.result == 'success' && needs.ui-smoke.result == 'success') ||
+           (github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' &&
+            needs.full-test.result != 'skipped' && needs.system-e2e-mock.result != 'skipped' && needs.ui-smoke.result != 'skipped')) }}
+    needs: [build, windows-proof, android-build, release-preflight, full-test, integration-test, system-e2e-mock, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
     runs-on: ubuntu-latest
     concurrency:
       group: release-${{ github.ref }}
@@ -2058,9 +2576,10 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Download all artifacts
+      - name: Download release artifacts (exclude unsigned build handoff)
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: ouroboros-*
           path: release-artifacts/
           merge-multiple: true
 
@@ -2110,11 +2629,28 @@ jobs:
         env:
           ANDROID_BUILD_RESULT: ${{ needs.android-build.result }}
           ANDROID_ATTESTATION_RESULT: ${{ steps.verify_artifacts.outputs.android_result }}
+          # Empty selects the explicitly unsigned Windows ZIP; set, the proof
+          # receipt must name exactly this verified signer.
+          WINDOWS_SIGNER_THUMBPRINT: ${{ vars.ESIGNER_CERT_SHA1 }}
+          # Every consumed job's actual result; the proof refuses a missing one.
+          RELEASE_GATE_RESULTS: >-
+            full-test=${{ needs.full-test.result }}
+            integration-test=${{ needs.integration-test.result }}
+            system-e2e-mock=${{ needs.system-e2e-mock.result }}
+            release-preflight=${{ needs.release-preflight.result }}
+            build=${{ needs.build.result }}
+            windows-proof=${{ needs.windows-proof.result }}
+            marker-guards=${{ needs.marker-guards.result }}
+            ui-smoke=${{ needs.ui-smoke.result }}
+            docker-ui-smoke=${{ needs.docker-ui-smoke.result }}
+            docker-portable-test=${{ needs.docker-portable-test.result }}
+            skill-smoke=${{ needs.skill-smoke.result }}
         shell: bash
         run: |
           set -euo pipefail
           PREVIOUS_TAG="$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)"
           ARGS=()
+          for GATE in $RELEASE_GATE_RESULTS; do ARGS+=(--gate-result "$GATE"); done
           if [ -n "$PREVIOUS_TAG" ]; then ARGS+=(--previous-tag "$PREVIOUS_TAG"); fi
           python scripts/release_proof.py assemble \
             --directory release-artifacts \
@@ -2124,6 +2660,7 @@ jobs:
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             --android-build-result "$ANDROID_BUILD_RESULT" \
             --android-attestation-result "$ANDROID_ATTESTATION_RESULT" \
+            --windows-signer-thumbprint "$WINDOWS_SIGNER_THUMBPRINT" \
             --github-output "$GITHUB_OUTPUT" \
             --notes-output release-notes.md \
             "${ARGS[@]}"
@@ -2226,7 +2763,13 @@ jobs:
             exit 1
           fi
 
+      - name: Hold the v7.7.0 owner-exception release at its verified draft
+        if: ${{ github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros' }}
+        shell: bash
+        run: echo "v7.7.0 remains a verified draft; the owner publishes it explicitly." >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish verified GitHub Release
+        if: ${{ !(github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros') }}
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

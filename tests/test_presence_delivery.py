@@ -15,8 +15,8 @@ from starlette.testclient import TestClient
 
 import ouroboros.presence_delivery as delivery
 from ouroboros.gateway.host_service import create_host_service_app
-from ouroboros.utils import atomic_write_json
 from tests.test_host_service_api import FakeBridge, _seed_presence_behavior, _seed_token
+from tests._store_shared import seed_result
 
 
 @pytest.fixture(autouse=True)
@@ -271,7 +271,7 @@ def test_cold_chain_io_failure_remains_retryable(tmp_path, monkeypatch):
 @pytest.mark.parametrize("owner", ["transport", "another-transport", None])
 def test_task_lineage_requires_stored_task_owned_by_reporting_transport(tmp_path, owner):
     if owner is not None:
-        atomic_write_json(tmp_path / "task_results/turn-1.json", {
+        seed_result(tmp_path, "turn-1", {
             "_schema_version": 1, "task_id": "turn-1", "status": "completed",
             "metadata": {"presence": {"transport_skill": owner, "binding_id": "b" * 32,
                                       "event": {"source_event_id": "in-1"}}},
@@ -332,7 +332,7 @@ def test_deferred_work_echoes_original_persisted_mode(tmp_path, status, version)
     presence = {"binding_id": binding}
     if version is not None:
         presence["delivery_reporting_version"] = version
-    atomic_write_json(tmp_path / "task_results/work-1.json", {
+    seed_result(tmp_path, "work-1", {
         "_schema_version": 1, "task_id": "work-1", "status": status,
         "metadata": {"presence": presence, "presence_outcome": "message"}, "result": "Late reply",
     })
@@ -355,8 +355,10 @@ def test_inbound_initiated_and_receipt_paths_derive_one_conversation_identity(tm
     events = []
 
     def runner(**kwargs):
+        from ouroboros.presence_runner import PresenceTurnResult
+
         events.append(kwargs["event"])
-        return SimpleNamespace(outcome="silent", text="", task_id="turn", work_ref="")
+        return PresenceTurnResult(outcome="silent", text="", task_id="turn", work_ref="")
 
     monkeypatch.setattr("ouroboros.presence_runner.run_presence_turn", runner)  # the initiate path's runner
     client = TestClient(create_host_service_app(tmp_path, presence_runner=runner))

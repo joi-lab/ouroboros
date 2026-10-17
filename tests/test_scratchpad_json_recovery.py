@@ -1,4 +1,8 @@
-"""Scratchpad JSON recovery preserves source memory, typed outcomes and paid usage."""
+"""Scratchpad JSON recovery preserves source memory, typed outcomes and paid usage.
+
+Answers still shaped like the older prompt (``knowledge_entries`` beside the block) are
+read for their compressed block alone: no note is created or revised.
+"""
 import copy
 import json
 from types import SimpleNamespace
@@ -14,13 +18,18 @@ from tests.test_memory_maintenance_visibility import _events, _scratchpad
 
 
 fit = fit_helpers.fit
-FINAL = {"knowledge_entries": [], "compressed_block": "Actual consolidated memory."}
+FINAL = {"knowledge_entries": [], "compressed_block": "Actual consolidated memory."}  # older answer shape
+NOMINATING = json.dumps({"knowledge_entries": [{"topic": "lessons/new", "content": "# Lesson\nNominated."},
+                                              {"topic": "untouched", "scope": "global", "edits": [
+                                                  {"old_text": "Keep unchanged.", "new_text": "Rewritten."}]}],
+                         "compressed_block": "Actual consolidated memory."})
 JSON = json.dumps(FINAL)
 EXAMPLE = json.dumps({"knowledge_entries": [], "compressed_block": "Quoted prompt example."})
 USAGE = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
          "cost": 0.02, "provider": "openrouter", "resolved_model": "light/fixture"}
 CASES = [
     ("pure", JSON, "replaced", ""),
+    ("old_nominations", NOMINATING, "replaced", ""),
     ("fenced", "```json\n" + JSON + "\n```", "replaced", ""),
     ("prose_tail", "Here is the consolidated memory.\n" + JSON, "replaced", ""),
     ("example_then_tail", "Example: " + EXAMPLE + "\nActual result:\n" + JSON,
@@ -64,7 +73,7 @@ def _run_case(tmp_path, label, raw, *, stage=False, monkeypatch=None):
         assert len(accounted) == 1
         usage = accounted[0]
     else:
-        usage = c.consolidate_scratchpad(memory, knowledge, llm)
+        usage = c.consolidate_scratchpad(memory, llm)
         outcome = None
     after = memory.load_scratchpad_blocks()
     files_after = _memory_bytes(tmp_path)
@@ -74,12 +83,15 @@ def _run_case(tmp_path, label, raw, *, stage=False, monkeypatch=None):
     assert len(llm.calls) == 1, "formatting never causes another synthetic model call"
     assert usage["prompt_tokens"] == 10 and usage["completion_tokens"] == 5 and usage["cost"] == 0.02
     assert event["accounted_upper_bound_usd"] == 0.02
-    assert event["knowledge_writes"] == {"ok": 0, "failed": 0}
-    assert (knowledge / "untouched.md").read_bytes() == files_before["memory/knowledge/untouched.md"]
+    assert "knowledge_writes" not in event
+    # no note is created or revised, whatever the answer nominated
+    assert ({k: v for k, v in files_after.items() if k.startswith("memory/knowledge/")}
+            == {k: v for k, v in files_before.items() if k.startswith("memory/knowledge/")})
     if event["outcome"] == "replaced":
         assert after[0]["content"] == FINAL["compressed_block"]
         assert after[1:] == before[2:]
         assert len(consolidated) == 1 and consolidated[0]["source_blocks"] == before[:2]
+        assert "knowledge_entries" not in consolidated[0]
         assert after[0]["metadata"]["source_ref"]["entry_id"] == event["source_entry_id"]
     else:
         assert after == before and files_after == files_before

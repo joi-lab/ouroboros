@@ -197,13 +197,15 @@ def test_openai_compatible_metadata_window_fail_closed(monkeypatch):
 def test_provider_metadata_window_routes_openai_compatible(monkeypatch):
     seen = {}
 
-    def _fake(model, base_url, allow_fetch, api_key=None):
-        seen["hit"] = (model, base_url)
+    def _fake(model, base_url, allow_fetch, api_key=None, provider=""):
+        seen["hit"] = (model, base_url, provider)
         return 4096
 
     monkeypatch.setattr(ce, "_openai_compatible_metadata_window", _fake)
     win = ce._provider_metadata_window("openai-compatible", "m", "http://x/v1", allow_fetch=True)
-    assert win == 4096 and seen["hit"] == ("m", "http://x/v1")
+    # The route's provider travels with the probe, so only an openai-compatible
+    # gateway's /models is ever read for image input (never MiniMax's).
+    assert win == 4096 and seen["hit"] == ("m", "http://x/v1", "openai-compatible")
     # gigachat stays unprobeable (no per-model window in its /models)
     assert ce._provider_metadata_window("gigachat", "GigaChat", "", allow_fetch=True) == 0
 
@@ -215,7 +217,7 @@ def test_probe_threads_api_key_through_metadata_and_generative(tmp_path, monkeyp
     openai-compatible route."""
     seen = {}
 
-    def _fake_meta(model, base_url, allow_fetch, api_key=None):
+    def _fake_meta(model, base_url, allow_fetch, api_key=None, provider=""):
         seen["meta_key"] = api_key
         return 0  # force fall-through to the generative probe
 
@@ -673,7 +675,7 @@ def test_no_observation_non_claude_main_route_keeps_todays_initial_mode(tmp_path
         docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
-    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: ([], ""))
 
     def resolver(task, *, allow_fetch):
         return (
@@ -733,7 +735,7 @@ def test_first_successful_call_seeds_density_so_the_next_projection_is_measured(
         docs_need_development=False,
     )
     env = SimpleNamespace(drive_root=str(tmp_path))
-    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: ([], ""))
 
     def resolver(task, *, allow_fetch):
         return (

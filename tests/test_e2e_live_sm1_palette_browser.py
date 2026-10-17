@@ -29,7 +29,7 @@ def test_shared_palette_reaches_both_documents_and_rejects_divergence(subscripti
     page.route("**/static/ui.css", lambda route: route.fulfill(content_type="text/css", body=shared))
     if fault == "wizard-missing-link":
         html = (setup_browser.WEB / "onboarding_template.html").read_text()
-        link = '<link rel="stylesheet" href="/static/ui.css">'
+        link = '<link rel="stylesheet" href="/onboarding/static/ui.css">'
         assert html.count(link) == 1
         bootstrap = (setup_browser.WEB / "tests/fixtures/onboarding_bootstrap.json").read_text()
         html = html.replace(link, "").replace("__ONBOARDING_BOOTSTRAP__", bootstrap)

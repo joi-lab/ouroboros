@@ -3,6 +3,7 @@
 import asyncio
 from copy import deepcopy
 import json
+import os
 import pathlib
 import queue
 from types import SimpleNamespace
@@ -11,10 +12,12 @@ import pytest
 
 from ouroboros import cancel_intents, loop, model_wait, owner_mailbox, usage_accounting as ua
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
+from ouroboros.settings_integrity import task_settings_snapshot
 from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
 from tests.test_subscription_main_wait import main_call as main_fixture
+from tests._usage_store_testing import ledger_rows
 
 setup = gateway_fixture
 live_wait = wait_fixture
@@ -110,7 +113,8 @@ def test_plan_executor_carries_wait_and_admitted_wallet_without_main_capture(tmp
     assert observed == [(owner, wallet, None, None)]
 
 
-def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wait, monkeypatch, advisory):
     _root, gateway, client, _owner, _events, _decide = live_wait
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"light": "account-a"}))
     monkeypatch.setattr(model_wait.time, "sleep", lambda _seconds: None)
@@ -124,7 +128,8 @@ def test_pinned_wait_rejects_other_catalog_account_before_new_generation(live_wa
         assert profile == "account-a" and len(gateway.accepted_operations) == 1
         polls.append(profile)
         return {"source": source, "credentialProfileId": "account-b" if len(polls) == 1 else "account-a",
-                "models": [{"id": "exact-model"}]}
+                "models": [] if advisory else [{"id": "exact-model"}],
+                "admission": {"requestedModel": "exact-model", "inventoryAbsence": "advisory" if advisory else "authoritative"}}
 
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
     client.chat([], MODEL, model_role="light")
@@ -355,15 +360,11 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
             msg_id=owner_stop_control_id(intent), kind=owner_mailbox.KIND_FINALIZE_NOW)
         return True
 
-    if interactive:
-        monkeypatch.setattr(loop_llm_call, "_sleep_within_deadline",
-                            lambda seconds, deadline, **kw: release_wait_after_control_check(seconds, kw["wake_check"]))
-    else:
-        monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
+    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", release_wait_after_control_check)
     def run():
         kwargs = _loop_kwargs(tmp_path, ControlledLLM(), [])
         kwargs["tools"]._ctx.is_direct_chat = interactive
-        if interactive:  # inline Presence retains the paid-repeat rail
+        if interactive:
             kwargs["task_type"] = kwargs["tools"]._ctx.current_task_type = "presence"
         with model_wait.task_model_wait_scope(task={"id": "t-death"}, drive_root=tmp_path,
                 event_queue=None, worker_slot_held=not interactive) as owner:
@@ -375,18 +376,15 @@ def test_outage_wrap_keeps_older_wire_death_custody_without_summary(tmp_path, mo
     # the authority is unknown: the loop refuses before any reservation or send.
     with pytest.raises(model_wait.ModelWaitInterrupted, match="owner_pause_authority_unreadable"):
         run()
-    assert not posted and llm.calls == 0 and not (tmp_path / ua.LEDGER_REL).exists()
+    assert not posted and llm.calls == 0 and not ledger_rows(tmp_path)
     write_task_result(tmp_path, "t-death", STATUS_RUNNING, root_task_id="t-death",
                       _is_direct_chat=interactive)
     _text, usage, trace = run()
     assert posted and llm.calls == 1
-    assert [row["state"] for row in _ledger(tmp_path)] == ["reserved", "dispatched", "unresolved"]
+    assert [row["state"] for row in _ledger(tmp_path)] == ["unresolved"]
     assert loop_llm_call.provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
-    if interactive:
-        assert trace["forced_finalization"]["control_reason"] == "finalize_requested"
-    else:
-        assert "owner requested Wrap up" in _text
-        assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
+    assert "owner requested Wrap up" in _text
+    assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
 
 
 @pytest.mark.parametrize("stop,expected_reason", [
@@ -409,8 +407,8 @@ def test_real_main_control_preserves_candidate_without_new_summary(main_call, mo
     gateway.dispatch = ["response_received", "not_started"]
     held = []
 
-    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False):
-        assert explicit_candidate is False, "this fixture holds the first ordinary answer"
+    def hold(content, limit, trace, actual_tools, *_args, explicit_candidate=False, resume_candidate=False):
+        assert explicit_candidate is False and resume_candidate is False, "this fixture holds the first ordinary answer"
         held.append(loop._replace_delivery_candidate(actual_tools, limit, trace, content, control="hold_for_verification"))
         if stop == "wrap_unknown":
             gateway.pending = True
@@ -480,7 +478,8 @@ def test_hard_cancel_returns_empty_events_to_real_worker_loop_and_keeps_queue_ow
 
     monkeypatch.setattr(actual, "_prepare_task_context", prepare)
     monkeypatch.setattr(actual, "_start_task_heartbeat_loop", lambda *_args: None)
-    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose", lambda *_args: None)
+    monkeypatch.setattr(subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *_args: task_settings_snapshot({}, os.environ))
     monkeypatch.setattr(agent_module, "make_agent", lambda **_kwargs: actual)
     monkeypatch.setattr(worker_process, "_bind_worker_repo_root", lambda *_args: None)
     monkeypatch.setattr(worker_process, "_prepare_worker_task_runtime", lambda: None)

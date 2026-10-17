@@ -7,6 +7,7 @@ open obligations that must survive that retirement.
 """
 
 from __future__ import annotations
+from tests._store_shared import seed_result
 
 
 
@@ -75,7 +76,7 @@ def test_review_ledger_caps_runs_and_attempts_with_omission_notes(tmp_path):
     state = AdvisoryReviewState()
     long_msg = "feat: " + ("y" * 2000)
     for i in range(8):
-        state.add_run(AdvisoryRunRecord(
+        state.advisory_runs.append(AdvisoryRunRecord(
             snapshot_hash=f"hash{i:04d}00000000",
             commit_message=long_msg if i == 7 else f"commit {i}",
             status="fresh",
@@ -202,11 +203,8 @@ def test_settled_continuation_with_open_obligations_survives_age_retirement(tmp_
 
     _aged_continuation("unresolvedtask", ["obl-open-1"])
     _aged_continuation("closedtask", ["obl-long-gone"])
-    task_results = tmp_path / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
     for tid in ("unresolvedtask", "closedtask"):
-        (task_results / f"{tid}.json").write_text(
-            _json.dumps({"_schema_version": 1, "id": tid, "status": "failed"}), encoding="utf-8")
+        seed_result(tmp_path, tid, {"_schema_version": 1, "id": tid, "status": "failed"})
 
     state = AdvisoryReviewState(open_obligations=[
         ObligationItem(

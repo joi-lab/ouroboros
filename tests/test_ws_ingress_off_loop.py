@@ -22,6 +22,7 @@ echo first, and a retry rejoins the one delivery.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import threading
 import time
@@ -219,6 +220,33 @@ def test_an_acceptance_failure_still_answers_the_socket(bridge):
     assert socket.sent and socket.sent[0]["system_type"] == "initialization_notice", socket.sent
     assert echoes == [] and bridge.get_updates(offset=0, timeout=0) == []
 
+
+
+def test_a_redelivered_frame_rejoins_and_a_reused_id_gets_the_failure_reply(bridge):
+    """The same frame twice on a socket (a redispatch) is one row, one queue item and the
+    same echo again; the id reused for other words is refused with the socket's only
+    failure reply, and nothing more is logged, queued or echoed."""
+    echoes = _witness_echoes(bridge)
+    socket = _OpenSocket([_chat_frame("dup-1", "hello"), _chat_frame("dup-1", "hello"),
+                          _chat_frame("dup-1", "changed")])
+
+    async def main():
+        task = asyncio.create_task(ws_endpoint(socket))
+        deadline = time.monotonic() + 5.0
+        while not socket.sent and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, 5)
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(main())
+    assert [(q, ids) for _payload, q, ids in echoes] == [(1, ["dup-1"]), (1, ["dup-1"])], echoes
+    assert echoes[1][0] == echoes[0][0], "the rejoin echo is the accepted row's echo"
+    assert [frame["system_type"] for frame in socket.sent] == ["initialization_notice"]
+    assert _row_ids(bridge.drive) == ["dup-1"]
+    assert len(bridge.get_updates(offset=0, timeout=1)) == 1
 
 
 def _record_handoffs(bridge, release: threading.Event | None = None):
@@ -488,6 +516,7 @@ def test_a_cancelled_socket_settles_every_received_chat_in_order(bridge, mode):
 
 _LATE_ID = "quiz_late_answer:task-1:q1"
 _LATE_BODY = {"request_id": "r1", "decision_id": "quiz:task-1:q1", "option_index": 1}
+_CARD_ROWS = ["quiz_publication:task-1:q1", "quiz_answer:task-1:q1"]
 
 
 def _expired_card(bridge, monkeypatch):
@@ -498,6 +527,10 @@ def _expired_card(bridge, monkeypatch):
 
     record_asked(bridge.drive, "task-1", quiz_id="q1", question="Which db?",
                  options=["sqlite", "postgres"], assumption="sqlite meanwhile", chat_id=1)
+    # The owner answers an exposed card. Publish it to bind its immutable room;
+    # the ask-time chat alone intentionally cannot authorize a late delivery.
+    assert bridge.send_quiz(1, "q1", "Which db?", ["sqlite", "postgres"],
+                            assumption="sqlite meanwhile", task_id="task-1") == (True, "ok")
     reconcile_terminal(bridge.drive, "task-1")
     monkeypatch.setattr(td, "request_drive_root", lambda request: bridge.drive)
     monkeypatch.setattr(td, "_live_root_task", lambda task_id: (None, "task_not_live"))
@@ -581,7 +614,7 @@ def test_a_late_quiz_answer_behind_a_held_socket_acceptance_never_stalls_the_loo
             other.send_text(json.dumps({"type": "command", "cmd": "/stop"}))
             assert command_queued.wait(5) and not timed_out.is_set(), "a command queued behind the late answer"
             assert poster.is_alive() and frames == []
-            assert _row_ids(bridge.drive) == ["quiz_answer:task-1:q1"]  # the card's history row only
+            assert _row_ids(bridge.drive) == _CARD_ROWS  # the card's lifecycle rows only
             release.set()
             poster.join(10)
             assert echoed.wait(5), frames
@@ -590,7 +623,7 @@ def test_a_late_quiz_answer_behind_a_held_socket_acceptance_never_stalls_the_loo
     assert answered["response"].status_code == 200, answered["response"].text
     body = answered["response"].json()
     assert body["answered_after_terminal"] is True and body["forwarded"] is True
-    assert _row_ids(bridge.drive) == ["quiz_answer:task-1:q1", "held-1", _LATE_ID]
+    assert _row_ids(bridge.drive) == _CARD_ROWS + ["held-1", _LATE_ID]
     chats = {frame["client_message_id"]: (queued, rows) for frame, queued, rows in frames if frame.get("type") == "chat"}
     assert set(chats) == {"held-1", _LATE_ID}
     for client_message_id, (queued, rows) in chats.items():  # row → queue → echo, each in custody order
@@ -625,7 +658,7 @@ def test_a_cancelled_late_answer_request_settles_its_delivery_and_a_retry_rejoin
         task.cancel()
         await asyncio.sleep(0)
         assert not task.done(), "the cancelled request abandoned its late delivery (or blocked the loop)"
-        assert frames == [] and _row_ids(bridge.drive) == ["quiz_answer:task-1:q1"]
+        assert frames == [] and _row_ids(bridge.drive) == _CARD_ROWS
         release.set()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
@@ -639,12 +672,90 @@ def test_a_cancelled_late_answer_request_settles_its_delivery_and_a_retry_rejoin
     assert not timed_out.is_set()
     [(echo, queued, rows)] = frames
     assert echo["client_message_id"] == _LATE_ID and echo["ingress_accepted"] is True
-    assert queued == [_LATE_ID] and rows == ["quiz_answer:task-1:q1", _LATE_ID]
+    assert queued == [_LATE_ID] and rows == _CARD_ROWS + [_LATE_ID]
 
     status, body = asyncio.run(td.answer_decision(bridge.drive, dict(_LATE_BODY)))
     assert status == 200 and body["duplicate"] is True and body["forwarded"] is True
-    assert _row_ids(bridge.drive) == ["quiz_answer:task-1:q1", _LATE_ID]
+    assert _row_ids(bridge.drive) == _CARD_ROWS + [_LATE_ID]
     assert [frame["type"] for frame, *_ in frames] == ["chat", "quiz_state"]  # no second echo; the card settles
     [update] = bridge.get_updates(offset=0, timeout=1)
     assert update["message"]["text"] == "2. postgres"
     assert update["message"]["accepted_source_row"]["client_message_id"] == _LATE_ID
+
+
+_ONE_PIXEL_PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC")
+
+
+@pytest.mark.parametrize("name,data,placeholder", [("notes.txt", b"attachment bytes", "(file attached)"),
+                                                   ("owner.png", _ONE_PIXEL_PNG, "(image attached)")])
+@pytest.mark.parametrize("caption", ["", "   "])
+def test_attachment_inspection_keeps_health_and_same_socket_panic_live(bridge, monkeypatch, caption,
+                                                                       name, data, placeholder):
+    from pathlib import Path
+    from ouroboros import chat_uploads
+    from ouroboros.gateway import ws
+
+    monkeypatch.setattr(ws, "DATA_DIR", bridge.drive)
+    stored, _ref = chat_uploads.store_upload(data, name, data_dir=bridge.drive)
+    entered, release, panic = (threading.Event() for _ in range(3))
+    original_resolve = Path.resolve
+
+    def held_resolve(path, *args, **kwargs):
+        if path == bridge.drive / "uploads" and not entered.is_set():
+            entered.set()
+            assert release.wait(5), "attachment inspection was not released"
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", held_resolve)
+    original_panic = bridge.panic.request
+
+    def witness_panic(text, **kwargs):
+        if str(text).strip().lower() == "/panic":
+            panic.set()
+            return True
+        return original_panic(text, **kwargs)
+
+    monkeypatch.setattr(bridge.panic, "request", witness_panic)
+    frames, echoed = _witness_custody(bridge, chat_echoes=2)
+    app = Starlette(routes=[WebSocketRoute("/ws", ws_endpoint), Route("/api/health", api_health)])
+    try:
+        with TestClient(app) as client, client.websocket_connect("/ws") as socket:
+            socket.send_json({"type": "chat", "content": caption, "client_message_id": "image-only",
+                              "attachments": [{"filename": stored.name, "display_name": name}]})
+            assert entered.wait(3)
+            socket.send_text(_chat_frame("later", "after attachment"))
+            socket.send_text(_chat_frame("panic", " /PaNiC "))
+            assert panic.wait(2), "same-socket Panic waited on attachment I/O"
+            assert client.get("/api/health").status_code == 200
+            assert not release.is_set() and _row_ids(bridge.drive) == []
+            release.set()
+            assert echoed.wait(3)
+    finally:
+        release.set()
+    assert _row_ids(bridge.drive) == ["image-only", "later"]
+    assert [frame["client_message_id"] for frame, *_ in frames] == ["image-only", "later"]
+    assert frames[0][0]["text_placeholder"] is True and frames[0][0]["content"] == placeholder
+    updates = bridge.get_updates(0, timeout=1)
+    first = updates[0]["message"]
+    assert not first.get("image_base64")
+    assert first["task_metadata"]["chat_attachment_uploads"][0]["sha256"] == _ref["sha256"]
+    # Dequeue must validate the very row already accepted by the WebSocket door.
+    import server
+    from types import SimpleNamespace
+
+    state, routed = {}, []
+    monkeypatch.setattr(server, "_route_owner_message", lambda _bridge, _ctx, incoming: routed.append(incoming))
+    ctx = SimpleNamespace(load_state=lambda: state, update_state=lambda fn: fn(state) or state)
+    server._handle_bridge_update_batch(bridge, updates, 0, ctx, [0])
+    assert [item["client_message_id"] for item in routed] == ["image-only", "later"]
+    assert routed[0]["log_text"] == placeholder
+    assert routed[0]["origin_message_ref"] == first["accepted_source_ref"]
+    assert _row_ids(bridge.drive) == ["image-only", "later"]
+
+    # A same-id retry re-echoes its row, without another dispatch; changed words
+    # under that identity still fail the source integrity check.
+    bridge.ui_send(caption, client_message_id="image-only", task_metadata=first["task_metadata"])
+    assert bridge.get_updates(0, timeout=0) == []
+    assert _row_ids(bridge.drive) == ["image-only", "later"]
+    with pytest.raises(ValueError, match="different message"):
+        bridge.ui_send("changed caption", client_message_id="image-only", task_metadata=first["task_metadata"])

@@ -17,6 +17,7 @@ from ouroboros.presence_runner import PresenceTurnError
 from ouroboros.presence_runner import PresenceTurnGate, presence_turn_task_id, presence_retry_proof, run_presence_turn
 from ouroboros.presence_runner import _notify_unresolved_turn, presence_result_from_stored, presence_unknown_outcome
 from ouroboros.task_results import load_task_result, task_result_path, write_task_result
+from tests._store_shared import result_signature, seed_result, unreadable_result
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_host_service_responsiveness import _answer, _event, _presence_app, _request, _turn
 from tests.test_presence_delivery import _payload
@@ -103,6 +104,7 @@ def test_receipt_write_retry_and_conflict_do_not_share_disposition(tmp_path, mon
 def test_missing_work_is_rejected_without_losing_original_error(tmp_path):
     app, binding, _ctx = _presence_app(tmp_path, _answer)
     request = _request(app)
+    request.method = "GET"
     request.path_params = {"work_ref": "missing-work"}
     request.query_params = {"binding_id": binding}
     response = asyncio.run(host_service._api_presence_work(request))
@@ -114,9 +116,9 @@ def test_missing_work_is_rejected_without_losing_original_error(tmp_path):
 
 
 @pytest.mark.parametrize("status,code,disposition", [
-    ("running", "presence_attempt_outcome_unknown", "retry"),
-    ("interrupted", "presence_attempt_outcome_unknown", "retry"),
-    ("cancelled", "presence_turn_cancelled", "blocked"),
+    ("running", "presence_attempt_outcome_unknown", "retained"),
+    ("interrupted", "presence_attempt_outcome_unknown", "retained"),
+    ("cancelled", "presence_turn_cancelled", "retained"),
 ])
 def test_lost_or_cancelled_turn_never_regenerates_and_releases_host_capacity(tmp_path, status, code, disposition):
     attempted = []
@@ -140,86 +142,28 @@ def test_lost_or_cancelled_turn_never_regenerates_and_releases_host_capacity(tmp
         assert body["disposition"] == disposition and body["turn_ref"] == turn_id
         assert not body.get("text") and attempted == []
         assert ctx.presence_turns.live() == [] and not any(ctx._inflight.values())
-        assert load_task_result(tmp_path, turn_id) == original
+        assert load_task_result(tmp_path, turn_id)["status"] == original["status"]
 
 
-def test_unresolved_turn_asks_owner_once_and_never_addresses_correspondent(tmp_path, monkeypatch):
+def test_retained_turn_records_facts_without_forced_owner_or_correspondent_speech(tmp_path, monkeypatch):
     from supervisor import message_bus
 
     task_id = "presence-unresolved"
-    write_task_result(tmp_path, task_id, "running", metadata={"source": "presence"})
-    deliveries = []
-    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(message_bus, "try_get_bridge", lambda: object())
-    monkeypatch.setattr(message_bus, "send_with_budget", lambda *args, **kwargs: deliveries.append((args, kwargs)))
+    write_task_result(tmp_path, task_id, "running", metadata={"source": "presence", "presence": {"binding_id": "binding"}})
+    monkeypatch.setattr(message_bus, "send_with_budget", lambda *a, **kw: pytest.fail("forced speech"))
     _notify_unresolved_turn(tmp_path, task_id)
     _notify_unresolved_turn(tmp_path, task_id)
-    assert len(deliveries) == 1
-    args, kwargs = deliveries[0]
-    assert args[0] == 1 and task_id in args[1]
-    assert kwargs == {"role": "system", "system_type": "presence_recovery_required", "require_write": True,
-                      "ensure_record_boundary": True}
-    assert load_task_result(tmp_path, task_id)["presence_recovery_owner_notified"]
-
-
-def test_concurrent_replay_sends_one_owner_recovery_notice(tmp_path, monkeypatch):
-    from concurrent.futures import ThreadPoolExecutor
-    from threading import Event
-    from supervisor import message_bus
-
-    task_id = "presence-concurrent-refusal"
-    write_task_result(tmp_path, task_id, "failed", reason_code="resource_refusal_no_resend",
-                      metadata={"source": "presence"})
-    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(message_bus, "try_get_bridge", lambda: object())
-    entered, release, second_started = Event(), Event(), Event()
-    deliveries = []
-
-    def record(*args, **kwargs):
-        deliveries.append((args, kwargs))
-        if len(deliveries) == 1:
-            entered.set()
-            assert release.wait(5)
-
-    monkeypatch.setattr(message_bus, "send_with_budget", record)
-
-    def second_reader():
-        second_started.set()
-        _notify_unresolved_turn(tmp_path, task_id)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first = pool.submit(_notify_unresolved_turn, tmp_path, task_id)
-        assert entered.wait(5)
-        second = pool.submit(second_reader)
-        assert second_started.wait(5)
-        try:
-            # The second replay cannot race through read/check/write while the
-            # first still owes its durable stamp, even though no turn is admitted.
-            assert not second.done()
-        finally:
-            release.set()
-        first.result(timeout=5)
-        second.result(timeout=5)
-    assert len(deliveries) == 1
-    assert load_task_result(tmp_path, task_id)["presence_recovery_owner_notified"]
-
-
-def test_unrecorded_owner_question_never_gets_a_notified_stamp(tmp_path, monkeypatch):
-    from supervisor import message_bus
-
-    task_id = "presence-unrecorded"
-    write_task_result(tmp_path, task_id, "running", metadata={"source": "presence"})
-    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(message_bus, "try_get_bridge", lambda: object())
-    monkeypatch.setattr(message_bus, "get_bridge", lambda: pytest.fail("unrecorded message was sent"))
-    monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: (_ for _ in ()).throw(OSError("disk")))
-    _notify_unresolved_turn(tmp_path, task_id)
-    assert not load_task_result(tmp_path, task_id).get("presence_recovery_owner_notified")
-    assert not (tmp_path / "logs" / "chat.jsonl").exists()
+    assert load_task_result(tmp_path, task_id)["status"] == "running"
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    facts = [row for row in rows if row.get("summary_id") == f"presence-retained:{task_id}"]
+    assert len(facts) == 1 and facts[0]["summary_kind"] == "host_task_facts"
+    assert facts[0]["text"] == "" and facts[0]["presence_recovery"]["turn_ref"] == task_id
 
 
 @pytest.mark.parametrize("quarantined", [False, True])
-def test_unreadable_or_quarantined_result_never_becomes_a_new_turn(tmp_path, quarantined):
+def test_unreadable_or_quarantined_result_never_becomes_a_new_turn(tmp_path, monkeypatch, quarantined):
+    """A row the store cannot answer for, or an id an old quarantined file still occupies,
+    is an admitted event whose state is unknown: a retry, never a fresh turn."""
     invoked = []
 
     def runner(**kwargs):
@@ -230,18 +174,25 @@ def test_unreadable_or_quarantined_result_never_becomes_a_new_turn(tmp_path, qua
 
     app, binding, ctx = _presence_app(tmp_path, runner)
     task_id = presence_turn_task_id(binding, "event")
-    result_path = task_result_path(tmp_path, task_id)
     if quarantined:
-        result_path = result_path.parent / "quarantine" / result_path.name
+        result_path = task_result_path(tmp_path, task_id).parent / "quarantine" / f"{task_id}.json"
         result_path.parent.mkdir(parents=True)
-    result_path.write_text("{broken", encoding="utf-8")
+        result_path.write_text("{broken", encoding="utf-8")
+    else:
+        seed_result(tmp_path, task_id, {"task_id": task_id, "status": "running"})
+        before = result_signature(tmp_path, task_id)
+        unreadable = unreadable_result(monkeypatch, task_id)
     for _ in range(2):
         response = asyncio.run(_turn(app, binding, "event"))
         body = json.loads(response.body)
         assert response.status_code == 409 and body["code"] == "presence_result_unreadable"
         assert body["disposition"] == "retry" and body["turn_ref"] == task_id
         assert invoked == [] and ctx.presence_turns.live() == [] and not any(ctx._inflight.values())
+    if quarantined:
         assert result_path.read_text(encoding="utf-8") == "{broken"
+    else:
+        unreadable["on"] = False
+        assert result_signature(tmp_path, task_id) == before  # nothing was written over the row
 
 
 def test_failed_durable_start_never_calls_agent_then_same_event_may_retry(tmp_path, monkeypatch):
@@ -305,7 +256,7 @@ def test_resource_refusal_never_returns_a_prepared_reply_as_completed(tmp_path):
         refused = asyncio.run(_turn(app, binding, "event"))
         body = json.loads(refused.body)
         assert refused.status_code == 409 and body["code"] == "presence_resources_unavailable"
-        assert body["disposition"] == "retry" and not body.get("text")
+        assert body["disposition"] == "retained" and not body.get("text")
         assert not ctx.presence_turns.live() and not any(ctx._inflight.values())
     assert len(invoked) == 1  # retry cannot regenerate work behind an already terminal row
 
@@ -617,7 +568,7 @@ def test_unknown_outcome_fallback_terminal_never_acknowledges_the_event(tmp_path
         response = asyncio.run(_turn(app, binding, "event"))
         body = json.loads(response.body)
         assert response.status_code == 409 and body["code"] == "presence_attempt_outcome_unknown"
-        assert body["disposition"] == "retry" and not body.get("text")
+        assert body["disposition"] == "retained" and not body.get("text")
         assert body["work_ref"] == child_id
         assert not ctx.presence_turns.live() and not any(ctx._inflight.values())
     assert invoked == [task_id] and notices == [task_id] * 2
@@ -655,42 +606,28 @@ def test_lost_terminal_write_after_start_barrier_never_acknowledges_the_event(tm
     first = asyncio.run(_turn(app, binding, "event"))
     body = json.loads(first.body)
     assert first.status_code == 409 and body["code"] == "presence_attempt_outcome_unknown"
-    assert body["disposition"] == "retry" and not body.get("text") and body["work_ref"] == child_id
+    assert body["disposition"] == "retained" and not body.get("text") and body["work_ref"] == child_id
     assert load_task_result(tmp_path, presence_turn_task_id(binding, "event"))["status"] == "running"
     again = asyncio.run(_turn(app, binding, "event"))
     assert again.status_code == 409 and json.loads(again.body)["code"] == "presence_attempt_outcome_unknown"
     assert invoked == [presence_turn_task_id(binding, "event")] and ctx.presence_turns.live() == []
 
 
-def test_inline_turn_repeats_a_dispatched_transport_death_as_a_no_effect_attempt(tmp_path, monkeypatch):
-    """The bounded same-round transport-death repeat is not the forbidden event retry.
-
-    An inline Presence turn is a direct-chat task, so its PRIMARY round keeps the paid repeat
-    rail (``loop_llm_call._TRANSPORT_DEATH_RETRIES``): a DISPATCHED request whose socket died
-    with a typed transport death is sent once more in the same round as a NEW physical attempt
-    with its own ledger row. That repeat is no-effect BY CONSTRUCTION in this narrow sense: no
-    Host-executed tool and no correspondent action can stem from the failed attempt, because the
-    host executes tools and the transport speaks only after a model response has landed, and
-    none landed. Provider-owned retrieval (e.g. the server-side web search a provider runs
-    before the response lands) may execute again on the repeat: read-only, non-mutating, priced.
-    So the owner rule (the same event is retried only with positive proof of no prior effect and
-    a new physical identity) is met, and the unknown-outcome refusal (empty 409 plus owner
-    notice) applies when the round ends unresolved without a further permitted repeat: the
-    deadline or a typed finalize control can refuse even the first repeat, and a repeat failing
-    with any other class ends the round at once. Real Host endpoint, runner, loop, round
-    dispatcher, terminal pipeline and attempt ledger: the socket is scripted, the backoff sleep is
-    recorded instead of slept, and the fallback chain is a tripwire.
-    """
+def test_inline_turn_recovers_lost_response_without_replaying_event(tmp_path, monkeypatch):
+    """A lost pure response follows the shared same-turn recovery path; the event never reruns."""
     from ouroboros import agent_task_pipeline as pipeline
 
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(tmp_path / "settings.json"))
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")  # a configured chain the rail must never walk
+    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(loop, "_run_cross_model_fallback_chain", _no_chain)
+    monkeypatch.setattr("ouroboros.loop_transport.upstream_transport_reachable",
+                        lambda *_a, **_kw: {"kind": "upstream_http", "status_code": 200})
+    monkeypatch.setattr("ouroboros.loop_transport.interruptible_wait_sleep", lambda *_a, **_kw: False)
     sleeps, notices, executed, sends = [], [], [], []
     monkeypatch.setattr(call_mod, "_sleep_within_deadline", lambda sec, _deadline, **_kw: (sleeps.append(sec), True)[1])
     monkeypatch.setattr("ouroboros.presence_runner._write_unresolved_notice",
@@ -744,24 +681,27 @@ def test_inline_turn_repeats_a_dispatched_transport_death_as_a_no_effect_attempt
 
     # Exactly two physical attempts: the dead send stays unresolved at its bound, the repeat settles.
     assert llm.calls == 2
-    by_attempt = {}
-    for row in _ledger(tmp_path):
-        by_attempt.setdefault(row["attempt_id"], []).append(row["state"])
-    assert list(by_attempt.values()) == [["reserved", "dispatched", "unresolved"], ["reserved", "dispatched", "settled"]]
+    # Failure evidence advances the first row's revision without adding a call.
+    attempts = _ledger(tmp_path)
+    assert [(row["state"], row["revision"]) for row in attempts] == [("unresolved", 4), ("settled", 3)]
+    assert attempts[0]["physical_failure"]["stage"] == "raised_exception"
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
     # No effect between them: the repeat is the same logical request, and before either send
     # no tool had run and nothing had been spoken; the transport heard the answer once, after it landed.
-    assert sends[1]["messages"] == sends[0]["messages"]
+    assert sends[1]["messages"][0] == sends[0]["messages"][0]
+    recovery = [str(row.get("content") or "") for row in sends[1]["messages"] if "[Transport recovery]" in str(row.get("content"))]
+    assert len(recovery) == 1 and attempts[0]["attempt_id"] in recovery[0]
     assert [send["tools_executed"] for send in sends] == [[], []] and executed == []
     assert [send["spoken"] for send in sends] == [[], []] and spoken() == ["done"]
-    assert sleeps == [4.0]  # the first-death backoff; no wait episode, no chain, no forced final
+    assert sleeps == []  # no Presence-only same-request paid repeat
     api_errors = _events(tmp_path / "logs", "llm_api_error")
     assert [(row["error_kind"], row["retry_same_request"], row["transport_cause_type"]) for row in api_errors] == [
-        ("provider_outcome_unknown", True, "ReadError")]
-    assert api_errors[0]["physical_attempt_id"] == next(iter(by_attempt))
-    assert _events(tmp_path / "logs", "llm_non_retryable_same_request") == []
+        ("provider_outcome_unknown", False, "ReadError")]
+    assert api_errors[0]["physical_attempt_id"] == attempts[0]["attempt_id"]
+    assert len(_events(tmp_path / "logs", "llm_non_retryable_same_request")) == 1
     assert _events(tmp_path / "logs", "llm_retry_deadline_exhausted") == []
     usage, trace = captured["usage"], captured["trace"]
+    assert usage["transport_recovery"]["previous_attempt"]["physical_attempt_id"] == attempts[0]["attempt_id"]
     assert captured["text"] == "done" and trace.get("forced_finalization") is None
     assert TRANSPORT_DEATHS_KEY not in usage and "_last_llm_error_kind" not in usage  # the usable response cleared both
     assert usage.get("reason_code") is None and usage.get("execution_status") != "infra_failed"

@@ -26,6 +26,10 @@ from ouroboros import (
     llm_substitution,
 )
 from ouroboros.llm import LLMClient
+from ouroboros.review import (
+    MAX_MODULE_LINES, SIZE_RATCHET_MANIFEST_PATH, TARGET_MODULE_LINES,
+    load_size_ratchet_manifest,
+)
 
 REPO = pathlib.Path(__file__).parents[1]
 PKG = REPO / "ouroboros"
@@ -131,7 +135,6 @@ _MIXIN_OWNERS = {
         "_build_remote_kwargs _normalize_remote_response _openrouter_main_web_search_tool "
         "extract_display_reasoning"
     ),
-    (llm_pricing, "_GenerationCostMixin"): "_fetch_generation_cost",
 }
 
 # Members llm.py keeps: the composition itself, the caller-facing chat surface,
@@ -168,6 +171,11 @@ def test_llm_facade_reexports_every_moved_module_identity():
     assert llm.CONTEXT_OVERFLOW_CODES is context_budget.CONTEXT_OVERFLOW_CODES
 
 
+def test_claudexor_catalog_aliases_keep_the_metadata_owner_identity():
+    for name in ("model_catalog", "catalog_admits_model"):
+        assert getattr(llm_claudexor, name) is getattr(llm_capability_policy, name)
+
+
 def _defined_members(path: pathlib.Path, class_name: str) -> set[str]:
     """Members a class DEFINES in source — immune to monkeypatch residue that an
     earlier test in the same process may have left on the class object."""
@@ -199,7 +207,7 @@ def test_llm_client_members_resolve_to_their_mixin_owners():
 def test_llm_client_member_inventory_is_unchanged():
     """The composed class exposes exactly the member set of the tree it was split from.
 
-    The digest has moved twice, each time with named provenance. (1) The final upstream
+    The digest changes only with named provenance. (1) The final upstream
     cutoff (PR #257) added three methods to ``LLMClient`` in the base —
     ``_new_remote_client``, ``probe_provider_readiness`` and ``_new_gigachat_client`` —
     and the adopting merge re-homed them into the leaves that own their siblings.
@@ -216,7 +224,8 @@ def test_llm_client_member_inventory_is_unchanged():
     kind of provenance is what this pin exists to catch. (4) The subscription
     model integration adds three explicit route capability/catalog methods and
     places complete remote dispatch with the existing provider/client owner.
-    Every prior member remains inherited; no dispatch semantics changed.
+    (5) Explicit OpenRouter receipt reconciliation retires the unused
+    ``_fetch_generation_cost`` compatibility stub and its empty mixin.
     """
     assert _defined_members(pathlib.Path(llm.__file__), "LLMClient") == _PARENT_MEMBERS
     moved = {name for names in _MIXIN_OWNERS.values() for name in names.split()}
@@ -224,7 +233,7 @@ def test_llm_client_member_inventory_is_unchanged():
     assert hashlib.sha256(
         json.dumps(composed, separators=(",", ":")).encode()
 
-    ).hexdigest() == "e41b36df9a44c020082acd5db82ab40fb8a65811c5dd982ecac7df3325a5833c"
+    ).hexdigest() == "4d444f433e693f9692ebbdff2e1f71cb1a223f0c1674d9e148b970329856430c"
     for name in composed:
         assert hasattr(LLMClient, name), name
 
@@ -241,7 +250,6 @@ def test_llm_mixin_composition_order_is_pinned():
         "_GigaChatLaneMixin",
         "_LocalLaneMixin",
         "_OpenAICompatibleLaneMixin",
-        "_GenerationCostMixin",
         "object",
     ]
     # No mixin shadows another: every member has exactly one owner.
@@ -252,15 +260,21 @@ def test_llm_mixin_composition_order_is_pinned():
             owners[name] = base.__name__
 
 
-def test_llm_extraction_size_bounds_have_meaningful_headroom():
+def test_llm_facade_headroom_and_leaf_size_policy():
     counts = {
-        module.__name__: len(
+        pathlib.Path(module.__file__).relative_to(REPO).as_posix(): len(
             pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
         )
         for module in (llm, *_LEAVES)
     }
-    assert counts["ouroboros.llm"] <= 750
-    assert all(count <= 1000 for count in counts.values()), counts
+    assert counts["ouroboros/llm.py"] <= 750
+    # Coherent leaves use the same reviewed size bands as the rest of the repository.
+    band = load_size_ratchet_manifest(REPO / SIZE_RATCHET_MANIFEST_PATH).band_paths
+    for path, count in counts.items():
+        assert count <= MAX_MODULE_LINES, (path, count)
+        if count > TARGET_MODULE_LINES:
+            reason = band.get(path)
+            assert isinstance(reason, str) and reason.strip(), (path, count)
 
 
 def test_llm_leaf_import_graph_is_acyclic_and_shallow():

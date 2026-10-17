@@ -1,0 +1,161 @@
+"""The one supervisor bus serves its control lane before its telemetry lane.
+
+Owner decision (14 Oct 2026): «делим EVENT_Q на две полосы — приоритетную
+(сообщения в чат, старт/стоп задач) и фоновую (пульс, статистика токенов), чтобы
+телеметрия никогда не задерживала ответы». The lane is declared once on the
+taxonomy, the bus routes on put and serves control-first on get, the idle-input
+index spans both lanes, and a queued send's delivery identity stays outstanding
+from its put until the consumer releases it. Every guard is pinned in both
+directions, and the manager-backed shape runs on the real spawn-context
+``EventQueueManager`` the server uses.
+"""
+from __future__ import annotations
+
+import multiprocessing
+import queue as stdqueue
+from types import SimpleNamespace
+
+import pytest
+
+from supervisor.event_observation import (
+    EventQueueManager,
+    ObservedEventQueue,
+    delivery_outstanding,
+    event_lane,
+    pending_idle_observations,
+)
+from supervisor.event_taxonomy import CONTROL_LANE, TELEMETRY_LANE
+
+
+def _telemetry(n: int) -> dict:
+    kind = ("log_event", "llm_usage", "task_heartbeat")[n % 3]
+    if kind == "log_event":
+        return {"type": kind, "n": n, "data": {"type": "tool_call_started", "task_id": "worker-task"}}
+    return {"type": kind, "n": n, "task_id": "worker-task"}
+
+
+def _send(n: int = 0, **extra: object) -> dict:
+    return {"type": "send_message", "n": n, "task_id": "answer-task", "chat_id": 1, "text": "final", **extra}
+
+
+@pytest.mark.serial
+def test_a_send_behind_five_thousand_telemetry_frames_is_the_first_event_served_on_the_real_manager():
+    context = multiprocessing.get_context("spawn")
+    with EventQueueManager(ctx=context) as manager:
+        endpoint = manager.Queue()
+        for n in range(5000):
+            endpoint.put(_telemetry(n))
+        endpoint.put(_send(5000, delivery_id="final:answer-task:0123456789abcdef"))
+        assert endpoint.qsize() == 5001
+        first = endpoint.get_nowait()
+        assert first["type"] == "send_message" and first["n"] == 5000
+        assert endpoint.qsize() == 5000
+        # The membership rides the manager too: outstanding until the consumer releases it.
+        assert endpoint.delivery_outstanding("final:answer-task:0123456789abcdef") is True
+        assert endpoint.put_unless_outstanding(_send(1, delivery_id="final:answer-task:0123456789abcdef")) is False
+        assert endpoint.qsize() == 5000
+        endpoint.release_delivery("final:answer-task:0123456789abcdef")
+        assert endpoint.delivery_outstanding("final:answer-task:0123456789abcdef") is False
+        assert delivery_outstanding(endpoint, "final:answer-task:0123456789abcdef") is False
+        # Telemetry keeps its own FIFO behind the control lane.
+        assert [endpoint.get_nowait()["n"] for _ in range(3)] == [0, 1, 2]
+
+
+def test_fifo_inside_each_lane_and_control_first_across_them():
+    bus = ObservedEventQueue()
+    order = [("c", 1), ("t", 1), ("c", 2), ("t", 2), ("t", 3), ("c", 3)]
+    for lane, n in order:
+        bus.put(_send(n) if lane == "c" else {**_telemetry(n), "n": n})
+    served = []
+    while True:
+        try:
+            evt = bus.get_nowait()
+        except stdqueue.Empty:
+            break
+        served.append((event_lane(evt)[0], evt["n"]))
+    assert served == [("c", 1), ("c", 2), ("c", 3), ("t", 1), ("t", 2), ("t", 3)]
+    assert bus.qsize() == 0
+
+
+def test_an_undeclared_kind_rides_the_control_lane():
+    bus = ObservedEventQueue()
+    bus.put(_telemetry(0))
+    bus.put({"type": "kind_nobody_declared", "n": 1})
+    assert event_lane({"type": "kind_nobody_declared"}) == CONTROL_LANE
+    assert bus.get_nowait()["n"] == 1
+    assert event_lane(bus.get_nowait()) == TELEMETRY_LANE
+
+
+def test_the_idle_input_index_spans_both_lanes_and_follows_the_served_order():
+    bus = ObservedEventQueue()
+    bus.put({"type": "llm_usage", "task_id": "telemetry-task"})  # idle input, telemetry lane
+    bus.put({"type": "schedule_subagent", "task_id": "control-task"})  # idle input, control lane
+    bus.put({"type": "task_heartbeat", "task_id": "liveness-only"})  # never an idle input
+    assert pending_idle_observations(bus) == {"telemetry-task", "control-task"}
+    assert bus.get_nowait()["type"] == "schedule_subagent"
+    assert pending_idle_observations(bus) == {"telemetry-task"}
+    assert bus.get_nowait()["type"] == "llm_usage"
+    assert pending_idle_observations(bus) == set()
+    assert bus.get_nowait()["type"] == "task_heartbeat"
+    assert bus.qsize() == 0
+
+
+def test_delivery_membership_counts_every_put_and_releases_one_at_a_time():
+    bus = ObservedEventQueue()
+    did = "final:answer-task:0123456789abcdef"
+    assert bus.delivery_outstanding(did) is False
+    bus.put(_send(1, delivery_id=did))
+    bus.put_nowait(_send(2, delivery_id=did))  # the worker's original and a queued copy
+    assert bus.delivery_outstanding(did) is True and bus.qsize() == 2
+    assert bus.put_unless_outstanding(_send(3, delivery_id=did)) is False
+    assert bus.qsize() == 2, "a refused copy enqueues nothing"
+    bus.get_nowait()  # dequeue does NOT release: the handler may still be sending
+    bus.release_delivery(did)
+    assert bus.delivery_outstanding(did) is True, "one release retires one put"
+    bus.release_delivery(did)
+    assert bus.delivery_outstanding(did) is False
+    bus.release_delivery(did)  # a surplus release is harmless, never negative
+    assert bus.delivery_outstanding(did) is False
+    assert bus.put_unless_outstanding(_send(4, delivery_id=did)) is True
+    assert bus.delivery_outstanding(did) is True and bus.qsize() == 2
+    # Sends without an id and non-send events are enqueued without membership.
+    assert bus.put_unless_outstanding(_send(5)) is True
+    assert bus.put_unless_outstanding({"type": "task_heartbeat", "task_id": "t", "delivery_id": did}) is True
+    assert bus.qsize() == 4 and bus.delivery_outstanding(did) is True
+
+
+def test_put_unless_outstanding_keeps_the_queue_bound_and_the_idle_index():
+    bus = ObservedEventQueue(maxsize=1)
+    assert bus.put_unless_outstanding({"type": "llm_usage", "task_id": "t"}) is True
+    with pytest.raises(stdqueue.Full):
+        bus.put_unless_outstanding({"type": "llm_usage", "task_id": "refused"})
+    assert pending_idle_observations(bus) == {"t"}
+    assert bus.get_nowait()["task_id"] == "t"
+    assert pending_idle_observations(bus) == set()
+
+
+@pytest.mark.parametrize("endpoint", [None, stdqueue.Queue(), SimpleNamespace(delivery_outstanding=lambda did: "yes")])
+def test_an_unobservable_membership_is_unknown_not_absent(endpoint):
+    assert delivery_outstanding(endpoint, "final:x:0123456789abcdef") is None
+    assert delivery_outstanding(ObservedEventQueue(), "final:x:0123456789abcdef") is False
+
+
+def test_a_contended_schedule_deferral_lands_in_the_control_lane_ahead_of_older_telemetry():
+    """ADM-1: ``workspace_preparation.defer_schedule_event`` re-puts a contended
+    ``schedule_subagent`` on the same transport; with the lanes that put is served
+    before every telemetry frame that was queued earlier, so a contention bounce
+    no longer costs a lap of the telemetry backlog. One transport, no second
+    deferral mechanism."""
+    from supervisor.workspace_preparation import defer_schedule_event
+
+    bus = ObservedEventQueue()
+    for n in range(100):
+        bus.put(_telemetry(n))
+    event = {"type": "schedule_subagent", "task_id": "child", "parent_task_id": "root",
+             "root_task_id": "root", "chat_id": 1, "delegation_role": "subagent"}
+    assert defer_schedule_event(SimpleNamespace(event_queue=bus), event) is True
+    assert bus.qsize() == 101
+    served = bus.get_nowait()
+    assert served["type"] == "schedule_subagent" and served["task_id"] == "child"
+    assert "child" not in pending_idle_observations(bus) and "root" not in pending_idle_observations(bus)
+    assert bus.get_nowait()["n"] == 0

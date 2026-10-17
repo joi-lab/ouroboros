@@ -119,7 +119,7 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
                                                   worker_slot_held=False) as owner:
                 observed["owner"] = owner
                 pipeline._dispatch_root_post_task(f.env, f.task, "Already answered", self._event_queue, pending,
-                    {"rounds": 3}, {}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
+                    {"rounds": 3}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
                     project_scoped=bool(project_id), project_task=False, parent_env=None, parent_task=None)
             return pending
 
@@ -162,7 +162,7 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
                     return reason
 
                 # Keep paid post-task custody alive until HTTP reports its
-                # existing still-live response; this is a schedule, not a fake stop.
+                # pending response; this is a schedule, not a fake stop.
                 monkeypatch.setattr(owner, "control_reason", hold_observed_stop)
             else:
                 real_request_cancel = cancel_intents.request_cancel
@@ -170,11 +170,16 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
                 def settle_after_durable_stop(*args, **kwargs):
                     assert post_task_model_wait(f.root, task_id) is owner
                     intent = real_request_cancel(*args, **kwargs)
+                    if intent.get("already_settled") and not kwargs.get("allow_settled_target"):
+                        return intent  # the settled answer asks live ownership before it mints
                     assert intent["request_id"] and intent["state"] == "requested"
                     assert intent["source"] == "http_single"
                     assert not intent.get("already_settled")
                     assert f.done.wait(5)
-                    until(lambda: owner.closed and post_task_model_wait(f.root, task_id) is None)
+                    # A finished post phase is the returned turn: close() flips `closed` BEFORE
+                    # it retires its consumer in this task result, a write custody must not straddle.
+                    thread.join(5)
+                    assert not thread.is_alive() and owner.closed and post_task_model_wait(f.root, task_id) is None
                     assert row["resolution"] == "cancelled"
                     observed["accepted_stop"] = intent["request_id"]
                     return intent
@@ -184,7 +189,7 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
                 monkeypatch.setattr(cancel_intents, "request_cancel", settle_after_durable_stop)
             with _client(f.root) as client:
                 response = client.post(f"/api/tasks/{task_id}/cancel", json={"stop_policy": "immediate"})
-                assert response.status_code == (503 if action == "stop" else 404), response.json()
+                assert response.status_code == (202 if action == "stop" else 404), response.json()
             if action == "stop":
                 assert stop_observed.wait(5)
                 assert post_task_model_wait(f.root, task_id) is owner and not owner.closed
@@ -205,7 +210,7 @@ def test_native_post_task_wait_remains_addressable_after_dialogue_closes(phase, 
             assert f.engine.uploads[-1][0]["account"] == {"mode": "pin", "profileId": "replacement"}
         else:
             assert row["resolution"] == "cancelled"
-            assert f.stages == ["facts", "scratch", "reflection"]
+            assert f.stages == ["facts", "scratch", "promotion"]
         assert workers.drain_repo_writers(0) == []
         assert post_task_model_wait(f.root, task_id) is None
     finally:

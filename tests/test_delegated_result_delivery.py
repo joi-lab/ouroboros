@@ -9,6 +9,15 @@ truncated output.
 from __future__ import annotations
 
 import json
+import hashlib
+from dataclasses import replace
+
+import pytest
+
+from tests.test_main_authored_context import call
+from tests.test_main_authored_context import main_loop as _main_loop
+
+main_loop = _main_loop
 import pathlib
 
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
@@ -16,6 +25,7 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
     _event_types,
     _nanny_ctx,
     _owned_gateway_uses_each_test_transport,
+    _select_transport_access,
 )
 
 
@@ -58,7 +68,13 @@ def test_a_large_delegated_result_is_delivered_whole_or_declared_partial(tmp_pat
     assert payload["primary_output_preview"] and payload["primary_output_preview"] in verdict
 
     artifact = delivery["artifact"]
-    assert artifact["root"] == "task_drive"
+    # #1573: retained once in the staging task's CANONICAL source store, read back by
+    # its absolute path through the artifact_store lineage read.
+    from ouroboros.artifacts import task_artifact_dir_path
+
+    assert artifact["root"] == "artifact_store"
+    assert artifact["source"]["task_id"] == "t-a"
+    assert pathlib.Path(artifact["path"]) == task_artifact_dir_path(tmp_path, "t-a") / artifact["source"]["path"]
     staged = pathlib.Path(artifact["abs_path"]).read_text(encoding="utf-8")
     assert json.loads(staged)["primary_output"] == verdict, "the whole result must survive"
     assert delivery["read_next"]["tool"] == "read_file"
@@ -71,114 +87,263 @@ def test_a_large_delegated_result_is_delivered_whole_or_declared_partial(tmp_pat
     from ouroboros.contracts.task_constraint import TaskConstraint
 
     ctx.task_constraint = TaskConstraint(mode=LOCAL_READONLY_SUBAGENT_MODE)
-    head = _read_file(ctx, path=artifact["path"], root="task_drive", start_line=1, max_lines=5)
-    tail = _read_file(ctx, path=artifact["path"], root="task_drive",
+    head = _read_file(ctx, path=artifact["path"], root=artifact["root"], start_line=1, max_lines=5)
+    tail = _read_file(ctx, path=artifact["path"], root=artifact["root"],
                       start_line=artifact["lines"], max_lines=5)
     assert "BLOCKED" not in head and "NOT_FOUND" not in head and "ERROR" not in head
     assert head != tail, "start_line must be a real cursor, not a no-op"
 
 
 def _read_artifact_whole(ctx, artifact, step=7):
-    """Cover the staged artifact contiguously, like a real reader: line windows, plus
-    the start_char sub-line cursor for any line longer than the delivery budget (a cut
-    window only credits the delivered prefix)."""
-    from ouroboros.tool_capabilities import tool_result_limit
+    """Direct readers receive exactly their selected line window, without a hidden cap."""
     from ouroboros.tools.core import _read_file
 
-    stride = tool_result_limit("read_file") - 5_000
     lines = pathlib.Path(artifact["abs_path"]).read_text(encoding="utf-8").splitlines(keepends=True)
-    for line_no, line in enumerate(lines, start=1):
-        offset = 0
-        while offset == 0 or offset < len(line):
-            _read_file(ctx, path=artifact["path"], root="task_drive",
-                       start_line=line_no, max_lines=1, start_char=offset)
-            offset += stride
+    for line_no in range(1, len(lines) + 1, step):
+        _read_file(ctx, path=artifact["path"], root=artifact["root"], start_line=line_no, max_lines=step)
 
 
-def test_the_coverage_ack_binds_to_what_delivery_actually_hands_the_model(
-        tmp_path, monkeypatch):
-    """P34R.7 (scope reviewer, p34.part2 gate) claimed the ack credits characters the
-    delivery layer cuts, because it runs before _annotate_reread and the 80K cap. The
-    executed probe REFUTED it: the reread note is APPENDED and the outer truncator
-    KEEPS THE HEAD (s[:limit]), so the note can only lose its own tail — it never
-    displaces body characters — and the ack's budget math mirrors the real truncator
-    to the character. This test PINS that equivalence on the real seam (tool ->
-    annotation -> real _truncate_tool_result), so a future reordering — prepending
-    the note, a tail-keep truncator, a second budget constant — cannot silently turn
-    the rejected finding true: on every shape, the interval the ack credits must not
-    exceed the window-body characters actually present in the delivered string."""
-    import ouroboros.delegate_custody as dc
-    import ouroboros.tools.delegate as delegate
-    from ouroboros.gateways import claudexor as gw
-    from ouroboros.loop_tool_execution import _truncate_tool_result
-    from ouroboros.tool_capabilities import tool_result_limit
+def _staged_for_main(f, raw, run_id="run-coverage"):
+    from ouroboros import delegate_custody as dc, delegate_output as output
+    from ouroboros.tool_access import resource_root_path
+
+    f.ctx.task_id = "authored-main"
+    output._READ_COVERAGE.clear()
+    target = resource_root_path(f.ctx, "task_drive") / "delegated_runs" / f"{run_id}.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(raw)
+    entry = dc.RunCustody(run_id=run_id, task_id="authored-main", route_id="fixture", model="fixture",
+                          project_id="fixture", project_owned=False, ledger_root=str(f.ctx.drive_root))
+    dc.record_started(f.ctx.drive_root, entry)
+    entry.output_artifact, entry.output_sha = f"delegated_runs/{target.name}", hashlib.sha256(raw).hexdigest()
+    entry.output_complete = True
+    dc.emit(f.ctx.drive_root, dc.OUTPUT_SPILLED, {
+        "run_id": run_id, "task_id": entry.task_id, "staged": True, "full_content": True,
+        "artifact": entry.output_artifact, "sha256": entry.output_sha,
+    })
+    return target, entry
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("partial", [False, True], ids=["whole-large", "measured-head-tail"])
+def test_the_coverage_ack_binds_to_what_delivery_actually_hands_the_model(main_loop, monkeypatch, partial):
+    """Real Main credits the exact read window intersected with its final projection."""
+    from ouroboros import delegate_output as output
     from ouroboros.tools.core import _read_file
+    from tests.test_main_result_ingress import _observe_measurements
 
-    budget = tool_result_limit("read_file")
+    f = main_loop
+    raw = ("Преамбула\r\n" + "Ж🙂Ω" * 55_000 + "\rЗавершение\n").encode("utf-8")
+    target, entry = _staged_for_main(f, raw)
+    content = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    f.ctx.context_fit_plan = replace(f.ctx.context_fit_plan, window_tokens=120_000 if partial else 2_000_000)
+    _observe_measurements(monkeypatch)
+    offset = 37 if partial else 0
+    answer, _, trace = f.run([
+        call("read_file", {"root": "task_drive", "path": entry.output_artifact,
+                           "start_line": 1, "max_lines": 100, "start_char": offset}, "read-staged"),
+        {"content": "done"},
+    ])
+    assert answer == "done"
+    row = next(row for row in trace["tool_calls"] if row["tool_call_id"] == "read-staged")
+    read_view = row["tool_result_meta"]["read_view"]
+    assert read_view["source_revision"] == hashlib.sha256(raw).hexdigest()
+    assert read_view["source_start_char"] == offset
+    assert read_view["body_chars"] == len(content) - offset
+    assert read_view["complete_chars"] == len(content) < len(raw)
+    visible = next(row["content"] for row in f.inputs[-1]["messages"] if row.get("tool_call_id") == "read-staged")
+    key = f"{target.resolve()}|{entry.output_sha}"
+    last = "Завершение\n"
+    if not partial:
+        numbered = "".join(f"{n:>6}\t{line}" for n, line in enumerate(content.splitlines(keepends=True), 1))
+        assert numbered in visible and len(visible) > 160_000
+        assert output._READ_COVERAGE[key] == [[0, len(content)]]
+        assert entry.output_consumed is True
+    else:
+        assert row["result_partial"] is True
+        spans = row["result_source_view"]["shown_ranges"]
+        assert len(spans) == 2
+        # The cursor lands inside line 2, so the first row is that line's partial
+        # head under its own number; display numbers are never source.
+        header = read_view["body_start"] + len(f"{2:>6}\t")
+        assert header < spans[0][1] and spans[1][0] < header + len(content) - offset - len(last)
+        expected = [[offset, offset + spans[0][1] - header],
+                    [offset + spans[1][0] - header, len(content)]]
+        assert output._READ_COVERAGE[key] == expected
+        assert content[expected[0][0]:expected[0][1]] in visible
+        assert content[expected[1][0]:-len(last)] + f"{3:>6}\t{last}" in visible
+        assert expected[0][1] < expected[1][0] and not entry.output_consumed
+        # Exact pages fill the omitted interval and the deliberately skipped prefix.
+        _read_file(f.ctx, root="task_drive", path=entry.output_artifact, max_lines=100,
+                   start_char=expected[0][1], max_chars=expected[1][0] - expected[0][1])
+        assert not entry.output_consumed
+        _read_file(f.ctx, root="task_drive", path=entry.output_artifact, max_lines=100, max_chars=offset)
+        assert entry.output_consumed
+    consumed = [json.loads(line) for line in (f.ctx.drive_root / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                if '"delegate_run_output_consumed"' in line]
+    assert len(consumed) == 1 and consumed[0]["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert consumed[0]["bytes"] == len(raw) and consumed[0]["chars"] == len(content)
 
-    class _Stub(_LiveRunStub):
-        def get_run(self, rid, **_kw):
-            return {"lastSeq": 9, "primaryOutput": "V" * (budget * 2),
-                    "summary": {"state": "succeeded", "spendUsd": 0.0}}
 
-    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    delegate._CUSTODY.clear()
-    delegate._READ_COVERAGE.clear()
-    dc.record_started(tmp_path, delegate._RunCustody(
-        run_id="run-1", task_id="t-a", route_id="r", model="m",
-        project_id="p", project_owned=False, root_task_id="t-a", ledger_root=str(tmp_path)))
-    ctx = _nanny_ctx(tmp_path)
-    artifact = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1)
-                          )["output_delivery"]["artifact"]
-    content = pathlib.Path(artifact["abs_path"]).read_text(encoding="utf-8")
-    import hashlib as _hl
-    identity = (f"{pathlib.Path(artifact['abs_path']).resolve()}|"
-                f"{_hl.sha256(content.encode('utf-8', 'replace')).hexdigest()}")
+@pytest.mark.serial
+@pytest.mark.parametrize("missing", ["read_view", "source_revision", "projection"])
+def test_unknown_delivery_metadata_never_claims_complete(main_loop, missing):
+    from ouroboros import delegate_output as output
+    from ouroboros.tools.tool_result import ToolResult
+
+    f = main_loop
+    target, entry = _staged_for_main(f, b"exact staged output\n")
+    with output.staged_read_delivery_scope():
+        typed = f.registry.execute_result("read_file", {"root": "task_drive", "path": entry.output_artifact})
+    assert not output._READ_COVERAGE and not entry.output_consumed
+    meta = dict(typed.meta)
+    if missing == "read_view":
+        meta.pop("read_view")
+    elif missing == "source_revision":
+        meta["read_view"] = {**meta["read_view"], "source_revision": "unknown"}
+    invalid = ToolResult(status=typed.status, code=typed.code, text=typed.text, meta=meta)
+    projected = {"result": typed.text}
+    if missing == "projection":
+        projected.update(result_partial=True)
+    output.acknowledge_staged_output_delivery(f.ctx, {"result": typed.text, "tool_result": invalid}, projected)
+    assert not output._READ_COVERAGE and not entry.output_consumed
+    output.acknowledge_staged_output_delivery(f.ctx, {"result": typed.text, "tool_result": typed}, {"result": typed.text})
+    assert entry.output_consumed
+    assert output._READ_COVERAGE[f"{target.resolve()}|{entry.output_sha}"] == [[0, len(target.read_bytes())]]
+
+
+def _numbered_display_oracle(content, rendered, body_start, *, start_line, start_char, max_chars):
+    """Display offset -> source offset, built from the content (never by parsing the display)."""
     lines = content.splitlines(keepends=True)
-    long_no, long_line = max(enumerate(lines, start=1), key=lambda p: len(p[1]))
-    assert len(long_line) > budget + 1000
+    window = "".join(lines[start_line - 1:])
+    body = window[start_char:][:max_chars] if max_chars else window[start_char:]
+    ends, total = [], 0
+    for line in window.splitlines(keepends=True):
+        total += len(line)
+        ends.append(total)
+    number = start_line + sum(1 for end in ends if end <= start_char)
+    mapping, pos = {}, body_start
+    source = sum(len(line) for line in lines[:start_line - 1]) + start_char
+    for row in body.splitlines(keepends=True):
+        pos += len(f"{number:>6}\t")
+        for _ in row:
+            mapping[pos] = source
+            pos, source = pos + 1, source + 1
+        number += 1
+    assert pos == len(rendered)
+    return mapping
 
-    def delivered_body(delivered, window_body, hdr):
-        if hdr not in delivered:
-            return 0
-        after = delivered.split(hdr, 1)[1]
-        lo, hi, best = 0, min(len(after), len(window_body)), 0
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if after.startswith(window_body[:mid]):
-                best, lo = mid, mid + 1
-            else:
-                hi = mid - 1
-        return best
 
-    def call(start_char):
-        before = sum(b - a for a, b in delegate._READ_COVERAGE.get(identity, []))
-        result = _read_file(ctx, path=artifact["path"], root="task_drive",
-                            start_line=long_no, max_lines=1, start_char=start_char)
-        delivered = _truncate_tool_result(result, "read_file",
-                                          {"path": artifact["path"], "root": "task_drive"})
-        after = sum(b - a for a, b in delegate._READ_COVERAGE.get(identity, []))
-        hdr = result.split("\n", 1)[0] + "\n"
-        return result, delivered_body(delivered, long_line[start_char:], hdr), after - before
+def _credited(mapping, shown):
+    offsets = sorted({mapping[d] for lo, hi in shown for d in range(lo, hi) if d in mapping})
+    ranges = []
+    for offset in offsets:
+        if ranges and ranges[-1][1] == offset:
+            ranges[-1][1] += 1
+        else:
+            ranges.append([offset, offset + 1])
+    return ranges
 
-    # Shape A: rendering just under the budget; the repeat's appended note pushes the
-    # annotated result over it — the rejected finding's exact scenario.
-    offset = len(long_line) - (budget - 200)
-    r1, d1, c1 = call(offset)
-    assert len(r1) <= budget and c1 <= d1, (c1, d1)
-    r2, d2, c2 = call(offset)
-    assert len(r2) > budget, "the annotated repeat must exceed the budget here"
-    assert c2 <= max(0, d2), (c2, d2)
-    assert d2 == d1, "an appended note must never displace delivered body characters"
 
-    # Shape B: the rendering alone exceeds the budget; ack == the truncator's cut.
-    delegate._READ_COVERAGE.clear()
-    r3, d3, c3 = call(0)
-    assert len(r3) > budget and c3 == d3, (c3, d3)
-    r4, d4, c4 = call(0)
-    assert c4 <= max(0, d4) and d4 == d3, (c4, d4, d3)
-    delegate._CUSTODY.clear()
-    delegate._READ_COVERAGE.clear()
+@pytest.mark.parametrize("start_line,start_char,max_chars", [
+    (1, 0, None), (2, 7, None), (1, 3, 150), (3, 2, 40), (5, 0, 1)])
+def test_numbered_read_credit_counts_only_shown_source_characters(start_line, start_char, max_chars):
+    """The one delivered-range SSOT decodes read_file's numbered rows: display
+    numbers and a hidden middle credit nothing, partial rows keep exact offsets."""
+    from ouroboros import delegate_output as output
+    from ouroboros.tools.core_file_tools import _render_line_slice
+
+    content = "alpha\n" + "Ж🙂Ω" * 40 + "\n" + "mid line\n" + "x" * 90 + "\n" + "omega"
+    extent = {}
+    rendered = _render_line_slice("f", content, max_lines=10, start_line=start_line,
+                                  start_char=start_char, max_chars=max_chars, extent=extent)
+    oracle = _numbered_display_oracle(content, rendered, extent["body_start"], start_line=start_line,
+                                      start_char=start_char, max_chars=max_chars)
+    inside_first_row = min(len(rendered), extent["body_start"] + len(f"{1:>6}\t") + 2)
+    shown_sets = ([[0, len(rendered)]],                                   # whole
+                  [[0, extent["body_start"] + 3], [inside_first_row, len(rendered)]],  # cut inside a number
+                  [[0, (len(rendered) + extent["body_start"]) // 2], [len(rendered) - 9, len(rendered)]],
+                  [[0, extent["body_start"]]])                            # the header alone
+    for shown in shown_sets:
+        expected = _credited(oracle, shown)
+        assert output._delivered_source_ranges(extent, rendered, {}, content, shown) == expected, shown
+    whole = output._delivered_source_ranges(extent, rendered, {"result": rendered}, content)
+    assert whole == _credited(oracle, [[0, len(rendered)]])
+    assert whole == [[extent["source_start_char"], extent["source_end_char"]]]
+    # Tampered descriptors or display text credit nothing (never a guessed offset).
+    shape = extent["display_map"]
+    body_char = next(d for d in sorted(oracle))
+    forged = rendered[:body_char] + ("#" if rendered[body_char] != "#" else "!") + rendered[body_char + 1:]
+    for view, text in (({**extent, "display_map": {**shape, "first_number": shape["first_number"] + 1}}, rendered),
+                       ({**extent, "display_map": {**shape, "rows": shape["rows"] - 1}}, rendered),
+                       ({key: value for key, value in extent.items() if key != "display_map"}, rendered),
+                       ({**extent, "body_chars": extent["body_chars"] - 1}, rendered),
+                       (extent, forged)):
+        assert output._delivered_source_ranges(view, text, {}, content, [[0, len(text)]]) is None
+
+
+def test_a_real_2000_row_read_carries_its_display_map_on_the_bounded_result(tmp_path):
+    """The invocation-local read_view keeps the few-byte display map (never per-line
+    facts) and the SSOT credits the whole Unicode read from it."""
+    from ouroboros import delegate_output as output
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.tools.tool_result import (
+        _install_tool_result_sidecar, _published_tool_result, _restore_tool_result_sidecar,
+    )
+
+    rows = [f"Ж🙂Ω row {i}\n" for i in range(2000)]
+    rows[999] = "mid "  # a Unicode line boundary is a row of its own
+    (tmp_path / "big.txt").write_text("".join(rows), encoding="utf-8")
+    content = (tmp_path / "big.txt").read_text(encoding="utf-8")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path / "data")
+    sentinel = object()
+    token = _install_tool_result_sidecar(ctx, sentinel)
+    try:
+        text = _read_file(ctx, "big.txt", root="system_repo")
+        typed = _published_tool_result(ctx, sentinel)
+    finally:
+        _restore_tool_result_sidecar(token)
+    view = typed.meta["read_view"]
+    assert view["display_map"] == {"scheme": "numbered_rows_v1", "first_number": 1, "rows": 2000}
+    assert "line_ends" not in view and f"{2000:>6}\tЖ🙂Ω row 1999\n" in text
+    assert output._delivered_source_ranges(view, text, {"result": text}, content) == [[0, len(content)]]
+
+
+@pytest.mark.serial
+def test_parallel_main_reads_keep_their_own_source_window(main_loop, monkeypatch):
+    import threading
+    from ouroboros import delegate_output as output
+    from ouroboros.tools import core_file_tools
+    from tests.test_main_result_ingress import _observe_measurements
+
+    f = main_loop
+    first, first_entry = _staged_for_main(f, ("Ж" * 1000 + "\n").encode("utf-8"), "run-first")
+    second, second_entry = _staged_for_main(f, ("Ω" * 2000 + "\n").encode("utf-8"), "run-second")
+    _observe_measurements(monkeypatch)
+    stamp = core_file_tools._stamp_read_view
+    barrier = threading.Barrier(2)
+
+    def overlapping_stamp(*args, **kwargs):
+        rendered = stamp(*args, **kwargs)
+        barrier.wait(timeout=5)
+        f.ctx.last_read_view = {"target": "unrelated shared context value"}
+        return rendered
+
+    monkeypatch.setattr(core_file_tools, "_stamp_read_view", overlapping_stamp)
+    calls = call("read_file", {"root": "task_drive", "path": first_entry.output_artifact,
+                              "start_char": 7, "max_chars": 90}, "first-read")
+    calls["tool_calls"].extend(call("read_file", {
+        "root": "task_drive", "path": second_entry.output_artifact,
+        "start_char": 123, "max_chars": 40}, "second-read")["tool_calls"])
+    answer, _, trace = f.run([calls, {"content": "done"}])
+    assert answer == "done"
+    assert output._READ_COVERAGE[f"{first.resolve()}|{first_entry.output_sha}"] == [[7, 97]]
+    assert output._READ_COVERAGE[f"{second.resolve()}|{second_entry.output_sha}"] == [[123, 163]]
+    assert not first_entry.output_consumed and not second_entry.output_consumed
+    rows = {row["tool_call_id"]: row for row in trace["tool_calls"]}
+    assert rows["first-read"]["tool_result_meta"]["read_view"]["target"] == str(first)
+    assert rows["second-read"]["tool_result_meta"]["read_view"]["target"] == str(second)
 
 
 def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
@@ -221,14 +386,14 @@ def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
     assert spilled[-1]["full_content"] is True
 
     # A head read is served in full and acknowledges nothing.
-    head = _read_file(ctx, path=artifact["path"], root="task_drive", start_line=1, max_lines=5)
+    head = _read_file(ctx, path=artifact["path"], root=artifact["root"], start_line=1, max_lines=5)
     assert "BLOCKED" not in head and "ERROR" not in head
     assert "delegate_run_output_consumed" not in _event_types(tmp_path)
 
     # THE NEGATIVE THAT DEFINES THE CONTRACT: a tail window whose end touches EOF, with
     # the middle never read, is NOT full reading and must not acknowledge. (The first
     # cut of this feature acknowledged exactly this shape.)
-    tail = _read_file(ctx, path=artifact["path"], root="task_drive",
+    tail = _read_file(ctx, path=artifact["path"], root=artifact["root"],
                       start_line=artifact["lines"], max_lines=5)
     assert "BLOCKED" not in tail and "ERROR" not in tail
     assert "delegate_run_output_consumed" not in _event_types(tmp_path), \
@@ -260,7 +425,8 @@ def test_reading_the_staged_artifact_whole_writes_the_canonical_acknowledgement(
     replayed = dc.replay(tmp_path)["run-1"]
     assert replayed.output_consumed is True
     assert replayed.output_complete is True
-    assert replayed.output_artifact == artifact["path"]
+    assert replayed.output_artifact == artifact["source"]["path"]
+    assert replayed.output_source == artifact["source"]
     delegate._CUSTODY.clear()
 
 
@@ -411,7 +577,6 @@ def test_no_post_fires_when_the_start_request_row_did_not_land(tmp_path, monkeyp
     a worker death before record_started would leave a live overpowered run that
     nothing durable names. The POST is now conditional on the row landing: a broken
     event log refuses the start, typed, with the created registration retired."""
-    import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
@@ -422,16 +587,21 @@ def test_no_post_fires_when_the_start_request_row_did_not_land(tmp_path, monkeyp
             posts.append(idempotency_key)
             return {"runId": "run-1"}
 
+    # A READ-ONLY child (the stub serves readonly only): technical access alone decides
+    # the run shape now (#1609), so the premise is stated, not inferred from the ctx.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
-    real_append = dc.append_jsonl
+    from ouroboros import delegate_custody_current as current
 
-    def broken_append(path, row):
-        if row.get("type") == "delegate_run_start_requested":
-            return False               # append_jsonl's own "did not land" signal
-        return real_append(path, row)
+    real_publish = current.publish
 
-    monkeypatch.setattr(dc, "append_jsonl", broken_append)
+    def broken_publish(root, event, **kwargs):
+        if event.get("type") == "delegate_run_start_requested":
+            return False               # the reducing transaction's own "did not land" signal
+        return real_publish(root, event, **kwargs)
+
+    monkeypatch.setattr(current, "publish", broken_publish)
     delegate._CUSTODY.clear()
     out = json.loads(delegate._delegate_start(_nanny_ctx(tmp_path), "do the work").text)
     delegate._CUSTODY.clear()
@@ -442,23 +612,14 @@ def test_no_post_fires_when_the_start_request_row_did_not_land(tmp_path, monkeyp
     assert "delegate_run_started" not in _event_types(tmp_path)
 
 
-def test_a_line_the_delivery_layer_cut_is_not_covered(tmp_path, monkeypatch):
-    """Codex audit, claim 1: coverage must bind to what the DELIVERY layer actually
-    hands the model, not to source-file line ranges. read_file's result is cut at
-    tool_result_limit("read_file") by the outer truncator, so a single line longer
-    than that budget renders a window the model only ever sees the head of. Crediting
-    the whole line marked an artifact fully read while ~40K chars never reached the
-    model. The cut remainder is reachable — and only creditable — through start_char,
-    the sub-line cursor."""
+def test_a_reader_selected_partial_line_is_not_covered(tmp_path, monkeypatch):
+    """A direct reader credits its exact max_chars window, never its omitted tail."""
     import ouroboros.delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
-    from ouroboros.tool_capabilities import UNTRUNCATED_TOOL_RESULTS, tool_result_limit
     from ouroboros.tools.core import _read_file
 
-    # The premise the whole test rests on: these reads ARE outer-truncated.
-    assert "read_file" not in UNTRUNCATED_TOOL_RESULTS
-    budget = tool_result_limit("read_file")
+    budget = 4096
 
     class _Stub(_LiveRunStub):
         def get_run(self, rid, **_kw):
@@ -477,13 +638,11 @@ def test_a_line_the_delivery_layer_cut_is_not_covered(tmp_path, monkeypatch):
     first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     artifact = first["output_delivery"]["artifact"]
 
-    # THE NEGATIVE CODEX NAMES: a full line-window sweep — the pre-fix notion of
-    # "whole file", no sub-line cursor — must NOT acknowledge, because the long
-    # line's window is cut at delivery and the model never received its tail.
+    # A line-window sweep with an explicit character bound leaves the long-line gap.
     line = 1
     while line <= artifact["lines"]:
-        _read_file(ctx, path=artifact["path"], root="task_drive",
-                   start_line=line, max_lines=7)
+        _read_file(ctx, path=artifact["path"], root=artifact["root"],
+                   start_line=line, max_lines=7, max_chars=budget)
         line += 7
     assert "delegate_run_output_consumed" not in _event_types(tmp_path), \
         "a line the delivery layer cut is NOT covered"
@@ -493,14 +652,14 @@ def test_a_line_the_delivery_layer_cut_is_not_covered(tmp_path, monkeypatch):
     # The remainder is reachable through the sub-line cursor, and only DELIVERED
     # chunks accumulate: advancing start_char across the long line completes coverage.
     staged_lines = pathlib.Path(artifact["abs_path"]).read_text(encoding="utf-8").splitlines(keepends=True)
-    stride = budget - 5_000                     # safely below any delivered body size
+    stride = budget
     for line_no, line in enumerate(staged_lines, start=1):
         offset = 0
         while offset < len(line):
-            view = _read_file(ctx, path=artifact["path"], root="task_drive",
-                              start_line=line_no, max_lines=1, start_char=offset)
+            view = _read_file(ctx, path=artifact["path"], root=artifact["root"],
+                              start_line=line_no, max_lines=1, start_char=offset, max_chars=stride)
             if offset:
-                assert f"(from char {offset} of this window)" in view.splitlines()[0], \
+                assert f"(from char {offset} of this window" in view.splitlines()[0], \
                     "the sub-line cursor must be disclosed in the header"
             offset += stride
     assert sum(1 for t in _event_types(tmp_path) if t == "delegate_run_output_consumed") == 1, \
@@ -547,6 +706,11 @@ def test_a_restaged_different_artifact_does_not_inherit_the_old_acknowledgement(
 
     # DIFFERENT content re-staged at the same path: the old ack must not transfer.
     stub.payload = "B" * 30_000 + "\n" + ("y\n" * 300)
+    # The body publishes the newer exact observation independently of an
+    # immediate retained-result read; waiting itself no longer polls the engine.
+    from ouroboros.delegate_collection import observe_run
+    assert observe_run(tmp_path, dc.replay(tmp_path)["run-1"],
+                       {**stub.get_run("run-1"), "lastSeq": 10})
     changed = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     artifact2 = changed["output_delivery"]["artifact"]
     assert artifact2["sha256"] != artifact["sha256"]
@@ -734,7 +898,10 @@ def test_a_reconciled_run_with_an_unread_artifact_is_visible_as_uncollected(
     results = dc.reconcile_orphaned_runs(tmp_path, {"t-alive"}, gateway_factory=lambda: stub)
     assert [r["run_id"] for r in results] == ["run-1"]
     assert results[0]["staged_output_consumed"] is False
-    assert results[0]["staged_output"] == out["output_delivery"]["artifact"]["path"]
+    staged = out["output_delivery"]["artifact"]
+    assert results[0]["staged_output"] == staged["source"]["path"]
+    assert results[0]["staged_output_source"] == staged["source"], \
+        "the retained source names its staging task beside the store path (#1573)"
     reconciled = [json.loads(l) for l
                   in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
                   if '"delegate_run_reconciled"' in l]

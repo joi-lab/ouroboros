@@ -1,10 +1,4 @@
-"""Tool API v2 access matrix.
-
-This is the single policy shape for LLM-visible tools: a profile asks to run an
-operation against a resource root and receives an allow/block decision. The
-legacy per-tool checks still provide defense-in-depth while the public API is
-migrated to neutral tool names.
-"""
+"""Tool API v2 access policy and historical facade surface (ARCHITECTURE §6)."""
 
 from __future__ import annotations
 
@@ -14,8 +8,7 @@ import re  # noqa: F401 — historical facade surface
 from dataclasses import dataclass  # noqa: F401 — historical facade surface
 from typing import Any, Iterable, Literal, Optional  # noqa: F401 — historical facade surface
 
-from ouroboros.artifacts import (delegated_capture_read_target,
-                                 task_artifact_dir_path, task_id_for_artifacts)
+from ouroboros.artifacts import delegated_capture_read_target, task_artifact_dir_path, task_id_for_artifacts
 from ouroboros.headless import task_state_dir
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE  # noqa: F401 — historical facade surface
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint  # noqa: F401 — historical facade surface
@@ -23,14 +16,13 @@ from ouroboros import deliverables_paths as _deliverables_paths
 from ouroboros.shell_parse import is_absolute_path_text
 from ouroboros.task_results import validate_task_id
 from ouroboros.utils import safe_relpath
+from ouroboros.tool_access_reads import scheduled_origin  # re-export the read-authority owner
 
 _deliverables_root_lexical = _deliverables_paths._deliverables_root_lexical
 _deliverables_root_lexical_alias = _deliverables_paths._deliverables_root_lexical_alias
 _lexical_path_is_relative_to_casefold = _deliverables_paths._lexical_path_is_relative_to_casefold
 
-# v7 D04 split: the owners below were extracted VERBATIM from this module
-# (see each leaf's header); re-exported here so historical imports and
-# monkeypatch targets keep working unchanged.
+# These owners preserve historical imports and monkeypatch targets unchanged.
 from ouroboros.tool_access_types import (  # noqa: F401 — re-exported moved surface
     Operation,
     ResolvedResourceBinding,
@@ -52,10 +44,8 @@ from ouroboros.tool_access_paths import (  # noqa: F401 — re-exported moved su
     _deliverables_root,
     _path_is_relative_to_casefold,
     _user_files_root,
-    canonical_data_root,
-    normalize_root,
-    normalize_root_relative,
-    normalize_runtime_data_path,
+    canonical_data_root, docker_process_alias_target,
+    normalize_root, normalize_root_relative, normalize_runtime_data_path,
     path_is_relative_to,
     paths_overlap_casefold,
     workspace_mode_block_reason,
@@ -79,9 +69,6 @@ from ouroboros.tool_access_user_files import (  # noqa: F401 — re-exported mov
     user_files_path_block_reason,
 )
 
-
-# Readable roots are shared by ordinary parents and children; write authority
-# remains profile-specific. Physical ancestor bindings are derived, never grants.
 
 def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = "") -> str:
     """Compact, human-readable summary of a subagent's EFFECTIVE tool profile
@@ -115,16 +102,17 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
 
 def lineage_task_ids(ctx: Any) -> tuple[str, ...]:
     """Task ids whose ``task_drive``/``artifact_store`` this actor may READ: its own, its parent's
-    and its root's (own lineage fields, T4=A #1105) and the ONE predecessor its contract names
+    and its root's (own lineage fields, T4=A #1105), the ONE predecessor its contract names
     (``task_contract.predecessor_authority.source.task_id``, one hop, #1232; a child carrying the
-    envelope reads it too) — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
+    envelope reads it too) and the direct origin of a scheduled root (``scheduled_origin``, #1488)
+    — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
     meta, contract = (v if isinstance(v, dict) else {} for v in (
         getattr(ctx, "task_metadata", None), getattr(ctx, "task_contract", None)))
     authority = (contract or meta).get("predecessor_authority")
     source = authority.get("source") if isinstance(authority, dict) else None
     ids = [task_id_for_artifacts(ctx)]
     for raw in (meta.get("parent_task_id"), meta.get("root_task_id"),
-                source.get("task_id") if isinstance(source, dict) else None):
+                source.get("task_id") if isinstance(source, dict) else None, scheduled_origin(ctx)):
         try:
             ids.append(validate_task_id(raw))
         except ValueError:
@@ -497,8 +485,8 @@ def light_cognitive_or_root_redirect(tool_name: str, args: dict[str, Any]) -> st
                 continue
             return (
                 "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-                f"({path_text!r}) was given but root defaulted to 'active_workspace'. "
-                "Pass root='user_files' to write under the owner's home, e.g. "
+                f"({path_text!r}) is outside root='active_workspace'. "
+                "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
                 "write_file(root='user_files', path='Desktop/file.html', content=...)."
             )
     return None
@@ -588,6 +576,8 @@ def _select_process_target(
         [(root / safe_relpath(text)).resolve(strict=False)
          for _label, root, _source, _name in candidate_records]
     )
+    if aliased := docker_process_alias_target(ctx, operation, text, candidate_records, physical_candidates[0]):
+        return _finish(*aliased)  # Identity mounts and unmapped host paths use normal roots below.
     for target in physical_candidates:
         for record in candidate_records:
             label, base, _source, _name = record
@@ -701,6 +691,15 @@ def _resolve_target_in_selected_base(
         anchored = delegated_capture_read_target(
             canonical_data_root(ctx), task_id_for_artifacts(ctx),
             safe_relpath(path_text), resolved_base)
+        if anchored is not None and anchored.exists():
+            return anchored
+        if anchored is not None or not (resolved_base / safe_relpath(path_text)).exists():
+            from ouroboros.source_retention import retained_actor_source_read_target
+
+            retained = retained_actor_source_read_target(
+                canonical_data_root(ctx), task_id_for_artifacts(ctx), safe_relpath(path_text))
+            if retained is not None:
+                return retained
         if anchored is not None:
             return anchored
     resolved = (resolved_base / safe_relpath(path_text)).resolve(strict=False)

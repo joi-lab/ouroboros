@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+import functools
 import hashlib
 import json
 import logging
@@ -29,9 +30,10 @@ from ouroboros.task_results import (
     STATUS_RUNNING,
     is_reconciled_presence_placeholder,
     load_task_result,
-    task_result_path,
+    task_results_dir,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
+from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
 
@@ -45,11 +47,15 @@ class PresenceTurnError(ValueError):
         attachment_manifest: Sequence[Mapping[str, Any]] = (),
         turn_ref: str = "",
         work_ref: str = "",
+        disposition: str = "",
+        delivery_reporting_version: int = 0,
     ) -> None:
         self.code = str(code or "presence_turn_failed")
         self.field = str(field or "presence_turn")
         self.turn_ref = str(turn_ref or "")
         self.work_ref = str(work_ref or "")
+        self.disposition = disposition
+        self.delivery_reporting_version = delivery_reporting_version
         self.attachment_manifest = [
             dict(row) for row in attachment_manifest if isinstance(row, Mapping)
         ]
@@ -69,6 +75,9 @@ class PresenceTurnEvent:
     message: Mapping[str, Any]
     text: str
     delivery_reporting_version: int = 0
+    # Negotiated separately from receipts and never part of the event identity
+    # (``presence_continuation``): 1 lets the transport take the initial envelope early.
+    continuation_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +87,11 @@ class PresenceTurnResult:
     task_id: str
     work_ref: str = ""
     delivery_reporting_version: int = 0
+    # ``continuing``: the initial envelope of a live author; ``completed``: the author ended.
+    status: str = "completed"
+    continuation_ref: str = ""
+    output_ref: str = ""
+    continuation_version: int = 0
 
 
 def _presence_delivery(outcome: str, text: str, terminal_origin: str, *, legacy: bool = False) -> tuple[str, str]:
@@ -120,16 +134,19 @@ def presence_result_from_stored(stored: Mapping[str, Any], task_id: str) -> Pres
         # still stamp model_final over a round-one draft it salvaged before the quota
         # refusal, and the deferred-work view must not hand that draft to the correspondent.
         outcome, text = "silent", ""
+    presence = metadata.get("presence") if isinstance(metadata.get("presence"), dict) else {}
     return PresenceTurnResult(
         outcome=outcome, text=text, task_id=task_id,
         work_ref=str(metadata.get("presence_work_ref") or ""),
-        delivery_reporting_version=int((metadata.get("presence") or {}).get("delivery_reporting_version") == 1),
+        delivery_reporting_version=int(presence.get("delivery_reporting_version") == 1),
+        output_ref=str(metadata.get("presence_output_ref") or "") if text else "",
     )
 
 
 def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, terminal_origin: str = "",
                                 retain_scheduled_handoff: bool = False) -> dict[str, Any]:
     """Freeze typed delivery metadata before the ordinary durable result write."""
+    from ouroboros.presence_continuation import _handoff_ref, terminal_output
     from ouroboros.task_finalization import HOST_AUTHORED_TERMINAL_ORIGINS
 
     completion = getattr(ctx, "_presence_completion", None)
@@ -146,13 +163,7 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, te
         text = str(completion.get("message") or "") if completion.get("outcome") in {"message", "deferred"} else ""
     note = str(completion.get("message") or "") if completion.get("outcome") == "tool_delivered" else ""
     outcome = str(completion.get("outcome") or "message").strip()
-    handoff = getattr(ctx, "_swarm_handoff_attempt", None)
-    handoff = handoff if isinstance(handoff, dict) else {}
-    work_ref = (
-        str(handoff.get("task_id") or "")
-        if str(handoff.get("status") or "") == "scheduled"
-        else ""
-    )
+    work_ref = _handoff_ref(ctx)
     if outcome == "deferred" and not work_ref:
         outcome = "message"
     if work_ref and (retain_scheduled_handoff or terminal_origin in HOST_AUTHORED_TERMINAL_ORIGINS):
@@ -160,9 +171,13 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, te
         # Transports poll only deferred outcomes, even when no reply was authored.
         outcome = "deferred"
     outcome, result_text = _presence_delivery(outcome, str(text or ""), terminal_origin)
+    # An output this author already released at a review wait is never spoken twice.
+    outcome, result_text, output_ref = terminal_output(ctx, outcome, result_text)
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     metadata["presence_outcome"] = outcome
     metadata["presence_result_text"] = result_text
+    if output_ref:
+        metadata["presence_output_ref"] = output_ref
     if work_ref:
         metadata["presence_work_ref"] = work_ref
     if not getattr(ctx, "_presence_completion_accepted", False) and isinstance(declared, dict):
@@ -178,11 +193,14 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, te
         "message": result_text,
         **({"finish_note": note} if note else {}),
         "work_ref": work_ref,
+        "output_ref": output_ref,
         "ts": utc_now_iso(),
     }
 
 
 _GATE_POLL_SEC = 0.05
+# A stop check reads task controls from disk; a queued reacquisition asks at this cadence.
+_GATE_STOP_POLL_SEC = 1.0
 
 
 def _try_exclusive(fd: int) -> bool:
@@ -196,18 +214,68 @@ def _try_exclusive(fd: int) -> bool:
 
 
 class PresenceTurnLease:
-    """The gate resources one admitted turn holds; its owner releases them exactly once."""
+    """The gate resources one admitted turn holds; its owner releases them exactly once.
 
-    def __init__(self, conversation_key: str, resources: ExitStack) -> None:
+    A lease minted by a gate can also be LENT at a qualified review wait (#1536): the
+    conversation and active slot return to the gate while the same author stays live, and
+    ``reacquire`` takes both again, in admission order, before any model or tool step.
+    ``execution`` is the Host turn whose initial envelope that author may publish.
+    """
+
+    def __init__(self, conversation_key: str, resources: ExitStack,
+                 gate: "PresenceTurnGate | None" = None) -> None:
         self.conversation_key = conversation_key
         self._resources: ExitStack | None = resources
         self._lock = threading.Lock()
+        self._gate = gate
+        self._ended = False
+        self.execution: PresenceTurnExecution | None = None
 
     def release(self) -> None:
         with self._lock:
-            resources, self._resources = self._resources, None
+            resources, self._resources, self._ended = self._resources, None, True
         if resources is not None:
             resources.close()
+
+    def lendable(self) -> bool:
+        """Held, minted by a gate and not ended: ``lend`` can return it and ``reacquire`` take it back."""
+        with self._lock:
+            return self._gate is not None and not self._ended and self._resources is not None
+
+    def lend(self) -> bool:
+        """Return the held resources while keeping the lease reacquirable; False when it cannot."""
+        with self._lock:
+            if self._gate is None or self._ended or self._resources is None:
+                return False
+            resources, self._resources = self._resources, None
+        resources.close()
+        return True
+
+    def held(self) -> bool:
+        with self._lock:
+            return self._resources is not None
+
+    def reacquire(self, should_stop: Callable[[], bool]) -> bool:
+        """Wait for the conversation and a slot again; False when ``should_stop`` ends the wait.
+
+        A stop seen before the first attempt or right after the last one leaves nothing held,
+        so a stopped author never acts even when both resources were free at once.
+        """
+        if self._gate is None:
+            return False
+        if self.held():
+            return not should_stop()
+        resources = self._gate.acquire_resources(self.conversation_key, should_stop)
+        if resources is None:
+            return False
+        with self._lock:
+            if self._ended or self._resources is not None:
+                stale = resources
+            else:
+                self._resources, stale = resources, None
+        if stale is not None:
+            stale.close()
+        return stale is None
 
 
 class PresenceTurnGate:
@@ -288,24 +356,37 @@ class PresenceTurnGate:
             return release
         return None
 
-    @contextmanager
-    def _file_slot(self):
-        while (release := self._try_slot()) is None:
-            time.sleep(_GATE_POLL_SEC)
-        try:
-            yield
-        finally:
-            release()
-
     def run(self, conversation_key: str, callback: Callable[[], PresenceTurnResult]) -> PresenceTurnResult:
+        lease = self.acquire(conversation_key)
+        try:
+            return callback()
+        finally:
+            lease.release()
+
+    def _acquisition(self, conversation_key: str):
+        """Take what ``run`` takes, in the same order, without ever blocking.
+
+        A generator that yields while a resource is busy and returns the ExitStack holding
+        everything; closing it early releases whatever was already taken. The coroutine and
+        the thread admissions differ only in how they sleep between attempts.
+        """
+        from ouroboros.platform_layer import file_unlock
+
         key, conversation_lock = self._conversation(conversation_key)
-        with conversation_lock:
-            if self._state_root is None:
-                with self._slots:
-                    return callback()
-            with self._file_lock(self._conversation_file(key)):
-                with self._file_slot():
-                    return callback()
+        with ExitStack() as held:
+            while not conversation_lock.acquire(blocking=False):
+                yield
+            held.callback(conversation_lock.release)
+            if self._state_root is not None:
+                fd = os.open(self._conversation_file(key), os.O_CREAT | os.O_RDWR, 0o600)
+                held.callback(os.close, fd)
+                while not _try_exclusive(fd):
+                    yield
+                held.callback(file_unlock, fd)
+            while (release_slot := self._try_slot()) is None:
+                yield
+            held.callback(release_slot)
+            return held.pop_all()
 
     async def admit(self, conversation_key: str) -> PresenceTurnLease:
         """Take what ``run`` takes, in the same order, as a coroutine.
@@ -314,23 +395,52 @@ class PresenceTurnGate:
         behind its conversation or the active cap parks no thread. Cancellation releases
         whatever was already taken; success hands it all to the returned lease.
         """
-        from ouroboros.platform_layer import file_unlock
+        key, _lock = self._conversation(conversation_key)
+        steps = self._acquisition(key)
+        try:
+            while True:
+                try:
+                    next(steps)
+                except StopIteration as done:
+                    return PresenceTurnLease(key, done.value, self)
+                await asyncio.sleep(_GATE_POLL_SEC)
+        finally:
+            steps.close()
 
-        key, conversation_lock = self._conversation(conversation_key)
-        with ExitStack() as held:
-            while not conversation_lock.acquire(blocking=False):
-                await asyncio.sleep(_GATE_POLL_SEC)
-            held.callback(conversation_lock.release)
-            if self._state_root is not None:
-                fd = os.open(self._conversation_file(key), os.O_CREAT | os.O_RDWR, 0o600)
-                held.callback(os.close, fd)
-                while not _try_exclusive(fd):
-                    await asyncio.sleep(_GATE_POLL_SEC)
-                held.callback(file_unlock, fd)
-            while (release_slot := self._try_slot()) is None:
-                await asyncio.sleep(_GATE_POLL_SEC)
-            held.callback(release_slot)
-            return PresenceTurnLease(key, held.pop_all())
+    def acquire_resources(self, conversation_key: str,
+                          should_stop: Callable[[], bool] | None = None) -> ExitStack | None:
+        """The thread form of ``admit``; None when ``should_stop`` ends the wait.
+
+        ``should_stop`` is asked before the first attempt, every ``_GATE_STOP_POLL_SEC``
+        while waiting, and once more after the last attempt succeeds: what was taken as a
+        stop landed is returned at once instead of handed to a stopped caller.
+        """
+        if should_stop is not None and should_stop():
+            return None
+        steps = self._acquisition(conversation_key)
+        checked = time.monotonic()
+        try:
+            while True:
+                try:
+                    next(steps)
+                except StopIteration as done:
+                    resources = done.value
+                    break
+                if should_stop is not None and time.monotonic() - checked >= _GATE_STOP_POLL_SEC:
+                    checked = time.monotonic()
+                    if should_stop():
+                        return None
+                time.sleep(_GATE_POLL_SEC)
+        finally:
+            steps.close()
+        if should_stop is not None and should_stop():
+            resources.close()
+            return None
+        return resources
+
+    def acquire(self, conversation_key: str) -> PresenceTurnLease:
+        key, _lock = self._conversation(conversation_key)
+        return PresenceTurnLease(key, self.acquire_resources(key), self)
 
 
 _GATES_LOCK = threading.Lock()
@@ -429,6 +539,22 @@ def _successor_id(task_id: str) -> str:
     return "presence-" + hashlib.sha256(f"presence-retry\0{task_id}".encode("utf-8")).hexdigest()[:24]
 
 
+def _retry_reset(row: Mapping[str, Any], task_id: str, identity: str) -> datetime | None:
+    """Only the source-bound, pre-dispatch certificate can permit event regeneration."""
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    proof = metadata.get("presence_retry_proof")
+    if not (identity and row.get("status") == STATUS_FAILED
+            and row.get("reason_code") == "resource_refusal_no_resend"
+            and isinstance(proof, dict) and proof.get("kind") == "first_round_engine_not_started"
+            and proof.get("event_identity") == identity and proof.get("task_id") == task_id):
+        return None
+    try:
+        reset = datetime.fromisoformat(str(proof.get("reset_at") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return reset if reset.tzinfo is not None else None
+
+
 def _retry_target(drive_root: Path, first_id: str, identity: str, *, claim: bool = False) -> str:
     """Follow immutable predecessor links; only the conversation-lock holder may claim one.
 
@@ -448,19 +574,11 @@ def _retry_target(drive_root: Path, first_id: str, identity: str, *, claim: bool
                 raise PresenceTurnError("presence_result_unreadable", "source_event_id", turn_ref=current_id)
             current_id = next_id
             continue
-        if str(row.get("reason_code") or "") != "resource_refusal_no_resend":
+        reset = _retry_reset(row, current_id, identity)
+        if reset is None or reset > datetime.now(timezone.utc) or not claim:
             return current_id
         metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
         proof = metadata.get("presence_retry_proof")
-        if not (isinstance(proof, dict) and proof.get("kind") == "first_round_engine_not_started"
-                and proof.get("event_identity") == identity and proof.get("task_id") == current_id):
-            return current_id
-        try:
-            reset = datetime.fromisoformat(str(proof.get("reset_at") or "").replace("Z", "+00:00"))
-        except ValueError:
-            return current_id
-        if reset.tzinfo is None or reset > datetime.now(timezone.utc) or not claim:
-            return current_id
         successor = _successor_id(current_id)
 
         def link(existing: dict, _fields: dict) -> dict | None:
@@ -478,7 +596,7 @@ def _retry_target(drive_root: Path, first_id: str, identity: str, *, claim: bool
         try:
             write_task_result(drive_root, current_id, STATUS_FAILED,
                               strict_existing_dict=True, _field_projector=link)
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, StoreError) as exc:
             if isinstance(exc, PresenceTurnError):
                 raise
             raise PresenceTurnError("presence_result_unreadable", "source_event_id", turn_ref=current_id) from exc
@@ -534,40 +652,30 @@ def _stored_turn(drive_root: Path, task_id: str, identity: str = "") -> dict[str
     """
     from ouroboros.task_result_schema import TASK_RESULT_QUARANTINE_DIR
 
-    path = task_result_path(drive_root, task_id, create=False)
-    quarantined = path.parent / TASK_RESULT_QUARANTINE_DIR
+    quarantined = task_results_dir(drive_root, create=False) / TASK_RESULT_QUARANTINE_DIR
     try:
         current = load_task_result(drive_root, task_id, strict=True) or {}
-        if (quarantined / path.name).exists() or any(quarantined.glob(f"{task_id}.*.json")):
+        if (quarantined / f"{task_id}.json").exists() or any(quarantined.glob(f"{task_id}.*.json")):
             # A strictly admitted, source-bound late terminal is newer authority than an old
             # quarantined attempt. Nothing else, including an unrelated or running row, clears it.
             if str(current.get("status") or "") not in {STATUS_COMPLETED, STATUS_FAILED} or not identity:
                 raise PresenceTurnError("presence_result_unreadable", "source_event_id", turn_ref=task_id)
-            _assert_event_identity(current, task_id, identity)
         _assert_event_identity(current, task_id, identity)
         return current
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, StoreError) as exc:
         if isinstance(exc, PresenceTurnError):
             raise
         raise PresenceTurnError("presence_result_unreadable", "source_event_id", turn_ref=task_id) from exc
 
 
 def _terminal_refusal(stored: Mapping[str, Any]) -> str:
-    """The typed refusal a durable Presence row demands before its event may be acknowledged.
+    """Classify an unresolved attempt without certifying silence or absence of effects.
 
-    The durable terminal cause decides, never a draft or the in-memory envelope. A confirmed
-    resource refusal keeps the event with the transport (``presence_resources_unavailable``).
-    A row without a canonical terminal of its own (RUNNING/INTERRUPTED, a terminal write that
-    failed after the start barrier, or the host's reconcile of such a row: the orphan
-    placeholder or a stale row marked from its own already-failed axes) and a terminal under
-    the unknown-outcome fence (the pipeline's ``presence_unknown_outcome`` marker, stamped from
-    the loop's own no-resend predicate: a dispatched attempt stayed unresolved; the forced rail
-    words it ``provider_unavailable`` and may salvage a round-one draft as ``model_final``) are
-    attempts whose external effect is unproven (``presence_attempt_outcome_unknown``): no model
-    answered this event, so completed/silent would let the adapter drop it. Every other
-    infrastructure terminal (a confirmed outage, an overflow) is not refused here: it keeps the
-    deferred projection, where ``_presence_delivery`` decides speech from terminal authorship
-    and an admitted child stays pollable. Empty: the row may answer.
+    A missing terminal or the loop's durable unknown marker cannot authorize event
+    regeneration. The runner proves local loss under the conversation gate before
+    retaining a nonterminal row. Resource refusal is retryable only with its
+    source-bound pre-dispatch certificate. Other terminals retain ordinary authored
+    output projection, including a real admitted child's reference.
     """
     if str(stored.get("reason_code") or "") == "resource_refusal_no_resend":
         return "presence_resources_unavailable"
@@ -580,90 +688,73 @@ def _terminal_refusal(stored: Mapping[str, Any]) -> str:
     return ""
 
 
+def _refused_turn(drive_root: Path, task_id: str, stored: Mapping[str, Any], code: str,
+                  *, identity: str = "", work_ref: str = "") -> PresenceTurnError:
+    """Retain admitted work separately from input FIFO custody; never certify a reply."""
+    metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+    if work_ref and not metadata.get("presence_work_ref"):
+        # The final result write may have failed after the actual handoff. Retain that
+        # host-built reference before acknowledging custody, including across HTTP loss.
+        from ouroboros.task_store import patch_document
+
+        def retain_child(current: dict) -> dict:
+            meta = dict(current.get("metadata") or {})
+            meta.setdefault("presence_work_ref", work_ref)
+            return {**current, "metadata": meta}
+
+        try:
+            stored = patch_document(drive_root, task_id, retain_child)
+        except (OSError, ValueError, StoreError) as exc:
+            raise PresenceTurnError("presence_result_unreadable", "source_event_id", turn_ref=task_id) from exc
+        metadata = stored.get("metadata") or {}
+    presence = metadata.get("presence") if isinstance(metadata.get("presence"), dict) else {}
+    retryable = code == "presence_resources_unavailable" and _retry_reset(stored, task_id, identity) is not None
+    _notify_unresolved_turn(drive_root, task_id)
+    from ouroboros.presence_recovery import retained_turn_facts
+
+    return PresenceTurnError(code, "source_event_id", turn_ref=task_id,
+                             work_ref=str(retained_turn_facts(stored, task_id).get("work_ref") or ""),
+                             disposition="retry" if retryable else "retained",
+                             delivery_reporting_version=int(presence.get("delivery_reporting_version") == 1))
+
+
 def _cached_result(drive_root: Path, task_id: str, identity: str = "") -> PresenceTurnResult | None:
     if identity:
         task_id = _retry_target(drive_root, task_id, identity)
     stored = _stored_turn(drive_root, task_id, identity)
     refusal = _terminal_refusal(stored)
     if refusal == "presence_resources_unavailable":
-        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-        if identity and isinstance(metadata.get("presence_retry_proof"), dict):
-            proof = metadata["presence_retry_proof"]
-            try:
-                reset = datetime.fromisoformat(str(proof.get("reset_at") or "").replace("Z", "+00:00"))
-            except ValueError:
-                reset = None
-            if (proof.get("kind") == "first_round_engine_not_started" and
-                    proof.get("event_identity") == identity and proof.get("task_id") == task_id and
-                    reset is not None and reset.tzinfo is not None and reset <= datetime.now(timezone.utc)):
-                return None  # the conversation-lock holder claims its successor
-        # A failed quota/fallback attempt is not a completed/silent transport answer;
-        # retain the event with its adapter and never replay a draft as external speech.
-        _notify_unresolved_turn(drive_root, task_id)
-        raise PresenceTurnError("presence_resources_unavailable", "source_event_id", turn_ref=task_id,
-                                work_ref=str(metadata.get("presence_work_ref") or ""))
+        reset = _retry_reset(stored, task_id, identity)
+        if reset is not None and reset <= datetime.now(timezone.utc):
+            return None  # the conversation-lock holder claims its successor
+        raise _refused_turn(drive_root, task_id, stored, refusal, identity=identity)
     if refusal and (str(stored.get("status") or "") not in {STATUS_COMPLETED, STATUS_FAILED}
                     or is_reconciled_presence_placeholder(stored)):
-        return None  # a host-lost turn is not a result; the later admission guard refuses regeneration
+        return None  # the conversation gate distinguishes a live author from a lost attempt
     if refusal:
-        # A failed infrastructure terminal never earns a retry certificate: unknown is not
-        # not_started. Retain the event and any already scheduled work; ask the owner once.
-        metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-        _notify_unresolved_turn(drive_root, task_id)
-        raise PresenceTurnError(refusal, "source_event_id", turn_ref=task_id,
-                                work_ref=str(metadata.get("presence_work_ref") or ""))
+        raise _refused_turn(drive_root, task_id, stored, refusal, identity=identity)
     return presence_result_from_stored(stored, task_id)
 
 
 def _notify_unresolved_turn(drive_root: Path, task_id: str) -> None:
-    """Serialize one owner's recovery notice across concurrent Host replay readers.
+    """Serialize source-bound recovery facts across concurrent Host replay readers.
 
-    Reuse the per-conversation gate's process and file locks, keyed by the physical
-    task id, without taking an execution slot. A crash after the required chat
-    write but before the stamp may still repeat a question; it cannot mark an
-    undelivered question as delivered. No new notification authority is stored.
+    Reuse the existing gate locks without taking an execution slot. The canonical
+    room fact has its own stable identity; no public reply or owner question is sent.
     """
     try:
         gate = _configured_gate(drive_root)
-        key, local_lock = gate._conversation(f"owner-notice:{task_id}")
+        key, local_lock = gate._conversation(f"recovery-fact:{task_id}")
         with local_lock, gate._file_lock(gate._conversation_file(key)):
             _write_unresolved_notice(drive_root, task_id)
     except Exception:
-        log.warning("Presence recovery question lock failed for %s", task_id, exc_info=True)
+        log.warning("Presence recovery fact lock failed for %s", task_id, exc_info=True)
 
 
 def _write_unresolved_notice(drive_root: Path, task_id: str) -> None:
-    stored = load_task_result(drive_root, task_id) or {}
-    if stored.get("presence_recovery_owner_notified"):
-        return
-    try:
-        from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
-        from supervisor import message_bus
+    from ouroboros.presence_recovery import record_unresolved_turn
 
-        # Unit callers and unrelated installations must not write via a process-global
-        # bridge bound to another data root. The real Host shares this canonical root.
-        if message_bus.DATA_DIR is None or Path(message_bus.DATA_DIR).resolve() != drive_root.resolve():
-            return
-        if message_bus.try_get_bridge() is None:
-            return
-        message_bus.send_with_budget(
-            WEB_UI_CHAT_ID,
-            (f"Presence turn {task_id} has no available model route. Its original event remains "
-             "with the transport; check the subscription account or configured fallback in Main."
-             if str(stored.get("reason_code") or "") == "resource_refusal_no_resend" else
-             f"Presence turn {task_id} has an unconfirmed previous effect. Its original "
-             "event remains with the transport; I will not start another model or tool "
-             "attempt automatically. Please answer in Main after checking the prior "
-             "operation and external delivery, so we can decide how to recover it."),
-            role="system", system_type="presence_recovery_required", require_write=True,
-            ensure_record_boundary=True,
-        )
-        from ouroboros.task_results import write_task_result
-
-        write_task_result(drive_root, task_id, str(stored["status"]), strict_existing_dict=True,
-                          presence_recovery_owner_notified=utc_now_iso())
-    except Exception:
-        log.warning("Presence recovery question could not be recorded for %s", task_id, exc_info=True)
+    record_unresolved_turn(drive_root, task_id)
 
 
 def _live_task_rows(drive_root: Path, task_id: str, conversation_key: str) -> list[dict[str, Any]]:
@@ -720,6 +811,12 @@ def _read_previous_turn(drive_root: Path, conversation_key: str) -> dict[str, An
     return row if row.get("conversation_key") == conversation_key else None
 
 
+def _first_lent_at(stored: Mapping[str, Any]) -> str:
+    """Pointer chronology starts at the first yield, even when an author parks again."""
+    continued = stored.get("presence_continuation")
+    return str(continued.get("first_lent_at") or continued.get("lent_at") or "") if isinstance(continued, dict) else ""
+
+
 def _previous_turn_source_view(drive_root: Path, pointer: dict[str, Any]) -> dict[str, Any]:
     """Read a legacy deferred pointer's speech from its canonical result, without rewriting history.
 
@@ -743,18 +840,85 @@ def _previous_turn_source_view(drive_root: Path, pointer: dict[str, Any]) -> dic
 
 def _write_previous_turn(drive_root: Path, conversation_key: str, task_id: str, *, outcome: str, message: str,
                          sends: Sequence[str], work_ref: str, finished_at: str, delivery: str,
-                         finish_note: str = "") -> None:
-    """Best effort: the pointer is a projection, and a turn that already answered is not failed over it."""
+                         finish_note: str = "", lent_at: str = "", continuing: bool = False,
+                         strict: bool = False) -> None:
+    """Best effort: the pointer is a projection, and a turn that already answered is not failed over it.
+
+    It also lists the conversation's still-continuing authors (``open_turns``, refs only:
+    their facts stay on their task rows). An author that yielded its conversation at
+    its first ``lent_at`` never replaces a pointer a newer turn wrote since; a later
+    park keeps it in the open list and its terminal removes it from that list.
+    ``strict`` (an author about to yield) raises instead, and reads the write back first:
+    a successor must never run without seeing that the yielded author is still open.
+    """
+    pointer = {
+        "conversation_key": conversation_key, "task_id": task_id, "outcome": outcome, "message": message,
+        **({"finish_note": finish_note} if finish_note else {}),
+        "transport_sends": [text for text in sends if text], "work_ref": work_ref,
+        "finished_at": finished_at, "delivery": delivery, **({"continuing": True} if continuing else {}),
+    }
     try:
-        atomic_write_json(_previous_turn_path(drive_root, conversation_key), {
-            "conversation_key": conversation_key, "task_id": task_id, "outcome": outcome, "message": message,
-            **({"finish_note": finish_note} if finish_note else {}),
-            "transport_sends": [text for text in sends if text], "work_ref": work_ref,
-            "finished_at": finished_at, "delivery": delivery,
-        })
-    except OSError:
+        gate = _configured_gate(Path(drive_root))
+        key, local_lock = gate._conversation(f"projection:{conversation_key}")
+        with local_lock, gate._file_lock(gate._conversation_file(key)):
+            current = _read_previous_turn(drive_root, conversation_key) or {}
+            open_turns = [ref for ref in current.get("open_turns") or [] if ref != task_id and str(
+                (load_task_result(drive_root, ref) or {}).get("status") or STATUS_RUNNING) not in {
+                STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED}]
+            newer = bool(lent_at) and current.get("task_id") not in (None, "", task_id) and str(
+                current.get("finished_at") or "") > lent_at
+            row = {key: value for key, value in (current if newer else pointer).items() if key != "open_turns"}
+            written = {**row, **({"open_turns": [*open_turns, *([task_id] if continuing else [])]}
+                                 if open_turns or continuing else {})}
+            atomic_write_json(_previous_turn_path(drive_root, conversation_key), written)
+            if strict and _read_previous_turn(drive_root, conversation_key) != written:
+                raise OSError("presence previous-turn pointer did not read back")
+    except Exception:
+        if strict:
+            raise
         log.warning("presence previous-turn pointer not written for %s (task %s); the next replay of this turn "
                     "rebuilds it", conversation_key, task_id, exc_info=True)
+
+
+def record_continuing_turn(drive_root: Path, conversation_key: str, task_id: str, *, outcome: str, message: str,
+                           work_ref: str, lent_at: str) -> None:
+    """Record an open author without replacing a turn that ran since its first yield.
+
+    Raises when the projection cannot be written and read back: such an author keeps its
+    conversation, since a successor would otherwise run without seeing it is still open.
+    """
+    _write_previous_turn(drive_root, conversation_key, task_id, outcome=outcome, message=message, sends=[],
+                         work_ref=work_ref, finished_at=lent_at, delivery="unknown", continuing=True, strict=True,
+                         lent_at=_first_lent_at(load_task_result(drive_root, task_id) or {}) or lent_at)
+
+
+def _pointer_speech(stored: Mapping[str, Any], outcome: str, message: str) -> tuple[str, str]:
+    """A terminal that re-selected an output it released at a review wait says nothing new;
+    its pointer still names that released speech (``presence_continuation``)."""
+    continued = stored.get("presence_continuation") if isinstance(stored.get("presence_continuation"), dict) else {}
+    spoken = [item for item in continued.get("outputs") or [] if isinstance(item, dict) and item.get("text")]
+    if message or not spoken:
+        return outcome, message
+    return str(spoken[-1].get("outcome") or outcome), str(spoken[-1]["text"])
+
+
+def _repair_pointer(drive_root: Path, conversation_key: str, physical_id: str) -> None:
+    """Rebuild the pointer of a settled turn lost between its terminal write and its pointer write.
+
+    A pointer a newer turn wrote is never undone: the projection lock and the yielded
+    author's ``lent_at`` decide that in ``_write_previous_turn``.
+    """
+    stored = load_task_result(Path(drive_root), physical_id) or {}
+    if _terminal_refusal(stored) or not _pointer_behind(Path(drive_root), conversation_key, physical_id):
+        return
+    settled = presence_result_from_stored(stored, physical_id)
+    sends = (_turn_sends(_live_task_rows(Path(drive_root), physical_id, conversation_key))[0]
+             if settled.delivery_reporting_version else [])
+    outcome, message = _pointer_speech(stored, settled.outcome, settled.text)
+    _write_previous_turn(Path(drive_root), conversation_key, physical_id, outcome=outcome, message=message,
+                         sends=sends or [], work_ref=settled.work_ref, finished_at=str(stored.get("ts") or ""),
+                         delivery=_delivery_state(settled.delivery_reporting_version, sends, message, outcome),
+                         lent_at=_first_lent_at(stored))
 
 
 def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bool:
@@ -771,23 +935,43 @@ def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bo
             status == STATUS_FAILED and str(stored.get("terminal_origin") or "") == TERMINAL_ORIGIN_MODEL_FINAL):
         return False
     pointer = _read_previous_turn(drive_root, conversation_key)
-    return pointer is None or (
-        pointer.get("task_id") != task_id and str(pointer.get("finished_at") or "") <= str(stored.get("ts") or ""))
+    # A continuing author pointed at itself when it yielded; a pointer naming another turn
+    # written after that belongs to a newer turn, however late this one completed. A
+    # pointer still calling this settled turn continuing is its yield, not its terminal.
+    settled = _first_lent_at(stored) or str(stored.get("ts") or "")
+    if pointer is not None and pointer.get("task_id") == task_id:
+        return bool(pointer.get("continuing"))
+    return pointer is None or str(pointer.get("finished_at") or "") <= settled
 
 
 def presence_turn_replay(drive_root: Path, task_id: str, conversation_key: str,
-                         identity: str = "") -> PresenceTurnResult | None:
-    """A settled turn's durable answer, returned without the gate; None when the turn must (re)run."""
+                         identity: str = "", continuation_version: int = 0) -> PresenceTurnResult | None:
+    """A settled turn's durable answer, returned without the gate; None when the turn must (re)run.
+
+    A version-1 consumer gets a continuing author's stored initial envelope (write-once),
+    whatever the author did since; its terminal is read from the continuation poll. When
+    that author has settled since, its lost pointer is rebuilt before the envelope returns.
+    """
+    if continuation_version and identity:
+        from ouroboros.presence_continuation import replay_envelope
+
+        envelope = replay_envelope(Path(drive_root), task_id, identity)
+        if envelope is not None:
+            _repair_pointer(Path(drive_root), conversation_key, envelope.task_id)
+            return envelope
     cached = _cached_result(Path(drive_root), task_id, identity)
     return None if cached is None or _pointer_behind(Path(drive_root), conversation_key, cached.task_id) else cached
 
 
-def _delivery_state(reporting_version: int, sends: Sequence[str] | None, text: str) -> str:
+def _delivery_state(reporting_version: int, sends: Sequence[str] | None, text: str, outcome: str = "message") -> str:
     """One rule for the live write and the repair.
 
     Tool sends confirm mid-turn; the adapter-delivered reply's receipt arrives only after the turn
     returns, so a reply text that is not among the confirmed sends is at most partly confirmed.
     """
+    # Legacy tool_delivered messages are finish notes, not unconfirmed adapter speech.
+    if outcome not in {"message", "deferred"}:
+        text = ""
     if not reporting_version or sends is None or not (sends or text):
         return "unknown"  # v0 never confirms; None = this turn's receipts left the live generation
     if not sends:
@@ -806,39 +990,49 @@ def _log_dialogue(
     task: Mapping[str, Any],
     task_id: str,
 ) -> None:
+    from types import SimpleNamespace
+    from ouroboros import chat_chain
     from ouroboros.dialogue_provenance import presence_provenance_from_task
 
     state = read_json_dict(drive_root / "state" / "state.json") or {}
-    written = append_jsonl(
-        drive_root / "logs" / "chat.jsonl",
-        ensure_record_boundary=(direction == "in"),  # a re-run never re-logs: this row must be parseable
-        obj={
-            "ts": utc_now_iso(),
-            "session_id": state.get("session_id"),
-            "direction": direction,
-            "chat_id": chat_id,
-            "user_id": user_id,
-            "text": text,
-            "format": "markdown" if direction == "out" else "",
-            "source": f"presence:{event.provider}",
-            "sender_label": str(event.actor.get("display_name") or event.actor.get("username") or ""),
-            "sender_session_id": str(event.actor.get("platform_actor_id") or event.actor.get("id") or ""),
-            "client_message_id": event.source_event_id,
-            "presence_event_identity": presence_event_identity(str(task["metadata"]["presence"]["binding_id"]), event),
-            "transport": {
-                "provider": event.provider,
-                "account_id": event.account_id,
-                "conversation_id": event.conversation_id,
-                "thread_id": event.thread_id,
-                "conversation_key": event.conversation_key,
-                "actor": dict(event.actor),
-                "conversation": dict(event.conversation),
-                "message": dict(event.message),
-                **({"delivery": {"state": "authored"}} if direction == "out" else {}),
-            },
-            "presence_provenance": presence_provenance_from_task(task),
-            "task_id": task_id,
+    row = {
+        "ts": utc_now_iso(),
+        "session_id": state.get("session_id"),
+        "direction": direction,
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "text": text,
+        "format": "markdown" if direction == "out" else "",
+        "source": f"presence:{event.provider}",
+        "sender_label": str(event.actor.get("display_name") or event.actor.get("username") or ""),
+        "sender_session_id": str(event.actor.get("platform_actor_id") or event.actor.get("id") or ""),
+        "client_message_id": event.source_event_id,
+        "presence_event_identity": presence_event_identity(str(task["metadata"]["presence"]["binding_id"]), event),
+        "transport": {
+            "provider": event.provider,
+            "account_id": event.account_id,
+            "conversation_id": event.conversation_id,
+            "thread_id": event.thread_id,
+            "conversation_key": event.conversation_key,
+            "actor": dict(event.actor),
+            "conversation": dict(event.conversation),
+            "message": dict(event.message),
+            **({"delivery": {"state": "authored"}} if direction == "out" else {}),
         },
+        "presence_provenance": presence_provenance_from_task(task),
+        "task_id": task_id,
+    }
+    if direction == "in":
+        # Retain the transport's exact contextual observations before publishing their address.
+        # They remain dated context of this event, never additional incoming speech or work.
+        source = {"recorded_at": row["ts"], "source_event_id": event.source_event_id,
+                  "text": text, "transport": row["transport"]}
+        row["context_source_ref"] = chat_chain.retain_memory_source(
+            SimpleNamespace(drive_root=drive_root, task_id=task_id), "presence-event",
+            json.dumps(source, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"), "json")
+    written = append_jsonl(
+        drive_root / "logs" / "chat.jsonl", obj=row,
+        ensure_record_boundary=(direction == "in"),  # a re-run never re-logs: this row must be parseable
     )
     if direction == "in" and written is False:
         # A re-run of a lost attempt relies on the inbound row having landed (it never re-logs), so
@@ -853,8 +1047,6 @@ def _build_task(
     drive_root: Path,
     staged_files: Sequence[Path],
     physical_task_id: str = "",
-    lost_attempt: bool = False,
-    prior_rows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     from ouroboros.config import runtime_setting
 
@@ -889,6 +1081,19 @@ def _build_task(
     }
     previous_turn = _read_previous_turn(drive_root, event.conversation_key)
     if previous_turn:
+        from ouroboros.presence_continuation import continuation_status
+
+        # Authors that yielded this conversation while their result awaits review: refs whose
+        # facts are read from their own canonical rows, never copied into the pointer.
+        open_turns = [{"task_id": ref, "status": continuation_status(load_task_result(drive_root, ref) or {})}
+                      for ref in previous_turn.pop("open_turns", None) or [] if ref != physical_task_id]
+        if open_turns:
+            presence_context["open_turns"] = open_turns
+        if previous_turn.get("continuing"):
+            # The pointer records the yield; whether that author still lives is its row's fact.
+            status = continuation_status(load_task_result(drive_root, str(previous_turn.get("task_id") or "")) or {})
+            if status != STATUS_RUNNING:
+                previous_turn = {**previous_turn, "continuing": False, "author_status": status}
         previous_turn = _previous_turn_source_view(drive_root, previous_turn)
         if previous_turn.get("work_ref"):   # the deferred child's fate is read from its canonical row, never stored
             work_ref = str(previous_turn["work_ref"])
@@ -899,14 +1104,6 @@ def _build_task(
             previous_turn = {**previous_turn, "work_status": status or "absent", "work_result": answered,
                              "work_record": record[:300] + (" …(truncated)" if len(record) > 300 else "")}
         presence_context["previous_turn"] = previous_turn
-    if lost_attempt:
-        # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.
-        sent, uncertain = _turn_sends(prior_rows) if event.delivery_reporting_version else (None, 0)
-        presence_context["previous_attempt"] = {
-            "delivered_count": None if sent is None else len(sent),
-            "delivered": None if sent is None else [text for text in sent if text],
-            "uncertain_count": uncertain,
-        }
     metadata: dict[str, Any] = {
         "source": "presence",
         "client_message_id": event.source_event_id,
@@ -949,8 +1146,7 @@ def _build_task(
     # atomic: the turn would run with none of its declared material.
     if manifest:
         from ouroboros.artifacts import (
-            attachment_manifest_all_rejected,
-            remove_staged_attachments,
+            attachment_manifest_all_rejected, attachment_manifest_projection, remove_staged_attachments,
         )
 
         if attachment_manifest_all_rejected(manifest):
@@ -960,14 +1156,12 @@ def _build_task(
                 "staged_files",
                 attachment_manifest=manifest,
             )
-    if manifest:
         from ouroboros.gateway.tasks import _render_attachment_lines
 
         # The manifest is task authority, not merely presentation prose.  Keep
         # every staged/rejected declaration on the canonical carrier before the
         # task contract is normalized so a later promotion or child can inherit
         # and materialize the exact inputs.
-        from ouroboros.artifacts import attachment_manifest_projection
         authority = attachment_manifest_projection(drive_root, task_id, manifest)
         task.update(authority)
         task["attachments"] = authority["attachment_manifest"]
@@ -999,34 +1193,33 @@ def run_presence_turn(
 
     ``admitted`` is a lease the caller already took for this conversation (``PresenceTurnGate.admit``):
     the turn runs under it instead of waiting on ``gate``, and the caller keeps releasing it.
+    Either lease may be lent at a qualified review wait (``presence_continuation``).
     """
 
     task_id = _task_id(admission, event)
     identity = presence_event_identity(admission.binding_id, event)
-    cached = presence_turn_replay(Path(drive_root), task_id, event.conversation_key, identity)
+    cached = presence_turn_replay(Path(drive_root), task_id, event.conversation_key, identity,
+                                  event.continuation_version)
     if cached is not None:
         return cached
+    lease = admitted
 
     def execute() -> PresenceTurnResult:
+        nonlocal task_id
+        if event.continuation_version:
+            from ouroboros.presence_continuation import replay_envelope
+
+            # The author may have yielded (and even ended) since the unlocked check above.
+            envelope = replay_envelope(Path(drive_root), task_id, identity)
+            if envelope is not None:
+                _repair_pointer(Path(drive_root), event.conversation_key, envelope.task_id)
+                return envelope
         second_cached = _cached_result(Path(drive_root), task_id, identity)
         if second_cached is not None:
             # A turn lost between its terminal write and its pointer write replays from the durable
             # row; its pointer is rebuilt here, under the conversation lock, so no newer turn is undone.
-            physical_id = second_cached.task_id
-            if _pointer_behind(Path(drive_root), event.conversation_key, physical_id):
-                stored = load_task_result(Path(drive_root), physical_id) or {}
-                sends = (_turn_sends(_live_task_rows(Path(drive_root), physical_id, event.conversation_key))[0]
-                         if second_cached.delivery_reporting_version else [])
-                _write_previous_turn(Path(drive_root), event.conversation_key, physical_id, outcome=second_cached.outcome,
-                                     message=second_cached.text, sends=sends or [], work_ref=second_cached.work_ref,
-                                     finished_at=str(stored.get("ts") or ""),
-                                     delivery=_delivery_state(second_cached.delivery_reporting_version, sends,
-                                                              second_cached.text))
+            _repair_pointer(Path(drive_root), event.conversation_key, second_cached.task_id)
             return second_cached
-        return _execute_live()
-
-    def _execute_live() -> PresenceTurnResult:
-        nonlocal task_id
         task_id = _retry_target(Path(drive_root), task_id, identity, claim=True)
         live_key = (str(Path(drive_root).resolve()), task_id)
         with _LIVE_LOCK:
@@ -1044,7 +1237,7 @@ def run_presence_turn(
         if str(stored.get("status") or "") == STATUS_CANCELLED:
             # An owner's Stop is not an absent turn. Never regenerate work after it,
             # nor acknowledge the original transport event as completed/silent.
-            raise PresenceTurnError("presence_turn_cancelled", "source_event_id", turn_ref=task_id)
+            raise _refused_turn(Path(drive_root), task_id, stored, "presence_turn_cancelled")
         lost_attempt = is_reconciled_presence_placeholder(stored) or str(stored.get("status") or "") in {
             STATUS_RUNNING, STATUS_INTERRUPTED}
         if lost_attempt:
@@ -1054,8 +1247,7 @@ def run_presence_turn(
             # leave this row untouched: no new inbound row, agent, or paid generation. A
             # positively pre-thread failure wrote no running row and reaches the normal path;
             # a later canonical terminal result wins the cached-replay check above.
-            _notify_unresolved_turn(Path(drive_root), task_id)
-            raise PresenceTurnError("presence_attempt_outcome_unknown", "source_event_id", turn_ref=task_id)
+            raise _refused_turn(Path(drive_root), task_id, stored, "presence_attempt_outcome_unknown")
         def chat_generation() -> tuple[int, int] | None:  # rotation renames the live file: a new inode
             try:
                 stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
@@ -1074,27 +1266,18 @@ def run_presence_turn(
             drive_root=Path(drive_root),
             staged_files=tuple(Path(item) for item in staged_files),
             physical_task_id=task_id,
-            lost_attempt=lost_attempt,
-            prior_rows=prior_rows,
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
+        log_dialogue = functools.partial(_log_dialogue, Path(drive_root), chat_id=chat_id,
+                                        event=event, task=task, task_id=task_id)
         own_start = len(prior_rows)
         # A lost attempt logged the message (here or in a rotated archive); an attempt that died before its
         # running write left only that row. Re-logging would also let a later retry mistake the fresh row
         # for complete receipt coverage, so the row is written only when no attempt has a trace at all.
-        if (not lost_attempt and task_id == _task_id(admission, event)
+        if (task_id == _task_id(admission, event)
                 and not any(row.get("direction") == "in" for row in prior_rows)):
-            _log_dialogue(
-                Path(drive_root),
-                direction="in",
-                chat_id=chat_id,
-                user_id=actor_id,
-                text=event.text or task["text"],
-                event=event,
-                task=task,
-                task_id=task_id,
-            )
+            log_dialogue(direction="in", user_id=actor_id, text=event.text or task["text"])
         if generation is None:  # the inbound log just created the live file: that is this execution's generation
             generation = chat_generation()
         if agent_factory is None:
@@ -1108,6 +1291,10 @@ def run_presence_turn(
             drive_root=str(drive_root),
             event_queue=event_queue,
         )
+        from ouroboros.presence_continuation import bind_review_wait
+
+        bind_review_wait(agent, lease=lease, event=event, task_id=task_id, identity=identity,
+                         drive_root=Path(drive_root))
         # The generic agent's RUNNING writer logs and continues on failure. Presence cannot:
         # after a crash, absence of that row would otherwise authorize a second model/tool effect.
         # This existing task-result authority is published and read back BEFORE handle_task.
@@ -1124,7 +1311,7 @@ def run_presence_turn(
             if str(start.get("status") or "") != STATUS_RUNNING or (
                     start.get("metadata") or {}).get("presence_event_identity") != identity:
                 raise ValueError("Presence start record was not bound to this event")
-        except (OSError, ValueError) as exc:
+        except (OSError, ValueError, StoreError) as exc:
             raise PresenceTurnError("presence_start_unwritable", "source_event_id", turn_ref=task_id) from exc
         events = agent.handle_task(task)
         # The model can have a draft reply before every allowed route refuses quota, and the
@@ -1135,50 +1322,49 @@ def run_presence_turn(
         row = next((item for item in events if item.get("type") == "presence_result"), None)
         refusal = _terminal_refusal(terminal)
         if refusal:
-            _notify_unresolved_turn(Path(drive_root), task_id)
             metadata = terminal.get("metadata") if isinstance(terminal.get("metadata"), dict) else {}
             # Scheduled work survives the refusal: the durable ref when the terminal landed, else the
             # host-built handoff fact of this execution (the terminal write itself may have failed).
             work_ref = str(metadata.get("presence_work_ref") or (row or {}).get("work_ref") or "")
-            raise PresenceTurnError(refusal, "source_event_id", turn_ref=task_id, work_ref=work_ref)
+            raise _refused_turn(Path(drive_root), task_id, terminal, refusal,
+                                identity=identity, work_ref=work_ref)
         if not isinstance(row, dict):
             raise PresenceTurnError("presence_result_missing", "presence_result")
+        continued = terminal.get("presence_continuation") if isinstance(terminal.get("presence_continuation"), dict) else {}
         result = PresenceTurnResult(
             outcome=str(row.get("outcome") or "message"),
             text=str(row.get("text") or ""),
             task_id=task_id,
             work_ref=str(row.get("work_ref") or ""),
             delivery_reporting_version=event.delivery_reporting_version,
+            continuation_ref=task_id if continued else "",
+            output_ref=str(row.get("output_ref") or ""),
+            continuation_version=event.continuation_version,
         )
         if result.outcome in {"message", "deferred"} and result.text and not result.delivery_reporting_version:
-            _log_dialogue(
-                Path(drive_root),
-                direction="out",
-                chat_id=chat_id,
-                user_id=0,
-                text=result.text,
-                event=event,
-                task=task,
-                task_id=task_id,
-            )
+            log_dialogue(direction="out", user_id=0, text=result.text)
         # Still under the conversation lock. A replay writes only through the cached-replay repair, under
         # this same lock, and it leaves a pointer that names a newer turn alone.
         sends: list[str] | None = []
         if event.delivery_reporting_version:
             sends = _turn_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key), own_start,
                                 same_generation=generation is None or chat_generation() == generation)[0]
-        _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
-                             message=str(row.get("message") or result.text), sends=sends or [],
-                             work_ref=result.work_ref, finished_at=utc_now_iso(),
-                             delivery=_delivery_state(event.delivery_reporting_version, sends, result.text),
-                             finish_note=str(row.get("finish_note") or ""))
+        outcome, message = _pointer_speech(terminal, result.outcome, str(row.get("message") or result.text))
+        _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=outcome, message=message,
+                             sends=sends or [], work_ref=result.work_ref, finished_at=utc_now_iso(),
+                             delivery=_delivery_state(event.delivery_reporting_version, sends, result.text or message, outcome),
+                             finish_note=str(row.get("finish_note") or ""), lent_at=_first_lent_at(terminal))
         return result
 
     if admitted is not None:
         if admitted.conversation_key != str(event.conversation_key or "").strip():
             raise PresenceTurnError("presence_admission_conversation_mismatch", "conversation_key")
         return execute()
-    return (gate or _configured_gate(Path(drive_root))).run(event.conversation_key, execute)
+    lease = (gate or _configured_gate(Path(drive_root))).acquire(event.conversation_key)
+    try:
+        return execute()
+    finally:
+        lease.release()
 
 
 class PresenceTurnNotStarted(RuntimeError):
@@ -1186,29 +1372,59 @@ class PresenceTurnNotStarted(RuntimeError):
 
 
 class PresenceTurnExecution:
-    """One live host turn: the result every waiter shares and the admission that starts it."""
+    """One live host turn: the results every waiter shares and the admission that starts it.
 
-    __slots__ = ("turn_id", "identity", "result", "admission")
+    ``initial`` is the first envelope (a continuing author's, or the terminal itself) and
+    ``result`` the author's terminal (#1536). The reserved capacity returns exactly once,
+    at whichever comes first; the turn stays live until its terminal.
+    """
+
+    __slots__ = ("turn_id", "identity", "result", "initial", "admission", "_capacity", "_returned", "_lock")
 
     def __init__(self, turn_id: str, identity: str = "") -> None:
         self.turn_id = turn_id
         self.identity = identity
         self.result: concurrent.futures.Future = concurrent.futures.Future()
+        self.initial: concurrent.futures.Future = concurrent.futures.Future()
         # RUNNING from birth: a cancelled waiter's wrapper calls Future.cancel(), which a running
         # future refuses, so no HTTP waiter can cancel the result other waiters share.
         self.result.set_running_or_notify_cancel()
+        self.initial.set_running_or_notify_cancel()
         self.admission: asyncio.Task | None = None
+        self._capacity: Callable[[], None] | None = None
+        self._returned = False
+        self._lock = threading.Lock()
+
+    def return_capacity(self, fallback: Callable[[], None] | None = None) -> None:
+        with self._lock:
+            if self._returned:
+                return
+            self._returned, release = True, self._capacity or fallback
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                log.warning("presence turn %s could not return its capacity", self.turn_id, exc_info=True)
+
+    def publish_initial(self, value: Any) -> bool:
+        """The durable initial envelope of a continuing author: its waiters answer, its capacity returns."""
+        with self._lock:
+            if self.initial.done():
+                return False
+            self.initial.set_result(value)
+        self.return_capacity()
+        return True
 
 
 class PresenceTurnExecutions:
     """The Host's live presence turns by durable turn id: start one, or join the one already running.
 
-    A turn is work, not its request. It queues on the gate as a coroutine (no thread, shared or
-    owned), then runs on its own daemon thread with the admitting request's context variables
-    (settings, usage and wait scopes), as ``asyncio.to_thread`` carried them. ``reserve``d
-    capacity returns only at true settlement: a cancelled or disconnected waiter leaves the turn
-    and its capacity in place, and a retry of the same event joins it. A turn the process exits
-    under stays host-lost for the transport's retry; the daemon thread never extends a drain.
+    A turn queues on the gate as a coroutine (no thread), then runs on its own daemon thread
+    with the admitting request's context variables (settings, usage and wait scopes), as
+    ``asyncio.to_thread`` carried them. Both versions return ``reserve``d capacity at a qualified
+    park or terminal settlement; version 0's HTTP waiter stays open until terminal. Cancelling or
+    disconnecting a waiter leaves the turn and any held capacity in place; retries join it.
+    A process exit leaves the turn host-lost for retry; the daemon thread never extends a drain.
     """
 
     def __init__(self) -> None:
@@ -1243,6 +1459,7 @@ class PresenceTurnExecutions:
             if not reserve():
                 return None, False
             execution = self._live[turn_id] = PresenceTurnExecution(turn_id, identity)
+            execution._capacity = release
         admission = self._admit_and_start(execution, admit, run, release)
         try:
             execution.admission = asyncio.get_running_loop().create_task(admission)
@@ -1251,6 +1468,35 @@ class PresenceTurnExecutions:
             self._settle(execution, release, error=PresenceTurnNotStarted("presence turn admission did not start"))
             raise
         execution.admission.add_done_callback(lambda task: self._admission_ended(execution, release, task))
+        return execution, True
+
+    def start_thread(self, turn_id: str, *, identity: str, admit: Callable[[], PresenceTurnLease],
+                     run: Callable[[PresenceTurnLease], Any],
+                     context: contextvars.Context) -> tuple[PresenceTurnExecution, bool]:
+        """The proactive form of ``start_or_join``: admission waits on the turn's own thread."""
+        with self._lock:
+            live = self._live.get(turn_id)
+            if live is not None:
+                if identity and live.identity and identity != live.identity:
+                    raise PresenceTurnError("presence_event_identity_conflict", "source_event_id", turn_ref=turn_id)
+                return live, False
+            execution = self._live[turn_id] = PresenceTurnExecution(turn_id, identity)
+
+        def body() -> None:
+            try:
+                lease = admit()
+            except BaseException as exc:
+                self._settle(execution, lambda: None, error=exc)
+                return
+            self._execute(execution, run, lease, lambda: None)
+
+        try:
+            threading.Thread(target=context.run, args=(body,), name=f"presence-turn-{turn_id}", daemon=True).start()
+        except BaseException as exc:
+            error = PresenceTurnNotStarted("presence turn thread could not start")
+            error.__cause__ = exc
+            self._settle(execution, lambda: None, error=error)
+            raise error from exc
         return execution, True
 
     def _admission_ended(self, execution: PresenceTurnExecution, release: Callable[[], None],
@@ -1289,6 +1535,7 @@ class PresenceTurnExecutions:
                  lease: PresenceTurnLease, release: Callable[[], None]) -> None:
         outcome: Any = None
         error: BaseException | None = None
+        lease.execution = execution  # the author may publish its initial envelope through its lease
         try:
             outcome = run(lease)
         except BaseException as exc:  # relayed unchanged to every waiter
@@ -1312,17 +1559,23 @@ class PresenceTurnExecutions:
         # the running turn; one that lands after retirement rechecks durable authority — a turn that
         # reached the model left its RUNNING/terminal row, so it replays or refuses; only a turn that
         # failed before the start barrier may have no row, and it never generated anything to repeat.
-        try:
-            release()
-        except Exception:
-            log.warning("presence turn %s could not return its capacity", execution.turn_id, exc_info=True)
+        # A continuing author returned its capacity with its initial envelope; that is never repeated.
+        execution.return_capacity(release)
         with self._lock:
             if self._live.get(execution.turn_id) is execution:
                 del self._live[execution.turn_id]
-        if error is None:
-            execution.result.set_result(result)
-        else:
-            execution.result.set_exception(error)
+        for future in (execution.initial, execution.result):
+            with execution._lock:
+                if future.done():
+                    continue
+                if error is None:
+                    future.set_result(result)
+                else:
+                    future.set_exception(error)
+
+
+# Initiated turns run under this process's own execution registry (the Host keeps its own).
+PROACTIVE_TURNS = PresenceTurnExecutions()
 
 
 __all__ = [

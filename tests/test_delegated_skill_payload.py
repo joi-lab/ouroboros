@@ -460,7 +460,7 @@ def test_capture_transports_utf8_with_nul_and_loader_junk_stays_out(tmp_path, mo
     entry = _payload_entry(handle, skill)
     capture = _capture_terminal_patch(ctx, entry)
     assert capture["status"] == "ready_with_changes", capture
-    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text())
+    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
     assert manifest["capture_kind"] == "skill_payload"
     assert set(manifest["tracked_changed"]) == {"table.txt", "plugin.py", "notes.txt"}
     assert manifest["blocked_reserved_paths"] == []
@@ -576,7 +576,7 @@ def test_reserved_path_patch_refuses_whole_apply_and_preserves_candidate(tmp_pat
 
     ctx, skill, handle, entry, capture = _captured(tmp_path, monkeypatch, edit=edit)
     assert capture["status"] == "ready_with_changes", capture
-    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text())
+    manifest = json.loads(pathlib.Path(capture["manifest_artifact"]).read_text(encoding="utf-8"))
     assert manifest["blocked_reserved_paths"] == [".clawhub.json"]
     out = _integrate_delegated_patch(ctx, "run-p1", "apply", "")
     assert "INTEGRATE_DELEGATED_RESERVED_PATHS" in out, out
@@ -689,9 +689,6 @@ def test_registry_golden_e2e_start_wait_apply_review_stale(tmp_path, monkeypatch
     # the APPLIED content — reviewer LLM faked deterministically, no live model.
     from tests.test_skill_review_persist_guard import _pass_actor
 
-    monkeypatch.setattr(
-        "ouroboros.skill_review._run_skill_advisory_pre_review",
-        lambda *_a, **_kw: {"status": "empty"})
     monkeypatch.setattr(
         "ouroboros.tools.review._handle_multi_model_review",
         lambda *_a, **_kw: json.dumps(
@@ -888,80 +885,98 @@ def test_reconcile_queue_failure_degrades_the_receipt_honestly(tmp_path, monkeyp
 
 
 def test_parallel_starts_on_same_payload_yield_exactly_one_winner(tmp_path, monkeypatch):
-    """Gate fix 5 + Sol delta 5a: deterministic REQUESTED→STARTED window, x50.
+    """Gate fix 5 + Sol delta 5a: one deterministic REQUESTED→STARTED window.
 
     Both starts pass the cheap early check and provision; the winner then claims
     (durable START_REQUESTED) and is HELD inside the gateway POST — after its
     request row, before its STARTED row. The loser runs its locked busy predicate
     strictly inside that window: the old two-pass read could miss a holder whose
-    transition landed between the passes; the single-pass snapshot cannot. Fifty
-    fresh-drive iterations prove the interleaving is stable, not schedule-lucky."""
+    transition landed between the passes; the single-pass snapshot cannot. The
+    barrier and events force that ordering, so repetition adds no new schedule.
+    (Both starts are one task here; distinct owners: tests/test_custody_keyed_readers.py.)"""
     import threading
+    from contextlib import contextmanager
 
     import ouroboros.tools.delegate as delegate
     import ouroboros.tools.delegate_integration as integration
+    from ouroboros import delegate_custody_current as current
+    from ouroboros import store
     from ouroboros.gateways import claudexor as gw
 
     real_provision = integration._provision_payload_snapshot
-    real_replay = custody.replay
-    for iteration in range(50):
-        base = tmp_path / f"iter{iteration}"
-        base.mkdir()
-        ctx = _payload_ctx(base, monkeypatch)
-        _seed_skill(base / "data")
-        delegate._CUSTODY.clear()
-        barrier = threading.Barrier(2, timeout=30)
-        in_window = threading.Event()   # winner: REQUESTED durable, STARTED not
-        release = threading.Event()     # loser observed busy; let winner finish
+    real_snapshot, real_open = current.payload_snapshot, store.open_store
+    inside = threading.local()
+    base = tmp_path / "race"
+    base.mkdir()
+    ctx = _payload_ctx(base, monkeypatch)
+    _seed_skill(base / "data")
+    delegate._CUSTODY.clear()
+    barrier = threading.Barrier(2, timeout=30)
+    in_window = threading.Event()   # winner: REQUESTED durable, STARTED not
+    release = threading.Event()     # loser observed busy; let winner finish
 
-        def _synced(*args, **kwargs):
-            result = real_provision(*args, **kwargs)
-            barrier.wait()
-            if threading.current_thread().name != "winner":
-                assert in_window.wait(30), "winner never reached its window"
-            return result
+    def _synced(*args, **kwargs):
+        result = real_provision(*args, **kwargs)
+        barrier.wait()
+        if threading.current_thread().name != "winner":
+            assert in_window.wait(30), "winner never reached its window"
+        return result
 
-        class _WindowStub(_StartStub):
-            def start_run(self, request, *, idempotency_key=""):
-                in_window.set()
-                assert release.wait(30), "the loser never settled"
-                return super().start_run(request, idempotency_key=idempotency_key)
+    class _WindowStub(_StartStub):
+        def start_run(self, request, *, idempotency_key=""):
+            in_window.set()
+            assert release.wait(30), "the loser never settled"
+            return super().start_run(request, idempotency_key=idempotency_key)
 
-        def _replay_hook(drive_root, rows=None):
-            state = real_replay(drive_root, rows=rows)
-            if (threading.current_thread().name != "winner"
-                    and in_window.is_set() and not release.is_set()):
-                # Mutant-killer: the winner's STARTED row lands durably AFTER
-                # this pass returned and BEFORE the pending projection runs —
-                # the exact hole a two-pass (re-reading) predicate had. Only a
-                # single shared row snapshot still reports busy here.
-                release.set()
-                thread.join(timeout=30)
-            return state
+    fired: list = []
 
-        seen: dict = {}
-        monkeypatch.setattr(custody, "replay", _replay_hook)
-        monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _WindowStub(seen))
-        monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
-        monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
-        winner_out: list = []
+    def _snapshot_hook(drive_root):
+        inside.active = True
+        try:
+            return real_snapshot(drive_root)
+        finally:
+            inside.active = False
 
-        def _winner():
-            winner_out.append(json.loads(_exact_payload_start(
-                ctx, "start winner", root="skill_payload", bucket="external",
-                skill_name="alpha")))
+    @contextmanager
+    def _read_hook(root, **kwargs):
+        with real_open(root, **kwargs) as txn:
+            yield txn
+        if (getattr(inside, "active", False) and threading.current_thread().name != "winner"
+                and in_window.is_set() and not release.is_set()):
+            # Mutant-killer: the winner's STARTED row lands durably AFTER
+            # the busy snapshot's read transaction closed and BEFORE its
+            # projections are built — the exact hole a two-pass (re-reading)
+            # predicate had. Only one shared read still reports busy here.
+            fired.append(True)
+            release.set()
+            thread.join(timeout=30)
 
-        thread = threading.Thread(target=_winner, name="winner")
-        thread.start()
+    seen: dict = {}
+    monkeypatch.setattr(current, "payload_snapshot", _snapshot_hook)
+    monkeypatch.setattr(store, "open_store", _read_hook)
+    monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _WindowStub(seen))
+    monkeypatch.setattr(integration, "_provision_payload_snapshot", _synced)
+    monkeypatch.setattr(delegate, "_provision_payload_snapshot", _synced)
+    winner_out: list = []
+
+    def _winner():
+        winner_out.append(json.loads(_exact_payload_start(
+            ctx, "start winner", root="skill_payload", bucket="external",
+            skill_name="alpha")))
+
+    thread = threading.Thread(target=_winner, name="winner")
+    thread.start()
+    try:
         loser = json.loads(_exact_payload_start(
-            ctx, "start loser", root="skill_payload", bucket="external",
-            skill_name="alpha"))
+            ctx, "start loser", root="skill_payload", bucket="external", skill_name="alpha"))
+    finally:
         release.set()
         thread.join(timeout=60)
-        assert not thread.is_alive(), f"iteration {iteration}: winner hung"
-        assert loser["status"] == "refused", (iteration, loser)
-        assert loser["reason"] == "payload_delegation_busy", (iteration, loser)
-        assert winner_out and winner_out[0]["status"] == "started", (iteration, winner_out)
+    assert not thread.is_alive(), "winner hung"
+    assert loser["status"] == "refused", loser
+    assert loser["reason"] == "payload_delegation_busy", loser
+    assert winner_out and winner_out[0]["status"] == "started", winner_out
+    assert fired == [True], "the window hook never ran"
     custody._CUSTODY.clear()
 
 
@@ -1177,9 +1192,9 @@ def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     assert "STAGED into your active root" in decision
     assert "applied LIVE into the non-Git payload" in decision
     arch = architecture_text()
-    assert "staging substrate differs" in arch
-    assert "A SKILL-PAYLOAD target captures through the payload adapter" in arch
-    assert "QUEUES the extension reconcile request" in arch
+    for identifier in ("integrate_delegated_patch", "integrate_payload_patch",
+                       "provision_payload_snapshot", "request_extension_reconcile"):
+        assert identifier in arch, identifier
 
 
 def test_registry_and_custody_baseline_disagreement_fails_capture_typed(
@@ -1423,20 +1438,31 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     derived, and the run died unable to reach its own read surface. The host
     renders ONE sentence from `DelegatedRunShape.access`, names it as the
     native-mechanism text, while explicit task constraints still bind."""
-    from ouroboros.delegate_start_instructions import access_instruction
+    from ouroboros.delegate_start_instructions import INVESTIGATION_INSTRUCTION, access_instruction
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _host_instructions
 
     precedence = ("this line governs native process access, while explicit task "
                   "constraints and the assigned edit target still bind.")
-    readonly = _host_instructions(delegated_run_shape(False))
+    # #1609: technical access alone decides the shape, so the read-only run is the
+    # explicitly readonly one.
+    readonly = _host_instructions(delegated_run_shape(False, "readonly"))
     assert "ACCESS: you may read and run read-only commands inside this root" in readonly
     assert readonly.count(precedence) == 1  # one sentence, never a paragraph
+    assert INVESTIGATION_INSTRUCTION not in readonly
 
     acting = _host_instructions(delegated_run_shape(True))
     assert "ACCESS: you may edit inside this root" in acting
     assert acting.count(precedence) == 1
     assert "read and run read-only commands" not in acting
+    assert INVESTIGATION_INSTRUCTION not in acting
+
+    # A non-acting child that captured writable access is an evidence-only investigation:
+    # the same ONE access sentence, followed once by the purpose that forbids applying.
+    investigation = _host_instructions(delegated_run_shape(False))
+    assert "ACCESS: you may edit inside this root" in investigation
+    assert investigation.count(precedence) == 1
+    assert investigation.count(INVESTIGATION_INSTRUCTION) == 1
     full = _host_instructions(delegated_run_shape(True, "full"))
     assert full.count(precedence) == 1
     assert "No filesystem sandbox is requested" in full
@@ -1444,7 +1470,7 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     assert "source edits delivered through the assigned root" in full
 
     assignment = "ASSIGNMENT\nRead-only, no edits or commands."
-    with_assignment = _host_instructions(delegated_run_shape(False), assignment)
+    with_assignment = _host_instructions(delegated_run_shape(False, "readonly"), assignment)
     assert with_assignment.endswith("\n\n" + assignment)  # assignment still last
     assert with_assignment.index(precedence) < with_assignment.index(assignment)
 

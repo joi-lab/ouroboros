@@ -152,12 +152,12 @@ def test_the_returned_call_retires_only_its_own_claim(tmp_path, monkeypatch):
     thread.start()
     try:
         assert entered.wait(5)
-        unknown = dict(load_task_result(tmp_path, "root")["launch_handoffs"])
+        unknown = dict(load_task_result(tmp_path, "root").get("launch_handoffs", {}))
         assert len(unknown) == 1
         calls = _wire(monkeypatch)
         assert registry.execute_result("mcp_demo__effect", {}).status == "ok"
         assert calls == ["effect"]
-        assert load_task_result(tmp_path, "root")["launch_handoffs"] == unknown
+        assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == unknown
         _consumers(tmp_path, registry, queue, workers, held=True)
     finally:
         release.set()
@@ -211,5 +211,6 @@ def test_a_return_is_recorded_only_on_the_open_invocation_it_names(tmp_path, mon
     closed = handoff
     owner_pause.record_mcp_call_returned("mcp_demo__effect")  # no open invocation: a no-op
     assert closed["closed"] is True
-    # The raw handoff seam leaves settlement to the registry; nothing was settled here.
-    assert load_task_result(tmp_path, "root").get("launch_handoffs")
+    # The direct fallback owns this joined return; a closed call cannot retain
+    # a phantom invocation or lend its completion fact to the next call.
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs")

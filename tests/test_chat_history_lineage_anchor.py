@@ -22,6 +22,7 @@ import pytest
 
 from ouroboros.gateway.history import make_chat_history_endpoint
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
+from tests._store_shared import seed_result
 
 ROOT_FLOOD = 70  # > the default n_progress=60, so the floor lands past the children
 
@@ -80,9 +81,7 @@ def _write(tmp_path, *, chat_lines=(), progress_lines=(), results=None):
         for task_id, payload in results.items():
             # 7.0 ABI (Q8=B): a stored task row carries its schema marker; the
             # strict loader ignores an unmarked row, so the fixture stamps it.
-            (results_dir / f"{task_id}.json").write_text(
-                json.dumps({"_schema_version": 1, **payload}), encoding="utf-8",
-            )
+            seed_result(tmp_path, task_id, {"_schema_version": 1, **payload})
 
 
 def _496_fixture(tmp_path, root_status, *, chat_id=1):

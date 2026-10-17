@@ -74,7 +74,7 @@ LIVE_SNAPSHOT = {
         {
             "id": "claude", "status": "ok", "enabled": True,
             "access_profiles_supported": ["readonly", "workspace_write"],
-            "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+            "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                        {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}],
         },
         {
@@ -135,8 +135,14 @@ def onboarding(monkeypatch, tmp_path):
         return payload
 
     monkeypatch.setattr(gw_onboarding, "_read_harness_snapshot", _snapshot)
-    monkeypatch.setattr(config, "apply_settings_to_env",
-                        lambda settings: calls["env"].append(dict(settings)))
+    original_apply_settings = config.apply_settings_to_env
+
+    def apply_settings(settings, *, environ=None):
+        if environ is not None:
+            return original_apply_settings(settings, environ=environ)
+        calls["env"].append(dict(settings))
+
+    monkeypatch.setattr(config, "apply_settings_to_env", apply_settings)
 
     def _supervisor(_request, _settings):
         calls["supervisor"] += 1
@@ -175,24 +181,23 @@ def test_fresh_install_applies_the_preset_in_one_write(onboarding):
     assert onboarding.calls["snapshot"] == 1  # exactly ONE daemon read
 
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     assert saved["OUROBOROS_SUBAGENT_HARNESS"] == ""
     available = json.loads(saved[SUBAGENTS_SETTING])
-    # 4=A: the advisory seat's session route matches no task actor, so the
-    # preset mints a roster row for it and every reviewer slot is a
-    # subagent_id REFERENCE into the roster the preset ships.
-    roster = {row["subagent_id"]: row["route"]["target_id"] for row in available["items"]}
-    assert [row["route"]["target_id"] for row in available["items"]] == [
-        "claude=claude-opus-5", "codex=gpt-5.6-sol", "openai/gpt-5.6-luna",
-        "claude=claude-sonnet-5",
+    # One list: the actors are Auto rows (the owner's effort range decides), so the
+    # review seats keep their pinned levels on minted rows of their own (the scope
+    # seat merges into the codex reviewer row); no advisory seat exists, and no
+    # lane key is written.
+    assert [(row["route"]["target_id"], row.get("review_eligible", False)) for row in available["items"]] == [
+        ("claude=claude-opus-5-5", False), ("codex=gpt-5.6-sol", False), ("openai/gpt-5.6-luna", False),
+        ("claude=claude-opus-5-5", True), ("codex=gpt-5.6-sol", True),
     ]
     assert all("name" not in row for row in available["items"])  # retired (1=A)
-    assert json.loads(saved[SUBAGENTS_RECEIPT_KEY])["available_subagents_fingerprint"]
-    slots = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    assert [roster[row["subagent_id"]] for row in slots["triad"]] == [
-        "claude=claude-opus-5", "codex=gpt-5.6-sol"]
-    assert roster[slots["scope"][0]["subagent_id"]] == "codex=gpt-5.6-sol"
-    assert roster[slots["advisory"]["subagent_id"]] == "claude=claude-sonnet-5"
+    assert [row.get("effort") for row in available["items"]] == [None, None, None, "medium", "medium"]
+    receipt = json.loads(saved[SUBAGENTS_RECEIPT_KEY])
+    assert receipt["available_subagents_fingerprint"]
+    assert receipt["review_pool"] == [row["subagent_id"] for row in available["items"][3:]]
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     # Everything else of the transaction landed in the SAME file.
     assert saved["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
@@ -232,7 +237,8 @@ def test_antigravity_install_succeeds_without_inventing_reviewer_seats(onboardin
         "target_id": "agy=gemini-3.8-flash-high",
         "credential_profile_id": "",
     }
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == ""
+    # The review lanes are retired (PR-3): the onboarding authors no lane key at all.
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
 
 
 def test_daemon_unavailable_persists_nothing_and_keeps_the_wizard_open(onboarding):
@@ -533,11 +539,14 @@ def test_local_only_preview_materializes_only_local_routes_without_daemon_read(o
     )
 
     assert response.status_code == 200, response.text
-    targets = [
-        row["route"]["target_id"]
-        for row in response.json()["available_subagents"]["items"]
-    ]
+    items = response.json()["available_subagents"]["items"]
+    targets = [row["route"]["target_id"] for row in items if not row.get("review_eligible")]
     assert targets == ["owner-main (local)", "owner-light (local)"]
+    # The factory pool of a local-only install is its one reachable model, run once
+    # (I3-1 after owner Q5=A: copies of it would only multiply the cost), never a remote panel.
+    reviewers = [row for row in items if row.get("review_eligible") is True]
+    assert [row["minted_from"] for row in reviewers] == ["factory_default"]
+    assert {row["route"]["target_id"] for row in reviewers} <= {"owner-main", "owner-main (local)"}
     assert onboarding.calls["snapshot"] == 0
     assert not onboarding.settings_path.exists()
 
@@ -572,11 +581,12 @@ def test_completion_validates_but_never_replaces_owner_edited_actor_rows(onboard
     )
     assert preview.status_code == 200, preview.text
     assert preview.json()["source"] == "configured"
-    expected = {
-        "enabled": True,
-        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
-    }
-    assert preview.json()["available_subagents"] == expected
+    expected = preview.json()["available_subagents"]
+    # The owner's row stays verbatim; the review pool IS catalog rows, so the
+    # connected subscriptions' reviewer rows are appended to it, marked.
+    assert expected["items"][0] == {k: v for k, v in owner["items"][0].items() if k != "name"}
+    assert [(row["route"]["target_id"], row["review_eligible"], row["minted_from"]) for row in expected["items"][1:]] == [
+        ("claude=claude-opus-5-5", True, "factory_default"), ("codex=gpt-5.6-sol", True, "factory_default")]
     assert not onboarding.settings_path.exists()
 
     response = onboarding.client.post(
@@ -669,36 +679,36 @@ def test_nonfresh_recovery_completion_still_saves_an_explicit_owner_draft(onboar
         SUBAGENTS_SETTING: "",
         "OUROBOROS_REVIEWER_SLOTS": "owner-reviewer-bytes",
     }), encoding="utf-8")
-    owner = {
-        "enabled": True,
-        "items": [{
-            "subagent_id": "owner-route",
-            "name": "Owner route",
-            "recommended_use": "Use this exact recovery draft.",
-            "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
-        }],
+    row = {
+        "subagent_id": "owner-route",
+        "name": "Owner route",
+        "recommended_use": "Use this exact recovery draft.",
+        "route": {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"},
     }
 
-    response = onboarding.client.post(
-        "/api/onboarding/complete",
-        json={
-            **WIZARD_PAYLOAD,
-            "subscriptionsConnected": True,
-            SUBAGENTS_SETTING: owner,
-        },
-    )
+    def _finish(item, **extra):
+        return onboarding.client.post("/api/onboarding/complete", json={
+            **WIZARD_PAYLOAD, "subscriptionsConnected": True,
+            SUBAGENTS_SETTING: {"enabled": True, "items": [item]}, **extra})
+
+    # A recovery draft that marks no reviewer is the empty-pool refusal: nothing is written.
+    refused = _finish(row)
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["code"] == "empty_review_pool"
+    assert json.loads(onboarding.settings_path.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
+
+    marked = {**row, "review_eligible": True}
+    response = _finish(marked)
 
     assert response.status_code == 200, response.text
     assert response.json()["preset"]["reason"] == "configured_by_owner"
     assert response.json()["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 0
     saved = onboarding.saved()
-    expected = {
-        "enabled": True,
-        "items": [{k: v for k, v in owner["items"][0].items() if k != "name"}],
-    }
+    expected = {"enabled": True, "items": [{k: v for k, v in marked.items() if k != "name"}]}
     assert json.loads(saved[SUBAGENTS_SETTING]) == expected
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == "owner-reviewer-bytes"
+    # The owner's catalog save is the one that clears the unmigratable lane bytes.
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     assert not saved.get(PRESET_MARKER_KEY)
 
 
@@ -747,7 +757,7 @@ def test_an_environment_completion_fact_cannot_close_the_install_window(monkeypa
     assert body["preset"]["applied"] is True
     assert onboarding.calls["snapshot"] == 1, "the daemon was never consulted"
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     # The endpoint's own timestamp, not the environment's.
     assert saved[ONBOARDING_COMPLETED_KEY] != "2020-01-01T00:00:00Z"
 
@@ -774,7 +784,7 @@ def test_subscription_free_completion_still_materializes_actor_default(onboardin
     assert response.json()["preset"]["applied"] is True
     saved = onboarding.saved()
     assert saved[ONBOARDING_COMPLETED_KEY], "the completion fact IS unconditional"
-    assert saved.get(PRESET_MARKER_KEY) == "3"
+    assert saved.get(PRESET_MARKER_KEY) == "4"
     assert json.loads(saved[SUBAGENTS_SETTING])["items"]
 
 
@@ -862,7 +872,7 @@ def test_a_post_commit_failure_reports_the_save_that_landed(monkeypatch, onboard
     assert "supervisor refused to start" in body["error"]
     # And the transaction really IS on disk, preset marker included.
     saved = onboarding.saved()
-    assert saved[PRESET_MARKER_KEY] == "3"
+    assert saved[PRESET_MARKER_KEY] == "4"
     assert saved[ONBOARDING_COMPLETED_KEY]
     assert saved["OPENROUTER_API_KEY"] == WIZARD_PAYLOAD["OPENROUTER_API_KEY"]
 
@@ -981,9 +991,9 @@ def test_install_time_status_cannot_be_forged_from_the_payload(onboarding):
     assert response.json()["preset"]["applied"] is False
     saved = onboarding.saved()
     assert not saved.get(PRESET_MARKER_KEY)
-    # Review is now an ordinary editable wizard surface. Its valid explicit
-    # value is preserved, but it cannot reopen presets or lower safety.
-    assert saved["OUROBOROS_REVIEWER_SLOTS"] == manual_slots
+    # Reviewers are catalog rows now: a posted lane value is not authored, and
+    # it cannot reopen presets or lower safety.
+    assert not saved.get("OUROBOROS_REVIEWER_SLOTS")
     assert saved.get("OUROBOROS_SAFETY_MODE", "") != "off"
 
 
@@ -1207,7 +1217,7 @@ def test_a_seat_with_no_capacity_still_reaches_the_compiled_preset_with_its_mode
         [_no_capacity_now("claude", native_login=True), _native_account("codex")],
         harnesses=[
             {"id": "claude", "status": "ok", "enabled": True,
-             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+             "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                         {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
             {"id": "codex", "status": "ok", "enabled": True,
              "models": [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.6-terra"}, {"id": "gpt-5.5"}]},
@@ -1509,7 +1519,7 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
         "daemon": {"state": "running"},
         "harnesses": [
             {"id": "claude", "status": "ok", "enabled": True,
-             "models": [{"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
+             "models": [{"id": "claude-opus-5-5"}, {"id": "claude-opus-5"}, {"id": "claude-sonnet-5"},
                         {"id": "claude-fable-5"}, {"id": "claude-opus-4-6"}]},
             {"id": "agy", "status": "unavailable", "enabled": True,
              "models": [{"id": "gemini-3.8-flash-high"}, {"id": "gemini-3.1-pro-high"}]},
@@ -1536,22 +1546,12 @@ def test_a_connected_agy_account_composes_with_core_reviewers(onboarding):
 
     assert response.status_code == 200, response.text
     saved = onboarding.saved()
-    actor_targets = [
-        row["route"]["target_id"]
-        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
-    ]
-    assert "agy=gemini-3.8-flash-high" in actor_targets
-    reviewer = json.loads(saved["OUROBOROS_REVIEWER_SLOTS"])
-    roster = {
-        row["subagent_id"]: row["route"]["target_id"]
-        for row in json.loads(saved[SUBAGENTS_SETTING])["items"]
-    }
-    triad_targets = [
-        roster[row["subagent_id"]] if "subagent_id" in row
-        else row["route"]["target_id"]
-        for row in reviewer["triad"]
-    ]
-    assert all("agy=" not in target for target in triad_targets)
+    items = json.loads(saved[SUBAGENTS_SETTING])["items"]
+    assert "agy=gemini-3.8-flash-high" in [row["route"]["target_id"] for row in items]
+    # The review pool is the marked rows: the core reviewers, never an agy session.
+    reviewers = [row["route"]["target_id"] for row in items if row.get("review_eligible") is True]
+    assert reviewers and all("agy=" not in target for target in reviewers)
+    assert "OUROBOROS_REVIEWER_SLOTS" not in saved
     assert onboarding.calls["supervisor"] == 1
 
 

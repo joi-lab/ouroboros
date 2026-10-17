@@ -344,12 +344,14 @@ def test_onboarding_frontend_uses_base_url_first_compatible_validation():
 
 def test_build_onboarding_html_serves_a_real_page_with_linked_modules():
     """ONE onboarding host: the page LINKS its stylesheet and its ES module from
-    /static instead of inlining them, so the wizard's steps can import ordinary
-    web/modules/* code. The bootstrap stays inline (it is per-install state)."""
+    /onboarding/static (the core's builtin tree, whatever main interface is selected)
+    instead of inlining them, so the wizard's steps can import ordinary web/modules/*
+    code. The bootstrap stays inline (it is per-install state)."""
     html = build_onboarding_html({})
 
-    assert '<script type="module" src="/static/modules/onboarding_wizard.js"></script>' in html
-    assert '<link rel="stylesheet" href="/static/onboarding.css">' in html
+    assert '<script type="module" src="/onboarding/static/modules/onboarding_wizard.js"></script>' in html
+    assert '<link rel="stylesheet" href="/onboarding/static/onboarding.css">' in html
+    assert 'src="/static/' not in html and 'href="/static/' not in html and "'/static/" not in html
     assert '"contract": {' in html
     assert '"providerFields": [' in html
     assert "openai::gpt-5.6-terra" in html
@@ -379,6 +381,24 @@ def test_bootstrap_freshness_is_explicit_display_provenance():
     assert fresh["freshInstall"] is True
     assert fresh["initialState"]["mainModel"] == settings["OUROBOROS_MODEL"]
     assert '"freshInstall": true' in build_onboarding_html({}, fresh_install=True)
+
+
+def test_reopened_wizard_shows_the_saved_vision_choice_and_defaults_only_a_missing_slot():
+    """PR #1560 owner decision: an existing install's Vision choice, empty included,
+    survives a reopened wizard. A loaded document carries every slot, so its blank is
+    saved "inherit Main"; only a slot the document lacks takes the profile default."""
+    from ouroboros.server_runtime import apply_runtime_provider_defaults, propose_unauthored_model_slots
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    # What the loader reads for a document holding only the key: its unauthored slots on Z.ai's proposals.
+    loaded = propose_unauthored_model_slots({**SETTINGS_DEFAULTS, "ZAI_API_KEY": "sk-zai-test-value"}, authored=())
+    saved, _changed, _keys = apply_runtime_provider_defaults(loaded)
+    initial = build_setup_bootstrap(saved, "web")["initialState"]
+    assert (initial["providerProfile"], initial["mainModel"], initial["visionModel"]) == ("zai", "zai::glm-5.3", "")
+    custom = build_setup_bootstrap({**saved, "OUROBOROS_MODEL_VISION": "zai::glm-ocr"}, "web")["initialState"]
+    assert custom["visionModel"] == "zai::glm-ocr"
+    missing = build_setup_bootstrap({"ZAI_API_KEY": "sk-zai-test-value"}, "web", fresh_install=True)["initialState"]
+    assert missing["visionModel"] == "zai::glm-5.3-flash"
 
 
 def test_onboarding_wizard_module_keeps_its_multistep_contract():
@@ -449,23 +469,6 @@ def test_agents_step_is_skippable_and_cannot_block_completion():
     # Nothing on the step is a form control the shared validator would see.
     step_source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
     assert "<input" not in step_source
-
-
-def test_agents_step_ladder_states_the_startup_gate_honestly():
-    """Codex can start Models; other subscriptions remain agent connections."""
-    source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
-
-    assert "Run models and agents without an API key" in source
-    assert "Claude Code, Cursor, and Antigravity remain agent connections" in source
-    assert "a plan cannot run it" not in source
-    assert "not free" in source
-    assert "Task acceptance stays on the API" not in source
-    assert "commit, plan, skill review and task acceptance each follow their configured" in source
-    assert "acceptance panel on the subscription" in source
-    assert "about 12 s" in source and "$0.07 per model row per task" in source  # R12 numbers, not adjectives
-    assert "all reviewers" not in source.lower()
-    # D-10 vocabulary in the new owner-facing surface.
-    assert "coding agent" not in source.lower()
 
 
 def test_agents_step_rotation_diagram_is_inert_static_artwork():

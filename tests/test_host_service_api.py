@@ -9,6 +9,7 @@ from ouroboros.gateway.host_service import AUTH_TOKEN_FILENAME, create_host_serv
 from ouroboros.event_bus import CHAT_OUTBOUND, publish_event
 from ouroboros.skill_loader import compute_content_hash, save_enabled, save_review_state, save_skill_grants, SkillReviewState
 from ouroboros.utils import atomic_write_json
+from tests._store_shared import seed_result
 
 
 class FakeBridge:
@@ -623,9 +624,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
     )
     binding_id = _seed_presence_behavior(tmp_path)
     work_ref = "presence-work-1"
-    atomic_write_json(
-        tmp_path / "task_results" / f"{work_ref}.json",
-        {
+    seed_result(tmp_path, work_ref, {
             "_schema_version": 1,
             "task_id": work_ref,
             "status": "completed",
@@ -635,8 +634,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
                 "presence_outcome": "message",
                 "presence_result_text": "late answer",
             },
-        },
-    )
+        })
     app = create_host_service_app(tmp_path, presence_runner=lambda **_kwargs: None)
     client = TestClient(app)
 
@@ -655,9 +653,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
         "delivery_reporting_version": 0,
     }
 
-    atomic_write_json(
-        tmp_path / "task_results" / f"{work_ref}.json",
-        {
+    seed_result(tmp_path, work_ref, {
             "_schema_version": 1,
             "task_id": work_ref,
             "status": "completed",
@@ -667,8 +663,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
                 "presence_outcome": "deferred",
                 "presence_result_text": "late deferred answer",
             },
-        },
-    )
+        })
     deferred = client.get(
         f"/presence/work/{work_ref}",
         params={"binding_id": binding_id},

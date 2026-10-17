@@ -96,6 +96,45 @@ def test_restart_requests_are_routed_and_an_empty_queue_ends_the_pass(dispatch_s
     assert backlog is False and ctx.dispatched == [1, 3] and ctx.restarts == [2]
 
 
+def test_a_dequeued_send_is_released_after_its_handler_returned_or_raised(monkeypatch, caplog):
+    """The consumer owns the one release of a send's delivery membership: after the
+    handler returned, after it raised, and after a restart intercept alike. A bus
+    without the membership (a plain queue) is fail-soft, logged once per class."""
+    import logging
+
+    from supervisor import events as events_mod
+    from supervisor.event_observation import ObservedEventQueue
+
+    did = "final:t:0123456789abcdef"
+
+    def dispatch(evt, ctx):
+        ctx.dispatched.append(evt["n"])
+        if evt.get("boom"):
+            raise RuntimeError("handler failed")
+
+    monkeypatch.setattr(events_mod, "dispatch_event", dispatch)
+    bus = ObservedEventQueue()
+    bus.put({"type": "send_message", "n": 1, "task_id": "t", "delivery_id": did, "boom": True})
+    bus.put({"type": "send_message", "n": 2, "task_id": "t", "delivery_id": did})
+    bus.put({"type": "restart_request", "n": 3, "delivery_id": did})
+    ctx = _ctx([])
+    with pytest.raises(RuntimeError):
+        sl.drain_worker_events(bus, ctx, _liveness(), on_restart=lambda evt, c: c.restarts.append(evt["n"]))
+    assert ctx.dispatched == [1] and bus.delivery_outstanding(did) is True, "one of two puts released"
+    assert sl.drain_worker_events(bus, ctx, _liveness(), on_restart=lambda evt, c: c.restarts.append(evt["n"])) is False
+    assert ctx.dispatched == [1, 2] and ctx.restarts == [3]
+    assert bus.delivery_outstanding(did) is False
+
+    monkeypatch.setattr(sl, "_RELEASE_FAILURES_SEEN", set())
+    plain: "queue.Queue" = queue.Queue()
+    for n in (4, 5):
+        plain.put({"type": "send_message", "n": n, "task_id": "t", "delivery_id": did})
+    with caplog.at_level(logging.WARNING, logger=sl.log.name):
+        assert sl.drain_worker_events(plain, ctx, _liveness(), on_restart=lambda evt, c: None) is False
+    assert ctx.dispatched == [1, 2, 4, 5]
+    assert sum("Delivery membership release failed" in rec.message for rec in caplog.records) == 1
+
+
 def test_flush_writes_once_when_dirty_and_clears_only_on_success(monkeypatch):
     writes = []
     ctx = SimpleNamespace(budget_projection_dirty=True,

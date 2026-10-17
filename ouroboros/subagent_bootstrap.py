@@ -496,7 +496,9 @@ def configured_actor_finalization_message(
 
     ``None`` = not a configured actor (the legacy nanny message applies);
     ``""`` = clean (succeeded leaf, adoption, or a typed zero-run receipt);
-    otherwise the one structural reminder. Host children and coordination
+    otherwise the one structural reminder, prefixed ``CONFIGURED_ACTOR_INCOMPLETE``
+    for an incomplete fact and ``CONFIGURED_ACTOR_UNKNOWN`` for anything else:
+    a disclosure, not a gate. Host children and coordination
     activity are auxiliary evidence and never silence it (owner 2026-08-28).
     """
     if not isinstance(getattr(ctx, "_configured_actor_bootstrap", None), dict):
@@ -700,6 +702,12 @@ def _prepare_actor_first_bootstrap(
         "route_available": not bool(getattr(dispatch, "blocked", False)),
         "exact_start_pending": True,
         "physical_started": False,
+        # The dispatch's effort decision for the LEAF ({requested, applied, source}): the
+        # first physical start body carries exactly this level (``exact_start``).
+        "effort_fact": ({"requested": str(task.get("effort_requested") or ""),
+                         "applied": str(task.get("effort_level") or ""),
+                         "source": str(task.get("effort_source") or "")}
+                        if task.get("effort_source") else {}),
         **{key: task[key] if key == "directory_strategy" else list(task[key])
            for key in ("directory_strategy", "scope_paths") if key in task},
     }

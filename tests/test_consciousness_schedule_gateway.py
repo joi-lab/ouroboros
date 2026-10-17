@@ -17,6 +17,7 @@ from supervisor import queue_schedules, schedule_lifecycle
 from tests.test_consciousness_schedule_controls import (
     _Queue, _bind, _events, _once_row, _ready, _rows, _skill, _skill_row, _write,
 )
+from tests._shared import write_queue_document
 
 
 # --- a lifecycle action governs dispatch, not a run already admitted ---------------
@@ -55,19 +56,19 @@ def test_a_worker_reports_unknown_rather_than_claiming_no_run_is_in_flight(tmp_p
     assert unknown["ok"] is True and unknown["running_or_queued"] is None
 
     snapshot = tmp_path / "state" / "queue_snapshot.json"
-    snapshot.write_text(json.dumps({
+    write_queue_document(snapshot, {
         "ts": ouro_utils.utc_now_iso(), "pending": [], "running": [
             {"id": "task-1", "task": {"id": "task-1", "metadata": {"schedule_id": "cron-1"}}}],
-    }), encoding="utf-8")
+    })
     seen = schedule_lifecycle.mutate_scheduled_task("restore", "cron-1", reason="back",
                                                  actor="agent", drive_root=tmp_path)
     assert seen["running_or_queued"] is True
 
-    snapshot.write_text(json.dumps({
+    write_queue_document(snapshot, {
         "ts": ouro_utils.utc_now_iso(), "pending": [
             {"id": "task-2", "task": {"id": "task-2", "metadata": {"schedule_id": "other"}}}],
         "running": [],
-    }), encoding="utf-8")
+    })
     clear = schedule_lifecycle.mutate_scheduled_task("disable", "cron-1", reason="pause again",
                                                   actor="agent", drive_root=tmp_path)
     assert clear["running_or_queued"] is False

@@ -47,6 +47,9 @@ _POPEN_ALLOWLIST = {
     "ouroboros/cli.py",                   # dev CLI (foreground)
     "ouroboros/server_control.py",        # restart exec path
     "ouroboros/workspace_patch_capture.py",  # waited synchronous child
+    # One raw-blob fast-import per staging call: reaped before the call returns,
+    # killed on any early exit (stage_raw_payload_inventory).
+    "ouroboros/subagent_worktrees.py",
     "ouroboros/preflight_runner.py",      # waited hermetic pytest child
     "ouroboros/tools/shell_process.py",   # bounded foreground commands (waited + tracked)
     "ouroboros/tools/skill_exec.py",      # bounded skill run (waited + tracked)
@@ -72,6 +75,11 @@ _POPEN_ALLOWLIST = {
     # operator rebase helper can import the module without the runtime stack.
     "supervisor/update_carriers.py",
     "ouroboros/colab_bootstrap.py",      # bounded Colab clone/fetch helper
+    # Stdlib-only switch helper that runs BEFORE any body import (no custody module is
+    # importable there): its one Popen is the Windows handover, where this process
+    # waits as the parent of the next generation and exits with its code — a
+    # foreground wait, not a long-lived child.
+    "ouroboros/body_switch.py",
 }
 
 
@@ -206,9 +214,14 @@ def test_spawn_supervised_kills_child_when_custody_record_fails(tmp_path, monkey
 
     class FakeProc:
         pid = 4321
+        returncode = None
 
         def wait(self, timeout=None):
-            return -9
+            self.returncode = -9
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
 
     proc = FakeProc()
     monkeypatch.setattr(process_custody.subprocess, "Popen", lambda *_a, **_k: proc)
@@ -227,7 +240,7 @@ def test_spawn_supervised_kills_child_when_custody_record_fails(tmp_path, monkey
             scope="task",
         )
 
-    assert killed == [proc]
+    assert killed == [proc] and proc.poll() == -9
 
 
 def test_update_quiesce_kills_service_group_that_outlives_leader(tmp_path, monkeypatch):

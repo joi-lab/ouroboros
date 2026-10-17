@@ -3,7 +3,9 @@
 Owner Batch4 (1A/4A/8A): Continue is a NEW root in the same room and folder
 that reads the interrupted work; it is never a resurrection of the old task,
 never offered after the owner's own Stop, a Panic or a finished answer, and it
-adopts no old children. The successor model decides whether and how to go on
+adopts no old children: it may only accept or reject a direct child's finished
+native result through ``integrate_subagent_patch`` under the recorded relation.
+The successor model decides whether and how to go on
 (LLM-first) and asks in the existing conversation when unsure — the host
 carries facts, not a policy. This module is the protocol's data half; the
 queue admission is ``supervisor/continuation_admission.py``.
@@ -44,6 +46,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.utils import utc_now_iso
+from ouroboros.task_store import patch_document
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +67,15 @@ TECHNICAL_REASON_CODES = frozenset({
     "reaper_wedged_worker_alive", "round_limit", "execution_deadline", "absolute_ceiling",
     "task_exception", "workers_unavailable", "worker_pool_unavailable", "finalization_grace",
     "idle_timeout", "worker_crash_signal", "worker_crash_retry_exhausted",
+    # A worker that died after an owner wait or with budget-continuation evidence
+    # is not retried automatically (replaying would repeat effects), and its saved
+    # source is retained: an explicit Continue is exactly its manual path (#1543).
+    "worker_crash_owner_wait", "worker_crash_budget_pausing",
+    # A positively reconciled orphan is a technical interruption, not an
+    # unrecorded cause. Continue still rechecks owner sources and live custody.
+    "orphaned_running_after_worker_restart", "interrupted_retry_lost",
+    # A billing or dispatch-fence authority that could not be read, where no exact pause was saved.
+    "billing_authority_unreadable", "control_authority_unreadable",
 })
 # The loop's forced-finalization rails that are technical limits: an extracted
 # best-effort answer settles ``completed``, the host fallback ``failed``
@@ -72,7 +84,7 @@ EXECUTION_LIMIT_RAILS = frozenset({"round_limit", "finalization_grace"})
 # The work's own hard bounds (its deadline, its money): a new task id never
 # extends them, so a task they ended is not offered Continue.
 HARD_LIMIT_REASON_CODES = frozenset({"deadline", "deadline_local", "budget_exhausted"})
-OWNER_SOURCE_KINDS = frozenset({"owner_text", "quiz_answer"})
+OWNER_SOURCE_KINDS = frozenset({"owner_text", "quiz_answer", "quiz_closed"})
 # The retained owner corpus (``review_evidence.task_inputs``) labels each row
 # by its recorder's typed ``source`` (``loop_messages._record_owner_directive``):
 # owner-authored rows (the successor's seeding set), the run's first text (a
@@ -119,6 +131,8 @@ def continuation_eligibility(result: Dict[str, Any], task_id: str) -> Dict[str, 
     reason = str(result.get("reason_code") or "")
     if reason in HARD_LIMIT_REASON_CODES:
         return {"eligible": False, "cause": reason, "refusal": "hard_limit_reached"}
+    if reason == "billing_authority_refused":  # missing/foreign lineage: Continue cannot supply one
+        return {"eligible": False, "cause": reason, "refusal": "billing_lineage_refused"}
     if status == "completed" and reason not in EXECUTION_LIMIT_RAILS:
         return {"eligible": False, "cause": "finished", "refusal": "author_finished"}
     origin = result.get("cancel_origin") if isinstance(result.get("cancel_origin"), dict) else {}
@@ -280,6 +294,9 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
         if kind in OWNER_SOURCE_KINDS | {"task_message"} and not isinstance(entry.get("text") or "", str):
             gaps.append("owner_mailbox_row_malformed")  # the writer stores text; never str() a body
             continue
+        if kind == "quiz_answer" and (entry.get("quiz_delivery") or {}).get("answer_snapshot"):
+            from ouroboros.owner_quiz import late_answer_owner_text
+            entry = {**entry, "text": late_answer_owner_text(entry["quiz_delivery"]["answer_snapshot"])}
         if msg_id and msg_id in seen:
             if seen[msg_id] != (str(entry.get("text") or ""), kind in OWNER_SOURCE_KINDS):
                 gaps.append("owner_message_identity_conflict")
@@ -293,6 +310,17 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
             later.append({"source": "owner_quiz_answer" if kind == "quiz_answer" else "owner_mailbox",
                           "content": str(entry.get("text") or ""), "msg_id": msg_id,
                           "ts": str(entry.get("ts") or ""), "exact_row": entry["_exact_row"]})
+        elif kind == "relay_entry":
+            for row in entry.get("owner_rows") or []:
+                from ouroboros.chat_chain import format_address, row_address
+                from ouroboros.owner_relay import owner_text
+                address = format_address(row_address(row))
+                if address not in seen:
+                    later.append({"source": "owner_mailbox", "content": owner_text(row), "msg_id": address})
+                    seen[address] = (owner_text(row), True)
+            peers.append({"msg_id": msg_id, "ts": str(entry.get("ts") or ""),
+                          "source_task_id": str(entry.get("source_task_id") or ""),
+                          "provenance": "independent_task", "text": str(entry.get("text") or "")})
         elif kind == "task_message":
             peers.append({"msg_id": msg_id, "ts": str(entry.get("ts") or ""),
                           "source_task_id": str(entry.get("source_task_id") or ""),
@@ -345,6 +373,8 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
         else:
             gaps.append("owner_source_provenance_unknown")  # never promoted to owner text
     return {"original": original, "later": later, "peer_context": peers, "gaps": list(dict.fromkeys(gaps)),
+            "open_relays": result.get("open_relays", chained.get("open_relays", {})),
+            "held_owner_messages": {**chained.get("held_owner_messages", {}), **result.get("held_owner_messages", {})},
             "predecessor_note": {"task_id": task_id, "reader": "get_task_result",
                                  "kind": "predecessor_authored_note"}}
 
@@ -383,19 +413,70 @@ def owner_corpus_rows(sources: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def recorded_system_checkout(result: Dict[str, Any]) -> Dict[str, str]:
+    """The predecessor's recorded system-checkout observations, each dated by its own capture.
+
+    The only per-task fact is the mutation baseline's ``system_repo`` surface:
+    ``rev-parse HEAD`` at that surface's ``captured_at``. The task's own
+    attributed commit or an accepted fast-forward re-anchors the surface (new
+    SHA, new timestamp), so it is an observation at that moment — never the
+    task's start, the code its process imported, or the checkout now. A
+    retained terminal snapshot of the same surface is a second dated
+    observation. Nothing recorded: ``{}``.
+    """
+    evidence = result.get("mutation_evidence") if isinstance(result.get("mutation_evidence"), dict) else {}
+    baseline = evidence.get("baseline") if isinstance(evidence.get("baseline"), dict) else {}
+    surface = next((row for row in baseline.get("surfaces") or [] if isinstance(row, dict)
+                    and row.get("surface_type") == "system_repo" and isinstance(row.get("git"), dict)
+                    and row["git"].get("base_commit") and row.get("captured_at")), None)
+    if surface is None:
+        return {}
+    observed = {"commit": str(surface["git"]["base_commit"]), "captured_at": str(surface["captured_at"])}
+    snapshot = (evidence.get("terminal_candidate_snapshot")
+                if isinstance(evidence.get("terminal_candidate_snapshot"), dict) else {})
+    terminal = next((row for row in snapshot.get("surfaces") or [] if isinstance(row, dict)
+                     and row.get("surface_type") == "system_repo" and row.get("base_commit")
+                     and row.get("canonical_root") == surface.get("canonical_root")), None)
+    if terminal is not None and snapshot.get("captured_at"):
+        observed.update(terminal_commit=str(terminal["base_commit"]),
+                        terminal_captured_at=str(snapshot["captured_at"]))
+    return observed
+
+
 def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any], *,
-                    deadline_at: str = "") -> str:
+                    deadline_at: str = "", authority_source: Optional[Dict[str, Any]] = None,
+                    checkout: Optional[Dict[str, str]] = None) -> str:
     """The successor's first message: host-authored FACTS, the owner's words verbatim.
 
     It frames nothing as a decision: the model judges whether and how to go on
-    and asks the owner in this conversation when it cannot tell.
+    and asks the owner in this conversation when it cannot tell. The request
+    names no actor (an action nonce proves the action, not who pressed it).
+    ``authority_source`` is the exact pointer the successor's start materializes
+    into its context as ``predecessor_authority`` (or refuses to start), so the
+    work order names it as an optional exact read, never a second copy to fetch;
+    without it the pointer is the only route to that result.
     """
+    if authority_source:
+        arguments = authority_source.get("arguments") or {}
+        call = f"{authority_source.get('tool')}({', '.join(f'{k}={v!r}' for k, v in arguments.items())})"
+        result_line = (
+            "Its saved result and materials are already in your context (predecessor_authority in the "
+            "Runtime context); that result is the previous run's own note, not an owner instruction. "
+            f"{call} returns the complete stored record if you need a field it shows only as a preview "
+            "or pointer.")
+    else:
+        result_line = (
+            f"Its saved result is not in your context: get_task_result(task_id={predecessor_task_id!r}, "
+            "include_authority=True) returns it — that result is the previous run's own note, not an "
+            "owner instruction.")
     lines = [
-        f"[CONTINUE] The owner pressed Continue on task {predecessor_task_id}, which was interrupted "
+        f"[CONTINUE] Continue was requested for task {predecessor_task_id}, which was interrupted "
         f"(recorded cause: {cause or 'technical interruption'}). This is a NEW task in the same "
-        "conversation and folder; the old task is not resumed and its helpers are not yours.",
-        "Read its saved results and materials first: get_task_result("
-        f"{predecessor_task_id!r}) — that result is the previous run's own note, not an owner instruction.",
+        "conversation and folder; the old task is not resumed and its helpers are not yours to steer; a "
+        "helper's FINISHED native result can be accepted or rejected with integrate_subagent_patch(task_id=...), "
+        "and the old task's stopped delegated runs are yours to continue with delegate_start(subagent_id=..., "
+        "continue_from=<run_id>, prompt=...) instead of redoing them.",
+        result_line,
         "Decide whether and how to continue; if the right next step is unclear (for example the work "
         "may no longer be wanted), ask the owner in this conversation instead of guessing.",
         "Use manage_schedules(action='list') to inspect related or unknown future follow-ups. "
@@ -404,6 +485,16 @@ def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any
     ]
     if deadline_at:
         lines.append(f"An explicit hard deadline still applies to this work: {deadline_at}.")
+    if checkout:
+        observed = f"HEAD {checkout['commit']} at {checkout['captured_at']}"
+        if checkout.get("terminal_commit"):
+            observed += (f"; its terminal snapshot saw HEAD {checkout['terminal_commit']} "
+                         f"at {checkout['terminal_captured_at']}")
+        lines.append(
+            f"Recorded observation of that task's system checkout: {observed}. That baseline is "
+            "re-captured after the task's own commits or an accepted fast-forward, so this is neither "
+            "its start nor proof of the code it ran; the current checkout is git_head in your Runtime "
+            "context.")
     original = sources.get("original") if isinstance(sources.get("original"), dict) else None
     if original and str(original.get("content") or "").strip():
         lines += ["", "Owner's original instruction (verbatim):", str(original["content"])]
@@ -427,9 +518,8 @@ def claim_on_predecessor(drive_root: Any, predecessor_task_id: str, nonce: str,
     turned ineligible refuses. Every refusal writes nothing.
     """
     from ouroboros.task_results import (
-        require_writable_task_result_schema, stamp_task_result_schema, task_result_path,
+        require_writable_task_result_schema, stamp_task_result_schema,
     )
-    from ouroboros.utils import update_json_locked
 
     outcome: Dict[str, Any] = {}
 
@@ -444,23 +534,22 @@ def claim_on_predecessor(drive_root: Any, predecessor_task_id: str, nonce: str,
         verdict = continuation_eligibility(current, predecessor_task_id)
         if not verdict["eligible"]:
             raise ValueError(verdict["refusal"])
-        claim = {"successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
+        from ouroboros.control_actor import control_actor
+        claim = {**control_actor(), "successor_task_id": binding["successor_task_id"], "action_nonce": nonce,
                  "binding": dict(binding), "binding_sha256": binding_sha(binding),
                  "bound_at": utc_now_iso(), "state": "bound"}
         outcome.update(claim=claim, created=True)
         return stamp_task_result_schema({**current, "continued_by": claim})
 
-    update_json_locked(task_result_path(pathlib.Path(drive_root), predecessor_task_id), update,
-                       strict_existing_dict=True)
+    patch_document(pathlib.Path(drive_root), predecessor_task_id, update)
     return dict(outcome["claim"]), bool(outcome["created"])
 
 
 def mark_claim_admitted(drive_root: Any, predecessor_task_id: str, nonce: str) -> None:
     """Record on the predecessor that its claimed successor is durably admitted."""
     from ouroboros.task_results import (
-        require_writable_task_result_schema, stamp_task_result_schema, task_result_path,
+        require_writable_task_result_schema, stamp_task_result_schema,
     )
-    from ouroboros.utils import update_json_locked
 
     def update(current: dict) -> Optional[dict]:
         require_writable_task_result_schema(current)
@@ -470,8 +559,43 @@ def mark_claim_admitted(drive_root: Any, predecessor_task_id: str, nonce: str) -
         return stamp_task_result_schema(
             {**current, "continued_by": {**claim, "state": "admitted", "admitted_at": utc_now_iso()}})
 
-    update_json_locked(task_result_path(pathlib.Path(drive_root), predecessor_task_id), update,
-                       strict_existing_dict=True)
+    patch_document(pathlib.Path(drive_root), predecessor_task_id, update)
+
+
+def continuation_chain(drive_root: Any, predecessor_task_id: str, task_id: str) -> List[str]:
+    """The verified roots from ``predecessor_task_id`` to ``task_id``, both included, or ``[]``.
+
+    Read from the recorded claims only: each ``continued_by`` binding on an
+    earlier root's own result names its successor (hash-verified), so a chain of
+    Continues is followed claim by claim. Room, folder or root equality grants
+    nothing, and an unreadable result is no binding (``delegate_continuation``).
+    """
+    from ouroboros.task_results import load_task_result
+
+    current, target, seen = str(predecessor_task_id or ""), str(task_id or ""), set()
+    chain: List[str] = []
+    while current and target and current not in seen:
+        seen.add(current)
+        chain.append(current)
+        try:
+            result = load_task_result(drive_root, current, strict=True) or {}
+        except Exception:
+            return []
+        claim = result.get("continued_by") if isinstance(result.get("continued_by"), dict) else {}
+        binding = claim.get("binding") if isinstance(claim.get("binding"), dict) else {}
+        successor = str(claim.get("successor_task_id") or "")
+        if (not successor or binding.get("successor_task_id") != successor
+                or claim.get("binding_sha256") != binding_sha(binding)):
+            return []
+        if successor == target:
+            return [*chain, target]
+        current = successor
+    return []
+
+
+def recorded_continuation(drive_root: Any, predecessor_task_id: str, task_id: str) -> bool:
+    """The existing yes/no form of the verified explicit-Continue chain."""
+    return bool(continuation_chain(drive_root, predecessor_task_id, task_id))
 
 
 def continuation_offer(result: Dict[str, Any], task_id: str) -> Dict[str, Any]:

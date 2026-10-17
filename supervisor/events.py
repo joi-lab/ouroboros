@@ -1,4 +1,15 @@
-"""Dispatch worker EVENT_Q messages to supervisor handlers."""
+"""Dispatch worker EVENT_Q messages to supervisor handlers.
+
+Dispatch is by ``EVENT_HANDLERS``. An event type with no registered handler is
+not an error: the row is truncated and logged as ``unknown_worker_event``, so a
+new worker event needs its handler registered here first;
+``tests/test_worker_event_registry.py`` pins the registry by an AST scan of the
+emitter call sites.
+
+``_compose_subagent_text`` (re-exported from ``events_subagent_admission``)
+writes the subagent task text frozen into the queued task at schedule time; its
+``[WRITE SURFACE]`` block states where changes land, not how they are executed.
+"""
 
 from __future__ import annotations
 
@@ -109,7 +120,7 @@ def _handle_main_llm_call_state(evt: Dict[str, Any], ctx: Any) -> None:
     round_id = str(evt.get("round_id") or "")
     if (
         not task_id
-        or phase not in {"started", "finished", "failed"}
+        or phase not in {"started", "observed", "finished", "failed"}
         or not llm_call_id
         or not execution_id
         or not round_id
@@ -124,12 +135,20 @@ def _handle_main_llm_call_state(evt: Dict[str, Any], ctx: Any) -> None:
         return
     running = getattr(ctx, "RUNNING", None)
     meta = running.get(task_id) if isinstance(running, dict) else None
+    direct = None
     if not isinstance(meta, dict):
-        return
-    expected_attempt = meta.get("attempt")
-    if expected_attempt is None:
+        from supervisor.active_activity import get_direct_activity_registry
+
+        direct = get_direct_activity_registry().get(task_id)
+        context = getattr(getattr(getattr(direct, "actor", None), "tools", None), "_ctx", None)
+        owner = getattr(context, "model_wait_context", None)
+        if owner is None or owner.closed or owner.task_id != task_id:
+            return
+        expected_attempt, active = owner.attempt, direct.active_llm_call
+    else:
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
-        expected_attempt = task.get("_attempt")
+        expected_attempt = meta.get("attempt") if meta.get("attempt") is not None else task.get("_attempt")
+        active = meta.get("active_llm_call")
     try:
         if int(expected_attempt) != task_attempt:
             return
@@ -143,12 +162,23 @@ def _handle_main_llm_call_state(evt: Dict[str, Any], ctx: Any) -> None:
         "call_attempt": call_attempt,
     }
     if phase == "started":
-        meta["active_llm_call"] = {**identity, "started_at": time.time()}
+        updated = {**identity, "started_at": time.time()}
+    elif not isinstance(active, dict) or any(active.get(key) != value for key, value in identity.items()):
         return
-    active = meta.get("active_llm_call")
-    if not isinstance(active, dict) or any(active.get(key) != value for key, value in identity.items()):
-        return
-    meta.pop("active_llm_call", None)
+    elif phase == "observed":
+        activity = evt.get("model_activity")
+        if not isinstance(activity, dict):
+            return
+        updated = {**active, "model_activity": {**activity, **identity}}
+    else:
+        updated = None
+    if direct is not None:
+        direct.active_llm_call = updated
+        direct.phase = "working"  # starting a call proves no provider reasoning
+    elif updated is not None:
+        meta["active_llm_call"] = updated
+    else:
+        meta.pop("active_llm_call", None)
 
 
 # v7next F1 (D08): moved spans live in their owner leaves; re-exported here
@@ -190,7 +220,6 @@ from supervisor.events_project_routing import (  # noqa: E402, F401 -- intention
     _handle_ensure_project_scope,
     _handle_project_digest,
     _handle_promote_chat_to_task,
-    _handle_routing_manual_target,
     _notify_host_initiated_refusal,
     _persist_promote_rejection,
     _prepare_promote_source_off_loop,
@@ -202,6 +231,7 @@ from supervisor.events_runtime_controls import (  # noqa: E402, F401 -- intentio
     _handle_deep_self_review_request,
     _handle_owner_message_injected,
     _handle_promote_to_stable,
+    _handle_rollback_request,
     _handle_toggle_consciousness,
     _handle_toggle_evolution,
 )
@@ -252,11 +282,15 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     _close_campaign_after_owner_stop,
 )
 from supervisor.worker_owner_wait import handle_owner_wait  # noqa: E402
+from supervisor.worker_pool_lifecycle import handle_worker_quiescent  # noqa: E402
+
+from supervisor.events_mind_controls import handle_mind_task_control
 
 EVENT_HANDLERS = {
     "llm_usage": _handle_llm_usage,
     "external_wait_lease": _handle_external_wait_lease,
     "owner_wait": handle_owner_wait,
+    "worker_quiescent": handle_worker_quiescent,
     **_CEH,
     **_MWH,
     **_CDE,
@@ -264,6 +298,7 @@ EVENT_HANDLERS = {
     "budget_pause": _handle_budget_pause,
     "budget_root_fence": _handle_budget_root_fence,
     "budget_resume_child": _handle_budget_resume_child,
+    "mind_task_control": handle_mind_task_control,
     "task_heartbeat": _handle_task_heartbeat,
     "task_dispatch_resolved": _handle_task_dispatch_resolved,
     "task_focus_updated": _handle_task_focus_updated,
@@ -273,6 +308,7 @@ EVENT_HANDLERS = {
     "task_metrics": _handle_task_metrics,
     "deep_self_review_request": _handle_deep_self_review_request,
     "promote_to_stable": _handle_promote_to_stable,
+    "rollback_request": _handle_rollback_request,
     # D06: the "schedule_task" key retired here had no producer anywhere in the
     # tree — it advertised a capability nothing could reach. The FUNCTION keeps
     # its name (its family and FUNCTION_DEBT key are pinned to it); only the
@@ -281,7 +317,6 @@ EVENT_HANDLERS = {
     "schedule_subagent": _handle_schedule_task,
     "promote_chat_to_task": _handle_promote_chat_to_task,
     "ensure_project_scope": _handle_ensure_project_scope,
-    "routing_manual_target": _handle_routing_manual_target,
     "steer_task": _handle_steer_task,
     "project_digest": _handle_project_digest,
     "cancel_task": _handle_cancel_task,

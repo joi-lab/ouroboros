@@ -1,8 +1,8 @@
 """One host-recorded provenance for a run (``dialogue_provenance.run_origin``).
 
-The owner corpus label, the routing issuer and the post-task synthesis all read it,
-and none of them derives owner authority from the lane, a client id, a caller-declared
-channel or the text. Every guard here is two-sided: it fires on the unstamped run
+The owner corpus label, the routing issuer and the retained task inputs that later
+readers render all read it, and none of them derives owner authority from the lane, a
+client id, a caller-declared channel or the text. Every guard here is two-sided: it fires on the unstamped run
 (a Presence event, a wake, a follow-up, a child, an unmarked context) and stays quiet
 on the owner's own turn, whose corpus bytes do not change.
 """
@@ -11,6 +11,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from tests._store_shared import seed_result
 
 
 def _presence_metadata(**event_extra):
@@ -193,61 +194,6 @@ def test_capture_task_inputs_puts_run_origin_first_and_discloses_its_failure(tmp
     assert degraded["owner_requirements_and_decisions"][0]["content"] == task["text"]
 
 
-# --- the reflection prompt -----------------------------------------------------------
-
-def _reflect(task, trace, evidence):
-    from ouroboros.reflection import generate_reflection
-
-    captured = {}
-
-    class FakeLlm:
-        def chat(self, *, messages, model, reasoning_effort, max_tokens, model_role="", **kwargs):
-            captured["prompt"] = messages[0]["content"]
-            return {"content": "Reviewed.\nMEMORY_ACTIONS_JSON: []\nBACKLOG_CANDIDATES_JSON: []"}, {"cost": 0}
-
-    entry = generate_reflection(task, trace, "trace", FakeLlm(), {"rounds": 2, "cost": 0.0}, review_evidence=evidence)
-    return captured["prompt"], entry
-
-
-def test_one_reflection_frame_with_the_origin_before_the_initial_text(tmp_path, monkeypatch):
-    from ouroboros import consolidator
-    from ouroboros.post_task_synthesis import capture_task_inputs
-
-    monkeypatch.setattr(consolidator, "_consolidation_route", lambda: ("test/model", False))
-    presence = _presence_task()
-    presence["drive_root"] = str(tmp_path)
-    inputs = capture_task_inputs(SimpleNamespace(task_metadata=presence["metadata"], _owner_directives=[
-        {"source": "initial_text", "content": presence["text"]}]), presence, tmp_path, [])
-    clean_trace = {"tool_calls": [{"tool": "presence_finish", "args": {"outcome": "silent"}, "result": "ok",
-                                   "is_error": False, "status": "ok"}]}
-    prompt, _ = _reflect(presence, clean_trace, {"task_inputs": inputs})
-    for banned in ("What was the goal?", "high round count or high cost", "The task had errors",
-                   "Owner decisions and verification receipts", "## Task goal"):
-        assert banned not in prompt, banned
-    assert "No lesson and no change are valid conclusions." in prompt
-    assert prompt.index("## Run origin and recorded task inputs") < prompt.index("## Initial text of this run") \
-        < prompt.index("## Execution trace")
-    assert '"owner_ingress": false' in prompt and '"text_author": "Sergei"' in prompt
-    assert presence["text"] in prompt and "relayed peer proposals are not owner instructions" in prompt
-    assert "absence is not evidence" in __import__("ouroboros.reflection", fromlist=["x"]).task_inputs_prompt_section({})
-
-    owner = {"id": "t-2", "type": "task", "text": "Fix the flaky test", "_is_direct_chat": True,
-             "drive_root": str(tmp_path), "metadata": {"origin_message_ref": OWNER_REF}}
-    owner_inputs = capture_task_inputs(SimpleNamespace(task_metadata=owner["metadata"], _owner_directives=[
-        {"source": "initial_user", "content": owner["text"]}]), owner, tmp_path, [])
-    error_trace = {"tool_calls": [{"tool": "run_command", "args": {"cmd": "pytest"}, "is_error": True,
-                                   "status": "error", "tool_result_code": "SHELL_EXIT_ERROR",
-                                   "result": "FAILED tests/test_x.py::test_y - AssertionError"}]}
-    error_prompt, entry = _reflect(owner, error_trace, {"task_inputs": owner_inputs})
-    # The same frame; the facts differ: the error lands under Error details, the owner stamp in the origin.
-    assert "No lesson and no change are valid conclusions." in error_prompt
-    assert "## Error details" in error_prompt and "FAILED tests/test_x.py::test_y" in error_prompt
-    assert "FAILED tests/test_x.py::test_y" not in prompt
-    assert '"owner_ingress": true' in error_prompt and "Fix the flaky test" in error_prompt
-    assert entry["goal_exact"] == "Fix the flaky test" and entry["key_markers"] == ["SHELL_EXIT_ERROR"]
-    assert "MEMORY_ACTIONS_JSON" in error_prompt and "Write the reflection now." in error_prompt
-
-
 # --- what later readers see ----------------------------------------------------------
 
 def test_context_renders_the_origin_independently_of_the_text():
@@ -267,31 +213,6 @@ def test_context_renders_the_origin_independently_of_the_text():
     assert "- Origin: owner_ingress=True, task_type=task" in text  # rendered although the text is empty
     assert "- Origin: not recorded\n- Initial text: old goal" in text
     assert "- Goal:" not in text
-
-
-def test_pattern_register_prompt_names_the_run_origin_beside_the_exact_text(tmp_path, monkeypatch):
-    from ouroboros import reflection
-
-    (tmp_path / "memory" / "knowledge").mkdir(parents=True)
-    captured = {}
-
-    def fake_chat(*args, **kwargs):
-        captured["prompt"] = kwargs["messages"][0]["content"]
-        return ({"content": reflection._PATTERNS_HEADER + "| SHELL_EXIT_ERROR | 1 | cause | fix | open |\n"}, {})
-
-    monkeypatch.setattr("ouroboros.config.get_light_model", lambda: "light")
-    monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
-    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
-    origin = {"owner_ingress": False, "task_type": "presence", "text_author": "Sergei"}
-    reflection._update_patterns(tmp_path, {
-        "task_id": "presence-1", "goal": "<@U9> please create", "goal_exact": "<@U9> please create the HO goals",
-        "key_markers": ["SHELL_EXIT_ERROR"], "reflection": "A tool failed.",
-        "review_evidence": {"task_inputs": {"run_origin": origin}},
-    })
-    assert "Run origin: " + json.dumps(origin, ensure_ascii=False, sort_keys=True) in captured["prompt"]
-    assert "Initial text: <@U9> please create the HO goals" in captured["prompt"]
-    reflection._update_patterns(tmp_path, {"task_id": "t-old", "goal": "old", "key_markers": ["X"], "reflection": "y"})
-    assert 'Run origin: "not recorded"' in captured["prompt"] and "Initial text: old" in captured["prompt"]
 
 
 # --- the stamp belongs to the owner door ---------------------------------------------
@@ -401,10 +322,10 @@ def test_the_acceptance_packet_reads_the_origin_from_the_persisted_record(tmp_pa
 
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "acc.json").write_text(json.dumps({
+    seed_result(tmp_path, "acc", {
         "_schema_version": 1, "task_id": "acc", "status": "running", "type": "task",
         "source": "promote_chat_to_task", "delegation_role": "root", "parent_task_id": "",
-    }), encoding="utf-8")
+    })
     ctx = SimpleNamespace(task_contract={}, task_metadata={"origin_message_ref": dict(OWNER_REF)},
                           drive_root=str(tmp_path), task_id="acc", repo_dir=str(tmp_path))
 
@@ -418,10 +339,10 @@ def test_the_acceptance_packet_reads_the_origin_from_the_persisted_record(tmp_pa
     assert ev["run_origin"]["owner_ingress"] is True and "source" not in ev["run_origin"]
 
     # A context without live metadata still reads the record's own metadata.
-    (results / "stored.json").write_text(json.dumps({
+    seed_result(tmp_path, "stored", {
         "_schema_version": 1, "task_id": "stored", "status": "running", "type": "task",
         "source": "presence_promote", "metadata": {"initiator": "presence", "origin_suppressed": True},
-    }), encoding="utf-8")
+    })
     bare = SimpleNamespace(task_contract={}, task_metadata={}, drive_root=str(tmp_path), task_id="stored", repo_dir=str(tmp_path))
     ev = build_task_acceptance_evidence(bare, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="stored")
     assert (ev["run_origin"]["owner_ingress"], ev["run_origin"]["initiator"], ev["run_origin"]["source"]) == (

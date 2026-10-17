@@ -1,14 +1,15 @@
 """Reviewers see the owner's words that caused the work.
 
-The triad, scope and advisory reviewers read the change against the author's intent;
+The triad and scope reviewers (a preflight's one seat included) read the change against the author's intent;
 ``build_goal_section`` now adds, right after that intent, the host-attested words of
 the owner the work answers (``owner_words.owner_words_text``: a root's own corpus, a
 child's inherited words, an absence line with the host marker when there are none).
 An empty section keeps every prompt byte-identical to a review without it, and the
 words ride the dynamic half, so the cache-marked prefixes of the triad and the scope
-brief do not move. The plan review puts them right after its objective; a replay of
-the same author request takes the recorded words, so an owner letter between waves
-cannot mint a paid wave. Reviewers still get no memory and no story: they stay independent.
+brief do not move. A plan's participants read them right after the task objective,
+inside the delivery's cache-stable prefix; each ask carries the words it was sent, so an
+owner letter reaches the next ask while an earlier ask's retained delivery keeps what it
+carried. Reviewers still get no memory and no story: they stay independent.
 Every rule is checked in both directions.
 """
 from __future__ import annotations
@@ -21,10 +22,12 @@ import pytest
 from ouroboros import owner_words as ow
 from ouroboros.tools.review_helpers import build_goal_section
 from ouroboros.utils import append_jsonl
-from tests.test_plan_review_engine import CLEAN, DECK_SPEC, _call, _state, _user_text
-from tests.test_plan_review_engine import harness as _plan_review_harness
+from tests._review_substrate_shared import user_text
+from tests.test_plan_task_tool import _call, _record, _write
+from tests.test_plan_task_tool import harness as _plan_task_harness
+from tests.review_pool_rosters import set_review_pool
 
-harness = _plan_review_harness  # the plan-review fixture, under the name its tests take
+harness = _plan_task_harness  # the plan_task fixture, under the name its tests take
 
 OWNER = "Fix the login timeout,\nand keep the old cookie name"
 CHILD_ASSIGNMENT = "Collect the timeout traces"
@@ -104,16 +107,20 @@ def _triad_prompt(tmp_path, monkeypatch, kind: str) -> tuple[str, int, str]:
         return ""
 
     def capture_review(*_args, **kwargs):
-        captured.update(prompt=kwargs["prompt"], stable=kwargs["stable_prefix_len"], task=kwargs["session_task"])
+        assert kwargs["row_plan"]["models"] == ["test/reviewer"]
+        plan = kwargs.get("row_plan") or {}
+        briefs = [task for task, parts in zip(plan.get("session_tasks") or [], plan.get("parts") or [])
+                  if "coupling" in tuple(parts)]
+        captured.update(prompt=kwargs["prompt"], stable=kwargs["stable_prefix_len"],
+                        task=briefs[0] if briefs else kwargs["session_task"])
         return json.dumps({"results": []})
 
     monkeypatch.setattr(review, "run_cmd", fake_run_cmd)
     monkeypatch.setattr(rbc, "capture_staged_diff", lambda _repo, *, unified=3: "diff --git a/x.py b/x.py\n+x = 1")
     monkeypatch.setattr(review, "_preflight_check", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(review, "_load_checklist_section", lambda: "checklist")
+    monkeypatch.setattr(review, "_load_checklist_section", lambda *_a, **_k: "checklist")
     monkeypatch.setattr(review, "load_governance_doc", lambda *_args, **_kwargs: "governance")
     monkeypatch.setattr(review, "build_touched_file_pack", lambda *_args, **_kwargs: ("files", []))
-    monkeypatch.setattr(review._cfg, "get_review_models", lambda: ["test/reviewer"])
     monkeypatch.setattr(review._cfg, "get_review_enforcement", lambda: "blocking")
     monkeypatch.setattr(review, "_handle_multi_model_review", capture_review)
     ctx = SimpleNamespace(
@@ -126,7 +133,7 @@ def _triad_prompt(tmp_path, monkeypatch, kind: str) -> tuple[str, int, str]:
 
 @pytest.mark.parametrize("kind", ["root", "child"])
 def test_the_triad_packet_reads_the_words_in_its_dynamic_half(tmp_path, monkeypatch, kind):
-    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")  # pin the packet seat
+    set_review_pool(monkeypatch, ["test/reviewer"])  # pin the packet seat
     prompt, stable, _task = _triad_prompt(tmp_path, monkeypatch, kind)
     conscious, conscious_stable, _task = _triad_prompt(tmp_path, monkeypatch, "conscious")
     words = _section(kind)
@@ -139,20 +146,21 @@ def test_the_triad_packet_reads_the_words_in_its_dynamic_half(tmp_path, monkeypa
 
 
 def test_the_retrieving_triad_reads_the_words_in_its_session_task(tmp_path, monkeypatch):
-    """The shipped default triad reads the work itself: its session task carries the same section."""
+    """A natively retrieving pool reads the work itself: its two-part brief carries the same section."""
+    set_review_pool(monkeypatch, ["test/reviewer"], delivery="native")
     prompt, _stable, task = _triad_prompt(tmp_path, monkeypatch, "root")
     assert not prompt and _section("root") in task and task.index("GOAL_SENTINEL") < task.index(OWNER)
     _prompt, _stable, conscious = _triad_prompt(tmp_path, monkeypatch, "conscious")
     assert ABSENT_CONSCIOUS in conscious and OWNER not in conscious
 
 
-# --- scope --------------------------------------------------------------------------------------------------
+# --- the two-part brief (Part 2 asks the coupling question) ---------------------------------------------
 
-def _scope_brief(tmp_path, kind: str) -> tuple[str, str]:
-    """One real scope row's brief (``prepare_scope_review``) on a staged repository."""
-    from ouroboros.review_execution import ReviewRouteKind
+def _two_part_brief(tmp_path, kind: str) -> tuple[str, str]:
+    """One real retrieving seat's two-part brief (``build_two_part_brief``) on a staged repository."""
     from ouroboros.tools.registry import ToolContext
-    from ouroboros.tools.review_admission import prepare_scope_review
+    from ouroboros.tools.review_admission import build_two_part_brief
+    from ouroboros.tools.review_subject import ReviewSubjectSpec, freeze_subject
     from tests.test_review_session_scope_wiring import BRIEF_TASK_ID, _staged_subject
 
     root = tmp_path / kind
@@ -163,74 +171,34 @@ def _scope_brief(tmp_path, kind: str) -> tuple[str, str]:
     ctx = ToolContext(repo_dir=repo, drive_root=drive, task_id=BRIEF_TASK_ID)
     for name, value in _attrs(kind).items():
         setattr(ctx, name, value)
-    prepared, final = prepare_scope_review(ctx, "fix: login timeout", goal="GOAL_SENTINEL", scope_model="fixture/model",
-                                           slot_id="scope_slot_1", route=ReviewRouteKind.API_CHAT)
-    assert final is None
-    return prepared["session_task"], ow.owner_words_text(ctx)
+    frozen = freeze_subject(ctx, ReviewSubjectSpec(root_kind="system_repo", root=str(repo), kind="index",
+                                                   surface="commit_gate", layer="body"))
+    seat = {"slot_id": "seat-native", "model": "fixture/model", "route": "api_chat", "retrieves": True}
+    words = ow.owner_words_text(ctx)
+    built = build_two_part_brief(frozen, seat, goal="GOAL_SENTINEL", commit_message="fix: login timeout",
+                                 owner_words=words, drive_root=drive, task_id=BRIEF_TASK_ID)
+    assert built["parts"] == ["change", "coupling"]
+    return built["system"], words
 
 
-def test_the_scope_brief_carries_the_words_after_its_intent(tmp_path):
-    brief, words = _scope_brief(tmp_path, "root")
-    assert words == _section("root", task_id="scope-brief-task")
-    assert words in brief and brief.index("GOAL_SENTINEL") < brief.index(words) < brief.index("## Staged diff")
-    conscious, _words = _scope_brief(tmp_path, "conscious")
+def test_the_two_part_brief_carries_the_words_after_its_intent(tmp_path):
+    from tests.test_review_session_scope_wiring import BRIEF_TASK_ID
+
+    brief, words = _two_part_brief(tmp_path, "root")
+    assert words == _section("root", task_id=BRIEF_TASK_ID)
+    assert words in brief and brief.index("GOAL_SENTINEL") < brief.index(words) < brief.index("### Staged diff")
+    assert brief.index(words) < brief.index("## Part 2")  # the words ride Part 1's intent; Part 2 reads them there
+    conscious, _words = _two_part_brief(tmp_path, "conscious")
     assert ABSENT_CONSCIOUS in conscious and OWNER not in conscious
 
 
-def test_the_scope_prompt_keeps_its_stable_prefix():
-    from ouroboros.tools.review_synthesis import build_scope_review_prompt
+def test_the_coupling_part_keeps_its_stable_text():
+    """Part 2 is the same bytes whatever the owner said: the words ride Part 1's intent only."""
+    from ouroboros.tools.review_synthesis import build_coupling_part
 
-    def prompt(owner_words: str) -> tuple[str, int]:
-        goal = build_goal_section("GOAL_SENTINEL", "", "fix: retry", owner_words)
-        return build_scope_review_prompt(
-            "touched", scope_checklist="checklist", canonical_docs="docs", intent_context=f"scope\n\n{goal}",
-            history_block="", diff_text="diff", repo_pack_placeholder="pack", critical_calibration="calibration",
-            task_evidence_section="")
-
-    (bare, bare_stable), (worded, worded_stable) = prompt(""), prompt(_section("root"))
-    assert OWNER not in bare and OWNER in worded and worded.index(OWNER) > worded_stable
-    assert bare_stable == worded_stable and bare[:bare_stable] == worded[:worded_stable]
-
-
-# --- advisory -----------------------------------------------------------------------------------------------
-
-@pytest.mark.parametrize("surface", ["repo", "skill"])
-def test_both_advisory_goal_sections_carry_the_words(tmp_path, surface):
-    from ouroboros.tools import claude_advisory_review as advisory
-
-    repo = tmp_path / "repo"
-    repo.mkdir()
-
-    def prompt(**extra) -> str:
-        return advisory._build_advisory_prompt(
-            repo, "fix: login timeout", goal="GOAL_SENTINEL", scope="PAYLOAD", resolved_paths=[],
-            prompt_context={"diff": "(not included)", "changed_files": "(not included)",
-                            "review_surface": surface, **extra})
-
-    words = _section("root")
-    worded, bare = prompt(owner_words=words), prompt()
-    assert words in worded and worded.index("GOAL_SENTINEL") < worded.index(words)
-    assert OWNER not in bare and worded.replace(f"\n\n\n{words}", "", 1) == bare
-
-
-def test_the_advisory_run_hands_the_runs_words_to_the_prompt(tmp_path, monkeypatch):
-    from tests.test_advisory_observability import _fake_native_result, _get_advisory_module
-
-    advisory = _get_advisory_module()
-    seen = []
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
-    monkeypatch.setattr(advisory, "_run_advisory_native", lambda prompt, repo_dir, ctx_, slot, model, **_: (
-        _fake_native_result(success=True, result_text="(no output)"), model))
-    monkeypatch.setattr(advisory, "_get_staged_diff", lambda *a, **kw: "diff")
-    monkeypatch.setattr(advisory, "_get_changed_file_list", lambda *a, **kw: "M file.py")
-    monkeypatch.setattr(advisory, "_build_advisory_prompt",
-                        lambda *a, **kw: seen.append(kw["prompt_context"]["owner_words"]) or "prompt")
-    for kind in ("root", "conscious"):
-        ctx = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, task_id="root", pending_events=[],
-                              emit_progress_fn=lambda *_: None, **_attrs(kind))
-        advisory._run_claude_advisory(tmp_path, "msg", ctx)
-    assert seen == [_section("root"), ABSENT_CONSCIOUS]
-    assert OWNER in seen[0] and "not the owner's" not in seen[0]
+    part2 = build_coupling_part(coupling_checklist="checklist", required_sources_section="sources",
+                                repository_index="index", history_block="", layer="body")
+    assert OWNER not in part2 and "GOAL_SENTINEL" not in part2 and part2.startswith("## Part 2")
 
 
 def test_reviewers_get_no_memory_or_story(tmp_path, monkeypatch):
@@ -241,9 +209,8 @@ def test_reviewers_get_no_memory_or_story(tmp_path, monkeypatch):
     review_root.mkdir()
     mind_root.mkdir()
     headings = ("## Identity", "## My story", "## This room", "## Working sources", "## Dialogue History")
-    for delivery in (None, ""):  # the retrieving rows' session task (the default), then the packet seat
-        if delivery is not None:
-            monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", delivery)
+    for delivery in ("native", "packet"):  # the retrieving rows' session task, then the packet seat
+        set_review_pool(monkeypatch, ["test/reviewer"], delivery=delivery)
         prompt, _stable, task = _triad_prompt(review_root, monkeypatch, "root")
         assert OWNER in prompt + task
         for heading in headings:
@@ -257,12 +224,13 @@ def test_reviewers_get_no_memory_or_story(tmp_path, monkeypatch):
 # --- plan review --------------------------------------------------------------------------------------------
 
 LATER = "Add the charts too"
-_PACKET = dict(objective="Deliver the thing", goal="Ship the deck", plan_prose="Outline first", spec=DECK_SPEC,
-               prior_cycles=[], dispositions=[], spec_delta=None, root_exploration_log="explored")
+_REVISION = {"n": 1, "ts": "2026-10-15T00:00:00+00:00", "goal": "Ship the deck", "plan": "Outline first",
+             "done_when": [{"id": "c1", "claim": "exactly 5 slides", "support": "count them"}],
+             "affected_paths": [], "body": False}
 
 
-def _plan_ctx(harness, kind="root"):
-    ctx = harness.make_ctx()
+def _plan_ctx(harness, kind="root", task_id="task-1"):
+    ctx = harness.make_ctx(task_id=task_id)
     ctx.current_chat_id = 1
     attrs = _attrs(kind)
     ctx.task_metadata = {**ctx.task_metadata, **attrs["task_metadata"]}
@@ -270,70 +238,86 @@ def _plan_ctx(harness, kind="root"):
     return ctx
 
 
-def test_the_plan_packet_puts_the_words_after_the_objective_and_never_trims_them(harness):
+def _participant_content(manifest):
+    """One participant's first-ask content (``plan_packet.build_participant_content``) as
+    ``plan_ask.participant_content`` assembles it from the ask's manifest."""
+    from ouroboros.tools import plan_packet
+    from ouroboros.tools.plan_dialogue import render_dialogue
+
+    return plan_packet.build_participant_content(
+        objective="Deliver the thing", owner_words=str(manifest.get("owner_words") or ""),
+        dialogue_section=render_dialogue(manifest), revision=_REVISION, delta=None, cross_talk="",
+        own_objections=[], message="First look.", evidence_section=plan_packet.render_evidence(manifest),
+        first_time=True)
+
+
+def test_the_plan_delivery_puts_the_words_after_the_objective_and_never_trims_them(harness):
     from ouroboros.tools.plan_dialogue import attach_own_dialogue, fit_dialogue_view
-    from ouroboros.tools.plan_packet import build_plan_review_user_content, plan_user_stable_len
+    from ouroboros.tools.plan_packet import plan_user_stable_len
 
     ctx = _plan_ctx(harness)
     for text in ("ROW_ONE", "ROW_TWO", "ROW_THREE"):
         append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1, "text": text})
-    manifest = attach_own_dialogue(ctx, harness.drive, {}, "a" * 64, persist=True)
+    manifest = attach_own_dialogue(ctx, harness.drive, {}, "plan-ask-task-1-a1", persist=True)
     words = ow.owner_words_text(ctx, audience="plan")
     assert manifest["owner_words"] == words and OWNER in words and "not the owner's" not in words
     assert words.startswith("## Words of my human that caused this work (verbatim, host-attested)\n"
                             "They state what was asked; the objective above is the author's account of this task.")
-    packet = build_plan_review_user_content(manifest=manifest, **_PACKET)
-    order = ["## TASK OBJECTIVE", words, "## SPEC", "## OWN ROOM DIALOGUE", "## ROOT EXPLORATION LOG"]
+    packet = _participant_content(manifest)
+    order = ["## TASK OBJECTIVE", words, "## OWN ROOM DIALOGUE", "## THE PLAN"]
     assert [packet.index(part) for part in order] == sorted(packet.index(part) for part in order)
-    assert packet.index(words) < plan_user_stable_len(packet)  # the cache-stable half
-    bare = build_plan_review_user_content(manifest={k: v for k, v in manifest.items() if k != "owner_words"}, **_PACKET)
-    assert OWNER not in bare and bare == packet.replace(f"{words}\n\n", "", 1)
+    assert packet.index(words) + len(words) <= plan_user_stable_len(packet)  # the cache-stable prefix
+    bare = _participant_content({k: v for k, v in manifest.items() if k != "owner_words"})
+    assert OWNER not in bare and "## Words of my human" not in bare
+    assert bare == packet.replace(f"{words}\n\n", "", 1)  # absent words leave no section
     # The tightest fit trims the conversation to nothing and leaves the words whole.
     fitted, facts = fit_dialogue_view(packet, manifest["own_dialogue"], 1)
     assert facts["conversation_rows"] == 3 and facts["conversation_inline_rows"] == 0 and "ROW_ONE" not in fitted
-    assert words in fitted and fitted.index(words) < fitted.index("## SPEC")
+    assert "ROW_ONE" in packet and words in fitted and fitted.index(words) < fitted.index("## THE PLAN")
 
 
-def test_a_letter_between_waves_keeps_the_recorded_words_until_the_author_asks_anew(harness, monkeypatch):
-    from ouroboros.tools import plan_review_artifacts
-    from ouroboros.tools.plan_dialogue import attach_own_dialogue
-    from ouroboros.tools.plan_evidence import evidence_manifest_hash
+def _delivered_words(harness, ask, seat_id="s1"):
+    """The text one seat's delivery of one ask retained in the intention ledger record."""
+    from ouroboros.review_ledger import read_source
 
-    substrate = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    seat = next(p for p in ask["participants"] if p["seat_id"] == seat_id)
+    messages = json.loads(read_source(harness.drive, "task-1", seat["delivery_ref"]).decode("utf-8"))
+    return [user_text(message["content"]) for message in messages]
+
+
+def test_each_ask_carries_the_words_it_was_sent_and_a_later_letter_reaches_the_next_ask(harness):
+    """Every ask is the author's own act: it reads the run's words when it is prepared, so an
+    owner letter reaches the next ask, and an earlier ask's delivery is never rewritten. (The
+    retired engine's free replay of an identical envelope, which kept the recorded words, is gone.)"""
+    substrate = harness.install({})
     ctx = _plan_ctx(harness)
-    _call(ctx)
-    first, words = _state(harness)["waves"][-1], ow.owner_words_text(ctx, audience="plan")
-    assert words in _user_text(substrate.calls[0]["request"].messages[1]["content"])
+    _write(ctx, ask="council")
+    words = ow.owner_words_text(ctx, audience="plan")
+    first = user_text(substrate.calls[0]["request"].slot_messages["s1"][-1]["content"])
+    assert words in first and LATER not in first
     ctx._owner_directives.append({"source": "owner_mailbox", "content": LATER})
-    _call(ctx)  # the same author request after the owner's letter
-    replay = _state(harness)["waves"][-1]
-    assert replay["request_fingerprint"] == first["request_fingerprint"]
-    assert replay["evidence_manifest_hash"] == first["evidence_manifest_hash"]
-    assert _state(harness)["cycles_paid"] == 1 and len(substrate.calls) == 1
-    recorded = attach_own_dialogue(ctx, harness.drive, {}, first["author_request_fingerprint"])
-    assert recorded["owner_words"] == words and LATER not in words
-    assert LATER in ow.owner_words_text(ctx, audience="plan")  # the run itself did hear the letter
-    # A wave recorded before the words existed replays without a section, with its hash.
-    real = plan_review_artifacts.authority_wave
-
-    def recorded_without_words(*args, **kwargs):
-        exact = real(*args, **kwargs)
-        full = {k: v for k, v in (exact.get("evidence_manifest_full") or {}).items() if k != "owner_words"}
-        return {**exact, "evidence_manifest_full": full}
-
-    monkeypatch.setattr(plan_review_artifacts, "authority_wave", recorded_without_words)
-    old = attach_own_dialogue(ctx, harness.drive, {}, first["author_request_fingerprint"])
-    assert "owner_words" not in old and evidence_manifest_hash(old) == evidence_manifest_hash(recorded)
-    monkeypatch.setattr(plan_review_artifacts, "authority_wave", real)
-    _call(ctx, plan="Revise the outline to add the charts.")  # a new author request reads the words now
-    revised = _user_text(substrate.calls[1]["request"].messages[1]["content"])
-    assert ow.owner_words_text(ctx, audience="plan") in revised and LATER in revised
-    assert _state(harness)["cycles_paid"] == 2
+    later = ow.owner_words_text(ctx, audience="plan")
+    assert LATER in later and OWNER in later  # the run itself heard the letter
+    _call(ctx, ask="council", message="My human wrote again.")
+    assert len(substrate.calls) == 2
+    transcript = substrate.calls[1]["request"].slot_messages["s1"]
+    assert [m["role"] for m in transcript] == ["system", "user", "assistant", "user"]
+    assert later in user_text(transcript[-1]["content"])  # the next ask reads the words now
+    assert words in user_text(transcript[1]["content"]) and LATER not in user_text(transcript[1]["content"])
+    first_ask, second_ask = _record(harness)["asks"]
+    retained_first, retained_second = _delivered_words(harness, first_ask), _delivered_words(harness, second_ask)
+    assert any(words in text for text in retained_first) and not any(LATER in text for text in retained_first)
+    assert later in retained_second[-1]
 
 
 def test_a_consciousness_plan_names_the_absence(harness):
-    substrate = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    _call(_plan_ctx(harness, "conscious"))
-    packet = _user_text(substrate.calls[0]["request"].messages[1]["content"])
-    assert packet.index("## TASK OBJECTIVE") < packet.index(ABSENT_CONSCIOUS) < packet.index("## SPEC")
-    assert "## Words of my human" not in packet
+    substrate = harness.install({})
+    _write(_plan_ctx(harness, "conscious"), ask="council")
+    packet = user_text(substrate.calls[0]["request"].slot_messages["s1"][-1]["content"])
+    assert packet.index("## TASK OBJECTIVE") < packet.index(ABSENT_CONSCIOUS) < packet.index("## THE PLAN")
+    assert "## Words of my human" not in packet and OWNER not in packet
+    # A run that heard its owner gets the words in the same place and no absence line.
+    _write(_plan_ctx(harness, "root", task_id="task-2"), ask="council")
+    heard = user_text(substrate.calls[1]["request"].slot_messages["s1"][-1]["content"])
+    assert heard.index("## TASK OBJECTIVE") < heard.index(OWNER) < heard.index("## THE PLAN")
+    assert ABSENT_CONSCIOUS not in heard

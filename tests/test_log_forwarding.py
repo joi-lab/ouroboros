@@ -25,7 +25,7 @@ WORKER_BASELINE_TYPES = frozenset(
 # emit_log_event sibling); the forwarded append copy is suppressed.
 WORKER_SAME_TYPE_PAIRS = frozenset({
     "provider_incomplete_response", "llm_empty_response", "provider_body_error",
-    "review_cycles_exhausted", "plan_review_advisory_open",
+    "review_cycles_exhausted",
     # #1316: the durable tool-call start / wait-ended row IS the live frame's payload.
     "tool_call_started", "tool_call_timeout",
 })
@@ -107,9 +107,13 @@ def test_server_suppressed_types_cover_worker_set_plus_handler_pushes():
 
 
 def test_handle_log_event_exactly_once_with_production_sink(production_sink):
-    """task_checkpoint: handler push + persist, and the persisted append's
-    sink copy is suppressed — ONE frame total (the claim the old suite made
-    with the sink stubbed out, now proved against the production wiring)."""
+    """task_checkpoint: the PRODUCER persists its row (whose sink copy is
+    suppressed) and the handler only pushes the live frame — ONE row and ONE
+    frame total, proved against the production wiring (the pre-fix suite
+    stubbed the sink out; the pre-lanes handler wrote the row itself)."""
+    import queue
+
+    from ouroboros.loop_messages import _emit_checkpoint_event
     from supervisor import events as ev
 
     ctx = _ctx(production_sink)
@@ -121,14 +125,15 @@ def test_handle_log_event_exactly_once_with_production_sink(production_sink):
     assert [e.get("type") for e in production_sink.frames] == ["task_received"]
     assert not events_file.exists()
 
-    ev._handle_log_event(
-        {"type": "log_event", "data": {"type": "task_checkpoint", "task_id": "t1", "round": 1}},
-        ctx,
-    )
+    bus: "queue.Queue" = queue.Queue()
+    _emit_checkpoint_event(bus, "t1", production_sink.drive_root / "logs", {"round": 1})
+    assert [e.get("type") for e in production_sink.frames] == ["task_received"], "the append's sink copy is suppressed"
+    ev._handle_log_event(bus.get_nowait(), ctx)
     checkpoints = [e for e in production_sink.frames if e.get("type") == "task_checkpoint"]
     assert len(checkpoints) == 1
     lines = [ln for ln in events_file.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 1 and json.loads(lines[0])["type"] == "task_checkpoint"
+    assert json.loads(lines[0])["ts"] == checkpoints[0]["ts"], "the row and the frame are one event"
 
 
 def test_project_child_error_routes_to_project_thread(production_sink, monkeypatch):
@@ -653,3 +658,13 @@ def test_llm_call_failure_reaches_the_live_log_exactly_once(
     assert frame["selected_context_mode"] == "test-context"
     rows = [json.loads(line) for line in events_file.read_text(encoding="utf-8").splitlines()]
     assert rows == ([error_row] if write_succeeds else [])
+
+
+def test_the_suppressed_worker_types_name_only_events_a_producer_still_emits():
+    """Scope R1, Fable 5: the retired planning organ's advisory event has no producer; the live
+    duplicate-suppression list names only types a worker still publishes twice."""
+    from supervisor.worker_process import WORKER_LOG_SINK_SUPPRESSED_TYPES
+
+    assert "plan_review_advisory_open" not in WORKER_LOG_SINK_SUPPRESSED_TYPES
+    assert {"provider_body_error", "tool_call", "task_done"} <= WORKER_LOG_SINK_SUPPRESSED_TYPES
+    assert WORKER_LOG_SINK_SUPPRESSED_TYPES == WORKER_BASELINE_TYPES | WORKER_SAME_TYPE_PAIRS

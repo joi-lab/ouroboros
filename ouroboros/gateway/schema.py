@@ -23,10 +23,18 @@ it is a RELEASE version carrier, pinned equal to the ``VERSION`` file by
 in that file ARE the exact browser mirror of ``gateway.contracts`` — the
 ABI-3 deferrals were paid off in the F3.3 sweep; only the version constant
 answers a different question.
+
+``contract_document`` derives the published ABI (``GET /api/contract``) from the
+same owners: the router-verified ``endpoint_index`` tuples and their shape
+bindings, the WS envelope index, and these derived schemas. It is a projection
+for clients, never runtime egress enforcement.
 """
 
 from __future__ import annotations
 
+import importlib
+import inspect
+import re
 from typing import Any, Dict, List, Literal, Union, get_args, get_origin, get_type_hints
 
 GATEWAY_ABI_VERSION = "7.0"
@@ -95,30 +103,21 @@ def _qualifier_name(hint: Any) -> str:
 
 
 def _required_keys(typed_dict: Any) -> frozenset:
-    """Requiredness resolved from the hints, not ``__required_keys__``.
+    """Requiredness resolved from the hints, not ``__required_keys__`` alone.
 
     Under PEP 563 (``from __future__ import annotations`` in contracts.py) the
-    class-time ``__required_keys__`` on Python 3.10 sees only STRING
-    annotations, cannot detect ``NotRequired``/``Required`` qualifiers, and
-    therefore lies (every key of a total class reads as required). Walk the
-    resolved hints instead: an explicit qualifier wins; otherwise the key's
-    DECLARING class's totality decides, exactly as PEP 655 specifies."""
+    class-time ``__required_keys__`` sees only STRING annotations and cannot
+    detect ``NotRequired``/``Required`` qualifiers. An explicit qualifier found
+    in the resolved hints wins; an unqualified key keeps the requiredness the
+    runtime computed from its DECLARING class's totality (PEP 655), which
+    ``__required_keys__`` gets right on every version, including inherited keys
+    on 3.11 where ``typing.TypedDict`` keeps no ``__orig_bases__``."""
     hints = get_type_hints(typed_dict, include_extras=True)
-    bases = [b for b in getattr(typed_dict, "__orig_bases__", ())
-             if _is_typed_dict(b)]
+    runtime_required = set(getattr(typed_dict, "__required_keys__", ()))
     required: set = set()
-    inherited: set = set()
-    for base in bases:
-        required |= _required_keys(base)
-        inherited |= set(get_type_hints(base))
-    total = bool(getattr(typed_dict, "__total__", True))
     for key, hint in hints.items():
-        if key in inherited:
-            continue  # the declaring base's totality already decided
         qualifier = _qualifier_name(hint)
-        if qualifier == "NotRequired":
-            required.discard(key)
-        elif qualifier == "Required" or total:
+        if qualifier == "Required" or (qualifier != "NotRequired" and key in runtime_required):
             required.add(key)
     return frozenset(required)
 
@@ -205,8 +204,120 @@ def validate_ingress(payload: Any, typed_dict: Any) -> List[str]:
     return _validate(payload, json_schema_for(typed_dict), "")
 
 
+# Body words of ``endpoint_index.Shape``: anything else names a contract TypedDict (JSON).
+_BODY_MEDIA = {
+    "json": "application/json", "html": "text/html", "sse": "text/event-stream",
+    "file": "application/octet-stream", "zip": "application/zip", "js": "application/javascript",
+    "empty": "", "any": "*/*", "multipart": "multipart/form-data",
+    "form": "application/x-www-form-urlencoded",
+}
+CONTRACT_MODULES = (
+    "ouroboros.gateway.contracts", "ouroboros.gateway.client_contracts",
+    "ouroboros.gateway.management_contracts", "ouroboros.gateway.history_contracts",
+    "ouroboros.gateway.ui_i18n_contracts", "ouroboros.gateway.mcp_import_contracts",
+    "ouroboros.gateway.model_route_contracts",
+)
+_CONTRACT_CACHE: Dict[str, Any] = {}
+
+
+def contract_typed_dict(name: str) -> Any:
+    """The contract TypedDict a shape names, from the gateway contract modules (KeyError if none)."""
+    for module_name in CONTRACT_MODULES:
+        candidate = getattr(importlib.import_module(module_name), name, None)
+        if _is_typed_dict(candidate):
+            return candidate
+    raise KeyError(f"no gateway contract TypedDict named {name!r}")
+
+
+def _contract_body(spec: str, names: set) -> Dict[str, Any]:
+    media: List[str] = []
+    schemas: List[str] = []
+    for alternative in spec.split("|"):
+        kind, _, item = alternative.partition("/")
+        if kind in _BODY_MEDIA:
+            media.append(_BODY_MEDIA[kind])
+            schemas.extend([item] if item else [])
+        else:
+            media.append("application/json")
+            schemas.append(kind)
+    names.update(schemas)
+    return {"content_type": " | ".join(dict.fromkeys(media)), "schemas": schemas}
+
+
+def _contract_http_entry(token: str, shape: Any, public_paths: frozenset, names: set) -> Dict[str, Any]:
+    method, path = token.split(" ", 1)
+    entry: Dict[str, Any] = {
+        "method": method, "path": path,
+        "path_params": re.findall(r"\{([^}:]+)(?::[^}]*)?\}", path),
+        "auth": "public" if path in public_paths else "gate",
+        "typed": shape is not None,
+    }
+    if shape is None:
+        return entry
+    if shape.query:
+        entry["query"] = shape.query.split()
+    if shape.headers:
+        entry["headers"] = shape.headers.split()
+    if shape.request:
+        entry["request"] = _contract_body(shape.request, names)
+    responses: Dict[str, Any] = {}
+    for group in shape.responses.split():
+        statuses, body = group.split(":", 1)
+        for status in statuses.split(","):
+            responses[status] = _contract_body(body, names)
+    entry["responses"] = responses
+    if shape.note:
+        entry["note"] = shape.note
+    return entry
+
+
+def _described_schema(name: str) -> Dict[str, Any]:
+    typed_dict = contract_typed_dict(name)
+    schema = dict(json_schema_for(typed_dict))  # a copy: the ingress cache stays description-free
+    doc = typed_dict.__dict__.get("__doc__")
+    if doc:
+        schema["description"] = inspect.cleandoc(doc)
+    return schema
+
+
+def contract_document() -> Dict[str, Any]:
+    """``GatewayContractResponse``: the published gateway ABI, derived once per process."""
+    if "document" in _CONTRACT_CACHE:
+        return _CONTRACT_CACHE["document"]
+    from ouroboros import get_version
+    from ouroboros.gateway import endpoint_index as index
+    from ouroboros.gateway.contracts import WS_MESSAGE_TYPES
+    from ouroboros.server_auth import _PUBLIC_HTTP_PATHS
+
+    names: set = set()
+    public_paths = frozenset(_PUBLIC_HTTP_PATHS)
+    http = [_contract_http_entry(token, index.HTTP_SHAPES.get(token), public_paths, names)
+            for token in index.HTTP_ENDPOINTS if not token.startswith("WS ")]
+    http += [_contract_http_entry(token, shape, public_paths, names) for token, shape in index.AUTH_ENDPOINTS.items()]
+    messages = []
+    for ws_type in WS_MESSAGE_TYPES:
+        inbound, outbound = index.WS_SHAPES[ws_type]
+        names.update(name for name in (inbound, outbound) if name)
+        messages.append({"type": ws_type, **({"inbound": inbound} if inbound else {}),
+                         **({"outbound": outbound} if outbound else {})})
+    document = {
+        "abi_version": GATEWAY_ABI_VERSION,
+        "runtime_version": get_version(),
+        "core_paths": list(index.CORE_PATHS),
+        "interface_paths": list(index.INTERFACE_PATHS),
+        "http": http,
+        "ws": {"path": "/ws", "messages": messages, "extension_namespace": index.EXTENSION_WS_NAMESPACE},
+        "schemas": {name: _described_schema(name) for name in sorted(names)},
+    }
+    _CONTRACT_CACHE["document"] = document
+    return document
+
+
 __all__ = [
+    "CONTRACT_MODULES",
     "GATEWAY_ABI_VERSION",
+    "contract_document",
+    "contract_typed_dict",
     "json_schema_for",
     "validate_ingress",
 ]

@@ -158,6 +158,7 @@ def test_declared_receipt_records_sources_without_prescribing_collaboration_orde
 
     receipt = input_source_selection_receipt({"task_contract": {"input_sources": "declared"}})
     assert receipt["included"] and receipt["omitted_automatic"]
+    assert any("own-body DESIGN navigation or source-gap disclosure" in item for item in receipt["included"])
     assert "Entire task" in receipt["lifetime"]
     assert "no collaboration order" in receipt["collaboration"]
     for key in ("collaboration", "later_inputs"):
@@ -184,6 +185,6 @@ def test_declared_tool_descriptions_leave_exchange_strategy_to_assignment():
     assert "forward_to_worker" not in selection
     # The field carries the one cue for choosing the selector; the tool description no
     # longer repeats the selector paragraph (one SSOT, fewer cached-prefix bytes).
-    assert "independently composed first position" in selection
+    assert "for an independent first position" in selection
     assert "input_sources=declared" not in schema["description"]
     assert "Retain the first position via forward_to_worker before" not in schema["description"]

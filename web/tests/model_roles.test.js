@@ -96,6 +96,16 @@ test('role pins and context survive a no-edit save, including identical model na
     editor.destroy();
 });
 
+test('image generation has no settings default or chat model role', () => {
+    const editor = createModelRolesEditor({ hostId: 'test', doc: () => null });
+    editor.load({ OUROBOROS_MODEL: 'openai::model', OUROBOROS_MODEL_IMAGE: 'legacy' }, contract);
+    const saved = editor.collect();
+    assert.ok(!('OUROBOROS_MODEL_IMAGE' in saved));
+    assert.ok(!contract.modelSlots.some((slot) => slot.slot === 'image'));
+    assert.equal(editor.validate(), '');
+    editor.destroy();
+});
+
 test('an unloaded editor authors nothing and an API-only save does not create role maps', () => {
     const editor = createModelRolesEditor({ hostId: 'test', doc: () => null });
     assert.deepEqual(editor.collect(), {});
@@ -116,9 +126,11 @@ test('context Auto uses the exact advertised maximum, while manual values stay a
 test('the same role sheets are loaded by both actual UI hosts', () => {
     for (const file of ['index.html', 'onboarding_template.html']) {
         const html = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8');
-        for (const sheet of ['model_roles.css', 'reviewer_slots.css']) {
-            assert.ok(html.includes(`href="/static/${sheet}"`), `${file} loads ${sheet}`);
-        }
+        // The wizard loads the core's own tree whatever main interface is selected.
+        const sheet = `${file === 'index.html' ? '' : '/onboarding'}/static/model_roles.css`;
+        assert.ok(html.includes(`href="${sheet}"`), `${file} loads ${sheet}`);
+        // The review lanes editor is retired: reviewers are rows of the subagent catalog.
+        assert.ok(!html.includes('reviewer_slots.css'), `${file} still loads the retired review lanes sheet`);
     }
 });
 

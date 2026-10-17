@@ -11,6 +11,20 @@ and only then the owner. A round whose later route exists returns its refusal
 instead of waiting (``ResourceDeferral``); the owner question is then opened
 from that retained refusal, never from another generation, and nothing sleeps
 to a reset. An inline Presence turn never waits for a resource or the owner.
+
+It also owns the one execution clock (#939) every finite execution bound reads:
+the narrower of the global ceiling and a task's API/CLI ``execution_timeout_sec``
+(``config.resolve_task_execution_timeout_sec``). Queue before the first dispatch,
+the confirmed quota-wait union, budget/owner Pause and model sleep are excluded
+(warm sleep live via ``TaskModelWait.sleep_started_monotonic``; a cold sleep and a
+bounded task's exact Resume from grant to consumption via ``sleep_exclusion_since``);
+tools and their result waits count, and calendar deadlines never move. A
+continuation that preserves the original start already spans earlier attempts;
+only a fresh-start successor carries their total as ``_execution_consumed_sec``,
+decided once where assignment and the worker choose the origin
+(``settle_execution_carry``). Recovery keeps confirmed quota facts newer than
+its checkpoint (``fold_running_clock``), and only the author's own wait owner
+moves the supervisor's RUNNING clock.
 """
 
 from __future__ import annotations
@@ -31,7 +45,8 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator
 
 from ouroboros.usage_accounting import current_usage_scope
-from ouroboros.utils import append_jsonl, update_json_locked, utc_now_iso
+from ouroboros.task_store import patch_handoff, put_handoffs
+from ouroboros.utils import append_jsonl, utc_now_iso
 
 
 class ModelWaitInterrupted(RuntimeError):
@@ -46,7 +61,7 @@ class ModelWaitInterrupted(RuntimeError):
         self.previous_error = cause
         if cause is not None:
             for name in ("physical_attempt_capture", "ledger_attempt_ids", "model_result", "usage",
-                         "model_role_route", "operation_id", "route"):
+                         "model_role_route", "operation_id", "route", "stream_incomplete", "stream_rejected"):
                 if hasattr(cause, name):
                     setattr(self, name, getattr(cause, name))
 
@@ -154,23 +169,171 @@ def budget_paused_seconds(meta: dict) -> float:
 
 
 def execution_elapsed_seconds(meta: dict, now: float) -> float:
-    """Execution time of one task: wall clock minus the quota-wait union minus
-    the separate budget-paused interval. ``started_at`` is never moved, so every
-    finite-lifetime consumer (supervisor timeouts, owner stop, the exact-pause
-    grant, the live wait controls) subtracts the same two carriers."""
+    """Execution time of one task: the carried pre-origin offset plus wall clock
+    minus the quota-wait union minus the separate budget-paused interval.
+    ``started_at`` is never moved, so every finite-lifetime consumer (supervisor
+    timeouts, owner stop, the exact-pause grant, the live wait controls)
+    subtracts the same carriers and adds the same offset."""
+    offset = execution_consumed_seconds(meta)
     try:
         started = float(meta.get("started_at") or 0.0)
     except (TypeError, ValueError):
-        return 0.0
+        return offset
     if started <= 0 or not math.isfinite(started):
+        return offset
+    sleeping = meta.get("sleep_parked_at")  # a warm sleep or owner Pause (worker_owner_wait)
+    return offset + max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta)
+                        - (max(0.0, now - float(sleeping)) if isinstance(sleeping, (int, float)) else 0.0))
+
+
+def execution_consumed_seconds(meta: dict) -> float:
+    """Execution spent BEFORE this clock's origin (#939), never queue time.
+
+    Only a fresh-origin successor of an explicitly bounded task carries one
+    (``settle_execution_carry``); a preserved original start already spans
+    every earlier attempt, so its offset never grows. Reads a RUNNING row's
+    ``task`` or a task row itself.
+    """
+    task = meta.get("task") if isinstance(meta.get("task"), dict) else meta
+    try:
+        value = float(task.get("_execution_consumed_sec") or 0.0)
+    except (TypeError, ValueError):
         return 0.0
-    sleeping = meta.get("sleep_parked_at")  # a pooled model sleep in progress (worker_owner_wait)
-    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta)
-               - (max(0.0, now - float(sleeping)) if isinstance(sleeping, (int, float)) else 0.0))
+    return max(0.0, value) if math.isfinite(value) else 0.0
+
+
+def stamp_execution_handoff(successor: dict, meta: dict | None, now: float | None = None) -> None:
+    """Record an ended attempt's total execution on its successor (#939).
+
+    At assignment, ``settle_execution_carry`` keeps this total: a preserved
+    origin excludes the intervening queue via the existing paused carrier;
+    a fresh origin carries the total as an offset. A quota wait
+    still open at the last observation stops there, never extended further:
+    the raw clock facts are read, never a reader's derived ``execution_sec``.
+    """
+    from ouroboros.runtime_limits import explicit_execution_timeout_sec
+
+    successor.pop("_execution_handoff_sec", None)
+    if explicit_execution_timeout_sec(successor) is None or not isinstance(meta, dict) or not meta:
+        return
+    clock = meta.get("model_wait_quota_clock")
+    closed = {**meta, "model_wait_quota_clock": {**clock, "active": False}} if isinstance(clock, dict) else meta
+    successor["_execution_handoff_sec"] = execution_elapsed_seconds(closed, time.time() if now is None else now)
+
+
+def native_sleep_started_at(handoff: Any) -> float | None:
+    """The selected native sleep's recorded open start; absent/invalid is unknown."""
+    started = handoff.get("sleep_started_at") if isinstance(handoff, dict) and handoff.get("reason") == "sleep" else None
+    return float(started) if (isinstance(started, (int, float)) and not isinstance(started, bool)
+                             and math.isfinite(started) and started > 0) else None
+
+
+def settle_execution_carry(task: dict, *, origin_preserved: bool) -> float:
+    """Settle the ended total once at handoff, excluding queued time for #939."""
+    handoff = task.pop("_execution_handoff_sec", None)
+    if handoff is not None:
+        total = execution_consumed_seconds({"_execution_consumed_sec": handoff})
+        if not origin_preserved:
+            task["_execution_consumed_sec"] = total
+        else:
+            from ouroboros.runtime_limits import explicit_execution_timeout_sec
+
+            if explicit_execution_timeout_sec(task) is not None:
+                key = next(key for key in ("_owner_wait_resume", "_budget_pause_resume", "_working_recovery")
+                           if task.get(key))
+                resume = dict(task[key])
+                # A returning native sleep already owns the interval across stop/boot;
+                # it cannot also become a closed queue exclusion at this assignment.
+                sleeping = native_sleep_started_at(resume) if key == "_owner_wait_resume" else None
+                queued = max(0.0, execution_elapsed_seconds(
+                    {**resume, "task": task, "sleep_parked_at": sleeping}, time.time()) - total)
+                resume["budget_paused_sec"] = budget_paused_seconds(resume) + queued
+                task[key] = resume
+    return execution_consumed_seconds(task)
+
+
+def fold_running_clock(task: dict, meta: dict) -> None:
+    """Keep exclusions confirmed after the saved checkpoint (#939).
+
+    A working-recovery handoff carries the cognition checkpoint's clock; the
+    supervisor's RUNNING row may hold a newer confirmed quota revision or paused
+    carrier of the SAME clock (same attempt, or the same preserved origin).
+    The newer fact wins, closed at its own observation; nothing is inferred.
+    """
+    handoff = task.get("_working_recovery")
+    if not isinstance(handoff, dict) or not isinstance(meta, dict):
+        return
+    attempt = int(meta.get("attempt") or (meta.get("task") or {}).get("_attempt") or 1)
+    try:
+        same_origin = float(handoff.get("started_at") or 0.0) == float(meta.get("started_at") or -1.0)
+    except (TypeError, ValueError):
+        same_origin = False
+    if int(handoff.get("from_attempt") or 0) != attempt and not same_origin:
+        return
+    clock, saved = meta.get("model_wait_quota_clock"), handoff.get("model_wait_quota_clock") or {}
+    if isinstance(clock, dict) and int(clock.get("revision") or 0) > int(saved.get("revision") or 0):
+        handoff["model_wait_quota_clock"] = {**clock, "active": False}
+    if budget_paused_seconds({"budget_paused_sec": meta.get("budget_paused_sec")}) > budget_paused_seconds(handoff):
+        handoff["budget_paused_sec"] = budget_paused_seconds({"budget_paused_sec": meta.get("budget_paused_sec")})
+
+
+def adopt_handoff_clock(model_state: dict, handoff: Any) -> dict:
+    """The worker side of ``fold_running_clock``: on a preserved origin, the handoff's newer
+    folded facts outrank the checkpoint's own; a fresh origin keeps the checkpoint reset."""
+    if not isinstance(handoff, dict) or not handoff.get("started_at"):
+        return model_state
+    state, newer = dict(model_state), handoff.get("model_wait_quota_clock")
+    if isinstance(newer, dict) and int(newer.get("revision") or 0) > int((state.get("quota_clock") or {}).get("revision") or 0):
+        state["quota_clock"] = dict(newer)
+    if budget_paused_seconds(handoff) > budget_paused_seconds({"budget_paused_sec": state.get("budget_paused_sec")}):
+        state["budget_paused_sec"] = budget_paused_seconds(handoff)
+    return state
+
+
+def explicit_execution_window_remaining(ctx: Any) -> float | None:
+    """The remaining window only when the task carries an explicit execution budget, so
+    pacing, finalize and tool clamps never invent one from the global ceiling alone."""
+    from ouroboros.config import explicit_execution_timeout_sec
+
+    meta = getattr(ctx, "task_metadata", None)
+    if not isinstance(meta, dict) or explicit_execution_timeout_sec(meta) is None:
+        return None
+    return execution_window_remaining_for_context(ctx)
+
+
+def execution_window_remaining_for_context(ctx: Any) -> float | None:
+    """Remaining execution window: the bound live owner's clock, else the same
+    arithmetic over the context's original start and carriers. ``None`` = no bound."""
+    owner = getattr(ctx, "model_wait_context", None) or current_model_wait()
+    if owner is not None and owner.task_id == str(getattr(ctx, "task_id", "") or ""):
+        return owner.execution_window_remaining()
+    from ouroboros.config import resolve_task_execution_timeout_sec
+
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    ceiling = resolve_task_execution_timeout_sec(meta)
+    if ceiling is None:
+        return None
+    paused = getattr(ctx, "_budget_paused_sec", None)
+    if paused is None:
+        paused = budget_paused_seconds(getattr(ctx, "budget_pause_resume", None) or {})
+    elapsed = execution_elapsed_seconds({**meta, "started_at": getattr(ctx, "task_started_at", None),
+                                         "budget_paused_sec": paused}, time.time())
+    return max(0.0, ceiling - elapsed)
 
 
 _CURRENT: contextvars.ContextVar[TaskModelWait | None] = contextvars.ContextVar(
     "ouroboros_model_wait", default=None)
+_STRICT_CONTROL_PROBE = contextvars.ContextVar("strict_presend_control_probe", default=None)
+
+
+def control_probe_requires_current() -> bool:
+    """Only an unsent admission needs a temporary control-read gap to reach its wait owner."""
+    return _STRICT_CONTROL_PROBE.get() is True
+
+
+def control_probe_active() -> bool:
+    return _STRICT_CONTROL_PROBE.get() is not None
 _REPREPARE: contextvars.ContextVar[dict[str, tuple[Callable, Callable | None]] | None] = contextvars.ContextVar(
     "ouroboros_model_wait_reprepare", default=None)
 _CALENDAR: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
@@ -194,6 +357,23 @@ def copy_wait_context() -> contextvars.Context:
     copy_task_settings_context(copied)
     for variable in (_CURRENT, _REPREPARE, _CALENDAR, _LOGICAL):
         copied.run(variable.set, variable.get())
+    return copied
+
+
+def independent_turn_context() -> contextvars.Context:
+    """The context an initiated independent turn starts from (#1536).
+
+    Like ``copy_wait_context`` it starts empty: the initiating call's physical capture,
+    usage scope, send clock, tool-result slot and billing frame stay with that call.
+    Settings and explicit calendar deadlines carry; the initiating operation's own
+    execution deadline, wait owner and re-preparation callbacks do not: the new turn's
+    task frame installs its own controls, and a tool's call bound is not its lifetime.
+    """
+    from ouroboros.settings_integrity import copy_task_settings_context
+
+    copied = contextvars.Context()
+    copy_task_settings_context(copied)
+    copied.run(_CALENDAR.set, _CALENDAR.get())
     return copied
 
 
@@ -263,30 +443,20 @@ def _deferral(role: str) -> ResourceDeferral | None:
 
 
 def mutate_wait(root: Any, task_id: str, wait_id: str, transform: Callable) -> dict:
-    """Mutate only one wait projection in the existing schema-stamped task result."""
-    from ouroboros.task_results import (
-        require_writable_task_result_schema, stamp_task_result_schema, task_result_path,
-    )
-
+    """Mutate one wait row of the task's ``model_waits`` projection (a row write, never the body)."""
     result: dict = {}
 
-    def update(current):
-        require_writable_task_result_schema(current)
-        if not current.get("status") or current.get("task_id") != task_id:
-            raise ValueError("model wait requires its lifecycle owner's task result")
-        waits = current.get("model_waits", {})
-        if not isinstance(waits, dict):
-            raise ValueError("model_waits projection is malformed")
-        previous = waits.get(wait_id)
+    def update(previous):
         if previous is not None and not isinstance(previous, dict):
             raise ValueError("model wait projection is malformed")
         next_row = transform(copy.deepcopy(previous))
         result.update(previous or {} if next_row is None else next_row)
-        if next_row is None:
-            return None
-        return stamp_task_result_schema({**current, "model_waits": {**waits, wait_id: next_row}})
+        return next_row
 
-    update_json_locked(task_result_path(pathlib.Path(root), task_id), update, strict_existing_dict=True)
+    try:
+        patch_handoff(pathlib.Path(root), task_id, "model_waits", wait_id, update)
+    except LookupError as exc:
+        raise ValueError("model wait requires its lifecycle owner's task result") from exc
     return result
 
 
@@ -374,21 +544,23 @@ class TaskModelWait:
                 for key, row in self.waits.items()}}
 
     def executed_seconds(self, *, now: float | None = None) -> float:
-        """Live execution time: elapsed minus the quota union minus budget pause,
-        minus a model sleep in progress (``model_sleep`` folds it into the paused
-        carrier when the task runs again, so it is never subtracted twice)."""
+        """Live execution time: the carried pre-origin offset plus elapsed minus the
+        quota union minus budget pause, minus a warm sleep or owner Pause
+        (``model_sleep`` folds it into the paused carrier when the task runs again,
+        so it is never subtracted twice)."""
         stamp = time.monotonic() if now is None else now
         sleeping = self.sleep_started_monotonic
-        return max(0.0, stamp - self.started_monotonic - self.paused_seconds(now=stamp) - self.budget_paused_sec
-                   - (max(0.0, stamp - sleeping) if sleeping is not None else 0.0))
+        return execution_consumed_seconds(self.task) + max(
+            0.0, stamp - self.started_monotonic - self.paused_seconds(now=stamp) - self.budget_paused_sec
+            - (max(0.0, stamp - sleeping) if sleeping is not None else 0.0))
 
     def execution_window_remaining(self) -> float | None:
-        """A custom live owner supplies its own clock and a task without an absolute
-        lifetime has none; None invents no deadline, and 0.0 means the window is spent."""
+        """A custom live owner supplies its own clock and a task without an execution
+        bound has none; None invents no deadline, and 0.0 means the window is spent."""
         if self.owner_control is not None:
             return None
-        from ouroboros.config import get_task_abs_ceiling_sec
-        ceiling = get_task_abs_ceiling_sec()
+        from ouroboros.config import resolve_task_execution_timeout_sec
+        ceiling = resolve_task_execution_timeout_sec(self.task)
         if ceiling is None:
             return None
         return max(0.0, ceiling - self.executed_seconds())
@@ -495,19 +667,34 @@ class TaskModelWait:
             raise ModelWaitInterrupted("model_wait_reprepare_required", role=role)
         return kwargs
 
-    def control_reason(self) -> str | None:
+    def control_reason(self, *, strict_current: bool = False) -> str | None:
+        from ouroboros.store import acquisition_budget
+        token = _STRICT_CONTROL_PROBE.set(strict_current)
+        try:
+            with acquisition_budget(0):
+                return self._control_reason(strict_current=strict_current)
+        finally:
+            _STRICT_CONTROL_PROBE.reset(token)
+
+    def _control_reason(self, *, strict_current: bool) -> str | None:
         """Existing task controls and explicit calendar bounds, never model prose."""
         from ouroboros.cancel_intents import cancel_pending, resolve_owner_stop_intent
-        from ouroboros.config import get_task_abs_ceiling_sec
+        from ouroboros.config import resolve_task_execution_timeout_sec
         from ouroboros.deadline_utils import seconds_until
         from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, drain_owner_entries
+        from ouroboros.store import StoreBusy
 
         if self.closed:
             return "task_ended"
-        if self.owner_control is None and cancel_pending(pathlib.Path(self.canonical_root), self.task_id):
-            _, graceful = resolve_owner_stop_intent(self.canonical_root, self.task_id)
-            if not graceful:
-                return "cancelled"
+        control_gap = None
+        if self.owner_control is None:
+            try:
+                if cancel_pending(pathlib.Path(self.canonical_root), self.task_id, propagate_busy=True):
+                    _, graceful = resolve_owner_stop_intent(self.canonical_root, self.task_id, propagate_busy=True)
+                    if not graceful:
+                        return "cancelled"
+            except StoreBusy as exc:
+                control_gap = exc  # No wait here; known Stop wins, then clocks, then an admission gap.
         metadata = getattr(self.tool_context, "task_metadata", None)
         if not isinstance(metadata, dict):
             metadata = self.task.get("metadata") or {}
@@ -519,9 +706,11 @@ class TaskModelWait:
             return "execution_deadline"
         if self.owner_control is not None:
             return self.owner_control()
-        ceiling = get_task_abs_ceiling_sec()  # None = unlimited; 0 = exhausted, never unlimited
+        ceiling = resolve_task_execution_timeout_sec(self.task)  # None = unlimited; 0 = exhausted
         if ceiling is not None and self.executed_seconds() >= ceiling:
             return "absolute_ceiling"
+        if strict_current and control_gap is not None:
+            raise control_gap
         # The loop owns delivery. A private seen copy leaves that ownership
         # intact and excludes an already-drained or superseded stop control.
         from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
@@ -559,6 +748,12 @@ class TaskModelWait:
             self.revision += 1
             row["revision"] = self.revision
             row["updated_at"] = utc_now_iso()
+            # The live owner knows whether this call has a non-generating access
+            # observer. A reset forecast alone cannot resume an API-only call;
+            # mixed auth/quota with a viable automatic route needs no human.
+            row["requires_owner_action"] = bool(row["state"] == "waiting" and (
+                row.get("reason") == "auth" or row.get("auto_continue") is False
+                or not row.get("source") or row.get("_unproven_account")))
             if applied_request_id:
                 row["applied_request_id"] = applied_request_id
             if applied_request_id or row["state"] == "resolved":
@@ -679,6 +874,7 @@ class TaskModelWait:
             reason == "quota" and not account_intent and getattr(error, "status_code", 0)
             and getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "settled"
             and not (problem_context.get("resetsAt") or problem_context.get("retryAfterMs"))) else ""
+        row["_unproven_account"] = unproven
         with self.lock:
             self.waits[wait_id] = row
         if quota_wait:
@@ -723,6 +919,8 @@ class TaskModelWait:
                                 row["credential_harness"] = harness
                                 self._publish(row)
                         if row["auto_continue"]:
+                            from ouroboros.llm_claudexor import catalog_admits_model
+
                             account = kwargs.get("model_account_override")
                             if account is None:
                                 account = model_role_option(MODEL_ACCOUNTS_KEY, role)
@@ -731,7 +929,7 @@ class TaskModelWait:
                             if (catalog.get("source") == source
                                     and (not account or catalog.get("credentialProfileId") == account)
                                     and not (unproven and not account and catalog.get("credentialProfileId") == unproven)
-                                    and any(item.get("id") == native_model for item in catalog.get("models", []))):
+                                    and catalog_admits_model(catalog, native_model)):
                                 resolution = "resource_available"
                                 return kwargs
                     except ClaudexorUnavailable:
@@ -761,11 +959,39 @@ class TaskModelWait:
                     "local_answer_task_attempt": self.attempt,
                     "local_answer_owner_birth": self.answer_owner_birth}
 
+    def rotate_answer_consumer(self) -> None:
+        """A warm return after this receiver abandoned a sent wait (owner Pause).
+
+        The exact old consumer identity is retired positively and durably, and a
+        fresh one is minted before the next send: an answer to the abandoned
+        attempt can never be read as the new call's, and the custody census sees
+        the new live call under its own identity. The scope stays open.
+        """
+        with self.lock:
+            old, bound = self.answer_consumer_id, self.answer_consumer_bound
+            self.answer_consumer_id = uuid.uuid4().hex
+            self.answer_consumer_bound = False
+        if bound:
+            try:
+                retire_model_consumers(self.canonical_root, self.task_id, {old: self.attempt})
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning("Abandoned model consumer retirement could not persist for %s",
+                                                    self.task_id, exc_info=True)
+                _retain_retirement_witness(self.canonical_root, self.task_id, {old: self.attempt})
+
     def close(self) -> None:
         with self.lock:
             self.closed = True
-            if not self.answer_consumer_bound:
-                return
+            bound = self.answer_consumer_bound
+        from types import SimpleNamespace
+        from ouroboros.budget_pause import forget_tool_scope
+        # Native review scopes may never enter loop cleanup. Use THIS frozen
+        # owner even when close is called under a different current context.
+        forget_tool_scope(SimpleNamespace(drive_root=self.canonical_root, task_id=self.task_id),
+                          attempt=self.attempt)
+        if not bound:
+            return
         # Positive retirement of THIS consumer, not terminal task status, PID
         # absence or the pool's current assignment. Cash and remote custody stay.
         try:
@@ -774,6 +1000,24 @@ class TaskModelWait:
             import logging
             logging.getLogger(__name__).warning("Model consumer retirement could not persist for %s", self.task_id,
                                                 exc_info=True)
+            # The receiver IS closed on a live host: keep that positive fact for the
+            # addressed repair owner (#1554); never a second census or a PID test.
+            _retain_retirement_witness(self.canonical_root, self.task_id, {self.answer_consumer_id: self.attempt})
+
+
+def _retain_retirement_witness(root: Any, task_id: str, consumers: dict[str, int]) -> None:
+    """A positive receiver closure whose durable retirement failed: retain the exact
+    witness (``local_custody_repair``), so the addressed recovery owner retries the
+    SAME writer instead of inferring death from the platform later."""
+    try:
+        from ouroboros.local_custody_repair import retain_witness
+
+        retain_witness(root, task_id, reason="receiver_closed_retirement_unwritten",
+                       model_consumers=dict(consumers))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Retirement witness for %s could not be retained", task_id,
+                                            exc_info=True)
 
 
 def retire_model_consumers(root: Any, task_id: str, consumers: dict[str, int]) -> None:
@@ -782,16 +1026,12 @@ def retire_model_consumers(root: Any, task_id: str, consumers: dict[str, int]) -
     This existing result projection releases only local answer-writing custody.
     It changes no usage row, external process or delegated-run obligation.
     """
-    from ouroboros.task_results import require_writable_task_result_schema, stamp_task_result_schema, task_result_path
-    def retire(current):
-        require_writable_task_result_schema(current)
-        if not current.get("status") or current.get("task_id") != task_id:
-            raise ValueError("model consumer retirement requires its task result")
-        retired = dict(current.get("retired_model_consumers") or {})
-        for consumer, attempt in consumers.items():
-            retired[consumer] = {"task_attempt": attempt, "retired_at": utc_now_iso()}
-        return stamp_task_result_schema({**current, "retired_model_consumers": retired})
-    update_json_locked(task_result_path(pathlib.Path(root), task_id), retire, strict_existing_dict=True)
+    try:  # one `retired_model_consumers` row per consumer, one transaction, never the body
+        put_handoffs(pathlib.Path(root), task_id, "retired_model_consumers",
+                     {consumer: {"task_attempt": attempt, "retired_at": utc_now_iso()}
+                      for consumer, attempt in consumers.items()})
+    except LookupError as exc:
+        raise ValueError("model consumer retirement requires its task result") from exc
 
 
 @contextlib.contextmanager

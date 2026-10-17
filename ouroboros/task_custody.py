@@ -78,6 +78,7 @@ from typing import Any, Callable, ContextManager, Dict, Iterator, List, Optional
 from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
 from ouroboros.utils import utc_now_iso
 from ouroboros.owner_mailbox import _mailbox_path, _MAILBOX_DIR as _OWNER_MAILBOX_DIR
+from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
 
@@ -88,8 +89,8 @@ _MAILBOX_DIR = pathlib.Path(_OWNER_MAILBOX_DIR)
 _STAGING_DIR = pathlib.Path("state") / "custody_staging"
 _TRASH_DIR = pathlib.Path("state") / "custody_trash"
 # The addressed words a sender is owed; controls (hurry, finalize_now, ...) are not mail.
-UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer"})
-OWNER_MAIL_KINDS = frozenset({"owner_text", "quiz_answer"})  # what the owner authored
+UNREAD_MAIL_KINDS = frozenset({"owner_text", "task_message", "quiz_answer", "quiz_closed", "relay_entry"})
+OWNER_MAIL_KINDS = frozenset({"owner_text", "quiz_answer", "quiz_closed"})  # what the owner authored
 # A store's own bookkeeping and non-deliverable subtrees (inputs, media, sources).
 _STORE_BOOKKEEPING = frozenset({".artifact_manifest.json", ".artifact_manifest.json.lock",
                                 ".scratch_manifest.json", "verification_receipts.jsonl"})
@@ -150,6 +151,11 @@ def custody_anchor(drive_root: Any, task_id: str) -> pathlib.Path:
     drive), so every writer of one mailbox takes the same lock.
     """
     validate_task_id(task_id)
+    return canonical_owner_root(drive_root)
+
+
+def canonical_owner_root(drive_root: Any) -> pathlib.Path:
+    """``custody_anchor``'s layout rule alone, for writers without a task id."""
     root = pathlib.Path(drive_root).resolve(strict=False)
     if root.name == "data" and len(root.parents) > 3 and root.parents[1].name == "headless_tasks" \
             and root.parents[2].name == "state":
@@ -324,7 +330,7 @@ def owner_mail_rows(drive_root: Any, task_id: str) -> Tuple[List[str], bool]:
             continue
         if not isinstance(entry, dict):
             complete = False
-        elif str(entry.get("kind") or "owner_text") in OWNER_MAIL_KINDS:
+        elif str(entry.get("kind") or "owner_text") in OWNER_MAIL_KINDS | {"relay_entry"}:
             rows.append(line)
     return rows, complete
 
@@ -501,7 +507,7 @@ def settle_task_mailbox(canonical_root: Any, task_id: str, mailbox_root: Any, *,
                     mailbox.unlink()
                 acks.unlink(missing_ok=True)
                 return True
-        except (_Retained, OSError, ValueError, TimeoutError):
+        except (_Retained, OSError, ValueError, TimeoutError, StoreError):
             if stop is None or not stop():
                 log.warning("Mailbox of %s kept: its unread rows are not in canonical custody", task_id, exc_info=True)
             return not mailbox.exists()
@@ -654,9 +660,15 @@ def _identity(path: pathlib.Path) -> Optional[tuple]:
 def _occupants(drive: pathlib.Path, task_id: str) -> List[str]:
     """Every task whose result, store or mailbox lives in DRIVE (a timeout retry keeps the
     original drive); a name that is not a task id retains the drive."""
+    from ouroboros.store import StoreError
+    from ouroboros.task_store import task_ids
+
     ids = {task_id}
-    for directory, suffix in ((drive / "task_results", ".json"), (drive / _ARTIFACTS_DIR, ""),
-                              (drive / _MAILBOX_DIR, ".jsonl")):
+    try:
+        ids.update(task_ids(drive))
+    except StoreError as exc:
+        raise _Retained("drive_occupant_unknown") from exc
+    for directory, suffix in ((drive / _ARTIFACTS_DIR, ""), (drive / _MAILBOX_DIR, ".jsonl")):
         if not directory.is_dir():
             continue
         for entry in directory.iterdir():
@@ -666,8 +678,6 @@ def _occupants(drive: pathlib.Path, task_id: str) -> List[str]:
             if not suffix and not entry.is_dir():
                 continue
             stem = name[: -len(suffix)] if suffix else name
-            if suffix == ".json" and (stem in {"quarantine"} or entry.is_dir()):
-                continue
             try:
                 ids.add(validate_task_id(stem))
             except ValueError as exc:
@@ -973,6 +983,7 @@ def _prepare_occupant(canonical: pathlib.Path, drive: pathlib.Path, task_id: str
     """Everything outside the locks: liveness, durable settledness, copy-back, pending refs and
     private staging; nothing served is written. Raises ``_Retained``."""
     from ouroboros.owner_mailbox import settled_mailbox_cleanup_allowed
+    from ouroboros.store import StoreError
     from ouroboros.task_results import cancellation_blocks_child_result
 
     alive = live(task_id)
@@ -981,7 +992,7 @@ def _prepare_occupant(canonical: pathlib.Path, drive: pathlib.Path, task_id: str
     try:
         current = load_task_result(canonical, task_id, strict=True) or {}
         child = load_task_result(drive, task_id, strict=True) or {}
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, StoreError) as exc:
         raise _Retained("task_result_unreadable") from exc
     status = str(current.get("status") or "")
     if admission_rollback and not child and not current.get("started_at") \

@@ -24,6 +24,7 @@ from supervisor.terminal_delivery import (
     register_pending_delivery,
     replay_pending_deliveries,
 )
+from tests._store_shared import seed_result
 
 
 RAW = "RAW INTERMEDIATE OUTPUT " * 40
@@ -156,14 +157,14 @@ def test_root_salvage_row_stays_an_ordinary_system_row_end_to_end(tmp_path, monk
 def test_owed_outbox_replay_keeps_the_same_row_identity(tmp_path):
     """A crash between the settle and the send replays the owed row: the
     replayed event names the same card row, so the card never grows a twin."""
-    import queue
+    from tests._cancel_intents_shared import DeliveryBus
 
     event = _worker_final(tmp_path, CHILD_TASK)
     assert register_pending_delivery(tmp_path, event)
     (owed,) = pending_deliveries(tmp_path)
     assert owed["progress_meta"]["card_row_id"] == ROW_ID
 
-    events = queue.Queue()
+    events = DeliveryBus()
     registry = tmp_path / "state" / "terminal_deliveries.json"
     data = json.loads(registry.read_text(encoding="utf-8"))
     data["pending"][event["delivery_id"]]["registered_at"] = "2026-01-01T00:00:00+00:00"
@@ -199,17 +200,15 @@ def test_telegram_holds_a_child_row_only_while_its_root_is_unfinished(tmp_path):
     there and follows the owner's progress toggle.
     """
     from tests.test_telegram_health_tasks import _api_with_data, _load_plugin
-    from ouroboros.task_results import task_result_path
 
     held = _load_plugin()._child_row_held_for_root
     api, data = _api_with_data(tmp_path)
     child = {"delegation_role": "subagent", "root_task_id": "root-one", "card_row": "timeline"}
     assert held(api, child), "an unreadable root counts as unfinished"
     assert held(api, {**child, "card_row": "", "system_type": "terminal_incident"})
-    path = task_result_path(data, "root-one")
-    path.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    seed_result(data, "root-one", {"status": "running"})
     assert held(api, child)
-    path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    seed_result(data, "root-one", {"status": "completed"})
     assert not held(api, child)
     assert not held(api, {"card_row": "timeline", "is_progress": True}), "a root's own row is never held"
     assert not held(api, {**child, "card_row": ""}), "an ordinary child message is not a card row"

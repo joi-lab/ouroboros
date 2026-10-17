@@ -133,12 +133,12 @@ def test_actual_presence_and_cached_read_keep_authored_speech_and_owner_notice_s
         response = host_service._presence_exception(err, 409)
         body = json.loads(response.body)
         assert response.status_code == 409 and body["code"] == "presence_attempt_outcome_unknown"
-        assert body["disposition"] == "retry" and not body.get("text") and "outcome" not in body
+        assert body["disposition"] == "retained" and not body.get("text") and "outcome" not in body
         assert body["error"] == "presence_attempt_outcome_unknown: source_event_id"
         assert (body["turn_ref"], body["work_ref"]) == (task_id, "next-task")
         assert all(RAW not in str(value) and notice not in str(value) for value in body.values())
-    # each refusal consults the owner-notice writer (mocked here; production dedups on
-    # presence_recovery_owner_notified, so the owner hears it once)
+    # Each refusal consults the recovery-fact writer (mocked here); production deduplicates
+    # its nonfinal room observation through presence_recovery_recorded, without owner speech.
     assert notices == [task_id] * 2
     view = presence_result_from_stored(stored, task_id)
     assert (view.outcome, view.text, view.work_ref) == ("silent", "", "next-task")
@@ -168,7 +168,7 @@ def test_real_mailbox_wait_exit_carries_the_control_cause_without_another_call(t
         assert "owner requested Wrap up" in text and "own limits ran out" not in text
         assert "no new summary request was sent" in usage["terminal_provider_notice"].lower()
     else:
-        assert "owner requested Wrap up" not in text and "provider outage" in text
+        assert "owner requested Wrap up" not in text and "ended as an outage" in text
 
 
 def test_deadline_text_does_not_hide_an_existing_unknown_attempt():
@@ -317,3 +317,65 @@ def test_body_error_diagnostic_is_masked_before_terminal_publication(tmp_path, m
     assert text == RAW
     assert secret not in usage["_last_llm_error"] + usage["terminal_provider_notice"] + notices[0]
     assert "***" in notices[0]
+
+
+# ---- 12.10 incident: owner-facing terminal truth (transport-not-delivered sprint) ----
+
+def test_host_authored_primary_carries_its_own_notice_without_a_second_row():
+    """A host-authored primary (the notice itself, or a salvage receipt) already
+    says it; a model-authored primary still gets the separate not-completed row."""
+    sent = []
+    ctx = SimpleNamespace(send_with_budget=lambda *a, **k: sent.append(a[1]))
+    for origin in ("host_notice", "host_salvage"):
+        assert send_provider_death_notice(ctx, 7, "t1", {"terminal_origin": origin,
+                                                         "terminal_provider_notice": "⚠️ n"}) is False
+    assert sent == []
+    assert send_provider_death_notice(ctx, 7, "t1", {"terminal_origin": "model_final",
+                                                     "terminal_provider_notice": "⚠️ n"}) is True
+    assert sent and "⚠️ n" in sent[0]
+
+
+def test_a_request_that_never_started_generation_is_not_called_a_provider_reply():
+    from ouroboros.loop_transport import provider_terminal_fallback_text
+
+    flags = dict(is_context_overflow=False, is_transport_wait=False, waited_sec=0.0, is_deadline_exhausted=False)
+    released = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "auth_error", "_last_llm_attempt_custody": "released"}, **flags)
+    assert released.startswith("⚠️ The model request did not start generation.")
+    assert "returned no usable response" not in released and "provider rejected" not in released
+    answered = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_error", "_last_llm_attempt_custody": "settled"}, **flags)
+    assert answered.startswith("⚠️ The model provider returned no usable response.")
+    # A stale released fact never hides a dispatched attempt whose outcome is unknown.
+    unknown = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "provider_outcome_unknown", "_last_llm_attempt_custody": "released"}, **flags)
+    assert "did not start generation" not in unknown
+
+
+def test_no_terminal_promises_a_retry_that_nothing_performs():
+    from ouroboros.loop_transport import provider_recovery_hint, provider_terminal_fallback_text
+
+    flags = dict(is_context_overflow=False, is_transport_wait=False, waited_sec=0.0, is_deadline_exhausted=False)
+    for kind in ("provider_error", "provider_transient", "rate_limit", "llm_empty_response"):
+        assert provider_recovery_hint({"_last_llm_error_kind": kind}) == ""
+        assert "consciousness" not in provider_terminal_fallback_text({"_last_llm_error_kind": kind}, **flags)
+
+
+@pytest.mark.parametrize("code", ["transport_not_delivered", "model_account_unavailable"])
+def test_a_waited_out_delivery_failure_names_its_typed_code(code):
+    from ouroboros.loop_transport import provider_terminal_fallback_text
+
+    text = provider_terminal_fallback_text(
+        {"_last_llm_error_kind": "transport_unavailable", "_last_llm_provider_code": code},
+        is_context_overflow=False, is_transport_wait=True, waited_sec=300.0, is_deadline_exhausted=False)
+    assert text.startswith("⚠️ The request did not reach the provider; the task waited and redialed for 5.0 min")
+    assert text.endswith(f" Last reported code: {code}.")
+    assert "Could not establish" not in text and "provider outage" not in text
+
+
+def test_a_usable_response_clears_the_released_attempt_fact():
+    from ouroboros.loop_llm_call import _take_response_facts
+
+    usage = {"_last_llm_attempt_custody": "released", "_last_llm_error_kind": "transport_unavailable"}
+    _take_response_facts({}, {"role": "assistant", "content": "ok"}, usage)
+    assert "_last_llm_attempt_custody" not in usage and "_last_llm_error_kind" not in usage

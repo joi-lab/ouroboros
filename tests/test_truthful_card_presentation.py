@@ -54,7 +54,11 @@ class TestHostNoteVoice:
         # A caller that already put the fact on its own meta keeps it.
         mb.send_with_budget(1, "carried", is_progress=True, task_id="t1",
                             progress_meta={"narration": True, "card_row": "timeline"})
-        assert sent[-1]["progress_meta"] == {"narration": True, "card_row": "timeline"}
+        from ouroboros.chat_references import resolve_progress_row
+        meta = dict(sent[-1]["progress_meta"])
+        stored = [json.loads(line) for line in (tmp_path / "logs/progress.jsonl").read_text().splitlines()][-1]
+        assert resolve_progress_row(tmp_path, meta.pop("row_address")) == stored
+        assert meta == {"narration": True, "card_row": "timeline"}
 
     def test_markdown_and_the_callers_other_meta_are_untouched(self, tmp_path, monkeypatch):
         mb, sent = self._bus(tmp_path, monkeypatch)
@@ -63,7 +67,11 @@ class TestHostNoteVoice:
                             lambda *a, **kw: captured.append((a, kw)) or (True, ""))
         mb.send_with_budget(1, "**bold**", fmt="markdown", is_progress=True, task_id="t1",
                             progress_meta={"card_row": "timeline"})
-        assert captured[-1][1]["progress_meta"] == {"card_row": "timeline", "narration": False}
+        from ouroboros.chat_references import resolve_progress_row
+        meta = dict(captured[-1][1]["progress_meta"])
+        stored = [json.loads(line) for line in (tmp_path / "logs/progress.jsonl").read_text().splitlines()][-1]
+        assert resolve_progress_row(tmp_path, meta.pop("row_address")) == stored
+        assert meta == {"card_row": "timeline", "narration": False}
 
     def test_the_legacy_read_is_unchanged(self):
         # ABSENT still means narration for every row written before the fact —

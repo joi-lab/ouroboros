@@ -79,6 +79,14 @@ export function modelWaitAction(taskId, row, action, fields, requestId) {
 const requestIdentity = () => globalThis.crypto?.randomUUID?.()
     || `model-wait-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 
+/** A requested Settings save that did not land, told once its wait resolved; '' otherwise. */
+export function unsavedPersistenceNotice(row, outcome) {
+    if (!outcome || outcome.saved === true || row?.state !== 'resolved') return '';
+    const applied = Boolean(outcome.request_id) && row.applied_request_id === outcome.request_id;
+    return `${modelWaitRoleLabel(row.role)}: ${applied ? 'model change applied' : 'model wait ended'}; `
+        + (outcome.saved === null ? 'whether it was saved in Settings is unconfirmed.' : 'it was not saved in Settings.');
+}
+
 export function isModelWaitReference(value) {
     return value?.type === 'task_model_wait' || value?.system_type === 'task_model_wait';
 }
@@ -89,7 +97,8 @@ export function isModelWaitReference(value) {
  * No polling, timer, login job or task lifecycle is owned by this component.
  */
 export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn(),
-    onChange = () => {}, openSettings = () => {}, login = startLogin,
+    onChange = () => {}, openSettings = () => {}, login = startLogin, notify = () => {},
+    includeWait = () => true,
     read = fetchJson, send = (body) => jsonPost('/api/decisions', body, { rejectOkFalse: true }),
     store = claudexorStatus, doc = () => document } = {}) {
     const tasks = new Map();
@@ -159,9 +168,11 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         const auth = node.querySelector('[data-wait-login]');
         auth.hidden = row.reason !== 'auth' || !observesAccess;
         node.querySelector('[data-wait-settings]').textContent = mixed ? 'Accounts' : 'Settings';
+        const saved = view.persisted?.saved;
         node.querySelector('[data-wait-notice]').textContent = view.error
             || (view.sending ? 'Sending your choice…' : isPending(row)
-                ? `${view.saved === true ? 'Settings saved. ' : view.saved === null ? 'Settings save is unconfirmed. ' : ''}Request accepted; waiting for the task to apply it.` : '');
+                ? `${saved === true ? 'Settings saved. ' : saved === null ? 'Settings save is unconfirmed. '
+                    : saved === false ? 'Settings were not saved. ' : ''}Request accepted; waiting for the task to apply it.` : '');
         node.querySelector('[data-wait-notice]').dataset.tone = view.error ? 'warn' : 'neutral';
         node.querySelector('[data-wait-repeat]').hidden = !view.error || !view.lastRequest;
         node.querySelectorAll('button, input, select').forEach((el) => { el.disabled = pending; });
@@ -179,12 +190,21 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             : row.review_operation ? 'This role changes for this review operation.' : 'This role changes until the task ends.';
     }
 
+    // A row leaving because it resolved still owes its requested Settings outcome; disposal does not.
+    function tellUnsaved(view, row) {
+        const notice = unsavedPersistenceNotice(row, view.persisted);
+        if (notice) { view.persisted = null; notify(notice, 'warn'); }
+    }
+
     function paint(taskId) {
         if (destroyed) return false;
         const task = tasks.get(taskId);
         if (!task) return false;
         const record = getRecord(taskId, false);
-        const active = activeModelWaits(task.waits, task.finished || record?.finished, task.attempt);
+        const active = activeModelWaits(task.waits, task.finished || record?.finished, task.attempt)
+            .filter(row => includeWait(taskId, row));
+        const activeIds = new Set(active.map((row) => row.wait_id));
+        for (const [id, view] of task.views) if (!activeIds.has(id)) tellUnsaved(view, task.waits[id]);
         if (!active.length) { clearViews(task); syncPhase(taskId, false); return true; }
         const card = record || getRecord(taskId);
         if (!card?.root) { clearViews(task); return false; }
@@ -202,7 +222,6 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
                 if (!destroyed && focused.isConnected && getDoc().activeElement === getDoc().body) focused.focus({ preventScroll: true });
             });
         }
-        const activeIds = new Set(active.map((row) => row.wait_id));
         for (const [id, view] of task.views) {
             if (activeIds.has(id)) continue;
             view.editor?.destroy(); view.node.remove(); task.views.delete(id);
@@ -243,6 +262,10 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         try { body = retry ? view.lastRequest : modelWaitAction(taskId, view.row, action, fields, requestIdentity()); }
         catch (error) { view.error = error.message; onDomWrite(() => paint(taskId)); return; }
         view.lastRequest = body;
+        if (!retry) view.persisted = null;
+        const persisted = (saved) => {
+            if (body.persist_role === true) view.persisted = { request_id: body.request_id, saved: typeof saved === 'boolean' ? saved : null };
+        };
         view.sending = true;
         view.error = '';
         onDomWrite(() => paint(taskId));
@@ -250,23 +273,26 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             const answer = await send(body);
             if (destroyed) return;
             if (answer?.ok !== true || !answer.wait) throw new Error('The request was not confirmed. Check the task state before retrying.');
-            view.saved = answer.saved;
+            persisted(answer.saved);
             adopt(taskId, { [answer.wait.wait_id]: answer.wait });
         } catch (error) {
             if (destroyed) return;
             const latest = error?.body?.wait || error?.payload?.wait;
+            const failure = error?.body || error?.payload || {};
+            persisted(failure.saved);
             if (latest) {
                 // A failed mailbox delivery retains the accepted action. Only
                 // its exact request can retry; a conflicting/stale one is gone.
-                const failure = error?.body || error?.payload || {};
                 if (!['mailbox_write_failed', 'model_wait_decision_failed'].includes(failure.reason_code)
                     || latest.pending_action?.request_id !== body.request_id) view.lastRequest = null;
-                view.saved = failure.saved;
                 adopt(taskId, { [latest.wait_id]: latest });
             }
             view.error = String(error?.message || error);
         } finally {
             view.sending = false;
+            const task = destroyed ? null : tasks.get(taskId);
+            // Its row may have resolved, and left the card, before this answer arrived.
+            if (task && task.views.get(view.row.wait_id) !== view) tellUnsaved(view, task.waits[view.row.wait_id]);
             if (!destroyed) onDomWrite(() => paint(taskId));
         }
     }
@@ -312,7 +338,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         node.dataset.waitId = row.wait_id;
         const editorId = `model-wait-editor-${++serial}-${requestIdentity()}`;
         const view = { node, row, editorId, editor: null, sending: false, loading: false,
-            error: '', saved: false, lastRequest: null };
+            error: '', persisted: null, lastRequest: null };
         node.innerHTML = `<div class="model-wait-heading"><strong data-wait-role></strong><span class="ui-status" data-tone="warn" data-wait-reason></span></div>
             <div class="model-wait-meta" data-wait-model></div><div class="model-wait-meta" data-wait-reset></div>
             <label class="model-wait-auto"><input class="ui-checkbox" type="checkbox" data-wait-auto> <span data-wait-auto-label></span></label>
@@ -354,6 +380,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
 
     return {
         adopt,
+        refresh(taskId) { return onDomWrite(() => paint(taskId)); },
         observe(taskId, value) {
             const attempt = Number.isInteger(value?.task_attempt) ? value.task_attempt : 0;
             if (attempt && attempt < (tasks.get(taskId)?.attempt || 0)) return false;

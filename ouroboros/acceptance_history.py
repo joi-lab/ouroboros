@@ -26,6 +26,8 @@ def historical_source_location_owned(location: str) -> bool:
 
     if location == "observations.source_ref" or location in {"evidence." + key for key in _EVIDENCE_SOURCE_REF_FIELDS}:
         return True
+    if location in {f"historical_author_inputs.anchors[{index}].source_ref" for index in (0, 1)}:
+        return True
     index, separator, field = location.removeprefix("trace.tool_calls[").partition("].")
     return bool(location.startswith("trace.tool_calls[") and separator and index.isdecimal()
                 and field in (*TOOL_SOURCE_REF_FIELDS, *("trace_ref." + key for key in CALL_SOURCE_REF_FIELDS)))
@@ -100,14 +102,66 @@ def seed_acceptance_history(ctx: Any, trace: dict, cause: str) -> None:
         log.warning("Acceptance history seed unavailable", exc_info=True)
 
 
+DELIVERY_AUTHOR_MODEL = "model"
+DELIVERY_AUTHOR_HOST = "host"
+
+
+def emitted_delivery_authorship(delivery: dict | None, usage: dict | None) -> str:
+    """Who wrote the bytes the host EMITTED as the terminal answer.
+
+    ``model``: the producer stamped ``model_final``, or a ``host_notice`` whose
+    text is the loop's retained model answer (the typed ``_best_effort_extracted``
+    fact the same forced rails stamp). ``host``: the projector replaced the text
+    with its System incident receipt (``host_salvage``), or a host notice the
+    host wrote alone. ``""``: no stamped origin (a legacy or Presence-rendered
+    row) — unknown provenance, never reclassified from text or length (#1572).
+    """
+    from ouroboros.task_finalization import (
+        TERMINAL_ORIGIN_HOST_NOTICE, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL,
+    )
+
+    delivery = delivery if isinstance(delivery, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    origin = str(delivery.get("terminal_origin") or usage.get("terminal_origin") or "")
+    if origin == TERMINAL_ORIGIN_MODEL_FINAL:
+        return DELIVERY_AUTHOR_MODEL
+    if origin == TERMINAL_ORIGIN_HOST_SALVAGE:
+        return DELIVERY_AUTHOR_HOST
+    if origin == TERMINAL_ORIGIN_HOST_NOTICE:
+        return DELIVERY_AUTHOR_MODEL if usage.get("_best_effort_extracted") is True else DELIVERY_AUTHOR_HOST
+    return ""
+
+
+def host_incident_receipt(record: dict | None) -> bool:
+    """Source-proven: the retained emitted record is the host's incident receipt.
+
+    ``terminal_delivery`` captures the role, system type and origin of the exact
+    bytes it sent. A ``terminal_incident`` System row (the ``host_salvage``
+    projection) is the host's receipt, never a delivered answer; an old record
+    without these keys stays unknown (#1572). Named gap: a legacy ``host_notice``
+    receipt proves nothing either way — the loop's extraction fact was never
+    persisted (new rows mint no debt for a host-written notice at all), so such
+    a debt keeps today's consumption rather than a text-shape guess.
+    """
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
+
+    record = record if isinstance(record, dict) else {}
+    return (str(record.get("system_type") or "") == "terminal_incident"
+            or str(record.get("terminal_origin") or "") == TERMINAL_ORIGIN_HOST_SALVAGE)
+
+
 def retain_acceptance_history(drive_root: Any, task: dict, text: str, trace: dict,
                               evidence: dict, observations: dict, artifacts: list,
-                              delivery: dict | None) -> dict:
+                              delivery: dict | None, *, usage: dict | None = None) -> dict:
     """Pin final values and identities without reading any referenced source bytes.
 
     The ordinary copyback/GC owner promotes retained refs later. Artifact paths
     without an immutable source handle are manifests only, never permission to
     reconstruct historical evidence from whatever bytes happen to be there.
+    The subject is the EMITTED delivery: a host-authored terminal (the salvage
+    receipt, or a notice the host wrote alone) is not a delivery, so it leaves
+    no debt — the row's ``terminal_origin`` and bypass reason remain the record,
+    and the raw model partial stays in the result and salvage copy (#1572).
     """
     from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
     from ouroboros.observability import CALL_SOURCE_REF_FIELDS, TOOL_SOURCE_REF_FIELDS
@@ -115,7 +169,9 @@ def retain_acceptance_history(drive_root: Any, task: dict, text: str, trace: dic
     from ouroboros.utils import utc_now_iso
 
     seed = trace.get("acceptance_history_seed")
-    if not isinstance(seed, dict):
+    if not isinstance(seed, dict) or (usage or {}).get("wake_silent") is True:  # a silent wake emitted no delivery
+        return {}
+    if emitted_delivery_authorship(delivery, usage) == DELIVERY_AUTHOR_HOST:
         return {}
     tid = str(task.get("id") or "")
     canonical = Path(task.get("budget_drive_root") or drive_root)
@@ -148,6 +204,10 @@ def retain_acceptance_history(drive_root: Any, task: dict, text: str, trace: dic
         # references. A nested shape, digest or provenance label grants nothing.
         carriers = [("evidence." + key, evidence.get(key)) for key in _EVIDENCE_SOURCE_REF_FIELDS]
         carriers.append(("observations.source_ref", observations.get("source_ref")))
+        historical_inputs = evidence.get("historical_author_inputs") or {}
+        carriers.extend((f"historical_author_inputs.anchors[{index}].source_ref", anchor.get("source_ref"))
+                        for index, anchor in enumerate(historical_inputs.get("anchors", []))
+                        if index < 2 and isinstance(anchor, dict))
         for index, call in enumerate(trace.get("tool_calls") or []):
             if not isinstance(call, dict):
                 continue
@@ -174,6 +234,7 @@ def retain_acceptance_history(drive_root: Any, task: dict, text: str, trace: dic
             "effective_criteria": candidate.get("effective_criteria", seed["effective_criteria"]),
             "task_contract": task.get("task_contract"),
             "owner_corpus": evidence.get("task_inputs"),
+            "historical_author_inputs": historical_inputs,
             "sources": sources, "artifact_manifests": manifests,
             "trajectory_cutoff": {"tool_calls": len(trace.get("tool_calls") or []),
                                   "reasoning_notes": len(trace.get("reasoning_notes") or [])},
@@ -258,6 +319,8 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
     from ouroboros.owner_mailbox import drain_owner_entries, KIND_HURRY, KIND_FINALIZE_NOW
     from ouroboros.task_results import load_task_result
+    from ouroboros.store import StoreBusy
+    from ouroboros.model_wait import control_probe_active
 
     blocked = []
     root = Path(root)
@@ -333,6 +396,10 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
         accounting = load_task_result(root, debt["accounting_root_task_id"], strict=True)
         if check_paid and (accounting is None or not _zero_physical({}, accounting, pending_panel=pending_panel)):
             blocked.append("paid_or_unknown_panel")
+    except StoreBusy as exc:
+        if exc.reason == "contention" and control_probe_active():
+            raise  # The wait owner retains an unknown probe; it is not a Stop.
+        blocked.append("control_authority_unavailable")
     except Exception:
         blocked.append("control_authority_unavailable")
     return list(dict.fromkeys(blocked))

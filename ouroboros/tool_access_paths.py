@@ -87,6 +87,39 @@ def path_is_relative_to(path: pathlib.Path, root: pathlib.Path) -> bool:
         return False
 
 
+def docker_process_alias_target(ctx: Any, operation: str, text: str, records: list, physical: pathlib.Path):
+    """``(active_workspace record, host target)`` for a Docker process cwd, else None.
+
+    Only shell/service (all four process tools) bind aliases; copy/write keep
+    host targets. A real host address inside active_workspace outranks an alias.
+    Identity mounts keep normal host-root checks; only ``BackendPathNoMatch``
+    falls back for an alias. Invalid or outside-active aliases refuse.
+    """
+    if operation not in {"shell", "service"} or not _tool_access().is_absolute_path_text(text):
+        return None
+    from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx, map_backend_path
+
+    try:
+        executor = executor_ref_from_ctx(ctx)
+    except ValueError:
+        return None  # No usable executor keeps host routing.
+    if executor is None or executor.kind != "docker_exec":
+        return None
+    active = next((record for record in records if record[0] == "active_workspace"), None)
+    if active and path_is_relative_to(physical, active[1]):
+        return active, physical
+    try:
+        mapped = map_backend_path(executor, text)
+    except BackendPathNoMatch:
+        return None
+    if mapped == physical:
+        return None  # An identity mount grants no root; ordinary host rules decide.
+    if active and path_is_relative_to(mapped, active[1]):
+        return active, mapped
+    raise ValueError(f"backend cwd {text!r} maps to host path {mapped}, "
+                     f"outside active_workspace ({active[1] if active else 'unavailable'})")
+
+
 def normalize_root_relative(root: pathlib.Path, path: str) -> str:
     """Map a model-supplied path to a root-relative string when it redundantly
     encodes the root, so structural/read tools accept the paths an agent
@@ -175,6 +208,7 @@ def workspace_mode_block_reason(ctx: Any) -> str:
     protected_values = (
         ("Ouroboros system repo", getattr(ctx, "system_repo_dir", None) or getattr(ctx, "repo_dir", None)),
         ("Ouroboros repo", getattr(ctx, "repo_dir", None)),
+        ("Ouroboros serving repo", getattr(ctx, "serving_repo_dir", None)),
         ("Ouroboros data drive", getattr(ctx, "drive_root", None)),
         (
             "Ouroboros parent data drive",

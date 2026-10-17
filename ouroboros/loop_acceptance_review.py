@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros import task_pacing
 from ouroboros.config import adaptive_quorum
+from ouroboros.observability import timed_phase
 from ouroboros.acceptance_preparation import (
     STAGE_APPLICATION, STAGE_DISPATCH, STAGE_PREPARATION, STAGE_RECONCILE,
 )
@@ -26,13 +27,7 @@ log = logging.getLogger("ouroboros.loop")
 
 
 def _loop():
-    """The parent loop module, read at call time.
-
-    The loop's members stay monkeypatch-addressable at their historical
-    ``ouroboros.loop`` bindings (tests rebind them there), so this leaf
-    resolves every cross-reference through the module at each call instead
-    of freezing whatever object a from-import saw at import time.
-    """
+    """Resolve historical loop bindings at call time; consumers may rebind them."""
     from ouroboros import loop
 
     return loop
@@ -50,8 +45,6 @@ _ACCEPTANCE_REVIEW_CHECKLIST = (
     "A DISCLOSED, task-justified cut is honest best_effort; an unjustified "
     "or silent cut is a finding — name it with severity high and a concrete "
     "recommendation (under blocking enforcement it becomes an obligation). "
-    "Replacing a means the author may change is not itself a scope cut when the requirement "
-    "stays verified; an owner- or parent-fixed method is not the author's to drop. "
     "If the task asks for a specific "
     "value or short answer, check the FINAL ANSWER line matches the "
     "requested format exactly."
@@ -74,17 +67,11 @@ class _TaskAcceptanceContext:
     passes_done: int
     evidence: Dict[str, Any] = field(default_factory=dict)
     review_binding: Dict[str, Any] = field(default_factory=dict)
-    # One pre-rendered rails line (money/time/rounds/passes headroom) built
-    # in loop.py from each real source, fed into the improvement capsule
-    # (v6.74.0 A1, owner Q6); the capsule builder never gains ctx.
+    # The capsule receives real rails, never the mutable caller context.
     rails_line: str = ""
-    # Int-like ceiling plus per-slot caps, resolved once (inside the local
-    # preparation stage, after the repeat guard) so rebuilds cannot drift.
+    # Resolve packet/seat caps once after the preparation repeat guard.
     packet_budget_chars: int = 0
-    # Which typed stage of this pass is running. A failure in `preparation` is
-    # LOCAL and pre-dispatch (no reviewer exists yet); `reconcile`, `dispatch`
-    # and `application` failures concern runs that were already dispatched and
-    # must never be relabelled as "no new reviewer was dispatched".
+    # Only preparation is local/unpaid; later failures concern real panels.
     stage: str = "preparation"
 
 
@@ -113,24 +100,17 @@ def _resolve_ctx_lineage(ctx: Any, task_id: str = "") -> Dict[str, Any]:
 
 
 def prepare_acceptance_observation(ctx: Any, trace: dict, incoming: Any, messages: list, tool_schemas: list) -> None:
-    """Present the current owner-source selector as an append-only transcript row.
-
-    A new row is appended only when the rendered facts changed; earlier rows stay,
-    because rewriting or removing an already-sent message breaks provider prompt
-    caches that only reuse a previous request when it is a byte-prefix of the next
-    (issue #906).
-    """
+    """Append changed owner-source facts; retain earlier rows for prefix caching."""
     from ouroboros.loop_acceptance import capture_acceptance_observation, acceptance_observation_prompt
 
     observed = capture_acceptance_observation(ctx, trace, incoming)
     if not getattr(ctx, "_delivery_control_required", False) and (_loop().get_task_review_mode() not in {"auto", "required"}
             or not any(row.get("function", {}).get("name") == "task_acceptance_review" for row in tool_schemas)):
         return  # an armed control always shows the selector it asks Main to name (subagents, review mode off)
-    # Cognitive-only direct turns (for example ``update_identity``) are ordinary
-    # conversation and are explicitly ineligible for task acceptance. Do not
-    # expose the internal source-selector protocol to Main in that case: after a
-    # successful cognitive tool call it can otherwise answer the selector itself,
-    # replacing the natural conversational response with acceptance bookkeeping.
+    # Ineligible conversation needs no selector bookkeeping unless delivery
+    # already requires a source acknowledgement.
+    # Observation only publishes owner facts. Capture produced sources once at
+    # finalization/admission, not on every (including Auto) model observation.
     lineage = _resolve_ctx_lineage(ctx)
     eligible, _reason = _loop()._task_acceptance_eligible(
         _loop().get_task_review_mode(),
@@ -390,10 +370,11 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         task_id=ctx.task_id,
         retry_key=f"task_acceptance:{ctx.review_binding.get('paid_identity') or task_acceptance_evidence_revision(evidence)}",
         deadline_at=_owner_deadline_at(ctx.tools._ctx),  # R23: the owner window bounds every row
-        # Managed Main actors have the existing mailbox continuation owner.
-        # Standalone callers without it retain their bounded synchronous call.
+        # Managed Main actors have the existing mailbox continuation owner and a Presence
+        # author its narrow review-wait owner. Standalone callers retain their bounded call.
         drain_deadline=(time.monotonic()
                         if callable(getattr(ctx.tools._ctx, "owner_wait_callback", None))
+                        or callable(getattr(ctx.tools._ctx, "review_wait_callback", None))
                         or not review_enforcement_blocks("blocking") else None),
     )
     if not slots:
@@ -445,9 +426,10 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
         )
         if _admission is not None:
             return _refused(
-                "review_wave_budget_insufficient: estimated "
-                f"~${_admission.get('estimated_wave_usd')} > remaining "
-                f"${_admission.get('remaining_usd')} (no reviewer was called)"
+                "review_wave_budget_insufficient: known spend has reached the "
+                f"{_admission.get('binding_axis') or 'budget'} limit (remaining "
+                f"${_admission.get('remaining_usd')}; wave estimated ~${_admission.get('estimated_wave_usd')}; "
+                "no reviewer was called)"
             )
     free_result = _free_dispatch(request, slots, drive_root=drive_root, usage_ctx=ctx.tools._ctx)
     if free_result is not None:
@@ -462,7 +444,7 @@ def _execute_task_acceptance_panel(ctx: _TaskAcceptanceContext) -> Any:
     # Route/candidate refusals remain free; one strict stamp gates every slot.
     started = time.monotonic()
     try:
-        with bind_task_acceptance_paid_dispatch(ctx) as usage_ctx:
+        with timed_phase("acceptance"), bind_task_acceptance_paid_dispatch(ctx) as usage_ctx:
             # The bound packet and admission were local. From this handoff on,
             # transport may exist even if it raises before returning its record.
             ctx.stage = STAGE_DISPATCH
@@ -581,46 +563,64 @@ def _set_applied_host_acceptance_impact(
 
 
 def _finish_cyber_acceptance(ctx: _TaskAcceptanceContext, result: Any) -> bool:
-    """Main's final response is its decision; criticism retains its own facts."""
+    """Return criticism for a decision; only an explicit author act finishes."""
+    from ouroboros.acceptance_settlement import acceptance_wait_chosen
     from ouroboros.loop_delivery import delivery_subject_hash
     from ouroboros.review_records import build_author_disposition
-    from ouroboros.review_substrate import build_improvement_capsule, task_acceptance_is_clean
+    from ouroboros.review_substrate import task_acceptance_is_clean
 
+    tool_ctx = ctx.tools._ctx
     pending = acceptance_run_pending(result)
-    if getattr(ctx.tools._ctx, "_acceptance_review_only", False):
-        if not pending and (capsule := build_improvement_capsule(result, rails_line=ctx.rails_line)):
-            _loop()._append_or_merge_user_message(ctx.messages, capsule)
-        _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="revision")
-        return False  # nomination supplies feedback, never final delivery
-    if _loop()._task_acceptance_owner_generation_changed(ctx.tools._ctx):
-        _loop()._supersede_task_acceptance_for_owner_followup(ctx.tools._ctx, ctx.llm_trace)
+    selected = getattr(tool_ctx, "_completion_selected", None) or {}
+    observed = (selected.get("observation") or {}).get("feedback") or {}
+    explicit = selected.get("action") == "finish"
+    informed = (observed.get("binding_hash") == getattr(result, "binding_hash", ctx.review_binding.get("binding_hash"))
+                and observed.get("settled_feedback_delivered"))
+    if pending and acceptance_wait_chosen(tool_ctx):
         return True
-    released = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="revision")
-    ctx.tools._ctx._task_acceptance_pending = ""  # only the wait; original actors remain custodied
-    ctx.tools._ctx._task_acceptance_reviewed = False  # final ingress, not review, owns delivery sealing
-    clean = not pending and task_acceptance_is_clean(result)
-    signal = "" if pending else str(getattr(result, "aggregate_signal", "") or "")
-    # The submitted final is Main's act (finish); Main stated no stance toward
-    # the criticism, so the record carries the act and no invented disposition.
+    if getattr(tool_ctx, "_acceptance_review_only", False) or not explicit or (
+            not pending and acceptance_wait_chosen(tool_ctx) and not informed):
+        if not pending:
+            _offer_acceptance_feedback(ctx, acceptance_feedback_text(result, rails_line=ctx.rails_line))
+        _loop()._end_task_acceptance_fence(tool_ctx, outcome="revision")
+        return not bool(getattr(tool_ctx, "_acceptance_review_only", False))
+    if _loop()._task_acceptance_owner_generation_changed(tool_ctx):
+        _loop()._supersede_task_acceptance_for_owner_followup(tool_ctx, ctx.llm_trace)
+        return True
+    from ouroboros.presence_continuation import keep_author_for_criticism
+
+    if pending and keep_author_for_criticism(ctx):
+        return True
+    released = _loop()._end_task_acceptance_fence(tool_ctx, outcome="revision")
+    tool_ctx._task_acceptance_pending = ""  # physical actors keep custody
+    tool_ctx._task_acceptance_reviewed = False  # final ingress seals delivery
+    clean = (not pending and task_acceptance_is_clean(result)
+             and not getattr(result, "superseded_by_revision", False)
+             and getattr(result, "subject_hash", ctx.review_binding.get("subject_hash"))
+             == delivery_subject_hash(tool_ctx, ctx.llm_trace, ctx.content))
+    stance = ctx.llm_trace.get("acceptance_decision") or {}
     author = build_author_disposition(
-        disposition="", action="finish",
-        rationale="Main submitted this complete response for delivery; independent review remains advisory.",
-        # Evidence assembly can fail before a review binding exists. Bind the
-        # author's decision to its real subject without inventing a reviewed pack.
-        subject_hash=ctx.review_binding.get("binding_hash") or delivery_subject_hash(ctx.tools._ctx, ctx.llm_trace, ctx.content),
-        reviewer_signal=signal,
-        enforcement="advisory", source="author_final_response",
+        disposition=str(stance.get("agent_disposition") or ""), action="finish",
+        rationale=str(selected.get("rationale") or stance.get("agent_rationale") or "").strip() or "Explicit completion selection.",
+        subject_hash=delivery_subject_hash(tool_ctx, ctx.llm_trace, ctx.content),
+        reviewer_signal="" if pending else str(getattr(result, "aggregate_signal", "") or ""),
+        enforcement="advisory", source=str(selected.get("source") or "finish_task"),
     )
+    # The author's finish is intent; a still-running panel stays in flight in
+    # the projection (the admission pass rewrote eligibility before this act).
     ctx.llm_trace["review_decision"].update(author_finish=True, review_pending=pending,
-                                          admission_released=bool(released))
+                                          admission_released=bool(released),
+                                          **({"eligibility": "review_in_flight", "operation_state": "in_flight"}
+                                             if pending else {}))
     _loop()._set_acceptance_decision(ctx.llm_trace, {
         "status": ACCEPTANCE_ACCEPTED if clean else ACCEPTANCE_FINALIZED_UNACCEPTED,
         "reason": "clean_pass" if clean else "author_finish", "source": "task_acceptance_review",
         "author_disposition": author, "review_pending": pending,
     })
-    ctx.emit_progress("Task acceptance feedback remains advisory; Main chose delivery."
+    ctx.emit_progress("Author selected completion with advisory review."
                       + (" Review is still running." if pending else ""))
     return False
+
 
 def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     """Honor an informed Advisory finish or an explicit non-authorizing stop."""
@@ -629,12 +629,10 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     action = str(intent.get("author_action") or "finish")
     if action != "stop" and review_enforcement_blocks(_loop().get_review_enforcement()):
         return False
-    feedback = next((run for run in reversed(ctx.llm_trace.get("review_runs") or [])
-                     if isinstance(run, dict) and run.get("authority") == "host_root"
-                     and run.get("feedback_delivered")), None)
+    from ouroboros.loop_delivery import completion_feedback
+
     outcome = ctx.llm_trace.get("acceptance_review_outcome") or {}
-    if not feedback and outcome.get("feedback_delivered"):
-        feedback = outcome
+    feedback = completion_feedback(ctx.llm_trace) or None
     disposition = str(stance.get("agent_disposition") or "")
     if not intent or (disposition and disposition not in {"accepted", "rejected", "partial", "deferred"}):
         return False
@@ -644,6 +642,19 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     # fingerprint, and rejecting the stop for that bought a panel whose
     # advisory author_finish then read as Done over "not ready".
     if action != "stop":
+        from ouroboros.acceptance_settlement import acceptance_wait_chosen, panel_awaiting_this_turn
+
+        awaited = panel_awaiting_this_turn(ctx.tools._ctx, ctx.llm_trace)
+        if awaited is not None and acceptance_run_pending(awaited):
+            return False  # Delivery owns a running panel: wait, or release while the author stays for criticism.
+        waiting = awaited or feedback
+        # A no-panel host outcome (refused launch, unavailable review) has no
+        # reviewer left to settle: its exposure is the settled feedback. Only a
+        # physical panel can still be pending or unread.
+        if acceptance_wait_chosen(ctx.tools._ctx) and waiting and waiting is not outcome and (
+                acceptance_run_pending(waiting) or not waiting.get("settled_feedback_delivered")):
+            return False
+        from ouroboros.acceptance_settlement import delivery_approves_clean_feedback
         from ouroboros.loop_delivery import delivery_evidence_fingerprint
         from ouroboros.tool_capabilities import completion_observation_calls
 
@@ -652,14 +663,16 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
                 or intent.get("owner_directives") != len(getattr(ctx.tools._ctx, "_owner_directives", []) or [])
                 or intent.get("evidence_fingerprint") != delivery_evidence_fingerprint(ctx.tools._ctx, ctx.llm_trace)):
             return False
+        if delivery_approves_clean_feedback(ctx.tools._ctx, ctx.llm_trace, feedback, ctx.review_binding["binding_hash"]):
+            return False  # Clean approval stays clean: ordinary delivery approves it at $0.
     from ouroboros.review_records import build_author_disposition
 
     author = build_author_disposition(
-        disposition=disposition, rationale=str(stance.get("agent_rationale") or ""),
+        disposition=disposition, rationale=str(stance.get("agent_rationale") or "").strip() or "Explicit completion selection.",
         subject_hash=ctx.review_binding["binding_hash"],
         reviewer_signal=str((feedback or {}).get("aggregate_signal") or ""),
         enforcement="blocking" if review_enforcement_blocks(_loop().get_review_enforcement()) else "advisory",
-        action=action,
+        action=action, source=str((getattr(ctx.tools._ctx, "_completion_selected", None) or {}).get("source") or "author"),
     )
     from ouroboros.task_results import project_task_acceptance_review_capacity
 
@@ -705,16 +718,24 @@ def _slot_cause_clause(result: Any) -> str:
     return f" Causes: {note}" if note else ""
 
 
-def _offer_acceptance_feedback(ctx: _TaskAcceptanceContext, feedback: str) -> None:
+def acceptance_feedback_text(result: Any, *, rails_line: str = "") -> str:
+    """A clean PASS has no improvement capsule, but is still a real verdict."""
+    from ouroboros.review_substrate import build_improvement_capsule
+    return (build_improvement_capsule(result, rails_line=rails_line)
+            or f"[Task acceptance feedback] Review verdict: {getattr(result, 'aggregate_signal', '') or 'UNKNOWN'} for the nominated answer.")
+
+
+def _offer_acceptance_feedback(ctx: _TaskAcceptanceContext, feedback: str, *, binding_hash: str | None = None) -> None:
     """Offer exact-panel feedback; the returned Main request proves delivery."""
     runs = ctx.llm_trace.get("review_runs") or []
     for index in range(len(runs) - 1, -1, -1):
         run = runs[index]
         if (isinstance(run, dict) and run.get("authority") == "host_root"
-                and run.get("binding_hash") == ctx.review_binding.get("binding_hash")):
+                and run.get("binding_hash") == (binding_hash or ctx.review_binding.get("binding_hash"))):
             run["feedback_offered"] = True
             ctx.messages.append({"role": "user", "content": feedback, "review_feedback": [{
                 "task_id": ctx.task_id, "run_index": index, "binding_hash": str(run.get("binding_hash") or ""),
+                "settled": not acceptance_run_pending(run),
             }]})
             break
 
@@ -736,6 +757,10 @@ def _apply_task_acceptance_result(
         _record_host_acceptance_run(ctx, result)
     if not review_enforcement_blocks("blocking"):
         return _finish_cyber_acceptance(ctx, result)
+    if task_acceptance_is_clean(result) and not getattr(result, "settled_feedback_delivered", False):
+        _offer_acceptance_feedback(ctx, acceptance_feedback_text(result, rails_line=ctx.rails_line))
+        _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="revision")
+        return True
     dissent = dissent_findings(result)
     blocking_lane = review_enforcement_blocks(_loop().get_review_enforcement())
     # Reused panels already have obligations; collecting twice changes evidence
@@ -800,7 +825,7 @@ def _apply_task_acceptance_result(
         capsule = (f"[Acceptance review outcome] {result.aggregate_signal}. "
                    + _slot_cause_clause(result)
                    + " No clean acceptance was established. Inspect this outcome, request another review only if useful and permitted, "
-                   "or choose author_action='stop'. Advisory may explicitly finish with a rationale; Blocking still requires fresh approval.")
+                   "or choose author_action='stop' with a rationale. Advisory may explicitly finish; Blocking still requires fresh approval.")
     if pass_ok:
         _loop()._set_acceptance_decision(ctx.llm_trace, {
             "status": ACCEPTANCE_REVISION_REQUESTED,
@@ -922,7 +947,7 @@ def _offer_acceptance_refusal(ctx: _TaskAcceptanceContext, reason: str, *, host_
         (f"Acceptance host processing failed: {reason}. Original reviewer evidence is retained; no replacement review was called. " if host_failure else
          f"Acceptance review could not start: {reason}. No new reviewer was called. ") +
         "You may preserve corrections or stop; Blocking grants no advancement without fresh review. "
-        "Advisory may finish explicitly with a rationale."), "review_feedback": [{
+        "Advisory may finish explicitly; stop requires a rationale."), "review_feedback": [{
             "task_id": ctx.task_id, "outcome_binding_hash": binding}]})
     _loop()._set_acceptance_decision(ctx.llm_trace, {"status": ACCEPTANCE_REVISION_REQUESTED,
         "reason": "review_outcome_received", "source": "task_acceptance_review",
@@ -1107,7 +1132,7 @@ def _prior_acceptance_run(
 
     def _matches(run: Any) -> bool:
         return isinstance(run, dict) and (
-            str(run.get("binding_hash") or "") == binding_hash
+            bool(binding_hash and str(run.get("binding_hash") or "") == binding_hash)
             or bool(identity and str(run.get("paid_identity") or "") == identity)
         )
 
@@ -1294,84 +1319,83 @@ def _run_task_acceptance_review_once(
     Loop-side rails facts arrive via the ``_acceptance_loop_rails`` ctx stash
     (set by ``_no_tool_final_answer``; keeps the signature at 8 params)."""
     mode = _loop().get_task_review_mode()
-    _loop()._latch_final_answer_marker(llm_trace, content)
-    subject_error = None
-    if getattr(tools._ctx, "_task_acceptance_reviewed", False):
-        from ouroboros.loop_delivery import delivery_subject_hash
-        from ouroboros.acceptance_preparation import preparation_delivery_choice
-
-        reviewed_subject = getattr(tools._ctx, "_task_acceptance_reviewed_subject", "")
-        try:
-            # Both early reads are fallible host work over the same material: a
-            # failure here is accounted under the local incident guard below,
-            # never read as permission to deliver under an older verdict.
-            if preparation_delivery_choice(tools._ctx, llm_trace):
-                return False
-            if not reviewed_subject or reviewed_subject == delivery_subject_hash(tools._ctx, llm_trace, content):
-                return False
-        except Exception as exc:
-            subject_error = exc  # Account below, under the same local incident guard.
-        tools._ctx._task_acceptance_reviewed = False
-    from ouroboros.review_evidence import acceptance_packet_budget_chars
-
-    eligible, trigger = _observe_host_acceptance_request(tools, llm_trace, task_id, mode)
-    if not eligible:
-        return False
-    # Owner hurry (§19.7.2 item 8): AFTER structural eligibility is known,
-    # BEFORE acceptance-fence/quiescence/reviewer admission, an armed latch
-    # skips the next otherwise-eligible panel with the typed reason — no
-    # reviewer calls (an in-flight panel is never cancelled/relabeled).
-    from ouroboros.owner_hurry import acceptance_skip_applied, effective_budget_profile
-
-    if acceptance_skip_applied(
-        tools._ctx, llm_trace, task_id=task_id, drive_root=drive_root,
-        set_decision=_loop()._set_acceptance_decision, emit_progress=emit_progress,
-    ):
-        return False
-    # A fence that answered no or not at all buys no model round: the panel runs on the
-    # disclosed rail `admission_fence_available=False` and final delivery seals again.
-    fence_ok, _fence_token = _loop()._begin_task_acceptance_fence(tools._ctx, task_id)
-    quiescent, subtree_statuses = _loop()._task_acceptance_subtree_snapshot(tools._ctx, drive_root, task_id)
-    if not quiescent and review_enforcement_blocks("blocking"):
-        _record_subtree_quiescence_wait(llm_trace, messages, emit_progress,
-                                        trigger=trigger, subtree_statuses=subtree_statuses)
-        return True
-    llm_trace["review_decision"].update(admission_fence_available=bool(fence_ok), subtree_quiescent=quiescent)
-    # One effective profile carries explicit author caps/Hurry to gates and display.
-    budget_profile = effective_budget_profile(tools._ctx, task_pacing.resolve_budget_profile(tools._ctx))
-    budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
-    passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
     review_ctx = _TaskAcceptanceContext(
         tools=tools, content=content, task_id=task_id, task_type=task_type,
-        llm_trace=llm_trace,
-        drive_root=drive_root,
-        messages=messages,
-        emit_progress=emit_progress,
-        mode=mode,
-        subtree_statuses=subtree_statuses,
-        budget_profile=budget_profile,
-        passes_done=passes_done,
-        evidence={},
-        review_binding={},
-        rails_line=task_pacing.acceptance_rails_line(
-            budget_snapshot,
-            budget_profile,
-            passes_done,
-            getattr(tools._ctx, "_acceptance_loop_rails", None),
-            required_blocking=(
-                mode == "required" and review_enforcement_blocks(_loop().get_review_enforcement())
-            ), workspace=task_pacing._workspace_delivery(tools._ctx),
-        ),
+        llm_trace=llm_trace, drive_root=drive_root, messages=messages,
+        emit_progress=emit_progress, mode=mode, subtree_statuses=[],
+        budget_profile=task_pacing.resolve_budget_profile(tools._ctx),
+        passes_done=int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0)),
     )
     try:
-        from ouroboros import acceptance_preparation as prep
-        from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
+        from ouroboros.acceptance_settlement import continue_acceptance_wait
 
-        # Reconciling ALREADY-DISPATCHED runs is its own stage: a failure here
-        # concerns real paid panels and never claims "no new reviewer was dispatched".
+        # Paid collection precedes new source preparation AND reviewed early exits.
+        # Failure remains a reconciliation fact beside the original operation.
         review_ctx.stage = STAGE_RECONCILE
-        reconcile_pending_acceptance_runs(
-            llm_trace, drive_root=drive_root or tools._ctx.drive_root, usage_ctx=tools._ctx)
+        if continue_acceptance_wait(tools._ctx, llm_trace, messages, task_id):
+            return True
+        review_ctx.stage = STAGE_PREPARATION
+        _loop()._latch_final_answer_marker(llm_trace, content)
+        from ouroboros.acceptance_material import retain_acceptance_material
+
+        from ouroboros.loop_acceptance import recorded_acceptance_nomination
+        retain_acceptance_material(tools._ctx, llm_trace, content, include_outputs=(
+            mode == "required" or recorded_acceptance_nomination(llm_trace)
+            or bool(llm_trace.get("review_runs"))))
+        subject_error = None
+        if getattr(tools._ctx, "_task_acceptance_reviewed", False):
+            from ouroboros.loop_delivery import delivery_subject_hash
+            from ouroboros.acceptance_preparation import preparation_delivery_choice
+
+            reviewed_subject = getattr(tools._ctx, "_task_acceptance_reviewed_subject", "")
+            try:
+                # Account failed early reads below; they authorize no older verdict.
+                if preparation_delivery_choice(tools._ctx, llm_trace):
+                    return False
+                if not reviewed_subject or reviewed_subject == delivery_subject_hash(tools._ctx, llm_trace, content):
+                    return False
+            except Exception as exc:
+                subject_error = exc  # Account below, under the same local incident guard.
+            tools._ctx._task_acceptance_reviewed = False
+        from ouroboros.review_evidence import acceptance_packet_budget_chars
+
+        eligible, trigger = _observe_host_acceptance_request(tools, llm_trace, task_id, mode)
+        if not eligible:
+            return False
+        # Owner hurry (§19.7.2 item 8): AFTER structural eligibility is known,
+        # BEFORE acceptance-fence/quiescence/reviewer admission, an armed latch
+        # skips the next otherwise-eligible panel with the typed reason — no
+        # reviewer calls (an in-flight panel is never cancelled/relabeled).
+        from ouroboros.owner_hurry import acceptance_skip_applied, effective_budget_profile
+
+        if acceptance_skip_applied(
+            tools._ctx, llm_trace, task_id=task_id, drive_root=drive_root,
+            set_decision=_loop()._set_acceptance_decision, emit_progress=emit_progress,
+        ):
+            return False
+        # A fence that answered no or not at all buys no model round: the panel runs on the
+        # disclosed rail `admission_fence_available=False` and final delivery seals again.
+        fence_ok, _fence_token = _loop()._begin_task_acceptance_fence(tools._ctx, task_id)
+        quiescent, subtree_statuses = _loop()._task_acceptance_subtree_snapshot(tools._ctx, drive_root, task_id)
+        if not quiescent and review_enforcement_blocks("blocking"):
+            _record_subtree_quiescence_wait(llm_trace, messages, emit_progress,
+                                            trigger=trigger, subtree_statuses=subtree_statuses)
+            return True
+        llm_trace["review_decision"].update(admission_fence_available=bool(fence_ok), subtree_quiescent=quiescent)
+        # One effective profile carries explicit author caps/Hurry to gates and display.
+        budget_profile = effective_budget_profile(tools._ctx, task_pacing.resolve_budget_profile(tools._ctx))
+        budget_snapshot = task_pacing.build_budget_snapshot(tools._ctx, profile=budget_profile)
+        passes_done = int(getattr(tools._ctx, "_task_acceptance_improvement_passes", 0))
+        review_ctx.subtree_statuses = subtree_statuses
+        review_ctx.budget_profile = budget_profile
+        review_ctx.passes_done = passes_done
+        review_ctx.rails_line = task_pacing.acceptance_rails_line(
+            budget_snapshot, budget_profile, passes_done,
+            getattr(tools._ctx, "_acceptance_loop_rails", None),
+            required_blocking=mode == "required" and review_enforcement_blocks(_loop().get_review_enforcement()),
+            workspace=task_pacing._workspace_delivery(tools._ctx),
+        )
+        from ouroboros import acceptance_preparation as prep
         from types import SimpleNamespace
 
         from ouroboros.review_substrate import build_review_binding
@@ -1382,11 +1406,8 @@ def _run_task_acceptance_review_once(
         if _loop()._task_acceptance_owner_generation_changed(tools._ctx):
             _loop()._supersede_task_acceptance_for_owner_followup(tools._ctx, llm_trace)
             return True
-        # The material's identity comes FIRST and cannot raise, so an exposed,
-        # unresolved failure over unchanged material is refused before any
-        # fallible pre-binding computation (packet budget, subject hash,
-        # builder) can run again and count a host attempt that never reached
-        # the builder; a builder that raises still has a stable incident.
+        # Stable incident identity precedes fallible assembly: unchanged failed
+        # material cannot count a new preparation attempt before the builder.
         prep_record, handled = prep.open_local_preparation(review_ctx)
         if handled is not None:
             return handled
@@ -1415,8 +1436,7 @@ def _run_task_acceptance_review_once(
             _loop()._supersede_task_acceptance_for_owner_followup(tools._ctx, llm_trace)
             return True
         binding_hash = str(review_ctx.review_binding.get("binding_hash") or "")
-        # A-material: what the tree's wallet actually buys. Stamped onto the
-        # binding before the free-replay lookup and the dispatch claim both read it.
+        # Paid identity precedes both free replay and dispatch claims.
         paid_identity = bind_acceptance_paid_identity(review_ctx.review_binding, llm_trace)
         seen_bindings, prior_run = _prior_acceptance_run(
             tools._ctx, llm_trace, binding_hash, paid_identity=paid_identity,
@@ -1452,9 +1472,7 @@ def _run_task_acceptance_review_once(
                 "panel_id", "paid_identity", "subject_hash",
             ) if key in prior_run}}
         elif binding_hash in seen_bindings:
-            # A process-local attempt without its authoritative trace is not
-            # safe to repeat or silently accept. The infra-degraded path below
-            # records the missing authority and closes finalization honestly.
+            # Missing paid authority permits neither resend nor acceptance.
             raise RuntimeError("acceptance binding was attempted but its host run is unavailable")
         else:
             launch_ok, launch_reason = task_pacing.review_launch_allowed(budget_snapshot)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import posixpath
 from typing import Any, Dict, Iterable, List
 
 from ouroboros.shell_parse import (
@@ -15,7 +16,7 @@ from ouroboros.shell_parse import (
 )
 from ouroboros.tool_access import ResolvedResourceBinding, resolve_shell_cwd
 from ouroboros.tools.shell_guards import interpreter_family
-from ouroboros.workspace_executor import executor_ref_from_ctx, map_backend_path, map_host_path
+from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx, map_backend_path, map_host_path
 
 _DEFAULT_DENIED_OPERATIONS = frozenset({
     "read_bytes",
@@ -160,6 +161,7 @@ def _base_roots(
         getattr(ctx, "workspace_root", None),
         getattr(ctx, "repo_dir", None),
         getattr(ctx, "system_repo_dir", None),
+        getattr(ctx, "serving_repo_dir", None),
         getattr(ctx, "drive_root", None),
     )
     for value in values:
@@ -397,9 +399,22 @@ def _resolve_candidate_path(ctx: Any, work_dir: pathlib.Path, text: str) -> path
         if is_absolute_path_text(text):
             try:
                 executor_ref = executor_ref_from_ctx(ctx)
-                return map_backend_path(executor_ref, text) if executor_ref is not None else path.resolve(strict=False)
             except Exception:
-                return path.resolve(strict=False)
+                executor_ref = None
+            if executor_ref is not None:
+                try:
+                    return map_backend_path(executor_ref, text)
+                except BackendPathNoMatch:
+                    pass  # Only a genuine no-match keeps the host spelling.
+                except Exception:
+                    # A matched but unmappable spelling (traversal) names the
+                    # container's lexical target, never a host reinterpretation.
+                    normalized = posixpath.normpath(slash_normalize_path_text(text))
+                    try:
+                        return map_backend_path(executor_ref, normalized)
+                    except Exception:
+                        return pathlib.Path(normalized)
+            return path.resolve(strict=False)
         return (pathlib.Path(work_dir) / path).resolve(strict=False)
     except (OSError, TypeError, ValueError):
         return None

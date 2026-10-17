@@ -46,6 +46,20 @@ def _tracked_subprocess_run(cmd, **kwargs):
         kwargs.setdefault("errors", "replace")
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     kwargs.update(subprocess_new_group_kwargs())
+    from ouroboros.process_scope import record_task_group, scoped_child_env, task_launch_target
+    from ouroboros.tool_custody import invocation_binding
+
+    binding = invocation_binding()
+    target = task_launch_target(binding)
+    if target is not None:
+        # The task scope marker rides THIS launch's env only (never os.environ): the
+        # child and whatever it leaves behind belong to the task until the task ends
+        # (DEVELOPMENT "Process Custody Rule"); the command's own process group is
+        # recorded below, which is what reaches a platform binary on macOS.
+        kwargs["env"] = scoped_child_env(kwargs["env"] if kwargs.get("env") is not None else os.environ, target)
+    from ouroboros.tool_custody import external_handoff
+    confirmed = external_handoff("shell_process")
+    proc = None
     _spawning_subprocesses += 1
     try:
         if _panic_requested:
@@ -59,13 +73,19 @@ def _tracked_subprocess_run(cmd, **kwargs):
                 exc.process_not_started = True
                 raise
         _active_subprocesses.add(proc)  # publish before the spawning owner can exit
-        from ouroboros.tool_custody import invocation_binding
         from ouroboros.workspace_executor import _register_process
-        binding = invocation_binding()
+        if target is not None:  # task scope only; the foreground receipt keeps its own condition below
+            record_task_group(*target, proc.pid)
         if binding.get("drive_root") and binding.get("task_id"):
             record_path = _register_process(pathlib.Path(binding["drive_root"]), {
                 "record_type": "foreground", "executor_type": "local", "executor_id": "host",
                 "host_pid": proc.pid})
+            if record_path is not None:
+                confirmed()
+    except BaseException:
+        if proc is None:
+            confirmed()
+        raise
     finally:
         _spawning_subprocesses -= 1
     try:
@@ -79,6 +99,7 @@ def _tracked_subprocess_run(cmd, **kwargs):
         raise
     finally:
         if proc.poll() is not None:
+            confirmed()
             from ouroboros.workspace_executor import _forget_process
             _active_subprocesses.discard(proc)
             _forget_process(record_path)
@@ -110,7 +131,14 @@ def _shell_env_for_cwd(ctx: ToolContext, work_dir: pathlib.Path) -> dict:
     shadow-import Ouroboros's own modules (R2). ``ctx.repo_dir`` stays pinned to
     the Ouroboros repo even in workspace mode, so this is the authoritative
     in-repo test. Every child receives the task environment; in-repo commands
-    retain the repository Python path."""
+    retain the repository Python path. A cwd inside the bound body candidate gets
+    the candidate's own isolated environment instead (``body_candidate``): its
+    code must never resolve the serving data root or repository."""
+    from ouroboros import body_candidate
+
+    isolated = body_candidate.process_environment(ctx, work_dir)
+    if isolated is not None:
+        return isolated
     env = runtime_environ()
     try:
         system_repo = pathlib.Path(getattr(ctx, "repo_dir")).resolve(strict=False)

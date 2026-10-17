@@ -24,9 +24,10 @@ def test_the_open_conversation_starts_after_the_legacy_frontier(tmp_path):
     _a, identity, changing, _cap = blocks(env, memory, {"id": "tmain", "chat_id": 1})
     room = section(changing, "## This room (Main)")
     assert "] next please" in room and "] and more" in room  # after the frontier: verbatim
-    # before it: the retold records of this room, whole; the first block's in my story, not repeated on the page
-    assert "\n  Main talk." in section(identity, "## My story") and "Main talk." not in room
-    assert "Main was quiet." in room
+    # All retold records are whole in the common story; the room keeps its open conversation.
+    story = section(identity, "## My story")
+    for record in ("Main talk.", "Main was quiet."):
+        assert f"\n  {record}" in story and record not in room
     for retold in ("] hello\n", "] hello back", "alpha question", "agent traffic"):
         assert retold not in changing, retold
 
@@ -45,8 +46,10 @@ def test_main_sees_other_rooms_as_lines_and_a_project_task_its_own_room(tmp_path
 
     _a, identity, bound, _cap = blocks(env, memory, {"id": "bound", "chat_id": 1})  # bound to alpha, written in Main
     room = section(bound, f"## This room ({alpha})")
-    assert "] alpha again" in room and "Alpha worked." in room
-    assert "\n  Alpha began." in section(identity, "## My story") and "Alpha began." not in room  # first block: story
+    assert "] alpha again" in room  # current room detail stays verbatim
+    story = section(identity, "## My story")
+    for record in ("Alpha began.", "Alpha worked."):
+        assert f"\n  {record}" in story and record not in room
     assert "next please" not in bound and "beta again" not in bound
     assert "### Main — open" in section(bound, "## Live rooms")
 
@@ -112,6 +115,7 @@ def test_append_journal_milestone_bounds_over_limit_with_pointer(tmp_path, monke
     txt = rows[0]["text"]
     assert len(txt) <= _MAX_TEXT_CHARS         # honors the durable per-row contract
     assert "task_results" in txt               # VISIBLE pointer to the full text
+    assert "digest" not in txt                 # recency event carries no full text
 
 
 def test_world_profile_is_loaded_with_stable_memory(tmp_path):

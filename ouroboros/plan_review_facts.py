@@ -1,16 +1,18 @@
-"""Host-recorded plan-review facts for the learning surfaces (reflection, late settlement).
+"""Host-recorded plan-review facts for a review panel that settled after its task ended.
 
-The post-task reflection asks the mind to account for every review finding, yet its
-evidence held only the commit/advisory ledger and the acceptance panels: what the PLAN
-review found, how the author answered, whether the element survived in the plan the
-author finally selected, and which reviewers never answered all vanished at task end.
-This leaf reads the recorded plan-review state and projects those facts, bounded and
-with a source pointer. It scores nothing and decides nothing: which advice mattered is
-the mind's judgement (BIBLE P5/P13); the host only keeps the facts in front of it.
+What the plan's reviewers objected to and whether each raiser withdrew it (for an
+earlier-schema wave: what it found, how the author answered, whether the element
+survived in the plan the author finally selected, and which reviewers never answered)
+would vanish at task end. This leaf reads the task's plan record, else its recorded
+plan-review state, and projects those facts, bounded and with a source pointer, into
+the one host row a late acceptance settlement appends to the reflection log. It scores
+nothing and decides nothing: which advice mattered is the mind's judgement (BIBLE
+P5/P13); the host only keeps the facts in front of it.
 
-One builder for the whole slice (``plan_review_reflection_slice``), one pure core over
-an already-loaded state (``facts_from_state``) so tests need no drive, and one bounded
-row for a panel that settled after the task ended (``late_settlement_reflection_entry``).
+One builder for the whole slice (``plan_review_reflection_slice``), pure cores over an
+already-loaded record or state (``facts_from_record``, ``facts_from_state``) so tests
+need no drive, and one bounded row for a panel that settled after the task ended
+(``late_settlement_reflection_entry``).
 Every cut the fit makes is counted in ``omitted``; an unreadable recorded source is a
 named ``unavailable`` fact, never rendered as "nothing was there".
 """
@@ -23,10 +25,11 @@ import pathlib
 from typing import Any, Dict, List, Mapping, Optional
 
 from ouroboros.utils import utc_now_iso
+from ouroboros.store import StoreError
 
 log = logging.getLogger(__name__)
 
-# Fit limits for a Light-route prompt section and a context row, not judgements.
+# Fit limits for the projected facts and the context row, not judgements.
 PLAN_REVIEW_REFLECTION_CHARS = 6_000
 LATE_SETTLEMENT_ROW_CHARS = 1_500
 _TEXT_CHARS = 200
@@ -295,14 +298,37 @@ def _render(facts: Mapping[str, Any]) -> str:
 
 
 def render_plan_review_section(facts: Mapping[str, Any]) -> str:
-    """The prompt section the reflection reads first: facts, with the judgement left to the reader."""
+    """The rendered facts the fit bounds, with the judgement left to the reader."""
     return _SECTION_HEADING + _render(facts)
 
 
+def facts_from_record(record: Mapping[str, Any], *, claims_source: str = "",
+                      source_ref: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """The planning organ's record as the late-settlement row prints it: how many revisions and
+    asks there were, and every objection with its standing (``plan_record.fold_objections``:
+    open / withdrawn / not adjudicated / owner-marked). Nothing else of the record is rendered
+    anywhere, so nothing else is projected. ``None`` when the task never wrote a plan."""
+    from ouroboros import plan_record
+
+    if not plan_record.engaged(record):
+        return None
+    return {
+        "organ": "plan_record", "source_ref": dict(source_ref or {}), "claims_source": claims_source or "unknown",
+        "revisions": len(record.get("revisions") or []), "asks": len(record.get("asks") or []),
+        "objections": [{"seat_id": o.get("seat_id"), "id": o.get("id"), "text": _cut(o.get("text"), _TEXT_CHARS),
+                        "raised_in": o.get("raised_in"), "open": bool(o.get("open")), "holds": bool(o.get("holds")),
+                        "not_adjudicated": bool(o.get("not_adjudicated")), "withdrawn_in": o.get("withdrawn_in") or "",
+                        "why_withdrawn": _cut(o.get("why"), _TEXT_CHARS)}
+                       for o in plan_record.fold_objections(record) if not o.get("unknown_withdrawal")],
+    }
+
+
 def plan_review_reflection_slice(root: Any, task_id: str, *, task: Optional[Mapping[str, Any]] = None) -> Optional[Dict[str, Any]]:
-    """Load one task's plan-review record and project it; ``None`` without waves, a disclosed
-    ``{"unavailable": …}`` when a recorded source cannot be read or the wave the author
-    answered is not in the index (no other wave is substituted for it)."""
+    """Load one task's plan record and project it (``facts_from_record``); a task that only
+    has a v1/v2 ``plan_review_state`` keeps the legacy projection below. ``None`` without a
+    plan, a disclosed ``{"unavailable": …}`` when a recorded source cannot be read or the
+    wave the author answered is not in the index (no other wave is substituted for it)."""
+    from ouroboros import plan_record
     from ouroboros.task_results import current_plan_review_wave, load_plan_review_state, plan_review_wave
     from ouroboros.tools.plan_review_artifacts import PlanReviewSourceUnavailable, authority_wave, current_author_plan
 
@@ -315,8 +341,22 @@ def plan_review_reflection_slice(root: Any, task_id: str, *, task: Optional[Mapp
         return {"unavailable": str(reason), "source_ref": source_ref}
 
     try:
+        record = plan_record.load_plan_record(drive, str(task_id))
+    except (plan_record.PlanRecordInvalid, OSError, ValueError, StoreError) as exc:
+        return unavailable(exc)
+    if plan_record.engaged(record):
+        claims_source = ""
+        try:
+            from ouroboros.review_evidence_sections import _accept_effective_claims
+
+            contract = (task or {}).get("task_contract") if isinstance((task or {}).get("task_contract"), Mapping) else {}
+            claims_source = _accept_effective_claims(None, dict(contract or {}), drive, str(task_id))[1]
+        except Exception:
+            log.debug("plan facts: claims source unavailable", exc_info=True)
+        return facts_from_record(record, claims_source=claims_source, source_ref={**source_ref, "field": "plan_record"})
+    try:
         state = load_plan_review_state(drive, str(task_id))
-    except (PlanReviewSourceUnavailable, OSError, ValueError) as exc:
+    except (PlanReviewSourceUnavailable, OSError, ValueError, StoreError) as exc:
         return unavailable(exc)
     if not (state.get("waves") or []):
         return None
@@ -365,15 +405,24 @@ def _late_panel(result: Mapping[str, Any], retry_key: str) -> Optional[Dict[str,
     return None
 
 
+def _standing(objection: Mapping[str, Any]) -> str:
+    """An objection's standing in the late row: withdrawn, or open (raised by an
+    owner-marked seat of its ask, not yet adjudicated by its raiser)."""
+    if not objection.get("open"):
+        return "withdrawn"
+    return ", ".join(["open"] + (["owner-marked"] if objection.get("holds") else [])
+                     + (["not adjudicated"] if objection.get("not_adjudicated") else []))
+
+
 def late_settlement_reflection_entry(root: Any, task_id: str, retry_key: str) -> Optional[Dict[str, Any]]:
     """One bounded reflection row for a panel that settled after its task ended.
 
-    The reflection that already ran was written over a still-running panel; this row
-    puts the settled verdict (the host's own sentence), each reviewer's output and the
-    plan findings of the touched elements into the same log, so the next tasks read it
-    through the ordinary recent-reflections window. No model call, no marker: the
-    Pattern Register stays closed (``_admits_pattern_register`` reads error evidence).
-    The source pointer comes right after the verdict, so a bounded row never loses it.
+    The task ended over a still-running panel; this row puts the settled verdict (the
+    host's own sentence), each reviewer's output and the plan's objections (for an
+    earlier-schema wave, the findings of its touched elements) into the reflection log,
+    whose host rows integrating contexts render whole (``context.build_recent_sections``).
+    No model call and no lesson: what it means is the mind's to judge. The source
+    pointer comes right after the verdict, so a bounded row never loses it.
     """
     from ouroboros.task_results import load_task_result
     from ouroboros.utils import truncate_within_limit
@@ -397,6 +446,12 @@ def late_settlement_reflection_entry(root: Any, task_id: str, retry_key: str) ->
         facts = {"unavailable": str(exc)}
     if isinstance(facts, Mapping) and facts.get("unavailable"):
         lines.append(f"Plan-review facts unavailable: {_cut(facts['unavailable'], 200)}")
+    elif isinstance(facts, Mapping) and facts.get("organ") == "plan_record":
+        objections = facts.get("objections") or []
+        shown = objections[:_LATE_ROW_ELEMENTS_SHOWN]
+        lines.append(f"Plan record ({facts.get('claims_source')} claims; {facts.get('revisions') or 0} revision(s), "
+                     f"{facts.get('asks') or 0} ask(s); {len(shown)} of {len(objections)} objections): "
+                     + ("; ".join(f"{o['seat_id']}/{o['id']} {_standing(o)}" for o in shown) or "none raised"))
     elif isinstance(facts, Mapping) and facts.get("elements"):
         shown = facts["elements"][:_LATE_ROW_ELEMENTS_SHOWN]
         lines.append(f"Plan review ({facts.get('claims_source')} claims; {len(shown)} of {len(facts['elements'])} elements): "
@@ -414,7 +469,7 @@ def late_settlement_reflection_entry(root: Any, task_id: str, retry_key: str) ->
 
 
 def learn_from_late_settlement(root: Any, result: Mapping[str, Any], retry_key: str) -> bool:
-    """Append the late-settlement row through the ordinary routed writer; failures only log."""
+    """Append the late-settlement row through the routed reflection-log store; failures only log."""
     from types import SimpleNamespace
 
     from ouroboros.reflection import append_reflection_routed

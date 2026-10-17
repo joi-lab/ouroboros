@@ -14,10 +14,10 @@ import os
 import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from ouroboros import budget_pause
+from ouroboros.tool_custody import submit_tool_future
 from ouroboros.config import (
     NESTED_SETTLEMENT_MARGIN_SEC,
     get_finalization_grace_sec,
@@ -34,11 +34,13 @@ from ouroboros.tool_capabilities import (
     READ_ONLY_PARALLEL_TOOLS,
     REVIEWED_MUTATIVE_TOOLS,
     STATEFUL_BROWSER_TOOLS,
-    UNTRUNCATED_REPO_READ_PATHS as _UNTRUNCATED_REPO_READ_PATHS,
-    UNTRUNCATED_REPO_READ_PREFIXES as _UNTRUNCATED_REPO_READ_PREFIXES,
-    UNTRUNCATED_TOOL_RESULTS as _UNTRUNCATED_TOOL_RESULTS,
-    routing_action_for_tool, completion_control_call, substantive_tool_calls, tool_result_limit as _tool_result_limit,
+    requested_result_view, routing_action_for_tool, completion_control_call, substantive_tool_calls,
 )
+from ouroboros.tool_result_delivery import (
+    FitCandidate, prepare_producer_sources, project_tool_result_batch, reader_text, render_result_view,
+    split_allowance, typed_result_facts, with_producer_source,
+)
+from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY, make_tool_result_record
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.tool_result import (
     TOOL_CODE_SPECS,
@@ -46,6 +48,7 @@ from ouroboros.tools.tool_result import (
     ToolResult,
 )
 from ouroboros.usage_accounting import UsageAccountingError
+from ouroboros.model_wait import ModelWaitInterrupted
 from ouroboros.utils import (
     append_jsonl,
     emit_cognitive_operation_event,
@@ -121,6 +124,17 @@ def _settle_host_error(tools, drive_logs, live, invocation, outcome):
             "result_preview": f"{type(exc).__name__}: {sanitize_tool_result_for_log(str(exc))[:500]}",
             **start_log_field(invocation),
         })
+
+
+def _settling_tool_worker(function, tools, drive_logs, live, invocation, *args):
+    """All producer effects, including exceptional settlement, precede Future completion."""
+    try:
+        from ouroboros.tool_call_log import invocation_scope
+        with invocation_scope(invocation):
+            return function(*args)
+    except BaseException as exc:
+        _settle_host_error(tools, drive_logs, live, invocation, exc)
+        raise
 
 
 def _attach_late_tool_settlement(
@@ -292,32 +306,34 @@ def _get_tool_timeout(
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
     "wait_task", "wait_tasks", "await_messages", "plan_task", "task_acceptance_review",
-    "analyze_screenshot", "vlm_query",
+    "analyze_screenshot", "vlm_query", "generate_image", "list_image_models", "recover_image",
 })
 
 
 def _deadline_clamped_timeout(tools: ToolRegistry, tool_name: str, base_timeout: int) -> int:
     """min(tool timeout, remaining − finalization reserve) for network/long tools.
 
-    Without ``deadline_at`` (remaining reads 0.0) the behavior is byte-identical.
-    An already-elapsed deadline is also left unclamped — the loop's forced
-    finalization owns that path. The clamp never floors PAST the reserve: inside
-    or near the finalization window the tool gets a near-immediate (1s) timeout —
-    a fast, cleanly-messaged failure — rather than a grace-period-eating floor
-    (review round 1: a 30s floor let one web call consume the reserve the clamp
-    exists to protect)."""
+    ``remaining`` is the nearer explicit bound: ``deadline_at`` or the execution
+    window (#939). With neither the behavior is byte-identical. An already-elapsed
+    bound is also left unclamped — the loop's forced finalization owns that path.
+    The clamp never floors PAST the reserve: inside or near the finalization window
+    the tool gets a near-immediate (1s) timeout — a fast, cleanly-messaged failure —
+    rather than a grace-period-eating floor (review round 1: a 30s floor let one web
+    call consume the reserve the clamp exists to protect)."""
     if tool_name not in _DEADLINE_CLAMPED_TOOLS:
         return base_timeout
     try:
         remaining = deadline_remaining_sec(getattr(tools, "_ctx", None))
+        from ouroboros.model_wait import explicit_execution_window_remaining
+        execution_left = explicit_execution_window_remaining(getattr(tools, "_ctx", None))  # #939
+        if execution_left is not None:
+            remaining = min(remaining, execution_left) if remaining > 0 else execution_left
     except Exception:
         return base_timeout
     if remaining <= 0:
         return base_timeout
-    # v6.55.0: the plain finalization GRACE emit-window (task_pacing SSOT) — the
-    # tool must return before the deadline leaves no time to emit a final answer.
-    # NOT the pct reserve (an acceptance-review gate concept): clamping a tool out
-    # of the last pct-of-total would strand long tasks with idle time.
+    # v6.55.0: the plain finalization GRACE emit-window (task_pacing SSOT), NOT the pct
+    # reserve (a review gate): clamping out the last pct-of-total strands long tasks idle.
     try:
         from ouroboros.task_pacing import effective_finalization_reserve_sec
 
@@ -330,110 +346,67 @@ def _deadline_clamped_timeout(tools: ToolRegistry, tool_name: str, base_timeout:
     return int(max(1.0, min(float(base_timeout), window)))
 
 
-def _path_is_cognitive_artifact(tool_name: str, tool_args: Optional[Dict[str, Any]]) -> bool:
-    """Return whether a read target must stay whole."""
-    if not tool_args:
-        return False
-
-    raw_path = str(tool_args.get("path") or "").strip()
-    if not raw_path:
-        return False
-
-    normalized = raw_path.replace("\\", "/").lstrip("./")
-
-    if tool_name == "read_file" and str((tool_args or {}).get("root") or "active_workspace") == "runtime_data":
-        return normalized.startswith("memory/") and "/_backup/" not in normalized
-
-    if tool_name == "read_file":
-        return (normalized.startswith(_UNTRUNCATED_REPO_READ_PREFIXES)
-                or normalized in _UNTRUNCATED_REPO_READ_PATHS)
-
-    return False
-
-
-def _should_skip_tool_result_truncation(
-    tool_name: str,
-    tool_args: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """Canonical/cognitive reads must remain whole."""
-    return tool_name in _UNTRUNCATED_TOOL_RESULTS or _path_is_cognitive_artifact(tool_name, tool_args)
-
-
 def _truncate_tool_result(
     result: Any,
     tool_name: str = "",
     tool_args: Optional[Dict[str, Any]] = None,
     source_ref: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Cap tool result unless it is an untruncated artifact."""
-    limit = _tool_result_limit(tool_name)
-    s = str(result)
-    if _should_skip_tool_result_truncation(tool_name, tool_args):
-        return s
-    if len(s) <= limit:
-        return s
-    marker = f"\n... (truncated from {len(s)} chars, limit={limit})"
-    if isinstance(source_ref, dict) and source_ref:
-        recover = (
-            "Read the exact source above, or page this tool (offset/limit) for the omitted range."
-            if tool_name in _PAGEABLE_TOOL_RESULTS
-            else "Do not rerun this tool to recover omitted output. Read the exact source above."
-        )
-        marker += (
-            "\nFULL_RESULT_SOURCE_JSON="
-            + json.dumps(source_ref, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            + "\n" + recover
-        )
-    else:
-        marker += (
-            "\nFULL_RESULT_SOURCE_UNAVAILABLE=true"
-            "\nDo not treat this partial result as complete; exact source persistence failed."
-        )
-    return s[:limit] + marker
-
-
-# Tools whose own affordance IS paging. This selects the marker WORDING only: it
-# no longer exempts the result from source persistence, because the acceptance
-# decider has no way to page a tool the agent ran — it can only read the exact
-# bytes the host persisted.
-_PAGEABLE_TOOL_RESULTS = frozenset({
-    "read_file", "chat_history", "journal_read", "tree_read", "recent_tasks", "query_code",
-})
-
-
-def _persist_truncated_tool_source(
-    ctx: Any,
-    tool_name: str,
-    tool_call_id: str,
-    result: Any,
-    tool_args: Optional[Dict[str, Any]] = None,
     *,
-    force: bool = False,
-) -> Dict[str, Any]:
-    """Write a generic over-limit result to this actor's existing artifact root."""
+    allowance_chars: Optional[int] = None,
+) -> str:
+    """Compatibility renderer: the whole text unless a measured allowance is given.
 
-    text = str(result)
-    if not force and (
-        _should_skip_tool_result_truncation(tool_name, tool_args)
-        or len(text) <= _tool_result_limit(tool_name)
-    ):
-        return {}
-    try:
-        from ouroboros.artifacts import store_actor_source_bytes, task_id_for_artifacts
-
-        return store_actor_source_bytes(
-            pathlib.Path(ctx.drive_root),
-            task_id_for_artifacts(ctx),
-            category="tool_results",
-            source_id=str(tool_call_id or new_call_id("tool_result")),
-            data=text.encode("utf-8"),
-            extension="txt",
-        )
-    except Exception:
-        log.warning("Failed to persist actor-readable tool result source", exc_info=True)
-        return {}
+    The per-name cap and the name/path exemptions are retired: what a result may
+    occupy is decided per batch from the measured frame (``tool_result_delivery``).
+    A caller holding only text and the chars this result may show renders the
+    same head+tail view Main delivers, with ``source_ref`` as its exact source
+    (``{}``/``None`` discloses a failed persistence); the call's own head/tail
+    request in ``tool_args`` shapes the split.
+    """
+    if allowance_chars is None:
+        return str(result)
+    text = reader_text(result)
+    head, tail = split_allowance(int(allowance_chars), requested_result_view(tool_args), len(text))
+    return render_result_view(text, head_chars=head, tail_chars=tail, tool_name=tool_name, source_ref=source_ref)[0]
 
 
+def _deliver_tool_results(
+    ctx: Any,
+    results: List[Dict[str, Any]],
+    messages: List[Dict[str, Any]],
+    tool_schemas: Optional[list],
+    fit_candidate: Optional[FitCandidate],
+    llm_trace: Dict[str, Any],
+    pending_messages: Optional[list] = None,
+) -> List[Dict[str, Any]]:
+    """First-show views for one batch: measured when the caller supplied the
+    frame, whole (truthful best effort, no invented cap) when it did not.
+
+    The delivery receipt of a batch that was not delivered whole is recorded
+    under ``llm_trace["tool_result_delivery"]`` (status, bounds, partial rows).
+    """
+    if ctx is None or fit_candidate is None or not results:
+        return results
+    from ouroboros.artifacts import task_id_for_artifacts
+
+    def complete_fit(candidate: list, schemas: list) -> Dict[str, Any]:
+        # Producer source locators and host notes are part of the delivered
+        # candidate, including the zero-body minimum. Never add them after fit.
+        shaped = list(candidate)
+        for index, row in enumerate(results, len(candidate) - len(results)):
+            shaped[index] = {**candidate[index], "content": with_producer_source(row, candidate[index]["content"])}
+        return fit_candidate([*shaped, *(pending_messages or [])], schemas)
+
+    rows, receipt = project_tool_result_batch(
+        results, messages, list(tool_schemas or []),
+        drive_root=pathlib.Path(ctx.drive_root), task_id=task_id_for_artifacts(ctx),
+        fit_candidate=complete_fit, policy="measured_frame",
+    )
+    if receipt.get("status") != "complete":
+        llm_trace.setdefault("tool_result_delivery", []).append({
+            key: value for key, value in receipt.items() if key != "fit"
+        } | {"round_id": next((r.get("round_id") for r in results if r.get("round_id")), None)})
+    return rows
 
 
 def _typed_execution_failure(tool_ok: bool, tool_result: ToolResult | None) -> bool:
@@ -483,10 +456,10 @@ def _typed_result_metadata(
     is_error: bool,
     tool_result: ToolResult | None = None,
 ) -> Dict[str, Any]:
-    """Outcome facts for summaries and reflections, taken from the typed result.
+    """Outcome facts for the trace, taken from the typed result.
 
     The status is the code's ``outcome_bucket``, which IS the trace vocabulary the
-    outcome classifier, the reflection scan and the web client already read, so the
+    outcome classifier and the web client already read, so the
     cutover replaces the PRODUCER of the field, not its consumers.
 
     The rules below are deliberately NOT text classification and stay here: the
@@ -505,6 +478,10 @@ def _typed_result_metadata(
         # One typed projection supplies both the legacy bucket and the published result facts.
         meta.update(tool_result_status=tool_result.status, tool_result_code=tool_result.code,
                     tool_result_meta=dict(tool_result.meta))
+        if tool_result.meta.get("artifact_registered") is True:
+            meta["artifact_registered"] = True
+        if isinstance(tool_result.meta.get("verification"), dict):  # the criterion verdict beside this status (#1585)
+            meta["verification"] = dict(tool_result.meta["verification"])
     # Legacy non-process deliverable fallback reads the FULL result before trace
     # truncation. Process producers must supply the typed fact below.
     if (
@@ -514,20 +491,18 @@ def _typed_result_metadata(
     ):
         meta["artifact_registered"] = True
     if fn_name == "plan_task" and not is_error and isinstance(tool_result, ToolResult):
-        plan_outcome = tool_result.meta.get("plan_review_outcome")
-        plan_closed = tool_result.meta.get("plan_review_closed")
-        if (
-            plan_outcome in {"GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED"}
-            and type(plan_closed) is bool
-            and not (plan_outcome == "GREEN" and not plan_closed)
-            and not (plan_outcome in {"REVISE_PLAN", "DEGRADED"} and plan_closed)
+        # The planning organ's typed facts: which effect the call had and the record's
+        # open objections / holds / pending asks after it (never read from the text).
+        effect = tool_result.meta.get("plan_effect")
+        counts = {key: tool_result.meta.get(key) for key in ("plan_revision", "plan_open_objections", "plan_holding", "plan_pending_asks")}
+        if effect in {"write", "ask", "write+ask", "read"} and all(
+            type(value) is int and value >= 0 for value in counts.values()
         ):
-            meta["plan_review_outcome"] = plan_outcome
-            meta["plan_review_closed"] = plan_closed
-            meta["plan_review_historical_critic"] = bool(tool_result.meta.get("plan_review_historical_critic"))
+            meta["plan_effect"] = effect
+            meta.update(counts)
     if isinstance(tool_result, ToolResult) and tool_result.meta.get("post_commit_tests") == "failed":
         # A preserved commit whose post-commit tests failed is a SUCCESS that
-        # still holds a failure the reflection triggers must see. The producer
+        # still holds a failure the trace keeps as a typed fact. The producer
         # states it; nothing here reads the result body for the word.
         meta["post_commit_tests"] = "failed"
     if fn_name in _PROCESS_RESULT_TOOLS and isinstance(tool_result, ToolResult):
@@ -537,8 +512,6 @@ def _typed_result_metadata(
         signal_name = tool_result.meta.get("signal")
         if isinstance(signal_name, str) and signal_name:
             meta["signal"] = signal_name
-        if tool_result.meta.get("artifact_registered") is True:
-            meta["artifact_registered"] = True
     if (
         meta["status"] == "ok"
         and isinstance(tool_result, ToolResult)
@@ -549,11 +522,8 @@ def _typed_result_metadata(
         # undeclared outputs) keeps that code; only an otherwise-plain success is
         # relabelled, which is what the retired text scan did for every shape.
         meta["status"] = "ok_autocorrected"
-    if fn_name == "run_command" and not is_error and meta.get("exit_code") == 0:
-        if meta["status"] == "ok_autocorrected":
-            meta["status"] = "ok_autocorrected"
-        else:
-            meta["status"] = "ok"
+    if fn_name == "run_command" and not is_error and meta.get("exit_code") == 0 and meta["status"] != "ok_autocorrected":
+        meta["status"] = "ok"
     if fn_name == "submit_skill_to_hub":
         from ouroboros.skill_publish_result import extract_skill_publish_result_metadata
 
@@ -601,13 +571,12 @@ def _execute_browser_tool_bound(
         return {"tool_call_id": tc.get("id"), "fn_name": fn_name, "result": result,
                 "is_error": True, "args_for_log": {}, "is_code_tool": False}
     if tool_ctx is not None and generation is not None:
-        # Pin the expectation for the tool body: _ensure_browser re-checks it
-        # at the exact moment it captures the generation, which closes the
-        # check-then-run window (safety checks between here and the handler
-        # can be long). _ensure_browser's own legitimate replacements update
-        # the pin, so a mid-call error after such a replacement is never
-        # mistaken for a timeout retirement.
-        setattr(tool_ctx, "_active_browser_generation", generation)
+        from ouroboros.tools.browser import browser_call_scope
+
+        # Bind before safety checks, in this invocation's context: after a
+        # timeout the replacement worker may already be running another call.
+        with browser_call_scope(tool_ctx, generation):
+            return _execute_single_tool(tools, tc, drive_logs, task_id, invocation)
     return _execute_single_tool(tools, tc, drive_logs, task_id, invocation)
 
 
@@ -698,9 +667,12 @@ def _execute_single_tool(
 
     tool_ok = True
     try:
-        tool_result = host_refusal if host_refusal is not None else tools.execute_result(fn_name, args)
+        from ouroboros.delegate_output import staged_read_delivery_scope
+
+        with staged_read_delivery_scope():
+            tool_result = host_refusal if host_refusal is not None else tools.execute_result(fn_name, args)
         result = tool_result.text
-    except UsageAccountingError:
+    except (UsageAccountingError, ModelWaitInterrupted):
         raise
     except Exception as e:
         tool_ok = False
@@ -969,6 +941,7 @@ def _make_timeout_result(
         "args_for_log": args_for_log,
         "is_code_tool": is_code_tool,
         "trace_ref": trace_ref, "round_id": corr.get("round_id"),
+        **invocation_fields(invocation),
         "result_meta": result_meta,
         "tool_result": tool_result,
     }
@@ -977,6 +950,7 @@ def _make_timeout_result(
 def _emit_finished(tools: ToolRegistry, live: Dict[str, Any], result: Dict[str, Any],
                    started_at: float, **extra: Any) -> Dict[str, Any]:
     """The live ``tool_call_finished`` frame of one call (every branch shares it)."""
+    result.update(invocation_fields(live))
     result_meta = result.get("result_meta") or {}
     _emit_live_log(tools, {
         **{key: value for key, value in live.items() if key not in {"ts", "timeout_sec", "terminal_wait"}},
@@ -986,6 +960,7 @@ def _emit_finished(tools: ToolRegistry, live: Dict[str, Any], result: Dict[str, 
         "is_error": bool(result.get("is_error")),
         "status": result_meta.get("status"),
         **_process_fact_fields(result_meta),
+        **({"verification": result_meta["verification"]} if "verification" in result_meta else {}),
         "result_preview": sanitize_tool_result_for_log(truncate_for_log(result.get("result", ""), 500)),
         **extra,
     })
@@ -1011,6 +986,9 @@ def _execute_with_timeout(
     tool_call_id = tc["id"]
     is_code_tool = fn_name in tools.CODE_TOOLS
     is_reviewed_mutative = fn_name in REVIEWED_MUTATIVE_TOOLS
+    # A foreground mutator's timeout is soft: it bounds the worker's inner waits,
+    # then the loop joins the handler (only a worker kill ends a hung one).
+    terminal_wait = is_reviewed_mutative or fn_name in FOREGROUND_MUTATIVE_TOOLS
     use_stateful = stateful_executor and fn_name in STATEFUL_BROWSER_TOOLS
     started_at = time.perf_counter()
     correlation = _tool_correlation(tools)
@@ -1031,24 +1009,44 @@ def _execute_with_timeout(
     live = _with_correlation({
         "ts": utc_now_iso(), "type": CALL_STARTED, "task_id": task_id, "tool": fn_name,
         "timeout_sec": None if is_reviewed_mutative else timeout_sec,
-        "terminal_wait": is_reviewed_mutative, "args": args_for_log,
+        "terminal_wait": terminal_wait, "args": args_for_log,
         **receipt, **invocation_fields(invocation),
     }, correlation, tool_call_id=tool_call_id)
     invocation["start_log"] = _append_tool_log(tools, drive_logs, dict(live))
     live.update(start_log_field(invocation))  # the live frames (and the wait-end row built on them) disclose it
     _emit_live_log(tools, live)
     try:
-        if use_stateful:
-            return _await_stateful_tool(tools, tc, drive_logs, timeout_sec, task_id, stateful_executor,
-                                        invocation, live, started_at)
-        with abandoned_on_timeout(timeout_sec, bounded=not is_reviewed_mutative) as submit:
-            future = submit(_execute_single_tool, tools, tc, drive_logs, task_id, invocation)
-            # Registered before the wait, so a call abandoned at its timeout is
-            # already visible to budget-pause quiescence (#1196); ownership is
-            # pinned until the finally below, after any late hold was claimed.
-            invocation["_worker_submitted"] = True
-            future.add_done_callback(partial(_settle_host_error, tools, drive_logs, live, invocation))
-            release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
+        with contextlib.ExitStack() as scope:
+            function, arguments = _execute_single_tool, (tools, tc, drive_logs, task_id, invocation)
+            if use_stateful:
+                from ouroboros.owner_pause import submit_tool
+                # Capture the generation in the submitting thread. A timed-out
+                # queued call must never enter its successor's browser state.
+                generation = getattr(tool_ctx, "browser_state", None)
+                function, arguments = _execute_browser_tool_bound, (tools, tc, drive_logs, task_id, generation, invocation)
+                def submit(fn, *values):
+                    # The invocation has captured its caller context before this
+                    # per-tool envelope is added to the sticky worker's copy.
+                    with execution_deadline_scope(monotonic_now() + timeout_sec):
+                        return submit_tool(tool_ctx, fn_name, stateful_executor.submit, fn, *values)
+            else:
+                submit = scope.enter_context(abandoned_on_timeout(timeout_sec, bounded=not is_reviewed_mutative))
+            from ouroboros.owner_pause import OwnerPauseRefused
+            from ouroboros.store import StoreError
+            try:
+                future, release_tool_custody = submit_tool_future(
+                    tool_ctx, invocation["invocation_id"], fn_name, submit, _settling_tool_worker,
+                    function, tools, drive_logs, live, invocation, *arguments)
+            except (OwnerPauseRefused, StoreError) as exc:
+                if not use_stateful:
+                    raise
+                from ouroboros.tools.tool_result import launch_refusal_result
+                result = _execute_single_tool(tools, tc, drive_logs, task_id, invocation,
+                                              host_refusal=launch_refusal_result(exc, not_started=True))
+                return _emit_finished(tools, live, result, started_at)
+            # Registration pins the caller through the wait and any late-hold
+            # claim. The exact submitted future also identifies no-entry cancellation.
+            invocation["_worker_future"] = future
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
                 return _emit_finished(tools, live, result, started_at)
@@ -1063,107 +1061,72 @@ def _execute_with_timeout(
                     # Foreground mutators own effects that cannot safely be
                     # abandoned in a background thread.
                     return _emit_finished(tools, live, future.result(), started_at, late=True, terminal_wait=True)
+                target, cleanup = (_retire_stateful_tool(stateful_executor, tool_ctx, future)
+                                   if use_stateful else (future, None))
+                def settled():
+                    _settle_host_error(tools, drive_logs, live, invocation, future)
+                    if cleanup is not None:
+                        cleanup()
                 _attach_late_tool_settlement(
-                    tools, future, task_id=task_id, tool_call_id=tool_call_id,
-                    correlation={**correlation, **invocation_fields(invocation), "tool": fn_name},
-                )
+                    tools, target, task_id=task_id, tool_call_id=tool_call_id,
+                    correlation={**correlation, **invocation_fields(invocation), "tool": fn_name}, on_settled=settled)
+                if use_stateful:
+                    # Retire, do not cancel: the queued cleanup still belongs to this worker.
+                    stateful_executor.retire()
                 return _make_timeout_result(
                     fn_name, tool_call_id, is_code_tool, tc, drive_logs, timeout_sec, task_id,
-                    correlation=correlation, tools=tools, invocation=invocation,
+                    "Browser state has been reset. " if use_stateful else "", correlation=correlation,
+                    tools=tools, invocation=invocation,
                     live={**live, "duration_sec": round(time.perf_counter() - started_at, 3)})
             finally:
                 release_tool_custody()
     except (TimeoutError, concurrent.futures.TimeoutError):
         raise
     except BaseException as exc:
-        # A submission failure or a body that raised before its own row (e.g. the
-        # accounting stop) still settles the started call, then propagates unchanged.
-        # A failure AFTER the real settlement (a live emit, the custody release, an
-        # interrupt) writes no second settlement: the call already has its result.
-        if not invocation.get("_worker_submitted"):
-            _settle_host_error(tools, drive_logs, live, invocation, exc)
+        # Submission/no-entry cancellation has no producer to settle it. A live
+        # worker retains its result even when wait-end/release bookkeeping fails;
+        # a failure after real settlement cannot write a second settlement.
+        worker = invocation.get("_worker_future")
+        if worker is None or worker.cancelled():
+            _settle_host_error(tools, drive_logs, live, invocation, exc if worker is None else worker)
         raise
 
 
-def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pathlib.Path, timeout_sec: int,
-                         task_id: str, stateful_executor: StatefulToolExecutor, invocation: Dict[str, Any],
-                         live: Dict[str, Any], started_at: float) -> Dict[str, Any]:
-    """The browser branch of ``_execute_with_timeout``: bound to one generation."""
-    fn_name = str(live.get("tool") or "")
-    tool_call_id = tc["id"]
-    tool_ctx = getattr(tools, "_ctx", None)
-    correlation = {key: invocation[key] for key in ("execution_id", "round_id", "llm_call_id") if key in invocation}
-    # The generation this call is bound to, captured by the SUBMITTING
-    # thread: if the call's own timeout retires it before the worker even
-    # reaches the tool body, the wrapper refuses instead of letting the
-    # abandoned call build a session in the NEXT command's state.
-    submit_generation = getattr(tool_ctx, "browser_state", None)
-    from ouroboros.owner_pause import OwnerPauseRefused, submit_tool
-    try:
-        with execution_deadline_scope(monotonic_now() + timeout_sec):
-            future = submit_tool(tool_ctx, fn_name, stateful_executor.submit,
-                _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation)
-    except OwnerPauseRefused as exc:
-        from ouroboros.tools.tool_result import launch_refusal_result
-
-        result = _execute_single_tool(tools, tc, drive_logs, task_id, invocation,
-                                      host_refusal=launch_refusal_result(str(exc)))
-        return _emit_finished(tools, live, result, started_at)
-    # The registration PINS settlement ownership until this call's own
-    # handling is over (result in time, or the late hold claimed below):
-    # released in the finally, after either branch (#1196).
-    invocation["_worker_submitted"] = True
-    future.add_done_callback(partial(_settle_host_error, tools, drive_logs, live, invocation))
-    release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
-    try:
-        return _emit_finished(tools, live, future_result(future, timeout_sec), started_at)
-    except (TimeoutError, concurrent.futures.TimeoutError):
-        settlement_target = future
-        on_settled: Optional[Callable[[], None]] = None
-        if tool_ctx is not None:  # stateful branch: use_stateful is already true here
-            from ouroboros.tools.browser import (
-                _detach_browser,
-                cleanup_browser_handles,
-            )
-
-            # CROSS-THREAD INVARIANT (#409): Playwright objects are bound
-            # to the worker thread that created them. This main-thread
-            # path may only DETACH (retire) the generation — never call
-            # close()/stop() here (a cross-thread stop() kills the driver
-            # under the hung worker and turns its dispatcher wait into a
-            # CPU busy-loop). The close is QUEUED on the retiring
-            # executor behind the hung call, so it runs on the owning
-            # worker thread whenever that call settles — including the
-            # already-settled race, where the queued task runs at once on
-            # that same thread (a done-callback would have run HERE, on
-            # the main thread, exactly the cross-thread close this path
-            # exists to prevent).
-            retired_generation, _fresh = _detach_browser(tool_ctx)
-            try:
-                settlement_target = stateful_executor.submit(
-                    cleanup_browser_handles, retired_generation,
-                )
-            except Exception:
-                # Degenerate fallback (executor already dead): settle on
-                # the tool future and close best-effort in its callback.
-                log.debug("cleanup submit failed; falling back to done-callback",
-                          exc_info=True)
-                settlement_target = future
-                on_settled = lambda: cleanup_browser_handles(retired_generation)  # noqa: E731
-        _attach_late_tool_settlement(
-            tools, settlement_target, task_id=task_id, tool_call_id=tool_call_id,
-            correlation={**correlation, **invocation_fields(invocation), "tool": fn_name},
-            on_settled=on_settled,
+def _retire_stateful_tool(stateful_executor, tool_ctx, future):
+    """Queue browser cleanup on its owning worker; return its physical settlement target."""
+    settlement_target = future
+    on_settled: Optional[Callable[[], None]] = None
+    if tool_ctx is not None:  # stateful branch: use_stateful is already true here
+        from ouroboros.tools.browser import (
+            _detach_browser,
+            cleanup_browser_handles,
         )
-        # retire(), not reset(): cancel_futures would cancel exactly the
-        # queued cleanup task this path just submitted.
-        stateful_executor.retire()
-        return _make_timeout_result(
-            fn_name, tool_call_id, fn_name in tools.CODE_TOOLS, tc, drive_logs, timeout_sec, task_id,
-            "Browser state has been reset. ", correlation=correlation, tools=tools, invocation=invocation,
-            live={**live, "duration_sec": round(time.perf_counter() - started_at, 3)})
-    finally:
-        release_tool_custody()
+
+        # CROSS-THREAD INVARIANT (#409): Playwright objects are bound
+        # to the worker thread that created them. This main-thread
+        # path may only DETACH (retire) the generation — never call
+        # close()/stop() here (a cross-thread stop() kills the driver
+        # under the hung worker and turns its dispatcher wait into a
+        # CPU busy-loop). The close is QUEUED on the retiring
+        # executor behind the hung call, so it runs on the owning
+        # worker thread whenever that call settles — including the
+        # already-settled race, where the queued task runs at once on
+        # that same thread (a done-callback would have run HERE, on
+        # the main thread, exactly the cross-thread close this path
+        # exists to prevent).
+        retired_generation, _fresh = _detach_browser(tool_ctx)
+        try:
+            settlement_target = stateful_executor.submit(
+                cleanup_browser_handles, retired_generation,
+            )
+        except Exception:
+            # Degenerate fallback (executor already dead): settle on
+            # the tool future and close best-effort in its callback.
+            log.debug("cleanup submit failed; falling back to done-callback",
+                      exc_info=True)
+            settlement_target = future
+            on_settled = lambda: cleanup_browser_handles(retired_generation)  # noqa: E731
+    return settlement_target, on_settled
 
 
 _PARALLEL_SAFE_TOOLS: frozenset[str] = READ_ONLY_PARALLEL_TOOLS | PARALLEL_SAFE_ENQUEUE_TOOLS
@@ -1193,8 +1156,18 @@ def handle_tool_calls(
     messages: List[Dict[str, Any]],
     llm_trace: Dict[str, Any],
     emit_progress: Callable[[str], None],
+    *,
+    fit_candidate: Optional[FitCandidate] = None,
+    tool_schemas: Optional[list] = None,
 ) -> int:
-    """Execute tool calls, append results, and return error count."""
+    """Execute tool calls, append results, and return error count.
+
+    ``fit_candidate(messages, schemas)`` is the round's Main measurement (the
+    existing ``_measure_main_context_view`` fields) and ``tool_schemas`` the
+    schemas the next send carries: together they let the result batch be
+    delivered under the measured frame. Without them results are delivered
+    whole, best effort, and no cap is invented.
+    """
     from ouroboros.openai_chat_dispatch import (
         custom_tool_argument_error,
         custom_validation_by_call_id,
@@ -1268,7 +1241,7 @@ def handle_tool_calls(
                 idx = future_to_index[future]
                 try:
                     results[idx] = future.result()
-                except UsageAccountingError:
+                except (UsageAccountingError, ModelWaitInterrupted):
                     raise
                 except Exception as exc:
                     tc = tool_calls[idx]
@@ -1301,7 +1274,8 @@ def handle_tool_calls(
             # started ones (each bounded by its own tool timeout) (#1196, Astra #4).
             executor.shutdown(wait=batch_raised, cancel_futures=True)
 
-    errors = process_tool_results(results, messages, llm_trace, emit_progress, tools=tools)
+    errors = process_tool_results(results, messages, llm_trace, emit_progress, tools=tools,
+                                  fit_candidate=fit_candidate, tool_schemas=tool_schemas)
     if substantive_tool_calls(llm_trace.get("tool_calls", [])[initial_count:]):
         tools._ctx._skill_finalization_injected = False
     return errors
@@ -1310,6 +1284,7 @@ def handle_tool_calls(
 def _maybe_auto_attach_image(
     exec_result: Dict[str, Any],
     tools: Optional[ToolRegistry],
+    *, staged_messages: Optional[list] = None,
 ) -> Optional[Dict[str, str]]:
     """Same-round image attachment for tool results that explicitly offer one.
 
@@ -1361,6 +1336,9 @@ def _maybe_auto_attach_image(
         ctx = getattr(tools, "_ctx", None)
         if ctx is None:
             return
+        if staged_messages is not None:
+            ctx = copy.copy(ctx)
+            ctx.messages = staged_messages  # Never rebind the shared live context.
         observation = {"status": "unavailable"}
         from ouroboros.tools.vision import attach_local_image_to_context
 
@@ -1374,7 +1352,7 @@ def _maybe_auto_attach_image(
 
 
 def reclaim_trace_refs(tool_ctx: Any) -> Dict[str, Any]:
-    """Per-task {tool_call_id: trace_ref} accumulated as tool results append."""
+    """Legacy diagnostic map; exact compaction custody belongs to each result row."""
     refs = getattr(tool_ctx, "_tool_trace_refs", None)
     return refs if isinstance(refs, dict) else {}
 
@@ -1408,65 +1386,78 @@ def process_tool_results(
     llm_trace: Dict[str, Any],
     emit_progress: Callable[[str], None],
     tools: Optional[ToolRegistry] = None,
+    *,
+    fit_candidate: Optional[FitCandidate] = None,
+    tool_schemas: Optional[list] = None,
 ) -> int:
-    """Append tool results to messages/trace and return error count."""
+    """Append tool results to messages/trace and return error count.
+
+    The batch is first projected as a whole under the measured frame
+    (``fit_candidate``/``tool_schemas``, see ``handle_tool_calls``); each
+    delivered view carries its typed facts and exact source when partial.
+    """
     error_count = 0
+    ctx = getattr(tools, "_ctx", None) if tools is not None else None
+    from ouroboros.task_pacing import record_tool_activity
 
     for exec_result in results:
+        record_tool_activity(ctx, exec_result)
+    from ouroboros.artifacts import task_id_for_artifacts
+
+    results = prepare_producer_sources(results, getattr(ctx, "drive_root", None),
+                                       task_id_for_artifacts(ctx) if ctx is not None else "")
+    review_updates, review_pending = [], {}
+    if ctx is not None and getattr(ctx, "_pending_review_context", None):
+        from ouroboros.review_history_view import review_context_updates
+        review_pending = dict(ctx._pending_review_context)
+        review_updates, _ = review_context_updates(ctx, families=review_pending, messages=messages)
+    from ouroboros.tools.owner_delivery import pending_owner_dialogue, acknowledge_owner_dialogue
+    dialogue_updates = pending_owner_dialogue(ctx)
+    # Eviction sees old + new images on one private candidate. Adopt that exact
+    # projection only after fitting, with new images after the whole tool block.
+    # Eviction replaces content-list entries; the rest of each old row is reused.
+    image_history = [{**row, "content": list(row["content"])} if isinstance(row.get("content"), list)
+                     else row for row in messages]
+    history_count = len(messages)
+    image_observations = [_maybe_auto_attach_image(row, tools, staged_messages=image_history) for row in results]
+    image_messages = image_history[history_count:]
+    views = _deliver_tool_results(ctx, results, image_history[:history_count], tool_schemas, fit_candidate, llm_trace,
+                                  [*review_updates, *dialogue_updates, *image_messages])
+    messages[:] = image_history[:history_count]
+
+    for exec_result, view in zip(results, views):
+        if ctx is not None:
+            from ouroboros.delegate_output import acknowledge_staged_output_delivery
+
+            acknowledge_staged_output_delivery(ctx, exec_result, view)
         fn_name = exec_result["fn_name"]
         is_error = exec_result["is_error"]
 
         if is_error:
             error_count += 1
 
-        ctx = getattr(tools, "_ctx", None) if tools is not None else None
-        from ouroboros.task_pacing import record_tool_activity
-
-        record_tool_activity(ctx, exec_result)
-        result_source_ref = (
-            _persist_truncated_tool_source(
-                ctx, fn_name, str(exec_result["tool_call_id"]), exec_result["result"],
-                exec_result.get("tool_args"),
-            )
-            if ctx is not None else {}
-        )
-        result_partial = (
-            not _should_skip_tool_result_truncation(fn_name, exec_result.get("tool_args"))
-            and len(str(exec_result["result"])) > _tool_result_limit(fn_name)
-        )
-        truncated_result = _truncate_tool_result(
-            exec_result["result"],
-            tool_name=fn_name,
-            tool_args=exec_result.get("tool_args"),
-            source_ref=result_source_ref,
-        )
+        truncated_result = str(view["result"])
+        result_partial = bool(view.get("result_partial"))
+        result_source_ref = view.get("result_source_ref") if isinstance(view.get("result_source_ref"), dict) else {}
         typed = exec_result.get("tool_result")
-        producer_ref = {}
-        if isinstance(typed, ToolResult) and typed.producer_text is not None:
-            if ctx is not None:
-                producer_ref = _persist_truncated_tool_source(
-                    ctx, fn_name, str(exec_result["tool_call_id"]) + ".producer",
-                    typed.producer_text, force=True,
-                )
-            # The complete annotated source above remains review evidence. This
-            # separate source is for parsers; neither bytes nor notes live in meta.
-            if result_partial and typed.host_annotations:
-                truncated_result += "\n\n" + "\n\n".join(typed.host_annotations)
-            truncated_result += (
-                "\nPRODUCER_RESULT_SOURCE_JSON=" + json.dumps(producer_ref, ensure_ascii=False)
-                + "\nUnannotated tool data for programmatic reading; host notes and outcome still apply."
-                if producer_ref else
-                "\nPRODUCER_RESULT_SOURCE_UNAVAILABLE=true"
-                "\nHost notes remain in the result; no clean producer file was retained."
-            )
+        producer_ref = exec_result.get("producer_source_ref") or {}
+        truncated_result = with_producer_source(exec_result, truncated_result)
 
         messages.append({
             "role": "tool",
             "tool_call_id": exec_result["tool_call_id"],
-            "content": truncated_result
+            "content": truncated_result,
+            TOOL_RESULT_RECORD_KEY: make_tool_result_record(
+                exec_result, truncated_result, facts=typed_result_facts(exec_result),
+                source_ref=result_source_ref),
         })
+        published = (exec_result.get("result_meta") or {}).get("tool_result_meta") or {}
+        if ctx is not None and published.get("sleep_question_notice") and not (is_error or result_partial):
+            from ouroboros.model_sleep import acknowledge_question_delivery
+            acknowledge_question_delivery(ctx, truncated_result)  # exposure needs the complete ready view
         # Keyed on the wake the RESULT published, not on a tool name: a call that published none has nothing to ack.
-        if ctx is not None and ((exec_result.get("result_meta") or {}).get("tool_result_meta") or {}).get("supervision_wake_id"):
+        # A delivered refusal wake too: ``acknowledge_pending_wake`` itself verifies what the text carried.
+        if ctx is not None and published.get("supervision_wake_id"):
             try:
                 from ouroboros.delegate_supervision import acknowledge_pending_wake
 
@@ -1474,8 +1465,8 @@ def process_tool_results(
             except Exception:
                 log.debug("Failed to acknowledge injected delegate wake", exc_info=True)
 
-        # Retain the pre-truncation trace ref per tool_call_id so the context
-        # reclaim materializer can bind exact tool CAS refs into its capsules.
+        # Keep the call-ID map for diagnostic callers. Compaction takes exact
+        # provenance from the occurrence-bound record on the canonical row.
         trace_ref = exec_result.get("trace_ref")
         if ctx is not None and isinstance(trace_ref, dict) and trace_ref:
             refs = getattr(ctx, "_tool_trace_refs", None)
@@ -1502,9 +1493,8 @@ def process_tool_results(
             **({
                 "result_partial": True,
                 "result_source_ref": result_source_ref,
-                "result_source_status": (
-                    "ready" if result_source_ref else "source_unavailable"
-                ),
+                "result_source_status": str(view.get("result_source_status") or ("ready" if result_source_ref else "source_unavailable")),
+                "result_source_view": view.get("result_source_view") or {},
             } if result_partial else {}),
             **(exec_result.get("result_meta") or {}),
             **({"producer_source_ref": producer_ref,
@@ -1542,9 +1532,9 @@ def process_tool_results(
                                 **(parsed.get("request") or {}),
                                 "acceptance_subject": parsed.get("acceptance_subject"),
                             }
-                    # A typed pre-dispatch refusal (child/off: no reviewer ran, no run or actor
-                    # evidence) stays this call's tool evidence; it is not a review run.
-                    elif not (parsed.get("status") == "not_dispatched" and not parsed.keys() & {"request", "actors", "aggregate_signal"}):
+                    # A review run is the producer's own structure (an ``actors`` list, even empty/pending/
+                    # refused); completion, cap, historical and child acknowledgements carry none (#1602, #1318).
+                    elif isinstance(parsed.get("actors"), list):
                         llm_trace.setdefault("review_runs", []).append(parsed)
                     # v6.54.4 (review round 2): dissent is recorded on the agent-called
                     # path too — merge into acceptance_decision without requiring an
@@ -1585,16 +1575,24 @@ def process_tool_results(
             except Exception:
                 log.debug("Failed to parse task_acceptance_review tool result", exc_info=True)
 
+    # These resident facts and exact bodies were included before allocation. Append
+    # only after the complete assistant/tool block, before an owner-wait can park.
+    messages.extend(review_updates)
+    messages.extend(dialogue_updates)
+    acknowledge_owner_dialogue(ctx, dialogue_updates)
+    if ctx is not None:
+        pending = dict(getattr(ctx, "_pending_review_context", {}) or {})
+        for key, value in review_pending.items():
+            if pending.get(key) == value:
+                pending.pop(key)
+        ctx._pending_review_context = pending
     # Auto-attach AFTER the round's complete tool-message block, never between two
     # tool messages answering the same assistant turn: the user(image) injection
     # then preserves tool-result contiguity BY CONSTRUCTION instead of relying on
     # the transport's adjacency repair to fix an interleaving we created ourselves.
-    by_call = {row["tool_call_id"]: row for row in llm_trace["tool_calls"][-len(results):]}
-    for exec_result in results:
-        observation = _maybe_auto_attach_image(exec_result, tools)
+    messages.extend(image_messages)
+    for row, observation in zip(llm_trace["tool_calls"][-len(results):], image_observations):
         if observation:
-            by_call[exec_result["tool_call_id"]]["image_attachment"] = observation
+            row["image_attachment"] = observation
 
     return error_count
-
-

@@ -1,0 +1,670 @@
+"""The quiet-wake door: finish_task(silent=true) on a consciousness wake's own turn.
+
+The scenarios run the real loop (scripted model responses) and the real terminal
+pipeline: a clean silent wake publishes no final row, owes no outbox delivery and
+mints no delivery subject, while its words, activity, sends and cost stay on the
+record. Owner words admitted after the last live reply, other turns, and any
+outcome but a clean one keep the ordinary final.
+"""
+
+import json
+import time
+import queue
+from types import SimpleNamespace
+
+import pytest
+
+import ouroboros.agent_task_pipeline as pipeline
+import ouroboros.loop as loop
+from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY, CONSCIOUSNESS_TASK_CATEGORY
+from ouroboros.owner_mailbox import write_owner_message
+from ouroboros.task_results import load_task_result
+from ouroboros.tools.registry import ToolRegistry
+
+TASK_ID = "wake-task"
+WAKE = {"initiator": "consciousness", "usage_category": CONSCIOUSNESS_CATEGORY, "wake_reason": "heartbeat"}
+
+
+def finish(answer=None, **kw):
+    arguments = {"action": "finish", **kw}
+    if answer is not None:
+        arguments["answer"] = answer
+    return call("finish_task", arguments)
+
+
+def call(name, arguments, call_id=None):
+    return {"role": "assistant", "content": None, "tool_calls": [{
+        "id": call_id or name, "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments)}}]}
+
+
+@pytest.fixture
+def wake(tmp_path, monkeypatch):
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.is_direct_chat = True
+    registry._ctx.current_chat_id = 1
+    registry._ctx.task_metadata = dict(WAKE)
+    calls = []
+
+    def run(responses, *, live=True, metadata=None, bus=None, messages=None):
+        registry = state.registry  # a cold resume swaps in a fresh registry (a new process)
+        if metadata is not None:
+            registry._ctx.task_metadata = dict(metadata)
+        iterator = iter(responses)
+
+        def respond(_llm, messages, *_a, **_kw):
+            calls.append(json.loads(json.dumps(messages)))
+            response = next(iterator)
+            return (response() if callable(response) else response), 0.0
+        monkeypatch.setattr(loop, "call_llm_with_retry", respond)
+        bus = bus if bus is not None else (queue.Queue() if live else None)
+        messages = [{"role": "user", "content": "Wake: no one has asked for a task."}] if messages is None else messages
+        text, usage, trace = loop.run_llm_loop(
+            messages, registry,
+            SimpleNamespace(default_model=lambda: "test-model"), tmp_path / "logs",
+            lambda *_a, **_kw: None, queue.Queue(), task_id=TASK_ID, event_queue=bus, drive_root=tmp_path)
+        return text, usage, trace, bus
+
+    def owner_writes(text, then, msg_id):
+        """A scripted response during whose generation the owner writes to the running wake."""
+        def response():
+            write_owner_message(tmp_path, text, TASK_ID, msg_id=msg_id)
+            return then
+        return response
+    state = SimpleNamespace(registry=registry, ctx=registry._ctx, calls=calls, run=run, root=tmp_path,
+                            owner_writes=owner_writes)
+    return state
+
+
+def emit(wake, text, usage, trace, *, bus=None, metadata=None, pending=None):
+    """The production terminal pipeline after the agent's empty-final resolution."""
+    from ouroboros.agent import _resolve_intentional_empty
+
+    pending = [] if pending is None else pending
+    replaced, _, text = _resolve_intentional_empty(wake.ctx, usage, text)
+    if replaced:
+        usage["terminal_origin"] = "host_notice"
+    task = {"id": TASK_ID, "type": "task", "chat_id": 1, "text": "wake", "_is_direct_chat": True,
+            "metadata": dict(metadata or WAKE)}
+    pipeline.emit_task_results(SimpleNamespace(drive_root=wake.root, repo_dir=wake.root), None, None,
+                               pending, task, text, usage, trace, 0.0, wake.root / "logs",
+                               ctx=wake.ctx, event_queue=bus)
+    return pending, load_task_result(wake.root, TASK_ID) or {}
+
+
+def sends(events):
+    return [e for e in events if isinstance(e, dict) and e.get("type") == "send_message"]
+
+
+def drained(bus):
+    rows = []
+    while bus is not None and not bus.empty():
+        rows.append(bus.get_nowait())
+    return rows
+
+
+def owed_rows(root):
+    from supervisor.terminal_delivery import pending_deliveries
+
+    return [row for row in pending_deliveries(root, strict=True) if row.get("task_id") == TASK_ID]
+
+
+@pytest.fixture(autouse=True)
+def _no_post_task_model(monkeypatch):
+    monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *a, **k: None)
+
+
+# --- clean silence: nothing published, everything retained ----------------------------
+
+@pytest.mark.parametrize("answer", [None, "", "Read the journal; nothing changed my view."])
+def test_clean_silent_wake_publishes_nothing_and_keeps_its_record(wake, answer):
+    text, usage, trace, bus = wake.run([finish(answer, silent=True)])
+    assert len(wake.calls) == 1 and usage.get("wake_silent") is True
+    assert text == (answer or "")
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    assert sends(pending) == [] and sends(drained(bus)) == [], "no final row, live or buffered"
+    assert owed_rows(wake.root) == [], "boot replay owes nothing"
+    assert stored["status"] == "completed" and stored.get("wake_silent") is True
+    assert stored["outcome_axes"]["execution"]["status"] == "ok"
+    assert stored["result"] == (answer or ""), "internal words are retained, not erased"
+    assert "​" not in json.dumps(stored, ensure_ascii=False)
+    done = [e for e in pending if e.get("type") == "task_done"]
+    metrics = [e for e in pending if e.get("type") == "task_metrics"]
+    assert done and done[0]["status"] == "completed" and "cost_accounting_status" in done[0]
+    assert metrics and "cost_accounting_status" in metrics[0], "cost stays on the record"
+
+
+def test_internal_work_and_earlier_sends_remain(wake):
+    wake.registry.override_handler("chat_history", lambda _ctx, **kw: "read result")
+    note = call("send_user_message", {"text": "Found the regression source."})
+    text, usage, trace, bus = wake.run([call("chat_history", {}), note, finish(silent=True)])
+    assert usage.get("wake_silent") is True
+    assert [c["tool"] for c in trace["tool_calls"]][:2] == ["chat_history", "send_user_message"]
+    live = drained(bus)
+    assert [e["text"] for e in sends(live)] == ["Found the regression source."], "the earlier live word stays"
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    assert sends(pending) == [] and sends(drained(bus)) == []
+    assert stored.get("wake_silent") is True
+
+
+def test_silent_terminal_ships_no_deferred_mid_turn_send_early(wake):
+    """The post-task fallback scan would otherwise pick a buffered mid-turn send as 'the final'."""
+    text, usage, trace, _ = wake.run([finish(silent=True)])
+    buffered = {"type": "send_message", "chat_id": 1, "text": "deferred note", "task_id": TASK_ID,
+                "system_type": None}
+    bus = queue.Queue()
+    pending, _stored = emit(wake, text, usage, trace, bus=bus, pending=[buffered])
+    assert drained(bus) == [], "nothing goes live ahead of the buffered drain"
+    assert sends(pending) == [buffered], "the buffered word still drains in its own order"
+
+
+# --- owner words: an admitted row needs a live reply first ------------------------------
+
+def test_unanswered_owner_words_refuse_silence_until_a_live_reply(wake):
+    text, usage, trace, bus = wake.run([
+        wake.owner_writes("Are you there?", call("chat_history", {}), "m1"),
+        finish(silent=True),
+        call("send_user_message", {"text": "Yes, here."}),
+        finish(silent=True),
+    ])
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert len(reasons) == 1 and reasons[0].startswith("owner_reply_owed")
+    assert usage.get("wake_silent") is True and len(wake.calls) == 4
+
+
+def test_deferred_or_failed_send_does_not_discharge_the_reply(wake):
+    text, usage, trace, _ = wake.run([
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        call("send_user_message", {"text": "Working on it."}),
+        finish(silent=True),
+        finish("Working on it; nothing else yet."),
+    ], live=False)
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert reasons and reasons[0].startswith("owner_reply_owed")
+    assert "wake_silent" not in usage and text == "Working on it; nothing else yet."
+    pending, stored = emit(wake, text, usage, trace)
+    assert [e["text"] for e in sends(pending) if not e.get("system_type")] == ["Working on it; nothing else yet."]
+    assert "wake_silent" not in stored
+
+
+def test_failed_live_put_does_not_discharge_the_reply(wake, monkeypatch):
+    """A live owner-send whose queue put fails falls back to the buffer: no live reply was made."""
+    class RefusingBus(queue.Queue):
+        def put_nowait(self, item):
+            if isinstance(item, dict) and item.get("type") == "send_message":
+                raise OSError("worker queue refused the frame")
+            return super().put_nowait(item)
+    import ouroboros.tools.owner_delivery as delivery
+
+    original, modes = delivery.deliver_owner_event, []
+    monkeypatch.setattr(delivery, "deliver_owner_event",
+                        lambda ctx, evt: modes.append(original(ctx, evt)) or modes[-1])
+    text, usage, trace, _ = wake.run([
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        call("send_user_message", {"text": "Working on it."}),
+        finish(silent=True),
+        finish("Working on it; nothing else yet."),
+    ], bus=RefusingBus())
+    assert modes == ["deferred"] and getattr(wake.ctx, "_owner_delivery_sticky_deferred", False) is True
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert reasons and reasons[0].startswith("owner_reply_owed")
+    assert "wake_silent" not in usage and text == "Working on it; nothing else yet."
+    assert not getattr(wake.ctx, "_owner_reply_revision", None)
+
+
+def test_new_owner_words_after_the_reply_refuse_silence_again(wake):
+    text, usage, trace, _ = wake.run([
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        wake.owner_writes("And the tests?", call("send_user_message", {"text": "Building now."}), "m2"),
+        finish(silent=True),
+        finish("Tests pass."),
+    ])
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert reasons and reasons[0].startswith("owner_reply_owed")
+    assert "wake_silent" not in usage and text == "Tests pass."
+
+
+def test_reply_already_sent_needs_no_ceremonial_second_final(wake):
+    text, usage, trace, _ = wake.run([
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        call("send_user_message", {"text": "All green."}),
+        finish(silent=True),
+    ])
+    assert not trace.get("completion_refusals") and usage.get("wake_silent") is True
+
+
+def test_owner_quiz_closure_counts_as_owner_words(wake):
+    """A Main owner-actor quiz closure rides the owner corpus (with a reason); it is not swallowed."""
+    from ouroboros.owner_mailbox import KIND_QUIZ_CLOSED
+
+    def closed():
+        write_owner_message(wake.root, "[Owner question closed without answer] quiz q1", TASK_ID,
+                            msg_id="quiz_closed:q1", kind=KIND_QUIZ_CLOSED)
+        return call("chat_history", {})
+    _, usage, trace, _ = wake.run([closed, finish(silent=True), finish("Noted; dropping it.")])
+    assert (trace.get("completion_refusals") or [{}])[0].get("reason", "").startswith("owner_reply_owed")
+    assert "wake_silent" not in usage
+
+
+# --- who may use the door ----------------------------------------------------------------
+
+@pytest.mark.parametrize("metadata,direct", [
+    ({"initiator": "owner", "usage_category": "chat"}, True),
+    ({"initiator": "consciousness", "usage_category": CONSCIOUSNESS_TASK_CATEGORY}, True),
+    ({"initiator": "consciousness", "usage_category": CONSCIOUSNESS_TASK_CATEGORY}, False),
+    ({"presence": {"binding_id": "b1"}, "usage_category": "presence"}, True),
+], ids=["owner-turn", "wake-started-root", "wake-started-child", "presence"])
+def test_other_turns_cannot_finish_silently(wake, metadata, direct):
+    wake.ctx.is_direct_chat = direct
+    text, usage, trace, _ = wake.run([finish(silent=True), finish("Ordinary answer.")], metadata=metadata)
+    assert trace["tool_calls"][0]["is_error"] is True
+    assert "wake_silent" not in usage and text == "Ordinary answer."
+
+
+def test_silent_stop_is_refused_even_on_the_wake(wake):
+    _, usage, trace, _ = wake.run([finish(silent=True, action="stop", rationale="x"), finish(silent=True)])
+    assert trace["tool_calls"][0]["is_error"] is True and usage.get("wake_silent") is True
+
+
+# --- outcomes that must stay visible ----------------------------------------------------
+
+def _degrade(trace):
+    trace["verification_events"] = [{"kind": "runtime_event", "services": [
+        {"name": "svc", "artifact_output_failed": True, "artifact_outputs": "boom"}]}]
+
+
+def _custody(wake, trace):
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(wake.root, TASK_ID, "running", delegated_runs_unreconciled=["run-1"])
+
+
+def _fail(usage):
+    usage["execution_status"] = "failed"
+
+
+@pytest.mark.parametrize("internal", ["", "INTERNAL: probe svc failed; retry next wake."])
+@pytest.mark.parametrize("outcome,status", [("failed", "failed"), ("degraded", "degraded"),
+                                            ("custody", "ok")])
+def test_nonclean_outcome_publishes_a_host_notice_never_the_internal_words(wake, internal, outcome, status):
+    """Errors are not hidden behind silence, and words selected as internal never become speech."""
+    from supervisor.terminal_delivery import build_completed_result_event
+    from ouroboros.task_finalization import build_sealed_final_package, sealed_final_prompt_section
+
+    text, usage, trace, bus = wake.run([finish(internal or None, silent=True)])
+    if outcome == "failed":
+        _fail(usage)
+    elif outcome == "degraded":
+        _degrade(trace)
+    else:
+        _custody(wake, trace)
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    shown = sends(pending)
+    assert len(shown) == 1 and shown[0]["role"] == "system", "one host-authored row, not the model's voice"
+    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message, but it ended")
+    assert f"ended {status} " in shown[0]["text"] and shown[0]["terminal_origin"] == "host_notice"
+    # Speech is every chat send, live or buffered, and every owed outbox row (tool-call activity is not speech).
+    spoken = json.dumps([shown, sends(drained(bus)), owed_rows(wake.root)], ensure_ascii=False)
+    assert owed_rows(wake.root), "the notice is owed like any final"
+    assert "\u200b" not in spoken and (not internal or internal not in spoken), "internal words never sent"
+    assert stored["result"] == internal and stored.get("wake_silent") is True
+    assert stored["terminal_origin"] == "model_final", "the retained words stay the model's, typed internal"
+    assert shown[0]["text"] in stored["terminal_host_notice"]
+    assert build_completed_result_event(wake.root, {"chat_id": 1}, TASK_ID, stored) is None
+    package = build_sealed_final_package(stored, shown[0]["text"])
+    assert package["final_result_text"] == "" and package["internal_terminal_text"] == internal
+    assert shown[0]["text"] in package["terminal_host_notice"]
+    assert "no model words were submitted" in sealed_final_prompt_section(package)
+
+
+def test_owner_hard_stop_is_never_silent(wake):
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW
+    from ouroboros.tools.control_runtime import _finish_task
+    from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
+
+    def stop(ctx, **kw):
+        result = _finish_task(ctx, **kw)
+        write_owner_message(wake.root, REASON_OWNER_STOPPED_DIRECT_TURN, TASK_ID, kind=KIND_FINALIZE_NOW)
+        return result
+    wake.registry.override_handler("finish_task", stop)
+    _, usage, _, _ = wake.run([finish("partial", silent=True, action="stop", rationale="x"),
+                               finish(silent=True)])
+    assert "wake_silent" not in usage
+
+
+# --- held candidates, cold continuation and replay -------------------------------------
+
+@pytest.mark.parametrize("hidden", ["", "hidden internal words"])
+def test_owner_words_at_admission_close_void_quiet_bytes(wake, monkeypatch, hidden):
+    """Owner words drained at the final admission close void the accepted selection; a plain
+    (even empty) follow-up then replaces the held quiet bytes instead of publishing them."""
+    import threading
+
+    wake.ctx.owner_message_admission_lock = threading.Lock()
+    wake.ctx.owner_message_admission_agent = SimpleNamespace(
+        _accepting_owner_messages=True, _busy=True, _current_task_id=TASK_ID)
+    original, written = loop._project_child_result_dispositions, []
+
+    def owner_arrives(*args):
+        if not written:  # after the selection was consumed, before admission closes
+            written.append(write_owner_message(wake.root, "Wait, one question", TASK_ID, msg_id="m9"))
+        return original(*args)
+    monkeypatch.setattr(loop, "_project_child_result_dispositions", owner_arrives)
+    text, usage, trace, _ = wake.run([finish(hidden, silent=True), {"content": ""}])
+    assert written and len(wake.calls) == 2
+    assert "wake_silent" not in usage and text == ""
+    pending, stored = emit(wake, text, usage, trace)
+    assert [e["text"] for e in sends(pending)] == ["⚠️ Model returned an empty response. Try rephrasing your request."]
+    assert "wake_silent" not in stored
+
+
+def test_cold_continuation_carries_the_quiet_selection_and_reply_mark(wake):
+    from ouroboros.loop_delivery import DeliveryCandidate, _prepare_delivery_candidate
+    from ouroboros.owner_wait import continuation_state, restore_continuation_state
+
+    ctx = wake.ctx
+    ctx.task_id, ctx.task_attempt = TASK_ID, 1
+    ctx._delivery_candidate = DeliveryCandidate(full_text="internal", content_sha256="a" * 64, revision=1,
+                                                evidence_revision=0, evidence_fingerprint="",
+                                                acceptance_binding={}, quiet=True)
+    ctx._completion_selected = {"action": "finish", "answer": "internal", "wake_silent": True}
+    ctx._owner_reply_revision = 2
+    state = json.loads(json.dumps(continuation_state(ctx, [], {}, {}, 3, [], set())))
+    ctx._delivery_candidate = ctx._completion_selected = ctx._owner_reply_revision = None
+    restore_continuation_state(wake.registry, state, [], {}, {}, set())
+    assert ctx._delivery_candidate.quiet is True and ctx._completion_selected["wake_silent"] is True
+    assert ctx._owner_reply_revision == 2
+    # A resumed boundary without the selection (a new execution id) re-asks instead of publishing.
+    ctx._completion_selected = None
+    ready, _ = _prepare_delivery_candidate("internal", wake.registry, SimpleNamespace(messages=[]), {},
+                                           explicit=False, resumed=True)
+    assert ready is False
+
+
+class _ProcessDied(BaseException):
+    """The worker dies right after its continuation was saved (nothing in the loop catches it)."""
+
+
+def _park_after_selection(wake, monkeypatch, responses):
+    """Run the wake until its silent selection is consumed, save the loop's own owner-wait
+    continuation at that exact boundary, then die; nothing is checkpointed by hand."""
+    from ouroboros.owner_wait import checkpoint_owner_wait
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(wake.root, TASK_ID, "running")
+    wake.ctx.task_attempt, saved = 1, {}
+    original = loop._project_child_result_dispositions
+
+    def park(limit_ctx, llm_trace):
+        ctx = wake.ctx
+        if not saved and (getattr(ctx, "_completion_selected", None) or {}).get("wake_silent"):
+            saved["wait"] = checkpoint_owner_wait(
+                ctx, limit_ctx.messages, llm_trace, limit_ctx.accumulated_usage, limit_ctx.round_idx,
+                loop.initial_tool_schemas(wake.registry), set(limit_ctx.owner_msg_seen or ()))
+            raise _ProcessDied()
+        return original(limit_ctx, llm_trace)
+    monkeypatch.setattr(loop, "_project_child_result_dispositions", park)
+    with pytest.raises(_ProcessDied):
+        wake.run(responses)
+    monkeypatch.setattr(loop, "_project_child_result_dispositions", original)
+    return saved["wait"]
+
+
+def _resume_in_new_process(wake, monkeypatch, wait):
+    from ouroboros import context
+    from ouroboros.owner_wait import set_owner_wait
+    from tests.test_context_fit_v664 import _plan
+
+    set_owner_wait(wake.root, TASK_ID, {**wait, "state": "waiting"})
+    fresh = ToolRegistry(repo_dir=wake.root, drive_root=wake.root)
+    resumed = fresh._ctx
+    resumed.is_direct_chat, resumed.current_chat_id, resumed.task_metadata = True, 1, dict(WAKE)
+    resumed.task_id, resumed.task_attempt = TASK_ID, 1
+    resumed.owner_wait_resume = {**wait, "restart_transaction_id": "observed-restart"}
+    resumed.owner_wait_callback = lambda *_: None
+    resumed.context_fit_plan = _plan(window=500_000, known=True)
+    monkeypatch.setattr(context, "_context_fit_route", lambda task, **_: (
+        {"model": task["model"], "provider": "openai", "use_local": False},
+        SimpleNamespace(status="confirmed", stale=False, window_tokens=500_000, route_fp="route-a")))
+    wake.registry, wake.ctx = fresh, resumed
+
+
+INTERNAL = "INTERNAL: journal read, nothing new."
+
+
+def test_cold_resume_completes_the_restored_quiet_selection_silently(wake, monkeypatch):
+    wait = _park_after_selection(wake, monkeypatch, [finish(INTERNAL, silent=True)])
+    _resume_in_new_process(wake, monkeypatch, wait)
+    text, usage, trace, bus = wake.run([{"content": ""}])
+    assert usage.get("wake_silent") is True and text == INTERNAL
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    assert sends(pending) == [] and sends(drained(bus)) == [] and owed_rows(wake.root) == []
+    assert stored["result"] == INTERNAL and stored.get("wake_silent") is True
+
+
+def test_cold_resume_new_owner_words_void_the_quiet_selection_without_leaking(wake, monkeypatch):
+    wait = _park_after_selection(wake, monkeypatch, [
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        call("send_user_message", {"text": "Quiet day."}),
+        finish(INTERNAL, silent=True)])
+    _resume_in_new_process(wake, monkeypatch, wait)
+    write_owner_message(wake.root, "Actually, what about the tests?", TASK_ID, msg_id="m2")
+    text, usage, trace, bus = wake.run([{"content": ""}, finish(silent=True), {"content": ""},
+                                        finish("Tests pass.")])
+    assert wake.ctx._owner_reply_revision == 1, "the restored mark covers m1, not the new m2"
+    reasons = [row["reason"] for row in trace.get("completion_refusals") or []]
+    assert any(reason.startswith("owner_reply_owed") for reason in reasons)
+    assert "wake_silent" not in usage and text == "Tests pass."
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    spoken = json.dumps([sends(pending), sends(drained(bus)), owed_rows(wake.root)], ensure_ascii=False)
+    assert "Tests pass." in spoken and INTERNAL not in spoken
+
+
+def test_cold_resume_restored_reply_mark_still_answers_earlier_owner_words(wake, monkeypatch):
+    """Parked after an answered owner row: the restored mark lets the resumed wake finish silently."""
+    wait = _park_after_selection(wake, monkeypatch, [
+        wake.owner_writes("Status?", call("chat_history", {}), "m1"),
+        call("send_user_message", {"text": "Quiet day."}),
+        finish(INTERNAL, silent=True)])
+    _resume_in_new_process(wake, monkeypatch, wait)
+    text, usage, trace, _ = wake.run([finish(silent=True)])  # a fresh selection after the restored one
+    assert usage.get("wake_silent") is True and not trace.get("completion_refusals")
+
+
+# --- forced rails after a quiet selection -------------------------------------------------
+
+def _control_at_admission_close(wake, monkeypatch, control, *, expire=False, stale=False):
+    """A mailbox control (and optionally an elapsed deadline or newer evidence) lands after the
+    silent selection was consumed, before admission closes, so a forced rail decides the final."""
+    import threading
+    import ouroboros.loop_delivery as delivery
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW
+
+    wake.ctx.owner_message_admission_lock = threading.Lock()
+    wake.ctx.owner_message_admission_agent = SimpleNamespace(
+        _accepting_owner_messages=True, _busy=True, _current_task_id=TASK_ID)
+    original, injected = loop._project_child_result_dispositions, []
+
+    def arrive(limit_ctx, llm_trace):
+        if not injected and (getattr(wake.ctx, "_completion_selected", None) or {}).get("wake_silent"):
+            injected.append(True)
+            if expire:
+                limit_ctx.deadline_ts = time.time() - 1
+            write_owner_message(wake.root, control, TASK_ID, kind=KIND_FINALIZE_NOW)
+        return original(limit_ctx, llm_trace)
+    monkeypatch.setattr(loop, "_project_child_result_dispositions", arrive)
+    if stale:  # newer evidence reaches the loop as the wrap-up opens, after the selection
+        wrap_up = loop._forced_final_answer
+
+        def newer_evidence(*args, **kwargs):
+            monkeypatch.setattr(delivery, "observed_delivery_evidence", lambda *_a, **_kw: "newer-evidence")
+            return wrap_up(*args, **kwargs)
+        monkeypatch.setattr(loop, "_forced_final_answer", newer_evidence)
+    return injected
+
+
+def _spoken(wake, pending, bus):
+    return json.dumps([sends(pending), sends(drained(bus)), owed_rows(wake.root)], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("internal", ["", INTERNAL])
+@pytest.mark.parametrize("control,expire,source,reason", [
+    ("deadline", True, "retained_candidate", "finalization_grace"),
+    ("owner_stopped_direct_chat_turn", False, "owner_stop_retained_candidate", "owner_requested_finalization"),
+], ids=["deadline", "owner-stop"])
+def test_forced_rail_retaining_quiet_bytes_publishes_only_the_host_notice(wake, monkeypatch, internal,
+                                                                           control, expire, source, reason):
+    """The forced rail keeps the quiet candidate's exact bytes: they stay internal, while the
+    failed outcome is still announced in the host's own words."""
+    from ouroboros.task_finalization import build_sealed_final_package
+
+    injected = _control_at_admission_close(wake, monkeypatch, control, expire=expire)
+    text, usage, trace, bus = wake.run([finish(internal or None, silent=True)])
+    assert injected and len(wake.calls) == 1, "no paid wrap-up call"
+    assert trace["forced_finalization"]["source"] == source
+    assert text == internal and usage.get("wake_silent") is True
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    shown = sends(pending)
+    assert len(shown) == 1 and shown[0]["role"] == "system" and shown[0]["terminal_origin"] == "host_notice"
+    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message, but it ended")
+    assert f"({reason})" in shown[0]["text"] and "ended ok" not in shown[0]["text"]
+    spoken = _spoken(wake, pending, bus)
+    assert owed_rows(wake.root) and (not internal or internal not in spoken), "the notice is owed, never the words"
+    assert stored["result"] == internal and stored.get("wake_silent") is True
+    assert build_sealed_final_package(stored, shown[0]["text"])["final_result_text"] == ""
+
+
+def test_forced_wrap_up_with_new_ordinary_words_speaks_them(wake, monkeypatch):
+    """A wrap-up the model authors afresh replaces the quiet candidate and is ordinary speech."""
+    _control_at_admission_close(wake, monkeypatch, "deadline")
+    text, usage, trace, bus = wake.run([finish(INTERNAL, silent=True),
+                                        {"role": "assistant", "content": "Wrap-up: the probe is still red."}])
+    assert len(wake.calls) == 2 and trace["forced_finalization"]["source"] == "model"
+    assert "wake_silent" not in usage and text == "Wrap-up: the probe is still red."
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    spoken = _spoken(wake, pending, bus)
+    assert "Wrap-up: the probe is still red." in spoken and INTERNAL not in spoken
+    assert "wake_silent" not in stored
+
+
+def test_forced_retention_of_stale_quiet_bytes_stays_internal(wake, monkeypatch):
+    """Retaining the quiet bytes after newer evidence republishes them as a stale candidate;
+    that replacement keeps their provenance, and the stale disclosure stays on the record."""
+    import hashlib
+
+    _control_at_admission_close(wake, monkeypatch, "deadline", stale=True)
+    keep = json.dumps({"action": "finish", "answer_sha256": hashlib.sha256(INTERNAL.encode()).hexdigest()})
+    text, usage, trace, bus = wake.run([finish(INTERNAL, silent=True), {"role": "assistant", "content": keep}])
+    assert len(wake.calls) == 2
+    assert trace["forced_finalization"]["source"] == "model_control_retained_stale_evidence_resume_required"
+    assert text == INTERNAL and usage.get("wake_silent") is True
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    shown = sends(pending)
+    assert len(shown) == 1 and shown[0]["text"].startswith("⚠️ This wake chose to finish without a message")
+    assert INTERNAL not in _spoken(wake, pending, bus)
+    assert "STALE-EVIDENCE NOTICE" in stored["terminal_host_notice"] and stored["result"] == INTERNAL
+
+
+def _batch(*calls):
+    return {"role": "assistant", "content": None, "tool_calls": [c["tool_calls"][0] for c in calls]}
+
+
+def _refused_quiet_selection(internal):
+    """One batch reads and selects silence: the selection is refused as unobserved, its bytes held."""
+    return _batch(call("chat_history", {}), finish(internal or None, silent=True))
+
+
+def _host_notice_only(wake, text, usage, trace, bus, internal, reason):
+    pending, stored = emit(wake, text, usage, trace, bus=bus)
+    shown = sends(pending)
+    assert len(shown) == 1 and shown[0]["role"] == "system" and shown[0]["terminal_origin"] == "host_notice"
+    assert shown[0]["text"].startswith("⚠️ This wake chose to finish without a message") and reason in shown[0]["text"]
+    spoken = _spoken(wake, pending, bus)
+    assert "empty response" not in spoken and (not internal or internal not in spoken)
+    assert stored["result"] == internal and stored.get("wake_silent") is True
+    assert stored["terminal_origin"] == "model_final"
+
+
+@pytest.mark.parametrize("internal", ["", "INTERNAL: probe read.\nFINAL ANSWER: internal pick"])
+def test_refused_quiet_selection_then_owner_stop_stays_internal(wake, internal):
+    """Held quiet bytes reach the hard-stop rail: no internal words, no false empty-response notice,
+    and the quiet words latch no fallback answer for the budget rail either."""
+    from ouroboros.owner_mailbox import KIND_FINALIZE_NOW
+    from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
+
+    def read(_ctx, **_kw):
+        write_owner_message(wake.root, REASON_OWNER_STOPPED_DIRECT_TURN, TASK_ID, kind=KIND_FINALIZE_NOW)
+        return "read result"
+    wake.registry.override_handler("chat_history", read)
+    text, usage, trace, bus = wake.run([_refused_quiet_selection(internal)])
+    assert (trace.get("completion_refusals") or [{}])[0].get("reason", "").startswith("unobserved_tool_results")
+    assert len(wake.calls) == 1 and trace["forced_finalization"]["source"] == "owner_stop_retained_candidate"
+    assert "best_valid_final_answer" not in trace
+    assert text == internal and usage.get("wake_silent") is True
+    _host_notice_only(wake, text, usage, trace, bus, internal, "(owner_requested_finalization)")
+
+
+def test_provider_death_after_refused_quiet_selection_keeps_words_internal(wake):
+    """The provider-salvage rail retains the held quiet bytes; only its failure is announced."""
+    wake.registry.override_handler("chat_history", lambda _ctx, **_kw: "read result")
+    text, usage, trace, bus = wake.run([_refused_quiet_selection(INTERNAL), None, None, None])
+    assert trace["forced_finalization"]["source"] == "retained_candidate"
+    assert text == INTERNAL and usage.get("wake_silent") is True
+    _host_notice_only(wake, text, usage, trace, bus, INTERNAL, "(provider_unavailable)")
+
+
+def test_completion_wins_quiet_row_speaks_only_its_custody_line(wake):
+    """A completion-wins teardown that left runs open discloses them for a silent wake too —
+    as the host's own row, never the internal words."""
+    from supervisor.terminal_delivery import build_completed_result_event
+
+    text, usage, trace, _ = wake.run([finish(INTERNAL, silent=True)])
+    _, stored = emit(wake, text, usage, trace)
+    assert build_completed_result_event(wake.root, {"chat_id": 1}, TASK_ID, stored) is None
+    event = build_completed_result_event(wake.root, {"chat_id": 1}, TASK_ID, stored, unreconciled_runs=["run-7"])
+    assert event["role"] == "system" and event["terminal_origin"] == "host_notice"
+    assert "run-7" in event["text"] and INTERNAL not in json.dumps(event, ensure_ascii=False)
+
+
+def test_held_quiet_candidate_rewritten_with_new_words_is_no_longer_quiet(wake, monkeypatch):
+    """An informed retained-work choice rewrites the held candidate in place: the same bytes keep
+    their quiet provenance, new bytes are new words and become ordinary speech."""
+    import ouroboros.acceptance_preparation as preparation
+    from ouroboros.loop_delivery import DeliveryCandidate
+
+    held = DeliveryCandidate(full_text=INTERNAL, content_sha256="a" * 64, revision=1, evidence_revision=0,
+                             evidence_fingerprint="", acceptance_binding={}, quiet=True)
+    wake.ctx._delivery_candidate = held
+    monkeypatch.setattr(preparation, "preparation_delivery_choice", lambda *_a: True)
+    limit = SimpleNamespace(task_id=TASK_ID, root_task_id=TASK_ID, status_drive_root=wake.root,
+                            drive_root=wake.root, drive_logs=wake.root / "logs")
+    assert loop._replace_delivery_candidate(wake.registry, limit, {}, INTERNAL, control="forced_preserve:x") is held
+    assert held.quiet is True
+    rewritten = loop._replace_delivery_candidate(wake.registry, limit, {}, "Wrap-up: ordinary words.",
+                                                 control="forced_replace:x")
+    assert rewritten is held and held.full_text == "Wrap-up: ordinary words." and held.quiet is False
+
+
+def test_history_replay_and_completion_wins_owe_no_silent_row(wake):
+    from supervisor.terminal_delivery import build_completed_result_event
+    from ouroboros.task_finalization import build_sealed_final_package, sealed_final_prompt_section
+
+    text, usage, trace, _ = wake.run([finish("internal note", silent=True)])
+    _, stored = emit(wake, text, usage, trace)
+    assert build_completed_result_event(wake.root, {"chat_id": 1}, TASK_ID, stored) is None
+    package = build_sealed_final_package(stored, "")
+    assert package["final_result_text"] == "" and package["internal_terminal_text"] == "internal note"
+    section = sealed_final_prompt_section(package)
+    assert "finished silently" in section and "never sent to the owner" in section
+
+
+def test_acceptance_history_mints_no_subject_for_silence(wake):
+    """A zero-physical seed would otherwise record a missing delivery body as a history gap."""
+    from ouroboros.acceptance_history import retain_acceptance_history
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(wake.root, TASK_ID, "running")
+    trace = {"acceptance_history_seed": {"task_id": TASK_ID, "task_attempt": 1, "accounting_root_task_id": TASK_ID}}
+    assert retain_acceptance_history(wake.root, {"id": TASK_ID}, "", trace, {}, {}, [], None,
+                                     usage={"wake_silent": True}) == {}

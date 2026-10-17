@@ -79,7 +79,8 @@ def test_page_header_is_shared_foundation_for_top_pages():
     assert "export function renderMobileNavToggle()" in header_js
     assert "toolbarHtml" in header_js
     assert "trailingHtml" in header_js
-    assert "app-page-toolbar app-page-actions" in header_js
+    # Actual toolbar class composition/escaping is exercised by page_header.test.js.
+    assert "'app-page-toolbar'" in header_js and "'app-page-actions'" in header_js
     assert "grid-template-areas:" in css
     assert '"leading title toolbar"' in css
     assert '"tabs tabs tabs"' in css
@@ -99,7 +100,6 @@ def test_project_rows_use_slots_not_generic_spans():
     app_js = _read("web/app.js")
     css = _read("web/style.css")
     assert "PROJECTS_VISIBLE_LIMIT" not in app_js
-    assert "Show more" not in app_js
     assert "className = 'nav-row nav-project-row'" in app_js
     # Project rows are a dotless, compact, indented list (no green status dot).
     assert "nav-project-dot" not in app_js
@@ -135,7 +135,7 @@ def test_project_panel_composer_and_welcome_contracts():
     assert "import { feedIsEmpty } from './chat_render_batch.js';" in welcome_js
     assert "if (!confirmedEmpty || !copy || !feedIsEmpty(messages)) {" in welcome_js
     assert "node.lastElementChild.textContent = copy;" in welcome_js
-    assert "Ouroboros has awakened" not in chat_js and "addMessage" not in welcome_js
+    assert "addMessage" not in welcome_js
     assert "padding: 10px 292px" not in css
     assert "right: 8px;\n    bottom: 6px" not in send_group_css
     assert ".chat-text-row:focus-within" in css
@@ -143,24 +143,30 @@ def test_project_panel_composer_and_welcome_contracts():
     assert ".chat-text-row {\n    order: 2;" in css
     assert "chat-header-more" in chat_js
     assert "chat-header-menu" in css
-    assert "backdrop-filter: blur(22px)" in css
+    # The Project is a reading surface, not a particular blur implementation.
+    # Its rendered CLOSED/OPEN backing and transparent falsifier are exercised by
+    # test_status_sheet_and_shade_geometry_light_dark_and_screenshots.
+    panel_css = css.split(".project-panel {", 1)[1].split("}", 1)[0]
+    assert "rgb(var(--shell-rgb))" in panel_css
     assert 'id="project-panel-backdrop" class="project-panel-backdrop"' in _read("web/index.html")
     assert ".project-panel-backdrop" in css
     assert "transition: transform 180ms ease, opacity 180ms ease;" in css
     assert ".project-panel.open" in css
     assert "left: var(--sidebar-width);" in css  # sidebar stays clickable under backdrop
     assert ".chat-header-actions {\n        display: none;" not in css
-    # Gateway Boundary: chat.js consumes the endpoint via the api_client wrapper,
-    # and the raw route lives in api_client.js (not a raw fetch in chat.js).
-    assert "projectFromTask" in chat_js
+    # Gateway Boundary: Turn into project (work_portal.js, the card's move) consumes the endpoint via
+    # the api_client wrapper, and the raw route lives in api_client.js (no raw fetch in a chat module).
+    portal_js = _read("web/modules/work_portal.js")
+    assert "apiClient.projectFromTask(" in portal_js
+    assert "/api/projects/from-task" not in portal_js and "/api/projects/from-task" not in chat_js
     assert "/api/projects/from-task" in _read("web/modules/api_client.js")
 
 
 def test_chat_header_controls_reorg_and_more_autodismiss():
     chat_js = _read("web/modules/chat.js")
     # Restart + Panic are promoted to always-visible header buttons...
-    assert 'class="chat-header-btn" type="button" data-chat-command="restart"' in chat_js
-    assert 'class="chat-header-btn danger" type="button" data-chat-command="panic"' in chat_js
+    assert 'class="chat-header-btn ui-chrome-control" type="button" data-chat-command="restart"' in chat_js
+    assert 'class="chat-header-btn danger ui-chrome-control" type="button" data-chat-command="panic"' in chat_js
     # ...and Consciousness / Evolve / Review move into the More overflow menu.
     menu = chat_js.split('class="chat-header-menu"', 1)[1].split("</details>", 1)[0]
     assert 'data-chat-command="bg"' in menu

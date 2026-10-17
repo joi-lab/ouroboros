@@ -322,14 +322,16 @@ def test_repeated_exhaustion_runs_to_the_existing_round_limit(tmp_path, loop_env
 def test_exhaustion_over_an_unresolved_attempt_starts_no_new_generation(tmp_path, loop_env, no_sleep):
     """The fence: a round still holding an unresolved attempt (a granted transport-death repeat)
     may start no new generation, so an exhausted repeat keeps the no-resend terminal."""
-    llm = _ScriptedLLM(_death, _incident_reply(0), OK_RESPONSE)
+    from tests.test_transport_wait_repeat_interaction import _held_repeat
+    llm = _ScriptedLLM(_incident_reply(0), OK_RESPONSE)
     kwargs = _loop_kwargs(tmp_path, llm, [])
-    kwargs["task_type"] = "presence"  # inline Presence alone keeps the bounded paid repeat
+    kwargs["task_type"] = "presence"
     kwargs["tools"]._ctx.is_direct_chat = True
     kwargs["tools"]._ctx.current_task_type = "presence"
+    _held_repeat(kwargs)
     _result, usage, trace = run_llm_loop(**kwargs)
 
-    assert llm.calls == 2  # the death and its one repeat; no round over the unresolved attempt
+    assert llm.calls == 1  # the exhausted response; no round over the retained unknown attempt
     assert usage["_last_llm_error_kind"] == "llm_output_exhausted"
     assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
     assert all(_host_facts(request["messages"]) == [] for request in llm.requests)

@@ -5,8 +5,8 @@ uses only stdlib and trusts the supplied Actions producer outcome, not case tota
 events.jsonl is the controller's incremental journal: it names the tests in flight
 when a session is killed before its final results.json export.
 
-Everything here is diagnostic except `reconcile-shards`: the sharded UI browser lane
-is proven complete only by its shards' projections, so there a missing or invalid
+Everything here is diagnostic except `reconcile-shards`: sharded UI and default lanes
+are proven complete only by their shards' projections, so there a missing or invalid
 projection is a failure, never an unknown.
 """
 from __future__ import annotations
@@ -21,6 +21,7 @@ from pathlib import Path
 import platform
 import sys
 import tempfile
+from time import monotonic
 
 _PHASES = frozenset({"setup", "call", "teardown"})
 
@@ -73,7 +74,8 @@ def _valid(row) -> bool:
     return (isinstance(row, dict)
             and all(isinstance(row.get(key), str) for key in ("nodeid", "phase", "outcome"))
             and (row["phase"] in _PHASES or row["phase"] == "crash")
-            and row["outcome"] in {"passed", "failed", "skipped"})
+            and row["outcome"] in {"passed", "failed", "skipped"}
+            and ("is_subtest" not in row or type(row["is_subtest"]) is bool))
 
 
 def _final(root: Path) -> tuple[dict, str]:
@@ -137,6 +139,14 @@ def render_summary(root: Path, *, producer_outcome: str, artifact_outcome: str,
     """Reporter failure cannot replace producer truth; missing reports stay unknown."""
     data, error = _final(root)
     available = not error
+    # The selected CLI writes scope beside the pass directories before execution.
+    # Its actual tier may escalate to full; never describe a subset as full.
+    try:
+        selection = json.loads((Path(root).parent / "selection.json").read_text(encoding="utf-8"))
+        if scope == "full" and selection.get("tier") in ("selected", "full"):
+            scope = selection["tier"]
+    except (OSError, ValueError, AttributeError):
+        pass
     lines = [
         "## CI test evidence" + (f" — {_cell(label)}" if label else "")
         + (" — PARTIAL DIAGNOSTIC" if scope != "full" else ""),
@@ -257,22 +267,42 @@ def _named(nodes, *, shown: int = 20) -> str:
     return ", ".join(nodes[:shown]) + (f" … and {len(nodes) - shown} more" if len(nodes) > shown else "")
 
 
-def _lane_shape(lane) -> bool:
+def file_shards(weights: dict[str, int], count: int) -> dict[str, int]:
+    """Whole-file greedy packing, deterministic even when input insertion order differs."""
+    loads, owners = [0] * count, {}
+    for path in sorted(weights, key=lambda path: (-weights[path], path)):
+        index = min(range(count), key=lambda index: (loads[index], index))
+        owners[path] = index + 1
+        loads[index] += weights[path]
+    return owners
+
+
+def _lane_shape(lane, lane_key="ui_browser") -> bool:
     def strings(value):
         return isinstance(value, list) and all(isinstance(node, str) for node in value)
     if not isinstance(lane, dict) or not strings(lane.get("full")):
         return False
+    if lane_key != "ui_browser":
+        weights = lane.get("file_weights")
+        if not (isinstance(weights, list) and weights
+                and all(isinstance(row, list) and len(row) == 2 and isinstance(row[0], str)
+                        and type(row[1]) is int and row[1] > 0 for row in weights)):
+            return False
+        files = dict(weights)
+        if len(files) != len(weights) or any(node.split("::", 1)[0] not in files for node in lane["full"]):
+            return False
     shard = lane.get("shard")
     return "shard" not in lane or (
         isinstance(shard, list) and len(shard) == 2 and all(type(part) is int for part in shard)
         and strings(lane.get("assigned")))
 
 
-def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list | None = None) -> list[dict]:
-    """UI lane projections beneath root that belong to this commit and run.
+def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list | None = None,
+                 lane_key="ui_browser") -> list[dict]:
+    """Lane projections beneath root that belong to this commit and run.
 
     Each results.json is judged where it lies, never by its directory name. One
-    without a `ui_browser` block is another producer's (browser tools) or a session the
+    without the requested lane block is another producer's or a session the
     guard refused before it recorded a lane: it proves no lane node and is collected in
     `others` for its session status only. An unreadable
     one, or a lane projection of another commit or run, is a gap.
@@ -289,13 +319,13 @@ def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list 
             continue
         identity = data.get("github") if isinstance(data.get("github"), dict) else {}
         attempt = identity.get("run_attempt")
-        if "ui_browser" not in data:
+        if lane_key not in data:
             if others is not None:
                 others.append({"name": name, "exit": data.get("session_exit_code")})
             continue
-        lane = data["ui_browser"]
-        if not _lane_shape(lane):
-            gaps.append(f"{name}: invalid ui_browser block")
+        lane = data[lane_key]
+        if not _lane_shape(lane, lane_key):
+            gaps.append(f"{name}: invalid {lane_key} block")
         elif identity.get("sha") != sha or identity.get("run_id") != run_id:
             gaps.append(f"{name}: belongs to commit {identity.get('sha')} run "
                         f"{identity.get('run_id')}, expected commit {sha} run {run_id}")
@@ -307,6 +337,9 @@ def _lane_proofs(root: Path, *, sha: str, run_id: str, gaps: list, others: list 
             executed = {row["nodeid"] for row in data["reports"]
                         if row["phase"] in ("call", "crash") or row["outcome"] != "passed"}
             proofs.append({"name": name, "attempt": int(attempt), "lane": lane, "executed": executed,
+                           "duplicates": [node for node, seen in Counter(
+                               row["nodeid"] for row in data["reports"]
+                               if row["phase"] == "call" and not row.get("is_subtest", False)).items() if seen > 1],
                            "exit": data.get("session_exit_code")})
     return proofs
 
@@ -320,8 +353,8 @@ def _red_session(label: str, proof: dict) -> list[str]:
 
 
 def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha: str,
-                     run_id: str) -> tuple[list[str], list[str]]:
-    """(gaps, notes) of one run's sharded UI lane; any gap makes the lane RED.
+                     run_id: str, lane_key="ui_browser") -> tuple[list[str], list[str]]:
+    """(gaps, notes) of one run's sharded lane; any gap makes the lane RED.
 
     AUTHORITATIVE, unlike every other reader in this module: the manifest is the
     unsharded collection's witness of the lane, each shard must prove it saw that
@@ -334,7 +367,7 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
     if not sha or not run_id or count < 1:
         return ["the expected commit, run id and a positive shard count are required"], notes
     full = None
-    witnesses = _lane_proofs(manifest_root, sha=sha, run_id=run_id, gaps=gaps)
+    witnesses = _lane_proofs(manifest_root, sha=sha, run_id=run_id, gaps=gaps, lane_key=lane_key)
     gaps += [f"{proof['name']}: the manifest carries a shard block"
              for proof in witnesses if "shard" in proof["lane"]]
     witnesses = [proof for proof in witnesses if "shard" not in proof["lane"]]
@@ -353,7 +386,8 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
                         + _named(node for node, seen in Counter(full).items() if seen > 1))
             full = None
     by_shard, others = {}, []
-    for proof in _lane_proofs(shards_root, sha=sha, run_id=run_id, gaps=gaps, others=others):
+    for proof in _lane_proofs(shards_root, sha=sha, run_id=run_id, gaps=gaps, others=others,
+                              lane_key=lane_key):
         index, total = proof["lane"].get("shard", (0, 0))
         if total != count or not 1 <= index <= count:
             gaps.append(f"{proof['name']}: " + (f"declares shard {index}/{total}, expected one of {count}"
@@ -373,6 +407,8 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
         if attempts.count(proof["attempt"]) > 1:
             gaps.append(f"{label}: {attempts.count(proof['attempt'])} proofs from attempt {proof['attempt']}")
         gaps += _red_session(label, proof)
+        if proof["duplicates"]:
+            gaps.append(f"{label}: duplicate executions: " + _named(proof["duplicates"]))
         assigned, executed = proof["lane"]["assigned"], proof["executed"]
         notes.append(f"{label}: proof from attempt {proof['attempt']}"
                      + (f" (attempts present: {', '.join(map(str, attempts))})" if len(proofs) > 1 else "")
@@ -383,10 +419,18 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
                         + (f"; only in the shard: {_named(theirs - ours)}" if theirs - ours else "")
                         + (f"; only in the manifest: {_named(ours - theirs)}" if ours - theirs else "")
                         + ("; same nodes in another order" if theirs == ours else ""))
-        # By position in the recorded list, exactly as the plugin slices it. The list is not
-        # sorted here: an id the export redacts can sort elsewhere than the id that ran.
-        if full is not None and assigned != full[index - 1::count]:
-            gaps.append(f"{label}: its assignment is not slice {index} of {count} of the manifest lane")
+        # Preserve recorded order: redaction can change a node's lexical position.
+        # UI slices by node position; the default suite assigns whole files by weight.
+        if full is not None:
+            expected = full[index - 1::count]
+            if lane_key != "ui_browser":
+                weights = manifest["lane"]["file_weights"]
+                owners = file_shards(dict(weights), count)
+                expected = [node for node in full if owners[node.split("::", 1)[0]] == index]
+                if proof["lane"]["file_weights"] != weights:
+                    gaps.append(f"{label}: file weights differ from the manifest")
+            if assigned != expected:
+                gaps.append(f"{label}: its assignment is not slice {index} of {count} of the manifest lane")
         if set(assigned) - executed:
             gaps.append(f"{label}: assigned but not executed ({len(set(assigned) - executed)}): "
                         + _named(set(assigned) - executed))
@@ -409,26 +453,27 @@ def reconcile_shards(manifest_root: Path, shards_root: Path, *, count: int, sha:
 def _reconcile(args) -> int:
     try:
         gaps, notes = reconcile_shards(args.manifest, args.shards, count=args.count,
-                                       sha=args.sha, run_id=args.run_id)
+                                       sha=args.sha, run_id=args.run_id, lane_key=args.lane)
     except Exception as error:  # An unreadable proof tree is a failed proof, not a skipped one.
         gaps, notes = [f"reconciliation failed ({type(error).__name__})"], []
     verdict = (f"INCOMPLETE — {len(gaps)} gap(s)" if gaps
                else f"complete — every node of the lane is executed by one of {args.count} shards")
-    lines = [f"UI_BROWSER_RECONCILE {verdict}"] + notes + [f"GAP {gap}" for gap in gaps]
+    label = "UI browser lane" if args.lane == "ui_browser" else args.lane.replace("_", " ") + " lane"
+    lines = [f"{args.lane.upper()}_RECONCILE {verdict}"] + notes + [f"GAP {gap}" for gap in gaps]
     # GitHub shows at most ten error annotations per step; the log and summary list every gap.
-    lines += [_annotation("UI browser lane incomplete", gap) for gap in gaps[:10]]
+    lines += [_annotation(f"{label} incomplete", gap) for gap in gaps[:10]]
     sys.stdout.buffer.write("".join(line + "\n" for line in lines).encode("utf-8", "replace"))
     sys.stdout.flush()
     try:
         with args.summary.open("a", encoding="utf-8") as handle:
             handle.write("\n".join(
-                [f"## UI browser lane reconciliation — {_cell(verdict)}", "",
+                [f"## {label} reconciliation — {_cell(verdict)}", "",
                  f"Commit `{_cell(args.sha)}`, run {_cell(args.run_id)}. "
                  "A session that ended red is a gap; its shard job names the failed tests.",
                  ""] + [f"- {_cell(note)}" for note in notes]
                 + [f"- **GAP** {_cell(gap)}" for gap in gaps]) + "\n")
     except OSError as error:  # The verdict stands without its rendering.
-        print(f"::warning::UI lane reconciliation summary is unavailable ({type(error).__name__}).")
+        print(f"::warning::{label} reconciliation summary is unavailable ({type(error).__name__}).")
     return 1 if gaps else 0
 
 
@@ -447,6 +492,8 @@ def _main(argv=None) -> int:
     annotate.add_argument("--evidence-dir", type=Path, action="append", required=True)
     annotate.add_argument("--limit", type=int, default=10)
     reconcile = commands.add_parser("reconcile-shards")
+    reconcile.add_argument("--lane", choices=("ui_browser", "default_parallel", "default_serial"),
+                           default="ui_browser")
     for flag, kind in (("--manifest", Path), ("--shards", Path), ("--count", int),
                        ("--sha", str), ("--run-id", str), ("--summary", Path)):
         reconcile.add_argument(flag, type=kind, required=True)
@@ -485,6 +532,12 @@ if __name__ == "__main__":
 # pytest is intentionally below the stdlib-only CLI entrypoint and loaded only
 # through conftest's post-isolation plugin registration.
 import pytest
+try:
+    from _pytest.subtests import SubtestReport
+except ModuleNotFoundError as error:
+    if error.name != "_pytest.subtests":
+        raise
+    SubtestReport = ()  # pytest <9 has no built-in subtest reports; ordinary calls still count.
 
 
 def pytest_addoption(parser):
@@ -513,6 +566,7 @@ class _Results:
         self.collection_failures = []
         self.secrets = tuple(os.environ[key] for key in MASKED_SECRET_SETTING_KEYS if os.environ.get(key))
         self.safe_text = {}
+        self.started_at = monotonic()
         self.journal = None
         if not hasattr(config, "workerinput"):  # xdist re-emits worker events on the controller.
             try:
@@ -539,8 +593,11 @@ class _Results:
         try:
             # A parametrized nodeid can carry a secret: every value is redacted
             # before its first write; the cache keeps that to once per distinct text.
-            row = {"event": event, "nodeid": nodeid, **facts}
+            row = {"event": event, "nodeid": nodeid,
+                   "elapsed_seconds": monotonic() - self.started_at, **facts}
             for key, value in row.items():
+                if not isinstance(value, str):  # Only approved numeric timing facts bypass redaction.
+                    continue
                 if value not in self.safe_text:
                     self.safe_text[value] = _redact(value, self.secrets)
                 row[key] = self.safe_text[value]
@@ -572,6 +629,8 @@ class _Results:
         crashed = report.when not in _PHASES
         row = {
             "nodeid": report.nodeid, "phase": "crash" if crashed else report.when,
+            # Preserve the report's kind, never its potentially private subtest context.
+            "is_subtest": isinstance(report, SubtestReport),
             "outcome": report.outcome,
             "duration_seconds": duration if math.isfinite(duration) else None,
             "error_type": "WorkerCrash" if crashed else getattr(report, "ci_error_type", ""),
@@ -579,7 +638,8 @@ class _Results:
         }
         self.reports.append(row)
         self._event("report", row["nodeid"], phase=row["phase"], outcome=row["outcome"],
-                    error_type=row["error_type"])
+                    error_type=row["error_type"], duration_seconds=row["duration_seconds"],
+                    is_subtest=row["is_subtest"])
 
     def pytest_collectreport(self, report):
         if report.failed:
@@ -606,6 +666,12 @@ class _Results:
             lane = getattr(self.config, "_ui_browser_lane", None)
             if lane:
                 facts["ui_browser"] = lane
+            lane = getattr(self.config, "_default_suite_lane", None)
+            if lane:
+                facts["default_" + lane["pass"]] = lane
+            crash = getattr(self.config, "_ouroboros_worker_crash", None)
+            if crash:
+                facts["worker_crash"] = crash
             write_json(output_dir(self.config) / "results.json", _redact(facts, self.secrets))
         except Exception as error:
             # Diagnostics alone never alter session.exitstatus or expose a body.

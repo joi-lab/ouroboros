@@ -46,6 +46,7 @@ from ouroboros.request_wire_recovery import (
 
 from ouroboros.usage_accounting import UsageAccountingError, last_physical_attempt_capture, UsageScope, usage_scope
 from ouroboros._usage_response import observed_processing_mode
+from ouroboros.event_usage import REPORTED_TOKENS_KEY, anthropic_token_counts
 
 
 class _AnthropicLaneMixin:
@@ -377,6 +378,8 @@ class _AnthropicLaneMixin:
             "provider": "anthropic",
             "resolved_model": str(target.get("usage_model") or target.get("resolved_model") or ""),
         }
+        # The counters above keep their billing shape; events read what was REPORTED (#1578).
+        usage[REPORTED_TOKENS_KEY] = anthropic_token_counts(raw_usage)
         for key in ("speed", "service_tier", "processing"):
             if key in raw_usage:
                 usage[key] = raw_usage[key]

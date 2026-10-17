@@ -9,6 +9,7 @@ from ouroboros.agent_task_pipeline import _store_task_result
 from ouroboros.loop_llm_call import call_llm_with_retry
 from ouroboros.subagent_history import record_task_execution, record_last_delegation, subagent_last_delegation, session_request_facts
 from ouroboros.subagent_runtime import resolve_configured_actor_dispatch
+from tests._store_shared import result_exists
 
 
 def _task(kind="api_model", target="openai::fixture"):
@@ -40,7 +41,7 @@ def test_api_failure_fallback_and_retry_reach_next_task_context(tmp_path, monkey
     # Another model's usable response does not erase this route's own incident.
     usage["llm_call_refs"].append({"model": "openai::fallback", "usable_solve_response": True})
     _store_task_result(SimpleNamespace(drive_root=tmp_path), task, "Fallback answered", usage, {"tool_calls": []})
-    assert (tmp_path / "task_results" / "task-history.json").is_file()
+    assert result_exists(tmp_path, "task-history")
     row = _delegation_capability_fact()["subagents_last_executions"][0]
     assert row["outcome"] == "failed" and row["occurred_at"] == failure["ts"]
     assert row["task_id"] == task["id"] and row["fallback"]["model"] == "openai::fallback"

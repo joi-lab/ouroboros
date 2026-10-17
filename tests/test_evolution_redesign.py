@@ -32,7 +32,8 @@ def test_evolution_campaign_text_includes_objective(tmp_path, monkeypatch):
 
     assert "EVOLUTION CAMPAIGN" in text
     assert "Improve scheduler observability" in text
-    assert "normal advisory + triad + scope review flow" in text
+    assert "the normal commit review by the review panel (`commit_reviewed`)" in text
+    assert "triad + scope" not in text
 
 
 def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
@@ -650,7 +651,10 @@ def test_frontend_evolution_and_consciousness_controls_are_present():
     assert consciousness["settingsToggleId"] == "s-local-consciousness"
     assert "modelRolesHost('settings-model-roles')" in settings_ui
     assert "modelRoles.load(s," in settings
-    assert "OUROBOROS_EFFORT_CONSCIOUSNESS', ''" in settings  # empty = the Task / Chat effort
+    # The role effort keys are retired: evolution and wakes start at the top of the owner's
+    # effort range, which only the composer's Effort control shows and edits.
+    assert "OUROBOROS_EFFORT_CONSCIOUSNESS" not in settings and "OUROBOROS_EFFORT_EVOLUTION" not in settings
+    assert "data-effort-range-summary" not in settings_ui and "Reasoning Effort" not in settings_ui
 
 
 def test_evolution_checkpoint_records_and_reads(tmp_path):
@@ -1055,8 +1059,8 @@ def test_enqueue_evolution_omits_duplicate_cycle_message(tmp_path, monkeypatch):
 
     assert len(pending) == 1
     assert pending[0]["type"] == "evolution"
-    # The generic "... task started." lifecycle message is the only start bubble;
-    # the redundant "Evolution #N: <id>" enqueue bubble is gone.
+    # The task's own card is its start (no standalone bubble); the redundant
+    # "Evolution #N: <id>" enqueue bubble is gone.
     assert not any("Evolution #" in m for m in sent)
 
 
@@ -1198,84 +1202,6 @@ body
     assert pending == []
     assert queue.list_scheduled_tasks(tmp_path)["tasks"] == [before]
     assert not (tmp_path / "task_results").exists()
-
-
-def test_reflection_extract_trailing_json_parses_memory_and_backlog():
-    from ouroboros.reflection import _extract_trailing_json
-
-    text = (
-        "Reflection body here.\n"
-        'MEMORY_ACTIONS_JSON: [{"type": "scratchpad_append", "content": "note"}]\n'
-        'BACKLOG_CANDIDATES_JSON: [{"summary": "s", "evidence": "e"}]'
-    )
-    body_after_backlog, backlog = _extract_trailing_json(text, "BACKLOG_CANDIDATES_JSON:")
-    reflection_text, memory = _extract_trailing_json(body_after_backlog, "MEMORY_ACTIONS_JSON:")
-
-    assert backlog == [{"summary": "s", "evidence": "e"}]
-    assert memory == [{"type": "scratchpad_append", "content": "note"}]
-    assert reflection_text.strip() == "Reflection body here."
-
-
-def test_reflection_extract_trailing_json_is_order_independent():
-    from ouroboros.reflection import _extract_trailing_json
-
-    # Markers emitted in the reverse of the documented order must still both parse
-    # (no silent memory-action loss).
-    text = (
-        "Reflection body.\n"
-        'BACKLOG_CANDIDATES_JSON: [{"summary": "s", "evidence": "e"}]\n'
-        'MEMORY_ACTIONS_JSON: [{"type": "knowledge_write", "content": "c", "topic": "t"}]'
-    )
-    after_backlog, backlog = _extract_trailing_json(text, "BACKLOG_CANDIDATES_JSON:")
-    reflection_text, memory = _extract_trailing_json(after_backlog, "MEMORY_ACTIONS_JSON:")
-
-    assert backlog == [{"summary": "s", "evidence": "e"}]
-    assert memory == [{"type": "knowledge_write", "content": "c", "topic": "t"}]
-    assert reflection_text.strip() == "Reflection body."
-
-
-def test_reflection_validate_memory_actions_filters_types():
-    from ouroboros.reflection import _validate_memory_actions
-
-    raw = [
-        {"type": "scratchpad_append", "content": "note"},
-        {"type": "knowledge_write", "content": "fact", "topic": "facts"},
-        {"type": "knowledge_write", "content": "no topic"},
-        {"type": "identity_update_candidate", "content": "refine"},
-        {"type": "delete_everything", "content": "nope"},
-        {"type": "scratchpad_append", "content": "   "},
-    ]
-    actions = _validate_memory_actions(raw, "task1")
-
-    assert [a["type"] for a in actions] == [
-        "scratchpad_append", "knowledge_write", "identity_update_candidate",
-    ]
-    assert actions[1]["topic"] == "facts"
-    assert all(a["task_id"] == "task1" for a in actions)
-
-
-def test_apply_memory_actions_writes_to_parent_drive(tmp_path):
-    from ouroboros.reflection import apply_memory_actions
-
-    env = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path)
-    actions = [
-        {"type": "scratchpad_append", "content": "durable note", "task_id": "t1"},
-        {"type": "knowledge_write", "content": "reusable fact", "topic": "review_process", "task_id": "t1"},
-        {"type": "identity_update_candidate", "content": "I value rigor", "task_id": "t1"},
-    ]
-
-    assert apply_memory_actions(env, actions) == 3
-
-    knowledge = (tmp_path / "memory" / "knowledge" / "review_process.md").read_text(encoding="utf-8")
-    assert "reusable fact" in knowledge
-    assert (tmp_path / "memory" / "knowledge_history.jsonl").exists()
-
-    scratchpad = (tmp_path / "memory" / "scratchpad.md").read_text(encoding="utf-8")
-    assert "durable note" in scratchpad
-    assert "IDENTITY UPDATE CANDIDATE" in scratchpad
-    # Identity is never auto-written; the candidate stays in the scratchpad only.
-    identity_path = tmp_path / "memory" / "identity.md"
-    assert not identity_path.exists() or "I value rigor" not in identity_path.read_text(encoding="utf-8")
 
 
 def test_runtime_context_includes_schedule_digest(tmp_path):

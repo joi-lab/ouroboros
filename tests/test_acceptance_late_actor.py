@@ -1,6 +1,5 @@
 """Late criticism follows the actor's ended drain, even before canonical copyback."""
 
-import json
 import queue
 from types import SimpleNamespace
 
@@ -12,6 +11,7 @@ from ouroboros.review_projection import publish_acceptance_checkpoint
 from ouroboros.task_results import load_task_result, write_task_result
 from supervisor.terminal_delivery import pending_deliveries, register_delivery
 from tests.test_review_operation_collection import TASK, _HeldModel, _ctx, _released_panel, _settle
+from tests._store_shared import delete_result, read_result, result_signature, seed_result
 
 
 @pytest.mark.parametrize("actor_status", ["completed", "running", None])
@@ -48,10 +48,9 @@ def _legacy_panel(tmp_path, monkeypatch, *, actor_status="completed"):
             model.release.set()
         _settle(model, run)
     # These old published panels carry their full request/roster, but no controller pointer.
-    path = tmp_path / "task_results" / f"{TASK}.json"
-    row = json.loads(path.read_text(encoding="utf-8"))
+    row = read_result(tmp_path, TASK)
     row.pop("review_operations", None)
-    path.write_text(json.dumps(row), encoding="utf-8")
+    seed_result(tmp_path, TASK, row)
     monkeypatch.setattr("ouroboros.review_substrate.run_review_request",
                         lambda *a, **kw: pytest.fail("catch-up dispatched a new review"))
     monkeypatch.setattr("ouroboros.review_substrate.ReviewCoordinator.run",
@@ -59,7 +58,7 @@ def _legacy_panel(tmp_path, monkeypatch, *, actor_status="completed"):
     monkeypatch.setattr("ouroboros.claudexor_daemon.ensure_owned_gateway",
                         lambda *a, **kw: pytest.fail("catch-up started a daemon"))
     sink = queue.Queue()
-    monkeypatch.setattr("supervisor.workers.get_event_q", lambda: sink)
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda *, create=True: sink)
     return child, model, sink
 
 
@@ -86,7 +85,7 @@ def test_legacy_catchup_does_not_treat_live_or_unknown_actor_as_ended(tmp_path, 
     child, model, sink = _legacy_panel(tmp_path, monkeypatch, actor_status="running")
     path = child / "task_results" / f"{TASK}.json"
     if actor_state == "missing":
-        path.unlink()
+        delete_result(child, TASK)
     elif actor_state == "unreadable":
         path.write_text("{broken", encoding="utf-8")
     monkeypatch.setattr(settlement, "settle_acceptance_operation",
@@ -121,10 +120,10 @@ def test_legacy_missing_applied_source_stays_unresolved_without_dispatch(tmp_pat
     row = load_task_result(tmp_path, TASK)
     ref = row["review_projection"]["panels"][0]["applied_source_ref"]
     (task_artifact_dir_path(tmp_path, TASK) / ref["path"]).unlink()
-    before = (tmp_path / "task_results" / f"{TASK}.json").read_bytes()
+    before = result_signature(tmp_path, TASK)
     report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
     assert report["errors"] and not report["settled"] and sink.empty()
-    assert (tmp_path / "task_results" / f"{TASK}.json").read_bytes() == before
+    assert result_signature(tmp_path, TASK) == before
     assert model.calls == 1
 
 
@@ -152,10 +151,10 @@ def test_legacy_notice_does_not_reappear_after_outbox_eviction(tmp_path, monkeyp
     from supervisor.terminal_delivery import already_delivered
 
     assert not already_delivered(tmp_path, "acceptance-late:legacy-wave"), "the bounded registry really evicted it"
-    before = (tmp_path / "task_results" / f"{TASK}.json").read_bytes()
+    before = result_signature(tmp_path, TASK)
     assert review_operation.recover_orphaned_acceptance_operations(tmp_path)["settled"] == []
     assert sink.qsize() == 1 and model.calls == 1 and not pending_deliveries(tmp_path)
-    assert (tmp_path / "task_results" / f"{TASK}.json").read_bytes() == before
+    assert result_signature(tmp_path, TASK) == before
 
 
 def test_notice_receipt_does_not_overwrite_a_concurrently_replaced_panel(tmp_path, monkeypatch):
@@ -164,24 +163,23 @@ def test_notice_receipt_does_not_overwrite_a_concurrently_replaced_panel(tmp_pat
     row = load_task_result(tmp_path, TASK)
     panel = row["review_projection"]["panels"][0]
     stale = {**panel, "publication_revision": panel["publication_revision"] - 1}
-    before = (tmp_path / "task_results" / f"{TASK}.json").read_bytes()
+    before = result_signature(tmp_path, TASK)
     review_operation._remember_legacy_notice(tmp_path, TASK, "stale-delivery", stale)
-    assert (tmp_path / "task_results" / f"{TASK}.json").read_bytes() == before
+    assert result_signature(tmp_path, TASK) == before
 
 
 def test_already_settled_legacy_panel_does_not_acquire_a_new_notice_on_upgrade(tmp_path, monkeypatch):
     _child, model, sink = _legacy_panel(tmp_path, monkeypatch)
     review_operation.recover_orphaned_acceptance_operations(tmp_path)
-    path = tmp_path / "task_results" / f"{TASK}.json"
-    row = json.loads(path.read_text(encoding="utf-8"))
+    row = read_result(tmp_path, TASK)
     row["review_projection"].pop("late_notice_receipts")  # old completed supplement, no new catch-up duty
-    path.write_text(json.dumps(row), encoding="utf-8")
+    seed_result(tmp_path, TASK, row)
     monkeypatch.setattr("supervisor.terminal_delivery._REGISTRY_CAP", 1)
     assert register_delivery(tmp_path, "acceptance-late:legacy-wave")
     assert register_delivery(tmp_path, "newer-delivery")
-    before = path.read_bytes()
+    before = result_signature(tmp_path, TASK)
     assert not review_operation.recover_orphaned_acceptance_operations(tmp_path)["settled"]
-    assert path.read_bytes() == before and sink.qsize() == 1 and model.calls == 1
+    assert result_signature(tmp_path, TASK) == before and sink.qsize() == 1 and model.calls == 1
 
 
 @pytest.mark.parametrize("legacy_order", [False, True])

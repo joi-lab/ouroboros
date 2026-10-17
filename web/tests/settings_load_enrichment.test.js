@@ -27,7 +27,7 @@ const SKILLS = [{ name: 'reveal-fixture', grants: { requested_keys: ['TEST_REVEA
 const SECTIONS = [{ skill: 'reveal-fixture', section_id: 'config', render: { components: [] } }];
 
 function settingsLoader({ activePage = 'settings', extensions } = {}) {
-    const calls = { applied: 0, rows: [], sections: [], baselines: 0, dirtyChecks: 0, extensionReads: 0 };
+    const calls = { applied: 0, rows: [], sections: [], baselines: 0, dirtyChecks: 0, extensionReads: 0, servedUiReads: 0 };
     const context = vm.createContext({
         page: {}, loadSequence: 0, restartReadSequence: 0, draftRevision: 0,
         currentSettings: {}, settingsLoaded: false, saveOutcomeUnknown: true, validationAttempted: true,
@@ -38,12 +38,13 @@ function settingsLoader({ activePage = 'settings', extensions } = {}) {
         },
         resetSecretReveals() {}, syncRestartState() {}, renderCustomSecrets() {}, paintSettingsFieldErrors() {},
         armCleanBaselineOnStatusSettle() {}, _renderNetworkHint() {}, syncSettingsLoadState() {},
+        refreshServedUi() { calls.servedUiReads += 1; },
         applySettings() { calls.applied += 1; },
         setSettingsCleanBaseline() { calls.baselines += 1; },
         updateSettingsDirtyState() { calls.dirtyChecks += 1; },
         renderRequestedSkillSecrets(root, skills) { calls.rows.push(skills); },
         renderExtensionSettingsSections: async (root, sections, { isCurrent }) => { if (isCurrent()) calls.sections.push(sections); },
-        reloadReviewerSlots: async () => {}, reloadSubagentsSection: async () => {},
+        reloadReviewPool: async () => {}, reloadSubagentsSection: async () => {},
     });
     vm.runInContext(source('    const settingsPageActive = ', '\n    async function reloadSettingsWithFeedback'), context);
     return { context, calls, load: () => context.loadSettings() };
@@ -56,6 +57,7 @@ test('the settings document paints and Save is usable while /api/extensions is h
     await nextTurn();
     assert.equal(view.calls.extensionReads, 1, 'the list read starts with the document read');
     assert.equal(view.calls.applied, 1, 'the document is applied without the list');
+    assert.equal(view.calls.servedUiReads, 1, 'the served interface is read beside the document, not behind the list');
     assert.equal(view.context.settingsLoaded, true, 'Save is usable while the list is held');
     assert.equal(view.context.saveOutcomeUnknown, false);
     assert.equal(view.calls.baselines, 1, 'the clean baseline is taken from the document alone');

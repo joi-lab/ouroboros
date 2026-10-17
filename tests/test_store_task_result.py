@@ -10,6 +10,7 @@ import json
 from types import SimpleNamespace
 
 import ouroboros.agent_task_pipeline as pipeline
+from tests._store_shared import read_result
 
 
 def test_store_task_result_persists_review_evidence(tmp_path):
@@ -24,7 +25,7 @@ def test_store_task_result_persists_review_evidence(tmp_path):
         review_evidence={"has_evidence": True, "open_obligations": [{"item": "tests_affected"}]},
     )
 
-    payload = json.loads((tmp_path / "task_results" / "task-store.json").read_text(encoding="utf-8"))
+    payload = read_result(tmp_path, "task-store")
     assert payload["review_evidence"]["has_evidence"] is True
     assert payload["review_evidence"]["open_obligations"][0]["item"] == "tests_affected"
 
@@ -53,9 +54,7 @@ def test_store_task_result_persists_only_compact_review_projection(tmp_path):
         review_evidence={},
     )
 
-    payload = json.loads(
-        (tmp_path / "task_results" / "task-review-projection.json").read_text(encoding="utf-8")
-    )
+    payload = read_result(tmp_path, "task-review-projection")
     actor = payload["review_projection"]["panels"][0]["actors"][0]
     assert actor["model"] == "openai/gpt-5.6-sol"
     assert actor["parse_status"] == "valid"
@@ -79,7 +78,7 @@ def test_store_task_result_preserves_failed_status(tmp_path):
         review_evidence={},
     )
 
-    payload = json.loads((tmp_path / "task_results" / "task-failed.json").read_text(encoding="utf-8"))
+    payload = read_result(tmp_path, "task-failed")
     assert payload["status"] == STATUS_FAILED
     assert payload["result"] == "final failure reply"
 
@@ -107,7 +106,7 @@ def test_store_task_result_keeps_delivered_answer_and_unresolved_tool_errors(tmp
         review_evidence={},
     )
 
-    payload = json.loads((tmp_path / "task_results" / "task-tool-failed.json").read_text(encoding="utf-8"))
+    payload = read_result(tmp_path, "task-tool-failed")
     assert payload["status"] == STATUS_COMPLETED
     assert payload["outcome_axes"]["execution"]["status"] == "ok"
     assert payload["outcome_axes"]["objective"]["status"] == "not_evaluated"
@@ -150,7 +149,7 @@ def test_store_task_result_allows_recovered_tool_failure_success(tmp_path):
         review_evidence={},
     )
 
-    payload = json.loads((tmp_path / "task_results" / "task-tool-recovered.json").read_text(encoding="utf-8"))
+    payload = read_result(tmp_path, "task-tool-recovered")
     assert payload["status"] == STATUS_COMPLETED
     assert payload["outcome_axes"]["execution"]["status"] == "ok"
     assert payload["outcome_axes"]["objective"]["status"] == "not_evaluated"

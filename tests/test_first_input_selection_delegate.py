@@ -13,6 +13,7 @@ from tests._delegated_transport_shared import (  # noqa: F401 - installs the off
     _LiveRunStub,
     _nanny_ctx,
     _owned_gateway_uses_each_test_transport,
+    _select_transport_access,
 )
 
 
@@ -28,6 +29,9 @@ def test_declared_direct_start_sends_the_normalized_contract_authority(tmp_path,
             requests.append(json.loads(json.dumps(request)))
             return super().start_run(request, idempotency_key=idempotency_key)
 
+    # A READ-ONLY child (the stub serves readonly only): technical access alone decides
+    # the run shape now (#1609), so the read-only premise is stated, not inferred.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=ordinary-model:high")
     monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *_a, **_kw: RecordingStub())
     ctx = _nanny_ctx(tmp_path)
@@ -76,7 +80,10 @@ def test_registered_direct_start_with_declared_selection_starts(tmp_path, monkey
     registry._ctx.task_metadata = {"root_task_id": "declared-child", "parent_task_id": "declared-child"}
     registry._ctx.task_contract = {"input_sources": "declared", "context": "COMMON_EVIDENCE"}
 
-    result = registry.execute_result("delegate_start", {"prompt": "Inspect declared evidence", "subagent_id": "session"})
+    # The configured row captures `full`; this read-only leaf lowers it explicitly at the
+    # call (#1609), the same choice a model makes for a read-only inspection.
+    result = registry.execute_result("delegate_start", {
+        "prompt": "Inspect declared evidence", "subagent_id": "session", "access": "readonly"})
 
     payload = json.loads(result.text)
     assert payload.get("status") == "started", result.text
@@ -98,6 +105,7 @@ def test_ordinary_direct_start_and_retry_preserve_request_and_parent_context(tmp
             return super().start_run(request, idempotency_key=idempotency_key)
 
     stub = RetryStub()
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=ordinary-model:high")
     monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *_a, **_kw: stub)
     ctx = _nanny_ctx(tmp_path)

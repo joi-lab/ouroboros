@@ -18,7 +18,8 @@ from typing import Any, Callable, Collection, Dict, Iterable, Mapping, Tuple
 
 @dataclass(frozen=True)
 class ToolEntry:
-    """Single tool descriptor."""
+    """Single tool descriptor: identity, schema, handler and the tool's own
+    capability facts, including the Safety Supervisor routing it declares."""
 
     name: str
     schema: Dict[str, Any]
@@ -36,6 +37,11 @@ class ToolEntry:
     # the canonical name while saved prompts, memories, and configs that still
     # use the old spelling keep working.
     alias_for: str = ""
+    # Declared safety policy (``safety.py`` vocabulary: skip / check /
+    # check_conditional), so a new built-in needs no edit of the protected
+    # table. A ``safety.TOOL_POLICY`` entry outranks it, an invalid value is
+    # checked, and extension/MCP dispatch passes none: their tools stay checked.
+    safety_policy: str = ""
 
 
 class DuplicateToolNameError(ValueError):

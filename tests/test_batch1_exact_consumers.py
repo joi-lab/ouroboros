@@ -235,11 +235,11 @@ def test_history_stamps_replay_evidence_on_a_latest_accounting_wait_checkpoint(t
 
 def test_review_reference_producer_history_and_chat_reconnect_keep_tool_evidence(tmp_path):
     import shutil
-    import subprocess
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.tool_call_log import append_call_row
-    from ouroboros.tools.plan_review_references import _emit_plan_review_reference
+    from ouroboros.tools.plan_review_references import _emit_review_reference
     from ouroboros.utils import append_jsonl
+    from tests.group_run import run_in_group
 
     task_id = "turn-a"
     append_jsonl(tmp_path / "logs/progress.jsonl", {"type": "send_message", "role": "assistant",
@@ -250,7 +250,7 @@ def test_review_reference_producer_history_and_chat_reconnect_keep_tool_evidence
             "invocation_id": invocation, "tool_call_id": "reused-provider-id", "tool": "read_file",
             "is_error": event == "tool_call_timeout", "status": "ok"})["task_log"]
     owner = SimpleNamespace(drive_root=tmp_path, current_chat_id=1, task_metadata={}, event_queue=None)
-    _emit_plan_review_reference(owner, task_id, {"current_attempt": {"fingerprint": "plan-1"}})
+    _emit_review_reference(owner, task_id, {"asks": [{"ask_id": "a1"}]}, surface="plan_review", fingerprint="plan-1")
     response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
     payload = json.loads(response.body)
     latest = payload["messages"][-1]
@@ -264,9 +264,9 @@ def test_review_reference_producer_history_and_chat_reconnect_keep_tool_evidence
     history.write_bytes(response.body)
     node = shutil.which("node")
     assert node, "Node is required for the real Chat consumer proof"
-    result = subprocess.run([node, "--test", "--test-name-pattern=reference carriers",
+    result = run_in_group([node, "--test", "--test-name-pattern=reference carriers",
         "web/tests/chat_activity_block.test.js"], cwd=pathlib.Path(__file__).resolve().parents[1],
-        env={**os.environ, "OURO_TEST_TOOL_HISTORY": str(history)}, capture_output=True, text=True, timeout=30)
+        env={**os.environ, "OURO_TEST_TOOL_HISTORY": str(history)}, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
 
 

@@ -37,7 +37,7 @@ def is_restricted_subagent_profile(ctx: ToolContext) -> bool:
     return profile in ("local_readonly_subagent", "acting_subagent")
 
 
-def _is_runtime_secret_data_path(norm: str) -> bool:
+def _is_runtime_secret_data_path(norm: str, *, include_owner_state: bool = True) -> bool:
     text = str(norm or "").replace("\\", "/").strip()
     while text.startswith("./"):
         text = text[2:]
@@ -54,11 +54,12 @@ def _is_runtime_secret_data_path(norm: str) -> bool:
     normalized_names = {name, name.lstrip(".")}
     if name.lstrip(".") == "settings.tmp":
         normalized_names.add("settings.json")
-    for protected_name in (RUNTIME_SECRET_FILE_NAMES | _SKILL_OWNER_STATE_FILENAMES):
+    protected_names = RUNTIME_SECRET_FILE_NAMES | (_SKILL_OWNER_STATE_FILENAMES if include_owner_state else set())
+    for protected_name in protected_names:
         bare = name.lstrip(".")
         if bare.startswith(f"{protected_name}.tmp") or bare.startswith(f"{protected_name}.lock"):
             normalized_names.add(protected_name)
-    if normalized_names & (RUNTIME_SECRET_FILE_NAMES | _SKILL_OWNER_STATE_FILENAMES):
+    if normalized_names & protected_names:
         return True
     if name.startswith(".env") or name.endswith(".env") or ".env." in name:
         return True
@@ -113,16 +114,20 @@ def runtime_data_roots(ctx: ToolContext) -> list[pathlib.Path]:
 def is_runtime_secret_target(
     target: pathlib.Path, repo_root: pathlib.Path, *, data_root: pathlib.Path | None = None,
     ctx: ToolContext | None = None,
+    include_owner_state: bool = True,
 ) -> bool:
-    return make_runtime_secret_target_check(repo_root, data_root=data_root, ctx=ctx)(target)
+    return make_runtime_secret_target_check(repo_root, data_root=data_root, ctx=ctx,
+                                          include_owner_state=include_owner_state)(target)
 
 
 def make_runtime_secret_target_check(
     repo_root: pathlib.Path, *, data_root: pathlib.Path | None = None,
     ctx: ToolContext | None = None,
+    include_owner_state: bool = True,
 ) -> Callable[[pathlib.Path], bool]:
     """Prepare locations for one runtime-control command check, never across calls.
 
+    Read-only typed state readers may exclude nonsecret owner mutation state.
     Only roots and candidate path names are retained. Each target still resolves
     and checks live owner-state aliases and file identity before admission.
     """
@@ -150,7 +155,8 @@ def make_runtime_secret_target_check(
     for data in data_roots:
         try:
             secret_candidates.extend(candidate for candidate in data.iterdir()
-                                     if candidate.is_file() and _is_runtime_secret_data_path(candidate.name))
+                                     if candidate.is_file() and _is_runtime_secret_data_path(
+                                         candidate.name, include_owner_state=include_owner_state))
         except OSError:
             pass
     try:
@@ -169,9 +175,9 @@ def make_runtime_secret_target_check(
             except ValueError:
                 data_rel = ""
             if data_rel and (
-                (not task_content and _is_runtime_secret_data_path(data_rel))
-                or _is_skill_owner_state_target(target, data)
-                or is_skill_owner_state_alias(target, data)
+                (not task_content and _is_runtime_secret_data_path(data_rel, include_owner_state=include_owner_state))
+                or (include_owner_state and (_is_skill_owner_state_target(target, data)
+                                            or is_skill_owner_state_alias(target, data)))
             ):
                 return True
         try:

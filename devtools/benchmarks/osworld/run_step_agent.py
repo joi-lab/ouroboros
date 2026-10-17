@@ -311,6 +311,7 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             # runs it — CLI env cannot configure the executing server, so the
             # preflight must verify it (adversarial review r2 #6).
             "OUROBOROS_REVIEW_ENFORCEMENT": "blocking",
+            "OUROBOROS_TASK_REVIEW_MODE": "required",
         }
         mismatches = []
         for key, want in expected.items():
@@ -329,6 +330,7 @@ def _preflight(config: PreflightConfig) -> dict[str, Any]:
             for k in (
                 "OUROBOROS_RUNTIME_MODE",
                 "OUROBOROS_SAFETY_MODE",
+                "OUROBOROS_TASK_REVIEW_MODE",
                 "OUROBOROS_MAX_WORKERS",
                 "OUROBOROS_MODEL",
                 "OUROBOROS_SUBAGENTS",

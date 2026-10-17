@@ -15,7 +15,8 @@ The packaged unit is supported only for the native `.deb` and `.rpm` layout. It
 starts the release-reviewed launcher at `/opt/ouroboros/Ouroboros`, the same
 entry point as the packaged desktop file. Source checkouts, AppImages, and
 tarballs have different locations and are deliberately outside this unit's
-contract.
+contract; containers use [`packaging/docker/compose.yaml`](../docker/compose.yaml)
+([`docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md)).
 
 The package installs the unit at:
 

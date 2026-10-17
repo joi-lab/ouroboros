@@ -41,7 +41,7 @@ def late_skill(tmp_path, monkeypatch):
     rows[-1]["reason"] = "full source " * 4000 + "EOF-SKILL-VERDICT"
     result_text = json.dumps(rows)
     behavior = SimpleNamespace(before_wait=lambda: None, text=result_text,
-                               wait=lambda kwargs: release.wait(10), expected_completions=2)
+                               wait=lambda kwargs: release.wait(), expected_completions=2)
     class Slow:
         def chat(self, **kwargs):
             invoke_bound_api_review_paid_stamp()
@@ -58,6 +58,8 @@ def late_skill(tmp_path, monkeypatch):
             settled.set()
     monkeypatch.setattr(custody, "_settle_review_attempt", settle)
     monkeypatch.setattr(custody, "_logical_timeout", lambda *_: .05)
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "skill-root", "running", root_task_id="skill-root")  # the child's real root
     def ctx():
         value = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="skill-task")
         value.task_attempt = 1
@@ -99,6 +101,21 @@ def test_public_skill_call_reaggregates_late_cas_at_cycle_cap(late_skill):
     assert not (h.root / "state/skills/late/enabled.json").exists()
 
 
+def test_current_contract_change_does_not_replace_a_recoverable_api_wave(late_skill):
+    h = late_skill
+    _handle_review_skill(h.ctx(), skill="late")
+    h.release.set()
+    assert h.settled.wait(10)
+    old = json.loads(h.history.read_bytes().splitlines()[-1])
+    h.delivery["efforts"] = ["high"] * 2
+    _handle_review_skill(h.ctx(), skill="late")
+    new = json.loads(h.history.read_bytes().splitlines()[-1])
+    assert new["review_resume_of"] == old["wave_id"]
+    assert new["review_contract_fingerprint"] == old["review_contract_fingerprint"]
+    assert load_review_state(h.root, "late").status == "clean"
+    assert len(h.calls) == 2
+
+
 @pytest.mark.parametrize("defect", ["missing", "partial", "tampered", "operation"])
 def test_incomplete_skill_cas_never_authorizes_pass_or_another_send(late_skill, defect):
     from ouroboros.observability import call_manifest_path
@@ -128,7 +145,7 @@ def test_incomplete_skill_cas_never_authorizes_pass_or_another_send(late_skill, 
     assert h.history.read_bytes().startswith(original)
 
 
-@pytest.mark.parametrize("axis", ["task", "attempt", "content", "contract", "rebuttal", "cancel", "superseded", "chunks"])
+@pytest.mark.parametrize("axis", ["task", "attempt", "content", "rebuttal", "cancel", "superseded", "chunks"])
 def test_unrelated_or_superseded_skill_intent_does_not_inherit(late_skill, monkeypatch, axis):
     h = late_skill
     _handle_review_skill(h.ctx(), skill="late")
@@ -138,7 +155,6 @@ def test_unrelated_or_superseded_skill_intent_does_not_inherit(late_skill, monke
     if axis == "task": ctx.task_id = "new-task"
     if axis == "attempt": ctx.task_attempt = 2
     if axis == "content": (h.skill_dir / "SKILL.md").write_text((h.skill_dir / "SKILL.md").read_text() + "Changed.\n")
-    if axis == "contract": h.delivery["efforts"] = ["high"] * 2
     if axis == "rebuttal": rebuttal = "Please assess this new counterargument."
     if axis in {"cancel", "superseded"}:
         row = json.loads(h.history.read_bytes().splitlines()[-1])
@@ -178,7 +194,8 @@ def test_timeout_history_is_immutable_and_current_lifecycle_keeps_postconditions
     def timeout():
         with guard:
             if not timed_out:
-                runner._mark_review_job_timeout(h.root, "late", "", reason="lifecycle_timeout")
+                owner = runner._read_review_job(runner.review_job_state_path(h.root, "late"))["job_id"]
+                runner._mark_review_job_timeout(h.root, "late", "", reason="lifecycle_timeout", job_id=owner)
                 timed_out.append(1)
     h.behavior.before_wait = timeout
     _handle_review_skill(h.ctx(), skill="late")
@@ -239,7 +256,7 @@ def test_all_completed_chunks_reaggregate_once_without_a_new_paid_stamp(late_ski
     monkeypatch.setattr(custody, "_logical_timeout",
                         lambda slot, request, meta: 2 if "chunk a" in str(request.messages) else .05)
     h.behavior.expected_completions = 4
-    h.behavior.wait = lambda kwargs: "chunk a" in str(kwargs["messages"]) or h.release.wait(10)
+    h.behavior.wait = lambda kwargs: "chunk a" in str(kwargs["messages"]) or h.release.wait()
     _handle_review_skill(h.ctx(), skill="late")
     old = h.history.read_bytes()
     h.release.set()
@@ -249,3 +266,94 @@ def test_all_completed_chunks_reaggregate_once_without_a_new_paid_stamp(late_ski
     assert len(h.calls) == 4
     assert count_paid_skill_review_cycles(h.root, "late", "task:skill-root:late") == 1
     assert h.history.read_bytes().startswith(old)
+
+
+def _model_errors(root):
+    path = root / "logs" / "events.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [(row["slot_id"], row["operation_id"], row["error"]) for row in rows if row["type"] == "review_model_error"]
+
+
+def _seat_a_fails_while_seat_b_is_in_flight(h, monkeypatch, seat_b_error=""):
+    """seat-a's provider fails at once (a terminal failure the first wave logs); seat-b is
+    still in flight past its window, so the paid wave stays pending for a resumed collection."""
+    # seat-a's window only bounds a loaded host: its failure is immediate and ends the wait.
+    monkeypatch.setattr(custody, "_logical_timeout", lambda slot, *_: 10 if slot.slot_id == "seat-a" else .05)
+
+    def wait(kwargs):
+        if kwargs["model"] == "fake/one":
+            raise RuntimeError("seat-a: provider HTTP 503")
+        assert h.release.wait()
+        if seat_b_error:
+            raise RuntimeError(seat_b_error)
+        return True
+    h.behavior.wait = wait
+
+
+def _resume_twice(h):
+    """Two cold collections of the same paid wave: the second reads the first one's row."""
+    old = json.loads(h.history.read_bytes().splitlines()[-1])
+    h.release.set()
+    assert h.settled.wait(10)
+    _handle_review_skill(h.ctx(), skill="late")
+    _handle_review_skill(h.ctx(), skill="late")
+    rows = [json.loads(line) for line in h.history.read_bytes().splitlines()[-2:]]
+    assert [row.get("review_resume_of") for row in rows] == [old["wave_id"]] * 2
+    assert len(h.calls) == 2  # collection never sends
+    return old["review_wave"]["chunks"][0]["operations"]
+
+
+def test_a_resumed_collection_keeps_the_recorded_failure_receipt(late_skill, monkeypatch):
+    """#1578: the pending row holds the first wave's positive receipt for seat-a's exact
+    operation; re-reading the same producer CAS never logs that identical failure again."""
+    h = late_skill
+    _seat_a_fails_while_seat_b_is_in_flight(h, monkeypatch)
+    _handle_review_skill(h.ctx(), skill="late")
+    first = _model_errors(h.root)
+    operations = _resume_twice(h)
+    assert ("seat-a", operations["seat-a"], "seat-a: provider HTTP 503") in first
+    assert _model_errors(h.root) == first
+
+
+def test_a_failed_append_is_written_by_the_next_collection_once(late_skill, monkeypatch):
+    from ouroboros import triad_review
+
+    h = late_skill
+    _seat_a_fails_while_seat_b_is_in_flight(h, monkeypatch)
+    append = triad_review.append_jsonl
+    monkeypatch.setattr(triad_review, "append_jsonl", lambda *a, **kw: False)
+    _handle_review_skill(h.ctx(), skill="late")
+    monkeypatch.setattr(triad_review, "append_jsonl", append)
+    old = json.loads(h.history.read_bytes().splitlines()[-1])
+    assert [actor["error_event_logged"] for actor in old["raw_actor_records"]] == [False, False]
+    operations = _resume_twice(h)  # a failure status alone is never a receipt
+    assert [error[:2] for error in _model_errors(h.root)] == [("seat-a", operations["seat-a"])]
+
+
+def test_an_awaited_seats_event_is_no_receipt_for_its_terminal_failure(late_skill, monkeypatch):
+    """seat-b's awaited row was logged as such; its terminal cause, settled after the
+    first wave, is a new fact for that operation and is written once."""
+    h = late_skill
+    _seat_a_fails_while_seat_b_is_in_flight(h, monkeypatch, seat_b_error="seat-b: provider HTTP 529")
+    _handle_review_skill(h.ctx(), skill="late")
+    first = _model_errors(h.root)
+    awaited = json.loads(h.history.read_bytes().splitlines()[-1])["raw_actor_records"][1]
+    assert awaited["slot_id"] == "seat-b" and awaited["late_result_pending"] and awaited["error_event_logged"]
+    operations = _resume_twice(h)
+    assert _model_errors(h.root)[len(first):] == [("seat-b", operations["seat-b"], "seat-b: provider HTTP 529")]
+
+
+@pytest.mark.parametrize("axis", ["operation", "slot"])
+def test_a_receipt_of_another_operation_or_slot_is_not_inherited(late_skill, monkeypatch, axis):
+    h = late_skill
+    _seat_a_fails_while_seat_b_is_in_flight(h, monkeypatch)
+    _handle_review_skill(h.ctx(), skill="late")
+    lines = h.history.read_bytes().splitlines()
+    row = json.loads(lines[-1])
+    record = row["raw_actor_records"][0]
+    assert record["slot_id"] == "seat-a" and record["error_event_logged"] is True
+    record["operation_id" if axis == "operation" else "slot_id"] = "another"
+    h.history.write_bytes(b"\n".join([*lines[:-1], json.dumps(row).encode()]) + b"\n")
+    first = _model_errors(h.root)
+    operations = _resume_twice(h)
+    assert [error[:2] for error in _model_errors(h.root)[len(first):]] == [("seat-a", operations["seat-a"])]

@@ -91,3 +91,30 @@ def test_cyber_does_not_clear_a_configured_password_incidentally(isolated_settin
     response = _post(monkeypatch, isolated_settings, initial, {"TOTAL_BUDGET": 25}, bound_host="0.0.0.0")
     assert response.status_code == 200
     assert server_auth.get_configured_network_password() == "synthetic-password"
+
+
+@pytest.mark.parametrize("host,password,trusted,warning", [
+    ("", "", False, ""),
+    ("127.0.0.1", "", False, ""),
+    ("0.0.0.0", "synthetic-password", False, ""),
+    ("0.0.0.0", "", False,
+     "Server Bind Host is non-localhost and Network Password is empty; "
+     "after restart the app will be reachable on the network without a password."),
+    ("0.0.0.0", "", True,
+     "OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD=1 allows this "
+     "non-localhost bind without Ouroboros's internal Network Password. "
+     "Use only behind ingress auth, VPN, private networking, or an auth proxy."),
+])
+def test_post_save_exposure_notice_is_unchanged(monkeypatch, host, password, trusted, warning):
+    current = {"OUROBOROS_SERVER_HOST": host, "OUROBOROS_NETWORK_PASSWORD": password}
+    before = dict(current)
+    monkeypatch.setattr(settings, "_trust_nonlocal_bind_without_password_enabled", lambda: trusted)
+    assert settings._network_exposure_warning(current) == warning
+    assert current == before
+
+
+def test_post_save_notice_failure_does_not_reclassify_saved_settings(monkeypatch):
+    def unavailable(host):
+        raise OSError("synthetic notice lookup failure")
+    monkeypatch.setattr(server_auth, "is_loopback_host", unavailable)
+    assert settings._network_exposure_warning({"OUROBOROS_SERVER_HOST": "0.0.0.0"}) == ""

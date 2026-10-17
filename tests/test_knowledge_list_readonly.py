@@ -53,13 +53,21 @@ def test_list_with_no_knowledge_dir_creates_nothing(tmp_path):
     assert not (ctx.drive_root / "memory" / "knowledge").exists()
 
 
-def test_list_prefers_existing_index_verbatim(tmp_path):
-    """0-regression: when the write path has maintained an index, list returns it."""
+def test_list_retains_legacy_index_prose_without_treating_it_as_current_inventory(tmp_path):
+    """Current source projection cannot let a stale index reactivate a note.
+
+    Earlier prose remains exact and visibly historical until an authored overview.
+    """
     ctx = _Ctx(tmp_path / "drive")
     kdir = ctx.drive_root / "memory" / "knowledge"
     kdir.mkdir(parents=True)
-    (kdir / INDEX_FILE).write_text("# Knowledge Base Index\n\n- **a**: alpha\n", encoding="utf-8")
-    assert _knowledge_list(ctx) == "# Knowledge Base Index\n\n- **a**: alpha\n"
+    (kdir / INDEX_FILE).write_bytes(b"# Knowledge Base Index\n\n- **a**: alpha\n")
+    before = {p: p.read_bytes() for p in kdir.iterdir()}
+    listing = _knowledge_list(ctx)
+    assert "# Knowledge Base Index\n\n- **a**: alpha\n" in listing
+    assert "historical context, not current authored summaries" in listing
+    assert "Archived notes: 0" in listing
+    assert before == {p: p.read_bytes() for p in kdir.iterdir()}
 
 
 def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
@@ -81,3 +89,19 @@ def test_first_write_into_indexless_store_seeds_the_full_index(tmp_path):
     for topic in ("alpha", "beta", "gamma"):
         assert topic in listing, (topic, listing)
     assert (kdir / INDEX_FILE).exists()
+
+
+def test_written_index_keeps_underscore_notes_and_never_lists_itself(tmp_path):
+    """A filename is not a knowledge taxonomy; only the generated index is excluded."""
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    ctx = _Ctx(tmp_path / "drive")
+    kdir = ctx.drive_root / "memory" / "knowledge"
+    kdir.mkdir(parents=True)
+    (kdir / "_draft.md").write_text("# Draft\n\nA useful provisional note.\n", encoding="utf-8")
+
+    _knowledge_write(ctx, topic="visible", content="# Visible\n\nShown.\n")
+
+    index = (kdir / INDEX_FILE).read_text(encoding="utf-8")
+    assert "**_draft**" in index and "**visible**" in index
+    assert "**index-full**" not in index

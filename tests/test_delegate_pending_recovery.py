@@ -213,6 +213,7 @@ def test_retry_refusal_preserves_live_owner_handoff_and_pending_invocation(
         running_task_ids=set(),
         recoverable_task_ids=recovery.recoverable_task_ids(tmp_path),
         gateway_factory=lambda: OrphanGateway(),
+        replay_pending=lambda: True,  # the admitted sweep is the one surface that replays
     )
     assert replayed == [invocation_id]
     custody._CUSTODY.clear()

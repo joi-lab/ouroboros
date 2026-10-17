@@ -7,12 +7,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from tests._store_shared import read_result
 
 pytestmark = pytest.mark.serial
 
 from ouroboros import usage_accounting as ua
 from ouroboros.llm_claudexor import ClaudexorModelError, ClaudexorModelNotDispatched
 from ouroboros.tools import vision, vision_process
+from tests._usage_store_testing import ledger_rows
 
 MODEL = "claudexor::fixture=image-model"
 ROUTE = {"source": "fixture", "model": "image-model", "credentialProfileId": "account-exact",
@@ -52,7 +54,7 @@ def _install_child_fixture(mode, events_path):
             return self.detail()
 
         def detail(self):
-            pending = mode in {"pending", "cancel"} or mode == "slow" and self.polls < 8
+            pending = mode in {"pending", "cancel", "cancel_contended", "cancel_unreadable"} or mode == "slow" and self.polls < 8
             not_started = mode in {"quota", "auth", "mixed"}
             refused = not_started or mode == "field"
             problem = {"code": {"quota": "subscription_window_exhausted", "auth": "auth_required",
@@ -96,11 +98,36 @@ def _install_child_fixture(mode, events_path):
     transport.ensure_owned_gateway = lambda: gateway
     transport.config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.01
     pricing._fetch_live_rows = lambda *_: pytest.fail("VLM fixture must never fetch live pricing")
-    if mode == "checkpoint_fail":
+    original_write = vision_process._private_json
+
+    def record_receipt(path, value):
+        original_write(path, value)
+        if path.name == "receipt.json":
+            event("custody", fields=sorted(value["custody"]), operation_id=value["custody"]["operation_id"])
+
+    vision_process._private_json = record_receipt
+    if mode in {"cancel_contended", "cancel_unreadable"}:
+        real_read, refusals = Path.read_text, []
+
+        def contended_read(self, *args, **kwargs):
+            # Simulate a transient sharing refusal over intact published JSON.
+            # The retained Windows failure did not identify its actual exception;
+            # a refusal that never clears must still remain unreadable.
+            if self.name == "control.json" and self.exists() and (mode == "cancel_unreadable" or not refusals):
+                refusals.append(self)
+                raise PermissionError(13, "controlled sharing violation", str(self))
+            return real_read(self, *args, **kwargs)
+
+        Path.read_text = contended_read
+    if mode in {"checkpoint_fail", "checkpoint_retry"}:
         original = vision_process._private_json
+        refused_once = False
 
         def fail_receipt(path, value):
-            if path.name == "receipt.json":
+            nonlocal refused_once
+            if path.name == "receipt.json" and (mode == "checkpoint_fail"
+                    or not refused_once and value["custody"]["operation_id"]):
+                refused_once = True
                 raise OSError("controlled IPC write failure")
             return original(path, value)
 
@@ -175,7 +202,7 @@ def test_private_ipc_publication_never_exposes_an_empty_control_file(tmp_path, m
         assert path.stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("mode", ["success", "slow", "lose_create", "checkpoint_fail"])
+@pytest.mark.parametrize("mode", ["success", "slow", "lose_create", "checkpoint_fail", "checkpoint_retry"])
 def test_real_child_retains_one_generation_and_unknown_cost(child_fixture, mode):
     state, events, root = child_fixture
     state["mode"] = mode
@@ -191,6 +218,10 @@ def test_real_child_retains_one_generation_and_unknown_cost(child_fixture, mode)
     assert len([row for row in rows if row["kind"] == "generation"]) == 1
     assert len({row["key"] for row in rows if row["kind"] == "create"}) == 1
     assert any(row["kind"] == "ack" for row in rows)
+    custody = [row for row in rows if row["kind"] == "custody"]
+    if mode != "checkpoint_fail":
+        assert [row["operation_id"] for row in custody] == ["", "operation-exact"]
+        assert all(row["fields"] == ["invocation_id", "operation_id", "request_manifest_ref", "request_ref"] for row in custody)
     if mode == "slow":
         assert len([row for row in rows if row["kind"] == "poll"]) >= 8
         assert state["timeouts"][0] > 90
@@ -230,25 +261,35 @@ def test_real_child_reconstructs_provider_field_display_after_settlement(child_f
     assert error.ledger_attempt_ids == [error.physical_attempt_capture.attempt_id]
     rows = _events(events)
     assert sum(row["kind"] == "generation" for row in rows) == sum(row["kind"] == "ack" for row in rows) == 1
-    attempts = [json.loads(line) for line in (root / ua.LEDGER_REL).read_text().splitlines()]
-    assert [row["state"] for row in attempts] == ["reserved", "dispatched", "settled"]
+    attempts = ledger_rows(root)
+    assert [row["state"] for row in attempts] == ["settled"]
 
 
-def test_parent_cancel_reaches_same_live_operation(child_fixture):
+def _parent_cancel(child_fixture, mode, reason):
     state, events, _ = child_fixture
-    state["mode"] = "cancel"
+    state["mode"] = mode
 
     def cancel_after_started():
         return "cancelled" if any(row["kind"] == "poll" for row in _events(events)) else None
 
     with pytest.raises(ClaudexorModelError) as caught:
         _call(model_poll_control=cancel_after_started)
-    assert caught.value.control_reason == "cancelled"
+    assert caught.value.control_reason == reason
     assert caught.value.operation_id == "operation-exact"
     assert caught.value.physical_attempt_capture.state == "unresolved"
     rows = _events(events)
     assert len([row for row in rows if row["kind"] == "generation"]) == 1
     assert {row["operation_id"] for row in rows if row["kind"] == "cancel"} == {"operation-exact"}
+
+
+def test_parent_cancel_reaches_same_live_operation(child_fixture):
+    _parent_cancel(child_fixture, "cancel", "cancelled")
+
+
+@pytest.mark.parametrize("mode,reason", [("cancel_contended", "cancelled"),
+                                         ("cancel_unreadable", "child_control_unreadable")])
+def test_only_a_transient_control_read_refusal_still_reaches_the_cancel(child_fixture, mode, reason):
+    _parent_cancel(child_fixture, mode, reason)
 
 
 def test_dead_child_without_checkpoint_is_unknown_not_free(monkeypatch):
@@ -278,7 +319,7 @@ def test_killed_child_retains_exact_operation_checkpoint(child_fixture):
     manifest = json.loads(Path(custody["request_manifest_ref"]["path"]).read_text())
     assert manifest["operation_id"] == error.operation_id
     assert len([row for row in _events(events) if row["kind"] == "generation"]) == 1
-    rows = [json.loads(line) for line in (root / ua.LEDGER_REL).read_text().splitlines()]
+    rows = ledger_rows(root)
     assert rows[-1]["state"] == "dispatched" and not any(row["state"] == "released" for row in rows)
 
 
@@ -362,6 +403,6 @@ def test_real_parent_quota_controller_polls_metadata_then_rejoins_image_call(chi
     assert text == "pixels read exactly once 🐍" and catalog_calls == [("fixture", None)]
     assert resolutions == [MODEL] and phases == ["started", "finished"]
     assert len([row for row in _events(events) if row["kind"] == "upload"]) == 2
-    persisted = json.loads((root / "task_results" / "image-task.json").read_text())
+    persisted = read_result(root, "image-task")
     wait, = persisted["model_waits"].values()
     assert wait["state"] == "resolved" and wait["resolution"] == "resource_available"

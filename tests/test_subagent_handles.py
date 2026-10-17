@@ -92,29 +92,22 @@ def test_a_frozen_record_is_named_from_its_own_facts(record):
     {"processing_preference": "economy"}, {"access": "workspace_write", "pin": "koshak"},
 ], ids=["unset", "explicit-standard", "explicit-economy", "lowered-and-pinned"])
 def test_one_engine_has_one_name_on_every_surface(row, global_processing, tmp_path):
-    """The live catalog, the frozen snapshot, the startup receipt, the dated
-    history fact and the reflection evidence must all carry the SAME handle for
-    one row - including a row that inherits the global processing preference,
-    which the snapshot freezes RESOLVED while the saved row leaves it empty."""
-    from ouroboros import post_task_synthesis
+    """The live catalog, the frozen snapshot, the startup receipt and the dated
+    history fact must all carry the SAME handle for one row - including a row
+    that inherits the global processing preference, which the snapshot freezes
+    RESOLVED while the saved row leaves it empty."""
     from ouroboros.subagent_history import execution_identity, recorded_handle, snapshot_handle
     from ouroboros.subagent_runtime import model_visible_subagent_catalog, select_subagent_snapshot
-    from ouroboros.task_results import write_task_result
 
     settings = {**_settings(_session("primary-builder", target="claude=claude-opus-5", **row)),
                 "OUROBOROS_PROCESSING_PREFERENCE": global_processing}
     catalog_name = model_visible_subagent_catalog(settings)["rows"][0]["subagent_id"]
     snapshot, _ = select_subagent_snapshot(settings, subagent_id=catalog_name)  # the name resolves
-    write_task_result(tmp_path, "kid", "completed", result="ok", configured_subagent=snapshot,
-                      parent_task_id="root", root_task_id="root", delegation_role="subagent")
-    _text, evidence = post_task_synthesis._child_task_evidence(
-        SimpleNamespace(drive_root=tmp_path), {"id": "root"})
 
     assert {
         catalog_name,
         snapshot_handle(snapshot),
         recorded_handle({"identity": execution_identity(snapshot)}),
-        evidence[0]["engine"]["subagent_id"],
     } == {catalog_name}
     assert "standard" not in catalog_name and "full" not in catalog_name
     assert catalog_name.endswith("/fast") == (global_processing == "fast" and "processing_preference" not in row)
@@ -268,12 +261,13 @@ def test_the_model_catalog_is_facts_only_and_keyed_by_handle():
     api, session = catalog["rows"]
     assert api == {
         "subagent_id": "google/gemini-3.8-flash", "route_class": "API model",
-        "requested_effort": "(not explicitly set)", "recommended_use": verbatim,
+        "effort": "auto", "review_eligible": False, "recommended_use": verbatim,
     }
     assert list(session) == [
-        "subagent_id", "route_class", "requested_effort", "requested_target",
-        "mutating_access", "credential_profile_id", "recommended_use",
+        "subagent_id", "route_class", "effort", "requested_target",
+        "mutating_access", "credential_profile_id", "review_eligible", "recommended_use",
     ], "facts lead, the owner's words ride last"
+    assert session["effort"] == "xhigh"
     assert session["subagent_id"] == "codex=gpt-6-astra/xhigh/@koshak"
     assert session["requested_target"] == "codex=gpt-6-astra"
     text = json.dumps(catalog)
@@ -304,6 +298,7 @@ def _post_settings(monkeypatch, body, stored=None):
 
     monkeypatch.setattr(gws, "load_settings", _fake_load)
     monkeypatch.setattr(gws, "_owner_write_settings", _fake_write)
+    monkeypatch.setattr(gws, "_owner_settings_document", lambda: dict(saved))  # the document the fake write keeps
     monkeypatch.setattr(gws, "_unrecognised_review_models", lambda models: [])
     monkeypatch.setattr(gws, "_apply_settings_to_env", lambda *a, **k: None)
 
@@ -316,6 +311,9 @@ def _post_settings(monkeypatch, body, stored=None):
     return asyncio.run(gws.api_settings_post(request)), saved
 
 
+NO_REVIEWERS_CONFIRMED = {"allow_empty_review_pool": True}
+
+
 def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(monkeypatch):
     twins = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="low")]}
     near = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="high")]}
@@ -323,14 +321,15 @@ def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(
     refused, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": twins})
     assert refused.status_code == 400 and b"same engine" in refused.body
     assert "OUROBOROS_SUBAGENTS" not in saved
-    accepted, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": near})
+    # None of these rows is a reviewer: the owner confirms the empty review pool.
+    accepted, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": near, **NO_REVIEWERS_CONFIRMED})
     assert accepted.status_code == 200, accepted.body[:300]
     assert json.loads(saved["OUROBOROS_SUBAGENTS"])["items"][1]["effort"] == "high"
 
     # The engine is judged under THIS save's effective facts: the same body that
     # turns the global preference to fast makes an unset row and an explicit fast row one engine.
     inherits = {"enabled": True, "items": [_api("one"), _api("two", processing_preference="fast")]}
-    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": inherits})
+    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": inherits, **NO_REVIEWERS_CONFIRMED})
     assert accepted.status_code == 200, accepted.body[:300]
     refused, _ = _post_settings(
         monkeypatch, {"OUROBOROS_SUBAGENTS": inherits, "OUROBOROS_PROCESSING_PREFERENCE": "fast"})
@@ -362,7 +361,7 @@ def test_stored_twins_never_block_an_unrelated_save_but_any_roster_edit_is_judge
         assert saved == stored
     # ...and an edit that tells the twins apart is an ordinary save.
     fixed = {"enabled": True, "items": [TWINS["items"][0], {**TWINS["items"][1], "effort": "high"}]}
-    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": fixed}, stored)
+    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": fixed, **NO_REVIEWERS_CONFIRMED}, stored)
     assert accepted.status_code == 200, accepted.body[:300]
     # (3) the same twins on an install that stores none are a FRESH twin: refused.
     refused, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": TWINS})
@@ -434,7 +433,11 @@ def test_onboarding_preview_and_completion_refuse_identical_engines(onboarding):
         json={**WIZARD_PAYLOAD, "subscriptionsConnected": True, "OUROBOROS_SUBAGENTS": near})
     assert response.status_code == 200, response.text
     saved = json.loads(onboarding.saved()["OUROBOROS_SUBAGENTS"])["items"]
-    assert [row["effort"] for row in saved] == ["low", "high"]
+    # The owner's draft rides first; the wizard's review seats are MARKED catalog
+    # rows on the same list (the pool has no inline lane to live in).
+    assert [row["effort"] for row in saved[:2]] == ["low", "high"]
+    assert saved[2:] and all(row["review_eligible"] and row["route"]["kind"] == "agent_session"
+                             for row in saved[2:])
 
 
 def test_an_actor_first_start_accepts_its_own_handle_and_stored_id_and_refuses_another_row(
@@ -529,34 +532,6 @@ def test_the_startup_receipt_and_the_start_result_name_the_snapshots_own_handle(
         SimpleNamespace(task_id="child", drive_root=tmp_path, budget_drive_root=str(tmp_path), task_metadata={}),
         "brief", {"snapshot": snapshot}).text)
     assert started["selected_subagent_id"] == "codex=gpt-6-astra/xhigh/@koshak"
-
-
-def test_every_childs_engine_survives_the_evidence_cap(tmp_path):
-    """The evidence text is capped at 6000 chars while one verbose row carries up
-    to 1600+800 chars of result and trace, so after about three children the rest
-    - and with them WHO ran each one - used to be truncated away. A compact
-    overview of ALL children leads; the verbose rows follow and may be cut."""
-    from ouroboros import post_task_synthesis
-    from ouroboros.subagent_runtime import select_subagent_snapshot
-    from ouroboros.task_results import write_task_result
-
-    for index in range(12):  # twelve children, each frozen from its own row (a roster holds ten)
-        row = _api(f"stored-key-{index}", target=f"vendor/model-{index}", effort="low")
-        snapshot, _ = select_subagent_snapshot(_settings(row), subagent_id=row["subagent_id"])
-        write_task_result(
-            tmp_path, f"kid-{index:02d}", "completed", result="R" * 3000, trace_summary="T" * 2000,
-            configured_subagent=snapshot, parent_task_id="root", root_task_id="root", delegation_role="subagent",
-            started_at="2026-09-20T10:00:00+00:00", ts="2026-09-20T10:01:00+00:00")
-
-    text, children = post_task_synthesis._child_task_evidence(
-        SimpleNamespace(drive_root=tmp_path), {"id": "root"})
-
-    assert len(children) == 12 and all("engine" in row for row in children), "the typed rows stay whole"
-    assert "OMISSION NOTE" in text, "the fixture really overflows the cap"
-    for index in range(12):
-        assert f'"engine": "vendor/model-{index}/low"' in text, f"child {index} lost its engine to the cap"
-    assert text.index('"children_overview"') < text.index('"children"')
-    assert '"duration_sec": 60.0' in text and "stored-key-" not in text
 
 
 def test_a_processing_only_save_may_create_effective_twins_by_decision(monkeypatch):

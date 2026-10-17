@@ -22,6 +22,8 @@ from ouroboros.model_wait import dispatch_deadline_remaining_sec
 from ouroboros.openrouter_attribution import OPENROUTER_APP_HEADERS
 from ouroboros.provider_models import (
     DEEPSEEK_BASE_URL,
+    compatible_endpoint,
+    compatible_endpoint_configured,
     resolve_zai_base_url,
     PROVIDER_PREFIXES,
     normalize_anthropic_model_id,
@@ -169,7 +171,8 @@ class _ProviderRoutingMixin:
                 )
             finally:
                 try:
-                    _http_client.close()
+                    from ouroboros._usage_wait import close_after_model_send
+                    close_after_model_send(_http_client)
                 except Exception:
                     pass
 
@@ -345,7 +348,8 @@ class _ProviderRoutingMixin:
             return {
                 "provider": provider, "source": source, "resolved_model": native_model,
                 "usage_model": usage_model, "api_key": "", "default_headers": {},
-                # A locality fact only; real daemon discovery never uses this URL.
+                # The daemon's address as route identity only; discovery never uses it, and each
+                # attempt states the model's real (remote) locality (llm_claudexor._accounted_request).
                 "base_url": "http://127.0.0.1", "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
             }
@@ -464,26 +468,21 @@ class _ProviderRoutingMixin:
             }
 
         if provider == "openai-compatible":
-            compatible_key = (configured("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-            compatible_base_url = (configured("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            legacy_base_url = (configured("OPENAI_BASE_URL", "") or "").strip()
-            legacy_key = (configured("OPENAI_API_KEY", "") or "").strip()
-            # A request-local mapping is authoritative as a PAIR: when its
-            # dedicated compatible endpoint is present, an explicitly empty
-            # compatible key must not be rehydrated from the legacy OpenAI key.
-            # Ordinary env-based chat keeps the historical per-field fallback.
-            if explicit_settings and compatible_base_url:
-                api_key = compatible_key
-                base_url = compatible_base_url
-            else:
-                api_key = compatible_key or legacy_key
-                base_url = compatible_base_url or legacy_base_url
+            # One pair on every path (request-local mapping and ambient settings alike):
+            # a dedicated endpoint never borrows the legacy OpenAI key.
+            def setting(key: str) -> str:
+                return str(configured(key, "") or "").strip()
+
+            api_key, base_url = compatible_endpoint(setting)
             return {
                 "provider": provider,
                 "resolved_model": resolved_model,
                 "usage_model": usage_model,
                 "api_key": api_key,
                 "base_url": base_url,
+                # A pair configured without a key is the dedicated endpoint's no-auth
+                # setting; its transport sends no credential (net_transport.openai_client_class).
+                "keyless": not api_key and compatible_endpoint_configured(setting),
                 "default_headers": {},
                 "supports_openrouter_extensions": False,
                 "supports_generation_cost": False,
@@ -503,6 +502,9 @@ class _ProviderRoutingMixin:
             "supports_generation_cost": True,
         }
 
+    # Non-chat provider facets share the same route, credential and header owner.
+    resolve_remote_target = _resolve_remote_target
+
     def _get_client(self):
         target = self._resolve_remote_target("openrouter::")
         return self._get_remote_client(target)
@@ -512,9 +514,7 @@ class _ProviderRoutingMixin:
         # The keepalive transport carries SDK-equivalent pool limits (an
         # explicit transport ignores the Client-level limits); on proxy-routed
         # installs the helper returns None and SDK defaults keep proxy mounts.
-        from openai import OpenAI
-
-        from ouroboros.net_transport import keepalive_http_client
+        from ouroboros.net_transport import keepalive_http_client, openai_client_class
 
         kwargs: Dict[str, Any] = {
             "api_key": str(target.get("api_key") or ""),
@@ -529,7 +529,7 @@ class _ProviderRoutingMixin:
             kwargs["base_url"] = base_url
         if headers:
             kwargs["default_headers"] = headers
-        return OpenAI(**kwargs)
+        return openai_client_class(target)(**kwargs)
 
     def _get_remote_client(self, target: Dict[str, Any]):
         base_url = str(target.get("base_url") or "")
@@ -539,7 +539,8 @@ class _ProviderRoutingMixin:
         ))
         from ouroboros.net_transport import extra_ca_bundle
 
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle())
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle(),
+                     bool(target.get("keyless")))
         if cache_key not in self._remote_clients:
             self._remote_clients[cache_key] = self._new_remote_client(target)
         return self._remote_clients[cache_key]
@@ -586,13 +587,12 @@ class _ProviderRoutingMixin:
         headers = tuple(sorted((str(k), str(v)) for k, v in headers_dict.items()))
         from ouroboros.net_transport import extra_ca_bundle
 
-        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle())
+        cache_key = (str(target.get("provider") or ""), base_url, api_key, headers, extra_ca_bundle(),
+                     bool(target.get("keyless")))
 
         client = self._async_remote_clients.get(cache_key)
         if client is None:
-            from openai import AsyncOpenAI
-
-            from ouroboros.net_transport import keepalive_http_client
+            from ouroboros.net_transport import keepalive_http_client, openai_client_class
 
             kwargs: Dict[str, Any] = {
                 "api_key": api_key,
@@ -605,7 +605,7 @@ class _ProviderRoutingMixin:
                 kwargs["base_url"] = base_url
             if headers_dict:
                 kwargs["default_headers"] = headers_dict
-            client = AsyncOpenAI(**kwargs)
+            client = openai_client_class(target, async_client=True)(**kwargs)
             self._async_remote_clients[cache_key] = client
         return client
 

@@ -50,7 +50,7 @@ def _read_network_wait_events(tmp_path):
     path = tmp_path / "events.jsonl"
     if not path.exists():
         return []
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     return [row for row in rows if row.get("type") == "network_wait"]
 
 
@@ -255,7 +255,7 @@ def test_transport_outage_waits_redials_free_rounds_and_recovers(tmp_path, monke
     assert phases[0] == "entered"
     assert phases.count("waiting") == 3
     assert phases[-1] == "recovered"
-    assert any("provider connection" in note for note in notes)  # first note, immediate
+    assert any("did not reach the provider" in note for note in notes)  # first note, immediate
     assert any("restored" in note for note in notes)  # mandatory recovery note
 
 
@@ -645,7 +645,7 @@ def test_end_to_end_episode_through_real_retry_helper(tmp_path, monkeypatch):
     assert len(sleeps) == 2
     phases = [row["phase"] for row in _read_network_wait_events(tmp_path)]
     assert phases == ["entered", "waiting", "waiting", "recovered"]
-    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     api_errors = [row for row in rows if row.get("type") == "llm_api_error"]
     assert api_errors and all(row.get("error_kind") == "transport_unavailable" for row in api_errors)
 
@@ -773,16 +773,19 @@ def test_finalize_now_during_episode_takes_no_resend_terminal_via_mailbox(tmp_pa
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     notes = []
-    start = time.monotonic()
-    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
-    elapsed = time.monotonic() - start
+    def forbidden_sleep(_seconds):
+        pytest.fail("finalize_now must wake the episode before any backoff sleep")
 
-    assert elapsed < 3.5  # the wake check saw the control before the 4 s backoff: no sleep ran
+    # Patch this transport's clock namespace, leaving unrelated store/fixture waits alone.
+    monkeypatch.setattr(loop_transport, "time", SimpleNamespace(
+        monotonic=time.monotonic, sleep=forbidden_sleep))
+    result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, registry, notes))
+
     assert calls["n"] == 1  # the woken redial exited at the round top: zero further dials
     assert usage.get("execution_status") == "infra_failed"
     assert usage.get("reason_code") == "provider_unavailable"
     assert trace.get("forced_finalization", {}).get("source") == "transport_unavailable_no_resend"
-    assert "ended as a provider outage" in result
+    assert "ended as an outage" in result
     events = _read_network_wait_events(tmp_path)
     assert events[-1]["phase"] == "ended"
     assert events[-1].get("detail") == "finalize_now"
@@ -885,7 +888,7 @@ def test_episode_ledger_evidence_has_zero_dispatched_paid_attempts(tmp_path, mon
         **_loop_kwargs(tmp_path, ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path), notes, llm=llm))
 
     assert result == "done"
-    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines() if line.strip()]
+    rows = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     entered_idx = next(i for i, r in enumerate(rows) if r.get("type") == "network_wait" and r.get("phase") == "entered")
     last_wait_idx = max(i for i, r in enumerate(rows) if r.get("type") == "network_wait" and r.get("phase") == "waiting")
     window = rows[entered_idx:last_wait_idx + 1]
@@ -938,18 +941,18 @@ def test_terminal_wordings_cover_four_wait_outcomes():
     kwargs = dict(is_context_overflow=False, is_transport_wait=True, is_deadline_exhausted=False)
     waited = loop_transport.provider_terminal_fallback_text({}, waited_sec=610.0, **kwargs)
     assert "the task waited and redialed" in waited
-    assert "ended as a provider outage, not completed" in waited
+    assert "ended as an outage, not completed" in waited
     assert "INTERRUPTED" not in waited
     zero_wait = loop_transport.provider_terminal_fallback_text({}, waited_sec=0.0, **kwargs)
     assert "left no time to wait" in zero_wait
     chat_waited = loop_transport.provider_terminal_fallback_text(
         {}, waited_sec=610.0, interactive=True, **kwargs)
     assert "this turn waited and redialed for 10.2 min" in chat_waited
-    assert "ended as a provider outage, not completed" in chat_waited
+    assert "ended as an outage, not completed" in chat_waited
     chat_zero = loop_transport.provider_terminal_fallback_text(
         {}, waited_sec=0.0, interactive=True, **kwargs)
     assert "no wait window was left" in chat_zero
-    assert "this turn ended as a provider outage" in chat_zero
+    assert "this turn ended as an outage" in chat_zero
     for text in (chat_waited, chat_zero):
         assert "task" not in text.lower()
         assert "INTERRUPTED" not in text

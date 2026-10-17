@@ -21,8 +21,9 @@ the same WS chat and HTTP cancel surfaces the SPA drives.
 DETERMINISM. "Mid-turn" is not a sleep. The loopback model HOLDS the turn's first
 tool-bearing round on a ``ModelGate`` (harness): the request thread blocks until the
 scenario releases it, so the owner's stop provably lands while the turn is inside
-a model round, the endpoint's typed "still live" is the ONLY answer it can give
-(a turn cannot reach its round boundary while its round is held), and the armed
+a model round, the endpoint's typed 202 ``cancel_state: pending`` is the ONLY
+answer it can give (a turn cannot reach its round boundary while its round is
+held), and the armed
 control, the toast and the marker are all read back DURABLY before the release.
 Everything else is durable-event polling over ``ArtifactOracle`` readers.
 
@@ -35,16 +36,19 @@ WHAT S26 ASSERTS, in order:
    ``_is_direct_chat=true`` and the client_message_id link (``task_started`` is a
    session-only live log, never persisted);
 2. STOP-NOW over the UI's ``POST /api/tasks/{id}/cancel`` (empty body = immediate)
-   mid-round is NOT 404: the typed 503 "still live" naming the task; the
-   cooperative control is ARMED — exactly one ``finalize_now`` row with the
+   mid-round is NOT 404: the intent is recorded first and the teardown is not yet
+   confirmed, so the answer is the typed 202 ``cancel_state: pending``
+   (``reason_code=teardown_unconfirmed``) naming the task and its durable
+   request; the cooperative control is ARMED — exactly one ``finalize_now`` row with the
    direct-turn reason in the canonical mailbox; the durable intent is open with
    the forensic trail requested(http_single, single) → claimed → claim_released
    ("has not reached its next step"); the owner toast went out as a progress frame
    carrying the host-attested ``cancelable`` marker (the direct-turn branch of the
    delivery seam) — durable in progress.jsonl and live on /ws; the durable row is
    still honestly ``running`` (no fabricated cancelled over a live turn);
-3. a SECOND stop-now while armed is typed and idempotent — 503 again, still ONE
-   control, still ONE toast, no model round in between (stamp latch, no re-arm);
+3. a SECOND stop-now while armed is typed and idempotent — 202 pending again on
+   the same request, still ONE control, still ONE toast, no model round in
+   between (stamp latch, no re-arm);
 4. RELEASE — the turn ends at its next step under the owner-stop reason with ZERO
    further model rounds: the durable terminal carries
    ``reason_code=owner_requested_finalization`` and the typed no-further-work
@@ -182,7 +186,6 @@ S26_PROBE = (f"[{S26_MARKER}] List the repository root and keep listing it "
 # loop_round_limits._handle_direct_turn_hard_stop's typed no-candidate answer).
 S26_TOAST_TEXT = "The owner stopped chat turn"
 S26_STOP_TEXT = "The owner stopped this chat turn"
-S26_STILL_LIVE = "still live"
 S26_NOT_ACTIVE = "task not found or not active"
 
 
@@ -331,11 +334,16 @@ def test_s26_direct_chat_turn_owner_stop_mid_round_is_typed_and_ends_the_turn(
 
                 # 1. IN FLIGHT inside a model round — and ADDRESSABLE.
                 assert gate.arrived.wait(180), "the direct turn never reached its first model round"
+                # The provider gate and supervisor event consumer are separate:
+                # the registered Preparing row may precede consumption of the
+                # main_llm_call_state event that projects Working (#1740).
                 activity = wait_until(
-                    lambda: (_direct_activities(server, client_message_id) or [None])[0], 30)
-                assert activity, "the direct turn is not in /api/state.active_chat_activities"
+                    lambda: next((row for row in _direct_activities(server, client_message_id)
+                                  if row.get("phase") == "working"), None), 30)
+                assert activity, "the direct turn never became Working in /api/state.active_chat_activities"
                 task_id = str(activity.get("activity_id") or "")
-                assert task_id and activity.get("phase") == "thinking", activity
+                # #1740 uses neutral Working once a physical model call starts.
+                assert task_id and activity.get("phase") == "working", activity
                 assert wait_until(lambda: task_id in _running_task_ids(server), 30), (
                     "the live direct turn is not listed by GET /api/tasks?status=running")
                 assert task_id not in oracle.running_ids(), "a direct turn must have no queue row"
@@ -354,11 +362,14 @@ def test_s26_direct_chat_turn_owner_stop_mid_round_is_typed_and_ends_the_turn(
                     "client_message_id") == client_message_id, received_task
 
                 # 2. STOP-NOW over the UI's endpoint, mid-round: typed, never 404,
-                #    the cooperative control ARMED.
+                #    the cooperative control ARMED. The intent is recorded first and
+                #    the teardown is not yet confirmed: 202 ``cancel_state: pending``
+                #    (``teardown_unconfirmed``), never a fabricated 200.
                 first = server.cancel_task(task_id)
-                assert first.get("status") == 503, first
+                assert first.get("status") == 202, first
                 first_body = first.get("body") or {}
-                assert S26_STILL_LIVE in str(first_body.get("error") or ""), first
+                assert first_body.get("cancel_state") == "pending", first
+                assert first_body.get("reason_code") == "teardown_unconfirmed", first
                 assert first_body.get("task_id") == task_id, first
                 controls = _mailbox_controls(server.data_root, task_id)
                 assert len(controls) == 1, controls
@@ -366,9 +377,10 @@ def test_s26_direct_chat_turn_owner_stop_mid_round_is_typed_and_ends_the_turn(
                 assert control_reason == REASON_OWNER_STOPPED_DIRECT_TURN, controls
                 # The durable intent: minted by the legacy immediate shape (the
                 # tree's own reader says IMMEDIATE), claim released back to
-                # ``requested`` for the sweep with the typed "still live" error.
+                # ``requested`` for the sweep with the typed 202 pending answer.
                 intent = oracle.cancel_intents().get(task_id) or {}
                 assert intent, oracle.cancel_intents()
+                assert first_body.get("request_id") == intent.get("request_id"), (first_body, intent)
                 assert stop_policy(intent) == STOP_POLICY_IMMEDIATE, intent
                 assert intent.get("state") == INTENT_REQUESTED, intent
                 assert "not reached its next step" in str(intent.get("last_error") or ""), intent
@@ -395,10 +407,13 @@ def test_s26_direct_chat_turn_owner_stop_mid_round_is_typed_and_ends_the_turn(
                 # No fabricated terminal over a live turn.
                 assert oracle.task_result(task_id).get("status") == "running", oracle.task_result(task_id)
 
-                # 3. A SECOND stop while armed: typed and idempotent.
+                # 3. A SECOND stop while armed: typed and idempotent — the same
+                #    pending envelope on the same durable request.
                 second = server.cancel_task(task_id)
-                assert second.get("status") == 503, second
-                assert S26_STILL_LIVE in str((second.get("body") or {}).get("error") or ""), second
+                assert second.get("status") == 202, second
+                second_body = second.get("body") or {}
+                assert second_body.get("cancel_state") == "pending", second
+                assert second_body.get("request_id") == intent.get("request_id"), (second_body, intent)
                 assert len(_mailbox_controls(server.data_root, task_id)) == 1, "the stop was re-armed"
                 assert len(_toast_rows(oracle, task_id)) == 1, "the owner was toasted twice"
                 assert gate.matched == 1 and gate.held == 1, (gate.matched, gate.held)

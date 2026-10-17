@@ -87,6 +87,7 @@ class _RunMemo:
 
     shown_through: Optional[int] = None  # None: unknown here, resolved from retained sources
     latest_message: Dict[str, Any] = field(default_factory=dict)
+    pending: Optional[Dict[str, Any]] = None  # a retained view whose emitter did not commit
 
 
 _MEMO: "OrderedDict[Tuple[str, str], _RunMemo]" = OrderedDict()
@@ -320,23 +321,32 @@ def _persist(ctx: Any, task_id: str, run_id: str, events: List[Any]) -> Dict[str
         return {}
 
 
-def _retained_range(ctx: Any, task_id: str, run_id: str) -> Optional[Tuple[int, int]]:
-    """``(first, last)`` of this run's latest retained range in the task's own store."""
+def _retained_sources(ctx: Any, task_id: str, run_id: str) -> List[Tuple[int, int, Dict[str, Any]]]:
+    """Address this run's retained ranges; unrelated source bodies are never read."""
     try:
         from ouroboros.artifacts import task_artifact_dir_path
         from ouroboros.delegate_custody import custody_root
 
-        directory = task_artifact_dir_path(custody_root(ctx), task_id) / "source_handles" / SOURCE_CATEGORY
-        pattern = re.compile(re.escape(_safe_run(run_id)) + r"-(\d+)-(\d+)-[0-9a-f]{64}\.jsonl")
-        best: Optional[Tuple[int, int]] = None
+        base = task_artifact_dir_path(custody_root(ctx), task_id)
+        directory = base / "source_handles" / SOURCE_CATEGORY
+        pattern = re.compile(re.escape(_safe_run(run_id)) + r"-(\d+)-(\d+)-([0-9a-f]{64})\.jsonl")
+        ranges = []
         with os.scandir(directory) as entries:
             for entry in entries:
                 match = pattern.fullmatch(entry.name)
-                if match and (best is None or int(match[2]) > best[1]):
-                    best = (int(match[1]), int(match[2]))
-        return best
+                if match:
+                    ranges.append((int(match[1]), int(match[2]), {
+                        "kind": "task_source", "root": "artifact_store",
+                        "path": f"source_handles/{SOURCE_CATEGORY}/{entry.name}",
+                        "size": entry.stat().st_size, "sha256": match[3]}))
+        return sorted(ranges, key=lambda item: (item[0], -item[1]))
     except (OSError, ValueError):
-        return None
+        return []
+
+
+def _retained_range(ctx: Any, task_id: str, run_id: str) -> Optional[Tuple[int, int]]:
+    ranges = _retained_sources(ctx, task_id, run_id)
+    return max(ranges, key=lambda item: item[1])[:2] if ranges else None
 
 
 def _record(task_id: str, run_id: str, after: int, through: int, items: List[Dict[str, Any]],
@@ -351,7 +361,8 @@ def _record(task_id: str, run_id: str, after: int, through: int, items: List[Dic
     if memo.latest_message and not any(part["kind"] == "message" for part in parts):
         # Text-only readers (the Telegram card) keep the run's latest words, marked earlier.
         record["latest_message"] = dict(memo.latest_message)
-    return _fit(record)
+    memo.pending = _fit(record)
+    return memo.pending
 
 
 def _commit(memo: _RunMemo, record: Dict[str, Any], shown_through: Optional[int]) -> Callable[[], None]:
@@ -363,7 +374,43 @@ def _commit(memo: _RunMemo, record: Dict[str, Any], shown_through: Optional[int]
             last = messages[-1]
             memo.latest_message = {key: last[key] for key in ("seq", "actor") if key in last}
             memo.latest_message.update(text=truncate_within_limit(last["text"], _RECAP_CHARS))
+        if memo.pending is record:
+            memo.pending = None
     return commit
+
+
+def retained_observations(ctx: Any, run_id: str):
+    """Replay unshown local sources; readiness never waits for the engine journal."""
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.delegate_custody import custody_root
+
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    memo = _memo(task_id, run_id)
+    if memo.pending is not None:
+        record = memo.pending
+        source = record["source"]
+        shown = (None if source.get("provisional") else
+                 source.get("read_through", record["through_seq"]))
+        yield record, _commit(memo, record, shown)
+        return
+    after = int(memo.shown_through or 0)
+    for first, last, ref in _retained_sources(ctx, task_id, run_id):
+        if last <= after or first > after + 1:
+            continue  # Missing ranges stay unshown, never an invented cursor advance.
+        raw = read_actor_source_bytes(custody_root(ctx), task_id, ref)
+        events = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+        if not events or any(not isinstance(row, dict) or not isinstance(row.get("seq"), int)
+                             or row.get("run_id") != run_id for row in events):
+            continue
+        selected = [row for row in events if after < row["seq"] <= last]
+        if not selected:
+            continue
+        record = _record(task_id, run_id, after, last,
+                         [_event_item(row["seq"], row) for row in selected],
+                         {"kind": "run_events", "read_through": last, "events": len(selected),
+                          "ref": ref}, [], memo)
+        yield record, _commit(memo, record, last)
+        after = int(memo.shown_through or 0)
 
 
 def _owner_stop(ctx: Any, task_id: str) -> str:

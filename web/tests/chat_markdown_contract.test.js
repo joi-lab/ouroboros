@@ -22,7 +22,7 @@ test('rich Markdown mounts use the seam or the existing message template contrac
     // direct-child layout. Its explicit host is the one string-rendering seam.
     const chat = readFileSync(new URL('chat.js', modules), 'utf8');
     assert.ok(chat.includes("message${richMarkdown ? ' ui-rich-content' : ''}"));
-    assert.match(chat, /: renderChatMarkdown\(text\);/);
+    assert.match(chat, /: renderChatMarkdown\(painted\);/);
     assert.equal([...chat.matchAll(/\brenderChatMarkdown\s*\(/g)].length, 1,
         'a second raw render must not bypass the mounting seam inside chat.js');
     for (const file of readdirSync(modules).filter((name) => name.endsWith('.js') && !['chat_markdown.js', 'chat.js'].includes(name))) {

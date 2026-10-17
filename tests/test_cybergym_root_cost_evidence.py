@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import datetime
 import hashlib
-import json
 import time
 from types import SimpleNamespace
 
@@ -28,6 +27,7 @@ from ouroboros.post_task_checkpoint import set_root_post_task_checkpoint
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_cybergym_executor import _config, dataclasses_replace
 from tests.test_cybergym_cost_grace import _completed_abandoned_residue_frame
+from tests._store_shared import read_result
 
 
 def _frame():
@@ -106,7 +106,7 @@ def test_real_ledger_checkpoint_gateway_and_disk_reach_grace(canonical_terminal,
     live = response.json()
     assert live["root_phase_checkpoint"]["accounting"] == stored["root_phase_checkpoint"]["accounting"]
     assert _abandoned_cost_residue_usd(live) == pytest.approx(0.05)
-    raw = json.loads((data / "task_results/cybergym-root.json").read_text(encoding="utf-8"))
+    raw = read_result(data, "cybergym-root")
     assert _abandoned_cost_residue_usd(raw) == pytest.approx(0.05)
     root = tmp_path / "executor"
     root.mkdir()

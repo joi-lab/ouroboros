@@ -33,6 +33,23 @@ function harness() {
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
 
+test('unavailable fan-out carries request time and cannot supersede a newer applied census', () => {
+    const unavailable = [];
+    let now = 100;
+    const sequencer = createStateSnapshotSequencer(() => {}, () => now++,
+        (...args) => unavailable.push(args));
+    const older = sequencer.begin(), newer = sequencer.begin();
+    assert.equal(sequencer.apply(newer, { current_questions: ['fresh'] }), true);
+    assert.equal(sequencer.fail(older), false);
+    assert.deepEqual(unavailable, []);
+    assert.deepEqual(sequencer.latest(), { current_questions: ['fresh'] });
+    const failed = sequencer.begin();
+    assert.equal(sequencer.fail(failed), true);
+    assert.deepEqual(unavailable, [[failed.requestedAt, failed.generation]]);
+    assert.equal(sequencer.apply(older, { current_questions: [] }), false);
+    assert.equal(sequencer.latest(), null);
+});
+
 test('periodic ticks while a read is in flight are skipped, not queued', async () => {
     const h = harness();
     const first = h.refresh(false);
@@ -125,9 +142,10 @@ test('generation ordering is unchanged: a synthetic bump makes the in-flight rea
     const h = harness();
     const inflight = h.refresh(false);
     await tick();
-    // app.js does this on socket open/close: an ungated generation bump.
-    h.sequencer.fail(h.sequencer.begin());
-    assert.deepEqual(h.events, ['unavailable']);
+    // app.js does this on socket open/close: an ungated generation bump, not a failed read.
+    h.sequencer.retire();
+    assert.deepEqual(h.events, [], 'retirement fans out no unavailability');
+    assert.equal(h.sequencer.latest(), null, 'the late-mount seed retires');
     h.fetches[0].resolve({ ok: true, data: 'older' });
     assert.equal(await inflight, 'applied');
     assert.deepEqual(h.applied, [], 'the older response cannot apply after a newer generation');
@@ -151,4 +169,25 @@ test('gate requests carry the same clock as begin() and settle through apply of 
     assert.equal(h.sequencer.apply(a, 'same'), false);
     // Settled: the next tick opens a fresh read instead of joining.
     assert.deepEqual(await h.sequencer.gate(false), { generation: 2, requestedAt: 1000 });
+});
+
+test('only an actual failed read fans out, and a throwing fan-out still releases the gate', async () => {
+    let throwing = true;
+    const unavailable = [];
+    const sequencer = createStateSnapshotSequencer(() => {}, () => 7, (...args) => {
+        unavailable.push(args);
+        if (throwing) throw new Error('one window failed to paint');
+    });
+    const retired = await sequencer.gate(false);
+    sequencer.retire();
+    assert.equal(sequencer.fail(retired), false, 'a retired read cannot report unavailability');
+    assert.deepEqual(unavailable, []);
+    const failed = await sequencer.gate(false);
+    assert.throws(() => sequencer.fail(failed), /failed to paint/);
+    assert.deepEqual(unavailable, [[7, failed.generation]]);
+    throwing = false;
+    const next = await Promise.race([sequencer.gate(false), tick().then(() => 'stuck')]);
+    assert.notEqual(next, 'stuck', 'the failed request settled despite the throwing fan-out');
+    assert.equal(sequencer.fail(next), true);
+    assert.equal(unavailable.length, 2);
 });

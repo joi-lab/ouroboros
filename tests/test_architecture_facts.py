@@ -51,6 +51,8 @@ def reexports(manifest):
 # ---------------------------------------------------------------------------
 
 def test_owner_of_resolves_a_module_path_a_dotted_module_and_a_symbol():
+    from ouroboros.code_intelligence import build_code_inventory
+
     (llm,) = owner_of(REPO, "ouroboros/llm.py")
     assert (llm.domain, llm.via) == ("D02", "module_path")
     assert llm.domain_title  # the human vocabulary rides along
@@ -60,7 +62,14 @@ def test_owner_of_resolves_a_module_path_a_dotted_module_and_a_symbol():
         "supervisor/state.py", "D08", "dotted_module",
     )
 
-    owners = owner_of(REPO, "protected_path_category")
+    # This oracle asks about one real definition, not every repository language.
+    # Keep the live carrier/parse witness without indexing tests, JS and fixtures;
+    # the tiny repository below exercises owner_of's default inventory path.
+    inventory = build_code_inventory(
+        REPO, scope="ouroboros/runtime_mode_policy.py", persist=False,
+    )
+    assert not inventory.enumeration_limits
+    owners = owner_of(REPO, "protected_path_category", inventory=inventory)
     assert any(
         (o.module, o.domain, o.via) == ("ouroboros/runtime_mode_policy.py", "D13", "symbol_definition")
         for o in owners
@@ -172,8 +181,8 @@ def test_writer_module_query_names_its_entities():
         r.entity for r in persistence_entities_written_by(REPO, "supervisor/state.py")
     )
     assert "state/state.json" in entities
-    ledger = persistence_entities_written_by(REPO, "ouroboros/usage_ledger.py")
-    assert any("usage_attempts.jsonl" in r.entity for r in ledger)
+    store = persistence_entities_written_by(REPO, "ouroboros/usage_store.py")
+    assert any("usage.sqlite" in r.entity for r in store)
     # A dotted spelling of the same writer answers identically.
     assert persistence_entities_written_by(REPO, "supervisor.state") == \
         persistence_entities_written_by(REPO, "supervisor/state.py")
@@ -325,6 +334,54 @@ def test_query_code_architecture_op_refuses_bad_facts_and_foreign_roots(tmp_path
     # or the op's own root guard refuses, typed.
     assert ("TOOL_ARG_ERROR" in out or "TOOL_ACCESS_BLOCKED" in out)
     assert "D02" not in out
+
+
+def test_query_code_owner_of_qualifies_partial_symbol_coverage(tmp_path, monkeypatch):
+    import subprocess
+
+    from ouroboros import code_intelligence
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    (repo / "ouroboros").mkdir(parents=True)
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "ouroboros" / "domains.toml").write_text(
+        '[domains]\nD01 = "Synthetic"\n\n[modules]\n'
+        '"ouroboros/a.py" = "D01"\n"ouroboros/z.py" = "D01"\n', encoding="utf-8")
+    (repo / "ouroboros" / "a.py").write_text("def shared():\n    pass\n", encoding="utf-8")
+    (repo / "ouroboros" / "z.py").write_text(
+        "def shared():\n    pass\n\n\ndef late():\n    pass\n", encoding="utf-8")
+    assert [(row.module, row.via) for row in owner_of(repo, "shared")] == [
+        ("ouroboros/a.py", "symbol_definition"),
+        ("ouroboros/z.py", "symbol_definition"),
+    ]
+    registry = ToolRegistry(repo_dir=repo, drive_root=tmp_path / "data")
+
+    def owner(arg):
+        return registry.execute("query_code", {"op": "architecture", "query": f"owner_of {arg}"})
+
+    complete = owner("shared")
+    assert "ouroboros/a.py -> D01" in complete and "ouroboros/z.py -> D01" in complete
+    assert "QUERY_CODE_TRUNCATED" not in complete and "limits:" not in complete
+    # Enumeration stops before z.py: its definitions are unread, not absent.
+    monkeypatch.setattr(code_intelligence, "_MAX_ENUMERATION_PATHS", 2)
+    missing = owner("late")
+    assert "not in the runtime module population" not in missing, missing
+    assert "QUERY_CODE_TRUNCATED" in missing and "absence not established" in missing
+    assert "ouroboros/z.py" in missing  # the unread population module is named
+    subset = owner("shared")
+    assert "ouroboros/a.py -> D01" in subset and "ouroboros/z.py -> D01" not in subset
+    assert "QUERY_CODE_TRUNCATED" in subset and "symbol owners may be missing" in subset
+    # Manifest lookups never build an inventory and stay exact answers.
+    monkeypatch.setattr(code_intelligence, "build_code_inventory",
+                        lambda *args, **kwargs: pytest.fail("manifest lookup built an inventory"))
+    path = owner("ouroboros/z.py")
+    assert "ouroboros/z.py -> D01 (Synthetic) [module_path]" in path
+    assert "QUERY_CODE_TRUNCATED" not in path
+    dotted = owner("ouroboros.z")
+    assert "[dotted_module]" in dotted and "QUERY_CODE_TRUNCATED" not in dotted
+    outside = owner("web/chat.js")
+    assert "no domain owner" in outside and "QUERY_CODE_TRUNCATED" not in outside
 
 
 def test_architecture_fact_vocabulary_is_closed():

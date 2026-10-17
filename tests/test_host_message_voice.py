@@ -4,8 +4,13 @@ Every send call and literal chat/send_message envelope in the runtime roots is
 examined. Host producers stamp both fields; dynamic transports and model/owner
 speech need an exact, counted exception. New calls inside an excepted function
 still fail. Arbitrary aliasing/computed envelopes remain a code-review duty.
+
+A second tripwire counts the stamped types (DESIGN "Chat authorship and System
+rows"): every host type sits in one closed class with its exact number of sites,
+so a new type or a new site of a known one waits for a person to place it.
 """
 import ast
+import functools
 from collections import Counter
 from pathlib import Path
 
@@ -26,6 +31,7 @@ EXCEPTIONS = {
     ("ouroboros/agent_task_pipeline.py", "emit_task_results", "envelope"): (1, "Final model output; prepare_terminal_send_event applies host terminal provenance separately."),
     ("ouroboros/agent.py", "OuroborosAgent._emit_progress", "envelope"): (1, "Explicit narration fact selects model versus host; end-to-end voice test pins both branches."),
     ("ouroboros/tools/control_runtime.py", "_send_user_message", "envelope"): (1, "The model authors this nonterminal reply; proactive_message is not a System voice."),
+    ("ouroboros/owner_relay.py", "publish_relay", "call"): (1, "One Ouroboros bubble (relay shape F): the teller's own note under the owner's host-held quoted words; no host-authored text."),
 }
 
 
@@ -104,10 +110,14 @@ def unstamped_sites(sources, exceptions):
     return violations
 
 
-def test_all_runtime_chat_producers_declare_authorship():
+def _runtime_sources():
     paths = [REPO / "server.py", *(REPO / "ouroboros").rglob("*.py"),
              *(REPO / "supervisor").rglob("*.py")]
-    sources = {p.relative_to(REPO).as_posix(): p.read_text(encoding="utf-8") for p in paths}
+    return {p.relative_to(REPO).as_posix(): p.read_text(encoding="utf-8") for p in paths}
+
+
+def test_all_runtime_chat_producers_declare_authorship():
+    sources = _runtime_sources()
     assert not (missing := unstamped_sites(sources, EXCEPTIONS)), (
         f"Chat sites need role='system' AND a nonempty system_type, or an exact "
         f"reasoned model/transport exception: {missing}")
@@ -141,3 +151,103 @@ def test_exceptions_are_counted_and_stale_rows_fail():
     assert not unstamped_sites({"new.py": source}, exceptions)
     assert unstamped_sites({"new.py": source + '    bridge.send_message(1, "host")\n'}, exceptions)
     assert unstamped_sites({"new.py": ""}, exceptions)
+
+
+# A host fact names its carrier: a task's fact is a row of its card, an owner message's fact the
+# typed annotation on it, and a landed act publishes no row. A standalone System row exists only
+# where nothing else can carry the fact. Each literal host type: (class, number of producer sites).
+# Two types are mixed and disclosed: `deep_self_review_queued` also echoes the model's own request,
+# `skill_repair` also the host's automatic repair after a marketplace install.
+HOST_ROW_CLASSES = {
+    "acceptance_late_settlement": ("card_row", 1),
+    "budget_notice": ("runtime_state", 1),
+    "cancel_receipt": ("owner_act_receipt", 2),
+    "command_reply": ("owner_act_receipt", 2),
+    "consciousness_notice": ("runtime_state", 1),
+    "deep_self_review_queued": ("owner_act_receipt", 1),
+    "deep_self_review_unavailable": ("not_started", 2),
+    "evolution_cycle_outcome": ("runtime_state", 1),
+    "evolution_notice": ("runtime_state", 10),
+    "finalization_notice": ("card_row", 2),
+    "host_progress": ("card_row", 1),
+    "initialization_notice": ("not_started", 1),
+    "managed_update_notice": ("runtime_state", 2),
+    "owner_pause_notice": ("card_row", 1),
+    "project_completion_summary": ("main_lifecycle", 1),
+    "project_handoff": ("main_lifecycle", 1),
+    "project_started": ("main_lifecycle", 1),
+    "promotion_notice": ("runtime_state", 4),
+    "reminder": ("signed_words", 1),
+    "restart_notice": ("runtime_state", 7),
+    "rollback_notice": ("runtime_state", 1),
+    "retired_settings_notice": ("runtime_state", 2),
+    "review_pool_migration_notice": ("runtime_state", 1),
+    "runtime_liveness_notice": ("runtime_state", 1),
+    "skill_lifecycle": ("card_row", 2),
+    "skill_lifecycle_pointer": ("owner_act_receipt", 1),
+    "skill_notice": ("signed_words", 1),
+    "skill_repair": ("owner_act_receipt", 2),
+    "startup_notice": ("runtime_state", 2),
+    "steer_not_delivered": ("not_started", 1),
+    "storage_switch_notice": ("runtime_state", 1),
+    "subagent_admission_notice": ("card_row", 1),
+    "subagent_started": ("card_row", 1),
+    "subagent_terminal_notice": ("card_row", 1),
+    "supervisor_failure": ("no_mind", 1),
+    "task_admission_notice": ("not_started", 5),
+    "task_error": ("no_mind", 1),
+    "task_not_started": ("not_started", 2),
+    "task_pause_notice": ("card_row", 1),
+    "task_reaper_notice": ("card_row", 4),
+    "task_scheduled": ("card_row", 1),
+    "task_start_unconfirmed": ("not_started", 1),
+    "terminal_incident": ("no_mind", 2),
+    "worker_failure": ("no_mind", 2),
+    "worker_readiness_notice": ("runtime_state", 2),
+}
+# The closed classes; none is "the success of a landed act" (its receipt or card already says it).
+HOST_ROW_CLASS_NAMES = {"no_mind", "not_started", "owner_act_receipt", "runtime_state", "main_lifecycle",
+                        "card_row", "signed_words"}
+
+
+def host_row_census(sources):
+    """The stamped literal host types and their producer sites (transports and owner echo excluded)."""
+    observed = Counter()
+    for path, source in sources.items():
+        sites, constants = voice_sites(source)
+        for function, shape, _line, fields in sites:
+            if (path, function, shape) in EXCEPTIONS or _literal_values(fields.get("role"), constants) == {"user"}:
+                continue
+            observed.update(_literal_values(fields.get("system_type"), constants) - {""})
+    return observed
+
+
+def census_errors(observed, classes=HOST_ROW_CLASSES):
+    errors = [f"{kind}: {count} site(s), none classified" for kind, count in sorted(observed.items())
+              if kind not in classes]
+    errors += [f"{kind}: classified with {want} site(s), {observed.get(kind, 0)} found"
+               for kind, (_name, want) in sorted(classes.items()) if observed.get(kind, 0) != want]
+    return errors + [f"{kind}: unknown class {name!r}" for kind, (name, _want) in sorted(classes.items())
+                     if name not in HOST_ROW_CLASS_NAMES]
+
+
+@functools.lru_cache(maxsize=1)
+def _live_census():
+    return host_row_census(_runtime_sources())
+
+
+def test_every_host_row_type_sits_in_one_closed_class_with_its_counted_sites():
+    assert not (errors := census_errors(_live_census())), (
+        "Place each host row in DESIGN 'Chat authorship and System rows' (a landed act publishes no row; "
+        f"a task's fact is a row of its card) and record its class and site count here: {errors}")
+
+
+@pytest.mark.parametrize("call", [
+    'ctx.send_with_budget(1, "success report", role="system", system_type="task_scheduled")',
+    'ctx.send_with_budget(1, "Repair task accepted", role="system", system_type="repair_accepted")',
+    'q.put({"type": "send_message", "text": "started", "role": "system", "system_type": "reminder"})',
+])
+def test_a_new_site_of_a_known_type_or_a_new_type_is_red(call):
+    """Borrowing an approved type (a card type sent unplaced) is a new site, so it is red too."""
+    assert census_errors(_live_census() + host_row_census({"new.py": "def emit():\n    " + call}))
+    assert census_errors(_live_census()) == []

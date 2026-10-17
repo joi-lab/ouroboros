@@ -1,6 +1,6 @@
 # The ONE browser-lane definition, called by two triggers that share this runner:
-#   - .github/workflows/ci.yml       → pull requests into `ouroboros`, manual runs, `v*` tags
-#   - .github/workflows/ui-browser-push.yml → every push to `ouroboros`, with no path filter
+#   - .github/workflows/ci.yml       → manual runs and `v*` tags
+#   - .github/workflows/ui-browser-push.yml → manual full-lane requests
 # Deliberately NOT wired to `schedule`: the owner decision adds no browser cron,
 # and the existing manual/tag checks stay exactly as they were.
 #
@@ -70,6 +70,30 @@ jobs:
         with:
           install-project: 'false'
         id: setup_python
+      # tests/test_separate_ui_browser.py runs the interface behind a real Caddy. The official
+      # release asset is pinned by the SHA-256 GitHub publishes for it (its SHA-512 is the line in
+      # the release's signed caddy_<version>_checksums.txt). A missing Caddy is no tolerated skip:
+      # this step fails, and the lane names every separate-interface test it could not run.
+      - name: Install digest-pinned Caddy
+        id: install_caddy
+        timeout-minutes: 5
+        shell: bash
+        env:
+          CADDY_VERSION: 2.11.7
+          CADDY_SHA256: 727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b
+        run: |
+          set -euo pipefail
+          ARCHIVE="$RUNNER_TEMP/caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+          TOOL_DIR="$RUNNER_TEMP/caddy-$CADDY_VERSION"
+          curl --fail --location --silent --show-error \
+            "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/caddy_${CADDY_VERSION}_linux_amd64.tar.gz" \
+            --output "$ARCHIVE"
+          python -c 'import hashlib,sys; p,e=sys.argv[1:]; a=hashlib.sha256(open(p,"rb").read()).hexdigest(); raise SystemExit(0 if a == e else f"Caddy digest mismatch: {a} != {e}")' \
+            "$ARCHIVE" "$CADDY_SHA256"
+          mkdir -p "$TOOL_DIR"
+          tar -xzf "$ARCHIVE" -C "$TOOL_DIR" caddy
+          "$TOOL_DIR/caddy" version | grep -F "v$CADDY_VERSION "
+          echo "path=$TOOL_DIR/caddy" >> "$GITHUB_OUTPUT"
       - name: Install UI smoke Chromium and WebKit
         id: install_browsers
         if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
@@ -89,6 +113,7 @@ jobs:
           OUROBOROS_RUN_UI_SMOKE: "1"
           OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
           PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ui-browsers
+          SEPARATE_UI_CADDY: ${{ steps.install_caddy.outputs.path }}
         run: >-
           python -I -S scripts/safe_test.py -- python -m pytest tests/ -m ui_browser --require-ui-browser -vv --tb=short
           --ui-browser-shard=${{ matrix.shard }}/4 --session-timeout=4500

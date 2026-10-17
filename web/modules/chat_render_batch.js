@@ -2,6 +2,7 @@
 // These helpers own no history source, navigation or task authority.
 import { compareHistoryPosition } from './chat_history_replay.js';
 import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
+import { isStoreMigrating } from './api_client.js';
 
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
@@ -54,23 +55,27 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
         recentFailed: () => Boolean(recent?.error),
         render(snapshot, coverage = {}, approximate = false) {
             const error = recent?.error || snapshot.error;
+            const migrating = isStoreMigrating(error);
             const hydrating = Boolean(recent?.loading);
             const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
             const incomplete = coverage.gaps === true;
-            let noteText = error ? 'Some saved history could not be loaded.'
-                : hydrating && feedIsEmpty(messagesDiv) ? 'Loading saved history…'
+            let noteText = migrating ? 'Saved history is being upgraded…' : error ? 'Some saved history could not be loaded.'
+                : hydrating && feedIsEmpty(messagesDiv) ? ''
                 : incomplete ? 'Some saved history is not loaded. Shown messages may have gaps.'
                 : !hydrating && coverage.complete ? 'Beginning of saved history' : '';
             if (approximate) noteText += `${noteText ? ' ' : ''}Saved position could not be restored exactly.`;
             // One note moves into persistent chrome when it describes the reading
             // window; the ordinary beginning marker belongs at the feed's start.
-            const host = statusHost && (error || incomplete || approximate || hydrating) ? statusHost : root;
+            const host = statusHost && noteText && (error || incomplete || approximate) ? statusHost : root;
             if (note.parentNode !== host) host.appendChild(note);
             note.classList.toggle('chat-history-status', host === statusHost);
-            const buttonHidden = !error && !snapshot.canOlder && !(coverage.horizonGap && !snapshot.canNewer) && !hydrating;
+            // A grown room's exhausted chain offers the way on (it rebases to the present); a chain a navigation
+            // began ends at its older end: ↓ is the way to the present.
+            const buttonHidden = migrating || (!error && !snapshot.canOlder
+                && !(coverage.horizonGap && !snapshot.away) && !hydrating);
             const fields = [
-                [button, { textContent: loading ? 'Loading…'
+                [button, { textContent: hydrating ? 'Loading saved history…' : loading ? 'Loading…'
                     : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load more history',
                     disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
@@ -81,7 +86,7 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
             }
             if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
             if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
-            root.classList.toggle('has-gaps', incomplete || Boolean(error));
+            root.classList.toggle('has-gaps', !migrating && (incomplete || Boolean(error)));
             return { ...coverage, complete: Boolean(coverage.complete && !error),
                 error: Boolean(error), note: noteText, truncated_by: incomplete ? ['unloaded'] : [] };
         },
@@ -291,7 +296,8 @@ export function syncLiveCardToggle(record) {
     const text = expanded ? 'Hide details' : 'Show details';
     const ariaExpanded = expanded ? 'true' : 'false';
     if (record.toggleEl.textContent !== text) record.toggleEl.textContent = text;
-    if (record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
+    // A Main portal's summary is content, not a disclosure (work_portal.js): it states no expanded state.
+    if (record.root.dataset.portal !== '1' && record.summaryButtonEl?.getAttribute('aria-expanded') !== ariaExpanded) {
         record.summaryButtonEl?.setAttribute('aria-expanded', ariaExpanded);
     }
 }
@@ -651,7 +657,9 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             if (!isRendered(node)) return false;
             const currentOffset = node.getBoundingClientRect().top
                 - messagesDiv.getBoundingClientRect().top;
-            messagesDiv.scrollTop += currentOffset - offset;
+            // A node still in place leaves the feed alone: even a write of the
+            // same scrollTop stops a scroll the engine animates (WebKit's End).
+            if (currentOffset !== offset) messagesDiv.scrollTop += currentOffset - offset;
             return true;
         };
 
@@ -769,7 +777,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
     let timelineUpdate = 'none', patchIndex = -1;
     const lastIdx = record.items.length - 1;
     // Full-array dedup keeps routine history syncs from growing Notes.
-    const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
+    const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey || it.occurrenceKey === syntheticKey);
     if (existingIdx !== -1 && inPlaceByKey) {
         const it = record.items[existingIdx];
         if (Number.isSafeInteger(it.cardRowRevision)
@@ -859,4 +867,19 @@ export function upsertToolFoldRow(record, view, ts, rawTs) {
     return updateLiveTimelineItem(record, view, {
         ts: first ? ts : '', rawTs, syntheticKey, headline: view.headline, inPlaceByKey: true,
     });
+}
+
+/** Replay places evidence at its earliest recorded call observation. A surviving start
+ *  outranks the history carrier, which can predate the calls it merely delivers. Without a
+ *  recorded start, retain an earlier carrier (legacy late-settlement placement); no missing
+ *  timestamp is reconstructed, and a partial history cannot prove the task's first call. */
+export function replayedEvidenceTs(evidence, carrierTs) {
+    let at = carrierTs, best = Infinity, observedStart = false;
+    for (const { ts, fact } of evidence?.observations || []) {
+        const time = /^\d{4}-\d\d-\d\dT/.test(ts) ? Date.parse(ts) : NaN;
+        if (Number.isFinite(time) && fact === 'started') observedStart = true;
+        if (time < best) [at, best] = [ts, time];
+    }
+    const carrier = Date.parse(carrierTs);
+    return observedStart || !Number.isFinite(carrier) || best < carrier ? at : carrierTs;
 }

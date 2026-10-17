@@ -158,15 +158,20 @@ def test_the_pooled_park_excludes_the_sleep_live_and_the_grant_folds_it(tmp_path
     workers.RUNNING["sleeper"] = meta
     ctx = SimpleNamespace(RUNNING=workers.RUNNING, WORKERS=workers.WORKERS, DRIVE_ROOT=tmp_path)
     checkpoint = {"wait_id": "w1", "task_attempt": 1, "source_ref": {"x": 1}, "reason": "sleep",
+                  "budget_paused_sec": 0.0, "sleep_started_at": time.time(),
                   "sleep": {"senders": ["peer-a"], "any_mail": False}}
     handle_owner_wait({"task_id": "sleeper", "wait_id": "w1", "task_attempt": 1, "worker_id": 0, "pid": 77,
                        "phase": "park", "checkpoint": checkpoint}, ctx)
     assert isinstance(meta.get("sleep_parked_at"), float) and worker.active_capacity is False
     meta["sleep_parked_at"] -= 30.0
+    parked_at = meta["sleep_parked_at"]
     meta["owner_wait_resume_requested"] = True
     monkeypatch.setattr(worker_owner_wait, "_resume_allowed", lambda *_a: True)
+    before_grant = time.time()
     assert worker_owner_wait._grant_resume("sleeper", meta, worker) is True
-    assert "sleep_parked_at" not in meta and 29.0 <= meta["budget_paused_sec"] <= 32.0
+    after_grant = time.time()
+    assert "sleep_parked_at" not in meta
+    assert before_grant - parked_at <= meta["budget_paused_sec"] <= after_grant - parked_at
 
 
 def test_a_cold_sleep_is_refused_over_its_own_live_writers(tmp_path, monkeypatch):
@@ -262,3 +267,154 @@ def test_a_panic_boot_holds_a_cold_sleeper_before_its_marker_is_consumed(tmp_pat
     (tmp_path / "state" / "panic_stop.flag").write_text("panic", encoding="utf-8")
     assert queue.restore_pending_from_snapshot() == 1
     assert budget_hold_fact(workers.PENDING[0])["reason"] == HOLD_PANIC
+
+
+def test_an_ordinary_restart_restores_a_cold_sleep_that_wakes_itself(tmp_path, monkeypatch):
+    from supervisor.events_budget import budget_hold_fact
+    from supervisor.sleep_wake import wake_ready_sleepers
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    _cold_park(tmp_path, monkeypatch, workers, wake_after_sec=1)
+    # An update or crash recovery: neither the owner's Restart flag nor a Panic flag.
+    assert queue.persist_queue_snapshot(reason="before_update")
+    workers.PENDING[:] = []
+    assert queue.restore_pending_from_snapshot() == 1
+    assert budget_hold_fact(workers.PENDING[0]) is None
+    time.sleep(1.2)
+    outcome = wake_ready_sleepers(queue)
+    assert outcome[0]["ok"] is True and outcome[0]["ready"]["reason"] == "timeout"
+
+
+@pytest.mark.parametrize("source", ["mail", "task", "runs"])
+def test_read_errors_do_not_hide_a_selected_time_or_become_a_wake(tmp_path, monkeypatch, source):
+    from ouroboros import delegate_custody_current, model_sleep, owner_wait, task_results
+    from supervisor.sleep_wake import _readiness
+
+    ctx = _ctx(tmp_path)
+    failure = OSError(f"unreadable {source}")
+
+    def broken(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(owner_wait, "_wait_entries", lambda _ctx: [])
+    monkeypatch.setattr(model_sleep, "_owned_runs", lambda *_a, **_k: {})
+    monkeypatch.setattr(delegate_custody_current, "run", lambda *_a: None)
+    monkeypatch.setattr(model_sleep, "_service_wake", lambda _pin: "")
+    # The real fail-soft task reader still propagates store-open failures.
+    # The service reader instead turns its own read failure into an unknown wake.
+    reader = {"mail": (owner_wait, "_wait_entries"), "task": (task_results, "read_document"),
+              "runs": (model_sleep, "_owned_runs")}[source]
+    monkeypatch.setattr(*reader, broken)
+    chosen = {"tasks": ["selected"], "runs": ["run-one"], "body_runs": [["run-one", "inv"]],
+              "services": [{"name": "selected-service"}], "wake_at": "2000-01-01T00:00:00+00:00"}
+    assert owner_wait._sleep_wake(ctx, {"sleep": chosen}) == "timeout"
+    assert _readiness(SimpleNamespace(DRIVE_ROOT=tmp_path), {"id": "sleeper"},
+                      {"sleep": chosen}) == "timeout"
+    assert model_sleep.request_sleep(ctx, chosen, "warm")["woke_by"] == "timeout"
+    assert not getattr(ctx, "_model_sleep", None), "an already-ready source never parks"
+    chosen["wake_at"] = "2099-01-01T00:00:00+00:00"
+    with pytest.raises(OSError) as raised:
+        model_sleep.wake_reason(ctx, chosen)
+    assert raised.value is failure, "no ready source: preserve the original read failure"
+    assert owner_wait._sleep_wake(ctx, {"sleep": chosen}) == ""
+
+
+def test_failed_selected_task_does_not_hide_another_task_or_an_exited_service(tmp_path, monkeypatch):
+    from ouroboros import model_sleep, owner_wait, task_results
+
+    _result(tmp_path, "ready", "completed")
+    ctx = _ctx(tmp_path)
+    load = task_results.read_document
+
+    def task_read(root, task_id, **kwargs):
+        if task_id == "broken":
+            raise OSError("broken selected task")
+        return load(root, task_id, **kwargs)
+
+    monkeypatch.setattr(task_results, "read_document", task_read)
+    chosen = {"tasks": ["broken", "ready"]}
+    assert model_sleep.wake_reason(ctx, chosen) == "task:ready:completed"
+    monkeypatch.setattr(model_sleep, "_service_wake", lambda _pin: "service:server:exited:0")
+    chosen = {"tasks": ["broken"], "services": [{"name": "server"}]}
+    assert owner_wait._sleep_wake(ctx, {"sleep": chosen}) == "service:server:exited:0"
+
+
+@pytest.mark.parametrize("source", ["runs", "mail"])
+def test_failed_read_preserves_direct_wait_and_owner_control_priority(tmp_path, monkeypatch, source):
+    from ouroboros import model_sleep, owner_wait
+
+    _result(tmp_path, "sleeper")
+    ctx = _ctx(tmp_path)
+    def broken(*_a, **_k):
+        raise OSError("unreadable selected run")
+    reader = (model_sleep, "_owned_runs") if source == "runs" else (owner_wait, "_wait_entries")
+    with monkeypatch.context() as fault:
+        fault.setattr(*reader, broken)
+        chosen = {"runs": ["run-one"], "wake_at": "2000-01-01T00:00:00+00:00"}
+        checkpoint = {"wait_id": "wait", "reason": "sleep", "sleep": chosen, "quiz_id": "",
+                      "wait_deadline_at": chosen["wake_at"]}
+        assert owner_wait.direct_owner_wait(ctx, checkpoint) == "timeout"
+    _mail(tmp_path, "sleeper", "pause", kind="owner_pause")
+    assert model_sleep.wake_reason(ctx, chosen) == "control:owner_pause"
+    assert owner_wait._fresh_wake(ctx, "", "timeout") == "control:owner_pause"
+
+
+@pytest.mark.parametrize("source", ["runs", "mail"])
+def test_pooled_sleep_requests_resume_after_read_failure_when_its_time_is_due(tmp_path, monkeypatch, source):
+    import queue
+    from ouroboros import model_sleep, owner_wait
+
+    _result(tmp_path, "sleeper")
+    ctx = _ctx(tmp_path)
+    events = []
+    def broken(*_a, **_k):
+        raise OSError("unreadable selected run")
+    reader = (model_sleep, "_owned_runs") if source == "runs" else (owner_wait, "_wait_entries")
+    monkeypatch.setattr(*reader, broken)
+    chosen = {"runs": ["run-one"], "wake_at": "2000-01-01T00:00:00+00:00"}
+    checkpoint = {"wait_id": "wait", "sleep": chosen, "wait_deadline_at": chosen["wake_at"]}
+    class Commands:
+        calls = 0
+        def get(self, **_kwargs):
+            self.calls += 1
+            assert self.calls <= 3, "the ready clock did not request resume after parking"
+            if self.calls > 1 and not any(e.get("phase") == "resume" for e in events):
+                raise queue.Empty()
+            return {"type": "owner_wait", "task_id": "sleeper", "task_attempt": 1,
+                    "wait_id": "wait", "phase": "parked" if self.calls == 1 else "resume_granted"}
+    assert owner_wait.worker_owner_wait(0, Commands(), SimpleNamespace(put=events.append),
+                                        ctx, checkpoint) == "timeout"
+    assert [e["phase"] for e in events] == ["park", "resume"]
+
+
+def test_failed_wake_refresh_cannot_invent_a_reason(tmp_path, monkeypatch):
+    from ouroboros import owner_wait
+    failure = OSError("mailbox unavailable")
+    def broken(_ctx):
+        raise failure
+    monkeypatch.setattr(owner_wait, "_wait_entries", broken)
+    with pytest.raises(OSError) as raised:
+        owner_wait._fresh_wake(_ctx(tmp_path), "", "unknown")
+    assert raised.value is failure
+
+
+def test_cold_clock_is_recorded_after_read_failure_but_owner_pause_still_vetoes(tmp_path, monkeypatch):
+    from ouroboros import deadline_utils, owner_pause, owner_wait
+    from ouroboros.budget_pause import budget_pause_row
+    from supervisor.sleep_wake import wake_ready_sleepers
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    _cold_park(tmp_path, monkeypatch, workers, wake_at="2099-01-01T00:00:00+00:00")
+    owner_pause.install_fence(tmp_path, "sleeper", request_id="p")
+    monkeypatch.setattr(deadline_utils, "utc_now", lambda: datetime.datetime(2100, 1, 1,
+                                                                          tzinfo=datetime.timezone.utc))
+    def unreadable(_ctx):
+        raise OSError("mailbox unavailable")
+    monkeypatch.setattr(owner_wait, "_wait_entries", unreadable)
+    outcome = wake_ready_sleepers(queue)
+    assert outcome[0]["ready"]["reason"] == "timeout"
+    assert outcome[0]["veto"] == "owner_pause" and not outcome[0]["ok"]
+    row = budget_pause_row(tmp_path, "sleeper")
+    assert row["sleep_ready"]["reason"] == "timeout" and not row.get("grant")

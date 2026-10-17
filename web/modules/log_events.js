@@ -1,11 +1,13 @@
 import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings, plainCauseText, savedTerminalRowNote } from './utils.js';
 import { cancelCauseClauses } from './cancel_presentation.js';
-import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoints.js';
+import { taskCheckpointLabel, taskCheckpointIdentity, checkpointHasProgressRow } from './task_checkpoints.js';
 export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
 import { fmt, tr } from './i18n.js';
 import { historyRetentionView } from './history_retention.js';
+import { checkFailureView } from './verification_presentation.js';
+import { hostRowDisplayText } from './host_notice_text.js';
 import { effortEvidenceText } from './effort_evidence.js';
 import { delegatedActivityView } from './delegated_activity.js';
 import { workerShaLogView, workerShaRelation } from './worker_sha_presentation.js';
@@ -111,31 +113,42 @@ export function compactModel(model = '') {
 }
 
 // Phase 6, owner directive #1: «бейдж точно нужен, но не рекламный … что ТУТ
-// бабл \ субагент на codex». A small chip carrying the harness route this bubble
-// or subagent was DISPATCHED to — icon plus the short harness name, in the style
-// of the agent account rows on the Agents tab, never a promotional badge.
-// Dispatch, not receipt:
-// `executor_route` is resolved once when the work is sent, so the chip says where
-// it was sent, and a landing below that ask is disclosed on `capability_delta`.
-//
-// Only a DELEGATED route is a fact worth a chip: the native API path is the
-// ordinary case and prints nothing, so the lane never fills with "api" noise on
-// every ordinary bubble. Absent fact -> null -> no chip element at all.
-// The completion seam's typed substrate claim (subagents.actual_substrate),
-// carried on the terminal frame beside the counts. Surfaced as a tooltip
-// clause — the counts own the label; the enum never travels bare.
+// бабл \ субагент на codex». A small chip naming the harness this bubble or
+// subagent was DISPATCHED to — icon plus the short harness name, in the style of
+// the agent account rows on the Agents tab, never a promotional badge.
+// Dispatch, not receipt: `executor_route` is resolved once when the work is sent,
+// so the chip says where it was sent; a landing below that ask is disclosed on
+// `capability_delta`. Only a DELEGATED route is worth a chip: the native API path
+// is the ordinary case and prints nothing (absent fact -> null -> no element).
+// The completion seam's typed substrate claim (subagents.actual_substrate) rides
+// the terminal frame beside the counts and joins the detail sentence; the enum
+// never travels bare.
 const SUBSTRATE_NOTE = {
     harness_used: 'custody evidence confirms a harness run',
     harness_attempted: 'harness attempted, no delegated run succeeded',
     native_only: 'no harness run recorded',
 };
 
+// Quiet label (owner choice #360 A). `label` is the helper's name, with one short
+// ` · phrase` only where the bare name would read as a receipt nothing issued: a
+// progress actor (`last update`), a refused pin (`blocked`, frozen), unreadable
+// evidence, no run, runs not settled, failed or unverified runs, an undisclosed
+// outcome split. The ordinary case — an assigned route while the card's own phase
+// chip says Working, or every settled run ok — is the bare name: it names the
+// selected helper and never proves its session computes now. `title` is the
+// detail sentence (counts, model and its source, spend, substrate, access);
+// executorIdentityMarkup also prints it as text on the expanded card, because a
+// hover title alone is invisible on touch, to AT and in copies. `hasEvidence`,
+// `observation`, `sourceTs` and the revision feed keepStickyExecutorChip.
 export function executorChip(evt) {
     const raw = evt?.executor_observation;
     const observation = raw && raw.task_id === String(evt?.subagent_task_id || evt?.task_id || '')
         && raw.run_id && raw.attempt_id && raw.harness_id && Number.isInteger(raw.revision)
         ? raw : null;
     if (observation && !evt?.execution_evidence) {
+        // A well-formed observation without execution evidence is the run's own
+        // progress report: it keeps `last update` (an observation, not a receipt)
+        // and its requested/observed model source, or `model unconfirmed`, in the detail.
         const name = harnessPresentation(observation.harness_id).label;
         const model = observation.model_source === 'observed' || observation.model_source === 'requested'
             ? compactModel(observation.model) : '';
@@ -144,8 +157,8 @@ export function executorChip(evt) {
             hasEvidence: false,
             observation,
             sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0,
-            label: `${name}${model ? ` · ${model} (${observation.model_source})` : ' · model unconfirmed'} · last update`,
-            title: `Latest observed activity: ${name}, run ${observation.run_id}, attempt ${observation.attempt_id}, revision ${observation.revision}. This is progress, not a terminal execution receipt.`,
+            label: `${name} · last update`,
+            title: `Latest observed activity: ${name}, ${model ? `model ${model} (${observation.model_source})` : 'model unconfirmed'}, run ${observation.run_id}, attempt ${observation.attempt_id}, revision ${observation.revision}. This is progress, not a terminal execution receipt.`,
         };
     }
     const route = String(evt?.executor_route || '').trim();
@@ -156,55 +169,43 @@ export function executorChip(evt) {
     if (!harness) return null;
     const name = harnessPresentation(harness).label;
     const base = { harness, label: name, sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0 };
-    // LAYERED TRUTH, label-level. Identity (mark + product name) comes from the
-    // harness_presentation SSOT; the run STATE stays on this label. The route is
-    // a DISPATCH decision; whether a delegated run actually happened is
-    // EVIDENCE, reconciled once at the completion seam
-    // (subagents.envelope_from_task -> execution_evidence) and carried on the
-    // terminal frame. The chip label always states the run FACT beside the
-    // harness name (`{harness} · {state}`) — a bare product name reads as
-    // "ran on codex", a receipt nothing may have issued, and the hover-only
-    // tooltip is invisible on touch, to AT, and in copies.
+    const chip = (hasEvidence, phrase, title) => ({ ...base, hasEvidence, label: phrase ? `${name} · ${phrase}` : name, title });
+    // LAYERED TRUTH: identity (mark + product name) comes from the
+    // harness_presentation SSOT; the route is a DISPATCH decision; whether a
+    // delegated run happened is EVIDENCE, reconciled once at the completion seam
+    // (subagents.envelope_from_task -> execution_evidence) on the terminal frame.
     const evidence = (evt && typeof evt.execution_evidence === 'object' && evt.execution_evidence)
         ? evt.execution_evidence : null;
-    // The substrate clause is a completion-seam claim coupled to evidence:
-    // never attach it to an evidence-less frame (a bare enum beside "dispatched"
-    // could contradict the label if a producer ever decoupled them).
+    // The substrate clause is a completion-seam claim coupled to evidence: never
+    // attach it to an evidence-less frame, where it could contradict the dispatch.
     const substrateNote = evidence ? (SUBSTRATE_NOTE[String(evt?.actual_substrate || '')] || '') : '';
     const withSubstrate = (title) => (substrateNote ? `${title} — ${substrateNote}` : title);
     if (String(evt?.reason_code || '') === 'subagent_executor_unavailable') {
         // The typed $0 terminal of a harness pin the resolution refused (#363):
-        // the route names WHO refused, the reason code says the child never
-        // ran. Checked before the evidence branches — an empty custody read
-        // would otherwise print "no run yet" over a child that was never
-        // dispatched at all. Evidence-grade so a later dispatch-shaped frame
-        // cannot downgrade it to "dispatched".
-        return {
-            ...base,
-            hasEvidence: true,
-            label: `${name} · blocked`,
-            title: `Pinned to ${name}, but the route could not run — the task was NOT run (no metered API spend, no delegated run)`,
-        };
+        // the route names WHO refused, the reason code says the child never ran.
+        // Checked before the evidence branches — an empty custody read would
+        // otherwise print "no run yet" over a child never dispatched at all.
+        // Evidence-grade so a later dispatch-shaped frame cannot downgrade it.
+        return chip(true, 'blocked', `Pinned to ${name}, but the route could not run — the task was NOT run (no metered API spend, no delegated run)`);
     }
     if (!evidence) {
+        const record = normalizeTaskTerminalRecord(evt);
+        const status = String(record.outcome_axes?.lifecycle?.status || record.status || evt?.subagent_event || '').toLowerCase();
+        if (OBSERVED_OUTCOME_STATUSES.has(status)) {
+            return chip(false, 'run outcome unknown', `The ${name} route was assigned, but this terminal record has no delegated-run evidence; the run outcome is unknown`);
+        }
         // Evidence rides TERMINAL frames only, so a live frame proves nothing
-        // either way — and under the pre-start charter the leaf usually IS
-        // running by now. "dispatched" states the dispatch-plan fact the frame
-        // actually carries; an evidence-grade negative ("no run yet") here
-        // would be false for most of the live phase.
-        return {
-            ...base,
-            hasEvidence: false,
-            label: `${name} · dispatched`,
-            title: `Dispatched to ${name} — run evidence arrives with the terminal receipt; this subagent itself runs on the API`,
-        };
+        // either way, and under the pre-start charter the leaf usually IS running
+        // by now: an evidence-grade negative ("no run yet") would be false for most
+        // of the live phase. The bare name states the assignment the frame carries.
+        return chip(false, '', `Dispatched to ${name} — run evidence arrives with the terminal receipt; this subagent itself runs on the API`);
     }
     const started = Number(evidence.delegated_runs_started || 0);
     const settled = Number(evidence.delegated_runs_settled || 0);
     // Historical frames (v6.94–v6.99) carry delegated_runs_succeeded without
     // delegated_runs_failed: reconstruct the exact complement rather than
-    // rendering a clean receipt over an all-failed delegation. Frames with
-    // neither counter stay plain, exactly as wide as what they disclosed.
+    // rendering a clean receipt over an all-failed delegation. A frame with
+    // neither counter disclosed no outcome split, so it never reads clean.
     let failed = Number(evidence.delegated_runs_failed ?? NaN);
     if (!Number.isFinite(failed)) {
         const succeeded = Number(evidence.delegated_runs_succeeded ?? NaN);
@@ -213,38 +214,21 @@ export function executorChip(evt) {
     failed = Math.max(0, failed);
     if (evidence.evidence_read_failed) {
         // The custody log EXISTS but could not be (fully) read: the counts are
-        // UNKNOWN, not an established fact (sol finding, b49f8192 wave). This
-        // holds past recorded starts too — the partial work-order replay sets
-        // the flag with started>0, and a confident settled/spend receipt over
-        // admittedly incomplete evidence would be a lie. No substrate clause:
-        // the seam never claims a substrate over unreadable evidence.
-        return {
-            ...base,
-            hasEvidence: true,
-            label: `${name} · evidence unavailable`,
-            title: started
-                ? `The ${name} route was assigned and at least ${started} delegated run(s) started, but the evidence could not be fully read — final counts are unknown`
-                : `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`,
-        };
+        // UNKNOWN, not an established fact (sol finding, b49f8192 wave) — past
+        // recorded starts too, where the partial work-order replay sets the flag.
+        // No substrate clause: the seam never claims one over unreadable evidence.
+        return chip(true, 'evidence unavailable', started
+            ? `The ${name} route was assigned and at least ${started} delegated run(s) started, but the evidence could not be fully read — final counts are unknown`
+            : `The ${name} route was assigned, but the delegated-run evidence could not be read — whether a run happened is unknown, not "none"`);
     }
     if (!started) {
-        return {
-            ...base,
-            hasEvidence: true,
-            label: `${name} · no run yet`,
-            title: withSubstrate(`The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`),
-        };
+        return chip(true, 'no run yet', withSubstrate(`The ${name} route was assigned, but there is no durable record of a delegated run for this subagent`));
     }
     if (!settled) {
-        // Evidence is terminal-frame material: started-but-unsettled here means
-        // the run(s) never settled (orphaned or lost), not "still executing" —
-        // a present-tense "running" on a finished card would be a lie.
-        return {
-            ...base,
-            hasEvidence: true,
-            label: `${name} · ${started} started, none settled`,
-            title: withSubstrate(`Delegated to your ${name} account — ${started} run(s) started, none settled`),
-        };
+        // Terminal-frame material: started-but-unsettled means the run(s) never
+        // settled (orphaned or lost), not "still executing" — a present-tense
+        // "running" on a finished card would be a lie.
+        return chip(true, 'not settled', withSubstrate(`Delegated to your ${name} account — ${started} run(s) started, none settled`));
     }
     const cost = evidence.subscription_cost_usd;
     const approx = evidence.subscription_cost_estimated ? '~' : '';
@@ -252,23 +236,29 @@ export function executorChip(evt) {
         ? 'subscription spend undisclosed'
         : `${approx}$${Number(cost).toFixed(2)} subscription`;
     const runsPart = `${settled} run${settled === 1 ? '' : 's'}`;
-    // The owner dictionary is "N ok, M failed" (plan D9): ok = settled − failed
-    // when either counter is disclosed; a frame with neither counter renders
-    // plain "N runs", exactly as wide as what it disclosed. All-failed runs
-    // must never read as a clean receipt.
+    // Unverified work-order coverage is an honesty fact: those runs sit inside the
+    // aggregate failed count, discounted from ok, so label and detail name them
+    // instead of claiming a physical failure, and a mix says "failed or unverified".
+    // Nothing orders failures and recoveries in time: the counts carry no chronology.
+    // The detail keeps the owner dictionary "N ok, M failed" (plan D9) when either
+    // counter is disclosed. Access rides the detail — requested surface from the
+    // frame, applied access from the settlement receipts when the engine disclosed
+    // it (empty = predates the receipt).
     const counted = Number.isFinite(Number(evidence.delegated_runs_failed ?? NaN))
         || Number.isFinite(Number(evidence.delegated_runs_succeeded ?? NaN));
-    const ok = Math.max(0, settled - failed);
-    const okPart = `${ok} ok${failed ? `, ${failed} failed` : ''}`;
-    // Unverified work-order coverage is an honesty fact, not a style note:
-    // those runs were discounted from the ok-count, and the label must say
-    // why a "successful" delegation reads short. Access rides the tooltip —
-    // requested surface from the frame, applied access from the settlement
-    // receipts when the engine disclosed it (empty = predates the receipt).
     const unresolved = Number(evidence.delegated_runs_source_unresolved || 0);
-    const unresolvedPart = unresolved
-        ? `, ${unresolved} unverified`
-        : '';
+    const notOk = Math.max(failed, unresolved);
+    const ok = Math.max(0, settled - notOk);
+    // Coverage can be incomplete on a non-successful run; equal aggregate counts
+    // cannot erase that terminal fact. Legacy frames without states stay count-based.
+    const terminalFailure = Array.isArray(evidence.delegated_run_failure_states)
+        && evidence.delegated_run_failure_states.some(state => typeof state === 'string' && state && state !== 'source_incomplete');
+    const notOkWord = unresolved && (terminalFailure || unresolved < notOk) ? 'failed or unverified'
+        : unresolved ? 'unverified' : 'failed';
+    const okPart = `${ok} ok${notOk ? `, ${notOk} ${notOkWord}` : ''}`;
+    const unsettled = Math.max(0, started - settled);
+    const phrase = notOk ? (settled === 1 ? `run ${notOkWord}` : `${notOk} of ${settled} runs ${notOkWord}`)
+        : unsettled ? `${unsettled} of ${started} runs not settled` : (counted ? '' : 'run outcome unknown');
     const accessClauses = [];
     const surface = String(evt?.write_surface || '').trim();
     if (surface) accessClauses.push(`write surface ${surface}`);
@@ -279,13 +269,12 @@ export function executorChip(evt) {
     const unresolvedTitle = unresolved
         ? ` — ${unresolved} run(s) settled with unverified work-order coverage (not counted ok)`
         : '';
+    const unsettledTitle = unsettled ? ` — ${unsettled} more run(s) started, not settled` : '';
     return {
-        ...base,
-        hasEvidence: true,
-        label: counted ? `${name} · ${okPart}${unresolvedPart}` : `${name} · ${runsPart}${unresolvedPart}`,
+        ...chip(true, phrase, withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`)
+            + unresolvedTitle + unsettledTitle + accessPart),
         observedModels: Array.isArray(evidence.harness_models)
             ? [...new Set(evidence.harness_models.filter((model) => typeof model === 'string' && model))] : [],
-        title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`) + unresolvedTitle + accessPart,
     };
 }
 
@@ -303,11 +292,7 @@ function subagentHeadline(sid = '', role = '', label = '', model = '', { full = 
     return `${cleanRole}${modelPart}${shortId && full ? ` (${shortId})` : ''}${suffix}`;
 }
 
-const SUBAGENT_CARD_LABEL = {
-    scheduled: 'Working',
-    running: 'Working',
-    interrupted: 'Working',
-};
+const SUBAGENT_CARD_LABEL = { scheduled: 'Working', running: 'Working', interrupted: 'Working' };
 
 export function formatLogMoney(value) {
     return formatUsd4(value);
@@ -316,11 +301,7 @@ export function formatLogMoney(value) {
 export function formatLogDuration(sec) {
     const num = Number(sec);
     if (!Number.isFinite(num) || num < 0) return '';
-    if (num >= 60) {
-        const mins = Math.floor(num / 60);
-        const rem = Math.round(num % 60);
-        return `${mins}m ${rem}s`;
-    }
+    if (num >= 60) return `${Math.floor(num / 60)}m ${Math.round(num % 60)}s`;
     return `${num < 10 ? num.toFixed(1) : Math.round(num)}s`;
 }
 
@@ -329,6 +310,14 @@ function formatLogTokens(evt) {
     const completion = Number(evt.completion_tokens || 0);
     if (!prompt && !completion) return '';
     return `${prompt}\u2192${completion} tok`;
+}
+
+// Usage rows only (#1578): v2 null = not reported, 0 = a reported zero; an unstamped/v1 zero stays ambiguous (LEGACY_RULE).
+function formatUsageTokens(evt) {
+    const count = (n) => (!Number.isSafeInteger(n) || n < 0 ? '?' : n === 0 && evt.record_contract_version !== 2 ? '0?' : String(n));
+    const prompt = count(evt.prompt_tokens), completion = count(evt.completion_tokens);
+    if (prompt === '?' && completion === '?') return 'tokens not reported';
+    return `${prompt}\u2192${completion} tok${[prompt, completion].includes('0?') ? ' (legacy 0 may be unreported)' : ''}`;
 }
 
 function compactJson(value, maxLen = 220) {
@@ -454,9 +443,13 @@ const TASK_CAUSE_PHRASES = {
     plan_review_none_answered: "None of the plan reviewers answered; the work went on without their notes.",
     plan_review_answered_open: "The plan reviewers answered, but the review was never closed; the work went on with their notes.",
     plan_review_quorum_unreachable: "Too few plan reviewers could answer, so the work was held.",
+    plan_review_objections_open: "Objections to the plan were still open when this answer was delivered; the work went on with them disclosed.",
     host_child_status_suffix: "A child task had not settled when the answer was delivered",
     invalid_delivery_control_after_repair: "Ouroboros's final delivery instruction could not be read even after repair, so the answer stands as delivered.",
     budget_exhausted: "The task ran out of budget before it could finish cleanly",
+    billing_authority_unreadable: "Ouroboros could not read this task's billing authority, so it admitted no further paid call; budget exhaustion was not established",
+    billing_authority_refused: "This task's billing lineage was missing or not its own, so it admitted no further paid call; budget exhaustion was not established",
+    control_authority_unreadable: "Ouroboros could not read a control this task needs before a call, so it admitted none; budget exhaustion was not established",
     // The other forced-finalization rails (outcomes.BEST_EFFORT_REASON_CODES / ACCEPTANCE_BYPASS_REASON_BY_RAIL keys).
     round_limit: "The task hit its round limit before it could finish cleanly",
     finalization_grace: "The task hit a time limit and had to wrap up before it could finish cleanly",
@@ -473,7 +466,7 @@ const TASK_CAUSE_PHRASES = {
     deep_self_review_unavailable: "The deep self-review could not run",
     deep_self_review_error: "The deep self-review stopped on an error",
     // #869: the provider-death rail's terminal words (twin of project_dialogue.TASK_CAUSE_PHRASES).
-    provider_unavailable: "The model provider stopped answering, so the task could not finish",
+    provider_unavailable: "The task could not get a usable model answer, so it could not finish",
     accounting_wait_expired: "Accounting access did not recover within this turn’s wait window",
     delivery_control_degraded: "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     authoring_handover_incomplete: "The replacement model stopped before resuming tool work.",
@@ -482,7 +475,17 @@ const TASK_CAUSE_PHRASES = {
     terminal_plan_review_open: "The plan review was still open when this answer was delivered",
     child_results_deferred: "Some sub-task results were deferred instead of being folded into this answer",
     tool_failure: "A tool this task used failed and nothing recovered it",
+    receipt_absent: "No host verification receipt was recorded; this does not establish whether other checks ran.",
+    expected_output_ungrounded: "The declared output has no recorded tool work or structured final answer to support it.",
+    residual_tool_errors_without_review: "Tool errors remain in the record and the result has not been evaluated.",
+    artifacts_unavailable: "Some result files are missing or could not be preserved.",
+    partial_result: "The result is partial; remaining work is described in task details.",
     task_exception: "The task stopped on an internal error",
+    // Recovery finalized a dead attempt from its registered answer; the Done card's delivery
+    // disposition keys (the row's typed terminal_delivery), rendered by terminalDeliveryClause.
+    finalization_incomplete: "The answer was authored, but the task's finalization did not complete, so its review evidence, artifacts and cost accounting are incomplete.",
+    terminal_delivery_exhausted: "Sending the final answer was not confirmed after the delivery attempts ran out",
+    terminal_delivery_unknown: "Delivery of the final answer could not be confirmed because the delivery registry could not be read; the result is in task details.",
 };
 
 export function taskReasonPhrase(code) {
@@ -491,29 +494,31 @@ export function taskReasonPhrase(code) {
     return TASK_CAUSE_PHRASES[raw] ? tr(`task.cause.${raw}`, TASK_CAUSE_PHRASES[raw]) : raw;
 }
 
+// The card's one sentence about a delivery the host could not confirm: an exhausted delivery names
+// the saved copy when one exists and says so when it does not. Twin: project_dialogue.terminal_delivery_clause.
+export function terminalDeliveryClause(delivery) {
+    const state = String(delivery?.state || '');
+    if (!TASK_CAUSE_PHRASES[`terminal_delivery_${state}`]) return '';
+    const path = String(delivery?.preserved_path || '');
+    return taskReasonPhrase(`terminal_delivery_${state}`) + (state !== 'exhausted' ? ''
+        : path ? `; a copy of the answer is saved at ${path}.` : '; no copy of the answer could be saved.');
+}
+
 // The cause lookup the shared acceptance presenter receives: no second path reads the table.
 const causePhraseLookup = (key) => (TASK_CAUSE_PHRASES[String(key || '')] ? taskReasonPhrase(key) : '');
 
-// The custody overlay stamps this code as the row's reason_code while a
-// delegated run is still unreconciled, and the debt then heals from the WRITE
-// side while the stored code may not be rewritten. So the code outlives the
-// fact, and the debt list the record CARRIES is the only fresh truth. ONE rule
-// from ONE source on every surface: a non-empty list names the debt beside the
-// execution reason, while an empty list or none at all leaves the execution
-// reason standing alone. Nothing is inferred from absence, because the live
-// task_done event carries the stored list too (agent_task_pipeline
-// ._custody_debt_event_fields), so a record without one is a record that states
-// nothing about the debt. The browser twin of
-// project_dialogue._custody_debt_reason: the debt is a warning BESIDE the rail
-// cause, never a replacement, and any other code passes through untouched.
+// Custody heals on the write side without rewriting reason_code. Only the
+// carried nonempty delegated_runs_unreconciled list states a current debt;
+// absence states none, not proof of reconciliation. Live task_done carries
+// that list too (_custody_debt_event_fields). Twin: _custody_debt_reason.
+// Debt stands beside the execution cause; other codes pass through unchanged.
 const CUSTODY_DEBT_REASON = 'delegated_custody_unreconciled';
 
 function custodyDebtReason(record) {
     const raw = String(record?.reason_code || '');
-    if (raw !== CUSTODY_DEBT_REASON) return [raw, ''];
     const debt = record?.delegated_runs_unreconciled;
     return [
-        String(record?.outcome_axes?.execution?.reason_code || ''),
+        raw === CUSTODY_DEBT_REASON ? String(record?.outcome_axes?.execution?.reason_code || '') : raw,
         Array.isArray(debt) && debt.length ? CUSTODY_DEBT_REASON : '',
     ];
 }
@@ -549,7 +554,7 @@ const authorStopRationale = (d) => (explicitAuthorStop(d) ? String(d.author_disp
 // result's terminal_plan_review_open flag), worded by its class when one is
 // named. The twin of project_dialogue._terminal_limitations.
 // The open-review classes that state a standing limitation (never the merely awaited case).
-const PLAN_REVIEW_OPEN_CLASSES = new Set(['plan_review_unanswered', 'plan_review_none_answered', 'plan_review_answered_open']);
+const PLAN_REVIEW_OPEN_CLASSES = new Set(['plan_review_unanswered', 'plan_review_none_answered', 'plan_review_answered_open', 'plan_review_objections_open']);
 
 function terminalLimitations(record, reason, held = false) {
     const deferred = Number(record?.outcome_axes?.objective?.deferred_count || 0) > 0;
@@ -561,8 +566,8 @@ function terminalLimitations(record, reason, held = false) {
     return [deferred ? taskReasonPhrase('child_results_deferred') : '', open ? taskReasonPhrase(planReviewKey(record, planKey)) : ''];
 }
 
-// One line for the primary cause and standing limitations; equivalent clauses
-// appear once. The twin of project_dialogue._completion_verdict.
+// Independent functional causes precede review provenance, never replacing it.
+// Twin of project_dialogue._completion_verdict; neither renderer mutates health.
 export function taskReasonDetail(evt) {
     const record = normalizeTaskTerminalRecord(evt);
     const decision = record.outcome_axes?.review?.acceptance_decision
@@ -571,45 +576,48 @@ export function taskReasonDetail(evt) {
     const decisionCause = String(decision?.reason || '');
     const objective = record.outcome_axes?.objective;
     const completion = record.task_completion ?? record.outcome_axes?.execution?.task_completion;
-    // A healed debt is never restored: naming it again would state a debt the
-    // same record shows as empty. Resolved once for every branch.
-    const [reason, custody] = custodyDebtReason(record);
+    const [storedReason, custody] = custodyDebtReason(record);
+    const reason = ['', 'final_message'].includes(storedReason)
+        ? String(record.outcome_axes?.execution?.reason_code || storedReason) : storedReason;
     const origin = record.cancel_origin;
     const held = severity === 'error' && String(objective?.source || '').startsWith('plan_review_');
-    let clause;
-    if (taskStoppedWithSummary(evt)) {
-        // An owner-requested stop is a success and carries its own marker instead.
-        clause = '';
-    } else if (((severity !== 'error' && severity !== 'cancelled') || (explicitAuthorStop(decision) && severity === 'error'))
-        && decision?.status && (decision.status !== 'accepted' || Object.hasOwn(TASK_CAUSE_PHRASES, decisionCause))) {
-        // A REVIEW-caused warning, or the explicit author stop that ended a red card, speaks through the
-        // decision's TRUE typed reason (an accepted one only with a sentence); reviewer prose stays in the card.
-        clause = taskReasonPhrase(decisionCause);
-    } else if (severity === "cancelled" && origin && typeof origin === "object"
+    const reviewCause = !taskStoppedWithSummary(evt) && decision?.status
+        && (decision.status !== 'accepted' || Object.hasOwn(TASK_CAUSE_PHRASES, decisionCause))
+        && (['done', 'warn'].includes(severity) || explicitAuthorStop(decision)) ? decisionCause : '';
+    const bypass = { budget_exhausted: 'acceptance_bypassed_budget_exhausted', round_limit: 'acceptance_bypassed_round_limit',
+        finalization_grace: 'acceptance_bypassed_deadline', deadline_local: 'acceptance_bypassed_deadline',
+        provider_unavailable: 'acceptance_bypassed_provider_unavailable', context_overflow: 'acceptance_bypassed_context_overflow',
+        children_unabsorbed: 'acceptance_bypassed_children_unabsorbed', owner_requested_finalization: 'acceptance_bypassed_owner_requested_finalization' };
+    let clause = '';
+    if (taskStoppedWithSummary(evt)) clause = '';
+    else if (severity === "cancelled" && origin && typeof origin === "object"
         && !Array.isArray(origin) && Object.keys(origin).length) {
         clause = joinCauseClauses(cancelCauseClauses(origin, record));
     } else if (held) {
-        // A task HELD by a blocking plan review states the objective's own reason, so it
-        // never reads as work that went on.
         clause = taskReasonPhrase(String(objective.reason || ''));
-    } else if (!evt?.reason_code || evt.reason_code === 'final_message') {
-        // A clean finish over a plan review that was only awaited states that fact; an amber
-        // or red card owes its colour to something else, so the fact never sits in its cause slot.
+    } else if (!reason || reason === 'final_message') {
         clause = completion?.action === 'stop' && severity !== 'cancelled' ? taskReasonPhrase('author_stop')
             : severity === 'done' && record.outcome_axes?.execution?.plan_review === 'awaiting' ? taskReasonPhrase('plan_review_awaiting') : '';
     } else {
-        // The current execution reason speaks when there is one (the open plan review by its
-        // class), otherwise the row states no cause and leaves the headline to its own axis.
         const receiptVeto = objective?.receipt_veto;
-        clause = !reason ? '' : receiptVeto?.reason === reason && receiptVeto.detail
+        clause = receiptVeto?.reason === reason && receiptVeto.detail
             ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
+    if (reviewCause && (reason === reviewCause || bypass[reason] === reviewCause)) clause = '';
+    const excluded = ['', 'delegated_custody_unreconciled', 'terminal_delivery_unknown', 'terminal_delivery_exhausted'];
+    const warnings = [...(Array.isArray(objective?.warnings) ? objective.warnings : []), objective?.warning || ''];
+    const warningClauses = warnings.filter(w => !excluded.includes(w)).map(taskReasonPhrase);
+    const artifacts = record.artifact_bundle?.status || record.artifact_status || record.outcome_axes?.artifacts?.status;
+    if (['failed', 'missing'].includes(artifacts)) warningClauses.push(taskReasonPhrase('artifacts_unavailable'));
+    if (decision?.open_obligations?.length) warningClauses.push(taskReasonPhrase('open_obligations'));
+    if (objective?.status === 'best_effort' && !clause && !objective.deferred_count && !taskStoppedWithSummary(evt)
+        && ['', 'previous_revision_accepted'].includes(reviewCause)) warningClauses.push(taskReasonPhrase('partial_result'));
     const rationale = completion?.action === 'stop' ? plainCauseText(completion.rationale, 0) : authorStopRationale(decision);
-    const line = joinCauseClauses([clause, rationale, ...acceptanceIncidentClauses(decision, reason, causePhraseLookup),
-        ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
-    // Cancellation's host/browser sentence has identical punctuation. Other
-    // cause policy stays with the runtime owner of this shared seam.
+    const line = joinCauseClauses([clause, ...warningClauses, taskReasonPhrase(reviewCause), rationale,
+        ...acceptanceIncidentClauses(decision, reason, causePhraseLookup),
+        ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '',
+        terminalDeliveryClause(record.terminal_delivery)]);  // the host twin appends the delivery clause last too
     return severity === 'cancelled' && line && !/[.!?…)\u2026]$/.test(line) ? `${line}.` : line;
 }
 
@@ -828,7 +836,7 @@ export function summarizeLogEvent(evt) {
             body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
-                formatLogTokens(evt),
+                formatUsageTokens(evt),
                 // Backfill uses accounted upper bounds; live frames may carry cost.
                 formatLogMoney(accountedUpperBound(evt) ?? evt.cost),
                 evt.response_kind === 'tool_calls' ? `${evt.tool_call_count || 0} tool calls` : evt.response_kind || '',
@@ -854,7 +862,7 @@ export function summarizeLogEvent(evt) {
             body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
-                formatLogTokens(evt),
+                formatUsageTokens(evt),
                 formatLogMoney(accountedUpperBound(evt) ?? evt.cost),
                 evt.category || '',
             ),
@@ -1046,7 +1054,7 @@ export function summarizeLogEvent(evt) {
     }
 
     if (t === 'task_checkpoint' || t === 'context_reclaim') {
-        return view(evt.checkpoint_kind === 'context_fit_low_retry' ? 'warn' : 'thinking', taskCheckpointLabel(evt), {
+        return view(['context_fit_low_retry', 'service_finalization_error'].includes(evt.checkpoint_kind) ? 'warn' : 'thinking', taskCheckpointLabel(evt), {
             meta: taskMeta(evt.model ? compactModel(evt.model) : '', evt.round ? `r${evt.round}` : '',
                 evt.checkpoint_kind === 'context_fit_low_retry' ? 'same-model retry' : '', evt.context_tokens ? `~${evt.context_tokens} tok` : '',
                 formatLogMoney(evt.task_cost)),
@@ -1258,6 +1266,7 @@ function summarizeChatLiveEventView(evt) {
     const delegated = delegatedActivityView(evt); // a delegated run's typed observation, root or child
     if (delegated) return Object.assign(chatView({ ...delegated, chip: executorChip(evt), model: evt.model }), { activity: delegated.activity });
     if ((evt.is_progress || t === 'send_message') && isSubagentEvent(evt)) {
+        const note = describeText(hostRowDisplayText({ ...evt, text: progressText.full }), 240, { markdown: true });
         const sid = subagentId(evt);
         const rawEvent = String(evt.subagent_event || '').toLowerCase();
         const role = String(evt.subagent_role || '').trim();
@@ -1275,7 +1284,7 @@ function summarizeChatLiveEventView(evt) {
         const stopDetail = (evt.task_completion ?? evt.outcome_axes?.execution?.task_completion)?.action === 'stop' ? taskReasonDetail(evt) : '';
         const reasonDetail = cancelDetail || stopDetail || (evt.reason_code ? taskReasonPhrase(evt.reason_code) : '');
         const detailParts = [
-            progressText.full,
+            note.full,
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
             traceText.full ? `[TRACE]\n${traceText.full}` : '',
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
@@ -1314,8 +1323,8 @@ function summarizeChatLiveEventView(evt) {
                 : resultText.full ? resultText
                     : errorText.full ? errorText
                         : traceText.full ? traceText
-                            : progressText)
-            : (progressText.full ? progressText
+                            : note)
+            : (note.full ? note
                 : resultText.full ? resultText
                     : errorText.full ? errorText
                         : traceText);
@@ -1347,13 +1356,14 @@ function summarizeChatLiveEventView(evt) {
         // host note is a typed fact, never a text match. Both stay visible rows; only
         // narration is promoted (title, collapsed line). ABSENT = predates the fact.
         const narration = evt.narration === true || evt.narration === undefined;
+        const note = describeText(hostRowDisplayText({ ...evt, text: progressText.full }), 240, { markdown: true });
         return chatView({
             phase: lifecycleTerminal ? (/failed\b/i.test(progressText.full) ? 'lifecycle_error' : 'done') : 'working',
             // An empty note is no narration: a placeholder would become the card title as if said (#1369).
-            headline: progressText.preview || '',
-            fullHeadline: progressText.full || '',
-            activityPreview: progressText.preview || '',
-            visible: Boolean(progressText.preview),
+            headline: note.preview || '',
+            fullHeadline: note.full || '',
+            activityPreview: note.preview || '',
+            visible: Boolean(note.preview),
             promote: narration,
             human: narration,
             // «ТУТ бабл … на codex» — an ordinary progress bubble carries the chip
@@ -1409,15 +1419,14 @@ function summarizeChatLiveEventView(evt) {
     if (t === 'tool_call_started' || (['tool_call_finished', 'tool_call'].includes(t) && !evt.is_error)) {
         // A successful call is execution evidence, not narration: start and finish feed the
         // block's ONE folded row (counts; tools behind Expand), a receipt while every counted
-        // call is a host-stamped routing or completion act. Failures keep their own row. `done` is
-        // the TASK's phase; a finished CALL is `ok`.
+        // call is a host-stamped routing or completion act. Failures keep their own row; so does a
+        // completed check whose criterion failed, while its call still counts once as `ok`. `done`
+        // is the TASK's phase; a finished CALL is `ok`.
         const status = t === 'tool_call_started' ? (evt._live_tool_frame ? 'calling' : 'unknown') : 'ok';
         return chatView({
-            phase: status,
-            headline: '',
-            visible: true,
+            phase: status, headline: '', visible: true, dedupeKey: `tools|${groupId}`,
             receipt: Boolean(evt.routing_action) || evt.completion_control === true,
-            dedupeKey: `tools|${groupId}`,
+            ...checkFailureView(evt, toolCallKey(evt, groupId)),
             toolCall: toolObservation(evt, groupId, status),
         });
     }
@@ -1426,11 +1435,10 @@ function summarizeChatLiveEventView(evt) {
         // Visible in the expanded timeline, with no narration/title promotion.
         const lowRetry = evt.checkpoint_kind === 'context_fit_low_retry';
         return chatView({
-            phase: lowRetry ? 'warn' : 'thinking',
+            phase: lowRetry || evt.checkpoint_kind === 'service_finalization_error' ? 'warn' : 'thinking',
             headline: taskCheckpointLabel(evt) + (lowRetry ? ' — retrying the same model once' : ''),
             visible: !checkpointHasProgressRow(evt),
-            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_kind === 'usage_lock_wait'
-                ? `${evt.episode_id || evt.ts || ''}:${evt.phase}` : evt.checkpoint_number || evt.round || ''),
+            dedupeKey: key(evt.checkpoint_kind || '', taskCheckpointIdentity(evt)),
         });
     }
 
@@ -1482,21 +1490,13 @@ function summarizeChatLiveEventView(evt) {
         if (errorResult.preview) bodyParts.push(errorResult.preview);
         if (commandText.full) fullBodyParts.push(`Command: ${commandText.full}`);
         if (errorResult.full) fullBodyParts.push(errorResult.full);
-        if (evt.status === 'non_zero_exit') {
-            const exitCode = Number(evt.exit_code);
-            return chatView({
-                phase: 'warn',
-                headline: `A command returned ${Number.isFinite(exitCode) ? `exit code ${exitCode}` : 'a non-zero exit code'}`,
-                body: shortText(bodyParts.join(' '), 220),
-                fullBody: fullBodyParts.join('\n\n'),
-                visible: true,
-                dedupeKey: toolCallKey(evt, groupId),
-                toolCall: failed,
-            });
-        }
+        const commandFailed = evt.status === 'non_zero_exit';
+        const exitCode = commandFailed ? Number(evt.exit_code) : NaN;
         return chatView({
-            phase: 'error',
-            headline: `One of the steps failed${evt.tool ? ` · ${evt.tool}` : ''}`,
+            phase: commandFailed ? 'warn' : 'error',
+            headline: commandFailed
+                ? `A command returned ${Number.isFinite(exitCode) ? `exit code ${exitCode}` : 'a non-zero exit code'}`
+                : `One of the steps failed${evt.tool ? ` · ${evt.tool}` : ''}`,
             body: shortText(bodyParts.join(' '), 220),
             fullBody: fullBodyParts.join('\n\n'),
             visible: true,

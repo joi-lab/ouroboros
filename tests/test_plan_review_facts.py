@@ -1,9 +1,8 @@
-"""Plan-review facts for the learning surfaces (``ouroboros.plan_review_facts``).
+"""Plan-review facts for a late review settlement (``ouroboros.plan_review_facts``).
 
-The reflection asks the mind to account for every review finding; these tests pin
-that the host now puts the plan review's facts in front of it — bounded, with a
-source pointer, never a score — and that a panel settling after the task ended
-leaves one bounded row in the reflection log.
+A panel settling after its task ended leaves one bounded host row in the reflection
+log: the settled verdict, each reviewer's output and the plan review's facts —
+bounded, with a source pointer, never a score.
 """
 from __future__ import annotations
 
@@ -275,42 +274,10 @@ def test_a_task_without_waves_or_without_an_id_has_no_slice(tmp_path, monkeypatc
     assert plan_review_reflection_slice(tmp_path, "") is None
 
 
-def test_the_evidence_formatter_leads_with_the_slice_and_is_byte_identical_without_it():
-    from ouroboros.review_evidence import format_review_evidence_for_prompt
-
-    evidence = {"task_id": "t-1", "has_evidence": True, "lens_marker": "lens-survives"}
-    plain = format_review_evidence_for_prompt(evidence, max_chars=8000, acceptance_panels=None)
-    assert format_review_evidence_for_prompt(evidence, max_chars=8000, acceptance_panels=None, plan_review=None) == plain
-
-    with_facts = format_review_evidence_for_prompt(evidence, max_chars=8000, acceptance_panels=None,
-                                                   plan_review={"claims_source": "author_plan", "elements": []})
-    assert with_facts.startswith("TASK PLAN REVIEW (host-recorded facts; which advice mattered is yours to judge):")
-    assert with_facts.endswith(plain) and "author_plan" in with_facts
-
-
-@pytest.mark.parametrize("recorded", [True, False])
-def test_the_reflection_prompt_carries_the_slice_exactly_when_the_task_recorded_waves(monkeypatch, recorded):
-    from ouroboros.reflection import generate_reflection
-
-    captured = {}
-
-    class _Llm:
-        def chat(self, **kwargs):
-            captured["prompt"] = kwargs["messages"][0]["content"]
-            return {"content": "Reflection completed."}, {}
-
-    slice_ = {"claims_source": "author_plan", "elements": [{"id": "claim_7", "text": "MARKER_CLAIM_SEVEN"}]}
-    monkeypatch.setattr(facts_mod, "plan_review_reflection_slice",
-                        lambda root, tid, task=None: slice_ if recorded else None)
-
-    generate_reflection(task={"id": "reflection-task", "text": "reflect"},
-                        llm_trace={"tool_calls": [], "review_runs": []}, trace_summary="completed",
-                        llm_client=_Llm(), usage_dict={"rounds": 2, "cost": 0.1},
-                        review_evidence={"has_evidence": True, "lens_marker": "lens-survives"})
-
-    assert ("TASK PLAN REVIEW" in captured["prompt"]) is recorded
-    assert ("MARKER_CLAIM_SEVEN" in captured["prompt"]) is recorded
-    assert "lens-survives" in captured["prompt"]
+def test_the_measured_section_leads_with_its_heading_and_carries_the_facts():
+    rendered = render_plan_review_section({"claims_source": "author_plan", "elements": []})
+    assert rendered.startswith("TASK PLAN REVIEW (host-recorded facts; which advice mattered is yours to judge):")
+    assert "author_plan" in rendered
 
 
 def _late_result(tmp_path, task_id="late-1", retry_key="rk-1", **fields):
@@ -324,9 +291,7 @@ def _late_result(tmp_path, task_id="late-1", retry_key="rk-1", **fields):
     return task_id
 
 
-def test_the_late_settlement_row_is_bounded_sourced_and_closed_to_the_pattern_register(tmp_path, monkeypatch):
-    from ouroboros.reflection import _admits_pattern_register
-
+def test_the_late_settlement_row_is_bounded_and_sourced(tmp_path, monkeypatch):
     monkeypatch.setattr(facts_mod, "plan_review_reflection_slice", lambda root, tid, task=None: None)
     task_id = _late_result(tmp_path)
 
@@ -338,7 +303,6 @@ def test_the_late_settlement_row_is_bounded_sourced_and_closed_to_the_pattern_re
     assert entry["reflection"].splitlines()[1] == f"Source: get_task_result(task_id={task_id}), review_projection panel panel_1."
     assert "- a (model/a): PASS" in entry["reflection"]
     assert entry["source_ref"]["panel_id"] == "panel_1" and entry["goal"] == "Ship the deck"
-    assert not _admits_pattern_register(entry)
     assert late_settlement_reflection_entry(tmp_path, task_id, "unknown-key") is None
 
 
@@ -357,6 +321,46 @@ def test_the_late_row_passes_the_result_so_the_claims_source_sees_the_task_contr
 
     assert seen["contract"]["acceptance_claims"][0]["id"] == "claim_1"
     assert "Plan review (ingress_contract claims; 3 of 3 elements)" in entry["reflection"]
+
+
+def _organ_participant(seat, *, reply, owner_marked=True):
+    return {"seat_id": seat, "model": "m/x", "route": "api_chat", "owner_marked": owner_marked, "dispatched": True,
+            "status": "answered", "reply": {"prose": "", "objections": [], "withdrawn": [], **reply}}
+
+
+def test_an_organ_task_late_row_names_each_objection_with_its_standing(tmp_path):
+    """An organ task has no legacy elements: its late row names every objection of the plan
+    record and whether its raiser withdrew it; a plan nobody objected to says so."""
+    from ouroboros import plan_record as pr
+
+    task_id = _late_result(tmp_path)
+    pr.append_revision(tmp_path, task_id, pr.compose_revision(
+        None, goal="ship", plan="outline, then draft", done_when=["five slides"], affected_paths=[]), body=False)
+    pr.append_ask(tmp_path, task_id, {"ask_id": "a1", "ts": "t1", "revision": 1, "message": "look", "participants": [
+        _organ_participant("triad_a", reply={"objections": [{"id": "o1", "text": "no export"}, {"id": "o2", "text": "too long"}]}),
+        _organ_participant("critic_x", owner_marked=False, reply={"objections": [{"id": "o3", "text": "dated"}]})]})
+    pr.append_ask(tmp_path, task_id, {"ask_id": "a2", "ts": "t2", "revision": 1, "message": "export added", "participants": [
+        _organ_participant("triad_a", reply={"withdrawn": [{"id": "o1", "why": "added"}]})]})
+
+    reflection = late_settlement_reflection_entry(tmp_path, task_id, "rk-1")["reflection"]
+
+    (line,) = [row for row in reflection.splitlines() if row.startswith("Plan record (")]
+    assert "1 revision(s), 2 ask(s); 3 of 3 objections" in line
+    assert "triad_a/o1 withdrawn" in line and "triad_a/o2 open, owner-marked, not adjudicated" in line
+    assert line.endswith("critic_x/o3 open")  # an added critic's objection is open, never owner-marked
+    assert "Plan review (" not in reflection
+    # Scope R1, D1: the slice carries exactly what the row prints — counts and the fold — and no unrendered projection.
+    facts = plan_review_reflection_slice(tmp_path, task_id, task={"task_contract": {}})
+    assert set(facts) == {"organ", "source_ref", "claims_source", "revisions", "asks", "objections"}
+    assert facts["revisions"] == 1 and facts["asks"] == 2 and [o["id"] for o in facts["objections"]] == ["o1", "o2", "o3"]
+    assert facts["source_ref"]["field"] == "plan_record"
+
+    quiet = _late_result(tmp_path, task_id="late-2")
+    pr.append_revision(tmp_path, quiet, pr.compose_revision(
+        None, goal="ship", plan="outline", done_when=["five slides"], affected_paths=[]), body=False)
+    pr.append_ask(tmp_path, quiet, {"ask_id": "a1", "ts": "t1", "revision": 1, "message": "look",
+                                    "participants": [_organ_participant("triad_a", reply={"prose": "fine"})]})
+    assert "1 ask(s); 0 of 0 objections): none raised" in late_settlement_reflection_entry(tmp_path, quiet, "rk-1")["reflection"]
 
 
 def test_a_failing_plan_fact_read_still_leaves_the_late_row_with_its_verdict(tmp_path, monkeypatch):

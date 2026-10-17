@@ -128,7 +128,7 @@ test('one status-word family: the card phase matches the host over the shared fi
     for (const { name, record, phase, headline, acceptance_clause: clause } of fixture.cases) {
         const resolved = taskDoneIsTerminal(record) ? taskTerminalPhase(record) : 'working';
         assert.deepEqual(taskPresentation(resolved), { phase, headline }, name);
-        if (clause) {
+        if (clause !== undefined) {
             // The host composes the same sentence for its durable prose rows and
             // terminates it there; the card line adds no punctuation of its own.
             const detail = taskReasonDetail(record);
@@ -265,7 +265,7 @@ test('a real debt beside a real execution cause is one card line', () => {
         reason_code: 'delegated_custody_unreconciled',
         delegated_runs_unreconciled: ['run-a1', 'run-b2'],
         outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
-    }), 'The model provider stopped answering, so the task could not finish · Some delegated work was never reconciled.');
+    }), 'The task could not get a usable model answer, so it could not finish · Some delegated work was never reconciled.');
 });
 
 // A LIVE task_done event carries the row's own debt list too
@@ -288,7 +288,7 @@ test('a record carrying no debt list states nothing about the debt', () => {
         status: 'failed',
         reason_code: 'delegated_custody_unreconciled',
         outcome_axes: { execution: { status: 'failed', reason_code: 'provider_unavailable' } },
-    }), 'The model provider stopped answering, so the task could not finish');
+    }), 'The task could not get a usable model answer, so it could not finish');
     assert.equal(taskReasonDetail({
         status: 'completed',
         reason_code: 'delegated_custody_unreconciled',
@@ -386,7 +386,7 @@ test('standing limitations are stated beside the primary cause, each once', () =
     'Some sub-task results were deferred instead of being folded into this answer · Only some of the plan reviewers answered; the work went on with their notes.');
     // A clause that is not last drops its own full stop; equivalent clauses state themselves once.
     assert.equal(taskReasonDetail(openPlan('unanswered', { delegated_runs_unreconciled: ['run-a1'] })),
-        'Only some of the plan reviewers answered; the work went on with their notes.');
+        'Only some of the plan reviewers answered; the work went on with their notes · Some delegated work was never reconciled.');
     assert.equal(taskReasonDetail({ ...openPlan('unanswered'), reason_code: 'delegated_custody_unreconciled',
         delegated_runs_unreconciled: ['run-a1'] }),
     'Only some of the plan reviewers answered; the work went on with their notes · Some delegated work was never reconciled.');

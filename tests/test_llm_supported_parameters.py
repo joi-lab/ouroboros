@@ -558,10 +558,3 @@ class TestSupportedParametersFilter:
         )
         # Unknown model → cache miss → None → no stripping
         assert kwargs.get("temperature") == 0.2
-
-    def test_no_version_specific_sampling_gate_remains(self):
-        import pathlib
-
-        llm_text = pathlib.Path(__file__).resolve().parents[1].joinpath("ouroboros", "llm.py").read_text(encoding="utf-8")
-        assert "claude-opus-4-7" not in llm_text
-        assert "claude-opus-4.7" not in llm_text

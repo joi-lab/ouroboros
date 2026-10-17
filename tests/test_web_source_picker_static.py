@@ -33,7 +33,6 @@ WEB = REPO_ROOT / "web"
 WEB_MODULES = WEB / "modules"
 INDEX_HTML = WEB / "index.html"
 SETUP_CONTRACT = REPO_ROOT / "ouroboros" / "settings_setup_contract.py"
-DESIGN_DOC = REPO_ROOT / "docs" / "DESIGN.md"
 PRIMITIVES = WEB_MODULES / "route_editor_primitives.js"
 
 # The serialized separator the owner must never be asked to type.
@@ -185,7 +184,7 @@ def _reexports(source: str, symbol: str) -> bool:
         if symbol in names and "route_editor_primitives" in match.group("from"):
             return True
     # A same-named wrapper that delegates to the primitive counts: the source
-    # list still has ONE owner (reviewer_slots.js narrows the API label).
+    # list still has ONE owner.
     if re.search(rf"export\s+function\s+{re.escape(symbol)}\b", source):
         return bool(_import_specifiers(source, symbol) or re.search(
             rf"\w+\s*\.\s*{re.escape(symbol)}\b", source))
@@ -193,15 +192,16 @@ def _reexports(source: str, symbol: str) -> bool:
 
 
 def test_model_assigning_editors_share_the_grouped_source_select() -> None:
-    """Models roles, Available subagents and review lanes take their source
-    groups from ONE primitive, directly or through a module that re-exports it.
+    """Models roles and Available subagents (whose rows marked Reviewer are the
+    reviewers) take their source groups from ONE primitive, directly or through a
+    module that re-exports it.
 
     docs/DESIGN.md §7: every model-assigning surface offers "one grouped source
-    select with the same groups in the same order". Three private copies of the
-    group list is exactly how that order drifts apart per surface.
+    select with the same groups in the same order". Private copies of the group
+    list is exactly how that order drifts apart per surface.
     """
     symbol = "routeChoiceGroups"
-    editors = ("model_roles.js", "reviewer_slots.js", "subagents_settings.js")
+    editors = ("model_roles.js", "subagents_settings.js")
 
     primitives_source = PRIMITIVES.read_text(encoding="utf-8")
     assert re.search(rf"export\s+(?:function|const)\s+{symbol}\b", primitives_source), (
@@ -233,28 +233,4 @@ def test_model_assigning_editors_share_the_grouped_source_select() -> None:
         f"these model-assigning editors do not take {symbol} from "
         "web/modules/route_editor_primitives.js (directly or via a re-export): "
         + ", ".join(missing)
-    )
-
-
-def test_design_doc_states_the_source_is_chosen_rule() -> None:
-    """The rule itself lives in the design document, with its four groups
-    named in the order every surface renders them."""
-    design = DESIGN_DOC.read_text(encoding="utf-8")
-    rule_sentence = "A source is chosen, never spelled."
-
-    # Scope the group check to the rule's own paragraph. "API keys" is ordinary
-    # vocabulary elsewhere in the document, so a whole-file index would match
-    # the Accounts sentence instead of the group list.
-    paragraphs = [" ".join(block.split()) for block in design.split("\n\n")]
-    rule = next((block for block in paragraphs if rule_sentence in block), "")
-    assert rule, f"docs/DESIGN.md must state the rule: {rule_sentence!r}"
-
-    groups = ("configured subagents", "Subscriptions · models", "API keys", "Agents · sessions")
-    positions = []
-    for group in groups:
-        assert group in rule, f"the rule paragraph must name the source group {group!r}"
-        positions.append(rule.index(group))
-    assert positions == sorted(positions), (
-        "docs/DESIGN.md must name the source groups in their rendered order: "
-        + ", ".join(groups)
     )

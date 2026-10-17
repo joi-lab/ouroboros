@@ -13,18 +13,17 @@ def test_globalized_project_promotion_keeps_the_origin(monkeypatch):
     from ouroboros import agent_task_pipeline as pipeline
 
     captured: list = []
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda env, entry: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote",
-                        lambda env, task, entry, llm: captured.append(task))
+                        lambda env, task, sealed, llm: captured.append(task))
     task = {"id": "p-1", "type": "task", "metadata": dict(_wake_task("full")["metadata"]),
             "task_contract": {"disabled_tools": []}}
-    entry = {"backlog_candidates": [{"summary": "make it better"}]}
-    pipeline._run_global_backlog_promotion_only(types.SimpleNamespace(), task, entry, None)
+    sealed = {"final_result_text": "Shipped.", "artifact_manifest": [], "completion_observations": {"status": "unavailable"}}
+    pipeline._run_global_backlog_promotion_only(types.SimpleNamespace(), task, sealed, None)
     assert captured and captured[0]["metadata"] == {
         "globalized_from_project_task": True, "initiator": "consciousness",
         "usage_category": "consciousness_task", "consciousness_autonomy": "full"}
     captured.clear()
-    pipeline._run_global_backlog_promotion_only(types.SimpleNamespace(), {"id": "p-2", "type": "task"}, entry, None)
+    pipeline._run_global_backlog_promotion_only(types.SimpleNamespace(), {"id": "p-2", "type": "task"}, sealed, None)
     assert captured[0]["metadata"] == {"globalized_from_project_task": True}
 
 
@@ -36,15 +35,20 @@ def test_a_consciousness_started_review_keeps_the_tree_category():
     """The allowance discovers its roots by the consciousness categories: a review root whose only
     priced rows said `deep_self_review` was invisible to it (astra round 3)."""
     from ouroboros.deep_self_review import _review_usage_scope
+    from ouroboros.review_records import ReviewRequest
     from ouroboros.usage_accounting import UsageScope
 
-    kept = _review_usage_scope(UsageScope(category="consciousness_task", source="agent.task"))
+    def scope(current):
+        return _review_usage_scope(current, ReviewRequest(surface="deep_self_review", goal="review"))
+
+    kept = scope(UsageScope(category="consciousness_task", source="agent.task"))
     assert kept.category == "consciousness_task" and kept.source == "deep_self_review"
-    wake = _review_usage_scope(UsageScope(category="consciousness", source="agent.task"))
+    assert kept.review_wave_id.startswith("wave-")  # the review names its round (#1544)
+    wake = scope(UsageScope(category="consciousness", source="agent.task"))
     assert wake.category == "consciousness"
-    own = _review_usage_scope(UsageScope(category="task", source="agent.task"))
+    own = scope(UsageScope(category="task", source="agent.task"))
     assert own.category == "deep_self_review" and own.source == "deep_self_review"
-    assert _review_usage_scope(UsageScope()).category == "deep_self_review"
+    assert scope(UsageScope()).category == "deep_self_review"
 
 
 def test_a_started_root_reads_the_mode_it_runs_in_but_the_wake_keeps_mains(tmp_path, monkeypatch):

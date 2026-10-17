@@ -119,7 +119,7 @@ function folderTooltip(folder) {
 }
 
 // Rows use the markdown list markup (`md-li`, `md-link`) this body already styles.
-function resultArtifactsHtml(view) {
+function resultArtifactsHtml(view, limit = RESULT_FILE_ROWS) {
     const rows = [
         ...view.files.map((file) => ({
             files: 1,
@@ -143,8 +143,8 @@ function resultArtifactsHtml(view) {
                 + '</span>',
         })),
     ];
-    const hidden = rows.slice(RESULT_FILE_ROWS).reduce((sum, row) => sum + row.files, 0);
-    return rows.slice(0, RESULT_FILE_ROWS).map((row) => `<span class="md-li">• ${row.html}</span>`).join('')
+    const hidden = rows.slice(limit).reduce((sum, row) => sum + row.files, 0);
+    return rows.slice(0, limit).map((row) => `<span class="md-li">• ${row.html}</span>`).join('')
         + (hidden ? `<span class="md-li">+${fileCountText(hidden).replace(/ (files?)$/, ' more $1')}</span>` : '');
 }
 
@@ -159,4 +159,31 @@ export function resultFilesItemHtml(item) {
             <div class="chat-live-line-body">${resultArtifactsHtml(item.resultArtifacts)}</div>
         </div>
     `;
+}
+
+/** Explicit question materials share the retained result artifact address authority. */
+export function syncQuestionMaterials(card, records, render = null) {
+    if (!records.length || card.querySelector('.chat-quiz-materials')) return;
+    const materials = document.createElement('div');
+    materials.className = 'chat-quiz-materials';
+    for (const item of records) {
+        if (!item?.task_id || !item.name || !item.sha256) continue;
+        const url = taskArtifactDownloadUrl(item.task_id, item.name);
+        if (!url) continue;
+        const label = item.label || item.name;
+        // Reuse the ordinary file reader and photo preview with only a canonical custody URL.
+        const extension = String(label).split('.').at(-1).toLowerCase();
+        const image = ({ png: 'png', jpg: 'jpeg', jpeg: 'jpeg', gif: 'gif', webp: 'webp', avif: 'avif' })[extension];
+        const rendered = render?.({ task_id: item.task_id, filename: label, size_bytes: item.size,
+            download_url: url, mime: image ? `image/${image}` : 'application/octet-stream' });
+        const content = rendered?.querySelector('.message');
+        if (content) { materials.append(content); continue; }
+        const link = document.createElement('a');
+        link.className = 'md-link';
+        link.textContent = item.label || item.name;
+        link.href = url;
+        link.download = item.label || item.name;
+        materials.append(link);
+    }
+    if (materials.children.length) card.append(materials);
 }

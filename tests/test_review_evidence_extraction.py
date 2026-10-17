@@ -80,7 +80,6 @@ def test_review_evidence_keeps_the_packet_assembler_and_its_patchable_seams():
         "build_task_acceptance_evidence",
         "annotate_criteria_evidence_resolution",
         "collect_review_evidence",
-        "format_review_evidence_for_prompt",
     ):
         assert getattr(review_evidence, name).__module__ == "ouroboros.review_evidence", name
     for name in ("build_review_projection", "build_review_status_payload"):

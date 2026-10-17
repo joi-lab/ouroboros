@@ -48,6 +48,23 @@ test('the census-only Activity row offers Resume only for a saved remainder', ()
     assert.match(pausing, /data-root="1"/);
 });
 
+test('an answered root names its work and that only the remainder waits, not a generic turn', () => {
+    const row = (phase, late_work) => liveActivityRowHtml({ activity_id: 'late-root', kind: 'direct_chat', phase,
+        started_at: 0, late_work }, 1_700_000_100_000);
+    const paused = row('budget_paused', { title: 'Audit <the> release', answered_at: '2026-10-13T21:11:55Z' });
+    assert.match(paused, /<span class="activity-name">Audit &lt;the&gt; release<\/span>/);
+    assert.match(paused, /Remaining work paused · answer delivered <time datetime="2026-10-13T21:11:55.000Z"[^>]*>[^<]+<\/time>/);
+    assert.doesNotMatch(paused, /Direct turn|budget_paused/);
+    assert.match(paused, /data-budget-paused="1"/, 'its saved remainder keeps the shared Resume');
+    const pausing = row('budget_pausing', { title: 'Audit', answered_at: 'not a time' });
+    assert.match(pausing, /Remaining work pausing · answer delivered<\/span>/, 'an unknown answer time is omitted');
+    assert.doesNotMatch(pausing, /data-budget-paused/);
+    assert.match(row('budget_paused', {}), /<span class="activity-name">Answered task<\/span>/);
+    // Positive control: a live direct turn without a late phase keeps its plain census line.
+    assert.match(liveActivityRowHtml({ activity_id: 'turn', kind: 'direct_chat', phase: 'working', started_at: 0 }),
+        /<span class="activity-name">Direct turn<\/span>\s*<span class="activity-sub">working<\/span>/);
+});
+
 test('Resume of late work says it continues in place, never that it returns to the queue', async () => {
     const { resumeTaskAction } = await import('../modules/task_control_menu.js');
     const toasts = [];

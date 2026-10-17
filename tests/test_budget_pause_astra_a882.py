@@ -21,11 +21,12 @@ from tests._budget_pause_exact_helpers import (  # noqa: F401 -- shared fixtures
     _loop_ctx,
     _parked,
 )
+from tests.worker_pool_support import affirm_ready
 
 
 def _idle_worker(workers, sent):
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
 
 
 def _recording_writer(monkeypatch, budget_pause):
@@ -144,52 +145,59 @@ def test_a_grant_still_carried_by_a_queue_row_is_not_orphaned(tmp_path, monkeypa
 
 # --- #2: unreadable custody chain is UNKNOWN, never "no open runs" -----------------
 
+def _store_lost(monkeypatch):
+    from ouroboros import store
+    from ouroboros import delegate_custody_current as current
+
+    def lost(_root, _task_id):
+        raise store.StoreLost("current.sqlite cannot be opened")
+
+    monkeypatch.setattr(current, "task_snapshot", lost)
+
+
 def test_an_unreadable_custody_chain_is_a_failed_read_not_no_open_runs(tmp_path, monkeypatch):
-    """Astra a882 #2: ``replay`` falls back leniently (an unreadable segment reads
-    as empty), so the observer probes the chain first: unreadable → ``custody_read``
-    ``failed`` with ``coverage_basis`` ``custody_unreadable``, and a grant refuses typed."""
+    """Astra a882 #2, store era: the store answers or raises; a raise is ``custody_read``
+    ``failed`` with ``coverage_basis`` ``custody_unreadable``, never "no open runs"."""
     from ouroboros import budget_pause
-    from ouroboros import delegate_custody as custody
-    from ouroboros import delegate_pending
 
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
-    monkeypatch.setattr(custody, "replay", lambda _root, rows=None: {})
-    monkeypatch.setattr(delegate_pending, "pending_invocations", lambda _root, rows=None: [])
-
+    _store_lost(monkeypatch)
     observed = budget_pause.observe_task_runs(tmp_path, "a882-unreadable")
     assert observed["custody_read"] == "failed" and observed["runs"] == []
     assert observed["coverage_basis"] == "custody_unreadable"
-    assert "custody_log_unreadable" in observed["error"]
+    assert "StoreLost" in observed["error"]
 
-    # Same probe, readable chain: the empty replay is a positively established absence.
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
+    # Same read, answering store: the empty rows are a positively established absence.
+    monkeypatch.undo()
     clean = budget_pause.observe_task_runs(tmp_path, "a882-unreadable")
     assert clean["custody_read"] == "ok" and clean["coverage_basis"] == "no_open_runs"
 
 
 def test_an_unreadable_custody_chain_refuses_the_owner_resume_typed(tmp_path, monkeypatch):
     """End to end for #2: the grant side re-reads custody through the same body
-    and refuses ``external_custody_unreadable`` while the chain is unreadable."""
-    from ouroboros import delegate_custody as custody
+    and refuses ``external_custody_unreadable`` while the store cannot answer."""
+    from ouroboros import delegate_custody_current as current
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     task, _row = _parked(tmp_path, monkeypatch, task_id="a882-unreadable-grant")
-    monkeypatch.setattr(custody, "replay", lambda _root, rows=None: {})
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: True)
+    answering = current.task_snapshot
+    _store_lost(monkeypatch)
     refused = queue.resume_budget_paused_task("a882-unreadable-grant")
     assert refused["error"] == "external_custody_unreadable"
-    assert "custody_log_unreadable" in refused["detail"]
+    assert "StoreLost" in refused["detail"]
     assert "_budget_pause" in task and "_budget_pause_resume" not in task
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
+    monkeypatch.setattr(current, "task_snapshot", answering)
     assert queue.resume_budget_paused_task("a882-unreadable-grant")["ok"] is True
 
 
 # --- #3: a pending (unbound) invocation of THIS task is unknown custody -------------
 
-def _pending_row(task_id, invocation_id, route="claudexor"):
-    return {"invocation_id": invocation_id, "task_id": task_id, "route": route,
-            "surface": "delegate", "request": {}}
+def _request(root, task_id, invocation_id, route="claudexor"):
+    from ouroboros import delegate_custody as custody
+
+    assert custody.emit(root, custody.START_REQUESTED, {
+        "invocation_id": invocation_id, "task_id": task_id, "route": route,
+        "surface": "delegate", "request": {"prompt": "work"}})
 
 
 def test_a_pending_invocation_of_this_task_is_unknown_custody_never_absence(tmp_path, monkeypatch):
@@ -198,22 +206,21 @@ def test_a_pending_invocation_of_this_task_is_unknown_custody_never_absence(tmp_
     ``pending_invocation_unbound`` under ``coverage_basis`` ``pending_invocations_unbound``;
     another task's pending invocation is not this task's custody."""
     from ouroboros import budget_pause
-    from ouroboros import delegate_custody as custody
-    from ouroboros import delegate_pending
 
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
-    monkeypatch.setattr(custody, "replay", lambda _root, rows=None: {})
-    pending = [_pending_row("a882-pending", "inv-mine"), _pending_row("someone-else", "inv-theirs", route="codex")]
-    monkeypatch.setattr(delegate_pending, "pending_invocations", lambda _root, rows=None: list(pending))
+    _request(tmp_path, "a882-pending", "inv-mine")
+    _request(tmp_path, "someone-else", "inv-theirs", route="codex")
 
     observed = budget_pause.observe_task_runs(tmp_path, "a882-pending")
     assert observed["custody_read"] == "ok"
     assert observed["coverage_basis"] == "pending_invocations_unbound"
     assert observed["runs"] == [{
         "run_id": "", "invocation_id": "inv-mine", "route": "claudexor",
-        "cost_coverage": "unproven_preterminal", "stop_policy": "reconcile_first",
+        "cost_coverage": "unproven_preterminal", "stop_policy": "reconcile_first", "review_owned": False,
         "state": budget_pause.EXTERNAL_STOP_UNKNOWN, "stop_outcome": "pending_invocation_unbound",
         "detail": "",
+        # The real pending-request projector supplies the same default source as
+        # the upstream chain path; this unbound delegation is not an independent review.
+        "source": "delegated_subagent", "independent_review": False,
     }]
     assert observed["runs"][0]["state"] != budget_pause.EXTERNAL_STOP_CONFIRMED  # unsettled for a grant
 
@@ -229,15 +236,12 @@ def test_a_pending_invocation_keeps_the_owner_resume_refused_until_it_binds_or_f
     row, and admits once the invocation is no longer pending."""
     from ouroboros import budget_pause
     from ouroboros import delegate_custody as custody
-    from ouroboros import delegate_pending
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     task, _row = _parked(tmp_path, monkeypatch, task_id="a882-pending-grant")
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
-    monkeypatch.setattr(custody, "replay", lambda _root, rows=None: {})
-    pending = [_pending_row("a882-pending-grant", "inv-1"), _pending_row("other", "inv-2")]
-    monkeypatch.setattr(delegate_pending, "pending_invocations", lambda _root, rows=None: list(pending))
+    _request(tmp_path, "a882-pending-grant", "inv-1")
+    _request(tmp_path, "other", "inv-2")
 
     refused = queue.resume_budget_paused_task("a882-pending-grant")
     assert refused["error"] == "external_runs_unsettled"
@@ -250,8 +254,9 @@ def test_a_pending_invocation_keeps_the_owner_resume_refused_until_it_binds_or_f
     assert row["external_runs"]["coverage_basis"] == "pending_invocations_unbound"
     assert row["external_runs"]["runs"][0]["invocation_id"] == "inv-1"
 
-    # The invocation bound (or failed definitively): only the other task's remains.
-    pending[:] = [_pending_row("other", "inv-2")]
+    # The invocation failed definitively (or bound): only the other task's remains.
+    assert custody.emit(tmp_path, custody.START_FAILED, {
+        "invocation_id": "inv-1", "task_id": "a882-pending-grant", "definite": True, "error": "refused"})
     granted = queue.resume_budget_paused_task("a882-pending-grant")
     assert granted["ok"] is True
     assert task["_budget_pause_resume"]["external_runs"]["coverage_basis"] == "no_open_runs"
@@ -308,88 +313,46 @@ def test_a_parallel_batch_raising_usage_accounting_error_waits_for_already_start
 
 # --- Astra run-6fe5bf761449 follow-ups: one snapshot, and malformed custody lines ----
 
-def _write_event_log(root, lines):
-    from ouroboros import delegate_custody as custody
-
-    path = custody.event_log_path(root)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(b"".join(lines))
-    return path
-
-
 def test_both_custody_projections_come_from_one_snapshot(tmp_path, monkeypatch):
-    """Astra 6fe5 #1: replay and pending_invocations must fold the SAME rows, so a
-    START_REQUESTED that becomes STARTED between two reads is seen by one of them."""
-    from ouroboros import budget_pause
+    """Astra 6fe5 #1, store era: a task's open runs and its pending invocations are read in
+    ONE store transaction, so a START_REQUESTED that becomes STARTED between two reads is
+    seen by exactly one of them."""
+    from contextlib import contextmanager
+
+    from ouroboros import budget_pause, store
     from ouroboros import delegate_custody as custody
-    from ouroboros import delegate_pending
 
-    snapshot = [{"type": custody.START_REQUESTED, "invocation_id": "inv-x", "task_id": "snap-1"}]
-    seen = {}
-    from ouroboros import delegate_custody_memo
+    assert custody.emit(tmp_path, custody.START_REQUESTED,
+                        {"invocation_id": "inv-x", "task_id": "snap-1", "route": "codex", "request": {"prompt": "x"}})
+    opened = []
+    real_open = store.open_store
 
-    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
-    monkeypatch.setattr(delegate_custody_memo, "custody_rows_with_integrity",
-                        lambda _root, _needle: (tuple(snapshot), 0))
+    @contextmanager
+    def tracked(root, **kwargs):
+        with real_open(root, **kwargs) as txn:
+            opened.append(1)
+            yield txn
 
-    def _replay(_root, rows=None):
-        seen["replay"] = rows
-        return {}
-
-    def _pending(_root, rows=None):
-        seen["pending"] = rows
-        return [{"invocation_id": "inv-x", "task_id": "snap-1", "route": "codex"}]
-
-    monkeypatch.setattr(custody, "replay", _replay)
-    monkeypatch.setattr(delegate_pending, "pending_invocations", _pending)
+    monkeypatch.setattr(store, "open_store", tracked)
     observed = budget_pause.observe_task_runs(tmp_path, "snap-1")
-    assert seen["replay"] is not None and seen["replay"] == seen["pending"] == snapshot
     assert observed["coverage_basis"] == "pending_invocations_unbound"
+    assert [row["invocation_id"] for row in observed["runs"]] == ["inv-x"]
+    assert len(opened) == 1
 
 
-def test_a_malformed_custody_line_naming_the_task_is_unknown_custody(tmp_path):
-    """Astra 6fe5 #2, on a REAL event log: a START_REQUESTED joined onto a torn
-    prefix is unparseable; the memo used to skip it silently and the observer then
-    proved "no open runs". Now it is an incomplete read, never absence."""
-    import json
+def test_a_store_that_cannot_answer_is_unknown_custody_never_absence(tmp_path, monkeypatch):
+    """Astra 6fe5 #2 / 2bc1, store era: the memo's torn-line scan is gone with the memo; the
+    store either answers or raises, and a raise is an incomplete read, never "no open runs"."""
+    from ouroboros import budget_pause, store
+    from ouroboros import delegate_custody_current as current
 
-    from ouroboros import budget_pause
-    from ouroboros import delegate_custody as custody
+    def busy(_root, _task_id):
+        raise store.StoreBusy("current.sqlite is locked")
 
-    start = json.dumps({"type": custody.START_REQUESTED, "invocation_id": "inv-torn",
-                        "task_id": "torn-1"}).encode()
-    _write_event_log(tmp_path, [b'{"type": "llm_round", "x": 1', start + b"\n"])
+    monkeypatch.setattr(current, "task_snapshot", busy)
     observed = budget_pause.observe_task_runs(tmp_path, "torn-1")
-    assert observed["custody_read"] == "failed"
-    assert "custody_rows_incomplete" in observed["error"]
-    # Another task is not blocked by this task's torn line.
+    assert observed["custody_read"] == "failed" and observed["runs"] == []
+    assert "StoreBusy" in observed["error"] and observed["coverage_basis"] == "custody_unreadable"
+    monkeypatch.undo()
     other = budget_pause.observe_task_runs(tmp_path, "someone-else")
     assert other["custody_read"] == "ok" and other["coverage_basis"] == "no_open_runs"
-
-
-def test_a_huge_torn_prefix_cannot_truncate_the_task_id_away(tmp_path):
-    """Astra 2bc1 #1: a >64 KiB torn unrelated prefix with this task's
-    START_REQUESTED joined after it must still count as this task's malformed line."""
-    import json
-
-    from ouroboros import budget_pause
-    from ouroboros import delegate_custody as custody
-
-    start = json.dumps({"type": custody.START_REQUESTED, "invocation_id": "inv-big",
-                        "task_id": "big-1"}).encode()
-    prefix = b'{"type": "delegate_run_note", "blob": "' + b"x" * 200_000
-    _write_event_log(tmp_path, [prefix, start + b"\n"])
-    observed = budget_pause.observe_task_runs(tmp_path, "big-1")
-    assert observed["custody_read"] == "failed"
-
-
-def test_a_bypassed_refresh_in_the_same_read_is_unknown(tmp_path, monkeypatch):
-    """Astra 2bc1 #2: when the one refresh that produced the rows bypassed the memo
-    (lenient read), the observer cannot prove absence from those rows."""
-    from ouroboros import budget_pause
-    from ouroboros import delegate_custody_memo
-
-    _write_event_log(tmp_path, [b""])
-    monkeypatch.setattr(delegate_custody_memo, "_refresh", lambda _root: (None, ()))
-    observed = budget_pause.observe_task_runs(tmp_path, "bypass-1")
-    assert observed["custody_read"] == "failed" and "unknown" in observed["error"]

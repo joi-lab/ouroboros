@@ -91,10 +91,19 @@ def managed_update_remote_url(meta: Optional[Dict[str, Any]] = None) -> str:
     fork/mirror/air-gapped install depends on it). The hardcoded official
     repository URL is only the DEFAULT for installs that configured no source —
     it must never silently retarget a configured install on an update fetch
-    (W2-F2, owner sanction 2026-09-01 №4=A).
+    (W2-F2, owner sanction 2026-09-01 №4=A). The one exception is a former
+    official home (``repo_remotes.LEGACY_OFFICIAL_REPOS``, the archived joi-lab
+    repositories that builds before v6.8.0 store): that address was the
+    project's own, never the owner's choice, so it resolves to the official
+    repository (owner decision 2026-10-11 №3=A). The old launcher rewrites the
+    stored address on every start, so the mapping applies on every resolution.
     """
+    from ouroboros.repo_remotes import is_legacy_official_repo
+
     info = meta if meta is not None else _go()._read_managed_repo_meta()
     configured = str(info.get("managed_remote_url") or "").strip()
+    if is_legacy_official_repo(configured):
+        return _go().OFFICIAL_UPDATE_REMOTE_URL
     return configured or _go().OFFICIAL_UPDATE_REMOTE_URL
 
 
@@ -150,8 +159,46 @@ def _public_repo_url(url: str) -> str:
     return cleaned
 
 
+def local_changes_since_shared_base(head_sha: str, target_sha: str, ahead: int) -> Dict[str, str]:
+    """Whether the checkout carries content of its own against the update target.
+
+    Commit counts are history: the updater's own merge commits, or a commit and
+    its revert, put HEAD ahead without changing a byte. ``present`` means HEAD's
+    tree differs from the tree of the one ``merge-base --all`` of HEAD and the
+    target — a delta since that base, whether an owner commit, a conflict
+    resolution or an edit the target also carries; never authorship. ``absent``:
+    the trees are equal (HEAD with nothing ahead is the base itself). ``unknown``:
+    a shallow history, several bases or none, or a Git read that failed.
+    Read-only Git: no index, no lock, no network. ``ahead`` must be counted from
+    this same ``head_sha``, never from a re-read HEAD.
+    """
+    unknown = {"local_changes": "unknown", "local_changes_base": ""}
+    if not head_sha or not target_sha:
+        return {**unknown, "local_changes_reason": "unresolved_sha"}
+    if not ahead:
+        return {"local_changes": "absent", "local_changes_base": head_sha}
+    rc, shallow, _err = _go().git_capture(["git", "rev-parse", "--is-shallow-repository"])
+    if rc != 0 or shallow.strip() != "false":
+        return {**unknown, "local_changes_reason": "shallow_history" if rc == 0 else "git_error"}
+    rc, out, _err = _go().git_capture(["git", "merge-base", "--all", head_sha, target_sha])
+    bases = out.split()
+    if rc != 0 or len(bases) != 1:
+        reason = "several_bases" if rc == 0 and bases else "no_shared_base" if rc == 1 else "git_error"
+        return {**unknown, "local_changes_reason": reason}
+    rc, trees, _err = _go().git_capture(["git", "rev-parse", f"{bases[0]}^{{tree}}", f"{head_sha}^{{tree}}"])
+    trees = trees.split()
+    if rc != 0 or len(trees) != 2:
+        return {**unknown, "local_changes_reason": "git_error"}
+    return {"local_changes": "absent" if trees[0] == trees[1] else "present", "local_changes_base": bases[0]}
+
+
 def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
-    """Return current managed-remote divergence for the UI Update panel."""
+    """Return current managed-remote divergence for the UI Update panel.
+
+    ``ahead``/``behind`` count commits (history); ``local_changes`` says whether
+    HEAD carries content of its own (``local_changes_since_shared_base``), and
+    only that or uncommitted work makes an available update unsafe to apply
+    blindly. The apply path plans from Git on its own (``merge_plan``)."""
     branch_dev, _branch_stable = _go().managed_branch_defaults()
     remote_name, remote_branch, branch_ref = _go()._managed_update_target()
     from ouroboros.update_channels import get_update_channel
@@ -259,9 +306,10 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                 consumed = _go().git_capture(
                     ["git", "merge-base", "--is-ancestor", cached_sha, state["current_sha"]]
                 )[0] == 0
+            # Counted from the HEAD captured above, never a re-read one ("...X" alone would mean HEAD).
             counts_rc, cached_counts, _counts_error = _go().git_capture(
-                ["git", "rev-list", "--left-right", "--count", f"HEAD...{cached_sha}"]
-            ) if cached_sha else (1, "", "")
+                ["git", "rev-list", "--left-right", "--count", f"{state['current_sha']}...{cached_sha}"]
+            ) if cached_sha and state["current_sha"] else (1, "", "")
             try:
                 cached_ahead, cached_behind = (
                     (int(part) for part in cached_counts.split()) if counts_rc == 0 else (0, 0)
@@ -297,7 +345,6 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
             ):
                 state.update({
                     "available": True,
-                    "safe_to_apply": cached_ahead == 0 and not state["dirty"],
                     "latest_sha": cached_sha,
                     "latest_short_sha": str(cache.get("latest_short_sha") or ""),
                     "latest_message": str(cache.get("latest_message") or ""),
@@ -306,6 +353,9 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
                     "checked_at": str(cache.get("checked_at") or ""),
                     "from_cache": True,
                 })
+                # Recomputed for the captured HEAD, like the counts: never the cached verdict.
+                state.update(local_changes_since_shared_base(state["current_sha"], cached_sha, cached_ahead))
+                state["safe_to_apply"] = not state["dirty"] and state["local_changes"] == "absent"
         except Exception:
             log.debug("managed update status cache overlay failed", exc_info=True)
         return state
@@ -327,7 +377,9 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
     if rc == 0:
         state["latest_message"] = latest_msg
 
-    rc, counts, err = _go().git_capture(["git", "rev-list", "--left-right", "--count", f"HEAD...{latest_sha}"])
+    head = state["current_sha"]  # the captured HEAD: counts, local_changes and the cache describe one tree
+    rc, counts, err = _go().git_capture(["git", "rev-list", "--left-right", "--count", f"{head}...{latest_sha}"]
+                                        ) if head else (1, "", "HEAD is unresolved")
     if rc == 0:
         try:
             ahead, behind = (int(part) for part in counts.split())
@@ -336,10 +388,12 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
             state["warnings"].append(f"divergence_parse_error:{counts}")
         else:
             state["check_ok"] = True
+            state.update(local_changes_since_shared_base(state["current_sha"], latest_sha, ahead))
         state["ahead"] = ahead
         state["behind"] = behind
         state["available"] = behind > 0
-        state["safe_to_apply"] = behind > 0 and ahead == 0 and not state["dirty"]
+        state["safe_to_apply"] = (behind > 0 and not state["dirty"]
+                                  and state.get("local_changes") == "absent")
     elif err:
         state["warnings"].append(f"divergence_error:{err}")
     if not state["check_ok"]:
@@ -356,9 +410,12 @@ def compute_managed_update_status(fetch: bool = False) -> Dict[str, Any]:
             for key in (
                 "remote", "remote_branch", "target_ref", "update_channel", "available",
                 "safe_to_apply", "latest_sha", "latest_short_sha", "latest_message",
-                "behind", "ahead",
+                "behind", "ahead", "local_changes", "local_changes_base",
             )
         }
+        # The HEAD the counts and local_changes describe: a later reader that sees
+        # another HEAD knows the cached content fact is not about its tree.
+        snapshot["checked_head_sha"] = state["current_sha"]
         snapshot["checked_at"] = _go().utc_now_iso()
         state["checked_at"] = snapshot["checked_at"]
         update_state(lambda saved: saved.__setitem__("managed_update_cache", snapshot))

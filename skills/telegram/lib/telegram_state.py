@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import threading
 from typing import Any, Dict
 
 import httpx
@@ -16,6 +17,145 @@ from .telegram_i18n import Index
 
 
 _RUNTIME_STATE_TIMEOUT_SEC = 2.0
+_MAX_MESSAGE_REFS = 1000
+_MESSAGE_REFS_LOCK = threading.RLock()
+
+
+def _reference_state(api) -> dict:
+    data = _read_json_file(_state_file(api, "message_refs.json"))
+    return data if isinstance(data, dict) else {}
+
+
+def _message_refs(api) -> dict:
+    """Bounded transport index, never authority for host routing or authorship."""
+    return _reference_state(api).get("messages", {})
+
+
+def _remember_message(api, chat_id: int, message_id: int, record: dict) -> None:
+    if not message_id:
+        return
+    with _MESSAGE_REFS_LOCK:
+        state = _reference_state(api)
+        data = state.setdefault("messages", {})
+        key = f"{chat_id}:{message_id}"
+        data.pop(key, None)
+        data[key] = dict(record)
+        for stale in list(data)[:-_MAX_MESSAGE_REFS]:
+            data.pop(stale, None)
+        if record.get("direction") == "in":
+            latest = state.setdefault("latest_owner", {})
+            latest[str(chat_id)] = max(message_id, latest.get(str(chat_id), 0))
+            for stale in list(latest)[:-_MAX_MESSAGE_REFS]:
+                latest.pop(stale, None)
+        path = _state_file(api, "message_refs.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+
+def _owner_message_seen(api, chat_id: int, message_id: int) -> None:
+    """Even a local command is the latest owner message in this Telegram chat."""
+    if not message_id:
+        return
+    record = _message_ref(api, chat_id, message_id)
+    _remember_message(api, chat_id, message_id, {
+        **record, "direction": "in", "chat_id": chat_id, "kind": "message",
+    })
+
+
+def _owner_ingress_fields(api, chat_id: int, message: dict, update_id: int) -> dict:
+    message_id = int(message.get("message_id") or 0)
+    client_id = f"tg:{chat_id}:{message_id or update_id}"
+    if message_id:
+        _remember_message(api, chat_id, message_id, {
+            **_message_ref(api, chat_id, message_id), "direction": "in", "chat_id": chat_id,
+            "kind": "message", "client_message_id": client_id,
+        })
+    reply = message.get("reply_to_message")
+    address = _reply_reference(api, chat_id, int(reply.get("message_id") or 0)) if isinstance(reply, dict) else ""
+    return {"client_message_id": client_id, **({"reply_to": address} if address else {})}
+
+
+def _native_reply_id(api, chat_id: int, event: dict) -> int:
+    """Join host-derived owner references to exact, same-chat Telegram ingress.
+
+    A reply may arrive while /chat/inject is still awaiting its HTTP receipt.
+    Bind pending ids here from the canonical acceptance index, never by text or
+    chat order. The index already serves the shared ingress and reads only deltas.
+    """
+    reply = event.get("reply_to")
+    if not isinstance(reply, dict) or reply.get("role") != "user" or reply.get("unresolved"):
+        return 0
+    address = str(reply.get("address") or "")
+    if not address:
+        return 0
+    with _MESSAGE_REFS_LOCK:
+        owners = [(int(key.split(":", 1)[1]), record) for key, record in _message_refs(api).items()
+                  if key.startswith(f"{chat_id}:") and record.get("direction") == "in"]
+        latest = _reference_state(api).get("latest_owner", {}).get(str(chat_id), 0)
+    for mid, record in owners:
+        if not record.get("row_address") and record.get("client_message_id"):
+            from supervisor.message_bus import accepted_chat_message
+            from ouroboros.chat_chain import format_address, row_address
+
+            try:
+                row = accepted_chat_message(_data_dir(api), record["chat_id"], record["client_message_id"])
+            except Exception:
+                api.log("warning", "Telegram reply source could not be read; sending without a native reply.")
+                continue
+            if row is not None:
+                record = {**record, "row_address": format_address(row_address(row))}
+                _remember_message(api, chat_id, mid, record)
+        if record.get("row_address") == address and record.get("chat_id") == reply.get("chat_id"):
+            return mid if latest and mid != latest else 0
+    return 0
+
+
+def _mirror_options(api, event: dict, chat_id: int) -> dict:
+    """A client mirrors one host row; all of its physical parts share this fact."""
+    task_id = str(event.get("subagent_task_id") or event.get("task_id") or "")
+    kind = str(event.get("kind") or event.get("type") or event.get("system_type") or "message")
+    if event.get("subagent_event") or kind == "task_summary":
+        kind = "work_card"
+    elif event.get("quiz_id"):
+        kind = "question"
+    reply = event.get("reply_to")
+    native_reply_id = _native_reply_id(api, chat_id, event)
+    record = {"row_address": str(event.get("row_address") or ""), "chat_id": event.get("chat_id"),
+              "task_id": task_id, "kind": kind,
+              "reply_to": str(reply.get("address") or "") if isinstance(reply, dict) else "",
+              "native_reply_id": native_reply_id}
+    return {"on_message": lambda chat, mid: _remember_message(api, chat, mid, record),
+            "reply_to_message_id": native_reply_id}
+
+
+def _same_silent_episode(api, chat_id: int, message_id: int, event: dict) -> bool:
+    """Silent mode edits thoughts within an episode, never a Continue predecessor.
+
+    Telegram cannot change a message's native reply anchor by editing its text.
+    A changed host reply origin therefore also starts a fresh bubble.
+    """
+    old = _message_ref(api, chat_id, message_id)
+    reply = event.get("reply_to")
+    address = str(reply.get("address") or "") if isinstance(reply, dict) else ""
+    return (str(old.get("task_id") or "") == str(event.get("task_id") or "")
+            and str(old.get("reply_to") or "") == address
+            and int(old.get("native_reply_id") or 0) == _native_reply_id(api, chat_id, event))
+
+
+def _message_ref(api, chat_id: int, message_id: int) -> dict:
+    with _MESSAGE_REFS_LOCK:
+        value = _message_refs(api).get(f"{chat_id}:{message_id}")
+        return dict(value) if isinstance(value, dict) else {}
+
+
+def _reply_reference(api, chat_id: int, message_id: int) -> str:
+    record = _message_ref(api, chat_id, message_id)
+    task_id = str(record.get("task_id") or "")
+    if record.get("kind") == "work_card" and task_id:
+        return f"task:{task_id}"
+    return str(record.get("row_address") or (f"task:{task_id}" if task_id else ""))
 
 
 def _data_dir(api) -> pathlib.Path:
@@ -215,14 +355,13 @@ def _child_row_held_for_root(api, event: Dict[str, Any]) -> bool:
     root = str(event.get("root_task_id") or event.get("parent_task_id") or "").strip()
     if not root:
         return False
-    from ouroboros.task_results import task_result_path
+    from ouroboros.task_results import load_task_result
     from ouroboros.task_status import FINAL_STATUSES
 
     try:
-        path = task_result_path(_data_dir(api), root, create=False)
-    except ValueError:
+        stored = load_task_result(_data_dir(api), root)
+    except Exception:
         return False
-    stored = _read_json_file(path)
     status = str(stored.get("status") or "").strip().lower() if isinstance(stored, dict) else ""
     return status not in FINAL_STATUSES
 

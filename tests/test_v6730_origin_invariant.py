@@ -154,7 +154,7 @@ def _tool_ctx(tmp_path, events, metadata):
 
 
 def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_path, monkeypatch):
-    from ouroboros.tools.control import _promote_chat_to_task
+    from ouroboros.tools.control import _start_task
 
     monkeypatch.setattr(
         "ouroboros.tools.control_events._wait_for_promotion_admission",
@@ -166,11 +166,12 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
         "origin_message_ref": _ref(),
         "origin_message_text": OWNER_TEXT,
     })
-    out = _promote_chat_to_task(
+    out = _start_task(
         ctx,
         objective="Create a standalone 3D browser game about a robot (LLM-rewritten)",
+        title="Robot browser game",
         project_name="Robot City Adventure",
-        predecessor_task_id="",
+
     )
     assert out.startswith("OK: task")
     evt = events[0]
@@ -179,7 +180,7 @@ def test_promote_tool_passes_origin_by_value_despite_rewritten_objective(tmp_pat
 
 
 def test_ensure_scope_tool_attaches_task_origin(tmp_path):
-    from ouroboros.tools.control_delegation import _ensure_project_scope
+    from ouroboros.tools.control_delegation import _move_to_project
 
     events = []
     ctx = _tool_ctx(tmp_path, events, {
@@ -189,8 +190,8 @@ def test_ensure_scope_tool_attaches_task_origin(tmp_path):
     ctx.project_id = ""
     ctx.task_id = "t-run"
     ctx.task_contract = {}
-    out = _ensure_project_scope(ctx, project_name="Robot City")
-    assert out.startswith("⚠️ SCOPE_UNCONFIRMED")  # deferred transport: no bind landed yet
+    out = _move_to_project(ctx, project_name="Robot City")
+    assert out.startswith("SCOPE_UNCONFIRMED")  # deferred transport: no bind landed yet
     evt = [e for e in events if e.get("type") == "ensure_project_scope"][0]
     assert evt["source_ref"] == _ref()
     assert evt["source_text"] == OWNER_TEXT
@@ -647,3 +648,89 @@ def test_lens_zero_human_quota_synthesizes_nothing(tmp_path):
     view = _history(tmp_path, proj_chat, n_human=0)
     assert [m for m in view if m.get("role") == "user"] == []
     assert [m for m in view if m.get("origin_projected")] == []
+
+
+# ---------------------------------------------------------------- attachment-bearing origins
+
+def _attachment_origin(tmp_path, *, cmid="owner-att-1", text="Посмотри\n\n[Attached file: one.png]",
+                       source="web", placeholder=False, name="one.png"):
+    """A canonical Main row with recorded attachment refs, as the ingress writes it."""
+    from ouroboros import chat_uploads
+    from supervisor.message_bus import log_chat
+    from tests.test_chat_attachments import PNG
+
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "progress.jsonl").touch()
+    _path, stored = chat_uploads.store_upload(PNG, name, data_dir=tmp_path)
+    row = log_chat("in", 1, 1, text, source=source, client_message_id=cmid, drive_root=tmp_path,
+                   require_write=True, message_meta={"attachments": [stored], "text_placeholder": placeholder})
+    return row, _ref(cmid=cmid, ts=row["ts"], text=text)
+
+
+def _later_project_rows(tmp_path, chat_id, count):
+    from supervisor.message_bus import log_chat
+
+    for index in range(count):
+        log_chat("in", chat_id, 1, f"later project message {index}", source="web",
+                 client_message_id=f"later-{index}", drive_root=tmp_path)
+
+
+def test_an_attachment_origin_keeps_its_recorded_media_when_quota_prunes_its_row(tmp_path):
+    """The binding records the refs its canonical row recorded (never guessed from the text), so the
+    quota-pruned copy renders as the row does; once the row is emitted again it adopts the copy:
+    same id, origin, text, views and provenance."""
+    from ouroboros.chat_uploads import attachment_views, stored_refs
+
+    canonical, ref = _attachment_origin(tmp_path)
+    project = create_project(tmp_path, "gallery", name="Gallery")
+    binding = bind_task_to_project(tmp_path, "root-task", "gallery", origin={"ref": ref, "text": canonical["text"]})
+    assert binding["source_attachments"] == stored_refs(canonical["attachments"])
+    assert binding["source_channel"] == "web" and "source_text_placeholder" not in binding
+    chat = int(project["chat_id"])
+    _later_project_rows(tmp_path, chat, 3)
+
+    whole = [m for m in _history(tmp_path, chat, n_human=50) if m.get("client_message_id") == "owner-att-1"]
+    pruned = [m for m in _history(tmp_path, chat, n_human=1) if m.get("client_message_id") == "owner-att-1"]
+    assert len(whole) == 1 and not whole[0].get("origin_projected"), "the canonical row, emitted once"
+    assert len(pruned) == 1 and pruned[0]["origin_projected"] is True, "quota pruned it: the binding's copy"
+    copy, row = pruned[0], whole[0]
+    assert copy["attachments"] == row["attachments"] == attachment_views(canonical["attachments"], tmp_path)
+    assert copy["attachments"][0]["available"] is True and copy["attachments"][0]["kind"] == "image"
+    for key in ("text", "source", "client_message_id", "origin_id"):
+        assert copy[key] == row[key], key
+    assert "text_placeholder" not in copy and "text_placeholder" not in row
+
+
+def test_an_origin_copy_keeps_the_host_placeholder_mark_and_a_skill_source(tmp_path):
+    canonical, ref = _attachment_origin(tmp_path, cmid="tg:origin", text="(image attached)",
+                                        source="skill:telegram", placeholder=True)
+    project = create_project(tmp_path, "scan", name="Scan")
+    binding = bind_task_to_project(tmp_path, "root-task", "scan", origin={"ref": ref, "text": canonical["text"]})
+    assert (binding["source_channel"], binding["source_text_placeholder"]) == ("skill:telegram", True)
+    chat = int(project["chat_id"])
+    _later_project_rows(tmp_path, chat, 2)
+    (copy,) = [m for m in _history(tmp_path, chat, n_human=1) if m.get("origin_projected")]
+    assert copy["text_placeholder"] is True and copy["source"] == "skill:telegram"
+    assert [view["name"] for view in copy["attachments"]] == ["one.png"]
+
+
+def test_an_origin_without_its_canonical_row_records_no_guessed_media(tmp_path):
+    """No row, or another message under that id: nothing is recorded, however the text names files."""
+    from ouroboros import chat_uploads
+    from tests.test_chat_attachments import PNG
+
+    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "logs" / "progress.jsonl").touch()
+    (tmp_path / "logs" / "chat.jsonl").touch()
+    chat_uploads.store_upload(PNG, "one.png", data_dir=tmp_path)  # a file of that name exists
+    text = "Посмотри\n\n[Attached file: one.png]"
+    project = create_project(tmp_path, "nothing", name="Nothing")
+    binding = bind_task_to_project(tmp_path, "task-a", "nothing", origin={"ref": _ref(cmid="gone", text=text), "text": text})
+    assert not {"source_attachments", "source_channel", "source_text_placeholder"} & set(binding)
+
+    other, _ref_other = _attachment_origin(tmp_path, cmid="reused", text="other words")
+    binding = bind_task_to_project(tmp_path, "task-b", "nothing",
+                                   origin={"ref": _ref(cmid="reused", ts=other["ts"], text=text), "text": text})
+    assert "source_attachments" not in binding, "a row whose words differ from the ref is not this origin"
+    copies = [m for m in _history(tmp_path, int(project["chat_id"])) if m.get("origin_projected")]
+    assert copies and all("attachments" not in m and m["source"] == "" for m in copies)

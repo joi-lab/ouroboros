@@ -5,7 +5,8 @@ designed HTML route. Install/review/enable it through the ordinary extension
 lifecycle. If you change its skill name, change the route prefix in widget.js.
 
 The module asks its own `author-kit` route for the installed `web/ui.css` and
-self-contained `web/modules/ui_primitives.js`. `OuroborosWidget.fetch` uses the
+self-contained `web/modules/ui_primitives.js`: the core's builtin files, whatever
+main interface `OUROBOROS_UI_DIR` selects. `OuroborosWidget.fetch` uses the
 existing authenticated parent bridge. The application inserts the CSS as text
 and imports the primitives through a frame-owned Blob URL, revoked after import.
 The module's existing sandbox and CSP remain unchanged.
@@ -45,7 +46,11 @@ Keep the returned unsubscribe in the module disposer. The bridge delivers
 have no bridge. Fetching the kit again alone does not synchronize appearance.
 
 Authors may set their own root's `data-theme`, track their document's media
-query, or keep a fixed palette. Native `Canvas`/`CanvasText` colours follow the
-document's supported `color-scheme`, not necessarily the host's pinned choice or
-the OS. Declare that scheme deliberately if following the OS. The example keeps
-its own native-colour surface readable before kit loading and on kit failure.
+query, or keep a fixed palette. `data-theme` selects only that palette: the
+product's capsule button and chip recipes apply where the document root itself is
+`.ouro-ui` (the app and its setup page), so an inner `.ouro-ui` area like this
+example's keeps the base controls that later author CSS such as `.ouro-ui .btn`
+overrides. Native `Canvas`/`CanvasText` colours follow the document's supported
+`color-scheme`, not necessarily the host's pinned choice or the OS. Declare that
+scheme deliberately if following the OS. The example keeps its own native-colour
+surface readable before kit loading and on kit failure.

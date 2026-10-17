@@ -24,6 +24,7 @@ from ouroboros.task_results import (
     write_task_result,
 )
 from ouroboros.utils import utc_now_iso
+from tests._shared import write_queue_document
 
 from tests._cancel_intents_shared import qenv as _qenv
 
@@ -39,23 +40,21 @@ def _restart_snapshot(qenv, monkeypatch, *, running: list, pending: list = ()) -
     """Write a queue snapshot the way an unplanned stop left it, and aim restore at it."""
     path = qenv.drive / "state" / "queue_snapshot.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
+    write_queue_document(path, {
         "ts": utc_now_iso(),
         "pending": [{"task": task} for task in pending],
         "running": running,
         "acceptance_fences": [],
         "budget_root_fences": [],
-    }), encoding="utf-8")
+    })
     monkeypatch.setattr(qenv.q, "QUEUE_SNAPSHOT_PATH", path, raising=False)
 
 
 def _direct_roots_fragment(drive, rows: list, *, incomplete: bool = False) -> None:
     path = drive / "state" / "direct_roots.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"ts": utc_now_iso(), "roots": rows, "incomplete": incomplete}),
-        encoding="utf-8",
-    )
+    write_queue_document(path, {"ts": utc_now_iso(), "roots": rows, "incomplete": incomplete})
+
 
 
 def _boot_pool(qenv, monkeypatch) -> list:

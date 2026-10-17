@@ -564,9 +564,14 @@ def _telegram_html_to_plain(value: str) -> str:
 
 
 class TelegramClient:
-    def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None):
+    def __init__(self, token: str, *, trust_env: bool = False, proxy: Optional[str] = None,
+                 on_message=None, reply_to_message_id: int = 0):
         self.token = str(token or "").strip()
         self.trust_env = bool(trust_env)
+        # One observer per mirrored host row, called for EVERY confirmed part,
+        # including media and edits. A later chunk failure cannot erase earlier ids.
+        self.on_message = on_message
+        self.reply_to_message_id = int(reply_to_message_id)
         if not self.token:
             raise ValueError("TELEGRAM_BOT_TOKEN is missing")
         # An explicit proxy replaces ambient proxies for these calls only. The target stays
@@ -579,6 +584,9 @@ class TelegramClient:
     async def call(self, method: str, *, data: Optional[dict] = None, files: Optional[dict] = None, timeout: int = 30) -> Dict[str, Any]:
         method_text = str(method or "")
         safe_method = method_text if re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,63}", method_text) else "request"
+        if self.reply_to_message_id and method_text in {"sendMessage", "sendPhoto", "sendVideo", "sendDocument", "sendAudio"}:
+            data = {**(data or {}), "reply_to_message_id": self.reply_to_message_id,
+                    "allow_sending_without_reply": True}
         try:
             # trust_env trades ambient-proxy/SSL_CERT isolation for a proxy-routed install's
             # only egress; decided once by the caller via net_transport.env_proxies_configured.
@@ -608,6 +616,7 @@ class TelegramClient:
             api_status = response.status_code
         description = str(payload.get("description") or "").strip()
         if safe_method == "editMessageText" and description.casefold().startswith(_NOT_MODIFIED_PREFIX):
+            self._observe_message(data, data)
             # Preserve the one benign signal callers rely on without forwarding
             # Telegram's free-form suffix (which may echo the token-bearing URL).
             raise TelegramRequestRejected(
@@ -626,7 +635,17 @@ class TelegramClient:
                 status_code=api_status,
                 plain_retry_safe=(safe_method == "sendMessage" and api_status == 400),
             )
+        self._observe_message(data, payload.get("result"))
         return payload
+
+    def _observe_message(self, data, result) -> None:
+        """Only a returned Message (or an unchanged edit) proves its Telegram id."""
+        if self.on_message is None or not isinstance(result, dict):
+            return
+        chat_id = (data or {}).get("chat_id")
+        message_id = result.get("message_id")
+        if chat_id is not None and message_id:
+            self.on_message(int(chat_id), int(message_id))
 
     async def _download_bytes(self, file_path: str) -> bytes:
         try:
@@ -666,6 +685,7 @@ class TelegramClient:
         Protected blocks stay whole unless one block exceeds Telegram's limit;
         oversized blocks are split with active HTML tags re-balanced.
         Returns the LAST chunk's message_id (0 on parse failure / empty input).
+        The optional on_message observer receives every confirmed chunk id.
         """
         source = str(text or "")
         chunks = (
@@ -890,6 +910,7 @@ _MENU_TEXTS_EN = {
     "metrics_budget_status": "• **Budget Status:**\n  Spent: `${spent_usd}`\n  Limit: `${total_budget}`\n  Remaining: `${rem}`\n\n• **System Environment:**\n  Branch: `{branch}`\n  BG Thoughts: `{bg_status}`",
     "file_too_large_notice": "{filename} is saved in Ouroboros. This file exceeds the Telegram upload limit and cannot be mirrored here.",
     "file_open_app_hint": "Open the app to download it.",
+    "attachments_not_attached": "Not attached to the task: {names}",
     "btn_open_app": "Open Ouroboros",
     "budget_unbounded": "unbounded",
     "bg_active_label": "ACTIVE",

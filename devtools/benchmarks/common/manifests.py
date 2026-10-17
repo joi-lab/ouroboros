@@ -68,25 +68,29 @@ ACTIVE_MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL_VISION",
     "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
     "OUROBOROS_WEBSEARCH_MODEL",
-    "OUROBOROS_REVIEWER_SLOTS",
-    "OUROBOROS_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODEL",
+    # The review pool is the marked rows of the roster (OUROBOROS_SUBAGENTS); the
+    # roster is projected separately (``available_subagents``), not as a slot.
     "OUROBOROS_EFFORT_TASK",
-    "OUROBOROS_EFFORT_REVIEW",
-    "OUROBOROS_EFFORT_SCOPE_REVIEW",
     *MODEL_ROUTE_OPTION_KEYS,
 )
 
-# Historical READ vocabulary. Old durable manifests can still carry Heavy and retain
-# their original meaning; new writers use ACTIVE_MODEL_SLOT_KEYS above. Keep the public
-# name for compatibility with existing artifact readers and cleanup code.
+# Historical READ vocabulary. Old durable manifests can still carry Heavy, the
+# lane-era reviewer panel and the retired comma keys and retain their original
+# meaning; new writers use ACTIVE_MODEL_SLOT_KEYS above. Keep the public name for
+# compatibility with existing artifact readers and cleanup code.
 MODEL_SLOT_KEYS = (
     "OUROBOROS_MODEL",
     "OUROBOROS_MODEL_HEAVY",
     "CLAUDE_CODE_MODEL",  # retired transport slot; old manifests still carry it
+    "OUROBOROS_REVIEWER_SLOTS",
+    "OUROBOROS_REVIEW_MODELS",
+    "OUROBOROS_SCOPE_REVIEW_MODELS",
+    "OUROBOROS_SCOPE_REVIEW_MODEL",
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
+    "OUROBOROS_EFFORT_REVIEW",
+    "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    "OUROBOROS_EFFORT_DEEP_SELF_REVIEW",
     *ACTIVE_MODEL_SLOT_KEYS[1:],
 )
 
@@ -98,19 +102,19 @@ def read_json(path: pathlib.Path) -> Any:
 def write_json(path: pathlib.Path, payload: Any) -> None:
     """Atomically overwrite ``path`` with pretty JSON plus a trailing newline.
 
-    ``ouroboros.utils.atomic_write_json`` is imported LAZILY on purpose: this module is
+    ``ouroboros.utils.write_text_atomic`` is imported LAZILY on purpose: this module is
     stdlib-only at import time and is imported by every benchmark launcher, including the
     container-side Terminal-Bench agent, so a module-level ``ouroboros`` import would make
     the runtime package a hard import dependency of all benchmark families.
-    ``trailing_newline=True`` (the helper's default is False) preserves the byte-for-byte
-    form of every manifest/sidecar written before this change. Note that an existing
+    Explicit indentation preserves the byte-for-byte form of each manifest/sidecar
+    independently of the runtime's compact machine JSON. Note that an existing
     SYMLINK at ``path`` is replaced by a regular file rather than written through — that is
     the atomic helper's documented confinement behaviour; benchmark sidecars are never
     file symlinks (the CephFS run archive uses directory-level links, which are unaffected).
     """
-    from ouroboros.utils import atomic_write_json
+    from ouroboros.utils import write_text_atomic
 
-    atomic_write_json(pathlib.Path(path), payload, trailing_newline=True)
+    write_text_atomic(pathlib.Path(path), json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def read_jsonl(path: pathlib.Path) -> list[dict[str, Any]]:

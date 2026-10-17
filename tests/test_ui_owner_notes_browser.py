@@ -4,7 +4,9 @@ A running supervisor shows a due note in Main as one System row whose host signa
 stands on its own line above the mind's words; reopening replays it from history
 without a banner; Activity names a waiting note by its words; and with notifications
 on, a note that fires while the page is open rings once in the existing messages
-category, titled by its author. No model is called for any of it.
+category, titled by its author. Two reconnects retain that live row and its text
+selection while history gives it a durable identity, without ringing again.
+No model is called for any of it.
 """
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', state="attached", timeout=30_000)
             bubble = page.locator(f"#chat-messages {BUBBLE}").filter(has_text=DUE)
             bubble.wait_for(state="visible", timeout=30_000)
-            assert bubble.locator(".sender").inner_text().strip() == "📋 System"
+            assert bubble.locator(".sender").inner_text().strip() == "System"
             message = bubble.locator(".message")
             signature, words = message.inner_text().split("\n", 1)
             assert signature.startswith("Reminder · Ouroboros · written Dec 31 ") and " · for Jan 1 " in signature
@@ -105,6 +107,61 @@ def test_notes_reach_main_activity_and_the_live_banner(direct_server_with_data, 
             assert toast.inner_text().strip().endswith(LIVE)
             assert page.locator("#toast-stack .toast").filter(has_text="Reminder").count() == 1
             page.screenshot(path=str(evidence / "main-live-banner.png"))
+
+            live = page.locator(f"#chat-messages {BUBBLE}").filter(has_text=LIVE)
+            live.evaluate("""(node, words) => {
+                window.__liveReminder = node;
+                const body = node.querySelector('.message').firstChild;
+                const start = body.textContent.lastIndexOf(words);
+                const range = document.createRange();
+                range.setStart(body, start); range.setEnd(body, start + words.length);
+                const selection = getSelection();
+                selection.removeAllRanges(); selection.addRange(range);
+                window.__reminderSelection = { anchorNode: selection.anchorNode,
+                    anchorOffset: selection.anchorOffset, focusNode: selection.focusNode,
+                    focusOffset: selection.focusOffset };
+                window.__extraReminderBanners = 0;
+                window.__reminderBannerObserver = new MutationObserver(records => {
+                    for (const record of records) for (const added of record.addedNodes) {
+                        if (added.nodeType === 1 && added.matches('.toast')
+                            && added.textContent.includes('Reminder from Ouroboros')) {
+                            window.__extraReminderBanners += 1;
+                        }
+                    }
+                });
+                window.__reminderBannerObserver.observe(document.querySelector('#toast-stack'), { childList: true });
+            }""", LIVE)
+            assert page.evaluate("getSelection().toString()") == LIVE
+            for attempt in (1, 2):
+                reconnected = page.locator('#chat-messages .chat-bubble[data-system-type="reconnect"]')
+                before = reconnected.count()
+                with page.expect_response(lambda response: "/api/chat/history" in response.url
+                                          and response.request.method == "GET", timeout=30_000) as history:
+                    page.evaluate("window.__ouroWs.ws.close()")
+                assert history.value.status == 200
+                rows = history.value.json()["messages"]
+                row = next(row for row in rows if row.get("system_type") == "reminder"
+                           and row.get("text", "").endswith(LIVE))
+                # The reconnect row is appended only after syncHistory has painted.
+                # Wait for that independent marker, so a duplicate still gets a RED capture.
+                page.wait_for_function("""before => document.querySelectorAll(
+                    '#chat-messages .chat-bubble[data-system-type="reconnect"]').length > before""",
+                    arg=before, timeout=30_000)
+                page.evaluate(SETTLED)
+                page.screenshot(path=str(evidence / f"main-live-reconnect-{attempt}.png"))
+                assert live.count() == 1, "reconnect history must adopt the live reminder"
+                assert live.evaluate("node => node === window.__liveReminder")
+                assert live.get_attribute("data-history-id") == row["history_id"]
+                assert live.get_attribute("data-history-source") == row["history_position"]["source"]
+                assert live.get_attribute("data-history-offset") == str(row["history_position"]["offset"])
+                assert page.evaluate("""() => {
+                    const current = getSelection(), saved = window.__reminderSelection;
+                    return ['anchorNode', 'anchorOffset', 'focusNode', 'focusOffset']
+                        .every(key => current[key] === saved[key]);
+                }""")
+                assert page.evaluate("getSelection().toString()") == LIVE
+                assert page.evaluate("window.__extraReminderBanners") == 0, "history replay must not ring again"
+            page.evaluate("window.__reminderBannerObserver.disconnect()")
 
             page.click('[data-nav-page="dashboard"]')
             page.click('[data-dashboard-tab="activity"]')

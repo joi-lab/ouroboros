@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from tests._store_shared import seed_result
+
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
 from tests.test_ui_smoke_playwright import _open_review_checkpoint
@@ -120,8 +122,6 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
         "task_id": "review-no-summary",
         "content": "Terminal review must survive without a task summary.",
     }) + "\n", encoding="utf-8")
-    task_results = data_dir / "task_results"
-    task_results.mkdir(parents=True, exist_ok=True)
     plan_state = {
         "schema_version": 2,
         "current_attempt": {"fingerprint": "f" * 64, "status": "open"},
@@ -155,7 +155,8 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
         }],
         "waves_omitted": 0,
     }
-    (task_results / "review-no-summary.json").write_text(json.dumps({
+    # The running server reads results from its store (#1733), never a file written after boot.
+    seed_result(data_dir, "review-no-summary", {
         "_schema_version": 1,
         "task_id": "review-no-summary",
         "status": "completed",
@@ -163,7 +164,7 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
         "outcome_axes": axes,
         "review_projection": projection,
         "plan_review_state": plan_state,
-    }) + "\n", encoding="utf-8")
+    })
 
     try:
         with sync_playwright() as pw:
@@ -192,7 +193,12 @@ def test_ui_smoke_review_truth_is_visible_in_chat_and_logs(direct_server_with_da
                 assert no_summary.get_attribute("data-expanded") == "0"
                 # This card carries BOTH groups; the helper opens the first
                 # (Plan review), whose finding text must be readable.
-                _open_review_checkpoint(no_summary)
+                # The Plan review group is hydrated from the task detail once the card opens; the helper
+                # opens the FIRST group, so open the card here and let the Plan group arrive (first)
+                # before the helper walks the section.
+                no_summary.locator(":scope > [data-live-summary-button]").click()
+                no_summary.locator('[data-review-group^="plan:"]').wait_for(state="attached", timeout=30_000)
+                _open_review_checkpoint(no_summary, open_card=False)
                 assert no_summary.locator('[data-live-phase]').first.get_attribute("data-phase") == "warn"
                 plan_text = no_summary.inner_text()
                 assert "The migration step drops the audit ledger" in plan_text
@@ -252,11 +258,15 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
 
     from ouroboros.outcomes import derive_loop_outcome
     from ouroboros.review_substrate import compact_review_projection
-    from tests.test_acceptance_author_stop import _run_stop_loop
+    from tests.test_acceptance_author_stop import _finish_tool_call, _run_stop_loop
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
     (tmp_path / "producer").mkdir()
-    run = _run_stop_loop(tmp_path / "producer", monkeypatch, ["The export endpoint ships."] * 3, stop_services=False)
+    # Produced evidence makes the Required panel run on the first answer; the author's next turn is the
+    # action-only `finish_task` (no stance), the shape the loop's finish front door now takes.
+    run = _run_stop_loop(tmp_path / "producer", monkeypatch,
+                         ["The export endpoint ships.", *[_finish_tool_call("The export endpoint ships.")] * 3],
+                         stop_services=False, produced=True)
     axes = derive_loop_outcome(run.result, run.usage, run.trace)["outcome_axes"]
     decision = axes["review"]["acceptance_decision"]
     assert decision["reason"] == "author_finish" and decision["author_disposition"]["disposition"] == ""
@@ -268,10 +278,9 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
         "ts": "2026-09-26T10:00:00+00:00", "direction": "system", "type": "task_summary", "task_id": task_id,
         "chat_id": 1, "status": "completed", "text": "", "tool_calls": 0, "rounds": 1,
         "outcome_axes": axes, "review_projection": projection}) + "\n", encoding="utf-8")
-    (data_dir / "task_results").mkdir(parents=True, exist_ok=True)
-    (data_dir / "task_results" / f"{task_id}.json").write_text(json.dumps({
+    seed_result(data_dir, task_id, {
         "_schema_version": 1, "task_id": task_id, "status": "completed", "reason_code": "final_message",
-        "result": run.result, "outcome_axes": axes, "review_projection": projection}) + "\n", encoding="utf-8")
+        "result": run.result, "outcome_axes": axes, "review_projection": projection})
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
@@ -286,7 +295,8 @@ def test_ui_smoke_action_only_author_finish_keeps_the_reviewer_fail(direct_serve
                 author_text = author.inner_text()
                 assert "Task author decision" in author_text and "Author finish" in author_text
                 assert "reviewer signal=FAIL" in author_text
-                assert "Main submitted this complete response for delivery" in author_text
+                # An action-only finish carries no rationale of its own: the record's default is the stated act.
+                assert "Explicit completion selection." in author_text and "source=finish_task" in author_text
                 assert not re.search(r"accepted|partial|solved|Author finish:", author_text, re.I), author_text
                 group = card.locator(f'[data-review-group="task_acceptance:{task_id}"]')
                 assert "FAIL" in group.locator(".chat-review-group-meta").inner_text()

@@ -20,8 +20,11 @@ the structural fact, no browser needed.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
+
+import pytest
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 WEB = REPO_ROOT / "web"
@@ -34,27 +37,45 @@ def _read(rel: str) -> str:
     return (REPO_ROOT / rel).read_text(encoding="utf-8")
 
 
+def _assert_persistent_webview_starts(source: str, rel: str) -> int:
+    calls = [node for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+             and isinstance(node.func.value, ast.Name)
+             and node.func.value.id == "webview" and node.func.attr == "start"]
+    for call in calls:
+        assert any(keyword.arg == "private_mode" and isinstance(keyword.value, ast.Constant)
+                   and keyword.value.value is False for keyword in call.keywords), (
+            f"{rel}:{call.lineno}: webview.start() must explicitly pass private_mode=False; "
+            "a private WebView discards the appearance choice when the window closes"
+        )
+    return len(calls)
+
+
 def test_every_first_party_window_uses_a_persistent_profile():
-    calls = 0
-    for rel in WEBVIEW_HOSTS:
-        source = _read(rel)
-        for match in re.finditer(r"^\s*webview\.start\((.*)\)\s*$", source, re.M):
-            calls += 1
-            assert "private_mode=False" in match.group(1), (
-                f"{rel}: {match.group(0).strip()} starts a private WebView, so the "
-                "appearance choice is discarded when the window closes"
-            )
+    calls = sum(_assert_persistent_webview_starts(_read(rel), rel) for rel in WEBVIEW_HOSTS)
     # The count is asserted so that a NEW window added without the flag fails
     # here rather than silently using the library default.
     assert calls == 5, f"expected 5 first-party webview.start() calls, found {calls}"
 
 
-def test_the_owner_approved_cost_is_written_down_where_it_is_paid():
-    # A flag that makes local site data persist on disk is an owner decision,
-    # not an implementation detail; the rationale must survive the next reader.
-    main = _read("launcher.py")
-    assert "cookies and website data" in main
-    assert "ouroboros.theme" in main
+def test_persistent_profile_guard_reads_multiline_calls_and_ignores_non_calls():
+    source = '''
+# webview.start()
+example = "webview.start(private_mode=True)"
+other.start(private_mode=True)
+webview.start(
+    debug=False,
+    private_mode=False,
+    menu=build_menu(),
+)
+'''
+    assert _assert_persistent_webview_starts(source, "fixture.py") == 1
+
+
+@pytest.mark.parametrize("argument", ["", "private_mode=True", "private_mode=0"])
+def test_persistent_profile_guard_rejects_missing_or_non_false_argument(argument):
+    with pytest.raises(AssertionError, match="must explicitly pass private_mode=False"):
+        _assert_persistent_webview_starts(f"webview.start(\n    {argument}\n)", "fixture.py")
 
 
 def test_the_select_arrow_is_a_theme_token_not_a_baked_colour():
@@ -125,7 +146,10 @@ def test_status_text_uses_foreground_roles_not_raw_hues():
 def test_chat_palette_redraw_is_local_viewport_work():
     chat = _read('web/modules/chat.js')
     mount = chat.split('function enhanceMountedMarkdown(root)', 1)[1].split('const {', 1)[0]
-    assert 'onThemeDomWrite: withStableViewport' in mount
+    assert 'onThemeDomWrite: foldedWrite(withStableViewport)' in mount
+    assert 'const foldedWrite = writer => (mutate, options) => writer(() => {' in mount
+    assert mount.index('const changed = mutate();') < mount.index('refreshProjectAnswerFold(') < mount.index('return changed;')
+    assert 'refreshProjectAnswerFold(root.closest?.(\'.project-answer\'))' in mount
 
 
 def test_surface_sheets_carry_no_near_white_ink():
@@ -144,3 +168,16 @@ def test_surface_sheets_carry_no_near_white_ink():
         if near_white.search(line)
     ]
     assert not leftovers, "near-white literals outside the token sheet:\n" + "\n".join(leftovers)
+
+
+def test_an_old_desktop_app_is_named_where_its_choices_are_lost():
+    """In-app updates replace the core, never the frozen launcher that decides WebView storage, so
+    the Appearance panel carries the line ``desktop_shell.js`` fills for an app that erases it."""
+    panel = re.search(
+        r'data-settings-panel="appearance"(.*?)</section>', _read("web/modules/settings_ui.js"), re.S).group(1)
+    assert "data-shell-storage-status" in panel
+    settings = _read("web/modules/settings.js")
+    assert "mountDesktopShell(page" in settings and "disposeShell()" in settings
+    shell = _read("web/modules/desktop_shell.js")
+    assert "PERSISTENT_STORAGE_SINCE = Object.freeze([7, 2, 0])" in shell, (
+        "7.2.0 is the first release whose launcher passes private_mode=False (git tag --contains e30957143)")

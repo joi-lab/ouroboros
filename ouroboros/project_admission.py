@@ -2,6 +2,8 @@
 
 The registry remains the only durable authority. The registry facade re-exports
 these operations for preparation consumers; queue admission holds Q through append.
+Routing comparison covers identity and routing fields only, so activity or lock
+occupancy never invalidates admission; each pass parses registry and bindings once.
 """
 from __future__ import annotations
 
@@ -32,8 +34,11 @@ def hold_unreadable_result(task: dict) -> bool:
 
     Restore and live assignment share this rule: the same row keeps its id,
     payload and resources; hold release rechecks its original receipt, scope and
-    no-dispatch or exact continuation evidence; Stop/terminal results stay
-    independent. Exact budget pauses keep their own hold authority.
+    no-dispatch or exact continuation evidence (exact budget, owner wait or
+    resolver continuation) and canonical bindings; Stop/terminal results stay
+    independent. An invalid basis or unreadable authority keeps the hold at any
+    snapshot age, and bases are never recaptured. Exact budget pauses keep their
+    own hold authority.
     """
     pause = task.get("_budget_pause")
     if (not task.get("_project_admission_restore_hold")
@@ -212,11 +217,11 @@ def validate_project_admission(view: Any) -> dict:
 def task_project_membership(drive_root: Any, task: dict, *, bindings_snapshot: Optional[dict] = None) -> tuple[str, bool]:
     """Recover positive room evidence from host lineage before any scope-only permit.
 
-    One strict bindings snapshot, including origin lookup; no registry lock.
-    Exact/predecessor membership precedes origin
-    and ancestor evidence; explicit scopes remain valid without any room binding.
+    One strict bindings snapshot; no registry lock. The task's own, retry-attempt,
+    ancestor and launching-task bindings are authority; a shared origin message is not.
+    Explicit scopes remain valid without any room binding.
     """
-    from ouroboros.projects_registry import _load_bindings, origin_key, project_id_for_origin
+    from ouroboros.projects_registry import _load_bindings
 
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     intent = metadata.get("resource_intent")
@@ -237,15 +242,6 @@ def task_project_membership(drive_root: Any, task: dict, *, bindings_snapshot: O
         if not pid:
             pid = bound
         known = known or bound == pid
-    # A retry may share the captured owner message with a bound sibling, even
-    # after the room closes or disappears. Active-only display lookup loses that fact.
-    key = origin_key(task.get("origin_message_ref"))
-    if key is not None:
-        bound = project_id_for_origin(drive_root, task["origin_message_ref"], strict=True,
-                                      include_inactive=True, bindings_snapshot=bindings)
-        if not pid:
-            pid = bound
-        known = known or bool(bound and bound == pid)
     return pid, known
 
 

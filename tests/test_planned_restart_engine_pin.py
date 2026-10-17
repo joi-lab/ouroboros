@@ -163,6 +163,30 @@ def test_pin_is_read_from_the_landed_checkout_not_the_cached_manager(planned, mo
     assert planned.calls == ["daemon_stop"]
 
 
+def test_a_switch_intent_compares_the_targets_pin_not_the_landed_checkouts(planned, monkeypatch, tmp_path):
+    """S3 fix 14 (Astra M12): with a store switch intent recorded, the seam moves the checkout to
+    the intent's target after this cleanup, so the daemon is compared with THAT tree's pin."""
+    from ouroboros import store_switch
+
+    asked = []
+    target = SimpleNamespace(version="3.9.8", build_sha="b" * 40)
+
+    def pin(path=None, *, data=None):
+        return target if data == b"target-pin" else PIN
+
+    def target_file(repo_dir, sha, rel):
+        asked.append((sha, rel))
+        return b"target-pin" if rel == "ouroboros/claudexor_runtime_pin.json" else None
+
+    monkeypatch.setattr(claudexor_runtime, "load_runtime_pin", pin)
+    monkeypatch.setattr(store_switch, "target_file_bytes", target_file)
+    monkeypatch.setattr(planned.manager, "stop_outcome", lambda: planned.calls.append("daemon_stop") or "stopped")
+    planned.serving("3.10.0", "a" * 40)  # the landed checkout's pin: without the intent nothing would stop
+    store_switch.record_switch_intent(tmp_path, target_sha="c" * 40, target_ref="v1.0", reason="owner rollback", door="ui_rollback")
+    server_restart._stop_owned_daemon_for_new_pin()
+    assert planned.calls == ["daemon_stop"] and asked == [("c" * 40, "ouroboros/claudexor_runtime_pin.json")]
+
+
 def test_the_check_lives_in_the_restart_teardown_and_the_handoff_performer_is_untouched(planned, monkeypatch, tmp_path):
     """Source pin in the file's style: the teardown makes the check after the worker kill and before
     the bridge goes down, only for a requested restart; ``_perform_supervisor_restart`` keeps its
@@ -174,7 +198,7 @@ def test_the_check_lives_in_the_restart_teardown_and_the_handoff_performer_is_un
     check = source.index("_stop_owned_daemon_for_new_pin()")
     assert kill < check < source.index("get_bridge().shutdown()")
     assert check < source.index("if extension_reconcile_task is not None:")
-    assert check < source.index("_stop_owned_local_processes(lifespan_drive_root)")
+    assert check < source.index("stop_owned_work(lifespan_drive_root)")
     assert source.rindex("if _restart_requested.is_set():", 0, check) > kill
     assert "_stop_owned_daemon_for_new_pin" not in inspect.getsource(server._perform_supervisor_restart)
 

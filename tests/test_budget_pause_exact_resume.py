@@ -18,6 +18,7 @@ import pytest
 from tests._budget_pause_exact_helpers import (
     _install_queue, _loop_ctx, _parked, _pause, _running_row, _supervisor_ctx,
 )
+from tests.worker_pool_support import affirm_ready
 
 
 # --------------------------------------------------------------------------- supervisor: park
@@ -282,17 +283,19 @@ def test_root_grant_refuses_a_cached_tree_snapshot_and_admits_a_fresh_read(tmp_p
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     task, _row = _parked(tmp_path, monkeypatch, task_id="strict-root", scope="root")
-    usage_accounting._stash_root_accounting("strict-root", 1.0, 10.0)
+    usage_accounting._stash_root_accounting("strict-root", {"settled_usd": 1.0, "accounted_usd": 1.0}, 10.0)
     monkeypatch.setattr(usage_accounting, "usage_projection",
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger unavailable")))
     refused = queue.resume_budget_paused_task("strict-root")
     assert refused["error"] == "root_accounting_unavailable" and refused["action"] == "retry_or_cancel"
     assert "_budget_pause" in task and "_budget_pause_resume" not in task
     monkeypatch.setattr(usage_accounting, "usage_projection",
-                        lambda *_a, **_k: {"accounted_usd": 10.0, "limit_usd": 10.0})
+                        lambda *_a, **_k: {"settled_usd": 10.0, "accounted_usd": 10.0, "limit_usd": 10.0})
     assert queue.resume_budget_paused_task("strict-root")["error"] == "root_hard_cap_exhausted"
+    # #1487: a $25 unresolved bound beside $1 of known spend is exposure, not spending:
+    # explicit Resume within the authorized $10 is granted.
     monkeypatch.setattr(usage_accounting, "usage_projection",
-                        lambda *_a, **_k: {"accounted_usd": 1.0, "limit_usd": 10.0})
+                        lambda *_a, **_k: {"settled_usd": 1.0, "accounted_usd": 26.0, "limit_usd": 10.0})
     assert queue.resume_budget_paused_task("strict-root")["ok"] is True
 
 
@@ -307,8 +310,8 @@ def test_grant_is_revoked_when_money_vanishes_before_dispatch(tmp_path, monkeypa
     assert task["_budget_pause_resume"]["grant_generation"] == 1
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 0.0)
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(t)))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(t))))
     workers.assign_tasks()
     assert sent == []
     assert task.get("_budget_pause", {}).get("exact_continuation") is True
@@ -328,8 +331,8 @@ def test_granted_task_dispatches_with_original_started_at_and_paused_carrier(tmp
     task, row = _parked(tmp_path, monkeypatch, task_id="dispatch-1")
     assert queue.resume_budget_paused_task("dispatch-1")["ok"] is True
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
     workers.assign_tasks()
     assert [t["id"] for t in sent] == ["dispatch-1"]
     meta = workers.RUNNING["dispatch-1"]
@@ -470,7 +473,7 @@ def test_graceful_rail_refreshes_planning_threshold_within_authorized_money(tmp_
     # wallet observation and a fresh, undegraded root-accounting read.
     monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
     monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
-                        lambda **_k: {"accounted_usd": 8.0, "age_sec": 0.0})
+                        lambda **_k: {"settled_usd": 8.0, "accounted_usd": 8.0, "age_sec": 0.0})
     monkeypatch.setattr(task_pacing, "resolve_budget_profile", lambda _c: {"cost_hard_stop_pct": 50})
     disclosure = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
     assert disclosure["refreshed"] is True
@@ -487,7 +490,7 @@ def test_graceful_rail_refreshes_planning_threshold_within_authorized_money(tmp_
     # authorized room, and the owner's explicit act cannot invent any.
     ctx._accumulated_usage = {"cost": 10.0}
     monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
-                        lambda **_k: {"accounted_usd": 10.0, "age_sec": 0.0})
+                        lambda **_k: {"settled_usd": 10.0, "accounted_usd": 10.0, "age_sec": 0.0})
     spent = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
     assert spent["refreshed"] is False and spent["reason"] == "no_authorized_room"
 
@@ -514,7 +517,7 @@ def test_threshold_refresh_refuses_every_unknown_or_stale_money_fact(tmp_path, m
     ctx._accumulated_usage = {"cost": 8.0}
     monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: None)
     monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
-                        lambda **_k: {"accounted_usd": 8.0, "age_sec": 0.0})
+                        lambda **_k: {"settled_usd": 8.0, "accounted_usd": 8.0, "age_sec": 0.0})
     assert budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0) == {
         "refreshed": False, "reason": "wallet_unavailable", "wallet_basis": "ledger_unavailable",
         "dispatch_time_remaining_usd": 100.0}
@@ -523,8 +526,8 @@ def test_threshold_refresh_refuses_every_unknown_or_stale_money_fact(tmp_path, m
     monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
     for tree, reason in (
         (None, "tree_spend_unavailable"),
-        ({"accounted_usd": 8.0, "age_sec": 0.0, "integrity_degraded": True}, "tree_accounting_degraded"),
-        ({"accounted_usd": None, "age_sec": 0.0}, "tree_spend_unknown"),
+        ({"settled_usd": 8.0, "accounted_usd": 8.0, "age_sec": 0.0, "integrity_degraded": True}, "tree_accounting_degraded"),
+        ({"settled_usd": None, "accounted_usd": None, "age_sec": 0.0}, "tree_spend_unknown"),
     ):
         ctx._cost_ceiling = _ceiling()
         monkeypatch.setattr(loop_budget, "_loop_tree_accounting", lambda _t=tree, **_k: _t)
@@ -547,7 +550,7 @@ def test_threshold_refresh_reads_the_ledger_now_never_a_cached_snapshot(tmp_path
     ctx._accumulated_usage = {"cost": 8.0}
     monkeypatch.setattr(task_pacing, "resolve_budget_profile", lambda _c: {"cost_hard_stop_pct": 50})
     monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
-    usage_accounting._stash_root_accounting("q10-root", 8.0, 10.0)  # fresh, 0-age display cache
+    usage_accounting._stash_root_accounting("q10-root", {"settled_usd": 8.0, "accounted_usd": 8.0}, 10.0)  # fresh, 0-age display cache
     monkeypatch.setattr(usage_accounting, "usage_projection",
                         lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger unavailable")))
     with usage_scope(UsageScope(drive_root=tmp_path, task_id="q10-task", root_task_id="q10-root")):
@@ -555,7 +558,7 @@ def test_threshold_refresh_reads_the_ledger_now_never_a_cached_snapshot(tmp_path
         assert refused == {"refreshed": False, "reason": "tree_spend_unavailable", "wallet_basis": "ledger_projection"}
         assert ctx._cost_ceiling.ceiling_usd == 7.0
         monkeypatch.setattr(usage_accounting, "usage_projection",
-                            lambda *_a, **_k: {"accounted_usd": 8.0, "limit_usd": 10.0})
+                            lambda *_a, **_k: {"settled_usd": 8.0, "accounted_usd": 8.0, "limit_usd": 10.0})
         granted = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
     assert granted["refreshed"] is True and granted["root_cap_basis"] == "root_accounting"
     assert ctx._cost_ceiling.ceiling_usd == pytest.approx(10.0)
@@ -628,16 +631,6 @@ def test_activity_rows_show_a_held_budget_row_as_paused_not_queued():
     source = _repo_file("web", "modules", "activity.js")
     assert "_budget_pause_hold" in source and "heldRow" in source
     assert "|| heldRow(t)" in source  # consulted by the pending-row pause predicate
-
-
-def test_runbook_does_not_promise_a_managed_outage_window_the_runtime_has_no_rail_for():
-    """F8: with no deadline and an unlimited absolute ceiling, a managed task's
-    transport-outage episode has NO window of its own — the 6h operation-window
-    fallback belongs to other operations. The runbook names the optional rails an
-    operator can set instead of promising a timeout that does not exist."""
-    source = _repo_file("devtools", "benchmarks", "continual_learning", "RUNBOOK.md")
-    assert "6h operation window from episode entry" not in source
-    assert "OUROBOROS_TASK_ABS_CEILING_SEC" in source and "idle reaper" in source
 
 
 # --------------------------------------------------------------------------- consumption publication holds
@@ -736,12 +729,13 @@ def test_paused_row_survives_a_snapshot_with_an_invalid_timestamp_while_ordinary
     workers.PENDING.append({"id": "ts-ordinary", "type": "task", "chat_id": 0, "_attempt": 1, "text": "x"})
     queue.persist_queue_snapshot(reason="test")
     workers.PENDING[:] = []
-    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    alive = queue.QUEUE_SNAPSHOT_PATH.with_name("queue.alive")
+    snap = json.loads(alive.read_text(encoding="utf-8"))
     if stamp:
         snap["ts"] = stamp
     else:
         snap.pop("ts", None)
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    alive.write_text(json.dumps(snap), encoding="utf-8")
     assert queue.restore_pending_from_snapshot() == 1
     assert [task["id"] for task in workers.PENDING] == ["ts-paused"]
     assert workers.PENDING[0]["_budget_pause"]["exact_continuation"] is True  # retained, not woken

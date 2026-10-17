@@ -84,7 +84,9 @@ test('a lost answer is retried under the SAME nonce; an already accepted press n
     assert.match(toasts[0][0], /^Continue not confirmed: network timeout/);
     assert.equal(await continueTaskAction('root-1', { request, storage, toast }), 'root-1-cabc');
     assert.equal(seen[0][1], seen[1][1], 'the retry carries the same action nonce');
-    assert.match(toasts[1][0], /use Resume in Activity to recheck/);
+    // Held without named blockers: the fact, never a promise that earlier work is merely settling (#1721).
+    assert.equal(toasts[1][0], 'Continue accepted and held: earlier work is not proven settled. '
+        + 'Resume in Activity checks it again.');
     assert.ok(!toasts[1][0].includes('root-1-cabc'), 'compact acknowledgement hides opaque identity');
     const refused = async () => { throw Object.assign(new Error('continue refused: already_continued'), {
         body: { reason_code: 'already_continued', successor_task_id: 'root-1-cabc' } }); };
@@ -127,7 +129,7 @@ test('a canonical hard-bound refusal remains one readable fact beside the existi
         const detail = { status: 'failed', reason_code: 'provider_unavailable',
             continuation_offer: { eligible: false, refusal: 'hard_limit_reached', cause: 'deadline' } };
         const terminalReason = taskReasonDetail(detail);
-        assert.match(terminalReason, /provider/);
+        assert.match(terminalReason, /usable model answer/);
         assert.deepEqual(continueOfferView(detail), { kind: 'refusal', cause: 'deadline' });
         syncContinueAction(card, detail);
         const note = card.root.querySelector('[data-continue-refusal]');
@@ -383,4 +385,15 @@ test('a resolved malformed 200 is unconfirmed: no success toast, the same nonce 
     } finally {
         globalThis.fetch = priorFetch;
     }
+});
+
+test('a held Continue toasts the blockers its census observed, not a generic wait (#1721)', async () => {
+    const toasts = [];
+    const blockers = [{ kind: 'delegated_run', task_id: 'pred-1', run_id: '', invocation_id: 'inv-1',
+        state: 'stop_unknown', stop_outcome: 'pending_invocation_unbound', source: '' }];
+    const request = async () => ({ ok: true, held: true, successor_task_id: 'pred-1-s1', blockers });
+    assert.equal(await continueTaskAction('held-facts', { request, storage: memoryStorage(), toast: (t, k) => toasts.push([t, k]) }),
+        'pred-1-s1');
+    assert.deepEqual(toasts, [['Continue accepted and held: a delegated start has an unknown outcome (no run was recorded). '
+        + 'Resume in Activity checks it again.', 'ok']]);
 });

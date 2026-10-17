@@ -960,7 +960,7 @@ def test_corrupt_retry_lineage_holds_until_grace_deadline_then_releases_hard_pat
         now=ostop._requested_ts(intent) + OWNER_STOP_OUTER_CAP_SEC + 1.0,
     )
     assert after == {root_id: lifecycle.CANCEL_CANCELLED}
-    assert hard_calls == [(root_id, {"cascade": True})]
+    assert hard_calls == [(root_id, {})]
 
 
 def test_sweep_feeds_custody_for_settled_pending_or_expired_roots(tmp_path, monkeypatch):

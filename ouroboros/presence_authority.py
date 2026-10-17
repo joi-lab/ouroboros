@@ -32,10 +32,10 @@ PRESENCE_CEILING_SCHEMA_VERSION = 1
 _SHA256_LEN = 64
 # The own-work baseline (owner Q1/Q2): a Presence mind may find, read and message
 # the independent work it started from ANY conversation of its own binding. The two
-# readers arrive bound to that scope (the host overwrites the argument); steer_task
+# readers arrive bound to that scope (the host overwrites the argument); tell_task
 # is narrowed by its handler for every Presence caller. A profile that selected one
 # of these names keeps that grant, so a selected global reader stays global.
-_OWN_WORK_BASELINE = (("get_task_result", True), ("recent_tasks", True), ("steer_task", False))
+_OWN_WORK_BASELINE = (("get_task_result", True), ("recent_tasks", True), ("tell_task", False))
 
 
 class PresenceAuthorityError(ValueError):

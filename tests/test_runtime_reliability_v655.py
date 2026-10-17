@@ -19,6 +19,10 @@ import pytest
 from ouroboros import config as config_mod
 from ouroboros import safety as safety_mod
 from ouroboros.tools.registry import ToolContext
+from tests.test_plan_task_tool import _record, _write
+from tests.test_plan_task_tool import harness as _plan_task_harness
+
+harness = _plan_task_harness  # the plan_task fixture (real ToolContext and plan record, fake review substrate)
 
 
 # ---------------------------------------------------------------------------
@@ -635,48 +639,46 @@ def test_deadline_clamp_never_floors_past_reserve(tmp_path, monkeypatch):
 # 1.5 — plan_task deadline scaling
 
 
-def test_plan_task_skips_under_tight_deadline(tmp_path):
+def _deadline_ctx(harness, seconds):
     from datetime import datetime, timedelta, timezone
 
-    from ouroboros.tools.plan_review import _handle_plan_task
-
-    deadline = (datetime.now(timezone.utc) + timedelta(seconds=400)).isoformat()
-    ctx = _ctx(tmp_path, meta={"deadline_at": deadline})
-    # The spec carries `affected_paths` (owner 9=A): without it the deadline
-    # question is never reached, because the old mixed form is refused first.
-    out = _handle_plan_task(
-        ctx, plan="do X then Y", goal="ship X",
-        spec={"in_scope": ["X"], "affected_paths": []},
-    )
-    assert out.startswith("PLAN_TASK_SKIPPED_DEADLINE")
-    events = []
-    while not ctx.event_queue.empty():
-        events.append(ctx.event_queue.get_nowait())
-    assert any(e.get("type") == "plan_task_deadline_skip" for e in events)
+    ctx = harness.make_ctx()
+    if seconds is not None:
+        ctx.task_metadata["deadline_at"] = (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+    return ctx
 
 
-def test_plan_task_no_deadline_does_not_skip(tmp_path, monkeypatch):
-    # P1-2 moved the coroutine seam out of plan_review into
-    # plan_review_collect.run_plan_coroutine, which imports asyncio locally, so
-    # there is no plan_review.asyncio attribute to reach through any more. The
-    # same stdlib module object is patched directly; what is pinned is unchanged:
-    # with no deadline plan_task does not skip, it runs the review coroutine.
-    import asyncio
+def _deadline_skip_events(events):
+    drained = []
+    while not events.empty():
+        drained.append(events.get_nowait())
+    return [e for e in drained if e.get("type") == "plan_task_deadline_skip"]
 
-    from ouroboros.tools import plan_review as pr
 
-    sentinel = {"called": False}
+def test_plan_task_skips_under_tight_deadline(harness, monkeypatch):
+    # 400 s left gives a 100 s planning window, under the 300 s useful floor: the ask is the
+    # paid act, so the whole write+ask call is refused before anything is written or sent.
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "300")
+    substrate = harness.install({})
+    text, result = _write(_deadline_ctx(harness, 400), ask="council")
+    assert "PLAN_ASK_SKIPPED_DEADLINE" in text and "PLAN_TASK_SKIPPED_DEADLINE" in text
+    assert result.code == "CAPABILITY_UNAVAILABLE" and "Nothing was written" in text
+    assert substrate.calls == []
+    assert _record(harness)["revisions"] == [] and _record(harness)["asks"] == []
+    [event] = _deadline_skip_events(harness.events)
+    assert event["task_id"] == "task-1" and event["min_useful_sec"] == 300
 
-    def _fake_run(coro=None, *a, **k):
-        sentinel["called"] = True
-        if coro is not None and hasattr(coro, "close"):
-            coro.close()
-        return "ok"
 
-    monkeypatch.setattr(asyncio, "run", _fake_run)
-    ctx = _ctx(tmp_path)
-    out = pr._handle_plan_task(ctx, plan="p", goal="g")
-    assert sentinel["called"] is True and out == "ok"
+@pytest.mark.parametrize("seconds", [None, 86_400], ids=["no-deadline", "roomy-deadline"])
+def test_plan_task_no_deadline_does_not_skip(harness, monkeypatch, seconds):
+    monkeypatch.setenv("OUROBOROS_PLAN_TASK_DEADLINE_MIN_SEC", "300")
+    substrate = harness.install({})
+    text, result = _write(_deadline_ctx(harness, seconds), ask="council")
+    assert result.status == "ok" and "SKIPPED_DEADLINE" not in text
+    assert len(substrate.calls) == 1  # one ask, one dispatch
+    record = _record(harness)
+    assert [r["n"] for r in record["revisions"]] == [1] and [a["ask_id"] for a in record["asks"]] == ["a1"]
+    assert _deadline_skip_events(harness.events) == []
 
 
 # ---------------------------------------------------------------------------

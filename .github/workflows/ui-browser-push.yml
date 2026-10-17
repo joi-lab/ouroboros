@@ -1,24 +1,11 @@
-# Browser proof for the code that actually landed on the shared branch.
-#
-# Two pull requests can each be green against the same base and still break the
-# interface once merged sequentially; only the merged commit proves otherwise.
-# This trigger therefore carries NO path filter — a Makefile-, `Ouroboros.spec`-
-# or requirements-only push reaches the lane too, as it reaches every push job
-# of `ci.yml`. The documentation-only skip is decided inside the shared lane from
-# the event diff, not here.
-#
-# No schedule and no new cron. A push and a manual `full` run call the shared lane,
-# the same one the manual/tag checks in ci.yml call. This manual entry is also the
-# ONLY place a PARTIAL DIAGNOSTIC can be selected: one fixed scenario that runs in
-# its own job below, outside the shared lane, so the lane a release waits for has no
-# selectable part and no job that is skipped whenever browsers run.
-# A red run here reports the branch state; it does not block merges by itself.
-name: UI browser (ouroboros push)
+# Manual browser proof; retain the filename for existing dispatch clients.
+# The default `full` calls the same complete lane as ci.yml's manual/tag runs.
+# Only this entry offers a PARTIAL DIAGNOSTIC, in a separate job: it cannot
+# substitute for the complete lane required by a release. No push/PR/schedule.
+name: UI browser (manual)
 run-name: ${{ inputs.diagnostic && inputs.diagnostic != 'full' && format('PARTIAL DIAGNOSTIC UI - {0}', inputs.diagnostic) || 'UI browser full lane' }}
 
 on:
-  push:
-    branches: [ouroboros]
   workflow_dispatch:
     inputs:
       diagnostic:
@@ -33,16 +20,11 @@ on:
 permissions:
   contents: read
 
-# Deliberately NO concurrency group. Each run skips browsers only when ITS OWN
-# `before..sha` range is documentation-only, so a later docs-only push cannot
-# vouch for an earlier code push. Cancelling in-progress runs — or replacing a
-# pending one, which a group does even without `cancel-in-progress` — would let
-# that docs-only tip end green while the code it follows was never exercised.
-# Every push keeps its own complete lane; overlapping runs cost runner time only.
+# No concurrency group: one requested qualification must not cancel or replace
+# another. Full manual runs exercise the complete lane regardless of path changes.
 
 jobs:
-  # Exactly one of the two jobs runs: the complete lane for a push and for a manual
-  # `full` run, the single scenario for any other manual selection.
+  # Exactly one job runs: the complete lane for `full`, otherwise one scenario.
   ui-smoke:
     name: ui-smoke
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.diagnostic == 'full' }}

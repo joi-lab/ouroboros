@@ -94,11 +94,12 @@ def test_business_metadata_does_not_outlive_a_joined_builtin(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("veto", ["unknown_dispatch", "stop", "foreign_hold", "snapshot", "fence_write"])
-def test_unstarted_combined_resume_retains_other_vetoes(tmp_path, monkeypatch, veto):
+@pytest.mark.parametrize("app_stopped", [False, True])
+def test_unstarted_combined_resume_retains_other_vetoes(tmp_path, monkeypatch, veto, app_stopped):
     from ouroboros import owner_pause
     from ouroboros.task_results import write_task_result
     from supervisor.owner_pause_control import request_owner_pause
-    from supervisor.events_budget import budget_hold_fact, hold_budget_row
+    from supervisor.events_budget import HOLD_SAVED_WORK, budget_hold_fact, hold_budget_row
     q, _, workers = _install_queue(tmp_path, monkeypatch)
     _pool_events(workers, monkeypatch)
     write_task_result(tmp_path, "root", "scheduled", root_task_id="root")
@@ -107,6 +108,8 @@ def test_unstarted_combined_resume_retains_other_vetoes(tmp_path, monkeypatch, v
     workers.PENDING.append(task)
     assert request_owner_pause("root", request_id="pause")["ok"]
     _restart_door(tmp_path, monkeypatch, workers)
+    if app_stopped:
+        hold_budget_row(task, reason=HOLD_SAVED_WORK)
     if veto == "unknown_dispatch":
         task.pop("admitted_dispatch")
     elif veto == "stop":
@@ -123,7 +126,9 @@ def test_unstarted_combined_resume_retains_other_vetoes(tmp_path, monkeypatch, v
     assert not outcome["ok"], outcome
     assert task == before and task["_admission_owner_token"] == "original"
     assert owner_pause.read_fence(tmp_path, "root")["state"] != "released"
-    assert budget_hold_fact(task) and q.BUDGET_ROOT_FENCES["root"]
+    # Owner 2026-10-08 (quiz d2f7532b): the owner's Restart names its never-started row
+    # for return instead of holding it; the Pause's own fence and queue latch still veto.
+    assert q.BUDGET_ROOT_FENCES["root"] and bool(budget_hold_fact(task)) is (app_stopped or veto == "foreign_hold")
 
 
 def test_cold_request_exempts_only_its_own_invocation(tmp_path, monkeypatch):
@@ -263,7 +268,11 @@ def test_resume_crash_before_durable_commit_restores_usable_fence(tmp_path, monk
     q.BUDGET_ROOT_FENCES.clear()
     assert q.restore_pending_from_snapshot() == 1
     assert "root" in q.BUDGET_ROOT_FENCES
-    assert q.resume_budget_paused_task("root")["ok"]
+    from supervisor.events_budget import HOLD_SAVED_WORK, budget_hold_fact
+
+    assert budget_hold_fact(workers.PENDING[0])["reason"] == HOLD_SAVED_WORK
+    resumed = q.resume_budget_paused_task("root")
+    assert resumed["ok"], resumed
     assert workers.PENDING[0]["_admission_owner_token"] == "original"
 
 
@@ -278,8 +287,8 @@ def test_cold_rechecks_a_child_claim_that_lands_after_initial_census(tmp_path, m
     ctx._model_sleep = {"sleep_id": "s", "mode": "cold", **model_sleep.selectors(ctx, wake_after_sec=3600)}
     original = model_sleep.cold_blockers
     observations = []
-    def initial_census(source):
-        blockers = original(source)
+    def initial_census(source, **kwargs):
+        blockers = original(source, **kwargs)
         observations.append(blockers)
         if len(observations) == 1:
             write_task_result(tmp_path, "child", "scheduled", launch_handoffs={"external": {"tool": "opaque"}})
@@ -341,7 +350,10 @@ def test_delegated_start_pause_after_claim_prevents_post(tmp_path, monkeypatch):
         assert request_owner_pause("root", request_id="delegate-final")["ok"]
         return value
     monkeypatch.setattr(delegate, "claimed_start_request", claim)
-    token = subagent_runtime._EXACT_START_SELECTION.set({"snapshot": _transport_snapshot(subagents.get_subagent_harness())})
+    # A read-only child (the stub serves readonly only); #1609: technical access alone
+    # decides the run shape, so the selected row says so.
+    token = subagent_runtime._EXACT_START_SELECTION.set(
+        {"snapshot": _transport_snapshot(subagents.get_subagent_harness(), access="readonly")})
     try:
         outcome = delegate._delegate_start(_nanny_ctx(tmp_path, "root"), "work")
     finally:
@@ -403,6 +415,12 @@ def test_timed_out_mcp_runner_cannot_start_after_caller_return(tmp_path, monkeyp
     monkeypatch.setattr(mcp_client, "_transport_factory", transport)
     monkeypatch.setattr(mcp_client, "ClientSession", Session)
     def timed_call(*_a):
+        join = threading.Thread.join
+        def after_entry(thread, timeout=None):
+            if thread.name == "mcp-sync-runner":
+                assert entered.wait(5)  # prove preparation began before caller timeout
+            return join(thread, timeout)
+        monkeypatch.setattr(threading.Thread, "join", after_entry)
         try:
             return mcp_client._run_async(
                 lambda: mcp_client._call_tool_async(None, "effect", {}, timeout_sec=10), join_timeout=0)
@@ -415,7 +433,8 @@ def test_timed_out_mcp_runner_cannot_start_after_caller_return(tmp_path, monkeyp
     try:
         result = asyncio.run(execute())
         assert result.status == "timeout" and entered.wait(5)
-        assert not load_task_result(tmp_path, "root").get("launch_handoffs")
+        # Unlike a closed-before-entry runner, this transport is really alive.
+        assert load_task_result(tmp_path, "root").get("launch_handoffs")
     finally:
         release.set()
         assert entered.wait(5)

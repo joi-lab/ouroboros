@@ -322,17 +322,27 @@ def _dispatch_extension_tool_untagged(
     except Exception as exc:
         text = f"⚠️ TOOL_ERROR ({name}): extension tool failed: {type(exc).__name__}: {exc}"
         return _extension_result("error", "EXTENSION_ERROR", text)
-    from ouroboros.owner_pause import run_operation, submit_async_operation, OwnerPauseRefused
+    from ouroboros.owner_pause import run_tool_handler, submit_async_operation, OwnerPauseRefused
+    from ouroboros.model_wait import ModelWaitInterrupted
+    from ouroboros.usage_accounting import UsageAccountingError
+    controls = (OwnerPauseRefused, ModelWaitInterrupted, UsageAccountingError)
 
     try:
-        result = run_operation(ctx, handler, *((ctx,) if _wants else ()), **call_args)
-    except OwnerPauseRefused:
+        result = run_tool_handler(ctx, handler, *((ctx,) if _wants else ()), **call_args)
+    except controls:
         raise
     except Exception as exc:
+        from ouroboros.store import StoreError
+        if isinstance(exc, StoreError) and handoff is not None and handoff.get("not_started") is True:
+            raise  # registry snapshots the shared positive no-entry fact
         text = f"⚠️ TOOL_ERROR ({name}): extension tool failed: {type(exc).__name__}: {exc}"
         return _extension_result("error", "EXTENSION_ERROR", text, dispatched=True)
 
     if inspect.iscoroutine(result):
+        from ouroboros.tool_custody import hold_invocation
+        if handoff is not None:
+            handoff["settled"] = False  # constructing a coroutine did not execute it
+        release_runner = hold_invocation()
         box: Dict[str, Any] = {}
         timeout = max(1, int(ext_tool.get("timeout_sec") or 60))
 
@@ -341,7 +351,7 @@ def _dispatch_extension_tool_untagged(
                 async def _bounded():
                     try:
                         task = submit_async_operation(ctx, lambda: result)
-                    except OwnerPauseRefused:
+                    except controls:
                         result.close()
                         raise
                     done, _pending = await asyncio.wait({task}, timeout=timeout)
@@ -358,6 +368,10 @@ def _dispatch_extension_tool_untagged(
                     box["host_timeout"] = True
             except BaseException as exc:
                 box["error"] = exc
+            finally:
+                if handoff is not None:
+                    handoff["settled"] = True
+                release_runner()
 
         # Preserve the admitted task settings snapshot across the async handler
         # thread while keeping live immediate controls live in the API reader.
@@ -367,7 +381,14 @@ def _dispatch_extension_tool_untagged(
             name=f"ext-tool-{name}-async",
             daemon=True,
         )
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            result.close()
+            if handoff is not None:
+                handoff["settled"] = True
+            release_runner()
+            raise
         thread.join(timeout=timeout + 2)
         if thread.is_alive():
             text = f"⚠️ TOOL_ERROR ({name}): extension async handler failed: TimeoutError: handler exceeded timeout"
@@ -389,6 +410,8 @@ def _dispatch_extension_tool_untagged(
             )
         if "error" in box:
             exc = box["error"]
+            if isinstance(exc, controls):
+                raise exc
             text = f"⚠️ TOOL_ERROR ({name}): extension async handler failed: {type(exc).__name__}: {exc}"
             return _extension_result("error", "EXTENSION_ERROR", text, dispatched=True)
         if "value" not in box:

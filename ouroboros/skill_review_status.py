@@ -304,3 +304,10 @@ def skill_review_gate(
             "preflight_failed_stale": bool(stale) and preflight_failed(findings),
         } if findings is not None else {}),
     }
+
+
+def executable_review_requirement(gate: Dict[str, Any]) -> str:
+    """What a refused gate still needs: Advisory also admits a qualified author acceptance."""
+    if str(gate.get("review_enforcement") or "") == "advisory":
+        return "a current executable reviewer verdict or a qualified Advisory author acceptance of these exact bytes"
+    return "a current executable reviewer verdict"

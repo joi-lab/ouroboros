@@ -37,6 +37,14 @@ captures the result and applies it through its existing integration path.
 Ordinary folders use the separate supported direct/copy work-product shape in
 `delegate_directory.py`.
 
+One start provisions nothing: a continuation (`continue_from` on `delegate_start`,
+`delegate_continuation.py`) of a run whose private snapshot is still undisposed
+runs in THAT snapshot, with the same execution root, baseline and binding, and
+takes its custody over, so the earlier work is captured once in the successor's
+cumulative patch. A predecessor whose patch was already applied or rejected is
+continued from a fresh snapshot of the target. The admission floors are unchanged:
+the continuation's access is the caller's own, never wider than the run it continues.
+
 The harness can execute model-generated commands under the operator's OS
 identity. It is not assumed hostile, but the host cannot review each command
 before it runs.
@@ -54,7 +62,27 @@ its private artifact and the existing locked apply check decides whether
 integration is safe. Excluded nested repositories remain outside the snapshot
 inventory and are disclosed as an untracked residual.
 
-A read-only child requests `mode: ask`, `access: readonly` under Claudexor's
+A child or reviewer without write authority but with configured
+`workspace_write`/`full` access is an evidence-only investigation: the same
+delegated `agent`/`live` shape in a private copy (an independent Git clone, or
+the engine's directory copy), recorded with `authority_source: investigation`;
+its capture is retained as evidence and never integrated. The Git clone keeps
+its own refs, stash, hooks and configuration, but converts and compares working
+files as its source does: the source's effective `core.autocrlf`, `core.eol`,
+`core.filemode` and attribute-file data (source-resolved `core.attributesFile`,
+kept at its lower precedence, and `info/attributes`) are adopted
+(data only — a baseline that needs a source-local filter driver still refuses
+typed instead of starting with a dirty copy). A Git-subdirectory
+starting folder clones the enclosing worktree and starts in the matching folder;
+a folderless Project's engine copy is made from this invocation's staged lineage
+inputs (`delegate_readonly_inputs`, `resource_ref.source_root`), never from the
+live scratch. Folderless readonly and investigation starts stage every permitted
+lineage file, a scheduled origin's whole `task_drive`/`artifact_store` included
+(`tool_access_reads.scheduled_origin`): the copy grows with that scratch, and one
+unreadable or nonregular file refuses the start before opening it (`readonly_inputs_unavailable`). A folder no private copy serves (a data-drive subfolder, an
+ignored starting folder) refuses typed, naming `access='readonly'`. A read-only child
+(an explicit `readonly` lowering, Observe, or a Presence ceiling without a
+delegated write grant) requests `mode: ask`, `access: readonly` under Claudexor's
 ordinary envelope. Its parent-selected starting folder is the session project
 root, not a read boundary; omitting it preserves inherited/folderless behavior.
 The host reads effective access back for both shapes;
@@ -76,7 +104,9 @@ its non-persistent siblings. Durable records written before the marker existed f
 to the immutable stored request (`execution.workspaceRoot` + `access`) at recovery time
 (`record_persistent`); rows that carry the key are authoritative and are never
 recomputed from a live engine. Older engines keep the legacy snapshot-in-`scope.root`
-shape and retire their one-shot registration as before.
+shape: that host-minted snapshot declares `scope.ephemeral` and registers nothing where
+the engine accepts the field (`CLAUDEXOR_EPHEMERAL_SCOPE_MIN_VERSION`), and otherwise
+retires its one-shot registration as before.
 
 ## 3. What Ouroboros actually controls
 
@@ -104,8 +134,10 @@ invocation may lower it. Full requests no OS sandbox. The private execution
 snapshot still owns patch delivery, and explicit task constraints remain in force.
 The owned gateway grants full access only for an absent scoped trust record,
 preserving an existing denial. Older immutable snapshots without an access field
-keep workspace_write; retries keep their exact recorded request. Runtime review
-sessions and genuinely read-only tasks retain readonly/ask. Scoped HOME and
+keep workspace_write; retries keep their exact recorded request. Review
+sessions run at their seat's configured access in a private checking copy (a
+catalog session row defaults to full), and explicitly read-only seats and tasks
+retain readonly/ask. Scoped HOME and
 actual-access receipts remain separate facts, and scoped trust grants persist
 without an automatic cleanup policy.
 

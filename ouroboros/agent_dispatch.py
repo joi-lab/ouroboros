@@ -352,19 +352,34 @@ def _initial_effort_for(task: Dict[str, Any], task_type: str) -> str:
     """The effort a task starts on.
 
     For a delegated child this is what ``resolve_subagent_dispatch`` derived and
-    wrote onto the record moments ago, which is ``resolve_effort(task_type)`` — read
-    back rather than recomputed so the loop runs the effort the record states. For
+    wrote onto the record moments ago — read back rather than recomputed so the
+    loop runs the effort the record states. For
     everything else, and for an unrecognized STORED value (durable data outlives the
     schema that wrote it), it is the task-type default directly — or, when the task
     names a model ROLE in its metadata (a consciousness wake-up), that role's effort
     slot: the role owns its effort the way it owns its account binding.
     """
     stored = str(task.get("reasoning_effort") or "").strip().lower()
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if str(task.get("delegation_role") or "").lower() != "subagent":
+        # A level encoded in the model name wins over a pin and a default (``choose_effort``).
+        named = main_model_named_effort(metadata)
+        if named:
+            return named
     if stored in EFFORT_SCALE:
         return stored
-    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     role = str(metadata.get("model_role") or "").strip().lower()
     return resolve_effort(role or task_type)
+
+
+def main_model_named_effort(task_metadata: Dict[str, Any]) -> str:
+    """The level the task's own model name carries — the role slot's model or Main's
+    (``route_spec.api_model_named_effort``) — '' when the model names none."""
+    from ouroboros.route_spec import api_model_named_effort
+
+    override = model_role_slot_override(task_metadata if isinstance(task_metadata, dict) else {})
+    model = override[0] if override else str(runtime_setting("OUROBOROS_MODEL", "") or "")
+    return api_model_named_effort(model)
 
 
 def model_role_slot_override(task_metadata: Dict[str, Any]) -> Optional[Tuple[str, bool]]:
@@ -521,13 +536,12 @@ def reset_nanny_economics_marks(ctx: Any, *, route_dispatched: bool, delegate_ac
     DEFENSIVE, not load-bearing: ``_prepare_task_context`` builds a FRESH
     ToolContext per task, so nothing stale can leak today — this states the
     marks' lifecycle in one place and keeps it true even if a refactor ever
-    reuses a context (leaked cursors would mute or misfire the reminder)."""
+    reuses a context (leaked marks would misstate the facts line's nanny burn)."""
     ctx._nanny_route_dispatched = bool(route_dispatched)
     ctx._nanny_finalization_injected = False
     ctx._nanny_metered_progress = None
     ctx._nanny_delegate_baseline = ({"round": 0, "cost": 0.0} if delegate_activity_seed else None)
     ctx._nanny_physical_activity_seed = False
-    ctx._nanny_reminder_mark = None
 
 
 def emit_dispatch_resolution(
@@ -605,4 +619,12 @@ def capability_delta_prompt_block(dispatch: Optional[SubagentDispatch]) -> str:
         )
     if delta.get("legacy_note"):
         parts.append(f"Ignored on your record: {delta['legacy_note']}.")
+    # The effort decision, when it moved or set aside the parent's request or a pin/name decided.
+    from ouroboros.settings_scales import effort_fact_phrase
+
+    fact = getattr(dispatch, "effort_fact", None)
+    phrase = effort_fact_phrase(fact) if isinstance(fact, dict) and fact else ""
+    if phrase:
+        whose = "Your delegated run's" if delta.get("effective_executor") == "harness" else "Your"
+        parts.append(f"{whose} {phrase}.")
     return "[CAPABILITY DELTA]\n" + "\n".join(parts) if parts else ""

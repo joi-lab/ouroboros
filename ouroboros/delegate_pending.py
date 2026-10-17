@@ -10,14 +10,20 @@ from typing import Any, Dict, List, Optional
 def pending_invocations(
     drive_root: Any, rows: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
-    """Return request rows with no bound run and no definite refusal."""
+    """Return request rows with no bound run and no definite refusal.
+
+    Without ``rows`` the store answers from its pending invocation rows (one read);
+    ``rows`` folds a chain snapshot (the importer, the forensic replays, the tests)."""
 
     from ouroboros import delegate_custody as c
 
+    if rows is None:
+        from ouroboros.delegate_custody_current import pending
+
+        return pending(drive_root)
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
-    source = rows if rows is not None else c.custody_rows(drive_root)
-    for row in source:
+    for row in c._unique_rows(rows):
         invocation_id = str(row.get("invocation_id") or "")
         if not invocation_id:
             continue
@@ -31,7 +37,6 @@ def pending_invocations(
                 "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "request_ref": row.get("request_ref"),
-                "request_locator": row.get("request_locator"),
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
@@ -50,7 +55,9 @@ def pending_invocations(
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
-                # Copies: the source rows may be the shared, read-only custody memo.
+                # A pending continuation names the run whose snapshot it takes over.
+                **{key: str(row.get(key) or "") for key in ("continuation_of", "capture_id", "snapshot_task_id")},
+                # Copies: the source rows are the caller's snapshot.
                 "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
@@ -77,9 +84,8 @@ def pending_invocations(
         # Resolve only survivors, not every historical start on each sweep.
         body = request_body(drive_root, record)
         ref = record.pop("request_ref")
-        locator = record.pop("request_locator")
         # An unreadable stored body does not discharge the pending start.
-        if body or ref is not None or locator is not None:
+        if body or ref is not None:
             record["request"] = body
             pending.append(record)
     return pending
@@ -88,20 +94,14 @@ def pending_invocations(
 def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Resolve the canonical replay envelope, legacy inline first, then raw CAS.
 
-    Unreadable references leave the request unknown for the caller's existing
-    refusal paths; never rebuild a paid invocation from current settings.
+    The raw CAS blob holds the full unredacted envelope, stored before the
+    start-requested row. Unreadable references leave the request unknown for
+    the caller's existing refusal paths; never rebuild a paid invocation from
+    current settings.
     """
     inline = row.get("request")
     if isinstance(inline, dict) and inline:
         return inline
-    locator = row.get("request_locator")
-    if locator is not None:
-        # A memo row carries the legacy inline body's location, not the body.
-        from ouroboros.delegate_custody_memo import read_locator_request
-
-        located = read_locator_request(drive_root, locator, invocation_id=str(row.get("invocation_id") or ""))
-        if located is not None:
-            return located
     ref = row.get("request_ref")
     if not isinstance(ref, dict) or not ref:
         return None

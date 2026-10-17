@@ -1,11 +1,10 @@
 """Model-wait ownership, controls and execution clocks preserve the live task."""
 
 import contextvars
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 import asyncio
 import json
 import queue
-import threading
 from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 
@@ -16,6 +15,8 @@ from ouroboros import model_wait
 from ouroboros.gateways.claudexor import ClaudexorUnavailable
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_llm_claudexor import MODEL, result, ledger, setup as gateway_fixture
+from ouroboros.store import StoreError
+from tests._store_shared import result_signature, seed_result, unreadable_result
 
 setup = gateway_fixture
 
@@ -193,10 +194,14 @@ def test_quota_wait_rejoins_call_without_replaying_tools_and_keeps_ledger(elapse
     answer, usage = client.chat(messages, MODEL, model_role="main")
     assert answer == result()["message"]
     assert transport.uploads[0][0]["messages"] == transport.uploads[1][0]["messages"]
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    # The never-started release retains its failure evidence before the answered repeat.
+    attempts = ledger(root)
+    assert [(row["state"], row["revision"]) for row in attempts] == [("released", 4), ("settled", 3)]
+    assert attempts[0]["physical_failure"]["stage"] == "raised_exception"
     assert len(usage["ledger_attempt_ids"]) == 2
     rows = list(events.queue)
     assert rows[0]["state"] == "waiting" and rows[-1]["state"] == "resolved"
+    assert all(row["requires_owner_action"] is False for row in rows)
     assert rows[-1]["resolution"] == "resource_available" and rows[-1]["credential_harness"] == "actual-harness"
     assert rows[-1]["revision"] > rows[0]["revision"]
     assert all(row["worker_slot_held"] is True and row["is_progress"] is False for row in rows)
@@ -204,7 +209,8 @@ def test_quota_wait_rejoins_call_without_replaying_tools_and_keeps_ledger(elapse
     assert controller.paused_seconds() == pytest.approx(2.5)
 
 
-def test_auto_wait_requests_its_model_and_resumes_when_compatible_second_account_recovers(live_wait, monkeypatch):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_auto_wait_requests_its_model_and_resumes_when_compatible_second_account_recovers(live_wait, monkeypatch, advisory):
     _root, transport, client, _controller, events, _decide = live_wait
     recovered = result()
     recovered["route"].update(credentialProfileId="account-b", accountFingerprint="identity-b")
@@ -216,7 +222,8 @@ def test_auto_wait_requests_its_model_and_resumes_when_compatible_second_account
         calls.append((source, profile, requested_model))
         assert requested_model == "exact-model"
         return {"source": source, "credentialProfileId": "account-b",
-                "accountFingerprint": "identity-b", "models": [{"id": "exact-model"}]}
+                "accountFingerprint": "identity-b", "models": [] if advisory else [{"id": "exact-model"}],
+                "admission": {"requestedModel": requested_model, "inventoryAbsence": "advisory" if advisory else "authoritative"}}
 
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
     _, usage = client.chat([{"role": "user", "content": "continue exact model"}], MODEL, model_role="main")
@@ -278,14 +285,14 @@ def test_owner_decision_revision_pending_and_replay_fences(live_wait):
     assert stale.status_code == 409 and json.loads(stale.body)["reason_code"] == "stale_model_wait"
 
 
-def test_wait_projection_refuses_corrupt_existing_task_result(tmp_path):
-    directory = tmp_path / "task_results"
-    directory.mkdir()
-    path = directory / "task-one.json"
-    path.write_bytes(b'{"broken":')
-    with pytest.raises(ValueError):
+def test_wait_projection_refuses_unreadable_existing_task_result(tmp_path, monkeypatch):
+    seed_result(tmp_path, "task-one", {"task_id": "task-one", "status": "running"})
+    before = result_signature(tmp_path, "task-one")
+    unreadable = unreadable_result(monkeypatch, "task-one")
+    with pytest.raises(StoreError):
         model_wait.mutate_wait(tmp_path, "task-one", "wait-one", lambda _: {"state": "waiting"})
-    assert path.read_bytes() == b'{"broken":'
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "task-one") == before  # the row is exactly as before
 
 
 def test_dated_pool_of_unknown_cause_waits_visibly_as_unavailable_never_as_quota(elapsed_quota_wait):
@@ -308,28 +315,36 @@ def test_async_cancellation_resolves_only_its_wait_and_keeps_shared_task(live_wa
     root, transport, client, controller, events, _decide = live_wait
     transport.results = [_refusal()]
     transport.dispatch = ["not_started"]
-    entered = threading.Event()
+    entered, resolved = Future(), Future()
 
     def catalog(*_, **_kw):
-        entered.set()
+        if not entered.done():
+            entered.set_result(None)
         raise ClaudexorUnavailable("subscription_window_exhausted", "not ready")
 
+    original_put = events.put
+
+    def record(event):
+        original_put(event)
+        if event["state"] == "resolved" and not resolved.done():
+            resolved.set_result(event)
+
     monkeypatch.setattr(client, "claudexor_model_catalog", catalog)
+    monkeypatch.setattr(events, "put", record)
 
     async def run():
         task = asyncio.create_task(client.chat_async([{"role": "user", "content": "hi"}], MODEL, model_role="main"))
-        assert await asyncio.to_thread(entered.wait, 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        terminal = None
-        while terminal is None:
-            event = await asyncio.to_thread(events.get, True, 2)
-            if event["state"] == "resolved":
-                terminal = event
+        try:
+            await asyncio.wrap_future(entered)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            task.cancel()
+        terminal = await asyncio.wrap_future(resolved)
         assert terminal["resolution"] == "caller_cancelled"
 
-    asyncio.run(run())
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
     assert not controller.closed and len(transport.accepted_operations) == 1
     assert all(row["state"] == "resolved" for row in load_task_result(root, "task-one")["model_waits"].values())
 
@@ -440,6 +455,45 @@ def test_permanent_switch_uses_existing_owner_writer_once(live_wait, monkeypatch
     replay = decide(body)
     assert replay.status_code == 200 and json.loads(replay.body)["saved"] is True
     assert (root / "settings.json").stat().st_mtime_ns == stamp
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("surface, role, key", [
+    ("web", "main", "OUROBOROS_MODEL"), ("host", "reviewer:main", "OUROBOROS_MODEL"),
+    ("web", "light", "OUROBOROS_MODEL_LIGHT"), ("host", "fallback:0", "OUROBOROS_MODEL_FALLBACKS")])
+def test_permanent_switch_to_the_shown_default_authors_the_slot(live_wait, monkeypatch, surface, role, key):
+    """Keeping a model is a choice even when it is the default an unsaved slot shows: the card saves
+    it, and the next task keeps it after an access change moves the slots nobody chose. An
+    unrelated owner write beside it still authors no slot."""
+    from ouroboros import config
+    from ouroboros.gateway.owner_settings import _owner_update_settings, fields_on_saved_document
+    from ouroboros.provider_models import ANTHROPIC_DIRECT_DEFAULTS
+    from ouroboros.subagent_runtime import apply_task_start_settings
+
+    root, _transport, _client, controller, _events, _decide = live_wait
+    path = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", path)
+    for name in (*config.SETTINGS_DEFAULTS, "OUROBOROS_MODEL_FALLBACK"):
+        monkeypatch.delenv(name, raising=False)
+    path.write_text(json.dumps({"OPENROUTER_API_KEY": "sk-or-present-key"}))
+    _owner_update_settings(fields_on_saved_document({"OUROBOROS_TOOL_TIMEOUT_SEC": 77}))
+    assert key not in json.loads(path.read_text())
+    chosen = config.SETTINGS_DEFAULTS[key]
+    row = {"wait_id": "wait-one", "revision": 1, "task_attempt": 1, "state": "waiting", "role": role}
+    model_wait.mutate_wait(root, "task-one", "wait-one", lambda _: row)
+    controller.waits["wait-one"] = dict(row)
+    with _decision_clients(root) as clients:
+        response = clients[surface](_action_for({**row, "task_id": "task-one"}, "switch", model=chosen,
+                                                credential_profile_id="", use_local=False, persist_role=True))
+    assert response.status_code == 202 and response.json()["saved"] is True
+    document = json.loads(path.read_text())
+    assert document[key] == chosen
+    del document["OPENROUTER_API_KEY"]
+    path.write_text(json.dumps({**document, "ANTHROPIC_API_KEY": "sk-ant-present-key"}))
+    started = apply_task_start_settings().settings
+    assert started[key] == chosen
+    other = "OUROBOROS_MODEL_LIGHT" if key == "OUROBOROS_MODEL" else "OUROBOROS_MODEL"
+    assert started[other] == ANTHROPIC_DIRECT_DEFAULTS["light" if key == "OUROBOROS_MODEL" else "main"]
 
 
 def test_invalid_persistent_choice_and_failed_revalidation_do_not_wedge_action(live_wait, monkeypatch):
@@ -557,8 +611,9 @@ def test_supervisor_reordering_keeps_latest_union_clock_and_never_marks_progress
                           bridge=SimpleNamespace(push_log=pushed.append))
     first = {"type": "task_model_wait", "task_id": "task-one", "wait_id": "wait-a", "revision": 1,
              "task_attempt": 1, "state": "waiting", "is_progress": False,
+             "requires_owner_action": True,
              "quota_clock": {"revision": 1, "elapsed_sec": 0.0, "active": True, "observed_at": 100.0}}
-    last = {**first, "revision": 3, "state": "resolved",
+    last = {**first, "revision": 3, "state": "resolved", "requires_owner_action": False,
             "quota_clock": {"revision": 3, "elapsed_sec": 20.0, "active": False, "observed_at": 120.0}}
     sibling = {**first, "wait_id": "wait-b", "revision": 2}
     for event in (last, first, sibling):
@@ -566,6 +621,8 @@ def test_supervisor_reordering_keeps_latest_union_clock_and_never_marks_progress
     meta = task_queue.RUNNING["task-one"]
     assert meta["task"]["model_waits"]["wait-a"]["state"] == "resolved"
     assert meta["task"]["model_waits"]["wait-b"]["state"] == "waiting"
+    assert meta["task"]["model_waits"]["wait-a"]["requires_owner_action"] is False
+    assert meta["task"]["model_waits"]["wait-b"]["requires_owner_action"] is True
     assert projection.quota_waited_seconds(meta, 200.0) == 20.0
     assert "last_progress_at" not in meta and len(pushed) == len(persisted) == 2
 
@@ -608,6 +665,7 @@ def test_confirmed_mixed_pool_waits_and_heals_on_the_same_live_call(elapsed_quot
     assert len(usage["ledger_attempt_ids"]) == 2
     rows = list(events.queue)
     assert rows[0]["reason"] == rows[-1]["reason"] == "auth_quota"
+    assert all(row["requires_owner_action"] is False for row in rows)
     assert rows[0]["credential_profile_id"] == "", "A mixed pool has no single login target"
     assert rows[0]["quota_clock"]["active"] is True
     assert rows[-1]["state"] == "resolved" and rows[-1]["resolution"] == "resource_available"
@@ -700,7 +758,9 @@ def test_call_can_decline_resource_wait_without_losing_task_binding(live_wait, c
     assert transport.uploads[0][0]["account"] == {"mode": "auto"}
     assert "wait_for_resources" not in json.dumps(transport.uploads[0][0])
     assert model_wait.current_model_wait() is controller and not controller.closed
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"]
+    attempts = ledger(root)
+    assert [(row["state"], row["revision"]) for row in attempts] == [("released", 4)]
+    assert attempts[0]["physical_failure"]["stage"] == "raised_exception"
 
     answer, usage = call()
     assert answer == result()["message"] and len(transport.accepted_operations) == 3

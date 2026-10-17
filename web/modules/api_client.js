@@ -9,6 +9,27 @@ export async function apiFetch(url, init = {}) {
 }
 
 /**
+ * The core's own same-origin sign-in, returning to this page. Only its network
+ * gate answers 401 on the readiness and state reads that send a page here: a
+ * separately hosted interface never passes through the gate's login page at load,
+ * and a page whose session expired keeps showing until such a read is refused.
+ * Every other failure keeps its own presentation, and nothing the page had queued
+ * or failed to save is resent after signing in — the return is a fresh load.
+ */
+export function signInUrl(href = window.location.href) {
+    const here = new URL(href);
+    here.searchParams.delete('_ouro_refresh');
+    here.searchParams.delete('_ouro_reason');
+    return `/auth/login?next=${encodeURIComponent(`${here.pathname}${here.search}${here.hash}`)}`;
+}
+
+export function openSignIn() {
+    window.location.replace(signInUrl());
+}
+
+export const isStoreMigrating = error => error?.status === 503 && error?.body?.reason_code === 'migrating';
+
+/**
  * Read an owner-visible sentence out of a gateway error body. Several routes
  * answer with a STRUCTURED error (`{error: {code, message, ...}}`), and
  * interpolating that object straight into an Error message produced the
@@ -29,7 +50,7 @@ function errorText(data) {
 }
 
 export async function fetchJson(url, init = {}, options = {}) {
-    const response = await apiFetch(url, init);
+    const response = await (options.fetchImpl || apiFetch)(url, init);
     let data = null;
     try {
         data = await response.json();
@@ -60,6 +81,51 @@ export function jsonPost(url, payload = {}, options = {}) {
     }, options);
 }
 
+/** Exact-profile refresh; omitted target keeps the existing full refresh. */
+export function refreshAccountResources(target, options = {}) {
+    return jsonPost('/api/claudexor/quota/refresh', target ? { target } : {}, options);
+}
+
+/** The caller retains BOTH request and key until this logical operation settles. */
+export function createAccountReset(request, key, options = {}) {
+    return fetchJson('/api/claudexor/account-resets', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+        body: JSON.stringify(request),
+    }, options);
+}
+
+export function getAccountReset(operationId, options = {}) {
+    return fetchJson(`/api/claudexor/account-resets/${encodeURIComponent(operationId)}`,
+        { cache: 'no-store' }, options);
+}
+
+/** Passive inspection; the host never starts an engine for this read. */
+export function harnessMaintenanceInventory({ harness = '', fresh = false, checkLatest = false } = {}) {
+    const params = new URLSearchParams();
+    if (harness) params.set('harness', harness);
+    if (fresh) params.set('fresh', 'true');
+    if (checkLatest) params.set('checkLatest', 'true');
+    return fetchJson(`/api/claudexor/maintenance/harnesses${params.size ? `?${params}` : ''}`, { cache: 'no-store' });
+}
+
+/** Reuse both key and body when the reply to an accepted request was lost. */
+export function startHarnessMaintenance(payload, idempotencyKey) {
+    return fetchJson('/api/claudexor/maintenance/operations', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify(payload),
+    });
+}
+
+export function harnessMaintenanceOperation(operationId) {
+    return fetchJson(`/api/claudexor/maintenance/operations/${encodeURIComponent(operationId)}`, { cache: 'no-store' });
+}
+
+export function cancelHarnessMaintenance(operationId) {
+    return fetchJson(`/api/claudexor/maintenance/operations/${encodeURIComponent(operationId)}/cancel`, { method: 'POST' });
+}
+
 /**
  * Run the read-only publication preflight for one selected skill. Domain
  * states, including repairable findings, remain successful JSON responses;
@@ -81,12 +147,15 @@ export function createTask(payload) {
 }
 
 /**
- * Cancel a task. With {cascade:true} the server also cancels the task's live
- * subtree and answers only once that teardown has finished; without it the
- * request stays the synchronous single-task cancel (no body — headless compat).
- * S3 (Q1/Q2): stopPolicy "finalize_then_cancel" requests the soft
- * finalize-then-stop episode (202 acknowledgement, cancel_state "pending");
- * "immediate" (or absent) keeps today's hard cancel byte-identical.
+ * Cancel a task. The server records the durable Stop first, then drives it;
+ * with {cascade:true} the task's live subtree is torn down too. Without
+ * options no body is sent (headless compat). Every answer with ok:true is an
+ * accepted Stop: 200 once the teardown settled, 202 cancel_state "pending"
+ * while it is still being finished — the soft finalize-then-stop episode of
+ * stopPolicy "finalize_then_cancel" (S3, Q1/Q2), or an "immediate" (or
+ * absent) Stop whose teardown is not confirmed yet (reason_code
+ * "teardown_unconfirmed"); the supervisor finishes it and task detail shows
+ * the pending state. 404 means there is nothing to stop.
  * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
  * @param {{cascade?: boolean, stopPolicy?: string, stopActionId?: string}} [options]
@@ -223,13 +292,16 @@ export async function fetchTaskDetail(taskId) {
  * @param {string} taskId
  * @returns {Promise<import('./api_types.js').TaskDetailResponse|null>}
  */
-export async function fetchTaskDetailStrict(taskId) {
-    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`);
+export async function fetchTaskDetailStrict(taskId, { signal } = {}) {
+    const resp = await apiFetch(`/api/tasks/${encodeURIComponent(taskId)}`, signal ? { signal } : {});
     if (resp && typeof resp.json === 'function') {
         if (resp.ok !== false) return resp.json();
         if (resp.status === 404) return null;
     }
-    throw new Error(`task detail read failed (HTTP ${resp?.status ?? 'no response'})`);
+    const error = new Error(`task detail read failed (HTTP ${resp?.status ?? 'no response'})`);
+    error.status = resp?.status;
+    try { error.body = await resp.json(); } catch { /* Retain the HTTP failure without a readable body. */ }
+    throw error;
 }
 
 export function cleanExtensionRoute(value) {
@@ -260,11 +332,16 @@ export function updateStrategyForPlan(plan = {}) {
 }
 
 export const apiClient = {
-    /** Read a recent window or replay one opaque, room-bound history page. */
-    chatHistory: ({ chatId = 1, cursor = null, signal } = {}) => {
+    harnessMaintenanceInventory,
+    startHarnessMaintenance,
+    harnessMaintenanceOperation,
+    cancelHarnessMaintenance,
+    /** Read a recent window, replay one opaque, room-bound history page, or read the page around one task. */
+    chatHistory: ({ chatId = 1, cursor = null, around = null, signal } = {}) => {
         const params = new URLSearchParams();
         if (chatId !== 1) params.set('chat_id', String(chatId));
         if (cursor) params.set('cursor', cursor);
+        if (around) params.set('around', around);  // `task:<id>`: the page around that task
         const query = params.toString();
         return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
     },
@@ -272,8 +349,21 @@ export const apiClient = {
     health: () => fetchJson('/api/health', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').StateResponse>} */
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
+    /** One composer file into the upload store. @returns {Promise<import('./api_types.js').UploadResponse>} */
+    uploadChatAttachment: (file) => {
+        const body = new FormData();
+        body.append('file', file);
+        return fetchJson('/api/chat/upload', { method: 'POST', body }, { rejectOkFalse: true });
+    },
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
-    /** @param {{key: string}|{mcp_server_id: string}} selector @returns {Promise<{value: string}>} */
+    /** @returns {Promise<import('./model_route_types.js').WebSearchRoute>} */
+    webSearchPreview: (selection = {}) => fetchJson(
+        `/api/settings?${new URLSearchParams({ websearch_preview: '1', ...selection })}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./model_route_types.js').ResponseLimitPreview>} */
+    responseLimitPreview: ({ model, local = false, account = '' }) => fetchJson(
+        `/api/settings?${new URLSearchParams({ response_limit_preview: '1', model, local: String(Boolean(local)), account })}`,
+        { cache: 'no-store' }),
+    /** @param {{key: string}|{mcp_server_id: string, header_name?: string}} selector @returns {Promise<{value: string}>} */
     revealSettingsSecret: (selector) => jsonPost('/api/settings/secret', selector),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
     uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
@@ -319,9 +409,12 @@ export const apiClient = {
     ownerRuntimeMode: (mode) => jsonPost('/api/owner/runtime-mode', { mode }),
     ownerAutoGrant: (enabled) => jsonPost('/api/owner/auto-grant', { enabled: Boolean(enabled) }),
     ownerContextMode: (mode) => jsonPost('/api/owner/context-mode', { mode }),
+    /** Save room primary effort and ordered helper bounds. @param {import('./client_contract_types.js').OwnerEffortRangeRequest} range */
+    ownerEffortRange: (range) => jsonPost('/api/owner/effort-range', range),
     /** @returns {Promise<import('./api_types.js').OwnerSafetyModeResponse>} */
     ownerSafetyMode: (mode) => jsonPost('/api/owner/safety-mode', { mode }),
     logsTail: (name, limit = 2000) => fetchJson(`/api/logs/${encodeURIComponent(name)}?limit=${encodeURIComponent(limit)}`, { cache: 'no-store' }),
+    /** @returns {Promise<import('./model_route_types.js').ResponseLimitAckResponse|Object>} */
     ownerCapabilityAck: (payload) => jsonPost('/api/owner/capability-ack', payload),
     /** @returns {Promise<import('./api_types.js').OpenAICompatibleModelsResponse>} */
     openAICompatibleModels: (payload) => jsonPost('/api/openai-compatible/models', payload),
@@ -366,7 +459,19 @@ export const apiClient = {
     projectDelete: (projectId) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/delete`, {}),
     /** @returns {Promise<import('./api_types.js').FsDirsResponse>} */
     fsDirs: (path = '') => fetchJson(`/api/fs/dirs${path ? `?path=${encodeURIComponent(path)}` : ''}`, { cache: 'no-store' }),
+    /**
+     * Dashboard storage: the server's last measurement, read passively (no walk, no write).
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    storage: (init = {}) => fetchJson('/api/storage', { cache: 'no-store', ...init }),
+    /**
+     * Start one bounded measurement, or join the running one (202 either way).
+     * @returns {Promise<import('./storage_types.js').StorageResponse>}
+     */
+    measureStorage: () => jsonPost('/api/storage/measure', {}),
+    /** @returns {Promise<import('./management_contract_types.js').UpdateStatusResponse>} */
     updateStatus: () => fetchJson('/api/update/status', { cache: 'no-store' }),
+    /** @returns {Promise<import('./management_contract_types.js').UpdateStatusResponse>} */
     updateCheck: () => jsonPost('/api/update/check', {}),
     /** @returns {Promise<import('./api_types.js').UpdatePreflightResponse>} */
     updatePreflight: () => jsonPost('/api/update/preflight', {}),
@@ -378,3 +483,15 @@ export const apiClient = {
         ...(confirmRecovery ? { confirm_recovery: true } : {}),
     }),
 };
+
+/** Read-only import preview. Values return only to this Settings draft; this never saves or connects.
+ * @param {import('./mcp_import_types.js').MCPImportPreviewRequest} payload
+ * @param {AbortSignal=} signal
+ * @returns {Promise<import('./mcp_import_types.js').MCPImportPreviewResponse>}
+ */
+export function previewMcpImport(payload, signal) {
+    return fetchJson('/api/mcp/import/preview', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload), signal,
+    });
+}

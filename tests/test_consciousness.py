@@ -1,6 +1,6 @@
 """The alarm clock of Background Consciousness (redesign P2): ``tick`` decides WHEN an
 ordinary Main turn starts on its own; the direct-activity census is the only liveness
-truth; ``notify`` debounces early wakes arithmetically; a wake's own finish never
+truth; nothing but the schedule moves the next wake (#1603); a wake's own finish never
 re-arms it. The lane that runs the turn is pinned in ``test_consciousness_wake_lane.py``.
 """
 
@@ -21,6 +21,7 @@ from ouroboros.consciousness import (
     BackgroundConsciousness,
 )
 from supervisor.active_activity import get_direct_activity_registry
+from tests._store_shared import seed_result
 
 T0 = 1_800_000_000.0
 
@@ -28,8 +29,8 @@ T0 = 1_800_000_000.0
 def _iso(ts):
     return clock_module._iso(ts)
 FLOOR, CEILING, DEFAULT = 900, 14400, 3300
-AVAILABLE = {"status": "available", "limit_usd": 20.0, "accounted_usd": 2.5, "remaining_usd": 17.5,
-             "resets_at": "", "unknown_unmetered": 0}
+AVAILABLE = {"status": "available", "limit_usd": 20.0, "settled_usd": 2.5, "accounted_usd": 2.5,
+             "remaining_usd": 17.5, "resets_at": "", "unknown_unmetered": 0}
 
 
 @pytest.fixture
@@ -127,10 +128,10 @@ def test_restored_boundary_reaches_the_launched_wake_text(clock):
     """Without an accepted observation boundary yet, the first window starts at the last wake."""
     clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
     (clock.root / "task_results").mkdir()
-    (clock.root / "task_results" / "settled.json").write_text(json.dumps({
+    seed_result(clock.root, "settled", {
         "task_id": "settled", "status": "completed", "updated_at": _iso(T0 - 1800),
         "ts": _iso(T0 - 1800), "description": "settled before restart", "_schema_version": 1,
-    }), encoding="utf-8")
+    })
     _chat_row(root=clock.root, ts=_iso(T0 - 7200), direction="system", type="task_summary", task_id="older",
               status="completed")
     _chat_row(root=clock.root, ts=_iso(T0 - 1800), direction="system", type="task_summary", task_id="settled",
@@ -177,7 +178,7 @@ def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_obs
     (clock.root / "task_results").mkdir()
     row = {"task_id": "kid", "status": "running", "ts": _iso(T0 - 100), "updated_at": _iso(T0 - 100),
            "_schema_version": 1, "metadata": {}, "description": "child work"}
-    (clock.root / "task_results" / "kid.json").write_text(json.dumps(row), encoding="utf-8")
+    seed_result(clock.root, "kid", row)
     assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
     accepted = clock.store[OBSERVATION_STATE_KEY]["transitions"]
     from ouroboros.artifacts import read_actor_source_bytes
@@ -185,8 +186,7 @@ def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_obs
     header = json.loads(read_actor_source_bytes(clock.root, source['task_id'], source).splitlines()[0])
     inventory = header['boundary']['transitions']
     assert inventory["inventory"] == {"kid": []} and inventory["scan_at"] == _iso(T0 + FLOOR + 1)
-    (clock.root / "task_results" / "kid.json").write_text(json.dumps(
-        {**row, "status": "failed", "updated_at": _iso(T0 + FLOOR + 50)}), encoding="utf-8")  # the orphan sweep
+    seed_result(clock.root, "kid", {**row, "status": "failed", "updated_at": _iso(T0 + FLOOR + 50)})  # the orphan sweep
     clock.clock._wake_finished("wake0001", True)
     get_direct_activity_registry().clear()
     clock.receipt.update({"admitted": False, "task_id": "", "reason": "budget_exhausted"})
@@ -423,7 +423,7 @@ def test_launch_starts_an_ordinary_main_turn_with_the_wake_envelope(clock):
     assert meta["initiator"] == "consciousness" and meta["usage_category"] == "consciousness"
     assert meta["wake_reason"] == "heartbeat" and meta["consciousness_autonomy"] == "act"
     assert meta["model_role"] == "consciousness" and meta["runtime_mode_cap"] == "light"
-    assert "toggle_evolution" in meta["disabled_tools"] and "steer_task" not in meta["disabled_tools"]
+    assert "toggle_evolution" in meta["disabled_tools"] and "tell_task" not in meta["disabled_tools"]
     # В26=A: the wake tree's GRACEFUL ceiling = min(per-task cap 50, remaining 17.5); the
     # ledger fence keeps the per-task cap (a fence narrowed below one Main attempt's
     # reservation refused every wake of a nearly spent day before its first call).
@@ -440,10 +440,11 @@ def test_launch_starts_an_ordinary_main_turn_with_the_wake_envelope(clock):
     assert started and started[0]["task_id"] == "wake0001" and started[0]["wake_reason"] == "heartbeat"
 
 
-def test_launch_text_carries_the_trigger_line(clock):
-    clock.clock.notify("task_finished:done:completed")
+def test_launch_text_names_the_schedule_as_the_only_cause(clock):
+    """#1603: no event pulls a wake, so every wake's cause is its scheduled time."""
     assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
-    assert "- wake cause: task done finished (completed)" in clock.launches[-1]["text"]
+    assert "- wake cause: the scheduled wake time; events never move it" in clock.launches[-1]["text"]
+    assert clock.launches[-1]["metadata"]["wake_reason"] == "heartbeat"
 
 
 def test_launch_carries_the_main_lane_routing_facts_an_owner_turn_gets(clock):
@@ -494,21 +495,21 @@ def test_launch_cap_is_the_remaining_allowance_when_no_per_task_cap(clock, monke
     assert clock.launches[0]["metadata"]["root_cost_ceiling_usd"] == 17.5
 
 
-def test_less_than_one_planned_turn_left_is_exhausted(clock, monkeypatch):
-    """A remainder at or below the graceful stop's planning margin would only wake the
-    mind to be told to land at once: the tick skips it as exhausted instead."""
-    from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
-
-    thin = dict(AVAILABLE, remaining_usd=COST_PLANNING_MARGIN_USD, accounted_usd=20.0 - COST_PLANNING_MARGIN_USD)
+def test_a_thin_allowance_still_wakes_and_only_known_exhaustion_skips(clock, monkeypatch):
+    """Owner 2026-10-07: no extra $3 margin skip. $0.50 of known allowance left is a
+    wake under a $0.50 producer ceiling; only known spend at the limit skips."""
+    thin = dict(AVAILABLE, remaining_usd=0.5, settled_usd=19.5, accounted_usd=60.0)
     monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: dict(thin))
+    assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
+    assert clock.launches[-1]["metadata"]["root_cost_ceiling_usd"] == 0.5
+    clock.launches.clear()
+    clock.clock._last_wake_task_id, clock.clock._next_wake_at = "", 0.0
+    clock.live = None
+    spent = dict(AVAILABLE, status="exhausted", remaining_usd=0.0, settled_usd=20.0, accounted_usd=20.0)
+    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: dict(spent))
     assert clock.clock.tick(T0 + FLOOR + 1) == "skipped:allowance_exhausted"
     assert clock.launches == []
-    # On an exhausted day every root completion would otherwise pull the clock to "now" and cost a
-    # ledger read + a skip row per completion: a skip debounces the next event like a wake does.
-    clock.clock._next_wake_at = T0 + 9000
-    monkeypatch.setattr(clock_module.time, "time", lambda: T0 + FLOOR + 11)
-    clock.clock.notify("task_finished:x:completed")
-    assert clock.clock.next_wake_at == T0 + FLOOR + 1 + FLOOR
+    assert clock.clock.next_wake_at == T0 + FLOOR + 1 + FLOOR  # the skip's own retry, nothing sooner
 
 
 def test_launch_cap_rides_the_started_event_too(clock):
@@ -520,21 +521,21 @@ def test_launch_cap_rides_the_started_event_too(clock):
     assert "root_limit_usd" not in started[0]
 
 
-def test_pending_reason_is_captured_and_cleared_at_launch(clock):
-    clock.clock.notify("task_finished:abc:completed")
+def test_the_clock_has_no_early_wake_entry(clock):
+    """#1603 (owner 12 Oct: no accelerated wake, only the scheduled time): no notify, no pending
+    reason; every wake is the heartbeat, at the scheduled time."""
+    assert not hasattr(clock.clock, "notify") and not hasattr(clock.clock, "pending_reason")
+    assert not hasattr(clock.clock, "_pending_reason") and not hasattr(clock.clock, "_last_skip_at")
     assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
-    assert clock.launches[0]["metadata"]["wake_reason"] == "task_finished:abc:completed"
-    assert clock.launches[0]["text"].startswith("[Wake-up · task_finished:abc:completed]")
-    assert clock.clock.pending_reason is None
+    assert clock.launches[0]["metadata"]["wake_reason"] == "heartbeat"
+    assert clock.launches[0]["text"].startswith("[Wake-up · heartbeat]")
 
 
-def test_rejected_wake_is_typed_and_retried_by_its_reason(clock):
+def test_rejected_wake_is_typed_and_retried_on_its_schedule(clock):
     clock.receipt.update({"admitted": False, "task_id": "", "reason": "budget_exhausted"})
     now = T0 + FLOOR + 1
-    clock.clock.notify("task_finished:z:completed")
     assert clock.clock.tick(now) == "rejected:budget_exhausted"
     assert clock.clock.next_wake_at == now + DEFAULT  # the owner's budget is out: quietly, at the interval
-    assert clock.clock.pending_reason == "task_finished:z:completed"  # a refused launch does not consume the event
     assert clock.clock.status_snapshot()["last_wake_outcome"] == "rejected:budget_exhausted"
     assert [row["reason"] for row in _events(clock.root) if row["type"] == "consciousness_wake_rejected"] == ["budget_exhausted"]
     clock.receipt["reason"], clock.clock._next_wake_at = "repo_writer_gate_closed", now
@@ -548,20 +549,9 @@ def test_rejected_wake_is_typed_and_retried_by_its_reason(clock):
     clock.clock._next_wake_at = now
     assert clock.clock.tick(now) == "rejected:admission_failed"
     assert clock.clock.next_wake_at == now + DEFAULT * 4
-    # An event right after the refusal never pulls the retry below the floor (it would retry
-    # on the next supervisor pass and post the error again): the refusal debounces like a skip.
-    monkeypatch_time = now + 10
-    import ouroboros.consciousness as clock_mod
-    real_time = clock_mod.time.time
-    clock_mod.time.time = lambda: monkeypatch_time
-    try:
-        clock.clock.notify("task_finished:q:completed")
-        assert clock.clock.next_wake_at == now + FLOOR
-    finally:
-        clock_mod.time.time = real_time
 
 
-def test_a_turn_admitted_in_the_same_instant_keeps_the_reason_for_later(clock, monkeypatch):
+def test_a_turn_admitted_in_the_same_instant_keeps_the_wake_due(clock, monkeypatch):
     from supervisor import workers
 
     def handle_wake_direct(*_a, **_k):
@@ -571,16 +561,16 @@ def test_a_turn_admitted_in_the_same_instant_keeps_the_reason_for_later(clock, m
     calls = {"n": 0}
     real = clock.clock.live_turns
 
-    def live_turns():
+    def live_turns(**kwargs):
         calls["n"] += 1
         if calls["n"] == 2:  # the re-check under the gate lock sees a just-admitted owner turn
             _register("owner002")
-        return real()
+        return real(**kwargs)
 
     monkeypatch.setattr(clock.clock, "live_turns", live_turns)
-    clock.clock.notify("project_digest:p1")
+    due = clock.clock.next_wake_at
     assert clock.clock.tick(T0 + FLOOR + 1) == "owner_turn_live"
-    assert clock.clock.pending_reason == "project_digest:p1"
+    assert clock.clock.next_wake_at == due  # still due: the next pass after the turn launches it
 
 
 # --- finish -----------------------------------------------------------------------
@@ -611,13 +601,13 @@ def test_finish_schedules_the_chosen_interval_clamped(clock, monkeypatch):
     assert clock.clock.next_wake_at == T0 + 5000 + DEFAULT
 
 
-def test_finish_with_a_pending_reason_wakes_after_the_floor(clock, monkeypatch):
+def test_events_during_a_wake_never_shorten_the_next_interval(clock, monkeypatch):
+    """The old finish-while-pending pull (``floor if pending_reason``) is gone: a task or
+    project event during a wake waits for the chosen interval as an observed fact."""
     finished = _launched(clock)
     monkeypatch.setattr(clock_module.time, "time", lambda: T0 + 5000)
-    clock.clock.notify("task_finished:xyz:failed")
     finished("wake0001", True)
-    assert clock.clock.next_wake_at == T0 + 5000 + FLOOR
-    assert clock.clock.pending_reason == "task_finished:xyz:failed"
+    assert clock.clock.next_wake_at == T0 + 5000 + DEFAULT
 
 
 def test_runner_failure_backs_off_by_doubling_until_a_wake_succeeds(clock, monkeypatch):
@@ -635,67 +625,41 @@ def test_runner_failure_backs_off_by_doubling_until_a_wake_succeeds(clock, monke
     assert clock.clock.next_wake_at == T0 + 5000 + DEFAULT
 
 
-# --- notify -----------------------------------------------------------------------
+# --- events never move the wake (#1603) --------------------------------------------
 
 
-def test_notify_pulls_the_next_wake_to_the_floor_after_the_last_wake(clock, monkeypatch):
-    clock.clock._next_wake_at = T0 + 3000
-    monkeypatch.setattr(clock_module.time, "time", lambda: T0 + 100)
-    clock.clock.notify("task_finished:a:completed")
-    assert clock.clock.next_wake_at == T0 + FLOOR  # no wake yet: the boot floor holds (booted at T0)
-    clock.clock._last_wake_at = T0
-    clock.clock._next_wake_at = T0 + 3000
-    clock.clock.notify("task_finished:b:completed")
-    assert clock.clock.next_wake_at == T0 + FLOOR  # arithmetic debounce off the last wake
-    clock.clock.notify("task_finished:c:completed")
-    assert clock.clock.next_wake_at == T0 + FLOOR and clock.clock.pending_reason == "task_finished:c:completed"
-    # A notify never pushes a nearer wake further away.
-    clock.clock._next_wake_at = T0 + 50
-    clock.clock.notify("task_finished:d:completed")
-    assert clock.clock.next_wake_at == T0 + 50
+def test_a_root_finishing_and_a_project_digest_never_reach_the_clock(monkeypatch, tmp_path):
+    """The producers of the old early wake are gone: a root's task_done and a project
+    digest leave the alarm alone (the digest still touches its project), and the
+    healed-orphan sweep still heals but has no callback left to report a count through."""
+    import inspect
 
-
-def test_task_done_notifies_for_roots_of_any_outcome_but_never_for_consciousness_origin():
-    from supervisor.events_task_done import _notify_consciousness_of_root_done
-
-    reasons: list = []
-    ctx = SimpleNamespace(consciousness=SimpleNamespace(notify=reasons.append))
-    _notify_consciousness_of_root_done(ctx, {}, None, {"status": "failed"}, {"task_id": "t1", "status": "failed"})
-    _notify_consciousness_of_root_done(ctx, {"delegation_role": "root"}, None, {}, {"task_id": "t2", "status": "completed"})
-    _notify_consciousness_of_root_done(ctx, {"delegation_role": "subagent"}, None, {}, {"task_id": "t3", "status": "completed"})
-    _notify_consciousness_of_root_done(ctx, {}, None, {"metadata": {"initiator": "consciousness"}},
-                                       {"task_id": "wake1", "status": "completed"})
-    _notify_consciousness_of_root_done(ctx, {}, {"initiator": "consciousness", "usage_category": "consciousness_task"}, {},
-                                       {"task_id": "started1", "status": "completed"})
-    # В13: the owner's own direct turn ending is not a wake reason (chatting would otherwise
-    # re-arm a wake at the floor after every reply) — whichever carrier says it is direct.
-    _notify_consciousness_of_root_done(ctx, {}, None, {}, {"task_id": "chat1", "status": "completed", "_is_direct_chat": True})
-    _notify_consciousness_of_root_done(ctx, {"_is_direct_chat": True}, None, {}, {"task_id": "chat2", "status": "completed"})
-    # A cancelled subagent whose RUNNING row is already gone: the event's metadata still says.
-    _notify_consciousness_of_root_done(ctx, {}, {"delegation_role": "subagent"}, {}, {"task_id": "sub1", "status": "cancelled"})
-    assert reasons == ["task_finished:t1:failed", "task_finished:t2:completed"]
-    # No alarm clock on the ctx (supervisor init failed) is not an error.
-    _notify_consciousness_of_root_done(SimpleNamespace(), {}, None, {}, {"task_id": "t4", "status": "completed"})
-
-
-def test_project_digest_and_orphan_heal_reach_notify(monkeypatch, tmp_path):
+    import supervisor.events_task_done as events_task_done
     from ouroboros import server_maintenance
     from supervisor.events_project_routing import _handle_project_digest
 
-    reasons: list = []
-    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, consciousness=SimpleNamespace(notify=reasons.append))
-    monkeypatch.setattr("ouroboros.projects_registry.touch_project", lambda root, pid: None)
+    assert not hasattr(events_task_done, "_notify_consciousness_of_root_done")
+    touched: list = []
+
+    class _Clock:
+        def __getattr__(self, name):
+            raise AssertionError(f"the alarm clock was touched: {name}")
+
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, consciousness=_Clock())
+    monkeypatch.setattr("ouroboros.projects_registry.touch_project", lambda root, pid: touched.append(pid))
     _handle_project_digest({"project_id": "p9", "task_id": "t9"}, ctx)
-    # A digest of a tree consciousness started is its own news: never a wake reason.
     _handle_project_digest({"project_id": "p9", "task_id": "t10", "initiator": "consciousness"}, ctx)
-    assert reasons == ["project_digest:p9:t9"]
+    assert touched == ["p9", "p9"]
     monkeypatch.setattr("ouroboros.skill_review_runner.reconcile_stale_review_jobs", lambda root: None)
-    monkeypatch.setattr("ouroboros.task_status.reconcile_orphaned_running_tasks", lambda root, **kw: 2)
+    healed: list = []
+    monkeypatch.setattr("ouroboros.task_status.reconcile_orphaned_running_tasks",
+                        lambda root, **kw: healed.append(root) or 2)
     monkeypatch.setattr("ouroboros.projects_registry.reconcile_projects", lambda root: None)
     monkeypatch.setattr(server_maintenance, "_resume_interrupted_project_deletions", lambda: None)
-    healed: list = []
-    server_maintenance._periodic_zombie_reconcile(on_orphans_healed=healed.append)
-    assert healed == [2]
+    server_maintenance._periodic_zombie_reconcile()
+    assert healed == [server_maintenance.DATA_DIR]
+    for name in ("_periodic_supervisor_maintenance", "_run_periodic_reconcile_sweep", "_periodic_zombie_reconcile"):
+        assert "on_orphans_healed" not in inspect.signature(getattr(server_maintenance, name)).parameters, name
 
 
 # --- owner controls ---------------------------------------------------------------
@@ -729,7 +693,7 @@ def test_start_and_stop_flip_the_flag_and_stop_arms_a_graceful_stop_of_a_live_wa
 def test_status_snapshot_carries_the_alarm_facts(clock):
     snapshot = clock.clock.status_snapshot()
     assert set(snapshot) == {
-        "enabled", "level", "next_wake_at", "pending_reason", "last_wake_at", "last_wake_task_id",
+        "enabled", "level", "next_wake_at", "last_wake_at", "last_wake_task_id",
         "last_wake_outcome", "last_error", "spent_24h_usd", "daily_usd", "allowance_resets_at",
         "tasks_running", "max_tasks", "live_wake_task_id", "unknown_unmetered", "integrity_degraded",
     }

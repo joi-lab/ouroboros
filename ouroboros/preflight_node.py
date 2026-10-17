@@ -18,6 +18,7 @@ pytest plugins).
 from __future__ import annotations
 
 import pathlib
+import os
 import shutil
 import subprocess
 import time
@@ -31,10 +32,10 @@ from ouroboros.platform_layer import probe_node_version, resolve_bundled_node
 NODE_MIN_VERSION = (20, 11)
 
 # The web package boundary and its test glob. `web/package.json` runs
-# `node --test tests/*.test.js` FROM web/, and both CI jobs mirror that exact
-# step; the parity test derives the CI command from these two constants, so the
-# gate, CI, and the package script cannot drift apart silently. The gate globs
-# in Python (sorted, cross-platform) instead of relying on a shell.
+# `node --test tests/*.test.js` FROM web/; the gate and both CI jobs (through
+# `scripts/run_tests.py --node`) run `candidate_node_tests` over these two
+# constants, so the gate, CI, and the package script cannot drift apart silently.
+# The lane globs in Python (sorted, cross-platform) instead of relying on a shell.
 WEB_DIR = "web"
 TESTS_GLOB = "tests/*.test.js"
 
@@ -75,6 +76,22 @@ def resolve_node() -> Optional[str]:
     except Exception:
         bundled = None
     return bundled or shutil.which("node")
+
+
+def node_environment(env: dict) -> dict:
+    """Give Python tests and their children the Node selected for the web lane.
+    Preserve other PATH entries; discovery alone adds no runtime requirement or probe."""
+    projected = dict(env)
+    node = resolve_node()
+    if node:
+        current = shutil.which("node", path=env.get("PATH", os.defpath))
+        if pathlib.Path(node).is_absolute() and os.path.normcase(node) == os.path.normcase(current or ""):
+            return projected  # The selected Node is already reachable; keep other tool precedence.
+        directory = str(pathlib.Path(node).absolute().parent)
+        entries = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+        projected["PATH"] = os.pathsep.join([directory, *(entry for entry in entries
+            if os.path.normcase(entry) != os.path.normcase(directory))])
+    return projected
 
 
 def _version_tuple(version: str) -> tuple:
@@ -148,7 +165,7 @@ def run_node_tests(
     # reaped unconditionally, and a live-or-undeterminable leftover is a hard
     # block whatever the exit code said. Run from the candidate's web/ with
     # web-relative paths so imports resolve exactly as under `npm test`.
-    container = ProcessContainer()
+    container = ProcessContainer(lifeline=True, overload=True)
     started = time.monotonic()
     # NODE_OPTIONS admits --test-only/--test-*-pattern/--require: an inherited
     # operator value can silently green a red suite — same class the pytest
@@ -156,7 +173,7 @@ def run_node_tests(
     env = pr._preflight_env(temp_root, worktree)
     env.pop("NODE_OPTIONS", None)
     proc = container.spawn(
-        [node, "--test", *files],
+        [node, "--test", f"--test-concurrency={env['PYTEST_XDIST_AUTO_NUM_WORKERS']}", *files],
         cwd=str(pathlib.Path(worktree) / WEB_DIR),
         env=env,
         stdout=subprocess.PIPE,

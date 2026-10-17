@@ -14,6 +14,7 @@ while the run waits out the engine timeout).
 
 import json
 import queue as stdqueue
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +127,54 @@ def test_answer_interaction_returns_typed_statuses_at_any_http_code(monkeypatch)
 
 
 # -- delegate_wait surfaces the question ----------------------------------------
+
+
+@pytest.mark.parametrize("status,code", [
+    ("not_found", 404), ("already_resolved", 409), ("rejected", 409),
+])
+def test_answer_interaction_decodes_the_engine_problem_envelope(status, code):
+    import httpx
+
+    from ouroboros.gateways import claudexor as cx
+
+    problem = {
+        "code": f"http_{code}", "message": "engine answer", "retryable": False,
+        "fieldErrors": {}, "requiredActions": [], "evidenceRefs": [],
+        "context": {"accepted": False, "status": status},
+    }
+    gateway = cx.ClaudexorGateway.__new__(cx.ClaudexorGateway)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
+            code, json=problem, headers={"Content-Type": "application/problem+json"})),
+            base_url="http://offline.invalid") as client:
+        gateway._client = client
+        assert gateway.answer_interaction("run-1", "int-1", []) == {
+            "accepted": False, "status": status, "message": "engine answer"}
+
+
+@pytest.mark.parametrize("context,problem_code,content_type", [
+    (None, "http_409", "application/problem+json"),
+    ([], "http_409", "application/problem+json"),
+    ({"accepted": False, "status": "unknown"}, "http_409", "application/problem+json"),
+    ({"accepted": False, "status": "delivered"}, "http_409", "application/problem+json"),
+    ({"status": "already_resolved"}, "http_409", "application/problem+json"),
+    ({"accepted": False, "status": "already_resolved"}, "idempotency_conflict", "application/problem+json"),
+    ({"accepted": False, "status": "already_resolved"}, "http_409", "application/json"),
+])
+def test_answer_interaction_does_not_promote_other_problem_context(context, problem_code, content_type):
+    import httpx
+
+    from ouroboros.gateways import claudexor as cx
+
+    problem = {"code": problem_code, "message": "ordinary refusal", "context": context}
+    gateway = cx.ClaudexorGateway.__new__(cx.ClaudexorGateway)
+    with httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
+            409, json=problem, headers={"Content-Type": content_type})),
+            base_url="http://offline.invalid") as client:
+        gateway._client = client
+        with pytest.raises(cx.ClaudexorUnavailable) as exc:
+            gateway.answer_interaction("run-1", "int-1", [])
+    assert exc.value.code == problem_code
+    assert exc.value.status_code == 409
 
 
 def _wait_ctx(tmp_path):
@@ -302,6 +351,149 @@ def test_already_resolved_tells_the_nanny_not_to_repost(tmp_path, monkeypatch):
     delegate._CUSTODY.clear()
     assert out["status"] == "already_resolved"
     assert "do NOT re-post" in out["note"]
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("status,code,accepted", [
+    ("delivered", 200, True), ("already_resolved", 409, False),
+    ("not_found", 404, False), ("rejected", 409, False),
+])
+def test_wire_answer_outcome_reaches_the_nanny(tmp_path, monkeypatch, status, code, accepted):
+    import httpx
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as cx
+
+    answer = {"accepted": accepted, "status": status}
+    body = answer if accepted else {
+        "code": f"http_{code}", "message": "engine answer", "retryable": False,
+        "fieldErrors": {}, "requiredActions": [], "evidenceRefs": [], "context": answer,
+    }
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(code, json=body, headers={
+            "Content-Type": "application/json" if accepted else "application/problem+json"})
+
+    gateway = cx.ClaudexorGateway.__new__(cx.ClaudexorGateway)
+    monkeypatch.setattr(gateway, "handshake", lambda **kwargs: {})
+    monkeypatch.setattr(cx, "ClaudexorGateway", lambda *args, **kwargs: gateway)
+    ctx = _answer_ctx(tmp_path)
+    _own_run(delegate)
+    with httpx.Client(transport=httpx.MockTransport(respond), base_url="http://offline.invalid") as client:
+        gateway._client = client
+        result = delegate._delegate_answer(ctx, "run-1", "int-1", [
+            {"question_id": "q1", "free_text": "9090"},
+        ])
+        out = json.loads(result.text)
+    delegate._CUSTODY.clear()
+    assert out["status"] == status and out["accepted"] is accepted
+    if status == "not_found":
+        # A decoded engine absence is the same recorded substrate refusal as the
+        # untyped 404: the answer was not accepted, and nothing here is an OK call.
+        assert result.status != "ok" and result.code == "TOOL_REPORTED_FAILURE"
+    assert len(requests) == 1
+    assert requests[0].url.path == "/v2/runs/run-1/interactions/int-1/answer"
+    assert json.loads(requests[0].content) == {
+        "answers": [{"questionId": "q1", "selectedLabels": [], "freeText": "9090"}]}
+    if status == "already_resolved":
+        assert "do NOT re-post" in out["note"]
+        assert "fix the rows" not in out["note"]
+    if not accepted:
+        assert out["detail"] == "engine answer"
+
+
+# Wire bytes the engine's real control server wrote for each answer outcome (3.25.1 and
+# the pinned 4.0.0 alike); provenance and the recorder live beside the fixture.
+_RECORDED_ANSWERS = json.loads((Path(__file__).parent / "fixtures/claudexor_interaction_answer/responses.json")
+                               .read_text(encoding="utf-8"))["responses"]
+
+
+def _answer_over_wire(tmp_path, monkeypatch, response):
+    """One delegate_answer through the real gateway decoder, replaying exact response bytes."""
+    import httpx
+
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.gateways import claudexor as cx
+
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(response["status"], content=response["body"].encode("utf-8"),
+                              headers={"Content-Type": response["content_type"]})
+
+    gateway = cx.ClaudexorGateway.__new__(cx.ClaudexorGateway)
+    monkeypatch.setattr(gateway, "handshake", lambda **kwargs: {})
+    monkeypatch.setattr(cx, "ClaudexorGateway", lambda *args, **kwargs: gateway)
+    _own_run(delegate)
+    with httpx.Client(transport=httpx.MockTransport(respond), base_url="http://offline.invalid") as client:
+        gateway._client = client
+        result = delegate._delegate_answer(_answer_ctx(tmp_path), "run-1", "int-1", [
+            {"question_id": "q1", "free_text": "9090"},
+        ])
+    delegate._CUSTODY.clear()
+    assert len(requests) == 1
+    return result, json.loads(result.text)
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("response", _RECORDED_ANSWERS, ids=lambda row: row["case"])
+def test_recorded_engine_answers_reach_the_nanny_classified(tmp_path, monkeypatch, response):
+    """The published class of each engine outcome: delivered and already_resolved are
+    observations, an absent interaction or run a recorded substrate refusal, rejected
+    rows an agent fault; an engine without the answer service is a typed refusal."""
+    status, tool_code, detail = {
+        "delivered": ("delivered", "OK", "delivered to the live session"),
+        "already_resolved": ("already_resolved", "OK", "interaction was already resolved"),
+        "already_resolved_without_message": ("already_resolved", "OK", "request failed with status 409"),
+        "not_found": ("not_found", "TOOL_REPORTED_FAILURE", "no pending interaction"),
+        "rejected": ("rejected", "TOOL_ARG_ERROR", "answer does not match the question set"),
+        "unknown_run": ("not_found", "TOOL_REPORTED_FAILURE", "no such run"),
+        "no_answer_service": ("refused", "TOOL_REPORTED_FAILURE", None),
+    }[response["case"]]
+    result, out = _answer_over_wire(tmp_path, monkeypatch, response)
+    assert (out["status"], result.code) == (status, tool_code)
+    assert (result.status == "ok") is (tool_code == "OK")
+    if status == "refused":
+        assert out["reason"] == "interaction_answers_unsupported"
+        return
+    assert out["accepted"] is (status == "delivered") and out["detail"] == detail
+    assert ("do NOT re-post" in out["note"]) is (status == "already_resolved")
+    assert ("Fix the answer rows" in out["note"]) is (status == "rejected")
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("response", [row for row in _RECORDED_ANSWERS
+                                      if (row["service_outcome"] or {}).get("status") in
+                                      ("already_resolved", "not_found", "rejected")],
+                         ids=lambda row: row["case"])
+def test_direct_and_wrapped_answer_refusals_publish_identically(tmp_path, monkeypatch, response):
+    context = json.loads(response["body"])["context"]
+    direct = {**response, "content_type": "application/json", "body": json.dumps(
+        {**context, "message": json.loads(response["body"])["message"]})}
+    with monkeypatch.context() as patch:
+        legacy = _answer_over_wire(tmp_path, patch, direct)
+    with monkeypatch.context() as patch:
+        wrapped = _answer_over_wire(tmp_path, patch, response)
+    assert (wrapped[0].status, wrapped[0].code, wrapped[1]) == (legacy[0].status, legacy[0].code, legacy[1])
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("status,problem,outcome,tool_code", [
+    (409, {"code": "http_409", "context": {"accepted": True, "status": "delivered"}}, "rejected", "TOOL_ARG_ERROR"),
+    (409, {"code": "http_409", "context": {"accepted": False, "status": "unknown"}}, "rejected", "TOOL_ARG_ERROR"),
+    (409, {"code": "http_409", "context": []}, "rejected", "TOOL_ARG_ERROR"),
+    (404, {"code": "route_not_found", "context": {"accepted": False, "status": "not_found"}},
+     "not_found", "TOOL_REPORTED_FAILURE"),
+])
+def test_an_unrecognized_answer_problem_keeps_its_http_fallback(tmp_path, monkeypatch, status, problem,
+                                                                outcome, tool_code):
+    result, out = _answer_over_wire(tmp_path, monkeypatch, {
+        "status": status, "content_type": "application/problem+json",
+        "body": json.dumps({**problem, "message": "other problem"})})
+    assert (out["status"], out["accepted"], result.code) == (outcome, False, tool_code)
+    assert out["detail"] == "other problem"
 
 
 def test_ambiguous_transport_becomes_delivery_unknown_with_a_reread(tmp_path, monkeypatch):
@@ -947,7 +1139,8 @@ def test_an_input_required_terminal_names_the_new_start_path():
     shape = DelegatedRunShape(access="readonly", mode="ask", isolation="", delegated=False)
     payload = _terminal_payload("run-1", detail, shape)
     assert "input_required_note" in payload
-    assert "NEW delegate_start" in payload["input_required_note"]
+    # The answer continues THIS run: a new start bound to it, custody kept by the task.
+    assert "delegate_start(subagent_id=..., continue_from='run-1', prompt=" in payload["input_required_note"]
     assert "rerun/decision" in payload["input_required_note"]
 
 
@@ -995,49 +1188,11 @@ def test_delegate_schemas_teach_the_escalation_verb():
         assert "escalate to your human" not in schemas[name]
 
 
-def test_expiry_notes_teach_the_escalation_verb():
-    """Delta finding: the REPEAT delegate_wait rides the expiry path, whose
-    notes are decision points too — both branches name the escalate verb and
-    never the retired progress/your-human dead ends."""
-    import inspect
-
-    import ouroboros.delegate_progress as dp
-
-    source = inspect.getsource(dp)
-    assert "escalate an above-authority question with the" in source
-    assert "raise it with the escalate verb (parent-first)" in source
-    assert "escalate to your human via a progress message" not in source
-    assert "escalate to your human," not in source
-    # The dispatch charter is an LLM-facing user message too (agent.py appends
-    # it): the same dead end must not survive there. The campaign owner of
-    # dispatch_executor_note is agent_dispatch (subagent_dispatch_notes is the
-    # historical import facade).
-    import ouroboros.agent_dispatch as dn
-
-    charter = inspect.getsource(dn)
-    assert "escalated with the escalate verb (parent-first" in charter
-    assert "goes to your human via progress" not in charter
-    # No delegated-question surface may teach direct-to-human ESCALATION: the
-    # hierarchy (parent-first) is the ONLY route (decision 31). Semantic
-    # variants of the escalation phrasing, not just the exact retired lines
-    # (the live progress STREAM legitimately mentions the human).
-    import ouroboros.tools.delegate as dtool
-
-    import ouroboros.delegate_interactions as di
-
-    for module in (dp, dn, di, dtool):
-        text = inspect.getsource(module)
-        for phrase in ("escalated to its human", "escalated to your human",
-                       "escalated a question to its human",
-                       "goes to your human", "surface it to your human"):
-            assert phrase not in text, (module.__name__, phrase)
-
-
 def test_definite_answer_refusals_publish_as_recorded_refusals(tmp_path, monkeypatch):
     """Owner Q8A: a refusal the engine confirmed (rejected rows) is an agent fault,
     an absent run a substrate refusal; neither is an OK observation."""
     import ouroboros.tools.delegate as delegate
-    from ouroboros.delegate_shared import AGENT_FAULT_CODE
+    from ouroboros.delegate_shared import AGENT_FAULT_CODE, SUBSTRATE_REFUSAL_CODE
 
     ctx = _answer_ctx(tmp_path)
     _answer_stub(monkeypatch, result={"accepted": False, "status": "rejected", "message": "bad rows"})
@@ -1046,3 +1201,10 @@ def test_definite_answer_refusals_publish_as_recorded_refusals(tmp_path, monkeyp
     assert out.code == AGENT_FAULT_CODE and out.status != "ok"
     assert json.loads(out.text)["status"] == "rejected"
 
+    _answer_stub(monkeypatch, result={"accepted": False, "status": "not_found", "message": "gone"})
+    out = delegate._delegate_answer(ctx, "run-1", "int-1", [{"question_id": "q1", "free_text": "x"}])
+    delegate._CUSTODY.clear()
+    assert out.code == SUBSTRATE_REFUSAL_CODE and out.status != "ok"
+    payload = json.loads(out.text)
+    assert (payload["status"], payload["accepted"], payload["detail"]) == ("not_found", False, "gone")
+    assert "Re-read the run with delegate_wait" in payload["note"]

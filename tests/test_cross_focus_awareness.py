@@ -12,10 +12,12 @@ import pytest
 
 from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
 from ouroboros.utils import atomic_write_json, utc_now_iso
+from tests._shared import write_queue_document
+from tests._store_shared import read_result
 
 
 def _queue_snapshot(root, rows):
-    atomic_write_json(root / "state" / "queue_snapshot.json", {
+    write_queue_document(root / "state" / "queue_snapshot.json", {
         "ts": utc_now_iso(), "running": rows, "pending": [],
     })
 
@@ -37,11 +39,11 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     refused = _update_focus(ctx, "Investigating the migration seam",
                             {"reader": "journal_read", "project_id": "alpha", "snapshot": "abc"})
     assert "FOCUS_SOURCE_UNRESOLVED" in refused and "JOURNAL_READ_SNAPSHOT_CHANGED" in refused
-    assert "focus" not in json.loads((tmp_path / "task_results" / "root.json").read_text())
+    assert "focus" not in read_result(tmp_path, "root")
     assert events == []
     result = _update_focus(ctx, "Investigating the migration seam", {"reader": "journal_read", "project_id": "alpha"})
     assert result.startswith("OK: focus[root]")
-    stored = json.loads((tmp_path / "task_results" / "root.json").read_text())
+    stored = read_result(tmp_path, "root")
     assert stored["focus"]["text"] == "Investigating the migration seam"
     assert events[0]["type"] == "task_focus_updated"
     # The reader's exact answer is RETAINED beside the focus: the pointer keeps
@@ -87,7 +89,7 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     later = _update_focus(ctx, "Second focus, new page", {"reader": "journal_read", "project_id": "alpha"})
     assert later.startswith("OK: focus[root]")
     current = json.loads(_get_task_result(peer, "root", include_focus_source=True, source_start_char=0, source_end_char=20))["focus_source"]
-    assert current["complete_sha256"] != handle["sha256"] and "later evidence" in (tmp_path / "task_results" / "artifacts" / "root" / json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["source_handle"]["path"]).read_text()
+    assert current["complete_sha256"] != handle["sha256"] and "later evidence" in (tmp_path / "task_results" / "artifacts" / "root" / read_result(tmp_path, "root")["focus"]["source_handle"]["path"]).read_text()
     historical = json.loads(_get_task_result(peer, "root", include_focus_source=True, focus_source_sha256=handle["sha256"], source_start_char=0, source_end_char=20))["focus_source"]
     assert historical["complete_sha256"] == handle["sha256"] and historical["historical"] is True and historical["text"] == retained.decode("utf-8")[:20]
     assert json.loads(_get_task_result(peer, "root", include_focus_source=True, focus_source_sha256="0" * 64))["focus_source"]["reason"] == "source_unavailable"
@@ -137,7 +139,7 @@ def test_live_catalogue_and_roster_tail_are_stable_and_include_direct_focus(tmp_
         "authored_at": utc_now_iso(), "author_task_id": "pooled",
     }
     _queue_snapshot(tmp_path, [{"id": "pooled", "task": {"id": "pooled", "title": "Pool", "project_id": "alpha", "focus": focus}}])
-    atomic_write_json(tmp_path / "state" / "direct_roots.json", {
+    write_queue_document(tmp_path / "state" / "direct_roots.json", {
         "ts": utc_now_iso(), "incomplete": False,
         "roots": [{"task_id": "direct", "title": "Direct", "project_id": "alpha", "chat_id": 3, "focus": focus}],
     })
@@ -160,12 +162,12 @@ def test_focus_event_cannot_alias_root_and_source_freshness_controls_mailbox(tmp
 
     _queue_snapshot(tmp_path, [{"id": "pooled", "task": {"id": "pooled", "title": "Pool"}}])
     fresh = datetime.now(timezone.utc).isoformat()
-    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": fresh, "roots": [{"task_id": "direct", "title": "Direct"}], "incomplete": False})
+    write_queue_document(tmp_path / "state" / "direct_roots.json", {"ts": fresh, "roots": [{"task_id": "direct", "title": "Direct"}], "incomplete": False})
     before = roster_fingerprint(independent_roots(tmp_path))
     assert host_listed_independent_root(tmp_path, "pooled") is not None
     assert host_listed_independent_root(tmp_path, "direct") is not None
     old = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
-    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": old, "roots": [{"task_id": "direct", "title": "Direct"}], "incomplete": False})
+    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": old, "generation": "previous-generation", "roots": [{"task_id": "direct", "title": "Direct"}], "incomplete": False})
     _queue_snapshot(tmp_path, [{"id": "pooled", "task": {"id": "pooled", "title": "Pool"}}])
     after = roster_fingerprint(independent_roots(tmp_path))
     assert before != after
@@ -234,7 +236,7 @@ def test_source_ref_is_a_real_reader_contract_and_catalogue_token_ignores_heartb
     assert source_schema["type"] == "object" and "oneOf" not in source_schema
     _queue_snapshot(tmp_path, [{"id": "root", "task": {"id": "root", "title": "Root"}}])
     first = live_root_catalogue(tmp_path, limit=1)
-    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {
         "ts": "2099-01-01T00:00:00Z", "running": [{"id": "root", "task": {"id": "root", "title": "Root"}}], "pending": [],
     })
     second = live_root_catalogue(tmp_path, limit=1)
@@ -338,7 +340,7 @@ def test_focus_source_honours_the_task_contract_disabled_tools(tmp_path, monkeyp
     refused = _update_focus(ctx, "Reading what I may not", {"reader": "journal_read", "project_id": "alpha"})
     assert "FOCUS_SOURCE_UNRESOLVED" in refused and "withheld" in refused
     assert not list((tmp_path / "task_results" / "artifacts").glob("**/focus_source_*")) 
-    assert "focus" not in json.loads((tmp_path / "task_results" / "root.json").read_text())
+    assert "focus" not in read_result(tmp_path, "root")
 
 
 def test_schema_default_offset_zero_follows_the_omitted_path():
@@ -362,9 +364,9 @@ def test_replayed_older_queue_focus_never_replaces_a_newer_durable_focus(tmp_pat
     agent = OuroborosAgent.__new__(OuroborosAgent)
     agent.env = types.SimpleNamespace(drive_root=tmp_path, budget_drive_root=str(tmp_path))
     agent._persist_running_record({"id": "root", "description": "d", "focus": older})
-    assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newer"
+    assert read_result(tmp_path, "root")["focus"]["text"] == "newer"
     agent._persist_running_record({"id": "root", "description": "d", "focus": {**newer, "text": "newest", "authored_at": "2026-01-03T00:00:00+00:00"}})
-    assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newest"
+    assert read_result(tmp_path, "root")["focus"]["text"] == "newest"
 
 
 def _roster_rows(root):
@@ -449,7 +451,7 @@ def test_budget_paused_root_keeps_dated_focus_and_a_legacy_wait_stays_undated(tm
     write_task_result(tmp_path, "legacy", STATUS_RUNNING,
                       owner_wait={"wait_id": "w0", "state": "waiting", "quiz_id": "q0", "task_attempt": 1,
                                   "started_at": 1790406000.0})
-    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {
         "ts": utc_now_iso(),
         "running": [{"id": "legacy", "attempt": 1, "started_at": 1790406000.0, "task": {"id": "legacy", "title": "Old"}}],
         "pending": [{"id": "paused", "attempt": 1, "task": {"id": "paused", "title": "Paused", "_attempt": 1,
@@ -504,7 +506,7 @@ def test_direct_fragment_carries_name_start_and_typed_origin_until_the_result_ex
                                        "origin": {"owner_ingress": False, "initiator": "consciousness", "task_type": "task"}}
     assert direct_turn_facts({"id": "bare"}) == {}
     _queue_snapshot(tmp_path, [])
-    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
+    write_queue_document(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
         {"task_id": "direct1", "title": "", "chat_id": 3, "project_id": "", **direct_turn_facts(owner_turn)},
         {"task_id": "wake1", "title": "", "chat_id": 3, "project_id": "", **direct_turn_facts(wake)},
     ]})
@@ -520,7 +522,7 @@ def test_direct_fragment_carries_name_start_and_typed_origin_until_the_result_ex
     listed = host_listed_independent_root(tmp_path, "wake1")
     assert listed is not None and listed["status"] == "running" and listed["direct_chat"] is True
     # A malformed fragment origin is dropped, not echoed.
-    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
+    write_queue_document(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
         {"task_id": "odd", "title": "T", "origin": {"initiator": {"nested": "x"}, "owner_ingress": "yes", "extra": "z"}},
     ]})
     assert "origin" not in _roster_rows(tmp_path)["odd"]

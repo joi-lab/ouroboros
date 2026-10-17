@@ -33,7 +33,7 @@ INTERACTIVE_DETAIL = "interactive_wait_window_exhausted"
 # A managed episode's owner-visible texts are a frozen contract: these are the
 # literal wordings the base emits, and the ONLY notes a managed episode gets.
 BASE_MANAGED_ENTRY = (
-    "🌐 Could not establish a provider connection — waiting and "
+    "🌐 The request did not reach the provider — waiting and "
     "redialing automatically (failed attempts are $0). Stop cancels."
 )
 BASE_MANAGED_RECOVERY = "🌐 Provider connection restored after 1.5 min — resuming."
@@ -257,7 +257,7 @@ def test_deadline_refused_redial_uses_the_same_signed_attribution(tmp_path, monk
     if case == "managed":
         assert notes.texts == []  # a managed exhaustion is its terminal result, not a note
     else:
-        assert "this turn ends as a provider outage" in notes.texts[-1]
+        assert "this turn ends as an outage" in notes.texts[-1]
 
 
 # ------------------------------------------- final free redial at the bound
@@ -395,7 +395,7 @@ def test_interactive_notes_promise_no_cancellation_and_the_managed_note_still_do
         assert len(notes.texts) >= 3  # entry, at least one periodic, exhaustion
         assert all("cancel" not in text.lower() for text in notes.texts)
         assert "waiting and redialing automatically" in notes.texts[0]
-        assert "this turn ends as a provider outage" in notes.texts[-1]
+        assert "this turn ends as an outage" in notes.texts[-1]
         assert all("chat turn" not in text for text in notes.texts)
 
 

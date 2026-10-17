@@ -1,28 +1,23 @@
-"""The optional ``deep_review`` reviewer row (Ф3, owner decisions R6/R7).
+"""The deep self-review's reviewer row (Ф3 R6/R7; PR-3 decision 3A).
 
-Deep self-review joins the shared reviewer-row vocabulary as ONE optional
-singleton row: absent, the api row is synthesized from the legacy model key
-``OUROBOROS_MODEL_DEEP_SELF_REVIEW`` (the invisible migration source), so every
-existing install keeps a working row; present, the row names its route and its
-own effort outranks the surface key. Delivery is retrieval either way — an api
-row is the bounded native inspection episode, a session row a delegated run.
+Deep self-review runs on ONE reviewer row of the shared vocabulary: the direct
+Main row when nothing names another (the retired ``deep_review`` lane row and
+``OUROBOROS_MODEL_DEEP_SELF_REVIEW`` key reach it only through the migration), or
+the row a caller hands in (``review_change(subject=system)`` naming a catalog
+row). Delivery is retrieval either way — an api row is the bounded native
+inspection episode, a session row a delegated run.
 """
 
-import asyncio
 import json
 import ntpath
 
 import pytest
 
-from ouroboros.reviewer_slot_config import (
-    DEEP_REVIEW_SLOT_ID,
-    REVIEWER_SLOTS_ENV,
-    deep_review_slot,
-    load_reviewer_slot_config,
-    parse_reviewer_slots,
-    reviewer_slot_save_check,
-    row_effort,
-)
+pytestmark = pytest.mark.usefixtures("provider_catalog_offline")
+
+# The row identity the retired lane minted for its singleton; the executions
+# below are keyed by the row they ran on, so any fixed id serves the tests.
+_DEEP_SLOT_ID = "deep_review_slot_1"
 
 _ROSTER = {
     "enabled": True,
@@ -36,165 +31,12 @@ _ROSTER = {
 }
 
 
-def _payload(deep_review=None, **extra):
-    body = {
-        "triad": [{"slot_id": "t1", "route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-luna"}}],
-        "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-terra"}}],
-        **extra,
-    }
-    if deep_review is not None:
-        body["deep_review"] = deep_review
-    return json.dumps(body)
-
-
 @pytest.fixture()
 def env(monkeypatch):
     monkeypatch.setenv("OUROBOROS_SUBAGENTS", json.dumps(_ROSTER))
-    for key in ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODEL",
-                "OUROBOROS_ADVISORY_REVIEW_ROUTE", REVIEWER_SLOTS_ENV):
+    for key in ("OUROBOROS_REVIEW_MODELS", "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_EFFORT_DEEP_SELF_REVIEW"):
         monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "openai/legacy-deep-model")
-    monkeypatch.setenv("OUROBOROS_EFFORT_DEEP_SELF_REVIEW", "low")
     return monkeypatch
-
-
-def _get_endpoint():
-    from starlette.requests import Request
-
-    from ouroboros.gateway.settings import api_reviewer_slots
-
-    request = Request({"type": "http", "method": "GET", "path": "/api/reviewer-slots",
-                       "headers": [], "query_string": b""})
-    return json.loads(asyncio.run(api_reviewer_slots(request)).body)
-
-
-def test_deep_review_row_parses_on_the_shared_vocabulary(env):
-    """Direct api, direct session (with the manual pin) and a configured-subagent
-    reference all parse through the ONE row parser; the identity is fixed."""
-    api = parse_reviewer_slots(_payload(
-        {"route": {"kind": "api_chat", "target_id": "openai/gpt-5.6-sol-pro"}, "effort": "xhigh"})).deep_review
-    assert api.slot_id == DEEP_REVIEW_SLOT_ID and api.kind == "api_chat"
-    assert api.target_id == "openai/gpt-5.6-sol-pro" and api.effort == "xhigh"
-    assert api.retrieves is False and api.native_retrieval is False
-
-    session = parse_reviewer_slots(_payload(
-        {"route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol", "profile_id": "koshak"}})).deep_review
-    assert session.is_session and session.session_target == "codex=gpt-5.6-sol"
-    assert session.profile_id == "koshak" and session.retrieves is True
-
-    actor = parse_reviewer_slots(_payload({"subagent_id": "api-critic"})).deep_review
-    assert actor.subagent_id == "api-critic" and actor.kind == "api_chat"
-    assert actor.target_id == "openai/gpt-5.6-terra" and actor.effort == "medium"
-    assert actor.native_retrieval is True and actor.retrieves is True
-
-    # Absent is absent — never an empty placeholder row.
-    assert parse_reviewer_slots(_payload()).deep_review is None
-
-
-@pytest.mark.parametrize("row, fragment", [
-    ({"route": {"kind": "api_chat", "target_id": "m"}, "slot_id": "mine"}, "unknown keys"),
-    ({"route": {"kind": "api_chat", "target_id": "m"}, "enabled": True}, "unknown keys"),
-    ({"route": {"kind": "api_chat", "target_id": "m"}, "bogus": 1}, "unknown keys"),
-    ({"route": {"kind": "api_chat", "target_id": "m"}, "subagent_id": "api-critic"}, "either route or"),
-    ({"subagent_id": "nobody"}, "does not resolve"),
-    ({"route": {"kind": "agent_session", "target_id": "off"}}, "concrete harness route"),
-    ({"route": {"kind": "api_chat", "target_id": "m"}, "effort": "turbo"}, "unknown effort"),
-    ("openai/x", "must be an object"),
-])
-def test_deep_review_row_refuses_typed_like_every_other_row(env, row, fragment):
-    with pytest.raises(ValueError, match=fragment):
-        parse_reviewer_slots(_payload(row))
-
-
-def test_deep_review_identity_is_fixed_and_cannot_be_reused_by_another_row(env):
-    """The singleton's id lives in the SAME identity space as the other rows:
-    a triad row squatting on it collides, so receipts keep ONE history."""
-    body = json.loads(_payload({"route": {"kind": "api_chat", "target_id": "m"}}))
-    body["triad"][0]["slot_id"] = DEEP_REVIEW_SLOT_ID
-    with pytest.raises(ValueError, match="appears twice"):
-        parse_reviewer_slots(json.dumps(body))
-
-
-def test_deep_review_slot_synthesizes_the_api_row_from_the_model_key(env):
-    """No row saved (structured without the key, or legacy comma keys): a BARE
-    api row on the legacy model key — the same route the install already had,
-    with no fabricated subagent binding (`subagent_id` stays empty)."""
-    for setup in ("structured", "legacy"):
-        if setup == "structured":
-            env.setenv(REVIEWER_SLOTS_ENV, _payload())
-        else:
-            env.delenv(REVIEWER_SLOTS_ENV, raising=False)
-        row = deep_review_slot()
-        assert row.slot_id == DEEP_REVIEW_SLOT_ID and row.kind == "api_chat"
-        assert row.target_id == "openai/legacy-deep-model"
-        assert row.retrieves is False and row.subagent_id == "" and row.effort == ""
-    # A saved row wins over the key.
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "api_chat", "target_id": "openai/saved"}}))
-    assert deep_review_slot().target_id == "openai/saved"
-    # A caller that already parsed the setting hands its config over (no second parse).
-    config = load_reviewer_slot_config()
-    assert deep_review_slot(config) is config.deep_review
-
-
-def test_deep_review_row_effort_outranks_the_surface_key_only_when_set(env):
-    """R6: the row's effort is the authority when it names one; the synthesized
-    row (and a saved row with no effort) keeps the surface key."""
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "api_chat", "target_id": "m"}, "effort": "xhigh"}))
-    assert row_effort(deep_review_slot(), "deep_self_review") == "xhigh"
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "api_chat", "target_id": "m"}}))
-    assert row_effort(deep_review_slot(), "deep_self_review") == "low"
-    env.setenv(REVIEWER_SLOTS_ENV, _payload())
-    assert row_effort(deep_review_slot(), "deep_self_review") == "low"
-    # A compound Cursor slug on a session row carries its own effort (shared rule).
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "agent_session", "target_id": "cursor=cursor-grok-4.6-xhigh"}}))
-    assert row_effort(deep_review_slot(), "deep_self_review") == "xhigh"
-
-
-def test_malformed_deep_review_refuses_the_whole_setting(env):
-    """The parser is ONE authority: a bad deep_review row is a save-time 400 and
-    a runtime typed error, never a silent fallback onto the model key."""
-    bad = _payload({"route": {"kind": "api_chat", "target_id": "m"}, "bogus": 1})
-    with pytest.raises(ValueError, match="deep_review has unknown keys"):
-        reviewer_slot_save_check(bad)
-    env.setenv(REVIEWER_SLOTS_ENV, bad)
-    with pytest.raises(ValueError, match="deep_review has unknown keys"):
-        deep_review_slot()
-    # A valid row passes the save check (and produces no acceptance warning).
-    assert reviewer_slot_save_check(_payload({"subagent_id": "session-critic"})) == ""
-
-
-def test_reviewer_slots_endpoint_reports_the_deep_review_row_and_its_limit(env):
-    env.setenv(REVIEWER_SLOTS_ENV, _payload())
-    body = _get_endpoint()
-    assert body["limits"]["deep_review"] == 1
-    # Synthesized: the effective row is shown AND labeled as not saved yet.
-    assert body["deep_review"] == {
-        "route": {"kind": "api_chat", "target_id": "openai/legacy-deep-model"},
-        "effort": "",
-        "processing_preference": "",
-        "synthesized_from": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
-    }
-    # Saved direct session row: the stored form round-trips with its pin, unlabeled.
-    env.setenv(REVIEWER_SLOTS_ENV, _payload(
-        {"route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol", "profile_id": "koshak"}, "effort": "high"}))
-    body = _get_endpoint()
-    assert body["deep_review"] == {
-        "route": {"kind": "agent_session", "target_id": "codex=gpt-5.6-sol", "profile_id": "koshak"},
-        "effort": "high",
-        "processing_preference": "",
-    }
-    # Saved reference: the subagent_id IS the stored form; the route is disclosure only.
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"subagent_id": "api-critic"}))
-    row = _get_endpoint()["deep_review"]
-    assert row["subagent_id"] == "api-critic" and "route" not in row and "slot_id" not in row
-    assert row["resolved_route"] == {"kind": "api_chat", "target_id": "openai/gpt-5.6-terra"}
-    # Unconfigured install: the synthesized row is reported the same way.
-    # ABI 7.0 (ABI-10) retired the comma-list "legacy" source, so an install
-    # without the structured key reports the shipped default panel instead.
-    env.delenv(REVIEWER_SLOTS_ENV, raising=False)
-    body = _get_endpoint()
-    assert body["source"] == "default"
-    assert body["deep_review"]["synthesized_from"] == "OUROBOROS_MODEL_DEEP_SELF_REVIEW"
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +56,7 @@ from ouroboros.deep_self_review import (  # noqa: E402
 )
 from ouroboros.review_execution import ReviewAttemptResult, ReviewRouteKind, ReviewRouteUnavailable  # noqa: E402
 from ouroboros.reviewer_slot_config import ConfiguredReviewerSlot, reviewer_slot_last_executions  # noqa: E402
+from tests._review_substrate_shared import user_text as _user_text  # noqa: E402
 
 
 class _ScriptedLLM:
@@ -239,15 +82,18 @@ _REPORT = "Read: BIBLE.md in full; memory inline.\n\n# Deep self-review\n\nCRITI
 
 
 @pytest.fixture()
-def review_repo(tmp_path):
+def review_repo(tmp_path, monkeypatch):
+    from ouroboros.tools import review_helpers
+
     repo = tmp_path / "repo"
     (repo / "docs").mkdir(parents=True)
     (repo / "BIBLE.md").write_text(_BIBLE, encoding="utf-8")
     (repo / "docs" / "ARCHITECTURE.md").write_text("# Arch\n\n## Review stack\n\ntext\n\n#### Deep self-review\n\nmore\n", encoding="utf-8")
     (repo / "docs" / "DEVELOPMENT.md").write_text("# Dev\n\n## Rules\n\nx\n", encoding="utf-8")
-    (repo / "docs" / "CHECKLISTS.md").write_text("# Checks\n\n## Repo Commit Checklist\n\ny\n", encoding="utf-8")
+    (repo / "docs" / "CHECKLISTS.md").write_text("# Checks\n\n## Change Review Checklist\n\ny\n", encoding="utf-8")
     (repo / "ouroboros").mkdir()
     (repo / "ouroboros" / "loop.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    monkeypatch.setattr(review_helpers, "REPO_ROOT", repo)
     return repo
 
 
@@ -264,7 +110,7 @@ def review_drive(tmp_path):
 
 
 def _row(kind="api_chat", target="openai/fake-deep", **fields):
-    return ConfiguredReviewerSlot(slot_id=DEEP_REVIEW_SLOT_ID, kind=kind, target_id=target, **fields)
+    return ConfiguredReviewerSlot(slot_id=_DEEP_SLOT_ID, kind=kind, target_id=target, **fields)
 
 
 def _native_row():
@@ -296,7 +142,9 @@ def test_native_row_runs_the_inspection_episode_over_repo_and_memory(review_repo
         "<!-- deep-review provenance: delivery=native_tool_rounds, model=openai/fake-deep, memory=3/7, "
         "memory_missing=registry.md,WORLD.md,index-full.md,improvement-backlog.md, "
         "coverage=BIBLE.md:delivered_inline, incomplete=none, attestation=host_observed, rounds=3, tool_calls=2, receipts=2, "
-        "end_reason=final_answer, transcript=")
+        "end_reason=final_answer, coverage_basis=source_ranges, serialized_chars_diagnostic=")
+    assert "previous_prompt_tokens=10" in header
+    assert "output_allowance_tokens=" in header and "transcript=" not in header and "landing=" not in header
     assert "_Deep self-review: native inspection episode on openai/fake-deep — 3 rounds, 2 tool calls" in header
     assert "BIBLE.md delivered inline in full; memory 3/7 inlined (omitted: registry.md missing, WORLD.md missing, index-full.md missing, improvement-backlog.md missing); complete_" in header
     assert usage["deep_review_memory"]["inlined"] == 3 and usage["deep_review_memory"]["dispositions"]["memory/WORLD.md"] == "missing"
@@ -307,7 +155,7 @@ def test_native_row_runs_the_inspection_episode_over_repo_and_memory(review_repo
     # inline in full, nav maps, and the REPORT contract (never the
     # JSON array the executors fall back to).
     first = llm.calls[0]["messages"]
-    task = next(m["content"] for m in first if m["role"] == "user")
+    task = _user_text(next(m["content"] for m in first if m["role"] == "user"))
     assert "deep self-review of the Ouroboros project" in task
     assert "delivered IN FULL below" in task and f"{len(_BIBLE):,} chars" in task
     assert task.count(_BIBLE) == 1
@@ -323,7 +171,7 @@ def test_native_row_runs_the_inspection_episode_over_repo_and_memory(review_repo
     assert tool_msgs[0]["tool_call_id"] == "c1" and "becoming personality" in tool_msgs[0]["content"]
     assert tool_msgs[1]["tool_call_id"] == "c2" and "I am Ouroboros." in tool_msgs[1]["content"]
     # «Выполняется как» for the deep-review row, and the progress names the delivery.
-    last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
+    last = reviewer_slot_last_executions()[_DEEP_SLOT_ID]
     assert last["surface"] == "deep_self_review" and last["status"] == "responded"
     assert last["requested"]["subagent_id"] == "api-critic" and last["effective"]["model"] == "openai/fake-deep"
     assert any("native_tool_rounds" in line for line in progress)
@@ -342,7 +190,7 @@ def test_native_row_needs_no_second_read_of_inline_bible(review_repo, review_dri
     assert "coverage=BIBLE.md:delivered_inline" in text and "BIBLE.md delivered inline in full; memory 3/7 inlined" in text
     assert text.split("\n")[1].endswith("; complete_")
     assert not [d for d in usage.get("capability_delta", []) if d["reason"].startswith("deep_review_")]
-    assert reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]["status"] == "responded"
+    assert reviewer_slot_last_executions()[_DEEP_SLOT_ID]["status"] == "responded"
 
     def cov(receipts, calls=None):
         return deep_self_review._native_read_coverage(
@@ -406,24 +254,22 @@ def test_native_row_needs_no_second_read_of_inline_bible(review_repo, review_dri
     assert cov([rec("BIBLE.md", 13, 12, 12), rec("BIBLE.md", 1, 3, 12)])["state"] == "partial"
 
 
-def test_native_row_exhaustion_delivers_the_draft_marked_incomplete(review_repo, review_drive, monkeypatch):
-    """R13/Ф1: the report shape delivers the collected draft when the
-    transcript bound lands first; the header says INCOMPLETE and why."""
+def test_native_row_continues_past_retired_cap_to_final_report(review_repo, review_drive, monkeypatch):
+    """Serialized growth never replaces the reviewer's final report with its draft."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
     monkeypatch.setenv("OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", "50000")
     (review_repo / "big.txt").write_text("x" * 60_000, encoding="utf-8")
     draft = "# Deep self-review (draft)\n\nCRITICAL: loop.py finalization race.\n"
-    script = [{"content": draft, "tool_calls": [_tool_call("read_file", {"path": "big.txt"}, "c1")]}] + [
-        {"tool_calls": [_tool_call("read_file", {"path": "BIBLE.md"}, f"c{i}")]} for i in range(2, 40)
-    ]
+    script = [{"content": draft, "tool_calls": [_tool_call("read_file", {"path": "big.txt"}, "c1")]},
+              {"content": _REPORT}]
     llm = _ScriptedLLM(script)
     text, usage = run_deep_self_review(review_repo, review_drive, llm, lambda _m: None, slot=_native_row())
-    assert text.endswith("\n\n" + draft)
-    assert "incomplete=transcript_bound" in text and "INCOMPLETE (transcript_bound)_" in text
-    assert usage["native_incomplete"] == "transcript_bound" and usage["native_end_reason"] == "transcript_bound"
-    assert any(d["reason"] == "native_transcript_bound_before_final_answer" for d in usage["capability_delta"])
-    assert "execution_status" not in usage  # a partial product is a product, not a failure
-    assert llm.script  # the bound landed before the script ran out
+    assert text.endswith("\n\n" + _REPORT)
+    assert "incomplete=none" in text and "INCOMPLETE" not in text
+    assert usage["native_transcript_chars"] > 50_000
+    assert usage["native_end_reason"] == "final_answer" and not usage.get("native_incomplete")
+    assert "execution_status" not in usage and len(llm.calls) == 2
+    assert "x" * 60_000 in next(m["content"] for m in llm.calls[1]["messages"] if m.get("role") == "tool")
 
 
 class _FakeSessionExecutor:
@@ -486,13 +332,13 @@ def test_session_row_runs_through_the_session_executor_with_the_report_contract(
     assert request.max_tokens == 100_000 and request.no_proxy is True and request.deadline_at == deadline
     assert "## FILE: drive/memory/identity.md\nI am Ouroboros.\n" in request.session_task
     assert slot.route is ReviewRouteKind.AGENT_SESSION and slot.session_target == "codex=gpt-5.6-sol"
-    assert slot.session_profile == "koshak" and slot.slot_id == DEEP_REVIEW_SLOT_ID
+    assert slot.session_profile == "koshak" and slot.slot_id == _DEEP_SLOT_ID
     assert slot.max_tokens == 100_000 and slot.role_hint == "deep self-reviewer"
     # The logical window: the task ceiling narrowed by the owner deadline (never the 300 s default).
     assert 0 < slot.timeout_sec < 600
     assert before < executor._logical_deadline_monotonic < before + 600
     assert executor.assignment.custody_root == review_drive and executor.assignment.call_type == "deep_self_review"
-    last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
+    last = reviewer_slot_last_executions()[_DEEP_SLOT_ID]
     assert last["effective"] == {"route": "agent_session:codex", "model": "gpt-5.6-sol", "verdict_method": "report"}
     assert last["requested"]["session_target"] == "codex=gpt-5.6-sol" and last["requested"]["profile_id"] == "koshak"
     # Without an owner deadline the window is the task's operation window: its finite
@@ -519,7 +365,7 @@ def test_retrieving_failure_is_typed_and_recorded_never_a_report(review_repo, re
     # The typed failure usage carries the memory fact and the executor's failure
     # custody — the same usage the «Выполняется как» error row was recorded from.
     assert usage["deep_review_memory"]["total"] == 7 and usage["delegated_run_started"] is False
-    last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
+    last = reviewer_slot_last_executions()[_DEEP_SLOT_ID]
     assert last["status"] == "error" and last["surface"] == "deep_self_review"
 
 
@@ -565,7 +411,7 @@ def test_memory_fact_precedes_every_runs_as_record_and_rides_the_returned_usage(
         assert usage["deep_review_memory"] == handed["deep_review_memory"]
         if status == "error":
             assert usage["execution_status"] == "infra_failed" and usage["reason_code"] == "deep_self_review_error"
-        last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
+        last = reviewer_slot_last_executions()[_DEEP_SLOT_ID]
         assert last["status"] == status and last["surface"] == "deep_self_review"
         assert last["requested"]["session_target"] == "codex=gpt-5.6-sol" and "capability_delta" in last
         assert "deep_review_memory" not in json.dumps(last)  # intentionally absent from the durable projection
@@ -576,7 +422,7 @@ def test_availability_follows_the_row_not_the_model_key(env, monkeypatch):
     reader — agent, tool and runner all call it): an api row needs its model's
     credentials (a bare route and a subagent reference read the SAME rule), a
     session row needs a healthy delegated route (the substrate's own reader),
-    and a malformed setting is the typed reason — never a fallback onto the key."""
+    and with no row named it is the direct Main row's (decision 3A)."""
     for key in ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(key, raising=False)
     reason, identity = deep_review_route(_row())
@@ -609,10 +455,10 @@ def test_availability_follows_the_row_not_the_model_key(env, monkeypatch):
     monkeypatch.setattr(daemon, "ensure_owned_gateway", lambda **_k: (_ for _ in ()).throw(RuntimeError("daemon down")))
     assert deep_review_route(_session_row())[0].startswith("agent_service_unavailable: RuntimeError")
     assert deep_review_route(_row("agent_session", "=bad", session_target="=bad")) == ("session_target_unparsable", None)
-    # Malformed structured setting: the parser's typed text is the reason.
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "api_chat", "target_id": "m"}, "bogus": 1}))
-    reason, identity = deep_review_route()
-    assert "deep_review has unknown keys" in reason and identity is None
+    # No row named: the direct Main row — the catalog's review marks do not
+    # decide `/review`'s executor.
+    env.setenv("OUROBOROS_MODEL", "openai/main-model")
+    assert deep_review_route() == ("", "openai/main-model")
 
 
 def test_unavailable_row_never_runs_and_returns_typed_usage(review_repo, review_drive, monkeypatch, env):
@@ -623,16 +469,20 @@ def test_unavailable_row_never_runs_and_returns_typed_usage(review_repo, review_
     assert text.startswith("❌ Deep self-review unavailable: no OpenRouter or direct OpenAI credentials for openai/fake-deep")
     assert usage == {"execution_status": "infra_failed", "reason_code": "deep_self_review_unavailable"}
     assert not llm.chat.called
-    env.setenv(REVIEWER_SLOTS_ENV, _payload({"route": {"kind": "api_chat", "target_id": "m"}, "bogus": 1}))
+    env.setenv("OUROBOROS_MODEL", "openai/main-model")
     text, usage = run_deep_self_review(review_repo, review_drive, llm, lambda _m: None)
-    assert "deep_review has unknown keys" in text and usage["reason_code"] == "deep_self_review_unavailable"
+    assert text.startswith("❌ Deep self-review unavailable: no OpenRouter or direct OpenAI credentials for openai/main-model")
+    assert usage["reason_code"] == "deep_self_review_unavailable" and not llm.chat.called
 
 
 def test_agent_keeps_the_previous_report_when_the_review_fails(tmp_path, monkeypatch):
     """`memory/deep_review.md` is overwritten ONLY by a delivered report: a
-    typed failure goes to the task result and a typed `task_error` event."""
+    typed failure goes to the task result and a typed `task_error` event. The
+    worker runs `review_change(subject=system, surface=system)` and links its
+    record in the task's answer."""
     import ouroboros.agent as agent_module
     from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.review_ledger import load_record
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -642,10 +492,11 @@ def test_agent_keeps_the_previous_report_when_the_review_fails(tmp_path, monkeyp
     (drive / "memory" / "deep_review.md").write_text("PREVIOUS REPORT", encoding="utf-8")
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
     monkeypatch.setattr(agent_module, "build_llm_messages", lambda **_k: ([], {}))
-    monkeypatch.setattr(agent_module, "emit_task_results", lambda *_a, **_k: None)
-    outcome = {"value": ("❌ Deep self-review unavailable: no provider credentials for openai/x. Configure …",
+    answers = []
+    monkeypatch.setattr(agent_module, "emit_task_results", lambda *a, **_k: answers.append(a[5]))
+    outcome = {"value": ("❌ Deep self-review unavailable: no provider credentials for openai/x. Run /review …",
                          {"execution_status": "infra_failed", "reason_code": "deep_self_review_unavailable"})}
-    monkeypatch.setattr(deep_self_review, "run_deep_self_review", lambda **_k: outcome["value"])
+    monkeypatch.setattr(deep_self_review, "run_deep_self_review", lambda *_a, **_k: outcome["value"])
     agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
     task = {"id": "dsr-agent", "type": "deep_self_review", "chat_id": 1, "text": "owner:/review",
             "metadata": {"deadline_at": "2099-01-01T00:00:00+00:00"}}
@@ -655,10 +506,11 @@ def test_agent_keeps_the_previous_report_when_the_review_fails(tmp_path, monkeyp
     errors = [r for r in rows if r.get("type") == "task_error" and r.get("task_id") == "dsr-agent"]
     assert errors and errors[0]["reason_code"] == "deep_self_review_unavailable"
     assert any(e.get("type") == "llm_usage" and e.get("category") == "deep_self_review" for e in events)
-    # A delivered report overwrites it, and the deadline reaches the review.
+    # A delivered report overwrites it, the deadline reaches the review, and the
+    # answer links the surface=system record that keeps the report.
     seen = {}
 
-    def _ok(**kwargs):
+    def _ok(*_args, **kwargs):
         seen.update(kwargs)
         return "<!-- deep-review provenance: delivery=native_tool_rounds -->\n_x_\n\nNEW REPORT", {"resolved_model": "openai/x", "cost": 0.0}
 
@@ -666,61 +518,59 @@ def test_agent_keeps_the_previous_report_when_the_review_fails(tmp_path, monkeyp
     events = agent.handle_task(task)
     assert (drive / "memory" / "deep_review.md").read_text(encoding="utf-8").endswith("NEW REPORT")
     assert seen["task_id"] == "dsr-agent" and seen["deadline_at"] == "2099-01-01T00:00:00+00:00"
+    assert seen["slot"].slot_id == "main"
     usage_events = [e for e in events if e.get("type") == "llm_usage"]
     assert usage_events and usage_events[0]["model"] == "openai/x"
-
-
-# ---------------------------------------------------------------------------
-# Fix batch №1 — optional-key wire and repair save (items 1, 10).
-# ---------------------------------------------------------------------------
-
-
-def test_endpoint_carries_the_synthesized_row_beside_a_config_error(env):
-    """A malformed structured value must not blank the deep-review editor: the
-    legacy-derived REPAIR PLACEHOLDER (the row synthesized from the model key,
-    labeled `synthesized_from`) rides beside the typed config_error so the
-    repair save starts from a real row — it is NOT an effective row: none is
-    effective until the setting is repaired (`deep_review_slot()` raises)."""
-    env.setenv(REVIEWER_SLOTS_ENV, "{broken")
-    body = _get_endpoint()
-    assert "not valid JSON" in body["config_error"]
-    assert body["deep_review"] == {
-        "route": {"kind": "api_chat", "target_id": "openai/legacy-deep-model"},
-        "effort": "",
-        "synthesized_from": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
-    }
-    assert "triad" not in body  # the rows themselves are still unparseable
-
-
-def test_repair_save_without_the_optional_key_succeeds_and_an_emptied_target_is_refused(env):
-    """The optional key absent on the wire = the runtime synthesizes the row;
-    an EXPLICITLY emptied api target is the typed 400 (owner fork 3 = A).
-
-    Exercised at the save-check seam the POST handler calls
-    (`_check_reviewer_slots_against_incoming_roster`) — never through a real
-    `POST /api/settings`, whose apply rebinds the PROCESS-WIDE settings
-    authority (`config.SETTINGS_PATH`, bound session-wide by conftest) and
-    leaked this test's roster into later tests in the same worker."""
-    from ouroboros.gateway.settings import _check_reviewer_slots_against_incoming_roster
-
-    env.setenv(REVIEWER_SLOTS_ENV, "{broken")  # the stored value is malformed (config_error)
-    # Repair: a valid value WITHOUT deep_review passes the boundary check (no
-    # warning, no refusal) and the singleton stays synthesized from the key.
-    assert _check_reviewer_slots_against_incoming_roster({REVIEWER_SLOTS_ENV: _payload()}) == ""
-    assert deep_review_slot(parse_reviewer_slots(_payload())).target_id == "openai/legacy-deep-model"
-    # Explicitly emptied target: typed refusal at the parser and at the boundary seam.
-    emptied = _payload({"route": {"kind": "api_chat", "target_id": ""}})
-    with pytest.raises(ValueError, match="deep_review route.target_id"):
-        reviewer_slot_save_check(emptied)
-    with pytest.raises(ValueError, match="deep_review route.target_id"):
-        _check_reviewer_slots_against_incoming_roster({REVIEWER_SLOTS_ENV: emptied})
-    # An explicit CLEAR of the setting is a clear, not a validation subject.
-    assert _check_reviewer_slots_against_incoming_roster({REVIEWER_SLOTS_ENV: ""}) == ""
+    body, link = answers[-1].rsplit("\n\nReview record: ", 1)
+    assert body.endswith("NEW REPORT") and link.endswith(" (surface=system)")
+    record = load_record(drive, link.split(" ", 1)[0])
+    assert record["surface"] == "system" and [seat["seat_id"] for seat in record["rows"]] == ["main"]
 
 
 # ---------------------------------------------------------------------------
 # Fix batch №1 — provenance truthfulness (items 11, 13, 15, 23).
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bound", ["absent", None, 0])
+def test_native_header_has_context_facts_without_an_invented_cap(bound):
+    usage = {"native_transcript_chars": 917_662, "native_context": {
+        "serialized_chars": 917_662, "view_revision": "current-view",
+        "window": {"window_tokens": 1_000_000, "status": "confirmed", "stale": True,
+                   "observed_at": "2026-10-01T00:00:00Z", "model": "review/current",
+                   "asserted_window_tokens": None, "model_route": {"route_fp": "current-route"}},
+        "previous_request": {"prompt_tokens": 300_923, "round": 23, "view_revision": "previous-view",
+                             "model": "review/previous", "provider": "openrouter", "ledger_attempt_ids": ["physical-23"],
+                             "requested_model": "review/requested", "requested_profile": "profile-23", "route": {}},
+        "output_allowance_tokens": 65_536,
+    }}
+    if bound != "absent":
+        usage["native_transcript_bound"] = bound
+    header = deep_self_review._provenance_header(
+        "native_tool_rounds", "review/current", usage, {"inlined": 0, "total": 7, "dispositions": {}},
+        {}, "Context facts", incomplete="none")
+    assert "serialized_chars_diagnostic=917662" in header
+    assert "context_view_revision=current-view" in header
+    assert "window_tokens=1000000" in header and "window_stale=True" in header
+    assert "window_observed_at=2026-10-01T00:00:00Z" in header
+    assert "previous_prompt_tokens=300923" in header and "previous_request_view_revision=previous-view" in header
+    assert "previous_request_model=review/previous" in header and "previous_request_ledger_attempt_ids=['physical-23']" in header
+    assert "output_allowance_tokens=65536" in header
+    assert "transcript=" not in header and "landing=" not in header and "free_tokens=" not in header
+
+
+def test_native_header_preserves_unknown_and_historical_facts():
+    memory = {"inlined": 0, "total": 7, "dispositions": {}}
+    usage = {"native_context": {"serialized_chars": None, "window": {"window_tokens": 0, "status": "unknown"},
+                                "previous_request": None, "output_allowance_tokens": None}}
+    header = deep_self_review._provenance_header("native_tool_rounds", "m", usage, memory, {}, "Facts", incomplete="none")
+    assert "serialized_chars_diagnostic=unknown" in header and "window_tokens=unknown" in header
+    assert "previous_prompt_tokens=unknown" in header and "output_allowance_tokens=unknown" in header
+    legacy = {"native_transcript_chars": 49_999, "native_transcript_bound": 50_000,
+              "native_landing_notified": True, "native_landing_sent": False, "native_end_reason": "transcript_bound"}
+    header = deep_self_review._provenance_header("native_tool_rounds", "m", legacy, memory, {}, "Legacy", incomplete="transcript_bound")
+    assert "transcript=49999/50000" in header and "landing=True/False" in header
+    assert "incomplete=transcript_bound" in header and "previous_prompt_tokens=" not in header
 
 
 def test_header_sanitizes_hostile_values_and_builds_session_facts_by_construction(review_repo, review_drive, monkeypatch):
@@ -750,7 +600,7 @@ def test_header_sanitizes_hostile_values_and_builds_session_facts_by_constructio
     # through `_header_value` (no comment terminator, bounded with the disclosed marker).
     assert "-->" not in human and "OMISSION NOTE" in human and "x" * 121 not in human
     # A hostile session TARGET on the row is bounded the same way.
-    hostile_row = ConfiguredReviewerSlot(slot_id=DEEP_REVIEW_SLOT_ID, kind="agent_session",
+    hostile_row = ConfiguredReviewerSlot(slot_id=_DEEP_SLOT_ID, kind="agent_session",
                                          target_id="codex=" + "t" * 200 + "-->\nx", session_target="codex=" + "t" * 200 + "-->\nx")
     text2, _u = run_deep_self_review(review_repo, review_drive, object(), lambda _m: None, slot=hostile_row)
     human2 = text2.split("\n")[1]
@@ -806,7 +656,7 @@ def test_native_read_extent_rides_the_receipts_and_drives_coverage(review_repo, 
     (review_repo / "inspection.md").write_text(_BIBLE, encoding="utf-8")
 
     def required():
-        return [{"root": "system_repo", "path": "inspection.md",
+        return [{"root": "active_workspace", "path": "inspection.md",
                  **source_text_identity((review_repo / "inspection.md").read_bytes())}]
     total = len(_BIBLE.splitlines())
     half = total // 2
@@ -839,16 +689,13 @@ def test_native_read_extent_rides_the_receipts_and_drives_coverage(review_repo, 
     assert usage["native_tool_receipts"][0]["opened_root"] == "runtime_data"  # the opened root never credits a data-plane read
     assert "coverage=inspection.md:missing" in text
 
-    # The episode's own result bound cut the body: only complete delivered lines count.
-    # The bound must leave room for a CUT-but-inline result beside the task the
-    # governance tiers deliver, or the result rides a stored source instead.
-    monkeypatch.setenv("OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", "120000")
-    (review_repo / "inspection.md").write_text("".join(f"line {i:05d} " + "b" * 60 + "\n" for i in range(1500)), encoding="utf-8")
+    # The bounded read page still cuts long results, independently of episode size.
+    (review_repo / "inspection.md").write_text("".join(f"line {i:05d} " + "b" * 60 + "\n" for i in range(4000)), encoding="utf-8")
     llm = _ScriptedLLM([{"tool_calls": [_tool_call("read_file", {"path": "inspection.md"}, "c1")]}, {"content": _REPORT}])
     text, usage = run_deep_self_review(review_repo, review_drive, llm, lambda _m: None, slot=_native_row(), required_sources=required())
     receipt = usage["native_tool_receipts"][0]
-    assert receipt["total_lines"] == 1500 and receipt["start_line"] == 1
-    assert receipt["end_line"] < 1500 and receipt["eof"] is False
+    assert receipt["total_lines"] == 4000 and receipt["start_line"] == 1
+    assert receipt["end_line"] < 4000 and receipt["eof"] is False
     tool_msg = [m for m in llm.calls[1]["messages"] if m.get("role") == "tool"][0]["content"]
     # Source labels begin at zero; receipt line addresses begin at one.
     body = tool_msg.split("\n⚠️ RESULT TRUNCATED", 1)[0]  # the notice opens with its OWN newline: judge the delivered body only
@@ -870,7 +717,7 @@ def test_a_registry_refused_read_never_inherits_the_previous_reads_extent(review
     (review_repo / "inspection.md").write_text(_BIBLE, encoding="utf-8")
 
     def required():
-        return [{"root": "system_repo", "path": "inspection.md",
+        return [{"root": "active_workspace", "path": "inspection.md",
                  **source_text_identity((review_repo / "inspection.md").read_bytes())}]
     # ONE traversal shape at the coverage level; the refusal trio itself is the
     # executor suite's receipt-level pin (test_read_file_receipts_carry_the_delivered_extent).
@@ -933,7 +780,7 @@ def test_empty_retrieving_response_is_an_error_row_never_a_responded_review(revi
     text, usage = run_deep_self_review(review_repo, review_drive, object(), lambda _m: None, slot=_session_row())
     assert text.startswith("⚠️ Model returned an empty response")
     assert usage["execution_status"] == "infra_failed" and usage["reason_code"] == "deep_self_review_error"
-    last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
+    last = reviewer_slot_last_executions()[_DEEP_SLOT_ID]
     assert last["status"] == "error" and last["surface"] == "deep_self_review"
 
 
@@ -941,31 +788,20 @@ def test_coverage_deltas_never_mutate_the_executors_usage(review_repo, review_dr
     """Item 14: `dict(attempt.usage)` is shallow — the appended coverage delta
     must land on THIS record's copy, never on the list the executor owns."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
-    monkeypatch.setenv("OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS", "50000")
     import ouroboros.review_native_episode as native_episode
+    from ouroboros.tools.scope_required_sources import source_text_identity
 
-    attempts = []
-    original = native_episode.NativeToolRoundReviewExecutor.execute
-
-    def spy(self):
-        result = original(self)
-        attempts.append(result)
-        return result
-
-    monkeypatch.setattr(native_episode.NativeToolRoundReviewExecutor, "execute", spy)
-    # An exhausted report episode: the EXECUTOR itself owns a non-empty delta
-    # list (`native_transcript_bound_before_final_answer`); the record then
-    # keeps its own delta list, separate from the executor's.
-    (review_repo / "big.txt").write_text("x" * 60_000, encoding="utf-8")
-    draft = "# Draft\n\nCRITICAL: something.\n"
-    llm = _ScriptedLLM([{"content": draft, "tool_calls": [_tool_call("read_file", {"path": "big.txt"}, "c1")]}] + [
-        {"tool_calls": [_tool_call("read_file", {"path": "ouroboros/loop.py"}, f"c{i}")]} for i in range(2, 40)
-    ])
-    _text, usage = run_deep_self_review(review_repo, review_drive, llm, lambda _m: None, slot=_native_row())
-    executor_list = attempts[0].usage["capability_delta"]
+    executor_list = [{"reason": "native_transcript_bound_before_final_answer"}]
+    # A retained legacy actor result stays unchanged when current coverage adds a delta.
+    attempt = ReviewAttemptResult(message={"content": _REPORT}, raw_text=_REPORT,
+                                  usage={"capability_delta": executor_list})
+    monkeypatch.setattr(native_episode.NativeToolRoundReviewExecutor, "execute", lambda self: attempt)
+    required = [{"root": "active_workspace", "path": "inspection.md", **source_text_identity(b"inspect me")}]
+    _text, usage = run_deep_self_review(review_repo, review_drive, object(), lambda _m: None,
+                                       slot=_native_row(), required_sources=required)
     assert [d["reason"] for d in executor_list] == ["native_transcript_bound_before_final_answer"]
     assert [d["reason"] for d in usage["capability_delta"]] == [
-        "native_transcript_bound_before_final_answer"]
+        "native_transcript_bound_before_final_answer", "deep_review_mandatory_read_missing"]
     assert usage["capability_delta"] is not executor_list and len(executor_list) == 1
 
 
@@ -1002,7 +838,7 @@ def test_slot_override_with_an_empty_target_or_unknown_kind_is_refused_typed(rev
         (_row(target=""), "has no target"),
         (_row(target="   "), "has no target"),
         (_row("agent_session", "", session_target=""), "has no target"),
-        (ConfiguredReviewerSlot(slot_id=DEEP_REVIEW_SLOT_ID, kind="bogus", target_id="openai/x"), "unknown route kind 'bogus'"),
+        (ConfiguredReviewerSlot(slot_id=_DEEP_SLOT_ID, kind="bogus", target_id="openai/x"), "unknown route kind 'bogus'"),
     ):
         reason, identity = deep_review_route(row)
         assert fragment in reason and identity is None, (row, reason)
@@ -1010,3 +846,29 @@ def test_slot_override_with_an_empty_target_or_unknown_kind_is_refused_typed(rev
         assert text.startswith("❌ Deep self-review unavailable: ") and fragment in text
         assert usage["reason_code"] == "deep_self_review_unavailable"
     assert not llm.chat.called
+
+
+@pytest.mark.parametrize('access', ['readonly', 'full'])
+def test_selected_catalog_session_keeps_rights_and_each_explicit_deep_call_is_new(
+        review_repo, review_drive, monkeypatch, access):
+    from ouroboros.reviewer_slot_config import catalog_review_row
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
+    import ouroboros.review_execution as review_execution
+
+    set_review_pool(monkeypatch, pool_roster(pool_seat(
+        'selected-session', 'codex=gpt-5.6-sol', kind='agent_session', access=access)))
+    row = catalog_review_row(None, 'selected-session')
+    _FakeSessionExecutor.instances = []
+    monkeypatch.setattr(review_execution, '_review_route_executor', _FakeSessionExecutor)
+    monkeypatch.setattr(deep_self_review, '_session_route_reason', lambda row: '')
+    for _ in range(2):
+        text, usage = run_deep_self_review(review_repo, review_drive, object(), lambda _m: None,
+                                           task_id='same-task', slot=row)
+        assert text.endswith(_REPORT)
+    first, second = [ex.assignment for ex in _FakeSessionExecutor.instances]
+    assert first.call_id != second.call_id
+    for assignment in (first, second):
+        assert assignment.slot.session_access == access
+        assert bool(assignment.request.checking_source) is (access == 'full')
+        assert assignment.request.policy['native_data_root'] == str(review_drive)
+        assert 'I am Ouroboros.' in assignment.request.session_task

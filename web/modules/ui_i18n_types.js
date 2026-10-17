@@ -100,3 +100,72 @@
  * @property {number} dropped
  * @property {number} pending
  */
+
+/**
+ * A translation memory file (schema 1): what GET /api/ui/i18n/export downloads and POST
+ * /api/ui/i18n/import accepts (needs a non-English `language`; `schema`, when sent, must be 1).
+ * @typedef {Object} UiI18nMemoryDocument
+ * @property {number=} schema
+ * @property {string} language
+ * @property {number=} revision
+ * @property {string=} created_at
+ * @property {string=} updated_at
+ * @property {UiI18nProfile=} profile
+ * @property {?Object=} plural_select
+ * @property {?string[]=} plural_categories
+ * @property {string=} glossary_hash
+ * @property {Object.<string,UiI18nEntry>=} entries  // replaces the imported layer; owner entries shadow it
+ * @property {Object.<string,UiI18nEntry>=} shadow
+ * @property {Object.<string,Object>=} refused
+ * @property {string=} pack
+ * @property {string=} pack_version
+ */
+
+/**
+ * @typedef {Object} UiI18nImportResult
+ * @property {number} added
+ * @property {number} replaced
+ * @property {number} shadowed
+ * @property {number} dropped
+ */
+
+/**
+ * POST /api/ui/i18n/import: the memory's new revision.
+ * @typedef {Object} UiI18nImportResponse
+ * @property {boolean} ok
+ * @property {string} language
+ * @property {number} revision
+ * @property {UiI18nImportResult} result
+ * @property {UiI18nStats} stats
+ */
+
+/**
+ * POST /api/ui/i18n/regenerate; an absent `language` means the current one.
+ * @typedef {Object} UiI18nRegenerateRequest
+ * @property {string=} language
+ */
+
+/**
+ * @typedef {Object} UiI18nRegenerateResponse
+ * @property {boolean} ok
+ * @property {string} language
+ * @property {number} revision
+ * @property {number} removed
+ * @property {UiI18nStats} stats
+ */
+
+/**
+ * WS frame: the install's interface language was chosen (any client or transport); re-read GET /api/ui/i18n.
+ * @typedef {Object} UiLanguageChangedOutbound
+ * @property {'ui_language_changed'} type
+ * @property {string} language  // the chosen BCP-47 tag ("" = not chosen)
+ */
+
+/**
+ * WS frame: the translation memory of `language` reached `revision` (generated, imported or regenerated).
+ * @typedef {Object} UiI18nUpdatedOutbound
+ * @property {'ui_i18n_updated'} type
+ * @property {string} language
+ * @property {number} revision
+ * @property {number=} applied  // entries the generator wrote in this batch; absent for import and regenerate
+ */

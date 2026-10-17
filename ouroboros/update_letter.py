@@ -304,7 +304,8 @@ def _request_text(status: Dict[str, Any], material: Dict[str, Any], target_versi
         "official_target": {"version": target_version, "sha": _key_from_status(status)["target_sha"]},
         "update_channel": str(status.get("update_channel") or ""),
         "checkout": {"sha": str(status.get("current_sha") or ""),
-                     "commits_behind": status.get("behind"), "commits_ahead": status.get("ahead")},
+                     "commits_behind": status.get("behind"), "commits_ahead": status.get("ahead"),
+                     "local_changes": status.get("local_changes") or "unknown"},
         "checked_at": str(status.get("checked_at") or ""),
     }
     return (
@@ -877,7 +878,7 @@ def official_update_projection(
                 "status": "unchecked", "status_as_of": "",
                 "running": {"version": get_version(), "sha": head},
                 "update_channel": active_channel, "target": None, "behind": None, "ahead": None,
-                "letter": project_letter(record, head_sha=head, latest_sha=""),
+                "local_changes": "unknown", "letter": project_letter(record, head_sha=head, latest_sha=""),
             }
         latest = str(cache.get("latest_sha") or "")
         checked_head = str((record or {}).get("checked_head_sha") or "")
@@ -909,6 +910,9 @@ def official_update_projection(
             "target": target,
             "behind": cache.get("behind"),
             "ahead": cache.get("ahead"),
+            # Commits ahead are history; this is whether the checked HEAD held content of its own.
+            "local_changes": str(cache.get("local_changes") or "unknown")
+            if head == str(cache.get("checked_head_sha") or "") else "unknown",
             "letter": letter,
         }
     except Exception as exc:  # noqa: BLE001 — a fact that raises would take the whole context with it

@@ -20,7 +20,10 @@ class DecisionRequest(TypedDict):
     recorded confirmation instead of acting twice. ``comment`` is the owner's
     optional verbatim remark on quiz/routing decisions.
 
-    ``option_index`` is optional for the quiz family: an owner who takes none
+    Quiz ``action=close`` instead requires a non-empty ``reason`` and conveys
+    neither an answer nor approval; ``action=dismiss`` carries neither and only removes
+    an accepted late answer of unknown delivery from current questions (never delivered,
+    never resent). ``option_index`` is optional for answers: an owner who takes none
     of the offered options answers with a non-empty comment and no index.
     Routing requires the integer — its choice IS the option. Model waits
     instead require revision and action, with the matching action fields;
@@ -33,7 +36,8 @@ class DecisionRequest(TypedDict):
     option_index: NotRequired[int]
     comment: NotRequired[str]
     revision: NotRequired[int]
-    action: NotRequired[Literal["auto_continue", "switch", "retry"]]
+    action: NotRequired[Literal["auto_continue", "switch", "retry", "close", "dismiss"]]
+    reason: NotRequired[str]  # explicit quiz closure; never an answer/comment
     auto_continue: NotRequired[bool]
     model: NotRequired[str]
     credential_profile_id: NotRequired[str]
@@ -43,21 +47,31 @@ class DecisionRequest(TypedDict):
 
 class DecisionResponse(TypedDict, total=False):
     """Answer-ingress reply. 2xx carries the card's lifecycle state
-    (quiz: answered; duplicate marks an idempotent replay). A LATE quiz answer
+    (quiz: answered or explicitly closed; duplicate marks an idempotent replay).
+    Closure carries actor, request identity, reason and time plus its delivery
+    disposition; an owed delivery remains canonical until recovery confirms it.
+    A LATE quiz answer
     — the card's task already finished — is also 2xx, adding
     answered_after_terminal and forwarded: the answer is recorded and delivered
     into the card's chat as an ordinary owner message, and forwarded=false with
     a reason_code says when that chat is a machine or hidden destination with no
-    owner turn to start. 409 is left for a card that was already answered (and
+    owner turn to start. 409 carries the winning answered/closed disposition (and
     for a non-root addressee). Routing adds dispatched
     (confirmed durable receipt), task_id (derived promoted id), latest_status
     (superseding status on 409), reason/detail diagnostics, and cause (the
-    owner-facing sentence for a refused routing act).
+    owner-facing sentence for a refused routing act). A New task picked from a
+    card that carried an explicit start adds reasoning_effort, read from the
+    admitted root's own row; a steered existing task never reports one.
 
     Model waits distinguish accepted (202, applied false) from the worker's
     applied_request_id. wait carries the current projection and revision;
     saved says whether the optional permanent role update landed, with null
     reserved for the existing settings-writer timeout's unknown outcome.
+    Applied, saved and a refusal or failure stay separate facts: an error after
+    the claim still reports the claim's current row and receipt. ``applied:false``
+    is no observed application yet, not proof that a pending action cannot apply. The role saves
+    only while the task's stop state reads clear — a recorded Stop intent (Wrap
+    up included) or Panic saves nothing, nor does an unreadable (unknown) state.
     """
 
     ok: bool
@@ -65,6 +79,11 @@ class DecisionResponse(TypedDict, total=False):
     state: str
     answered_index: int
     comment: str
+    closed_reason: str
+    closed_at: str
+    closed_actor: Literal["owner", "model"]
+    closed_request_id: str
+    question_delivery: Dict[str, Any]
     duplicate: bool
     answered_after_terminal: bool
     forwarded: bool
@@ -75,6 +94,7 @@ class DecisionResponse(TypedDict, total=False):
     reason: str
     detail: str
     cause: str
+    reasoning_effort: str
     request_id: str
     applied: bool
     saved: Optional[bool]

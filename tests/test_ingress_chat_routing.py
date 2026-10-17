@@ -219,7 +219,7 @@ def test_derived_project_id_is_scoped_but_never_announced_in_main(tmp_path, monk
     enqueued = []
     monkeypatch.setattr(
         "supervisor.terminal_delivery.enqueue_terminal_delivery",
-        lambda drive_root, event: enqueued.append(event) or True,
+        lambda drive_root, event, *, event_queue=None: enqueued.append(event) or True,
     )
 
     task = {"id": "t1", "project_id": "proj_deadbeef1234", "description": "run"}
@@ -262,7 +262,7 @@ def test_main_is_told_a_project_finished_only_when_the_work_went_there(tmp_path,
     enqueued = []
     monkeypatch.setattr(
         "supervisor.terminal_delivery.enqueue_terminal_delivery",
-        lambda drive_root, event: enqueued.append(event) or True,
+        lambda drive_root, event, *, event_queue=None: enqueued.append(event) or True,
     )
     row = create_project(tmp_path, "proj_midflight", name="Mid flight")
     task = {"id": "m1", "project_id": "proj_midflight", "description": "run", "chat_id": 0}

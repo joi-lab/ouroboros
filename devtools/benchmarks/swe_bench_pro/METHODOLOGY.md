@@ -245,8 +245,8 @@ E1v2 contract:
   resolve against the task repo and the runtime records a workspace patch
   artifact alongside Method C capture (Method C from `/app` remains the
   OFFICIAL `model_patch` source; the workspace artifact is auditing/telemetry).
-  Global improvement-backlog/promotion signals still flow from workspace tasks
-  (v6.44.0), so native post-task evolution keeps working. Export
+  The sealed result reaches the owner-enabled canonical evolution chooser;
+  the authored backlog is not automatically rewritten. Export
   `OBO_SOLVE_WORKSPACE_ROOT=""` for the legacy rootless `dig-direct` mode.
 - (v6.56.0; policy spelling updated for ABI 7.0 — the `until_deadline` alias
   was removed, and the explicit pass cap was always the binding count axis)
@@ -303,8 +303,8 @@ Stateful runs introduce failure classes that frozen baseline runs do not have.
   context-overflow recovery.
 
 - Workspace mode often needs `memory_mode=forked`; shared memory can be
-  forbidden with an external workspace. Verify that canonical parent reflections
-  still grow across tasks.
+  forbidden with an external workspace. Verify that canonical knowledge the agent
+  authors (`memory/knowledge_history.jsonl`) carries across tasks.
 
 - If task N has an infrastructure failure, restore state to the snapshot after
   the last clean task and rerun the suffix. Keep per-task snapshots of runtime
@@ -428,7 +428,7 @@ stamp, no lineage, no self-edit accounting).
   portable.
 
 - Do not wait for heartbeat files such as `state/queue_snapshot.json` to become
-  quiet. Watch durable outputs such as task reflections or task result files.
+  quiet. Watch durable outputs such as task result files.
 
 - On macOS bind mounts, host-side files can lag behind container writes. For
   live monitoring, read files inside the container with `docker exec`.

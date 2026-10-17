@@ -1,0 +1,415 @@
+{
+  "$ref": "#/definitions/ImageCallResult",
+  "definitions": {
+    "ImageCallResult": {
+      "type": "object",
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "failed",
+            "unknown"
+          ]
+        },
+        "operation": {
+          "type": "string",
+          "enum": [
+            "generate",
+            "edit"
+          ]
+        },
+        "requestedModel": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S",
+          "description": "The model the caller asked for. route.model contains only a provider-observed model, or null."
+        },
+        "images": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "mime": {
+                "type": "string",
+                "enum": [
+                  "image/png",
+                  "image/jpeg",
+                  "image/webp"
+                ],
+                "description": "Sniffed from the decoded bytes."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^sha256:[a-f0-9]{64}$",
+                "description": "Digest of the decoded bytes."
+              },
+              "sizeBytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "dataBase64": {
+                "type": "string",
+                "minLength": 1,
+                "description": "The provider's b64_json, exact."
+              },
+              "generationId": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "mime",
+              "sha256",
+              "sizeBytes",
+              "dataBase64",
+              "generationId"
+            ],
+            "additionalProperties": false
+          },
+          "description": "Every usable returned item, in provider order; rejected items are diagnosed in problem."
+        },
+        "route": {
+          "type": "object",
+          "properties": {
+            "source": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Non-empty identifier string."
+            },
+            "credentialProfileId": {
+              "$ref": "#/definitions/ImageCallResult/properties/route/properties/source"
+            },
+            "accountFingerprint": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "source",
+            "credentialProfileId",
+            "accountFingerprint",
+            "model"
+          ],
+          "additionalProperties": false,
+          "description": "Selected route at dispatch; a result records the actually observed model, or null."
+        },
+        "appliedOptions": {
+          "type": "object",
+          "properties": {
+            "size": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "\\S",
+              "description": "Vendor size token, e.g. \"auto\" or \"1024x1024\"."
+            },
+            "quality": {
+              "type": "string",
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "auto"
+              ]
+            },
+            "background": {
+              "type": "string",
+              "enum": [
+                "transparent",
+                "opaque",
+                "auto"
+              ]
+            },
+            "n": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 10,
+              "description": "Requested image count in ONE provider request. Omitted sends no n; the provider may return several items either way."
+            }
+          },
+          "additionalProperties": false,
+          "description": "As reported by the provider response."
+        },
+        "usage": {
+          "type": "object",
+          "properties": {
+            "input_tokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "output_tokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "cached_input_tokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "cache_write_tokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "reasoning_tokens": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "description": "Provider-reported counters for one generation; missing counters remain null."
+        },
+        "cost": {
+          "type": "object",
+          "properties": {
+            "processing": {
+              "type": "object",
+              "properties": {
+                "nativeMode": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/definitions/ImageCallResult/properties/appliedOptions/properties/size"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "description": "User-supplied string that must contain visible content, not just whitespace."
+                },
+                "kind": {
+                  "type": "string",
+                  "enum": [
+                    "included",
+                    "paid_credits",
+                    "cash",
+                    "valuation",
+                    "unknown"
+                  ]
+                },
+                "source": {
+                  "$ref": "#/definitions/ImageCallResult/properties/appliedOptions/properties/size"
+                }
+              },
+              "required": [
+                "nativeMode",
+                "kind",
+                "source"
+              ],
+              "additionalProperties": false,
+              "description": "Mode-qualified billing evidence for an existing cost record. Authentication alone does not establish included premium service; credits, cash, and token valuation stay distinct."
+            },
+            "knowledge": {
+              "type": "string",
+              "enum": [
+                "exact",
+                "estimated",
+                "unknown"
+              ],
+              "description": "Quality of incremental-cash cost evidence for an operation."
+            },
+            "billing": {
+              "type": "string",
+              "enum": [
+                "proven_zero",
+                "subscription_entitlement",
+                "metered",
+                "unknown"
+              ],
+              "description": "What is actually known about incremental billing; a native credential route alone never proves entitlement or zero cost."
+            },
+            "source": {
+              "type": "string",
+              "minLength": 1
+            },
+            "provenance": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "estimatedUsd": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "cashUsd": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "valuationUsd": {
+              "anyOf": [
+                {
+                  "type": "number",
+                  "minimum": 0
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null
+            },
+            "valuationKnowledge": {
+              "$ref": "#/definitions/ImageCallResult/properties/cost/properties/knowledge",
+              "default": "unknown",
+              "description": "Quality of incremental-cash cost evidence for an operation."
+            }
+          },
+          "required": [
+            "knowledge",
+            "billing",
+            "source",
+            "provenance"
+          ],
+          "additionalProperties": false,
+          "description": "Incremental cash and token valuation are independent; subscription credentials alone never invent a cash receipt."
+        },
+        "providerRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "problem": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "code": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "message": {
+                  "type": "string"
+                },
+                "retryable": {
+                  "type": "boolean"
+                },
+                "fieldErrors": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  },
+                  "default": {}
+                },
+                "requiredActions": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "default": []
+                },
+                "evidenceRefs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "default": []
+                },
+                "context": {
+                  "type": "object",
+                  "additionalProperties": {},
+                  "default": {},
+                  "description": "Typed route-specific recovery context; never a duplicate error message."
+                }
+              },
+              "required": [
+                "code",
+                "message",
+                "retryable"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "outcome",
+        "operation",
+        "requestedModel",
+        "images",
+        "route",
+        "appliedOptions",
+        "usage",
+        "cost",
+        "providerRequestId",
+        "problem"
+      ],
+      "additionalProperties": false,
+      "description": "One provider image outcome; base64 lives only in this private result resource, never in model text."
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#"
+}

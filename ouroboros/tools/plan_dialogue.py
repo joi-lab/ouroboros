@@ -7,7 +7,7 @@ from typing import Any
 
 from ouroboros.dialogue_evidence import own_room_chat, read_room_source, task_room_record
 from ouroboros.owner_words import owner_words_text
-from ouroboros.projects_registry import all_task_bindings, list_reserved_projects
+from ouroboros.projects_registry import all_task_bindings, list_reserved_projects, RoomResolver
 from ouroboros.task_results import load_plan_review_state
 
 
@@ -15,13 +15,13 @@ def related_rooms(ctx: Any, root: pathlib.Path, own_chat: int | None) -> list[di
     """Only Main and task-lineage rooms, using existing registry activity facts."""
     task_id = str(getattr(ctx, "task_id", "") or "")
     task = {**(task_room_record(root, task_id)), **(getattr(ctx, "task_metadata", {}) or {}), "task_id": task_id}
-    bindings = all_task_bindings(root)
+    bindings, rooms = all_task_bindings(root), RoomResolver(root)
     chats = {1} if own_chat != 1 else set()
     for field in ("task_id", "parent_task_id", "root_task_id"):
         tid = str(task.get(field) or "")
         if tid:
             source = task_room_record(root, tid)
-            chat = bindings.get(tid) or source.get("chat_id")
+            chat = rooms(tid) or source.get("chat_id")
             if chat is not None:
                 chats.add(int(chat))
     from ouroboros.task_results import resolve_task_lineage
@@ -114,6 +114,20 @@ def plan_chat_reader(root: pathlib.Path, task_id: str):
             return None
         if not sep:
             return read_room_source(root, chat_id)
+        from ouroboros import plan_record
+
+        # The organ's asks carry the snapshot each council saw (``dialogue_ref``); an
+        # earlier-schema wave carries it as ``dialogue_source_ref``.
+        try:
+            asks = plan_record.load_plan_record(root, task_id).get("asks") or []
+        except Exception:
+            asks = []
+        for ask in reversed(asks):
+            carrier = ask.get("dialogue_ref") if isinstance(ask.get("dialogue_ref"), dict) else {}
+            ref = carrier.get("ref") if isinstance(carrier.get("ref"), dict) else None
+            if ref and str(carrier.get("sha256") or "") == digest and str(carrier.get("chat_id")) == str(chat_id):
+                raw = read_actor_source_bytes(root, task_id, ref)
+                return {"text": raw.decode("utf-8"), "coverage": json.loads(raw.split(b"\n", 1)[0]).get("coverage", {})}
         state = load_plan_review_state(root, task_id)
         for wave in reversed(state.get("waves") or []):
             ref = wave.get("dialogue_source_ref") or {}
@@ -149,13 +163,16 @@ def _snapshot_rows(own: dict) -> list[tuple[int, dict]]:
 
 def _is_conversation(row: dict) -> bool:
     return str(row.get("stream") or "") in _CONVERSATION_STREAMS and (
-        row.get("direction") != "system" or row.get("type") == "quiz_answer")
+        row.get("direction") != "system" or row.get("type") in {"quiz_answer", "quiz_closed"})
 
 
 def _quiz_text(row: dict) -> str:
     quiz = row.get("quiz") if isinstance(row.get("quiz"), dict) else {}
     options = [str(o) for o in quiz.get("options") or []] if isinstance(quiz.get("options"), list) else []
     qid = str(quiz.get("quiz_id") or "")
+    if row.get("type") == "quiz_closed":
+        actor = "owner" if quiz.get("closed_actor") == "owner" else f"task {quiz.get('closed_by_task_id')}"
+        return f"[question closed without answer {qid}] by {actor}: {quiz.get('closed_reason') or ''}. No approval recorded."
     if row.get("type") == "quiz_answer":
         index = quiz.get("answered_index")
         chosen = (f"chose ({index + 1}) {options[index]}" if isinstance(index, int) and 0 <= index < len(options)
@@ -169,7 +186,7 @@ def _quiz_text(row: dict) -> str:
 
 
 def _line(number: int, row: dict) -> str:
-    body = _quiz_text(row) if row.get("type") in {"quiz", "quiz_answer"} and isinstance(row.get("quiz"), dict) \
+    body = _quiz_text(row) if row.get("type") in {"quiz", "quiz_answer", "quiz_closed"} and isinstance(row.get("quiz"), dict) \
         else str(row.get("text") or "")
     names = [next((str(a[k]) for k in _ATTACHMENT_NAME_KEYS if a.get(k)), "")
              for a in (row.get("attachments") or []) if isinstance(a, dict)]
@@ -223,10 +240,10 @@ def dialogue_view(own: dict, keep: int | None = None) -> tuple[str, dict]:
         "carries its snapshot line number, so a gap in the numbering is a row not shown. The complete redacted "
         f"snapshot `{locator}` ({facts['snapshot_lines']} lines) is in task custody: a session reads "
         f"`{own.get('file') or '(not persisted for this dry run)'}`; a native episode reads "
-        f"read_file(root='artifact_store', path='{(own.get('source_ref') or {}).get('path') or ''}'); any reviewer "
-        f"may request lines with `need_evidence` locator `{locator}::lines=A-B`. Both speakers keep their source "
-        "and author; a peer suggestion is not an owner instruction. Later messages are not claimed reviewed by "
-        "this snapshot."
+        f"read_file(root='artifact_store', path='{(own.get('source_ref') or {}).get('path') or ''}'); a participant "
+        f"without tools asks for lines in prose, naming them (`{locator}::lines=A-B`) — the mind reads every reply "
+        "and can attach them to its next ask. Both speakers keep their source and author; a peer suggestion is not "
+        "an owner instruction. Later messages are not claimed reviewed by this snapshot."
     )
     return ("## OWN ROOM DIALOGUE (exact recorded snapshot)\n\n" + header + "\n\n"
             + "\n".join(_line(n, row) for n, row in inline) + ("\n\n" if inline else "") + footer + "\n"), facts
@@ -236,7 +253,7 @@ def render_dialogue(manifest: Any) -> str:
     own = manifest.get("own_dialogue") or {}
     return (
         dialogue_view(own)[0]
-        + "## RELATED ROOMS (pointers only; request chat:<id> with need_evidence)\n\n"
+        + "## RELATED ROOMS (pointers only; ask in prose for a room you need — the mind can attach chat:<id>)\n\n"
         + json.dumps(manifest.get("related_rooms") or [], ensure_ascii=False, default=str) + "\n"
     )
 
@@ -245,7 +262,8 @@ def fit_dialogue_view(packet: str, own: dict, capacity_chars: int, *, measure=le
     """Keep the whole conversation when it fits this delivery's actual measure, else the
     largest NEWEST run of conversation rows, the cut named in the footer with its exact
     line range. Only the inline conversation yields room; governance, the operative inputs
-    and the pointer stay intact. Progress and host rows are never inline."""
+    and the pointer stay intact. Progress and host rows are never inline. When even zero rows
+    do not fit, the zero-row view is returned and the over-capacity core is left untrimmed."""
     full, facts = dialogue_view(own)
     if measure(packet) <= capacity_chars or full not in packet:
         return packet, facts
@@ -295,18 +313,23 @@ def session_input_limits(slots: list) -> dict:
 def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                          session_task: str, manifest: dict, slot_messages: dict,
                          native_mandatory_chars: int, data_root: Any = "",
-                         frozen: dict | None = None, session_root: str = "", task_id: str = "",
-                         session_limits: dict | None = None) -> dict:
-    """Project a fresh request, or reuse the recorded delivery at collection."""
-    if frozen is not None:
-        from ouroboros.tools.plan_review_artifacts import frozen_delivery_inputs
-        return frozen_delivery_inputs(frozen, slots)
+                         session_root: str = "", task_id: str = "",
+                         session_limits: dict | None = None, output_contract: str) -> dict:
+    """Project one participant set's delivery for an ask.
+
+    ``output_contract`` is the reply contract the request policy and every retrieving
+    seat's first send carry (``plan_packet.PLAN_REPLY_CONTRACT``).
+
+    Each slot's fit lands in ``dialogue_delivery``; a session slot with an engine bound also
+    records ``input_limit`` (the bound, the measured ``prompt_chars``, ``fits``).
+    """
     from ouroboros.model_slots import MODEL_CONTEXT_WINDOWS_KEY, model_role_option
     from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS, slot_retrieves, slot_is_session
     from ouroboros.tools.review_synthesis import build_plan_review_messages, per_slot_input_token_limits
     from ouroboros.tools.plan_packet import plan_user_stable_len
-    from ouroboros.tools.plan_spec import PLAN_FINDINGS_ARRAY_CONTRACT
     from ouroboros.tools.scope_required_sources import source_text_identity
+
+    contract = str(output_contract)
     from ouroboros.review_native_episode import review_native_transcript_bound, native_landing_at, native_first_send_chars
     from ouroboros.reviewer_window import reviewer_window_binding
     from ouroboros.review_execution import _messages_char_count
@@ -326,8 +349,8 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 if own.get("source_ref") and own.get("file") else [])
     for slot in slots:
         sid = str(slot.slot_id)
-        # A shared packet cannot say "your": each slot's send ends with its own seat, after the
-        # cache-stable prefix, so a cycle-2 reviewer knows which earlier findings are its own.
+        # Each slot's send ends with its own seat, after the cache-stable prefix, so a
+        # participant always knows which seat it answers as.
         seat = f"\n## YOUR PANEL SEAT\n\n`{sid}`\n"
         if not slot_retrieves(slot):
             capacity = int(limits[sid]) * 4
@@ -351,13 +374,15 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 messages[sid] = build_plan_review_messages(system_prompt, view + seat, plan_user_stable_len(view))
             lengths[sid] = _messages_char_count(messages[sid])
         elif not slot_is_session(slot):
+            # Initial layout only: an irreducible brief remains sendable and
+            # every omitted dialogue range retains its exact readable source.
             bound = review_native_transcript_bound(slot.model, output_reserve=PLAN_REVIEW_MAX_TOKENS,
                                                    mandatory_read_chars=native_mandatory_chars,
                                                    **reviewer_window_binding(slot))
             governance_read = max(0, native_mandatory_chars - len(session_task))
             def first_send(task):
                 return native_first_send_chars(session_root, surface="plan_review", role_hint=slot.role_hint,
-                    slot_id=sid, session_task=task, output_contract=PLAN_FINDINGS_ARRAY_CONTRACT, task_id=task_id)
+                    slot_id=sid, session_task=task, output_contract=contract, task_id=task_id)
             tasks[sid], coverage[sid] = fit_dialogue_view(session_task + seat, own,
                 native_landing_at(bound) - governance_read - 1, measure=first_send)
         else:
@@ -370,7 +395,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 limit = per_slot_input_token_limits([slot.model], context_window=asserted, slots=[slot],
                                                     output_reserve=PLAN_REVIEW_MAX_TOKENS, tokenizer_margin=155_000)
                 capacity = min(capacity, int(limit[sid]) * 4) if capacity is not None else int(limit[sid]) * 4
-            request = SimpleNamespace(surface="plan_review", policy={"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT})
+            request = SimpleNamespace(surface="plan_review", policy={"output_contract": contract})
             def session_chars(task):
                 return len(render_review_session_prompt(request, slot, task.strip()))
             if capacity is not None:
@@ -390,7 +415,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
     return {"slot_messages": messages, "slot_session_tasks": tasks, "slot_prompt_chars": lengths,
             "dialogue_delivery": coverage, "continuation_restarted": restarted,
             "native_mandatory_read_chars": native_mandatory_chars,
-            "request_policy": {"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT,
+            "request_policy": {"output_contract": contract,
                                "native_data_root": str(data_root),
                                "native_mandatory_read_chars": native_mandatory_chars,
                                **({"observed_sources": observed} if observed else {})}}

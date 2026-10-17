@@ -8,7 +8,7 @@ import pathlib
 from typing import Any, Dict, List
 
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import completed_local_read
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.task_status import effective_task_result
 from ouroboros.dialogue_provenance import (
@@ -53,21 +53,27 @@ def _preview(text: Any) -> str:
 
 
 def _task_record(
-    path: pathlib.Path,
+    task_id: str,
     *,
     drive_root: pathlib.Path,
     include_results: bool,
     include_traces: bool,
     binding: str | None = None,
 ) -> tuple[Dict[str, Any] | None, Dict[str, str] | None]:
-    raw, error = _read_json(path)
+    from ouroboros.store import StoreError
+    from ouroboros.task_store import read_document
+
+    try:
+        raw = read_document(drive_root, task_id)
+    except StoreError as exc:
+        return None, {"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"}
     if raw is None:
-        return None, {"path": str(path), "error": error}
+        return None, {"task_id": task_id, "error": "the row left the store during the read"}
     data = effective_task_result(drive_root, raw)
     withheld = False
     if binding is not None:
         # A scoped page lists this binding's row; a retry successor it redirects to is judged too.
-        withheld = not presence_effective_related(binding, str(raw.get("task_id") or path.stem), data,
+        withheld = not presence_effective_related(binding, str(raw.get("task_id") or task_id), data,
                                                   drive_root=drive_root)
         data = raw if withheld else data
     result = str(data.get("result") or "")
@@ -75,7 +81,7 @@ def _task_record(
 
     _cost = cost_projection(data)
     record: Dict[str, Any] = {
-        "task_id": str(data.get("task_id") or path.stem),
+        "task_id": str(data.get("task_id") or task_id),
         "ts": str(data.get("ts") or ""),
         "status": str(data.get("status") or ""),
         "outcome_axes": normalize_outcome_axes(data),
@@ -164,11 +170,12 @@ def _running_tasks(drive_root: pathlib.Path, binding: str | None = None) -> List
         return []
     facts: Dict[str, Dict[str, Any]] = {}
     if binding is not None:
-        from ouroboros.task_result_facts import raw_result_facts
+        from ouroboros.store import StoreError
+        from ouroboros.task_store import task_facts
 
         try:
-            facts, _malformed = raw_result_facts(drive_root / "task_results")
-        except OSError:
+            facts = task_facts(drive_root)
+        except StoreError:
             pass  # no result row is readable: the queue rows decide, as on the scoped task list
     rows: List[Dict[str, Any]] = []
     for item in running:
@@ -176,8 +183,7 @@ def _running_tasks(drive_root: pathlib.Path, binding: str | None = None) -> List
             continue
         task = item.get("task") if isinstance(item.get("task"), dict) else {}
         task_id = str(item.get("id") or item.get("task_id") or "")
-        if binding is not None and not presence_related_work(
-                binding, _owner_record(facts.get(f"{task_id}.json"), task)):
+        if binding is not None and not presence_related_work(binding, _owner_record(facts.get(task_id), task)):
             continue  # a scoped page lists no foreign running work, whatever a stale queue row claims
         rows.append({
             "task_id": task_id,
@@ -190,24 +196,25 @@ def _running_tasks(drive_root: pathlib.Path, binding: str | None = None) -> List
 
 
 def _presence_scope_inventory(
-    drive_root: pathlib.Path, task_dir: pathlib.Path, binding: str, exclude: str,
+    drive_root: pathlib.Path, binding: str, exclude: str,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """This binding's own work (queue-only active rows first, then result files newest first) and its read gap.
+    """This binding's own work (queue-only active rows first, then result rows newest first) and its read gap.
 
-    The memo's scalar binding fact selects files without a second read; a row
-    without Presence provenance may be established only by the queue's own task
-    metadata (a legacy pending promotion), and a row naming another binding stays out.
-    Only a READABLE result row replaces a queue row: an unreadable one leaves the
-    queued work listed, and unreadable rows nothing attributes are counted, never dropped.
-    An unreadable queue snapshot is a gap too: its queued work cannot be listed, not absent.
+    The typed binding fact selects rows without a body read; a row without
+    Presence provenance may be established only by the queue's own task metadata
+    (a legacy pending promotion), and a row naming another binding stays out.
+    Only a stored result row replaces a queue row; an unavailable store leaves the
+    queued work listed. An unreadable queue snapshot is a gap too: its queued work
+    cannot be listed, not absent.
     """
-    from ouroboros.task_result_facts import raw_result_facts
+    from ouroboros.store import StoreError
+    from ouroboros.task_store import task_facts
 
     gap: Dict[str, Any] = {}
     try:
-        facts, malformed = raw_result_facts(task_dir)
-    except OSError:
-        facts, malformed = {}, []
+        facts = task_facts(drive_root)
+    except StoreError:
+        facts = {}
         gap["result_root"] = "unreadable"  # queued rows remain; no result row could be read
     snapshot, snapshot_unreadable = _queue_snapshot(drive_root)
     if snapshot_unreadable:
@@ -220,43 +227,28 @@ def _presence_scope_inventory(
             if task_id and task_id not in queued:
                 queued[task_id] = (status, task)
     selected: set[str] = set()
-    for name, row in facts.items():
-        task_id = row.get("task_id") or row.get("id") or name[:-5]
+    for task_id, row in facts.items():
         record = _owner_record(row, queued.get(task_id, ("", {}))[1])
         if task_id != exclude and presence_related_work(binding, record):
-            selected.add(name)
-    unreadable = set(malformed)
+            selected.add(task_id)
     queue_only = [
         {"queue_task_id": task_id, "status": status,
-         "description": str(task.get("description") or task.get("text") or ""),
-         **({"result_row": "unreadable"} if f"{task_id}.json" in unreadable else {})}
+         "description": str(task.get("description") or task.get("text") or "")}
         for task_id, (status, task) in queued.items()
-        if f"{task_id}.json" not in facts and task_id != exclude and presence_related_work(binding, task)
+        if task_id not in facts and task_id != exclude and presence_related_work(binding, task)
     ]
-    unattributed = sum(1 for name in unreadable if name[:-5] not in queued)  # a queue row attributed the rest
-    if unattributed:
-        gap["unattributed_unreadable_rows"] = unattributed  # any of them may be this binding's work
-    return queue_only + [row for row in _task_file_inventory(task_dir) if row["name"] in selected], gap
+    return queue_only + [row for row in _task_inventory(drive_root) if row["name"] in selected], gap
 
 
-def _task_file_inventory(task_dir: pathlib.Path) -> List[Dict[str, Any]]:
-    inventory: List[Dict[str, Any]] = []
-    if not task_dir.is_dir():
-        return inventory
-    for path in task_dir.glob("*.json"):
-        try:
-            stat = path.stat()
-        except OSError:
-            continue
-        if not path.is_file():
-            continue
-        inventory.append({
-            "name": path.name,
-            "size": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
-        })
-    inventory.sort(key=lambda row: (row["mtime_ns"], row["name"]), reverse=True)
-    return inventory
+def _task_inventory(drive_root: pathlib.Path) -> List[Dict[str, Any]]:
+    """Every stored row's paging identity, newest write first (``[]`` while the store is unavailable)."""
+    from ouroboros.store import StoreError
+    from ouroboros.task_store import inventory
+
+    try:
+        return inventory(drive_root)
+    except StoreError:
+        return []
 
 
 def _recent_tasks_snapshot(
@@ -311,7 +303,13 @@ def _handle_recent_tasks(
     )
     if binding is not None:
         page["presence_scope"] = {"scope": PRESENCE_OWN_WORK_SCOPE, "binding_id": binding}
-    return json.dumps(page, ensure_ascii=False, indent=2)
+    text = json.dumps(page, ensure_ascii=False, indent=2)
+    if page.get("error"):
+        # Snapshot refusal returns no page. Per-row unreadable_tasks/read_gap
+        # disclosures still accompany a successfully returned partial page.
+        return _publish_tool_result(ctx, ToolResult(
+            status="unavailable", code="LEGACY_UNAVAILABLE", text=text))
+    return text
 
 
 def recent_tasks_page(
@@ -327,7 +325,6 @@ def recent_tasks_page(
     exclude: str = "",
 ) -> Dict[str, Any]:
     """One stable page; ``binding`` filters to that Presence binding's own work BEFORE paging."""
-    task_dir = drive_root / "task_results"
     task_limit = _coerce_limit(limit)
     try:
         skip = max(0, int(offset or 0))
@@ -343,8 +340,8 @@ def recent_tasks_page(
 
     def _inventory() -> List[Dict[str, Any]]:
         if binding is None:
-            return _task_file_inventory(task_dir)
-        rows, gap = _presence_scope_inventory(drive_root, task_dir, binding, exclude)
+            return _task_inventory(drive_root)
+        rows, gap = _presence_scope_inventory(drive_root, binding, exclude)
         read_gap.clear()
         read_gap.update(gap)
         return rows
@@ -365,12 +362,10 @@ def recent_tasks_page(
                 tasks.append({
                     "task_id": str(item["queue_task_id"]), "status": str(item.get("status") or ""),
                     "description": str(item.get("description") or ""), "source": "queue_snapshot",
-                    **({"result_row": item["result_row"]} if item.get("result_row") else {}),
                 })
                 continue
-            path = task_dir / str(item["name"])
             record, error = _task_record(
-                path,
+                str(item["name"]),
                 drive_root=drive_root,
                 include_results=bool(include_results),
                 include_traces=bool(include_traces),

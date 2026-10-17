@@ -23,10 +23,12 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Optional, Set
 
 from ouroboros.anthropic_native_custody import is_replayed_native_content
-from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES
+from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES, HOST_CONTEXT_KIND_KEY
 from ouroboros.request_wire_contract import physical_candidate_bytes as _canonical_candidate_bytes
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
 from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
+from ouroboros.tool_result_record import TOOL_RESULT_RECORD_KEY
+from ouroboros.review_history_view import REVIEW_HISTORY_MESSAGE_KEY, REVIEW_CONTEXT_INDEX_KEY
 from ouroboros.usage_accounting import (
     AttemptRequest,
     PhysicalAttemptPreconditionFailed,
@@ -90,7 +92,7 @@ def require_physical_dispatch_window() -> Optional[float]:
     from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence, model_handed_off
 
     owner = current_model_wait()
-    reason = owner.control_reason() if owner is not None else None
+    reason = owner.control_reason(strict_current=not model_handed_off()) if owner is not None else None
     if not reason and not model_handed_off() and scope_fence():
         reason = RAIL_OWNER_PAUSE
     if reason:
@@ -461,12 +463,15 @@ def _attempt_request(
         key: payload[key] for key in ("system", "messages", "tools", "functions") if key in payload
     })
     from ouroboros.send_clock import record_candidate, split_clock_note
+    from ouroboros.vision_routing import note_candidate_images
+    from ouroboros.openrouter_cost import binding_for_target
 
     # The same bytes carry the Main clock line; its clock-free twin identifies
     # the candidate across two samples (the forced-final admission predicate).
     clock_note, clock_free = split_clock_note(payload)
     raw_sha256 = hashlib.sha256(raw).hexdigest()
     record_candidate(raw_sha256, clock_note)
+    note_candidate_images(raw_sha256, payload)  # the images it carries, for an image-refusal retry's predicate
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
@@ -486,6 +491,7 @@ def _attempt_request(
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
         effort=effort_request_facts(target, payload),
+        provider_receipt_binding=binding_for_target(target),
         candidate_clock_free_sha256=(
             hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
             if clock_note is not None else None
@@ -494,8 +500,14 @@ def _attempt_request(
 
 
 def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the send copy with capsule metadata removed only from context turns."""
+    """Remove host context metadata from the send copy, preserving native payloads."""
     candidate = copy.deepcopy(payload)
+    for message in candidate.get("messages") or []:
+        if isinstance(message, dict):
+            message.pop(HOST_CONTEXT_KIND_KEY, None)
+            message.pop(TOOL_RESULT_RECORD_KEY, None)
+            message.pop(REVIEW_HISTORY_MESSAGE_KEY, None)
+            message.pop(REVIEW_CONTEXT_INDEX_KEY, None)
 
     def _strip(value: Any) -> None:
         if isinstance(value, dict):
@@ -531,13 +543,13 @@ def _finalized_physical_candidate(
 
 
 def bound_reply_allowance(target: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Set a rendered-Nano Main candidate's wire allowance: the one place that does.
+    """Apply the exact-route output maximum, then Nano's window-room policy.
 
     ``context_budget.reply_allowance_tokens`` on THIS candidate: its own bounded count
     (system, messages, tools) times the density Main measured with, against the bound
     capacity (the local lane: its confirmed serving window); the local server's exact
-    count replaces the estimate, needs no slack and may raise it. Low and Max are left
-    alone (their floor is the ceiling, so the rule would return it: no measurement). A
+    count replaces the estimate and needs no slack. Low and Max retain the caller's
+    allowance up to the separate known output maximum (no window-room shrink). A
     payload without a numeric field (the web-search Responses body) is left alone too;
     the field is never created. An exact shortfall is the typed local overflow before
     any send, carrying this candidate's facts; an estimate never refuses.
@@ -546,8 +558,11 @@ def bound_reply_allowance(target: Dict[str, Any], payload: Dict[str, Any]) -> Di
     from ouroboros.context_fit import bounded_prompt_tokens_for_payload
 
     context = current_physical_attempt_context()
-    field = next((key for key in ("max_completion_tokens", "max_tokens")
+    field = next((key for key in ("max_completion_tokens", "max_tokens", "max_output_tokens")
                   if isinstance(payload.get(key), int) and not isinstance(payload.get(key), bool)), None)
+    if field is not None:
+        from ouroboros.response_limits import response_limit_for_target
+        payload = {**payload, field: response_limit_for_target(target).ceiling(payload[field])}
     if context is None or field is None or context.rendered_mode != "nano":
         return payload
     window, measured, exact = context.capacity_total_tokens, target.get("local_input_measurement") or {}, False
@@ -625,23 +640,8 @@ def _candidate_before_dispatch(candidate: Dict[str, Any], request: AttemptReques
                 ),
             },
         )
-        # CPL-5 forward invariant (model-visible ⟺ logged): reconstruct the
-        # durable record just written and byte-compare it with the wire-bound
-        # candidate. A mismatch is a typed durable fact, never a second dispatch
-        # gate — the in-memory identity refusal above stays the only blocking
-        # authority. The fresh seam digests are reused so the raw candidate is
-        # not serialized again.
-        from ouroboros.model_send_seal import verify_sealed_candidate
-
-        verify_sealed_candidate(
-            reservation.drive_root,
-            task_id=task_id,
-            attempt_id=reservation.attempt_id,
-            candidate=candidate,
-            manifest_ref=persisted["manifest_ref"],
-            raw_sha256=fresh.candidate_raw_sha256,
-            raw_size_bytes=fresh.candidate_raw_size_bytes,
-        )
+        # One frozen send copy and one durable pre-send record. Disk read-back
+        # comparison is the explicit historical audit's work, not dispatch IO.
         if predicate is not None:
             try:
                 accepted = predicate(request)
@@ -668,7 +668,8 @@ def _candidate_before_dispatch(candidate: Dict[str, Any], request: AttemptReques
 def _execute_candidate(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
     """Keep existing two-argument injected executors usable."""
     adopt_physical_attempt_capture(None)
-    require_physical_dispatch_window()
+    from ouroboros._usage_wait import retry_presend
+    retry_presend(require_physical_dispatch_window, check=False)
     send, before_dispatch = _deadline_checked_send(send, before_dispatch)
     if "before_dispatch" not in inspect.signature(execute_physical_attempt).parameters:
         return execute_physical_attempt(request, send)
@@ -677,7 +678,8 @@ def _execute_candidate(request: AttemptRequest, send: Any, before_dispatch: Any)
 
 async def _execute_candidate_async(request: AttemptRequest, send: Any, before_dispatch: Any) -> Any:
     adopt_physical_attempt_capture(None)
-    require_physical_dispatch_window()
+    from ouroboros._usage_wait import presend_off_loop, retry_presend
+    await presend_off_loop(retry_presend, require_physical_dispatch_window, check=False)
     send, before_dispatch = _deadline_checked_send(send, before_dispatch)
     if "before_dispatch" not in inspect.signature(execute_physical_attempt_async).parameters:
         return await execute_physical_attempt_async(request, send)
@@ -688,7 +690,8 @@ def _deadline_checked_send(send: Any, before_dispatch: Any):
     def prepare(reservation):
         manifest = before_dispatch(reservation) if before_dispatch is not None else None
         try:
-            require_physical_dispatch_window()
+            from ouroboros._usage_wait import retry_presend
+            retry_presend(require_physical_dispatch_window, check=False)
         except PhysicalDispatchInterrupted as exc:
             exc.candidate_manifest_ref = manifest
             raise
@@ -759,11 +762,11 @@ class _PayloadCachePolicyMixin:
         must precede a shorter one — 5m tools before 1h system is a hard 400) and never
         creates a marker on an earlier segment; a bare marker is the provider default and
         ranks as 5m; the ONLY marker it ever adds is on the last tool schema, and only when
-        the tools segment carries none (unconditional on this family in both deleted sites —
-        a tool-free payload therefore stays uncached HERE, and system/messages never gain a
+        the tools segment carries none and fewer than four markers are already declared.
+        A tool-free payload therefore stays uncached HERE, and system/messages never gain a
         marker they did not declare; a tool-free lane is cached only by DECLARING its stable
         prefix at the caller, as the review surfaces and the safety supervisor do via
-        ``review_helpers.cached_prompt_blocks``); above the four-breakpoint cap the four EARLIEST
+        ``review_helpers.cached_prompt_blocks``; above the four-breakpoint cap the four EARLIEST
         (governance-prefix) markers are kept, the tail MARKERS — never content — are dropped
         and the reduction is disclosed in usage (rationale and the builder-side loud layer:
         ``docs/ARCHITECTURE.md``). Only this freshly assembled payload is normalized —
@@ -792,7 +795,9 @@ class _PayloadCachePolicyMixin:
         note: Optional[Dict[str, Any]] = None
         if _route_normalizes_cache_breakpoints(target):
             tools = payload.get("tools") if isinstance(payload.get("tools"), list) else []
-            if not any(isinstance(t, dict) and isinstance(t.get("cache_control"), dict) for t in tools):
+            if len(breakpoints) < self._MAX_CACHE_BREAKPOINTS and not any(
+                isinstance(t, dict) and isinstance(t.get("cache_control"), dict) for t in tools
+            ):
                 for tool in reversed(tools):
                     # Schema entries only — skips an appended openrouter:web_search tool.
                     if isinstance(tool, dict) and (

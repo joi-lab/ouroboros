@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
+import copy
 import json
 import logging
 import os
@@ -18,6 +19,15 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from ouroboros.tools.release_sync import check_worktree_version_sync  # noqa: F401 - moved to its version-sync home; compatibility re-export
+from ouroboros.tools.review_checklist import (  # noqa: F401 -- intentional public re-exports (the checklist leaf)
+    BODY_CHECKLIST_SECTION,
+    CHECKLIST_LAYERS,
+    CHECKLIST_RELATIVE_PATH,
+    CORE_CHECKLIST_SECTION,
+    checklist_fingerprint,
+    load_checklist_layers,
+    load_checklist_section,
+)
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact as _truncate_review_artifact, utc_now_iso  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 
 if TYPE_CHECKING:
@@ -91,6 +101,51 @@ def calibrated_input_token_limit(
     )
 
 
+def review_row_call_usd(row: Any, *, allow_live_fetch: bool = True) -> Optional[float]:
+    """The price of ONE full call of a review row: the number Settings → Agents shows for a
+    catalog row and ``## Review`` for its pool seat. ``row`` is a pool slot, or a mapping with
+    its ``slot_id``, ``model``, ``profile_id`` and ``processing_preference``.
+
+    A full call is the row's calibrated input cap inside its reviewer window (the fit ladder's
+    bound, at most ``REVIEW_PROMPT_TOKEN_BUDGET``) plus the review output reservation within the
+    route's known maximum response, priced by the reservation math a review wave is admitted with.
+    A packet reviewer makes one such call per review; a reading reviewer makes several, each
+    reserved as it is sent, so this never bounds a whole review. ``None`` is unknown, never zero;
+    a local route is the known zero (``pricing.estimate_cost_optional`` prices route ``local`` at ``0.0``).
+
+    ``allow_live_fetch=False`` keeps the whole measurement in this process: the tariff AND
+    the reviewer window are read as already held (an unevidenced window prices at the full
+    window), so a context-assembly reader never waits on a provider catalog."""
+    get = row.get if isinstance(row, dict) else lambda key, default=None: getattr(row, key, default)
+    model = str(get("model", "") or "")
+    if not model:
+        return None
+    try:
+        from ouroboros.provider_models import review_model_uses_local
+
+        use_local = get("use_local", None)
+        if review_model_uses_local(model) if use_local is None else use_local:
+            return 0.0
+        from ouroboros.reviewer_window import reviewer_context_window, reviewer_window_binding, window_scaled_reserves
+        from ouroboros.tools.review_multi_model import review_output_allowance
+        from ouroboros.usage_admission import review_wave_admission
+
+        window = reviewer_context_window(model, allow_fetch=allow_live_fetch, **(binding := reviewer_window_binding(row)))
+        output = review_output_allowance(model, window, **binding)
+        reserve, margin = window_scaled_reserves(window, output_reserve=output, tokenizer_margin=50_000)
+        prompt = max(0, calibrated_input_token_limit(
+            model, context_window=window, output_reserve=reserve, tokenizer_margin=margin))
+        bounds = review_wave_admission(
+            root_task_id="review-row-price", models=[model], prompt_chars=prompt * 4, max_completion_tokens=output,
+            remaining_usd_override=0.0, processing_preferences=str(get("processing_preference", "") or ""),
+            allow_live_fetch=allow_live_fetch,
+        ).get("slot_bounds") or [None]
+    except Exception:
+        logger.debug("review row price estimate failed open", exc_info=True)
+        return None
+    return bounds[0]
+
+
 SKILL_HOST_CONTEXT_FILES = (
     ("docs/CREATING_SKILLS.md", "markdown"),
     ("ouroboros/contracts/plugin_api.py", "python"),
@@ -143,20 +198,21 @@ def emit_review_usage(
     prompt_chars: int = 0,
     extra: dict | None = None,
 ) -> None:
-    """Emit a normalized llm_usage event for every review surface."""
+    """Emit a normalized llm_usage event for every review surface.
+
+    #1578: each token counter is the reported value, a reported 0, or null; an
+    agent session that disclosed none stays unknown, never zero. A session's
+    ``claudexor`` receipt (run, requested/delegated route, observed attempt) rides
+    the row; an extraction call reports its own usage, never the session's.
+    """
     try:
+        from ouroboros.event_usage import event_token_counts
         from ouroboros.pricing import infer_api_key_type, infer_model_category, infer_provider_from_model
 
         usage_data = dict(usage or {})
-        prompt_tokens = int(usage_data.get("prompt_tokens", usage_data.get("input_tokens", 0)) or 0)
-        completion_tokens = int(usage_data.get("completion_tokens", usage_data.get("output_tokens", 0)) or 0)
-        cached_tokens = int(usage_data.get("cached_tokens", usage_data.get("cache_read_input_tokens", 0)) or 0)
-        cache_write_tokens = int(
-            usage_data.get("cache_write_tokens", usage_data.get("cache_creation_input_tokens", 0)) or 0
-        )
         prompt_cache_ttl = str(usage_data.get("prompt_cache_ttl") or "")
         ledger_attempt_ids = [str(value) for value in (usage_data.get("ledger_attempt_ids") or []) if value]
-        routed_provider = provider or infer_provider_from_model(model)
+        routed_provider = provider or str(usage_data.get("provider") or "") or infer_provider_from_model(model)
         cost = cost_usd if cost_usd is not None else usage_data.get("cost", usage_data.get("total_cost"))
         # Task-tree attribution from the bound usage scope (the supervisor
         # additionally backfills delegation/lane fields from RUNNING).
@@ -186,14 +242,13 @@ def emit_review_usage(
             "api_key_type": infer_api_key_type(model, routed_provider),
             "model_category": infer_model_category(model),
             "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
-                "cached_tokens": cached_tokens,
-                "cache_write_tokens": cache_write_tokens,
+                **event_token_counts(usage_data),
                 "prompt_cache_ttl": prompt_cache_ttl,
                 "cost": cost,
                 "cost_known": cost is not None,
                 "ledger_attempt_ids": ledger_attempt_ids,
+                **{key: copy.deepcopy(usage_data[key]) for key in ("claudexor", "effort", "effort_resolution",
+                                                                   "request_wire") if isinstance(usage_data.get(key), dict)},
             },
             "provider": routed_provider,
             "source": source,
@@ -202,8 +257,8 @@ def emit_review_usage(
             "ledger_attempt_ids": ledger_attempt_ids,
             **{key: value for key, value in attribution.items() if value},
         }
-        if session_id:
-            event["session_id"] = session_id
+        if session_id or usage_data.get("session_id"):
+            event["session_id"] = str(session_id or usage_data["session_id"])
         if prompt_chars:
             event["prompt_chars"] = int(prompt_chars)
         if extra:
@@ -230,16 +285,18 @@ def review_wave_budget_gate(
     Returns admission data when the wave must be declined, else None. Every paid
     review wave is admitted here as a whole — skill/plan/acceptance reviewers
     and, since the owner decision of 2026-09-05, the P3 commit gate
-    (``surface="commit_gate"``: scope seats first, then the triad, each seat
+    (``surface="commit_gate"``: every paid seat of the one wave, each seat
     priced with its own pack size and output reservation — ``prompt_chars`` /
     ``max_completion_tokens`` take one value per slot, and ``categories`` /
     ``slot_ids`` name the usage scope each seat will SEND under, so its bound
     reads the seat's own observed cache split rather than the caller's), against
-    every fence ``reserve_attempt`` enforces — the global TOTAL_BUDGET remainder
-    (the scope's ``global_limit_usd``) and the task's root fence — the event naming
-    the binding axis with both remainders. A wave that fits at admission time is
-    dispatched whole; one that does not is refused before any seat spends.
-    Fail-open on any error/unknown."""
+    every fence ``reserve_attempt`` enforces — global TOTAL_BUDGET, the task's
+    current root and its original billing group — with the binding axis and
+    remainders named in the event. The wave is admitted while KNOWN spend is
+    below every limit (#1487): its summed seat bounds are disclosed, never an
+    earlier refusal. A limit reached mid-wave refuses the remaining seats at
+    their own reservation and dispatch fences, with custody of what was sent.
+    A wave declined here spent nothing. Fail-open on any error/unknown."""
     try:
         from ouroboros.usage_accounting import current_usage_scope
         from ouroboros.usage_admission import review_wave_admission
@@ -269,14 +326,22 @@ def review_wave_budget_gate(
             "estimated_wave_usd": admission.get("estimated_wave_usd"),
             "remaining_usd": admission.get("remaining_usd"),
             "limit_usd": admission.get("limit_usd"),
+            "known_usd": admission.get("known_usd"),
             "accounted_usd": admission.get("accounted_usd"),
             "reserved_usd": admission.get("reserved_usd"),
             **{key: admission.get(key) for key in (
-                "binding_axis", "global_limit_usd", "global_accounted_usd", "global_reserved_usd", "global_remaining_usd")},
+                "binding_axis", "global_limit_usd", "global_known_usd", "global_accounted_usd",
+                "global_reserved_usd", "global_remaining_usd")},
             "slots": admission.get("slots"),
             "slot_bounds": admission.get("slot_bounds"),
             "unpriced_slots": unpriced,
         }
+        unknown = admission.get("admission_unknown")
+        if unknown or admission.get("reason") == "billing_authority_unavailable":
+            detail = {"error": unknown} if unknown else {"billing_authority": admission.get("billing_authority")}
+            event = "review_wave_admission_unavailable" if unknown else "review_wave_billing_authority_unavailable"
+            emit_review_event(ctx, {"type": event, **base, **detail, **(extra or {})})
+            return None  # Exhaustion not established; each seat's reservation remains authoritative.
         if admission.get("fits", True):
             # An admitted wave is normally silent. It must NOT be silent when part of the
             # estimate was unknowable: "fits, every slot priced" and "fits, but one slot
@@ -299,13 +364,15 @@ def review_wave_budget_gate(
 
 
 def review_wave_binding_fence(admission: dict) -> tuple[str, str]:
-    """(fence, remedy) of a refused wave: the binding axis (global TOTAL_BUDGET or
-    per-task root fence) and ITS knob — never a fence the wave would have fit."""
+    """Name the binding global/root/group fence and its actual remedy."""
     usd = lambda key: "unknown" if admission.get(key) is None else f"${float(admission[key]):.6f}"  # noqa: E731
     if admission.get("binding_axis") == "global":
-        return (f"global budget TOTAL_BUDGET {usd('global_limit_usd')}, accounted {usd('global_accounted_usd')} "
+        return (f"global budget TOTAL_BUDGET {usd('global_limit_usd')}, known spend {usd('global_known_usd')} "
                 "across every task", "raise TOTAL_BUDGET")
-    return f"per-task budget fence {usd('limit_usd')}, accounted {usd('accounted_usd')}", (
+    if admission.get("binding_axis") == "group":
+        return (f"whole-work billing-group budget fence {usd('limit_usd')}, known spend {usd('known_usd')}",
+                "amend the original billing-group owner's cap explicitly; changing the per-task setting does not amend it")
+    return f"per-task budget fence {usd('limit_usd')}, known spend {usd('known_usd')}", (
         "raise the per-task budget (OUROBOROS_PER_TASK_COST_USD)")
 
 
@@ -442,75 +509,6 @@ def load_governance_doc(
 # ---------------------------------------------------------------------------
 
 
-# Anti-thrashing prompt rules — shared across triad, scope, and advisory reviewers.
-
-
-# Shared anti-thrashing prompt scaffolding (DRY — used by triad, scope, skill
-# reviewers); per-reviewer history bodies stay local because record shapes differ.
-
-
-def build_scope_actor_record(scope_result: object, *, fallback_model_id: str = "", slot_id: str = "") -> dict:
-    parsed_items = list(getattr(scope_result, "parsed_items", None) or [])
-    critical_findings = list(getattr(scope_result, "critical_findings", None) or [])
-    advisory_findings = list(getattr(scope_result, "advisory_findings", None) or [])
-    if not parsed_items:
-        parsed_items = critical_findings + advisory_findings
-    status = getattr(scope_result, "status", "responded")
-    # Surface the failure text on non-responded actors: the provider error
-    # (e.g. a deterministic 400 prompt-too-long) lives in block_message, and
-    # dropping it here previously forced operators to dig observability blobs
-    # to learn WHY a scope slot recorded status=error with empty raw_text.
-    error_text = ""
-    if status not in ("responded", "ok"):
-        error_text = str(getattr(scope_result, "block_message", "") or "")
-    return {
-        "slot": slot_id,
-        "slot_id": slot_id,
-        "model_id": getattr(scope_result, "model_id", "") or fallback_model_id,
-        "status": status,
-        "error": error_text,
-        **{key: str(getattr(scope_result, key, "") or "") for key in ("failure_phase", "failure_code")},
-        "raw_text": getattr(scope_result, "raw_text", ""),
-        "prompt_chars": getattr(scope_result, "prompt_chars", 0),
-        # measured | estimated_from_tokens | not_assembled — a back-computed count
-        # must not read as a measurement (RS5).
-        "prompt_chars_source": getattr(scope_result, "prompt_chars_source", "measured"),
-        "tokens_in": getattr(scope_result, "tokens_in", 0),
-        "tokens_out": getattr(scope_result, "tokens_out", 0),
-        "cost_usd": getattr(scope_result, "cost_usd", 0.0),
-        "context_manifest": getattr(scope_result, "context_manifest", {}) or {},
-        "prompt_ref": getattr(scope_result, "prompt_ref", {}) or {},
-        "response_ref": getattr(scope_result, "response_ref", {}) or {},
-        "operation_id": str(getattr(scope_result, "operation_id", "") or ""),
-        "operation_state": str(getattr(scope_result, "operation_state", "settled") or "settled"),
-        "late_result_pending": bool(getattr(scope_result, "late_result_pending", False)),
-        "pending_invocation_id": str(getattr(scope_result, "pending_invocation_id", "") or ""),
-        "delegated_run_id": str(getattr(scope_result, "delegated_run_id", "") or ""),
-        "parsed_items": parsed_items,
-        "critical_findings": critical_findings,
-        "advisory_findings": advisory_findings,
-    }
-
-
-def load_checklist_section(section_name: str, checklist_path: Optional[Path] = None) -> str:
-    """Extract one ``## Header`` section from docs/CHECKLISTS.md (the host
-    repo's by default; ``checklist_path`` reads another tree's copy)."""
-    checklist_path = Path(checklist_path) if checklist_path else REPO_ROOT / "docs" / "CHECKLISTS.md"
-    text = checklist_path.read_text(encoding="utf-8")
-
-    header = f"## {section_name}"
-    start = text.find(header)
-    if start == -1:
-        raise ValueError(
-            f"Section {header!r} not found in {checklist_path}"
-        )
-
-    next_header = text.find("\n## ", start + len(header))
-    if next_header == -1:
-        return text[start:]
-    return text[start:next_header]
-
-
 def build_blocking_findings_json_section(
     open_obligations: list,
     blocking_history: list,
@@ -607,6 +605,8 @@ def build_goal_section(
     scope: str = "",
     commit_message: str = "",
     owner_words: str = "",
+    preflight_execution: str = "",
+    diff_pulse: str = "",
 ) -> str:
     """Format the 'Intended transformation' section.
 
@@ -620,6 +620,10 @@ def build_goal_section(
     caused the work (``owner_words.owner_words_text``), placed right after the
     intent: what was asked, beside the author's account of the change. Empty
     keeps the section byte-identical to a review without it.
+    ``preflight_execution`` is the wave's frozen test execution exhibit
+    (``preflight_receipts.execution_section``), placed after them on the same terms,
+    and ``diff_pulse`` the subject's growth since its contribution base
+    (``review_subject_pulse``) after that.
     """
     resolved_text, source = resolve_intent(goal, scope, commit_message)
     sections = [
@@ -632,6 +636,10 @@ def build_goal_section(
     ]
     if owner_words.strip():
         sections.append(f"\n\n{owner_words}")
+    if preflight_execution.strip():
+        sections.append(f"\n\n{preflight_execution}")
+    if diff_pulse.strip():
+        sections.append(f"\n\n{diff_pulse}")
 
     commit_text = commit_message.strip()
     if commit_text and commit_text != resolved_text:
@@ -644,6 +652,24 @@ def build_goal_section(
         )
 
     return "\n".join(sections)
+
+
+def review_subject_pulse(review_root: Any, layer: str, managed: Any = None) -> str:
+    """The diff pulse a review brief carries: ``review.diff_pulse`` over the reading root's
+    index, which holds the subject. Only the body has a contribution base to grow from, and
+    a managed resolution is reviewed as its declared delta rather than as that growth, so
+    neither another root's subject nor a managed one carries a pulse."""
+    if layer != "body" or managed is not None:
+        return ""
+    from ouroboros.review import diff_pulse
+
+    return diff_pulse(Path(review_root), staged=True)
+
+
+def review_history_with_obligations(history: Any, *, drive_root: Any, repo_root: Any, task_id: str = "") -> str:
+    """Public brief facade; the dispute owner joins its sources and obligations."""
+    from ouroboros.review_history import render_history_with_obligations
+    return render_history_with_obligations(history, drive_root=drive_root, repo_root=repo_root, task_id=task_id)
 
 
 def build_scope_section(scope: str = "") -> str:
@@ -727,27 +753,7 @@ def check_worktree_readiness(
     except Exception:
         pass
 
-    # 4. Diff size.
-    try:
-        diff_path_args = (["--"] + list(paths)) if paths else []
-        staged = subprocess.run(
-            ["git", "diff", "--cached"] + diff_path_args,
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-        )
-        unstaged = subprocess.run(
-            ["git", "diff"] + diff_path_args,
-            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
-        )
-        combined_len = len(staged.stdout or "") + len(unstaged.stdout or "")
-        if combined_len > 400_000:
-            warnings.append(
-                f"Large diff detected ({combined_len:,} chars). "
-                "Consider splitting into smaller commits for better advisory coverage."
-            )
-    except Exception:
-        pass
-
-    # 5. Size-ratchet findings. Never blocking here: the official repository's
+    # 4. Size-ratchet findings. Never blocking here: the official repository's
     # CI ``size_ratchet`` lane is the enforcing surface; this warning lets the
     # agent regenerate the manifest or shrink the debt before the official
     # line rejects the same finding. Cheap since the history replay retired
@@ -797,6 +803,8 @@ def _run_review_preflight_tests(ctx: "Any", timeout: Optional[int] = None, *, fo
 
         # Pre-commit entry point: the deleted-suite baseline is HEAD alone.
         run_kwargs = {"max_output": MAX_OUTPUT, "phase": PRE_COMMIT_PHASE, "ctx": ctx}
+        from ouroboros.test_selection import commit_test_options
+        run_kwargs.update(commit_test_options(ctx, force=force))
         if timeout is not None:
             run_kwargs["timeout"] = timeout
         output = run_hermetic_pytest(pathlib.Path(repo_dir), **run_kwargs)
@@ -832,7 +840,9 @@ def format_advisory_error(prefix: str, result_error: str, stderr_tail: str,
 from ouroboros.tools.review_prompt_text import (  # noqa: E402, F401 -- intentional public re-exports
     CRITICAL_FINDING_CALIBRATION,
     REPO_ANTI_PATTERN_LOCK_GUARD,
+    REPO_ANTI_PATTERN_LOCK_GUARD_CORE,
     REVIEW_PREAMBLE,
+    REVIEW_PREAMBLE_CORE,
     REVIEW_REPAIR_JUDGMENT,
     REVIEW_SEVERITY_THRESHOLDS,
     REVIEW_THOROUGHNESS_BLOCK,
@@ -844,6 +854,8 @@ from ouroboros.tools.review_prompt_text import (  # noqa: E402, F401 -- intentio
     _OBLIGATION_SUFFIX_RE,
     _SECRET_LINE_RE,
     _make_fence,
+    anti_pattern_lock_guard,
+    author_questions_block,
     build_anti_thrashing_rules_section,
     build_obligations_block,
     build_rebuttal_section,
@@ -852,10 +864,12 @@ from ouroboros.tools.review_prompt_text import (  # noqa: E402, F401 -- intentio
     format_obligation_excerpt,
     format_prompt_code_block,
     format_review_history_entry,
+    goal_with_author_questions,
     normalize_reviewer_item,
     normalize_reviewer_items,
     normalize_reviewer_obligation_id,
     redact_prompt_secrets,
+    review_preamble,
     single_line,
     strip_obligation_suffix,
 )

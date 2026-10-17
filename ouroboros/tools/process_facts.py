@@ -56,7 +56,7 @@ def redact_process_data(value):
     if isinstance(value, dict):
         # Host vocabulary/identity is not a child echo. In particular a one-char
         # selected secret must not rewrite PASS/status or receipt identity hashes.
-        typed = {"tool", "status", "code", "contract_kind", "expected_match", "ts",
+        typed = {"tool", "status", "code", "contract_kind", "expected_match", "ts", "receipt_ts",
                  "criterion_source", "check_rendering", "root", "source", "kind",
                  "sha256", "content_sha256", "input_sha256", "output_sha256"}
         return {key: item if key in typed else redact_process_data(item) for key, item in value.items()}

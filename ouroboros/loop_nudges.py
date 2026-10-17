@@ -1,26 +1,25 @@
-"""Mid-task steering notes injected into the transcript: the self-check, time and
-cost milestones, nanny economics and delegate-activity metering, round
-checkpoints, plan-forcing prompts, skill-finalization wording, finalization
-nudges and the answer protocol. Extracted from loop.py (v7 L-B split); loop.py
-re-exports every name."""
+"""Host notices injected into the transcript: one-time time and cost threshold
+crossings, plan-forcing prompts, skill-finalization facts, one-shot finalization
+facts and the answer protocol. Extracted from loop.py (v7 L-B split); loop.py
+re-exports every name. Notices state observations and the available actions;
+periodic questions and strategy advice were removed (owner 11 Oct, #1748).
+Every-round facts ride the facts line (``loop_messages``)."""
 
 from __future__ import annotations
 
-import json
 import logging
 import pathlib
 import queue
 
 from typing import Any, Callable, Dict, List, Optional
 from ouroboros import task_pacing
-from ouroboros.nanny_pacing import _nanny_burn_phrase, _nanny_metered_since_delegate_activity, _nanny_reminder_due
+from ouroboros.nanny_pacing import nanny_burn_fact, nanny_metered_since_delegate_activity
 from ouroboros.outcomes import extract_final_answer, latest_agent_defined_verification, latest_unreconciled_failed_verification, latest_unreconciled_masked_verification, should_nudge_verification, turn_has_reviewable_effects
 # D18b: the trace-touched skill-name scan lives with the readiness predicate that
 # consumes it (upstream 0463c6bb); the historical private name stays bound here so
 # loop.py's re-export and every existing caller keep addressing one object.
 from ouroboros.skill_readiness import skill_names_touched_by_trace as _skill_names_touched_by_trace  # noqa: F401 -- historical name
 from ouroboros.tools.registry import ToolRegistry
-from ouroboros.utils import estimate_tokens
 
 
 log = logging.getLogger("ouroboros.loop")
@@ -69,13 +68,10 @@ def _skill_finalization_message(drive_root: pathlib.Path, llm_trace: Dict[str, A
     if not blockers:
         return ""
     return (
-        "⚠️ SKILL_NOT_FINALIZED: Selected self-authored skills have execution "
-        "prerequisites to consider against the actual requested outcome. Address "
-        "the listed phase with its available action; a fresh review does not supply "
-        "missing owner grants or override intentional disablement. Use only actions "
-        "covered by the owner's request. If the requested result is blocked, preserve "
-        "an honest partial result and name the missing permission or runtime. "
-        "An intentionally disabled skill may satisfy the task. Current facts: " + "; ".join(blockers)
+        "⚠️ SKILL_NOT_FINALIZED: self-authored skills this task touched are not ready to "
+        "execute. A fresh review does not supply a missing owner grant or override an "
+        "intentional disablement, and an intentionally disabled skill may still satisfy the "
+        "task. Current facts, each with its available next actions: " + "; ".join(blockers)
     )
 
 
@@ -120,147 +116,15 @@ def _force_plan_disclosure(
     return plan_review_disclosure(decision, forced_reason)
 
 
-def _build_recent_tool_trace(
-    messages: List[Dict[str, Any]], window: int = 15, llm_trace: Optional[Dict[str, Any]] = None,
-) -> str:
-    """Build a compact recent-tool trace for the self-check prompt.
-
-    Each call carries its recorded outcome, and a failed one the first line of what the
-    tool answered: a list of calls alone asks "are you repeating yourself?" without the
-    one fact that says why. Facts only — what they mean stays with the model.
-
-    Built from ``llm_trace.tool_calls`` whenever it exists, so name, arguments and outcome
-    all come from ONE record. Joining the visible ``messages`` to the trace by call id
-    cannot be made sound: providers reuse ids (GigaChat answers ``call_0`` every round, the
-    local parser ``call_local_<i>``) and compaction removes whole units from anywhere — a
-    capsule replaces a prefix, ``_select_units`` leaves a zero-reclaim or memo-negative unit
-    in place, an authored view keeps an arbitrary set — so a surviving call took an evicted
-    namesake's error. Keying by id did that, and so did matching (id, tool) whenever both
-    calls were the SAME tool. Without a trace the messages still render, carrying no outcome
-    at all rather than a borrowed one.
-    """
-    from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
-
-    def _summary(name: str, args: Any) -> str:
-        if isinstance(args, dict):
-            args = json.dumps(args, sort_keys=True)
-        args_str = str(args or "")
-        return f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
-
-    rows = [row for row in ((llm_trace or {}).get("tool_calls") or []) if isinstance(row, dict)]
-    all_calls: List[str] = []
-    for row in rows:
-        status = str(row.get("status") or ("error" if row.get("is_error") else "ok"))
-        note = f" [{status}]"
-        if _trace_call_errored(row):
-            head = str(row.get("result") or "").strip().splitlines()[:1]
-            note += f" ← {head[0][:200]}" if head else ""
-        all_calls.append(_summary(str(row.get("tool") or ""), row.get("args")) + note)
-    if not rows:
-        for msg in messages:
-            if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {})
-                    all_calls.append(_summary(fn.get("name", ""), fn.get("arguments", "")))
-    recent = all_calls[-window:] if all_calls else []
-    if not recent:
-        return ""
-    return "Recent tool calls (oldest first):\n" + "\n".join(f"  {i+1}. {c}" for i, c in enumerate(recent))
-
-
-def _maybe_inject_self_check(
-    round_idx: int,
-    max_rounds: Optional[int],
-    messages: List[Dict[str, Any]],
-    accumulated_usage: Dict[str, Any],
-    emit_progress: Callable[[str], None],
-    *,
-    event_queue: Optional[queue.Queue] = None,
-    task_id: str = "",
-    drive_logs: Optional[pathlib.Path] = None,
-    cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
-    llm_trace: Optional[Dict[str, Any]] = None,
-) -> bool:
-    """Inject a normal user-turn self-check and emit one checkpoint event. Without a round
-    limit (``max_rounds is None``) it names the rounds used and no invented remainder."""
-    REMINDER_INTERVAL = 15
-    if (round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0
-            or (max_rounds is not None and round_idx >= max_rounds)):
+def _inject_note(note: Optional["task_pacing.PacingNote"], messages: List[Dict[str, Any]], tools: ToolRegistry,
+                 accumulated_usage: Optional[Dict[str, Any]], event_queue: Optional[queue.Queue], task_id: str,
+                 drive_logs: Optional[pathlib.Path]) -> bool:
+    """Append one threshold notice to the round about to be sent and emit its checkpoint."""
+    if note is None:
         return False
-    # Non-incrementing round re-entries (e.g. free redials): one self-check per round.
-    if accumulated_usage.get("_self_check_round") == round_idx:
-        return False
-    accumulated_usage["_self_check_round"] = round_idx
-
-    ctx_tokens = sum(
-        estimate_tokens(_loop()._extract_plain_text_from_content(m.get("content")))
-        for m in messages
-    )
-    raw_task_cost = accumulated_usage.get("cost")
-    task_cost = float(raw_task_cost) if raw_task_cost is not None else None
-    cost_text = f"${task_cost:.2f}" if task_cost is not None else "unknown"
-    checkpoint_num = round_idx // REMINDER_INTERVAL
-
-    # Tree spend under a root cap (v6.91): the checkpoint is already a
-    # cache-breaking user turn — one of the RARE surfaces allowed a live
-    # ledger number (DEVELOPMENT cache_friendliness item 22). The fence
-    # counts the whole tree; own cost alone hid two tree deaths.
-    tree_line = ""
-    tree_accounted: Optional[float] = None
-    tree_cap: Optional[float] = None
-    tree_info = _loop()._loop_tree_accounting(refresh=True, max_age_sec=30.0)
-    rendered = task_pacing.tree_spend_line(tree_info, cost_ceiling)
-    if rendered:
-        tree_accounted = float(tree_info["accounted_usd"])
-        raw_cap = tree_info.get("root_limit_usd")
-        tree_cap = float(raw_cap) if raw_cap is not None else None
-        tree_line = f"{rendered}\n"
-
-    tool_trace = _build_recent_tool_trace(messages, llm_trace=llm_trace)
-
-    round_text, remaining_text = f"round {round_idx}", ""
-    if max_rounds is not None:
-        round_text += f"/{max_rounds}"
-        remaining_text = f" | Rounds remaining: {max_rounds - round_idx}"
-    reminder = (
-        f"[CHECKPOINT {checkpoint_num} — {round_text}]\n"
-        f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text}{remaining_text}\n"
-        f"{tree_line}"
-    )
-    if tool_trace:
-        reminder += f"\n{tool_trace}\n"
-    reminder += (
-        "\nThis is a periodic self-check, not a command to stop. "
-        "Glance at your recent tool-call trace above and briefly consider:\n"
-        "- Are you still making progress toward the task, or repeating the same actions?\n"
-        "- Is the current approach still the right one, or should you narrow scope / try a different angle?\n"
-        "- If you are waiting on a long build/download/training run or have independent branches of investigation, consider schedule_subagent for a focused parallel handoff.\n"
-        "- If the task is effectively done, first re-check the literal original requirements one by one "
-        "against the specified interface/path/format/service, then wrap up by replying with your final answer in plain text (no tool call). "
-        "Otherwise continue with the most valuable next step.\n"
-        "\nNo special format required — just think, then act."
-    )
-
-    # Merge into a prior user turn to avoid Anthropic consecutive-role 400s,
-    # preserving multipart blocks so images/cache markers survive.
-    _loop()._append_or_merge_user_message(messages, reminder)
-    emit_progress(
-        f"Checkpoint {checkpoint_num} at round {round_idx}: "
-        f"~{ctx_tokens} tokens, {cost_text} spent"
-    )
-
-    checkpoint_payload: Dict[str, Any] = {
-        "checkpoint_number": checkpoint_num,
-        "round": round_idx,
-        "max_rounds": max_rounds,
-        "context_tokens": ctx_tokens,
-        "task_cost": task_cost,
-    }
-    if tree_accounted is not None:
-        checkpoint_payload["tree_accounted_usd"] = round(tree_accounted, 4)
-        checkpoint_payload["tree_cap_usd"] = round(tree_cap, 4) if tree_cap is not None else None
-    _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, checkpoint_payload)
-
+    note = task_pacing.with_resource_facts(note, tools._ctx, accumulated_usage)
+    _loop()._append_or_merge_user_message(messages, note.text)
+    _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
     return True
 
 
@@ -271,24 +135,21 @@ def _maybe_inject_time_budget_milestone(
     event_queue: Optional[queue.Queue] = None,
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
-    round_idx: int = 0,
     accumulated_usage: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Thin transport over the task_pacing SSOT (v6.54.4): the milestone content,
+    """Thin transport over the task_pacing SSOT (v6.54.4): the notice content,
     thresholds, and seen-state live in ouroboros/task_pacing.py; this wrapper only
-    appends the note and emits the checkpoint event."""
-    note = task_pacing.build_time_budget_note(
-        tools._ctx, round_idx=round_idx, accumulated_usage=accumulated_usage,
-        # A real ledger read happens ONLY when the pacing note actually fires
-        # (per 600s bucket) — the note is a cache-breaking user turn already.
-        tree_cost_provider=lambda: _loop()._loop_tree_accounting(refresh=True, max_age_sec=30.0),
-    )
-    if note is None:
-        return False
-    note = task_pacing.with_resource_facts(note, tools._ctx, accumulated_usage)
-    _loop()._append_or_merge_user_message(messages, note.text)
-    _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
-    return True
+    appends the notice and emits the checkpoint event."""
+    return _inject_note(task_pacing.build_time_budget_note(tools._ctx), messages, tools,
+                        accumulated_usage, event_queue, task_id, drive_logs)
+
+
+def _round_money(accumulated_usage: Dict[str, Any], round_idx: int) -> Dict[str, Any]:
+    """This round's wallet and tree readings, shared with the round's facts line."""
+    return task_pacing.round_money_observation(
+        accumulated_usage, round_idx,
+        tree_reader=lambda: _loop()._loop_tree_accounting(
+            refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC))
 
 
 def _maybe_inject_cost_budget_milestone(
@@ -298,183 +159,73 @@ def _maybe_inject_cost_budget_milestone(
     budget_remaining_usd: Optional[float],
     cost_ceiling: Optional["task_pacing.CostCeiling"],
     accumulated_usage: Optional[Dict[str, Any]],
+    round_idx: int = 0,
+    active_use_local: bool = False,
     event_queue: Optional[queue.Queue] = None,
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
 ) -> bool:
-    """Thin transport over the task_pacing cost axis (v6.56.0): content,
-    thresholds, and latch state live in ouroboros/task_pacing.py. The deciding
-    spend under a root cap is the tree-accounted stash (free read; refreshed by
-    every dispatch) with a bounded staleness cap — never a per-round ledger
-    read, see ``_TREE_ACCOUNTING_MAX_STALE_SEC``."""
+    """Thin transport over the task_pacing cost axes (v6.56.0; the wallet axis #1129).
+
+    The tree axis decides on the tree's KNOWN spend from the root stash (refreshed
+    by every dispatch) with a bounded staleness cap; the wallet axis compares the
+    shared wallet's current known headroom with ``budget_remaining_usd``, what
+    remained when this execution started. Both read this round's one money
+    observation (``_round_money``), the same one its facts line renders. A local
+    route spends nothing from the wallet, so its wallet axis waits."""
+    usage = accumulated_usage if isinstance(accumulated_usage, dict) else {}
+    money = _round_money(usage, round_idx)
+    tree_info = money.get("tree")
     ceiling_usd = (
         cost_ceiling.ceiling_usd
         if cost_ceiling is not None and cost_ceiling.state == task_pacing.COST_CEILING_ACTIVE
         else None
     )
-    tree_info = _loop()._loop_tree_accounting(
-        refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC,
-    )
-    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
-    note = task_pacing.build_cost_budget_note(
+    task_cost = usage.get("cost")
+    tree_note = task_pacing.build_cost_budget_note(
         tools._ctx,
-        start_remaining_usd=budget_remaining_usd,
         cost_ceiling_usd=ceiling_usd,
-        task_cost=(accumulated_usage or {}).get("cost"),
-        tree_cost_usd=tree_cost,
+        task_cost=task_cost,
+        tree_cost_usd=tree_info.get("settled_usd") if isinstance(tree_info, dict) else None,
         # Whether a tree cap exists at all decides if own cost is the complete
         # picture or a disclosed lower bound (task_pacing.resolve_deciding_spend).
         root_cap_usd=(cost_ceiling.root_cap_usd if cost_ceiling is not None else None),
+        whole_work_group=isinstance(tree_info, dict) and tree_info.get("accounting_basis") == "billing_group",
     )
-    if note is None:
-        return False
-    note = task_pacing.with_resource_facts(note, tools._ctx, accumulated_usage)
-    _loop()._append_or_merge_user_message(messages, note.text)
-    _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, note.checkpoint)
-    return True
-
-
-def _own_round_cost_sentence(ctx: Any, cost: float) -> tuple[str, str]:
-    """The reminder's money sentence from COST EVIDENCE first: a positive priced
-    delta (provider-reported or estimated cost of the nanny's own rounds) is
-    metered money; no price is an unknown cash cost, never zero. The latest round's
-    route is named only as context, and a fallback clause appears only when a
-    fallback chain is actually configured (a paid round is no proof the next is)."""
-    usage = getattr(ctx, "_accumulated_usage", None)
-    meta = usage.get("_last_llm_call_meta") if isinstance(usage, dict) else None
-    meta = meta if isinstance(meta, dict) else {}
-    model = str(meta.get("resolved_model") or meta.get("model") or "")
-    route = " / ".join(item for item in (str(meta.get("provider") or ""), model) if item)
-    if cost > 0:
-        cost_class, sentence = "priced", (
-            "Your own rounds here reported a price, so that spend is metered money")
-    else:
-        cost_class, sentence = "unpriced", (
-            "No provider price reached this task for your own rounds here: an unknown "
-            "cash cost, not a zero one")
-    sentence += f" (latest round: {route})." if route else "."
-    try:
-        from ouroboros.model_slots import get_fallback_models
-
-        fallbacks = get_fallback_models(str(meta.get("model") or ""))
-    except Exception:
-        fallbacks = []
-    if fallbacks:
-        sentence += (f" If this route stops serving, the configured fallback ({', '.join(fallbacks[:3])}) "
-                     "may take over, and a fallback round may be metered.")
-    return cost_class, sentence
-
-
-def _maybe_inject_nanny_economics_reminder(
-    round_idx: int,
-    messages: List[Dict[str, Any]],
-    tools: ToolRegistry,
-    emit_progress: Callable[[str], None],
-    *,
-    event_queue: Optional[queue.Queue] = None,
-    task_id: str = "",
-    drive_logs: Optional[pathlib.Path] = None,
-) -> bool:
-    """The periodic half of the nanny-economics reminder (poltergeist phase B).
-
-    A plain user-message reminder in the self-checkpoint style — the loop's
-    checkpoints are ordinary user turns, never protocol (ARCHITECTURE: "Loop
-    self-checkpoints remain plain user-message reminders"). Fires between
-    rounds, while the burn is happening — the finalization nudge alone
-    arrives after the money is spent. Proportional, unbounded in count: each
-    further threshold-width of metered rounds re-arms it (owner 2=B — no cap)."""
-    ctx = tools._ctx
-    if not getattr(ctx, "_nanny_route_dispatched", False):
-        return False
-    rounds, cost, due = _nanny_reminder_due(ctx, round_idx)
-    if not due:
-        return False
-    # The fire cursor is the metered-progress mark AT this firing (round + cost),
-    # so the dual-axis re-arm in `_nanny_reminder_due` measures both axes from
-    # the same instant. Cleared on delegate activity.
-    _progress_mark = getattr(ctx, "_nanny_metered_progress", None)
-    ctx._nanny_reminder_mark = (dict(_progress_mark) if isinstance(_progress_mark, dict)
-                                else {"round": int(round_idx), "cost": 0.0})
-    # R2-7c: before the first delegate verb there IS no "last delegated-run
-    # activity" — the burn is measured from task start, and the wording says
-    # so instead of implying an activity that never happened.
-    _baseline_known = isinstance(getattr(ctx, "_nanny_delegate_baseline", None), dict)
-    if _baseline_known:
-        since_phrase = (
-            "since your last act of delegation (delegate_start / "
-            "schedule_subagent), supervision included"
-        )
-    else:
-        since_phrase = "since this task started (no act of delegation yet)"
-    # BR1-3: never an unconditional "$0" claim — the owner's wording law is
-    # typed cost classes: known-zero only on a settled $0 spend, never "free"
-    # unqualified (estimated/undisclosed spend is never zero).
-    cost_class, cost_sentence = _own_round_cost_sentence(ctx, cost)
-    reminder = (
-        "[NANNY ECONOMICS REMINDER]\n"
-        f"You are a harness-dispatched NANNY and you have spent {_nanny_burn_phrase(rounds, cost)} "
-        f"{since_phrase}. A subscription-lane delegated run has known-zero "
-        "marginal cost only when its settled spend reports $0 (estimated or "
-        f"undisclosed spend is never zero). {cost_sentence}\n"
-        "This is a reminder, not a stop. Consider: delegate the remaining work "
-        "(delegate_start / delegate_wait — follow-up work and fixes are delegated too), "
-        "and keep your own rounds for judgment: acceptance, integration, honest "
-        "settlement. A deliberate switch_model raise for that judgment is "
-        "sanctioned — finish it and drop back. If this work genuinely must run "
-        "on metered tokens, continue deliberately and say why in your result."
-    )
-    _loop()._append_or_merge_user_message(messages, reminder)
-    # Owner decision (2026-08-15): no owner-chat progress line — the model sees
-    # the reminder and the typed task_checkpoint below carries observability.
-    _loop()._emit_checkpoint_event(event_queue, task_id, drive_logs, {
-        "checkpoint_kind": "nanny_economics_reminder",
-        "round": round_idx,
-        "metered_rounds_since_delegate_activity": rounds,
-        "metered_cost_since_delegate_activity_usd": round(cost, 4),
-        "own_round_cost_class": cost_class,
-    })
-    return True
+    wallet_note = None if active_use_local else task_pacing.build_wallet_budget_note(
+        tools._ctx, baseline_usd=budget_remaining_usd, wallet=money.get("wallet"), task_cost=task_cost)
+    injected = [_inject_note(note, messages, tools, accumulated_usage, event_queue, task_id, drive_logs)
+                for note in (tree_note, wallet_note)]
+    return any(injected)
 
 
 def _inject_round_checkpoints(
     *,
     round_idx: int,
-    max_rounds: Optional[int],
     messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
-    emit_progress: Callable[[str], None],
     tools: ToolRegistry,
     event_queue: Optional[queue.Queue],
     task_id: str,
     drive_logs: Optional[pathlib.Path],
     budget_remaining_usd: Optional[float] = None,
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
-    llm_trace: Optional[Dict[str, Any]] = None,
+    active_use_local: bool = False,
 ) -> bool:
-    """Inject the per-round self-check and the time-budget / intrinsic-pacing
-    milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
-    normal user turn). Returns whether any was injected (routine compaction is
-    skipped that round when so)."""
-    checkpoint = _maybe_inject_self_check(
-        round_idx, max_rounds, messages, accumulated_usage, emit_progress,
-        event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-        cost_ceiling=cost_ceiling, llm_trace=llm_trace,
-    )
+    """Inject this round's time and cost threshold notices AFTER owner messages, so a
+    notice joins the LLM-call tail (a normal user turn, never a paid round of its
+    own). Returns whether any was injected."""
     time_budget = _maybe_inject_time_budget_milestone(
         messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-        round_idx=round_idx, accumulated_usage=accumulated_usage,
+        accumulated_usage=accumulated_usage,
     )
     cost_budget = _maybe_inject_cost_budget_milestone(
         messages, tools,
         budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling,
-        accumulated_usage=accumulated_usage,
+        accumulated_usage=accumulated_usage, round_idx=round_idx, active_use_local=active_use_local,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
     )
-    nanny_economics = _maybe_inject_nanny_economics_reminder(
-        round_idx, messages, tools, emit_progress,
-        event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-    )
-    return bool(checkpoint or time_budget or cost_budget or nanny_economics)
+    return bool(time_budget or cost_budget)
 
 
 def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
@@ -499,29 +250,25 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
     started = int(evidence.get("delegated_runs_started") or 0)
     settled = int(evidence.get("delegated_runs_settled") or 0)
     if int(evidence.get("delegated_runs_succeeded") or 0):
-        # Proportional silence must not extend to FORCED exits (grok / F16):
-        # an overrun-forced wrap-up still owes the parent the honest-spend
-        # line. One shot riding the single forced prompt — never a re-loop.
-        rounds, cost = _nanny_metered_since_delegate_activity(tools_ctx)
-        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
-
-        if rounds >= NANNY_REMINDER_ROUNDS or cost >= NANNY_REMINDER_USD:
-            return (
-                "\nNOTE: your delegated run(s) succeeded, but you have since spent "
-                f"{_nanny_burn_phrase(rounds, cost)} beyond your last act of delegation. "
-                "Account for that spend honestly in your answer."
-            )
-        return ""
+        # The forced prompt carries no facts line, so the nanny's own burn since its
+        # anchors rides here as a fact (grok / F16) — no threshold, no advice, never a
+        # re-loop; with no own rounds or recorded cost since, there is nothing to state,
+        # unless an older checkpoint left the anchors unknown (unknown is not zero).
+        baseline = getattr(tools_ctx, "_nanny_delegate_baseline", None)
+        anchors_unknown = isinstance(baseline, dict) and "cost" not in baseline
+        if not anchors_unknown and not any(nanny_metered_since_delegate_activity(tools_ctx)):
+            return ""
+        return "\nNOTE: this task's delegated run(s) succeeded. " + nanny_burn_fact(tools_ctx) + "."
     if started > settled:
         return (
             "\nNOTE: this task dispatched delegated run(s) that have not settled "
-            f"yet ({started - settled} of {started} pending). State their status "
-            "in your answer; do not claim the delegated work finished."
+            f"yet ({started - settled} of {started} pending); their results are not in "
+            "this transcript."
         )
     if settled:
         return (
             f"\nNOTE: this task's delegated run(s) settled WITHOUT success ({settled} "
-            "run(s)). State that failure and its impact honestly in your answer."
+            "run(s))."
         )
     if evidence.get("delegate_start_attempted") or any(
         str(c.get("tool") or "") == "delegate_start"
@@ -531,8 +278,8 @@ def _forced_delegation_note(tools_ctx: Any, llm_trace: Dict[str, Any]) -> str:
         return ""
     return (
         "\nNOTE: this task was dispatched onto the delegated substrate "
-        "(executor=harness) and made no delegate_start calls — the work ran on "
-        "metered API tokens. State why in your answer."
+        "(executor=harness) and made no delegate_start calls; its work ran on "
+        "this task's own model calls."
     )
 
 
@@ -542,6 +289,12 @@ def _nanny_finalization_message(
 ) -> str:
     """The honest nanny reminder for a harness-dispatched child at finalization —
     or '' when no reminder is deserved.
+
+    A nanny with no durable delegated start gets NANNY_DID_NOT_DELEGATE; an unsettled
+    start gets NANNY_DELEGATED_RUN_PENDING (the custody fact a duplicate start would
+    contradict); runs that all ended without success get NANNY_DELEGATED_RUN_FAILED.
+    Each is a one-shot fact with the available verbs, not a gate. A succeeded run gets
+    nothing here: the nanny's own burn rides the facts line every round.
 
     F4 (2026-08-10 saga): the old reminder accused children whose delegated
     runs CRASHED of "choosing" not to delegate, and fired even with the verbs
@@ -577,23 +330,10 @@ def _nanny_finalization_message(
     except Exception:
         log.debug("nanny nudge: custody evidence read failed", exc_info=True)
     if evidence.get("delegated_runs_succeeded"):
-        # "Used once" is no permanent license (the poltergeist children ran one
-        # $0 run, then co-built for tens of opus rounds behind this early
-        # return): silence is proportional to the burn since the last delegated run.
-        rounds, cost = _nanny_metered_since_delegate_activity(tools._ctx)
-        from ouroboros.task_pacing import NANNY_REMINDER_ROUNDS, NANNY_REMINDER_USD
-
-        if rounds < NANNY_REMINDER_ROUNDS and cost < NANNY_REMINDER_USD:
-            return ""
-        return (
-            "⚠️ NANNY_METERED_OVERRUN: your delegated run(s) succeeded, but you have "
-            f"since spent {_nanny_burn_phrase(rounds, cost)} beyond your last act of "
-            "delegation (supervision included). "
-            "A successful run is verified and integrated, not rebuilt. If "
-            "the remaining work is substantive, delegate it (a new delegate_start); "
-            "if you are wrapping up, keep the wrap-up short and account for the "
-            "metered spend honestly in your result."
-        )
+        # The poltergeist children ran one $0 run, then co-built for tens of opus
+        # rounds: that burn is now on the facts line of every round
+        # (``nanny_pacing.nanny_burn_fact``), stated, not judged.
+        return ""
     started = int(evidence.get("delegated_runs_started") or 0)
     if not started and (evidence.get("evidence_read_failed") or not evidence):
         # Unreadable custody (a5e59bdf): configured -> unknown message; legacy -> silence.
@@ -617,22 +357,18 @@ def _nanny_finalization_message(
             if failure_states else ""
         )
         return (
-            "⚠️ NANNY_DELEGATED_RUN_PENDING: you routed work onto the delegated "
-            f"substrate and {pending} delegated run(s) have started but not "
-            "settled — they may still be executing. Do not finalize over an "
-            "in-flight delegated run (its result would be orphaned) and do not "
-            "start a duplicate: wait for or check it (delegate_wait) before "
-            "finalizing, or cancel it (delegate_cancel) and say so." + failed_note
+            f"⚠️ NANNY_DELEGATED_RUN_PENDING: {pending} delegated run(s) of this task have "
+            "started but not settled — they may still be executing. A final answer now "
+            "leaves their results unread (orphaned), and a new start would duplicate "
+            "them. Available: delegate_wait to check or wait, delegate_cancel to stop one."
+            + failed_note
         )
     if started:
         states = ", ".join(failure_states) or "settled without a recorded terminal state"
         return (
-            "⚠️ NANNY_DELEGATED_RUN_FAILED: you DID route work onto the delegated "
-            f"substrate ({started} run(s) started), but none succeeded — your "
-            f"delegated run(s) ended: {states}. Do not finalize as if delegation "
-            "was never attempted: either retry it (delegate_start / delegate_wait) "
-            "or state in your final answer that the delegated run failed and why "
-            "the remaining work ran on metered API tokens."
+            f"⚠️ NANNY_DELEGATED_RUN_FAILED: this task started {started} delegated run(s) "
+            f"and none succeeded; they ended: {states}. Available: delegate_start for "
+            "another run."
         )
     from ouroboros.subagent_bootstrap import configured_actor_finalization_message
 
@@ -642,12 +378,11 @@ def _nanny_finalization_message(
         return _actor
     return (
         "⚠️ NANNY_DID_NOT_DELEGATE: this task was dispatched onto the delegated "
-        "substrate (executor=harness), but you are finalizing with ZERO "
-        "delegate_start calls — the work would end up billed to metered API "
-        "tokens the parent asked to avoid. Either delegate the remaining work "
-        "now (delegate_start / delegate_wait), or finalize with an explicit "
-        "statement of WHY delegation was not used (route refused, work shape "
-        "unsuited, deadline) so your parent sees the substrate decision."
+        "substrate (executor=harness) and made zero delegate_start calls; its work "
+        "ran on this task's own model calls. If it completes this way, its "
+        "result discloses delegated_substrate_unused to the parent, together with the "
+        "fact that it finalized after this notice. Available: delegate_start, "
+        "delegate_wait."
     )
 
 
@@ -714,10 +449,11 @@ def _maybe_inject_finalization_nudges(
                 to_model = str(handover.get("to_model") or "the current model")
                 return _inject(
                     f"A host-driven model handover occurred ({from_model} → {to_model}) "
-                    "after the previous model had already used tools. Continue the owner's "
-                    "open task from the preserved plan and tool results. Use tools for the "
-                    "next substantive step or state a concrete blocker; do not stop at a "
-                    "work-in-progress status update.",
+                    "after the previous model had already used tools on this open task; the "
+                    "plan and tool results above are that earlier work. No substantive tool "
+                    "call has run since the handover. If the turn ends without one, the host "
+                    "records this handover as incomplete (execution degraded); later tool "
+                    "work clears that record.",
                     "Authoring handover recovery nudge injected before final response.",
                 )
             tools._ctx._authoring_handover = None
@@ -789,9 +525,9 @@ def _maybe_inject_finalization_nudges(
             _exit = f" (exit {_rc})" if _rc is not None else ""
             return _inject(
                 "Your latest host-attested verification is RED" + _on + _exit +
-                ". Before a clean final answer, reconcile it: re-check it, explain why this check is "
-                "not the task's acceptance contract, or fix and re-run verification. This is advisory — "
-                "if you finalize anyway, make the residual risk explicit.",
+                ", and no later receipt reconciles it. Available: re-check it, fix and re-run "
+                "verification, or state why this check is not the task's acceptance contract. "
+                "This notice is advisory, not a gate.",
                 "Red-verification nudge injected before final response.",
             )
     if not getattr(tools._ctx, "_verify_masked_nudged", False):
@@ -810,9 +546,8 @@ def _maybe_inject_finalization_nudges(
             return _inject(
                 "Your latest passing verification" + _mon + " uses a shell pipe" + _mwhy +
                 " that can hide the real command's exit code, so a failing run could read as exit 0. "
-                "Before a clean final answer, re-ground so the exit reflects the real result (drop the "
-                "masking pipe / use the runner's own pass marker), or explain why it is reliable. This is "
-                "advisory — if you finalize anyway, make the residual risk explicit.",
+                "Available: re-run it without the masking pipe or with the runner's own pass marker, "
+                "or state why the result is reliable. This notice is advisory, not a gate.",
                 "Masked-verification nudge injected before final response.",
             )
     if not getattr(tools._ctx, "_criterion_source_nudged", False):
@@ -827,11 +562,10 @@ def _maybe_inject_finalization_nudges(
             _acheck = str(_agent_defined.get("check") or "").strip()
             _aon = f" (`{_acheck}`)" if _acheck else ""
             return _inject(
-                "Your latest passing verification" + _aon + " uses a success "
-                "criterion YOU defined, not one the task states. Before finalizing, double-check the "
-                "criterion is equivalent to what the task actually asks for (format, units, scope) — "
-                "re-run verify_and_record with criterion_basis stating why it suffices, or adjust the "
-                "check. Advisory only — if you finalize anyway, make the assumption explicit.",
+                "Your latest passing verification" + _aon + " uses a success criterion you defined "
+                "(criterion_source agent_defined, no criterion_basis), not one the task states; the "
+                "receipt carries that provenance to acceptance. Available: verify_and_record with a "
+                "criterion_basis, or a check of the task's own stated criterion. This notice is advisory, not a gate.",
                 "Criterion-provenance nudge injected before final response.",
             )
     suppress_unavailable_zero_run_verify = False
@@ -858,49 +592,21 @@ def _maybe_inject_finalization_nudges(
         # finalization paths return earlier and bypass it (land best_effort).
         tools._ctx._verify_nudged = True
         return _inject(
-            "Before finalizing: you produced a real deliverable but recorded no "
-            "machine verification. Call verify_and_record — run your test/command (explicit_command/"
-            "explicit_metric/visible_verifier), confirm the artifact exists (artifact_observation), or "
-            "honestly declare no_visible_machine_contract — so the result is grounded, then continue.",
+            "This turn has reviewable effects and no host-attested verification receipt; a clean "
+            "finish records the receipt_absent warning (the result stays solved). Available "
+            "verify_and_record kinds: explicit_command / explicit_metric / visible_verifier (run a "
+            "check), artifact_observation (confirm an artifact exists), no_visible_machine_contract "
+            "(declare that none exists).",
             "Verify-before-done nudge injected before final response.",
         )
-        emit_progress("Verify-before-done nudge injected before final response.")
-        llm_trace["reasoning_notes"].append("Verify-before-done nudge injected before final response.")
-        return True
+    # No "expected output but nothing attempted" re-loop (A3, removed for #1748): plain
+    # prose can itself be the requested deliverable, and the transcript already shows
+    # the model its own calls; the outcome keeps its expected_output_ungrounded signal.
     from ouroboros.tool_capabilities import substantive_tool_calls
     work_calls = substantive_tool_calls(llm_trace.get("tool_calls"))
-    # A3 one-shot no-op nudge: a declared deliverable but no tool calls,
-    # reviewable effects or FINAL ANSWER marker this turn (family of the M2
-    # expected_output_ungrounded flag). Own latch after the verify nudge; never
-    # forces acceptance review; structural facts only.
-    if (
-        not getattr(tools._ctx, "_noop_attempt_nudged", False)
-        and str(_contract_expected_output(tools._ctx)).strip()
-        and not work_calls
-        and not turn_has_reviewable_effects(llm_trace)
-        and not extract_final_answer(content or "")
-    ):
-        tools._ctx._noop_attempt_nudged = True
-        # v6.60.0: the nudge keys on expected_output SEMANTICS; it mentions the FINAL
-        # ANSWER marker only when this task's contract actually declares the protocol.
-        _marker_bit = (
-            "no tool calls, no reviewable effects, no FINAL ANSWER"
-            if _answer_protocol_active(tools._ctx)
-            else "no tool calls, no reviewable effects, no delivered answer"
-        )
-        return _inject(
-            "This task declares an expected output, but you are about to finalize "
-            f"without having attempted it — {_marker_bit}. "
-            "Actually attempt the task now (do the work / produce the deliverable / derive the answer), "
-            "then finalize. If it is genuinely blocked, say so with the concrete blocker and evidence.",
-            "No-op attempt nudge injected before final response.",
-        )
-        emit_progress("No-op attempt nudge injected before final response.")
-        llm_trace["reasoning_notes"].append("No-op attempt nudge injected before final response.")
-        return True
     # P2 one-shot final-answer-marker nudge: real work + prose, no FINAL ANSWER
     # marker — the agent marks its OWN answer, prose is never mined (P5). Own
-    # latch after verify/red/A3; the protocol gate alone suffices (v6.56.0).
+    # latch after verify/red; the protocol gate alone suffices (v6.56.0).
     if (
         not getattr(tools._ctx, "_final_marker_nudged", False)
         and _answer_protocol_active(tools._ctx)  # v6.60.0: marker nudge is protocol-gated
@@ -910,10 +616,10 @@ def _maybe_inject_finalization_nudges(
     ):
         tools._ctx._final_marker_nudged = True
         return _inject(
-            "You have done the work but have not marked a final answer. If you "
-            "are done, end your response with a single line, exactly: FINAL ANSWER: <answer> — the "
-            "bare deliverable only (a number / a few words / a short list), so it is captured even if "
-            "the run is cut short. If you are not done, keep working.",
+            "This task's answer protocol (final_answer_line) captures an answer only from a line "
+            "exactly `FINAL ANSWER: <answer>` — the bare deliverable (a number / a few words / a "
+            "short list) — and the response above has none. The latest such line remains eligible "
+            "for interrupted-run delivery only while no later tool call has made it stale.",
             "Final-answer marker nudge injected before final response.",
         )
     return False
@@ -928,21 +634,3 @@ def _answer_protocol_active(ctx: Any) -> bool:
     from ouroboros.contracts.task_contract import answer_protocol_active
 
     return answer_protocol_active(ctx)
-
-
-def _contract_expected_output(ctx: Any) -> str:
-    """Read the declared expected_output (as carried on the task contract/metadata for the
-    running ctx — the same declared field the M2 ungrounded flag keys on), for the A3 no-op nudge gate."""
-    contract = getattr(ctx, "task_contract", {})
-    declared = str(contract.get("expected_output") or "") if isinstance(contract, dict) else ""
-    if declared.strip():
-        return declared
-    metadata = getattr(ctx, "task_metadata", {})
-    if isinstance(metadata, dict):
-        declared = str(metadata.get("expected_output") or "")
-        if declared.strip():
-            return declared
-        meta_contract = metadata.get("task_contract")
-        if isinstance(meta_contract, dict):
-            return str(meta_contract.get("expected_output") or "")
-    return ""

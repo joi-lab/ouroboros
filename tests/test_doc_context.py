@@ -21,7 +21,11 @@ SYSTEM + BIBLE are tier-0 and always full.
 import os
 import pathlib
 import tempfile
-from tests._governance_docs_shared import governance_doc_text
+import pytest
+from tests.test_swarm_host_admission import host as _promotion_host
+from tests._store_shared import seed_result, unreadable_result
+
+promotion_host = _promotion_host
 
 # Unique sentinel placed inside the ARCHITECTURE body so we can prove the full
 # body is inlined (max) vs replaced by a structure-only nav map (low).
@@ -51,7 +55,7 @@ def _make_env_and_memory(tmpdir: pathlib.Path):
     )
     (repo_dir / "docs" / "DEVELOPMENT.md").write_text("# DEVELOPMENT.md — Dev Guide", encoding="utf-8")
     (repo_dir / "README.md").write_text('[![Version 5.5.0](https://img.shields.io/badge/version-5.5.0-green.svg)](VERSION)', encoding="utf-8")
-    (repo_dir / "docs" / "CHECKLISTS.md").write_text("## Repo Commit Checklist\n| # | item |", encoding="utf-8")
+    (repo_dir / "docs" / "CHECKLISTS.md").write_text("## Change Review Checklist\n| # | item |", encoding="utf-8")
     (drive_root / "state" / "state.json").write_text('{"spent_usd": 0}', encoding="utf-8")
     (drive_root / "memory" / "scratchpad.md").write_text("test scratchpad", encoding="utf-8")
     (drive_root / "memory" / "identity.md").write_text("I am Ouroboros.", encoding="utf-8")
@@ -86,15 +90,6 @@ def test_max_mode_inlines_architecture_and_development_in_full():
     assert _ARCH_BODY_SENTINEL in text  # full body inlined
     assert "navigation map" not in text
     assert "## DEVELOPMENT.md" in text
-
-
-def test_plan_review_docs_pin_fail_closed_exact_artifact_custody():
-    repo = pathlib.Path(__file__).resolve().parents[1]
-
-    for relative in ("docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md"):
-        text = governance_doc_text(relative, repo)
-        assert "plan_review_exact_artifact_unavailable" in text, relative
-        assert "only when no exact artifact reference exists" in text, relative
 
 
 def test_forked_task_captures_canonical_memory_and_exact_api_context():
@@ -138,7 +133,7 @@ def test_forked_task_captures_canonical_memory_and_exact_api_context():
     assert task["task_contract"]["context"] == "never deploy; use profile X"
 
 
-def test_forked_context_uses_canonical_global_cognition_not_child_noise():
+def test_forked_context_uses_canonical_global_cognition_not_child_noise(monkeypatch):
     import json
 
     from ouroboros.agent import Env
@@ -164,40 +159,64 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise():
     )
     (child / "memory" / "deep_review.md").write_text("CHILD_DEEP_NOISE", encoding="utf-8")
     env = Env(repo_dir=canonical_env.repo_dir, drive_root=child, budget_drive_root=canonical)
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
 
+    # A forked root names the canonical original under runtime_data (mode matrix: tests/test_authored_memory.py).
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "cyber_pro")
+    ctx = ToolContext(repo_dir=env.repo_dir, drive_root=child, task_id="fork-cognition", is_direct_chat=True,
+                      task_metadata={"budget_drive_root": str(canonical)})
     messages, _ = build_llm_messages(
         env=env,
         memory=Memory(child, repo_dir=env.repo_dir),
         task={"id": "fork-cognition", "text": "continue", "budget_drive_root": str(canonical)},
+        ctx=ctx,
     )
     rendered = json.dumps(messages, ensure_ascii=False)
 
     assert "CANONICAL_PATTERN_REGISTER" in rendered
-    assert "CANONICAL_DEEP_REVIEW" in rendered
     assert "CHILD_PATTERN_NOISE" not in rendered
-    assert "CHILD_DEEP_NOISE" not in rendered
+    # The report rides as a pointer to the CANONICAL source (its size, its address), never a
+    # body, with an absolute canonical read address; actual dispatch of that call opens it.
+    assert f"{len('CANONICAL_DEEP_REVIEW')} chars" in rendered
+    assert "CANONICAL_DEEP_REVIEW" not in rendered and "CHILD_DEEP_NOISE" not in rendered
+    call = {"root": "runtime_data", "path": str((canonical / "memory" / "deep_review.md").resolve())}
+    pointer = f"Read: read_file(root='runtime_data', path='{call['path']}')"
+    assert json.dumps(pointer, ensure_ascii=False)[1:-1] in rendered
+    registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=child)
+    registry.set_context(ctx)
+    read = registry.execute("read_file", call)
+    assert "CANONICAL_DEEP_REVIEW" in read and "CHILD_DEEP_NOISE" not in read
 
 
-def test_deep_review_is_historical_without_shrinking_its_existing_excerpt(tmp_path):
+def test_deep_review_is_a_historical_pointer_dated_only_by_its_header(tmp_path):
     import json
 
     from ouroboros.context import build_llm_messages
-    from ouroboros.utils import truncate_review_artifact
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
 
     env, memory = _make_env_and_memory(tmp_path)
     path = env.drive_root / "memory" / "deep_review.md"
-    for prefix in ("LEGACY REPORT\n", "<!-- deep-review provenance: generated_at=2026-01-01T00:00:00Z, source_revision=unknown -->\n"):
+    ctx = ToolContext(repo_dir=env.repo_dir, drive_root=env.drive_root, task_id="history", is_direct_chat=True)
+    registry = ToolRegistry(repo_dir=env.repo_dir, drive_root=env.drive_root)
+    registry.set_context(ctx)
+    for prefix, provenance in (
+            ("LEGACY REPORT\n", "generated_at=unknown, source_revision=unknown (no provenance header)"),
+            ("<!-- deep-review provenance: generated_at=2026-01-01T00:00:00Z, source_revision=unknown -->\n",
+             "generated_at=2026-01-01T00:00:00Z, source_revision=unknown (its provenance header)")):
         original = prefix + "retained historical reasoning " * 400
-        path.write_text(original, encoding="utf-8")
+        path.write_bytes(original.encode("utf-8"))  # pin the source bytes, not the host's text-mode EOL
         # A recent file mtime is not a review date, even on a copied old report.
         os.utime(path, (1900000000, 1900000000))
         messages, _ = build_llm_messages(
-            env=env, memory=memory, task={"id": "history", "type": "task", "text": "continue"},
+            env=env, memory=memory, task={"id": "history", "type": "task", "text": "continue"}, ctx=ctx,
         )
         rendered = json.dumps(messages, ensure_ascii=False)
-        assert json.dumps(truncate_review_artifact(original, limit=8000), ensure_ascii=False)[1:-1] in rendered
+        assert provenance in rendered and f"{len(original)} chars" in rendered
+        assert "retained historical reasoning" not in rendered  # the report stays at its source
         assert "not a verdict on the current tree" in rendered
-        assert "unrecorded date or source revision is unknown" in rendered
+        assert "Read: read_file(root='runtime_data', path='memory/deep_review.md')" in rendered
+        assert "retained historical reasoning" in registry.execute(
+            "read_file", {"root": "runtime_data", "path": "memory/deep_review.md"})  # the call shown opens it
         assert path.read_text(encoding="utf-8") == original
 
 
@@ -212,7 +231,7 @@ def test_current_plan_and_open_dispositions_enter_actual_model_request():
     fingerprint = "a" * 64
     result_dir = env.drive_root / "task_results"
     result_dir.mkdir(parents=True)
-    (result_dir / f"{task_id}.json").write_text(json.dumps({
+    seed_result(env.drive_root, task_id, {
         "_schema_version": 1,
         "task_id": task_id,
         "status": "running",
@@ -238,7 +257,7 @@ def test_current_plan_and_open_dispositions_enter_actual_model_request():
             }],
             "waves_omitted": 0,
         },
-    }), encoding="utf-8")
+    })
 
     messages, _ = build_llm_messages(
         env=env,
@@ -266,7 +285,7 @@ def test_valid_named_predecessor_materializes_into_first_model_request_and_actor
     tail = "CLAUDEXOR_ONLY_AND_L1_L2_L3"
     result_dir = env.drive_root / "task_results"
     result_dir.mkdir(parents=True)
-    (result_dir / f"{predecessor_id}.json").write_text(json.dumps({
+    seed_result(env.drive_root, predecessor_id, {
         "_schema_version": 1,
         "task_id": predecessor_id,
         "status": "completed",
@@ -276,7 +295,7 @@ def test_valid_named_predecessor_materializes_into_first_model_request_and_actor
             "context": "never use native API",
             "delegation_budget": {"intent_note": "L1 asks L2 to spawn L3"},
         },
-    }), encoding="utf-8")
+    })
     source = {
         "kind": "task_result", "task_id": predecessor_id,
         "human_label": "Cat Tower Builder",
@@ -303,14 +322,13 @@ def test_valid_named_predecessor_materializes_into_first_model_request_and_actor
     assert actor_read["authority"]["task_contract"]["objective"].endswith(tail)
 
 
-def test_unreadable_current_plan_review_source_returns_typed_startup_refusal():
+def test_unreadable_current_plan_review_source_returns_typed_startup_refusal(monkeypatch):
     from ouroboros.agent_startup_checks import validate_task_authority_sources
 
     tmpdir = pathlib.Path(tempfile.mkdtemp())
     env, _memory = _make_env_and_memory(tmpdir)
-    result_dir = env.drive_root / "task_results"
-    result_dir.mkdir(parents=True)
-    (result_dir / "plan-broken.json").write_text("{broken", encoding="utf-8")
+    seed_result(env.drive_root, "plan-broken", {"task_id": "plan-broken", "status": "running"})
+    unreadable_result(monkeypatch, "plan-broken")
 
     refusal = validate_task_authority_sources(
         env, {"id": "plan-broken", "title": "Cat plan", "text": "continue"},
@@ -417,6 +435,98 @@ def test_low_mode_external_workspace_gets_both_book_navigation_views():
     assert "navigation map" in external
     assert _ARCH_BODY_SENTINEL not in external
     assert "## DEVELOPMENT.md (navigation map)" in external
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("mode", ["max", "low", "nano"])
+def test_promoted_self_body_requirement_reaches_the_contract_and_context_without_becoming_project_state(
+    promotion_host, tmp_path, monkeypatch, mode,
+):
+    """Schema → tool → event handler → real queue/contract → root and child context."""
+    import copy
+    from types import SimpleNamespace
+    from ouroboros.agent import Env
+    from ouroboros.context import build_llm_messages
+    from ouroboros.memory import Memory
+    from ouroboros.projects_registry import create_project, get_project
+    from ouroboros.task_results import load_task_result
+    from ouroboros.tools.control import _build_child_subagent_contract, get_tools
+    from supervisor.events import _handle_promote_chat_to_task
+
+    host = promotion_host
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", mode)
+    monkeypatch.setattr("ouroboros.context.resolve_context_fit_route", lambda *_a, **_kw: (
+        {"model": "fixture", "provider": "fixture"},
+        SimpleNamespace(route_fp="fixture", status="asserted", stale=False, window_tokens=1_000_000),
+    ))
+    books_env, _memory = _make_env_and_memory(tmp_path / "books")
+    env = Env(repo_dir=books_env.repo_dir, drive_root=host.root, budget_drive_root=host.root)
+    development_body = "# DEVELOPMENT.md — Dev Guide\n\n## Review\n\nRead every source before committing.\n"
+    (env.repo_dir / "docs" / "DEVELOPMENT.md").write_text(development_body, encoding="utf-8", newline="\n")
+    memory = Memory(host.root, repo_dir=env.repo_dir)
+    workspace = tmp_path / "working-copy"
+    workspace.mkdir()
+    project = create_project(host.root, "code-copy", name="Code Copy")
+    entry = next(tool for tool in get_tools() if tool.name == "start_task")
+    field = "context_requires_self_body_docs"
+    parameters = entry.schema["parameters"]
+    assert parameters["properties"][field]["type"] == "boolean"
+    assert field not in parameters["required"]
+    description = parameters["properties"][field]["description"]
+    assert "Ouroboros code" in description and "copies elsewhere" in description
+    assert "context_requires_development" not in parameters["properties"]
+    events = []
+
+    def emit(event):
+        events.append(copy.deepcopy(event))
+        _handle_promote_chat_to_task(event, host.ctx)
+
+    tool_ctx = SimpleNamespace(
+        repo_dir=env.repo_dir, system_repo_dir=env.repo_dir, drive_root=host.root, task_id="promoter",
+        current_chat_id=1, task_metadata={}, pending_events=[], event_queue=SimpleNamespace(put_nowait=emit),
+    )
+    first = None
+    # A later task in the SAME project must not inherit the first task's choice.
+    for flag in (True, None, False):
+        kwargs = {} if flag is None else {field: flag}
+        result = entry.handler(tool_ctx, "Inspect this working copy", title="Working copy inspection",
+                               project_id=project["id"],
+                               workspace_root=str(workspace), **kwargs)
+        assert result.startswith("OK: task"), result
+        task = copy.deepcopy(host.pending[-1])
+        assert events[-1][field] is bool(flag)
+        assert task["task_contract"][field] is bool(flag)
+        assert task[field] is bool(flag)
+        assert pathlib.Path(task["workspace_root"]).resolve() == workspace.resolve()
+        assert load_task_result(host.root, task["id"])["task_contract"][field] is bool(flag)
+        assert field not in get_project(host.root, project["id"])
+        # Exercise the existing contract-only consumer, as on restored tasks.
+        task.pop(field)
+        messages, _cap = build_llm_messages(env=env, memory=memory, task=task)
+        content = messages[0]["content"]
+        first = first or content[0]
+        assert content[0] == first and "docs/DEVELOPMENT.md" in content[0]["text"]
+        handbook = [block for block in content if block["text"].startswith("## DEVELOPMENT.md\n")]
+        assert len(handbook) == int(bool(flag) and mode == "max")
+        if handbook:
+            assert content[1] == handbook[0] and "cache_control" in handbook[0]
+            assert development_body in handbook[0]["text"]
+        if mode != "max":
+            assert "## DEVELOPMENT.md (navigation map)" in content[0]["text"]
+        child = {"id": "child-" + task["id"], "type": "task", "text": "Read the assignment", "chat_id": task["chat_id"],
+                 "delegation_role": "subagent", "parent_task_id": task["id"], "root_task_id": task["id"],
+                 "configured_subagent": {"id": "helper", "route": {"kind": "api_model"}}}
+        child["task_contract"] = _build_child_subagent_contract({
+            "tid": child["id"], "objective": child["text"], "parent_contract": task["task_contract"],
+            "parent_task_id": task["id"], "root_task_id": task["id"], "workspace_root": str(workspace),
+            "workspace_mode": "external", "parent_project_id": project["id"],
+        })
+        assert child["task_contract"][field] is bool(flag)
+        child_messages, _cap = build_llm_messages(env=env, memory=memory, task=child)
+        child_content = child_messages[0]["content"]
+        assert "## DEVELOPMENT.md (navigation map)" in child_content[0]["text"]
+        assert not any(block["text"].startswith("## DEVELOPMENT.md\n") for block in child_content)
+    assert len(events) == len(host.pending) == 3 and not host.attempts
 
 
 def test_max_mode_evolution_task_keeps_arch_and_development_full():

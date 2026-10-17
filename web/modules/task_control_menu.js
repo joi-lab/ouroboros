@@ -1,16 +1,14 @@
-// S3 (Q2/HQ1): the shared three-action task stop/hurry control.
+// The shared task control menu used by Chat live cards and the Activity tab:
+// "Wrap up" (soft finalize-then-stop), "Hurry up" (typed task-local hurry
+// control, never a chat message), "Pause"/"Resume" (root-only, whole tree; the
+// request_id survives uncertain or latch_pending replies until a confirmed
+// Pause or Resume retires it) and "Stop now" (hard stop). Dismissing the menu
+// continues the run. While a cancel intent is pending, the only offered action
+// is "Stop now", the monotonic escalation of the same durable stop intent;
+// "Hurry up" is refused then and never offered.
 //
-// One dropdown of exactly three owner-decided actions — "Wrap up"
-// (soft finalize-then-stop), "Hurry up" (typed task-local hurry control,
-// NO chat message ever), "Stop now" (hard stop). Dismissing the
-// menu continues the run (the dismiss affordance replaced the old separate
-// "keep running" confirm). While a cancel intent is already pending, the only
-// offered action is "Stop now" — the monotonic escalation of the
-// SAME durable stop intent; "Hurry up" is refused then and never offered.
-//
-// Chat live cards and the Activity tab consume the SAME module (owner
-// product-wide parity), so eligibility gates differ per surface but the
-// actions, endpoint bindings, request-id retry, and refusals do not.
+// Eligibility gates differ per surface; endpoints, stop policy, request-id
+// retry and verbatim refusals are shared.
 
 import { cancelTask, hurryTask, pauseTask, resumeTask } from './api_client.js';
 import { showToast } from './toast.js';
@@ -62,7 +60,8 @@ export function resumeRunEligibility(record, activity) {
 export function createTaskResumeButton(taskId, { canResume, onSettled = () => {} } = {}) {
     const button = document.createElement('button');
     button.type = 'button';
-    button.className = 'btn btn-xs btn-default';
+    // Resume is the one primary of a paused card (its Stop… beside it stays neutral).
+    button.className = 'btn btn-sm btn-primary';
     button.dataset.resumeRun = '1';
     button.textContent = tr('task.control.resume', 'Resume');
     button.addEventListener('click', async (event) => {
@@ -116,8 +115,8 @@ export function taskControlActions({ cancelPending = false, budgetPaused = false
     // The host-attested pause fact gates the offer; the server re-validates
     // (replay_unsafe and sibling checks answer 409 with the reason).
     if (budgetPaused) return resumeVisible ? [ACTION_STOP_NOW] : [ACTION_RESUME, ACTION_STOP_NOW];
-    // Owner Batch4: Pause saves the WHOLE tree exactly (sent work finishes,
-    // new work is fenced) until an explicit Resume; Stop still ends it.
+    // Pause saves the WHOLE tree until an explicit Resume: new work is fenced,
+    // members' own runs get a stop, launched reviewers finish; Stop still ends it.
     return wholeTree ? [ACTION_FINALIZE, ACTION_HURRY, ACTION_PAUSE, ACTION_STOP_NOW]
         : [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
 }
@@ -178,7 +177,10 @@ export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showT
         }
         toast(ack.state === 'paused'
             ? 'Paused: the whole task tree is saved until you resume it.'
-            : 'Pausing: new work is stopped; work already sent finishes, then the tree is saved.', 'ok');
+            // Owner S1: running work stops at its last saved point (a model answer
+            // still awaited is abandoned, not awaited); started reviews finish apart.
+            : 'Pausing: new work is stopped; running work stops at its last saved point. '
+                + 'Reviews already started finish separately.', 'ok');
         return true;
     } catch (exc) {
         toast(`Pause refused: ${exc?.message || exc}`, 'error');
@@ -186,6 +188,36 @@ export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showT
     } finally {
         inFlight.delete(id);
     }
+}
+
+// A held Continue's observed blockers in the owner's words (#1721), from the
+// server's census (supervisor/continuation_admission.py). Facts only: a start
+// with an unknown outcome is not called running or stoppable, and a kind with no
+// sentence yet stays raw (DESIGN §4). The machine record keeps the codes.
+const HELD_FACTS = {
+    running_member: (b) => `task ${b.task_id} is still running`,
+    dispatchable_member: (b) => `task ${b.task_id} is queued to run`,
+    owned_process: (b) => `a process of task ${b.task_id} is still alive`,
+    model_handoff: () => 'a model request has no recorded result',
+    tool_handoff: (b) => `a tool call of task ${b.task_id} has not returned`,
+    merge_operation: (b) => `a merge of task ${b.task_id} is not settled`,
+    workspace_executor: (b) => `a workspace process of task ${b.task_id} is not settled`,
+    delegated_run: (b) => (b.state === 'running' ? `delegated run ${b.run_id} is running`
+        : b.stop_outcome === 'pending_invocation_unbound'
+            ? 'a delegated start has an unknown outcome (no run was recorded)'
+            : b.state === 'stop_requested' ? `delegated run ${b.run_id}: its stop is requested, not confirmed`
+                : `delegated run ${b.run_id || b.invocation_id}: its outcome is unknown`),
+};
+
+/** @returns {string} the distinct observed facts, '' when the census named none */
+export function heldWorkFacts(blockers, limit = 3) {
+    const facts = [...new Set((Array.isArray(blockers) ? blockers : []).filter((b) => b && typeof b === 'object')
+        .map((b) => (HELD_FACTS[b.kind] ? HELD_FACTS[b.kind](b)
+            : /_unreadable$/.test(String(b.kind)) ? 'its custody record could not be read'
+                : String(b.kind || '').startsWith('late_phase_') ? `its work after the answer is ${b.kind.slice(11)}`
+                    : String(b.kind || 'unknown'))))];
+    return facts.length > limit
+        ? `${facts.slice(0, limit).join('; ')}; and ${facts.length - limit} more` : facts.join('; ');
 }
 
 export async function resumeTaskAction(taskId, { resume = resumeTask, toast = showToast } = {}) {
@@ -201,9 +233,12 @@ export async function resumeTaskAction(taskId, { resume = resumeTask, toast = sh
             : 'Resuming: the task returns to the queue.', 'info');
     } catch (exc) {
         // The server names the refusal (replay_unsafe / fence missing /
-        // not budget-paused): show it verbatim instead of a generic failure.
+        // not budget-paused): show it verbatim instead of a generic failure,
+        // and a held Continue's observed blockers as facts (#1721).
         // Handled here, never rethrown: the menu callback is fire-and-forget.
-        toast(`Resume refused: ${exc?.message || exc}`, 'error');
+        const facts = heldWorkFacts(exc?.body?.blockers);
+        toast(facts ? `Resume refused: ${facts}.${exc.body.action === 'wait_or_stop_the_previous_work'
+            ? ' Wait for that work or stop it.' : ''}` : `Resume refused: ${exc?.message || exc}`, 'error');
     } finally {
         inFlight.delete(id);
     }
@@ -454,10 +489,10 @@ function onMenuKeydown(event) {
  * closes the menu and invokes `onAction(actionId)`.
  * @param {HTMLElement} anchor trigger element
  * @param {{cancelPending?: boolean, budgetPaused?: boolean, wholeTree?: boolean, busy?: boolean,
- *     onAction: (action: string) => void}} opts
+ *     canAct?: (action: string) => boolean, onAction: (action: string) => void}} opts
  */
 export function openTaskControlMenu(anchor, {
-    cancelPending = false, budgetPaused = false, wholeTree = true, resumeVisible = false, busy = false, onAction,
+    cancelPending = false, budgetPaused = false, wholeTree = true, resumeVisible = false, busy = false, canAct = () => true, onAction,
 } = {}) {
     closeTaskControlMenu();
     if (!anchor?.isConnected || !document.body) return null;
@@ -477,6 +512,9 @@ export function openTaskControlMenu(anchor, {
         if (busy) item.disabled = true;
         item.addEventListener('click', (event) => {
             event.stopPropagation();
+            // A portal can outlive the facts that offered it. Its owner rechecks before EVERY effect,
+            // including Pause, which dispatches here rather than through onAction.
+            if (!canAct(action)) { closeTaskControlMenu(); return; }
             closeTaskControlMenu();
             // Both surfaces' anchors name their task (Activity row `data-id`,
             // chat card root `data-task-id`), so Pause needs no per-surface hook.
@@ -498,6 +536,24 @@ export function openTaskControlMenu(anchor, {
     document.addEventListener('pointerdown', onOutsidePointer, true);
     document.addEventListener('keydown', onMenuKeydown, true);
     return menu;
+}
+
+/**
+ * The shared controls of one exact task, from whichever surface shows it (its Chat card, the room's
+ * work list): the same actions, eligibility and request owners. `stop` is the caller's own stop path
+ * (a card keeps its optimistic chip); the Pause item reads its target from the anchor.
+ */
+export function openTaskControls(anchor, taskId, { record = null, activity = null, cancelPending = false, canAct, stop }) {
+    const id = String(taskId || '').trim();
+    return openTaskControlMenu(anchor, {
+        cancelPending,
+        budgetPaused: activity?.phase === 'budget_paused',
+        resumeVisible: resumeRunEligibility(record || { groupId: id }, activity),
+        busy: taskControlBusy(id),
+        canAct,
+        onAction: (action) => (action === ACTION_HURRY ? hurryTaskAction(id)
+            : action === ACTION_RESUME ? resumeTaskAction(id) : stop(action)),
+    });
 }
 
 // The trigger's constant label. The trigger always opens the dropdown; the

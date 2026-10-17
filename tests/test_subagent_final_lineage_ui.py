@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from tests._store_shared import seed_result
 
 pytest_plugins = ("tests.test_ui_smoke_playwright",)
 
@@ -29,13 +30,13 @@ def test_ui_smoke_final_only_child_stays_inside_child_card(direct_server_with_da
     }) + "\n", encoding="utf-8")
     results = data_dir / "task_results"
     results.mkdir(parents=True, exist_ok=True)
-    (results / "child-final-only.json").write_text(json.dumps({
+    seed_result(data_dir, "child-final-only", {
         "_schema_version": 1,
         "task_id": "child-final-only", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "parent-final-only",
         "root_task_id": "parent-final-only", "role": "legacy-reviewer",
         "model": "anthropic/claude-opus-5",
-    }), encoding="utf-8")
+    })
 
     try:
         with sync_playwright() as pw:

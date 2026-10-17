@@ -6,7 +6,7 @@ deep_self_review.py)."""
 from __future__ import annotations
 
 
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from ouroboros.model_slots import ResolvedModelTarget, parse_fallback_chain
 from ouroboros.settings_defaults import OPENROUTER_DEFAULTS, OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS  # noqa: F401
@@ -171,9 +171,9 @@ PROVIDER_CREDENTIAL_GROUPS: dict[str, tuple[str, ...]] = {
 }
 
 # Active settings keys that hold a ROUTED model identity (prefix -> provider via
-# provider_for_model). Heavy is a bounded migration/history input, not a live
-# route selector; keeping the split here prevents new consumers (including
-# Provider Test) from accidentally resurrecting it.
+# provider_for_model). Heavy and the retired review scalars are migration/history
+# inputs, not live route selectors; the active set keeps consumers (including
+# Provider Test) from accidentally resurrecting them.
 # Superset of the live slots; a key absent from settings still declares whatever
 # ``config.SETTINGS_DEFAULTS`` will hand the runtime, which is why declared_model_settings()
 # fills the defaults in rather than treating "unset" as "unused".
@@ -181,9 +181,7 @@ ACTIVE_MODEL_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT",
     "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS",
     "OUROBOROS_MODEL_FALLBACKS", "OUROBOROS_MODEL_FALLBACK",
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW", "OUROBOROS_WEBSEARCH_MODEL",
-    "OUROBOROS_REVIEW_MODELS", "OUROBOROS_SCOPE_REVIEW_MODELS",
-    "OUROBOROS_SCOPE_REVIEW_MODEL",
+    "OUROBOROS_WEBSEARCH_MODEL",
 )
 LEGACY_MODEL_SETTING_KEYS: tuple[str, ...] = ("OUROBOROS_MODEL_HEAVY",)
 # Compatibility import name. Its meaning is now explicitly the active set.
@@ -192,8 +190,7 @@ MODEL_SETTING_KEYS = ACTIVE_MODEL_SETTING_KEYS
 # Settings keys whose value is a Claude Agent SDK / Claude Code model NAME (``opus[1m]``),
 # NOT a routed model identity: they carry no provider prefix, so provider_for_model would
 # mis-route them to OpenRouter.  Their transport is the Anthropic SDK subprocess, which
-# authenticates with ANTHROPIC_API_KEY (the Claude runtime gateways:
-# tools/claude_advisory_review.py), so a non-empty value DECLARES the anthropic provider.
+# authenticates with ANTHROPIC_API_KEY, so a non-empty value DECLARES the anthropic provider.
 
 
 def provider_for_model(model: str) -> str:
@@ -276,6 +273,24 @@ def fallback_candidate_targets(active_model: str = "", *, preserve_slots: bool =
     )
 
 
+def compatible_endpoint(value: Callable[[str], str]) -> tuple[str, str]:
+    """``(api_key, base_url)`` of the OpenAI-compatible lane, one pair on every path.
+
+    A dedicated ``OPENAI_COMPATIBLE_BASE_URL`` travels only with its own key (blank = an
+    endpoint without auth); without it the legacy ``OPENAI_BASE_URL`` travels only with
+    ``OPENAI_API_KEY``. Neither pair borrows the other's key. ``value`` reads one stripped setting."""
+    if base := value("OPENAI_COMPATIBLE_BASE_URL"):
+        return value("OPENAI_COMPATIBLE_API_KEY"), base
+    return value("OPENAI_API_KEY"), value("OPENAI_BASE_URL")
+
+
+def compatible_endpoint_configured(value: Callable[[str], str]) -> bool:
+    """Readiness of that pair: the dedicated endpoint (its key optional), or the legacy endpoint
+    with its key. A dedicated key without its endpoint configures nothing."""
+    key, base = compatible_endpoint(value)
+    return bool(base and (key or value("OPENAI_COMPATIBLE_BASE_URL")))
+
+
 def provider_has_credentials(provider: str) -> bool:
     """Whether a route is configured; a managed engine's live readiness is separate."""
     if provider == "claudexor":
@@ -283,10 +298,7 @@ def provider_has_credentials(provider: str) -> bool:
     if provider == "local":
         return True
     if provider == "openai-compatible":
-        compat = str(runtime_setting("OPENAI_COMPATIBLE_API_KEY", "") or "").strip()
-        legacy_key = str(runtime_setting("OPENAI_API_KEY", "") or "").strip()
-        legacy_base = str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
-        return bool(compat or (legacy_key and legacy_base))
+        return compatible_endpoint_configured(lambda key: str(runtime_setting(key, "") or "").strip())
     if provider == "gigachat":
         creds = str(runtime_setting("GIGACHAT_CREDENTIALS", "") or "").strip()
         user = str(runtime_setting("GIGACHAT_USER", "") or "").strip()
@@ -307,10 +319,7 @@ def provider_has_credentials_in_settings(provider: str, settings: dict) -> bool:
     if provider == "local":
         return bool(get("LOCAL_MODEL_SOURCE"))
     if provider == "openai-compatible":
-        return bool(
-            get("OPENAI_COMPATIBLE_BASE_URL")
-            or (get("OPENAI_API_KEY") and get("OPENAI_BASE_URL"))
-        )
+        return compatible_endpoint_configured(get)
     if provider == "gigachat":
         return bool(
             get("GIGACHAT_CREDENTIALS")
@@ -514,7 +523,11 @@ ZAI_DIRECT_DEFAULTS = {
     "main": "zai::glm-5.3",
     "heavy": "",
     "light": "zai::glm-5.3-flash",
-    "vision": "",
+    # Image input per docs.z.ai/guides/vlm/glm-5.3-flash.md (read 2026-10-08; glm-5.3
+    # is text-only). A contributor probe (2026-10-06) covered the Coding Plan endpoint
+    # only; pay-as-you-go rests on the docs. A new install's wizard proposes it; a
+    # saved Vision choice, empty included, stays as saved.
+    "vision": "zai::glm-5.3-flash",
     "fallback": "zai::glm-5.3-flash",
     # No deep_review default: the route publishes no window metadata and no live
     # measurement exists, so the slot follows the MiniMax clear-instead-of-fill path.
@@ -533,8 +546,8 @@ DEEPSEEK_DIRECT_DEFAULTS = {
     # sizing remains evidence-driven; a missing window measurement does not
     # remove review authority (see ARCHITECTURE §7).
     "deep_self_review": "deepseek::deepseek-v4-pro",
-    # No vision default: deepseek-v4-flash-vision-exp is experimental; it is
-    # recognized by supports_vision() for explicit owner selection only.
+    # No vision default: deepseek-v4-flash-vision-exp is experimental and is
+    # for explicit owner selection only.
 }
 
 ANTHROPIC_DIRECT_DEFAULTS = {
@@ -558,27 +571,20 @@ DIRECT_PROVIDER_DEFAULTS = {
     "zai": ZAI_DIRECT_DEFAULTS,
 }
 
-# Review panels are declared as provider ROLE sequences, then compiled against
-# the owner's current provider-prefixed Main/Light values. This keeps explicit
-# custom models useful while making the shipped single-provider policy obvious:
-# OpenAI and Anthropic run their strongest Main model three independent times.
-# The older MiniMax mixed panel is preserved because that profile was not part of
-# this policy change.
+# Review panels are declared as provider ROLE sequences, one seat per role, then
+# compiled against the owner's current provider-prefixed Main/Light values. This
+# keeps explicit custom models useful while making the shipped single-provider
+# policy obvious: a provider reviews on its strongest Main ONCE (owner Q5=A —
+# copies of one model would each pay a run and add no second opinion), and
+# MiniMax keeps its mixed panel of two models.
 DIRECT_PROVIDER_REVIEW_ROLES = {
-    "openai": ("main", "main", "main"),
-    "anthropic": ("main", "main", "main"),
-    "cloudru": ("main", "main", "main"),
-    "gigachat": ("main", "main", "main"),
+    "openai": ("main",),
+    "anthropic": ("main",),
+    "cloudru": ("main",),
+    "gigachat": ("main",),
     "minimax": ("main", "light", "light"),
-    # Strongest-main ×3 policy (same as OpenAI/Anthropic): an exclusive
-    # DeepSeek install reviews with three independent thinking v4-pro calls.
-    "deepseek": ("main", "main", "main"),
-    "zai": ("main", "main", "main"),
-}
-
-DIRECT_PROVIDER_SCOPE_DEFAULTS = {
-    provider: defaults["main"]
-    for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
+    "deepseek": ("main",),
+    "zai": ("main",),
 }
 
 _ANTHROPIC_MODEL_ALIASES = {
@@ -663,10 +669,19 @@ def compute_direct_review_models_fallback(
     provider: str,
     main_model: str,
     light_model: str = "",
-    *,
-    review_runs: int = 3,
 ) -> list[str]:
     """Compile a direct-provider review panel from declarative role names."""
+    return [model for _role, model in compute_direct_review_seats(provider, main_model, light_model)]
+
+
+def compute_direct_review_seats(
+    provider: str,
+    main_model: str,
+    light_model: str = "",
+) -> list[tuple[str, str]]:
+    """The same panel as ``(role, model)`` seats, one per declared role: ``role`` is the owner slot a
+    seat runs (``main``, or ``light`` for a Light of this provider), '' where the provider's shipped
+    Light stands in."""
     if provider not in DIRECT_PROVIDER_DEFAULTS:
         return []
     provider_prefix = f"{provider}::"
@@ -675,56 +690,39 @@ def compute_direct_review_models_fallback(
         return []
     light = migrate_model_value(provider, light_model) if light_model else ""
     default_light = migrate_model_value(provider, DIRECT_PROVIDER_DEFAULTS[provider].get("light", ""))
-    light_slot = light if light.startswith(provider_prefix) else default_light
-    role_models = {"main": main, "light": light_slot or main}
+    seats = {"main": ("main", main), "light": ("light", light) if light.startswith(provider_prefix)
+             else ("", default_light) if default_light else ("main", main)}
     roles = DIRECT_PROVIDER_REVIEW_ROLES.get(provider, ("main", "light", "light"))
-    compiled = [role_models.get(role, main) for role in roles]
-    count = max(1, int(review_runs or 3))
-    return [compiled[index % len(compiled)] for index in range(count)]
+    return [seats.get(role, seats["main"]) for role in roles]
 
 
-# Conservative static vision map by normalized id/prefix. The OpenRouter
-# /models overlay (llm.py) refines this at runtime; static knowledge only
-# covers families whose vision support is long-established.
-_VISION_MODEL_PREFIXES: tuple[str, ...] = (
-    "openai/gpt-5", "openai/gpt-4o", "openai/gpt-4.1", "openai/o3", "openai/o4",
-    "google/gemini-", "anthropic/claude-",
-    "x-ai/grok-4", "x-ai/grok-3",
-    "qwen/qwen-vl", "qwen/qwen2.5-vl", "qwen/qwen3-vl",
-    "mistralai/pixtral", "meta-llama/llama-4", "meta-llama/llama-3.2-90b-vision",
-    "openai/gpt-5.5",
-    # Narrow on purpose: only the dedicated vision variant. Plain deepseek
-    # chat/v4 ids stay non-vision (pinned by tests), and this slash-form
-    # normalized id also names a real OpenRouter vendor namespace — the
-    # OpenRouter /models overlay may refine exact ids either way.
-    "deepseek/deepseek-v4-flash-vision",
-)
+def image_input_from_modalities(value: Any) -> bool | None:
+    """Image input stated by one input-modality list: True/False, or None when it says nothing.
 
-# Runtime overlay: model_id → bool, fed from OpenRouter /models
-# architecture.input_modalities by llm.py (same lifecycle as its
-# supported-parameters cache).
-_VISION_OVERLAY: dict = {}
-
-
-def update_vision_overlay(model_id: str, supports: bool) -> None:
-    normalized = normalize_model_identity(model_id)
-    if normalized:
-        _VISION_OVERLAY[normalized] = bool(supports)
+    Only a non-empty list of non-blank strings is a statement. A missing, null or empty
+    list, another shape, or one item that is not a non-blank string leaves it unknown:
+    the valid remainder of ``["text", 42]`` or ``["text", ""]`` is not a complete list
+    that omits images.
+    """
+    if isinstance(value, list) and value and all(isinstance(item, str) and item.strip() for item in value):
+        return "image" in {item.strip().lower() for item in value}
+    return None
 
 
 def supports_vision(model_id: str, *, model_role: str = "",
                     model_account_override: str | None = None) -> bool | None:
-    """Image capability; None means unavailable subscription metadata, not blindness.
+    """Image input of the exact route: True, False, or None when nothing sourced says.
 
-    Subscription metadata belongs to this call's role/account, never the global
-    model-id overlay. Image senders preserve input when that fact is unknown;
-    the actual call can start the engine and return its normal typed refusal.
-    Metadata discovery itself must not start it or buy a model generation.
+    A Claudexor route answers from the input modalities in the catalog of this
+    call's role/account (``image_input_from_modalities``), never
+    a global overlay; an API route answers from the fresh route-scoped catalog
+    record (``vision_routing.route_image_input``). A model's name is not
+    evidence, so every other case is None: image senders preserve input when the
+    fact is unknown and the actual call returns the route's own answer. Our own
+    lanes that cannot carry bytes (local, GigaChat) are the send policy's
+    transport fact, decided by lane, not a model fact. Metadata discovery never
+    starts an engine or buys a model generation.
     """
-    # Local lanes have no vision regardless of family name; check the RAW id —
-    # normalize_model_identity strips the " (local)" suffix.
-    if str(model_id or "").strip().endswith(" (local)"):
-        return False
     if provider_for_model(model_id) == "claudexor":
         from ouroboros.gateways.claudexor import ClaudexorUnavailable
         from ouroboros.llm import LLMClient
@@ -745,14 +743,10 @@ def supports_vision(model_id: str, *, model_role: str = "",
         if catalog.get("source") != source or (account and catalog.get("credentialProfileId") != account):
             return None
         item = next((row for row in catalog.get("models", []) if row.get("id") == native_model), {})
-        modalities = item.get("inputModalities")
-        return "image" in modalities if isinstance(modalities, list) and modalities else None
-    normalized = normalize_model_identity(model_id)
-    if not normalized:
-        return False
-    if normalized in _VISION_OVERLAY:
-        return _VISION_OVERLAY[normalized]
-    return normalized.startswith(_VISION_MODEL_PREFIXES)
+        return image_input_from_modalities(item.get("inputModalities"))
+    from ouroboros.vision_routing import route_image_input
+
+    return route_image_input(model_id).verdict
 
 
 # NOTE (v6.33.0): the static per-model context-window table was REMOVED. It

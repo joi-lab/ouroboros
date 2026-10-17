@@ -1,5 +1,6 @@
 """Owner process verbs work before onboarding without an unconsumed chat bus."""
 from types import SimpleNamespace
+import json
 import threading
 
 import pytest
@@ -127,14 +128,20 @@ def test_onboarding_restart_uses_existing_no_resume_flags_and_exit_signal(startu
 
 
 @pytest.mark.parametrize('thread_alive', [True, False])
-@pytest.mark.parametrize('surface', ['http', 'ws', 'ws_chat'])
+@pytest.mark.parametrize('surface', ['http', 'ws', 'ws_chat', 'ws_chat_files'])
 def test_restart_during_initialization_does_not_queue_to_published_bridge(
         startup_controls, monkeypatch, thread_alive, surface):
-    """Publishing the bridge precedes recovery; only a ready loop can consume Restart."""
+    """Publishing the bridge precedes recovery; only a ready loop can consume Restart. The composer
+    sends Restart typed beside a staged file as the exact command (chat_attachments.composerText):
+    the startup door still takes it, and its file stays on the one accepted row."""
     from supervisor import message_bus
-    from ouroboros import server_restart
+    from ouroboros import chat_uploads, server_restart
+    from ouroboros.gateway import ws as ws_gateway
+    from tests.test_chat_attachments import PNG
 
     obj = startup_controls
+    monkeypatch.setattr(ws_gateway, 'DATA_DIR', obj.data)
+    _path, staged = chat_uploads.store_upload(PNG, 'photo.png', data_dir=obj.data, pending=True)
     release = threading.Event()
     thread = threading.Thread(target=release.wait)
     thread.start()
@@ -156,9 +163,18 @@ def test_restart_during_initialization_does_not_queue_to_published_bridge(
         else:
             with obj.client.websocket_connect('/ws') as socket:
                 socket.send_json({'type': 'command', 'cmd': '/restart'} if surface == 'ws'
-                                 else {'type': 'chat', 'content': ' /ReStArT '})
+                                 else {'type': 'chat', 'content': ' /ReStArT '} if surface == 'ws_chat'
+                                 else {'type': 'chat', 'content': '/restart', 'client_message_id': 'with-file', 'attachments': [
+                                     {'filename': staged['upload'], 'display_name': 'photo.png', 'mime': 'image/png'}]})
                 assert did_stop.wait(3), 'Restart remained behind the initializing supervisor'
         assert stopped == [{}]
+        if surface == 'ws_chat_files':
+            rows = [json.loads(line) for line in (obj.data / 'logs/chat.jsonl').read_text(encoding='utf-8').splitlines()]
+            (row,) = [item for item in rows if item['direction'] == 'in']
+            assert (row['text'], row['client_message_id']) == ('/restart', 'with-file')
+            assert [ref['upload'] for ref in row['attachments']] == [staged['upload']], 'the file rides the accepted row'
+            assert any(item.get('type') == 'command_reply' and item['origin_message_ref']['client_message_id'] == 'with-file'
+                       for item in rows), "the door's reply answers that row"
         assert obj.server._restart_requested.wait(3) and obj.server._owner_restart_requested.is_set()
         assert (obj.data / 'state/owner_restart_no_resume.flag').read_text(encoding='utf-8') == 'owner_restart'
         assert bridge.get_updates(0, timeout=0) == []
@@ -172,7 +188,6 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
     obj = startup_without_consumer
     exits, stops = [], []
     from ouroboros import server_control
-    from ouroboros.gateway.host_service import host_service_port
     from ouroboros.startup_historical_audit import audit
     monkeypatch.setattr(audit, 'stop', lambda: None)
     monkeypatch.setattr('ouroboros.tools.shell.kill_all_tracked_subprocesses', lambda **kw: [])
@@ -192,7 +207,6 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
                             panic_stop=lambda *, request_only: stops.append(('daemon_request', request_only)) or [],
                             stop_outcome=lambda: stops.append(('daemon',))))
     monkeypatch.setattr('supervisor.workers.kill_workers', lambda **kw: stops.append(('workers', kw)))
-    monkeypatch.setattr(obj.server, '_ACTUAL_BOUND_PORT', 19876)
     monkeypatch.setattr(server_control.os, '_exit', lambda code: exits.append(code))
     before = set(threading.enumerate())
     try:
@@ -211,8 +225,7 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
     assert stops.count(('daemon',)) == 1
     assert [event for event in stops if event[0] == 'native_worker'] == [('native_worker', 4321)]
     assert not [event for event in stops if event[0] == 'workers']
-    assert stops.index(('native_worker', 4321)) < next(i for i, event in enumerate(stops) if event[0] == 'port')
-    assert sorted(event[1] for event in stops if event[0] == 'port') == sorted([19876, host_service_port()])
+    assert not [event for event in stops if event[0] == 'port']  # the exiting server's listeners close with it
     assert not (obj.data / 'settings.json').exists()
     from supervisor import state
     # Before onboarding there is no state to write: Panic never mints one (#1307). The flag is

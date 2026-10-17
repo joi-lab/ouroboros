@@ -72,6 +72,18 @@ def test_classify_wake_speaks_the_closed_vocabulary():
     assert classify_wake([{**mail, "source_task_id": "peer-2"}, mail], "q1") == "mail:peer-2"
 
 
+def test_a_wait_knows_its_answer_under_the_asker_scoped_identity(tmp_path):
+    """Answers now arrive as ``quiz_answer:{asker}:{quiz}``; saved mail may keep ``quiz_answer:{quiz}``."""
+    for msg_id in ("quiz_answer:q1", "quiz_answer:task-1:q1"):
+        assert classify_wake([{"kind": KIND_QUIZ_ANSWER, "msg_id": msg_id}], "q1") == "answer"
+    for msg_id in ("quiz_answer:q0", "quiz_answer:task-1:q0", "quiz_answer:q1:q0"):
+        assert classify_wake([{"kind": KIND_QUIZ_ANSWER, "msg_id": msg_id}], "q1") == "owner_text"
+    ctx = native_context(tmp_path)
+    assert write_owner_message(tmp_path, "Owner chose a", ctx.task_id,
+                               msg_id=f"quiz_answer:{ctx.task_id}:q1", kind=KIND_QUIZ_ANSWER)
+    assert _fresh_wake(ctx, "q1", "timeout") == "answer"
+
+
 def test_fresh_wake_upgrades_only_on_owner_authority(tmp_path):
     ctx = native_context(tmp_path)
     assert _fresh_wake(ctx, "q1", "timeout") == "timeout"

@@ -85,12 +85,8 @@ def test_unrecognized_handler_is_not_called_to_guess_its_behavior(native_model):
 
 
 def test_count_waits_for_generation_without_using_its_interrupt_lock(native_model, monkeypatch):
-    # FastAPI's installed dependency is paired with this existing Python-3.10
-    # annotated-doc wheel in the local operator cache; production code does not
-    # install or alter either package.
-    monkeypatch.syspath_prepend("/Users/anton/miniforge3/envs/py310/lib/python3.10/site-packages")
-    from fastapi import FastAPI
-    from llama_cpp.server import app as server
+    FastAPI = pytest.importorskip("fastapi").FastAPI
+    server = pytest.importorskip("llama_cpp.server.app")
 
     async def run():
         inner, outer = asyncio.Lock(), asyncio.Lock()

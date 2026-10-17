@@ -127,6 +127,25 @@ test('equal-time identical narration retains physical identities in source order
     assert.equal(compareHistoryPosition(row(10).history_position, row(20).history_position), -10);
 });
 
+test('equal-time identical child speech keeps distinct source rows through live redelivery', () => {
+    const record = { items: [] }, ts = '2026-09-12T12:00:00Z';
+    const summary = { headline: 'Researcher', body: 'Same words', phase: 'working',
+        dedupeKey: `subagent-line:child:${ts}:Same words` };
+    const row = offset => ({ history_id: `chat:${offset}`, ts, history_position: { source: 'chat', offset } });
+    const deliver = () => updateLiveTimelineItem(record, summary, {
+        syntheticKey: summary.dedupeKey, headline: summary.headline, ts: '12:00', rawTs: ts, inPlaceByKey: false,
+    });
+    deliver();
+    const originalLineKey = record.items[0].lineKey;
+    for (const offset of [10, 20, 10, 20]) mergeHistoricalTimelineItem(record, summary, row(offset), '12:00');
+    assert.deepEqual(record.items.map(item => item.historyId), ['chat:10', 'chat:20']);
+    assert.equal(record.items[0].lineKey, originalLineKey, 'adoption keeps the live line');
+    deliver();
+    assert.deepEqual(record.items.map(item => item.historyId), ['chat:10', 'chat:20'],
+        'matching live words cannot merge physical rows or invent a third row');
+    assert.deepEqual(record.items.map(item => item.count), [1, 1]);
+});
+
 test('a richer terminal updates its existing line while older terminal content cannot replace it', () => {
     const record = { items: [] };
     const summary = { visible: true, terminal: true, phase: 'done', headline: 'Done', dedupeKey: 'task_done|task' };

@@ -243,7 +243,8 @@ def test_delegated_rows_live_reconnect_reload_root_child_source_and_final_gap(en
     first, stretch, repeated, final = executor
     assert "I traced the card renderer end to end" in first and "Thinking" in first
     assert "Maybe the key lives" not in first, "thinking stays behind its labelled disclosure"
-    assert "⚠ claude · a01 · Bash: exit 1: 2 failed" in first
+    assert kid_card.locator(".chat-delegated-problem").first.inner_text() == \
+        "Problem: claude · a01 · Bash: exit 1: 2 failed"
     assert "technical activity" in stretch and "6 technical events since seq 7 · Grep ×3" in stretch, \
         "two silent observations read as one row"
     assert repeated.count("Reading the consumer.") == 2, "equal words at distinct seqs are two utterances"
@@ -296,7 +297,7 @@ def test_delegated_rows_live_reconnect_reload_root_child_source_and_final_gap(en
             break
         page.wait_for_timeout(100)
     assert len(sockets) >= 2 and len(served) > fetched, (len(sockets), len(served), fetched)
-    page.get_by_text("♻️ Reconnected").first.wait_for()
+    page.get_by_text("Reconnected", exact=True).first.wait_for()
     assert page.evaluate("() => window.__live1350 === true") and "_ouro_refresh" not in page.url, \
         "the reconnect refetched history into the live page instead of reloading it"
     page.wait_for_timeout(500)

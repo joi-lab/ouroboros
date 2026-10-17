@@ -238,3 +238,82 @@ def test_the_physical_context_literals_are_unchanged_by_the_density_field():
     """The ledger-validated ``measurement_basis`` literals stay; the witness basis string is another field."""
     physical = _physical(density=INCIDENT_DENSITY)
     assert json.loads(json.dumps(asdict(physical)))["measurement_basis"] == "fresh_route_usage"
+
+
+@pytest.mark.parametrize('maximum', [4096, 8192])
+@pytest.mark.parametrize('mode', ['low', 'max', 'nano', None])
+@pytest.mark.parametrize('model,field', [('openai::test-model', 'max_completion_tokens'),
+    ('openai/test-model', 'max_tokens'), ('anthropic::test-model', 'max_tokens'),
+    ('openai-compatible::unlisted-future-model', 'max_tokens')])
+def test_confirmed_output_maximum_reaches_real_wire_capture_and_reservation(transport, monkeypatch, maximum, mode, model, field):
+    from ouroboros.response_limits import record_response_ack
+    from tests._usage_store_testing import ledger_rows
+
+    root, client, sent = transport
+    monkeypatch.setenv('OPENAI_COMPATIBLE_BASE_URL', 'https://compatible.test/v1')
+    monkeypatch.setenv('OPENAI_COMPATIBLE_API_KEY', 'test-key')
+    target = client._resolve_remote_target(model)
+    record_response_ack(root, provider=target['provider'], model=model,
+                        base_url=target['base_url'], max_output_tokens=maximum)
+    import contextlib
+    bound = ua.bind_physical_attempt_context(_physical(mode=mode)) if mode else contextlib.nullcontext()
+    with bound:
+        message, usage = client.chat([{'role': 'user', 'content': 'small actual input'}], model,
+                                     max_tokens=C, model_role='reviewer:one')
+    assert message['content'] == 'ok'
+    assert _sent_payload(sent[0])[field] == maximum
+    rows = ledger_rows(root)
+    assert ua.last_physical_attempt_capture().max_completion_tokens == maximum
+    assert rows[-1]['candidate_raw_sha256']
+    # Same endpoint, different model has no borrowed owner assertion.
+    client.chat([{'role': 'user', 'content': 'same'}], model + '-other', max_tokens=C)
+    assert _sent_payload(sent[-1])[field] == C
+
+
+@pytest.mark.parametrize('provider,acked,sent_model,expected', [
+    # Direct Anthropic dispatch sends (and labels usage with) the canonical id, so the
+    # owner's maximum holds whichever alias the selection or the ack spelled.
+    ('anthropic', 'anthropic::claude-opus-4.8', 'anthropic::claude-opus-4.8', 4096),
+    ('anthropic', 'anthropic::claude-opus-4.8', 'anthropic::claude-opus-4-8', 4096),
+    ('anthropic', 'anthropic::claude-opus-4-8', 'anthropic::claude-opus-4.8', 4096),
+    ('anthropic', 'anthropic/claude-opus-4.8', 'anthropic::claude-opus-4-8', 4096),
+    # OpenRouter ids stay exact: no alias folding there, and no direct-route borrow.
+    ('openrouter', 'anthropic/claude-opus-4.8', 'anthropic/claude-opus-4.8', 4096),
+    ('openrouter', 'anthropic/claude-opus-4.8', 'anthropic/claude-opus-4-8', C),
+    ('anthropic', 'anthropic::claude-opus-4.8', 'anthropic/claude-opus-4-8', C),
+])
+def test_a_direct_anthropic_alias_keeps_the_owner_maximum_on_the_real_wire(transport, provider, acked, sent_model, expected):
+    from ouroboros.response_limits import record_response_ack
+    from tests._usage_store_testing import ledger_rows
+
+    root, client, sent = transport
+    record_response_ack(root, provider=provider, model=acked, max_output_tokens=4096)
+    message, _usage = client.chat([{'role': 'user', 'content': 'small actual input'}], sent_model,
+                                  max_tokens=C, model_role='reviewer:one')
+    assert message['content'] == 'ok'
+    assert _sent_payload(sent[0])['max_tokens'] == expected
+    assert ua.last_physical_attempt_capture().max_completion_tokens == expected
+    assert ledger_rows(root)[-1]['candidate_raw_sha256']
+
+
+def test_context_ack_does_not_suppress_output_metadata_or_refresh_its_clock(tmp_path, monkeypatch):
+    from ouroboros import capability_evidence as ce
+    from ouroboros.response_limits import resolve_response_limit
+
+    root = tmp_path / 'evidence'
+    route = dict(provider='openai-compatible', model='openai-compatible::new-model', base_url='https://compat.test/v1')
+    ce.record_owner_ack(root, **route, window_tokens=32768)
+    calls = []
+    def get(url, **kwargs):
+        calls.append(url)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {'data': [
+            {'id': 'new-model', 'max_output_tokens': 4096, 'max_tokens': 99999, 'context_length': 50000}]})
+    monkeypatch.setattr('httpx.get', get)
+    evidence = ce.probe(root, **route)
+    assert evidence.window_tokens == 32768 and evidence.source == 'owner_ack'
+    assert evidence.response_limit['max_output_tokens'] == 4096
+    stamp = evidence.response_limit['observed_at']
+    ce.record_owner_ack(root, **route, window_tokens=65536)
+    assert ce.probe(root, **route).response_limit['observed_at'] == stamp
+    assert calls == ['https://compat.test/v1/models']
+    assert resolve_response_limit(root, **{**route, 'base_url': 'https://other.test/v1'}).ceiling(C) == C

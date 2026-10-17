@@ -72,7 +72,7 @@ def test_an_exact_fit_is_sent_whole_without_the_compactor(lane):
     assert message["content"] == "local" and len(lane["measured"]) == 1
     assert "cut cut" in sent["messages"][0]["content"] and COMPACTED not in sent["messages"][0]["content"]
     assert sent["max_tokens"] == 4_096  # the quarter-window ceiling: never raised, the reply floor is the ceiling
-    assert [row["state"] for row in _rows(lane["root"])] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in _rows(lane["root"])] == ["settled"]  # the store keeps one row per attempt
     assert _todays_compacted(lane)[0]["content"] != sent["messages"][0]["content"]  # today's path would have cut it
 
 
@@ -100,7 +100,7 @@ def test_a_second_shortfall_is_the_typed_refusal_with_its_own_candidate_facts(la
         _send(lane, _nano(16_384))
     facts = caught.value.refused_candidate
     assert not lane["sent"] and len(lane["measured"]) == 2
-    assert not (lane["root"] / ua.LEDGER_REL).exists()  # nothing reserved, nothing sent
+    assert not _rows(lane["root"])  # nothing reserved, nothing sent
     assert facts["provider"] == "local" and facts["model"] == "local-model" and facts["max_completion_tokens"] == 4_096
     assert facts["physical_context"]["rendered_mode"] == "nano" and facts["input_tokens"] == 15_000
     assert len(facts["candidate_raw_sha256"]) == 64 and facts["candidate_context_size_bytes"] > 0

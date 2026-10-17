@@ -202,18 +202,20 @@ class _ReconcileMixin:
     ) -> Mapping[str, Any] | None:
         """Read a terminal task record persisted on the isolate's data root.
 
-        The gateway process may be dead while its ``task_results/`` tree
-        persists on disk.  An exact-id terminal record is returned raw: the
-        caller distinguishes deliverable accounting from a completed sparse
-        frame that must become an explicit infra row.
+        The gateway process may be dead while its store persists on disk.
+        An exact-id terminal record is returned raw: the caller distinguishes
+        deliverable accounting from a completed sparse frame that must become
+        an explicit infra row.
         """
+        from ouroboros.store import StoreError
+        from ouroboros.task_store import read_document
+
         root = self.config.isolate_data_root
         if root is None:
             return None
-        path = root / "task_results" / f"{gateway_task_id}.json"
         try:
-            value = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            value = read_document(root, gateway_task_id)
+        except StoreError:
             return None
         if not isinstance(value, Mapping):
             return None
@@ -821,7 +823,7 @@ def reconcile_main(args: argparse.Namespace) -> int:
         # ``run_root/ouroboros-data``; when that tree exists, adopt it so the
         # on-disk terminal-record fallback works for a dead gateway too.
         historical = run_dir / "ouroboros-data"
-        if (historical / "task_results").is_dir():
+        if (historical / "state" / "current.sqlite").is_file():
             isolate_data_root = historical
     ouroboros_url = str(getattr(args, "ouroboros_url", "") or "").strip()
     if not ouroboros_url:

@@ -11,15 +11,15 @@ from ouroboros.mutation_attribution import (
 )
 from ouroboros.review_state import load_state
 from ouroboros.task_results import load_task_result, write_task_result
+from ouroboros.task_store import list_documents
 from ouroboros.tools import git
 from ouroboros.tools.registry import ToolContext
-from ouroboros.tools.scope_review import ScopeReviewResult
+from ouroboros.review_ledger import CouplingOutcome
 from tests.test_mutation_attribution import _git, _repo
 
 
-def _promote_retained_correction(root, data, monkeypatch):
+def _admit_retained_correction(root, data, monkeypatch):
     from ouroboros.server_routing_context import _task_result_ground_truth
-    from ouroboros.tools import control_routing
     from supervisor import queue, workers
     from supervisor.events import _handle_promote_chat_to_task
 
@@ -40,17 +40,15 @@ def _promote_retained_correction(root, data, monkeypatch):
         load_state=lambda: {"owner_chat_id": 1}, append_jsonl=lambda *_a, **_kw: None,
     )
 
-    def deliver(_ctx, event):
-        assert event["predecessor_task_id"] == "first"
-        return "test_event_bus", _handle_promote_chat_to_task(event, supervisor)
-
-    monkeypatch.setattr(control_routing, "_emit_and_wait_for_routing", deliver)
-    router = ToolContext(repo_dir=root, drive_root=data, task_id="decision",
-        current_chat_id=1, task_metadata={"main_routing_manifest": {
-            "final_results": [_task_result_ground_truth(load_task_result(data, "first"))]}})
-    response = control_routing._promote_chat_to_task(
-        router, "Finish the retained correction", predecessor_task_id="first", workspace="none")
-    assert "durably scheduled" in response, response
+    # Frozen historical/technical admission still carries retained authority;
+    # the public start_task tool no longer selects predecessors.
+    response = _handle_promote_chat_to_task({
+        "type": "promote_chat_to_task", "task_id": "second", "routing_token": "correction-token",
+        "objective": "Finish the retained correction", "title": "Retained correction",
+        "predecessor_task_id": "first", "workspace": "none", "chat_id": 1,
+        "predecessor_authority_source": _task_result_ground_truth(load_task_result(data, "first"))["authority_source"],
+    }, supervisor)
+    assert response["status"] == "scheduled", response
     assert len(pending) == 1 and "predecessor_task_id" not in pending[0]
     snapshot = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert snapshot["pending"][0]["task"]["predecessor_authority_source"] == pending[0]["predecessor_authority_source"]
@@ -70,7 +68,6 @@ def test_second_task_reviews_and_commits_only_explicitly_selected_correction(tmp
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     reviews, checks, publications = [], [], []
-    monkeypatch.setattr(git, "advisory_gate_unavailable", lambda: False)
     monkeypatch.setattr(git, "_managed_candidate_needs_proof", lambda _ctx: False)
     monkeypatch.setattr(git, "_post_commit_result", lambda *_a, **_kw: None)
     monkeypatch.setattr(git, "_auto_push", lambda *_a, **_kw: publications.append("mock") or "")
@@ -103,8 +100,7 @@ def test_second_task_reviews_and_commits_only_explicitly_selected_correction(tmp
         ctx._last_review_critical_findings = [finding] if critical else []
         ctx._last_triad_raw_results = [{"slot_id": "critic", "status": "responded", "parsed": [finding],
                                        "raw_text": finding["reason"], "operation_state": "settled"}]
-        scope = ScopeReviewResult(blocked=False, status="responded", critical_findings=[])
-        ctx._last_scope_raw_result = {"status": "responded", "critical_findings": []}
+        scope = CouplingOutcome(verdict="PASS", status="responded")
         reviews.append({"task": ctx.task_id, "fingerprint": kw["review_binding_fingerprint"], "content": content})
         return ("Draft needs correction" if critical else None), scope, "critical_findings" if critical else "", []
 
@@ -128,11 +124,11 @@ def test_second_task_reviews_and_commits_only_explicitly_selected_correction(tmp
             "source": "task_acceptance_review", "reason": "review_cycles_exhausted",
             "outcome_tier": "blocked_with_evidence"}, "review": {"status": "fail"}})
     first_result = load_task_result(data, "first")
-    assert {path.stem for path in (data / "task_results").glob("*.json")} == {"first"}
+    assert {row["task_id"] for row in list_documents(data)} == {"first"}
 
-    # Independent admission explicitly selects the retained predecessor. It does
-    # not copy its paid wallet or critic authority, and does not reset first.
-    task = _promote_retained_correction(root, data, monkeypatch)
+    # Historical admission keeps the retained source without transferring critic
+    # authority or resetting the first result.
+    task = _admit_retained_correction(root, data, monkeypatch)
     second_id = task["id"]
     assert second_id != "first" and task["root_task_id"] == second_id
     agent = SimpleNamespace(env=SimpleNamespace(repo_dir=root, drive_root=data, budget_drive_root=str(data)))

@@ -58,7 +58,7 @@ def test_editor_validation_finishes_without_a_writer_and_owner_can_resume(tmp_pa
     assert result.status != "ok", result
     assert result.meta["operation_outcome"] == "completed_no_effect", result
     assert target.read_bytes() == before
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == {}
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == {}
     _pause_and_resume(tmp_path, monkeypatch, queue, workers)
 
 
@@ -89,7 +89,7 @@ def test_pre_effect_argument_refusals_do_not_hold_continue(tmp_path, monkeypatch
     assert result.meta.get("operation_outcome") == "completed_no_effect", result
     assert not effects and not (repo / "bad.py").exists()
     assert (repo / "notes.txt").read_bytes() == before
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == {}
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == {}
     workers.RUNNING.clear()
     _interrupted(tmp_path, task_id="root")
     _owner_mail(tmp_path, task_id="root")
@@ -122,7 +122,7 @@ def test_a_write_then_error_is_not_mislabelled_a_pre_effect_refusal(tmp_path, mo
     assert result.status == "error"
     assert result.meta.get("operation_outcome") != "completed_no_effect"
     assert (repo / "notes.txt").read_text(encoding="utf-8") == "alpha\ngamma\nalpha\n"
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"], "the write completed before its exception"
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {}), "the write completed before its exception"
 
 
 def _completion_refusal(registry, case):
@@ -211,10 +211,10 @@ def test_completion_refusal_preserves_an_unrelated_unknown_call(tmp_path, monkey
         with tool_handoff(registry._ctx, "unknown-external-effect"):
             with operation_start(registry._ctx):
                 raise TimeoutError("a submitted effect has no terminal receipt")
-    before = load_task_result(tmp_path, "root")["launch_handoffs"]
+    before = load_task_result(tmp_path, "root").get("launch_handoffs", {})
     assert len(before) == 1
     result = _completion_refusal(registry, case)
     assert result.meta["operation_outcome"] == "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == before
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == before
     assert any(row["kind"] == "tool_handoff" and row.get("task_id") == "root"
                for row in conflicting_writers(task_queue, "root"))

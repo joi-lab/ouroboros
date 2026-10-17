@@ -9,6 +9,7 @@
 // a second Continue — new work goes through the conversation).
 
 import { continueTask, fetchTaskDetail } from './api_client.js';
+import { heldWorkFacts } from './task_control_menu.js';
 import { ensureLiveActionsEl, ownLiveActionsEl } from './chat_activity.js';
 import { fmt, tr, tx } from './i18n.js';
 import { taskDoneIsTerminal, taskReasonPhrase } from './log_events.js';
@@ -69,8 +70,10 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
             const reason = typeof ack?.error === 'string' && ack.error ? ack.error : 'no acknowledgement';
             throw Object.assign(new Error(reason), { body: {} });
         }
+        // A held successor names what the census observed (#1721), never a generic wait.
         toast(ack?.held
-            ? 'Continue accepted. Waiting for earlier work to settle; use Resume in Activity to recheck.'
+            ? `Continue accepted and held: ${heldWorkFacts(ack.blockers) || 'earlier work is not proven settled'}. `
+                + 'Resume in Activity checks it again.'
             : 'Continue accepted.', 'ok');
         return successor;
     } catch (exc) {
@@ -92,6 +95,12 @@ function renderSuccessor(button, successorId) {
     button.textContent = tr('task.continue.continued', 'Continued');
     button.disabled = true;
     button.dataset.continueSuccessor = successorId;
+}
+
+/** The successor a card's Continue control names: '' while it still offers Continue, null with no control. */
+export function continueControlSuccessor(record) {
+    const button = ownLiveActionsEl(record)?.querySelector('[data-continue-task]');
+    return button ? String(button.dataset.continueSuccessor || '') : null;
 }
 
 /**
@@ -146,7 +155,8 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
     const button = existing || document.createElement('button');
     if (!existing) {
         button.type = 'button';
-        button.className = 'btn btn-xs';
+        // Continue is the one primary a settled card may offer; Continued (disabled) reads as a record.
+        button.className = 'btn btn-sm btn-primary';
         button.dataset.continueTask = String(record.groupId || '');
         actions.appendChild(button);
     }
@@ -162,8 +172,11 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         event.stopPropagation();
         button.disabled = true;
         const successor = await continueTaskAction(record.groupId, { actionNonce: view.actionNonce || '' });
-        if (successor) renderSuccessor(button, successor);
-        else button.disabled = false;
+        if (!successor) { button.disabled = false; return; }
+        renderSuccessor(button, successor);
+        // The card's own chat reads the predecessor's record now, so the successor joins this card (work_portal.js).
+        record.root?.dispatchEvent?.(new CustomEvent('ouro:task-continued', { bubbles: true,
+            detail: { taskId: String(record.groupId || ''), successorId: successor } }));
     };
     return !existing;
 }

@@ -6,6 +6,11 @@ policy above the seam (attempt rails, persistence, parsing, actor projection,
 quorum) and knows only that a route exists.
 
 The dependency runs one way: this module never imports the coordinator.
+
+A session verdict is trusted as structured output only when the run reports
+``outputConformance == "passed"``; otherwise it falls to the strict parse, then
+light-model extraction, and any landing below the requested ``outputSchema`` is
+disclosed as ``capability_delta``.
 """
 
 from __future__ import annotations
@@ -14,7 +19,7 @@ from types import SimpleNamespace
 from ouroboros.owner_pause import run_operation, OwnerPauseRefused
 
 from ouroboros.config import runtime_setting
-from ouroboros.model_wait import monotonic_now
+from ouroboros.model_wait import current_model_wait, monotonic_now, operation_wait_scope
 
 import asyncio
 import hashlib
@@ -33,13 +38,14 @@ from ouroboros.review_slot_cancel import (  # noqa: F401 — re-exported seam su
     _slot_cancel_outcome,
 )
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
-from ouroboros.usage_accounting import POSITIVE_PHYSICAL_ATTEMPT_STATES
+from ouroboros.usage_accounting import POSITIVE_PHYSICAL_ATTEMPT_STATES, BillingAuthorityUnavailable
 from ouroboros.delegate_custody_usage import (
     observe_failed_review_send, observe_review_usage, session_usage_once,
 )
 from ouroboros.triad_review import (
     ACCEPTANCE_SURFACE_RULES,
     TIER_CLASSIFICATION_RULES,
+    TWO_PART_SESSION_OUTPUT_SCHEMA,
     default_output_contract,
     review_output_shape,
 )
@@ -51,13 +57,12 @@ from ouroboros.config import get_finalization_grace_sec
 from ouroboros.review_session_custody import (
     checkpoint_pending_invocation,
     owned_started_review_custody,
+    recorded_review_shape,
     review_recovery_facts,
 )
 from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
-from ouroboros.review_session_usage import (
-    session_custody_attribution,
-    session_invocation_fields,
-)
+from ouroboros.review_session_usage import (review_event_identity, session_custody_attribution,
+                                             session_failure_identity, session_invocation_fields, session_usage_facts)
 if TYPE_CHECKING:  # annotations only — importing the substrate here would cycle
     from ouroboros.review_substrate import ReviewRequest, ReviewSlot
 
@@ -75,18 +80,21 @@ class ReviewRouteKind(str, Enum):
     AGENT_SESSION = "agent_session"
 
 
-def delivery_retrieves(route: Any, subagent_id: Any) -> bool:
+def delivery_retrieves(route: Any, native_retrieval: Any) -> bool:
     """THE delivery-class predicate: does this reviewer row read the subject
-    with its own tools (a hosted session, or a configured-subagent api row's
-    native tool rounds) instead of receiving the assembled packet?
+    with its own tools (a hosted session, or an api row saved with the
+    ``native`` delivery — bounded native tool rounds) instead of receiving the
+    assembled packet?
 
     One definition for every caller — slot properties, admission, packet fit
     and the surfaces' request builders — so a delivery class can never be
     recognised by one caller and missed by another. ``route`` may be a
-    ``ReviewRouteKind`` or its wire string."""
+    ``ReviewRouteKind`` or its wire string; ``native_retrieval`` is the row's
+    own explicit delivery fact. Every pool row carries a catalog id, so the id
+    is NOT a delivery signal (F8) and this predicate no longer reads one."""
     return (
         str(getattr(route, "value", route) or "") == ReviewRouteKind.AGENT_SESSION.value
-        or bool(str(subagent_id or "").strip())
+        or bool(native_retrieval)
     )
 
 class ReviewRouteUnavailable(RuntimeError):
@@ -100,6 +108,17 @@ class ReviewRouteUnavailable(RuntimeError):
     def __init__(self, message: str, *, code: str = "") -> None:
         super().__init__(message)
         self.code = str(code or "")
+
+class ReviewPollUnavailable(ReviewRouteUnavailable):
+    """A LIVE delegated review session could not be observed (#1547): the run started
+    and remains the slot's paid attempt, but every read of it failed (transport, read
+    timeout, 5xx, unreadable body) up to the slot deadline and the deadline cancel/verify
+    was unreachable too. Nothing terminal is known, so the attempt is NOT settled:
+    custody projects it ``in_flight`` for a later attach-only observation."""
+
+    def __init__(self, message: str, *, run_id: str) -> None:
+        super().__init__(message, code="review_poll_unavailable")
+        self.delegated_run_started, self.delegated_run_id = True, str(run_id or "")
 
 def _deadline_exhausted_error(
     message: str = "owner deadline leaves no dispatch window",
@@ -122,12 +141,6 @@ class ReviewSessionWaitingOnUser(RuntimeError):
     (completion wins). Answering support for hosted review lanes is a
     deliberate non-goal (owner: no acceptance host-wait; see docs/ARCHITECTURE.md).
     """
-
-def _poll_detail(gateway: Any, run_id: str, seconds: float) -> Dict[str, Any]:
-    from ouroboros.delegate_progress import bounded_poll, expiring_poll
-    if seconds > 0:
-        return bounded_poll(gateway, run_id, seconds, strict=True)
-    return expiring_poll(gateway, run_id, strict=True) or {}
 
 _DELIVERY_RANK = {"api_chat": 0, "native_tool_rounds": 1, "agent_session": 2}
 
@@ -496,8 +509,8 @@ class ApiChatReviewExecutor(ReviewSlotExecutor):
 # ---------------------------------------------------------------------------
 # Route configuration.
 #
-# Per-row delivery lives in the structured reviewer-slot SSOT
-# (``OUROBOROS_REVIEWER_SLOTS`` — D14/6.1); the phase-5 per-row route envs
+# Per-row delivery lives on the catalog's reviewer rows (the review pool,
+# ``OUROBOROS_SUBAGENTS`` ``delivery`` field); the phase-5 per-row route envs
 # (``OUROBOROS_REVIEW_ROUTES`` / ``OUROBOROS_SCOPE_REVIEW_ROUTES``) are
 # RETIRED settings keys (ABI-10) and are ignored — a row built outside the
 # structured config is pinned ``api_chat`` explicitly. The one surviving key
@@ -615,26 +628,23 @@ ACCEPTANCE_SESSION_OUTPUT_SCHEMA: Dict[str, Any] = {
 def review_session_output_schema(surface: str) -> Optional[Dict[str, Any]]:
     """The session verdict schema, shaped to the SURFACE's own clean contract.
 
-    The shared schema admits ``{"findings": []}`` — the honest clean verdict for a
-    triad or ordinary advisory reviewer. Scope's coverage contract requires all
-    checklist rows (PASS included); Skill Review has the same matrix shape. Their
-    schemas demand ``minItems: 1`` so an engine cannot conform with an empty answer;
-    each surface's downstream parser still verifies exact item coverage. An
-    ``object``-shaped surface (task acceptance) asks for the whole verdict object; a
-    ``report`` surface asks for NO schema — its prose passes through verbatim.
+    The shared schema admits ``{"findings": []}`` — the honest clean verdict for an
+    ordinary advisory reviewer. Skill Review's matrix contract requires all checklist
+    rows (PASS included): its schema demands ``minItems: 1`` and the downstream parser
+    still verifies exact item coverage. The commit gate's ``two_part`` shape asks for
+    contract B's one object; an ``object`` surface (task acceptance) for the whole
+    verdict object; a ``report`` surface for NO schema — its prose passes verbatim.
     """
     shape = review_output_shape(surface)
-    if shape == "report":
-        return None
-    if shape == "object":
-        return ACCEPTANCE_SESSION_OUTPUT_SCHEMA
-    if surface == "plan_review":
-        # plan review's own element contract (4e133c8a): the generic item/verdict shape
-        # would conform-and-launder — an unknown class demotes to a note.
-        from ouroboros.tools.plan_spec import PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
+    if shape in ("report", "object", "two_part"):
+        return {"object": ACCEPTANCE_SESSION_OUTPUT_SCHEMA, "two_part": TWO_PART_SESSION_OUTPUT_SCHEMA}.get(shape)
+    if shape == "plan_reply":
+        # The planning organ's reply object (prose, the participant's own objections and
+        # withdrawals): the generic item/verdict shape would conform-and-launder it.
+        from ouroboros.tools.plan_packet import PLAN_REPLY_SESSION_OUTPUT_SCHEMA
 
-        return PLAN_REVIEW_SESSION_OUTPUT_SCHEMA
-    if surface not in {"scope_review", "skill_review"}:
+        return PLAN_REPLY_SESSION_OUTPUT_SCHEMA
+    if surface != "skill_review":
         return REVIEW_SESSION_OUTPUT_SCHEMA
     shaped = json.loads(json.dumps(REVIEW_SESSION_OUTPUT_SCHEMA))
     shaped["properties"]["findings"]["minItems"] = 1
@@ -653,12 +663,11 @@ from ouroboros.review_verdict_extraction import (  # noqa: F401 — re-exported 
 
 
 # ---------------------------------------------------------------------------
-# The agent-session route: a delegated read-only Claudexor run per slot.
+# The agent-session route: configured access in a delegated checking copy, or readonly.
 # ---------------------------------------------------------------------------
 
-# Layered by Claudexor into the harness's native system-prompt channel — a
-# statement of role, not the enforcement (the enforcement is the readonly
-# access profile the engine derives).
+# Layered by Claudexor into the harness's native system-prompt channel: the role of an
+# explicitly readonly seat (writable seats get the checking-copy instructions instead).
 _REVIEW_SESSION_INSTRUCTIONS = (
     "You are a delegated read-only REVIEWER session. Retrieve the evidence "
     "yourself with the tools your read-only mode actually gives you inside this "
@@ -684,8 +693,8 @@ def _retire_orphaned_review_registration(
 
     Same semantics as the delegated-start path (ported from cxi/p34-converged
     ``tools/delegate._retire_orphaned_registration``, adapted to the custody-drive
-    signature this module has): the registration is destroyed ONLY on a DEFINITE
-    negative answer from the daemon. A transport error, a 5xx, or a 2xx handle with
+    signature this module has): only a proven unsent start or a definite negative
+    daemon answer permits retirement. A transport error, a 5xx, or a 2xx handle with
     no run id all leave the POST's fate UNKNOWN, and a run may well be live against
     this very registration — an unverified outcome is never grounds for destroying
     state. The START_FAILED row is written either way, so every failing branch
@@ -742,6 +751,9 @@ class SessionInvocation:
     pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
     owner_deadline_at: str = ""
     source_delivery: Optional[Dict[str, Any]] = None
+    # #1609: the seat's configured technical access ('' = historical read-only) and its wave's frozen checking source.
+    access: str = ""
+    checking_source: Optional[Dict[str, Any]] = None
 
 def run_delegated_review_session(
     *,
@@ -764,64 +776,63 @@ def run_delegated_review_session(
     )
     from ouroboros.subagents import delegated_run_shape, route_health
     from ouroboros.usage_accounting import current_usage_scope
+    from ouroboros.review_checking import bind_checking_thread, session_checking, terminal_seat_evidence
     task_id, surface, slot_id, timeout_sec, logical_key_extra, output_schema, \
         session_route, instructions, retry_state = session_invocation_fields(invocation)
-    owner_deadline_at = invocation.owner_deadline_at
     use_thread = bool(invocation.use_thread)
     thread_id = str(invocation.thread_id or "")
-    turn_id = ""
-    _scope = current_usage_scope()
-    root_task_id, parent_task_id, usage_custody = session_custody_attribution(_scope)
-    shape = delegated_run_shape(False)  # a reviewer reads and answers
+    root_task_id, parent_task_id, usage_custody = session_custody_attribution(current_usage_scope())
+    # A reviewer never holds candidate write authority: writable access is an investigation.
+    shape = delegated_run_shape(False, str(invocation.access or "readonly"))
+    checking: Dict[str, Any] = {}
     state = retry_state if retry_state is not None else {}
-    run_id, run_request, invocation_id = "", None, ""
+    run_id, turn_id, run_request, invocation_id = "", "", None, ""
     started_custody = None
     retry_token = str(state.get("pending_invocation_id") or "")
-    record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
-    if record is not None and record["state"] == "started" and record["run_id"]:
-        run_id, started_custody = owned_started_review_custody(
-            custody, custody_drive, record, task_id)
-        run_request, invocation_id = record.get("request"), retry_token
-    elif record is not None and record["state"] == "pending":
-        run_request, invocation_id = record.get("request"), retry_token
-    # Known pending custody survives body loss; recovery reports the missing request.
-    recovering = bool(run_id or invocation_id)
-    if retry_token and not recovering and surface != "skill_review":
-        raise ReviewRouteUnavailable(
-            "delegated retry token has no durable invocation; refusing a second paid run",
-            code="review_custody_lost",
-        )
-    if recovering:
-        route, project_id, existing_project, key, schema_asked = (
-            review_recovery_facts(
-                record, run_request, started_custody, prompt=prompt, root=root,
-                claimant_task_id=task_id, claimant_surface=surface,
-                claimant_slot_id=slot_id,
-                claimant_operation_id=str(invocation.operation_id or ""))
-        )
-        thread_id = str(run_request.get("_thread_id") or thread_id)
-        use_thread = bool(thread_id or run_request.get("_use_thread"))
-    else:
-        route = session_route if session_route is not None else review_session_route()
-        if route is None:
-            raise ReviewRouteUnavailable(
-                "delegated review session has no configured session route "
-                f"({REVIEW_SESSION_ROUTE_ENV} / OUROBOROS_SUBAGENT_HARNESS are empty or `off`)",
-                code="session_route_unconfigured")
-        project_id, existing_project, key, schema_asked = "", "", "", False
-    if invocation.reconcile_only and not recovering:
-        raise ReviewRouteUnavailable(
-            "the exact delegated review invocation is no longer available for "
-            "reconciliation; refusing to start a second paid run",
-            code="review_custody_lost",
-        )
-    gateway = ensure_owned_gateway()
+    unrequested = not (retry_token or invocation.reconcile_only)
+    gateway, route = None, session_route
+    recovering, project_id, existing_project = False, "", ""  # also bound on early recovery failures
+    observed, summary = {}, {}  # a failure after start still names what it observed
+    start_attempted, start_refused = False, False  # only submit witnesses POST entry
     try:
+        record = custody.invocation_record(custody_drive, retry_token) if retry_token else None
+        if record is not None and record["state"] == "started" and record["run_id"]:
+            run_id, started_custody = owned_started_review_custody(custody, custody_drive, record, task_id)
+        if record is not None and (run_id or record["state"] == "pending"):
+            run_request, invocation_id = record.get("request"), retry_token
+        # Known pending custody survives body loss; recovery reports the missing request.
+        recovering = bool(run_id or invocation_id)
+        if retry_token and not recovering and surface != "skill_review":
+            raise ReviewRouteUnavailable("delegated retry token has no durable invocation; refusing a second paid run",
+                                         code="review_custody_lost")
+        if recovering:
+            route, project_id, existing_project, key, schema_asked = review_recovery_facts(
+                record, run_request, started_custody, prompt=prompt, root=root,
+                claimant_task_id=task_id, claimant_surface=surface, claimant_slot_id=slot_id,
+                claimant_operation_id=str(invocation.operation_id or ""))
+            shape = recorded_review_shape(run_request)  # replay original rights and checking copy
+            if shape.investigation:
+                checking["custody"] = {k: str(record.get(k) or "") for k in ("authority_source", "execution_root", "target_root")}
+            thread_id = str(run_request.get("_thread_id") or thread_id)
+            use_thread = bool(thread_id or run_request.get("_use_thread"))
+        else:
+            route = session_route if session_route is not None else review_session_route()
+            if route is None:
+                raise ReviewRouteUnavailable(
+                    f"delegated review session has no configured session route ({REVIEW_SESSION_ROUTE_ENV} / "
+                    "OUROBOROS_SUBAGENT_HARNESS are empty or `off`)", code="session_route_unconfigured")
+            project_id, existing_project, key, schema_asked = "", "", "", False
+        if invocation.reconcile_only and not recovering:
+            raise ReviewRouteUnavailable("the exact delegated review invocation is no longer available for "
+                "reconciliation; refusing to start a second paid run", code="review_custody_lost")
+        gateway = ensure_owned_gateway()
+        if use_thread and shape.investigation and not run_id:
+            from ouroboros.review_thread_continuity import require_delegated_review_threads
+            require_delegated_review_threads(gateway)
         if not recovering and not run_id and not (use_thread and thread_id):
             unavailable, reset_at = route_health(
                 gateway, route.route_id, shape, route_model=route.model,
-                pinned_profile=str(getattr(route, "profile_id", "") or ""),
-            )
+                pinned_profile=str(getattr(route, "profile_id", "") or ""))
             if unavailable in WINDOW_EXHAUSTED_CODES or reset_at:
                 raise ClaudexorSubscriptionWindowExhausted(
                     "delegated review route subscription window is exhausted"
@@ -835,27 +846,36 @@ def run_delegated_review_session(
         if not recovering:
             from ouroboros.acceptance_retrieving import prepare_session_source
             prepare_session_source(invocation.source_delivery, task_id=task_id)
-            existing_project = gateway.find_project_id(root)
-            project_id = existing_project or gateway.register_project(root)
+            from ouroboros.delegate_registration_policy import minted_review_root, resolve_registration
+            project_id, owned_project_id, _persistent, ephemeral = resolve_registration(  # a sticky thread keeps it
+                gateway, root, "", shape.access, minted=not use_thread and minted_review_root(root, custody_drive))
+            existing_project = "" if owned_project_id else project_id
             schema_asked = bool(output_schema) and _effective_route_carries_schema(
                 gateway, route.route_id)
             key = custody.idempotency_key(
                 "review_slot", surface, slot_id, task_id, *logical_key_extra,
                 route.route_id, shape.access, shape.mode, root, prompt,
             )
-            if use_thread and not thread_id:
+            if shape.investigation:  # a thread advances its own clone; a run gets a copy per operation
+                checking = session_checking(gateway, custody_drive=custody_drive, task_id=task_id,
+                    operation_id=str(invocation.operation_id or ""), root=root, source=invocation.checking_source,
+                    shape=shape, thread_seat=f"{surface}:{slot_id}" if use_thread else "", thread_id=thread_id)
+            if use_thread:
                 from ouroboros.review_thread_continuity import ensure_review_thread
-                thread_id = ensure_review_thread(
-                    gateway, custody, thread_id, route=route, root=root,
-                    surface=surface, slot_id=slot_id, task_id=task_id)
+                # Thread creation can bind the project even if its response is lost.
                 existing_project = project_id
+                thread_id = ensure_review_thread(
+                    gateway, custody, thread_id or checking.get("thread_id", ""), route=route, root=root,
+                    workspace_root=checking.get("thread_root", ""),
+                    surface=surface, slot_id=slot_id, task_id=task_id, access=shape.access)
+                if shape.investigation:
+                    bind_checking_thread(custody_drive, task_id, f"{surface}:{slot_id}", thread_id)
             invocation_id = custody.new_invocation_id()
-            seconds = bounded_seconds(
-                timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS,
-            )
+            seconds = bounded_seconds(timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS)
             run_request = prepare_review_session_request(
-                invocation, route, prompt=prompt, root=root,
-                thread_id=thread_id, schema_asked=schema_asked)
+                invocation, route, prompt=prompt, root=root, ephemeral=ephemeral,
+                thread_id=thread_id, schema_asked=schema_asked,
+                shape=shape, execution=checking.get("execution"), instructions=checking.get("instructions", ""))
         if not run_id:
             from ouroboros.budget_pause import dispatch_fenced
 
@@ -864,83 +884,61 @@ def run_delegated_review_session(
                 # fresh start AND a pending-invocation replay are both a new
                 # POST. The invocation row stays pending for the resumed task.
                 raise ReviewRouteUnavailable(
-                    "the owning task is entering an exact budget pause; no delegated "
+                    "the owning task is entering an exact pause; no delegated "
                     "review is started or re-posted while it pauses",
                     code="budget_pausing_no_send")
-            if (not recovering and owner_deadline_at and owner_deadline_exhausted(
-                deadline_at=owner_deadline_at, reserve_sec=get_finalization_grace_sec())):
+            if (not recovering and invocation.owner_deadline_at and owner_deadline_exhausted(
+                deadline_at=invocation.owner_deadline_at, reserve_sec=get_finalization_grace_sec())):
                 raise _deadline_exhausted_error()
-            seconds = bounded_seconds(
-                run_request.get("maxSeconds"),
-                default=timeout_sec if timeout_sec is not None else 300,
-                maximum=_CLAUDEXOR_MAX_SECONDS,
-            )
+            seconds = bounded_seconds(run_request.get("maxSeconds"), maximum=_CLAUDEXOR_MAX_SECONDS,
+                                      default=timeout_sec if timeout_sec is not None else 300)
+            unrequested = False  # neither a paid stamp nor an ambiguous write can be undone
             invoke_review_paid_stamp(invocation.dispatch_stamp)
-            requested = custody.record_start_requested(
-                custody_drive, run_id="", task_id=task_id,
-                idempotency_key=key, invocation_id=invocation_id,
-                operation_id=str(invocation.operation_id or ""),
-                max_seconds=seconds, request=run_request, project_id=project_id,
-                project_owned=not existing_project, route=route.route_id,
-                surface=surface, slot_id=slot_id,
-                # #112: pending recovery replays the request row's lineage.
-                root_task_id=root_task_id, parent_task_id=parent_task_id,
-                review_source_delivery=dict(invocation.source_delivery or {}),
-                **usage_custody,
-            )
-            if not requested:
-                # No durable request means no POST; only a fresh registration is retirable.
-                _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id,
-                    definite_refusal=not recovering,
-                    reason="start_request_row_unwritable",
-                    invocation_id=invocation_id, surface=surface, slot_id=slot_id,
+            try:
+                requested = custody.record_start_requested(
+                    custody_drive, run_id="", task_id=task_id, idempotency_key=key, invocation_id=invocation_id,
+                    operation_id=str(invocation.operation_id or ""),
+                    max_seconds=seconds, request=run_request, project_id=project_id,
+                    project_owned=bool(project_id) and not existing_project, route=route.route_id,
+                    surface=surface, slot_id=slot_id,
+                    # #112: pending recovery replays the request row's lineage.
+                    root_task_id=root_task_id, parent_task_id=parent_task_id,
+                    review_source_delivery=dict(invocation.source_delivery or {}),
+                    **usage_custody, **checking.get("custody", {}),
                 )
-                raise ReviewRouteUnavailable(
-                    "the durable start-request row could not be written; the "
-                    "delegated review session was NOT started", code="start_request_row_unwritable")
+            except BillingAuthorityUnavailable as exc:  # Outer pre-start boundary owns cleanup; nothing sent.
+                raise ReviewRouteUnavailable(f"{exc}; the delegated review session was NOT started",
+                                             code="billing_authority_unavailable") from exc
+            if not requested:  # no POST was sent, but a False write may still have landed
+                raise ReviewRouteUnavailable("the durable start-request row could not be written; the delegated "
+                                             "review session was NOT started", code="start_request_row_unwritable")
             state["pending_invocation_id"] = invocation_id
             checkpoint_pending_invocation(
                 checkpoint=invocation.pending_invocation_checkpoint, invocation_id=invocation_id,
-                state=state, on_failure=lambda: _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id if not existing_project else "",
-                    definite_refusal=not recovering,
-                    reason="review_custody_checkpoint_unwritable",
-                    invocation_id=invocation_id, surface=surface, slot_id=slot_id))
+                state=state, on_failure=lambda: None)  # The outer boundary owns cleanup.
+
+            def submit():
+                nonlocal start_attempted
+                start_attempted = True  # Admission and preparation are not a POST.
+                if use_thread:
+                    from ouroboros.review_thread_continuity import start_review_thread_turn
+                    return start_review_thread_turn(gateway, thread_id, run_request, idempotency_key=invocation_id)
+                return gateway.start_run(run_request, idempotency_key=invocation_id)
+
             try:
                 launch_source = SimpleNamespace(drive_root=custody_drive,
                     task_id=task_id, root_task_id=root_task_id)
-                if use_thread:
-                    from ouroboros.review_thread_continuity import start_review_thread_turn
-                    handle = run_operation(launch_source, start_review_thread_turn,
-                        gateway, thread_id, run_request, idempotency_key=invocation_id)
-                else:
-                    handle = run_operation(launch_source, gateway.start_run, run_request, idempotency_key=invocation_id)
+                handle = run_operation(launch_source, submit)
             except (ClaudexorUnavailable, OwnerPauseRefused) as exc:
                 code = getattr(exc, "code", str(exc))
                 status = int(getattr(exc, "status_code", 0) or 0)
-                definite = isinstance(exc, OwnerPauseRefused) or 400 <= status < 500
-                _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id,
-                    # Only a definite 4xx proves the registration never bound a run.
-                    definite_refusal=definite and not recovering,
-                    reason=code, invocation_id=invocation_id,
-                    surface=surface, slot_id=slot_id,
-                )
-                if definite and not recovering:
-                    state.pop("pending_invocation_id", None)
+                start_refused = isinstance(exc, OwnerPauseRefused) or 400 <= status < 500
                 if isinstance(exc, OwnerPauseRefused):
                     raise ReviewRouteUnavailable("New delegated review start is fenced.", code=code) from exc
                 raise
             run_id = str(handle.get("runId") or handle.get("jobId") or "")
             turn_id = str(handle.get("turnId") or "")
             if not run_id:
-                # A successful POST retains the registration on malformed response.
-                _retire_orphaned_review_registration(
-                    custody, gateway, custody_drive, project_id,
-                    definite_refusal=False, reason="queued_without_run_id",
-                    invocation_id=invocation_id, surface=surface, slot_id=slot_id,
-                )
                 raise ReviewRouteUnavailable(
                     f"Claudexor returned a queued handle without a run id: {handle!r}", code="queued_without_run_id")
         state["pending_invocation_id"] = invocation_id or retry_token
@@ -950,26 +948,26 @@ def run_delegated_review_session(
             custody_durable = True
         else:
             entry = custody.RunCustody(
-                run_id=run_id, task_id=task_id,
-                route_id=route.route_id, model=str(route.model or ""),
+                run_id=run_id, task_id=task_id, route_id=route.route_id, model=str(route.model or ""),
                 profile_id=str(getattr(route, "profile_id", "") or ""),
-                project_id=project_id, project_owned=not existing_project,
-                root_task_id=root_task_id, parent_task_id=parent_task_id,
-                **usage_custody,
-                ledger_root=str(custody_drive), idempotency_key=key,
-                invocation_id=invocation_id or retry_token,
-            )
+                project_id=project_id, project_owned=bool(project_id) and not existing_project,
+                root_task_id=root_task_id, parent_task_id=parent_task_id, **usage_custody,
+                ledger_root=str(custody_drive), idempotency_key=key, invocation_id=invocation_id or retry_token,
+                **checking.get("custody", {}))
             # A missing started row leaves the run process-local and unresumable.
             custody_durable = bool(custody.record_started(custody_drive, entry, shape={
                 "effort": route.effort, "access": shape.access, "mode": shape.mode,
-                "isolation": shape.isolation, "delegated": shape.delegated,
+                "isolation": shape.isolation, "delegated": shape.delegated, "max_seconds": seconds,
                 "root": root, "surface": surface, "slot_id": slot_id,
             }))
         # Pending custody remains above throughout polling, including failures.
-        detail = _poll_session_terminal(
-            gateway, custody, custody_drive, entry, run_id,
-            float(timeout_sec) if timeout_sec is not None else 300.0,
-        )
+        window = float(timeout_sec) if timeout_sec is not None else 300.0
+        poll_deadline = time.monotonic() + window
+        detail = _poll_session_terminal(gateway, custody, custody_drive, entry, run_id, window)
+        late_success = time.monotonic() >= poll_deadline  # a terminal the deadline read discovered
+        if shape.investigation:  # every terminal turn retains its own named outputs and delta
+            checking["evidence"] = terminal_seat_evidence(
+                custody_drive, task_id, str(invocation.operation_id or ""), detail)
         settlement = custody.settle_run(custody_drive, gateway, entry, detail)
         summary = custody.summary_of(detail)
         observed = final_attempt_facts(detail, run_id)
@@ -990,9 +988,7 @@ def run_delegated_review_session(
         state.pop("pending_invocation_id", None)
         state.pop("delegated_run_id", None)
         return {
-            "run_id": run_id,
-            "thread_id": thread_id,
-            "turn_id": turn_id,
+            "run_id": run_id, "thread_id": thread_id, "turn_id": turn_id,
             "thread_receipt": thread_receipt,
             "profile_continuity_receipt": thread_receipt.get("profile_continuity") or {},
             "text": text,
@@ -1000,27 +996,50 @@ def run_delegated_review_session(
             "schema_asked": schema_asked,
             "custody_durable": custody_durable,
             "idempotent_recovery": recovering,
+            "late_success_accepted": late_success,
             "settlement": settlement,
             "route_id": str(entry.route_id), "run_dir": str(summary.get("runDir") or ""),
             # One final attempt, never the requested pool or a mixed summary route.
             "effective_route_ids": [observed["harness_id"]] if observed.get("harness_id") else [],
-            "observed_attempt": observed,
-            "model": observed.get("model", ""),
-            "spend": spend,
-            "spend_estimated": estimated,
+            "observed_attempt": observed, "model": observed.get("model", ""),
+            "usage": session_usage_facts(run_id, requested_route=str(entry.route_id), observed_attempt=observed, summary=summary),
+            "spend": spend, "spend_estimated": estimated,
             # D22/D29 applied facts are verbatim telemetry, never inferred.
             "applied_profile": observed.get("profile_id", ""),
             "auth_route_receipt": summary.get("authRoute") or {},
             # Only effectiveAccess witnesses applied access; request echo is insufficient.
             "applied_access": str(summary.get("effectiveAccess") or ""),
+            "requested_access": shape.access, "checking_evidence": checking.get("evidence") or {},
         }
     except BaseException as exc:
-        if run_id:
-            setattr(exc, "delegated_run_started", True)
-            setattr(exc, "delegated_run_id", run_id)
+        if unrequested:  # fresh preparation only: no paid stamp or START_REQUESTED write
+            exc.delegated_start_unrequested = True
+        if gateway is not None and not run_id and (project_id or invocation_id):
+            definite = not recovering and (not start_attempted or start_refused)
+            try:
+                _retire_orphaned_review_registration(
+                    custody, gateway, custody_drive, project_id if not existing_project else "",
+                    definite_refusal=definite, reason=str(getattr(exc, "code", type(exc).__name__)),
+                    invocation_id=invocation_id, surface=surface, slot_id=slot_id)
+            except Exception:
+                log.warning("Review start cleanup failed for %s", invocation_id, exc_info=True)
+            if definite:
+                state.pop("pending_invocation_id", None)
+            elif invocation_id:
+                state["pending_invocation_id"] = invocation_id
+        if gateway is not None and shape.investigation and not checking.get("evidence"):
+            checking["evidence"] = terminal_seat_evidence(
+                custody_drive, task_id, str(invocation.operation_id or ""), getattr(exc, "checking_terminal_detail", None))
+        if run_id and gateway is not None:
+            exc.delegated_run_started, exc.delegated_run_id = True, run_id
+            exc.delegated_usage = session_usage_facts(run_id, requested_route=str(getattr(route, "route_id", "") or ""),
+                                                      observed_attempt=observed, summary=summary)  # #1578
+        if checking.get("evidence"):
+            exc.checking_evidence = checking["evidence"]
         raise
     finally:
-        gateway.close()
+        if gateway is not None:
+            gateway.close()
 def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     """Can the EFFECTIVE route actually carry ``outputSchema`` on this run (D19)?
 
@@ -1050,56 +1069,76 @@ def _effective_route_carries_schema(gateway: Any, route_id: str) -> bool:
     except Exception:
         log.debug("harness manifest read failed", exc_info=True)
     return False
+def _observe_session(gateway: Any, run_id: str, remaining: float, streak: Any) -> tuple:
+    """One strict read of a live run on what remains of the slot clock: ``(detail, None)``,
+    or ``({}, failure)`` when the run could not be observed (transport, timeout, 5xx,
+    unreadable body) — it is still live, so polling continues (#1547). A received 4xx
+    about the run propagates while the window is open; a spent window takes the 1 ms
+    read whose silence means only "still unobserved", as ``expiring_poll`` does."""
+    from ouroboros.delegate_progress import bounded_poll
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    try:
+        return bounded_poll(gateway, run_id, max(0.0, remaining), strict=True), None
+    except ClaudexorUnavailable as exc:
+        if remaining > 0 and 400 <= exc.status_code < 500:
+            raise
+        log.log(logging.DEBUG if streak is not None else logging.WARNING,
+                "delegated review session %s could not be observed (%s); polling continues", run_id, exc)
+        return {}, exc
+
+
 def _poll_session_terminal(gateway: Any, custody: Any, custody_drive: Any, entry: Any,
                            run_id: str, seconds: float) -> Dict[str, Any]:
     """Poll a delegated review run on the slot clock; verified cancel and
     completion-wins semantics remain owned by the existing cancel seam."""
     from ouroboros.gateways.claudexor import pending_interactions as _cx_pending
     deadline = time.monotonic() + max(0.0, float(seconds))
-    detail = _poll_detail(gateway, run_id, max(0.0, deadline - time.monotonic()))
+    detail, unobserved = _observe_session(gateway, run_id, max(0.0, deadline - time.monotonic()), None)
     while not custody.is_terminal(detail):
         pending = _cx_pending(detail)
+        first = pending[0] if pending else {}
         if (pending or bool(custody.summary_of(detail).get("waitingOnUser"))) \
-                and _interaction_outlives_slot(
-                    (pending[0] if pending else {}).get("timeout_at"), deadline):
-            first = pending[0] if pending else {}
-            question = ""
-            for q in first.get("questions") or []:
-                question = str(q.get("question") or "").strip()
-                if question:
-                    break
+                and _interaction_outlives_slot(first.get("timeout_at"), deadline):
+            question = next((q for q in (str(x.get("question") or "").strip()
+                                         for x in first.get("questions") or []) if q), "")
             outcome, state, carried = _slot_cancel_outcome(
-                gateway, custody, custody_drive, entry, run_id,
-                "review_session_waiting_on_user")
+                gateway, custody, custody_drive, entry, run_id, "review_session_waiting_on_user")
             settled = _natural_success_terminal(gateway, custody, run_id, state, carried)
             if settled is not None:
                 return settled
             named = str(first.get("interaction_id") or "")
-            raise ReviewSessionWaitingOnUser(
+            error = ReviewSessionWaitingOnUser(
                 f"delegated review session {run_id} paused on an interactive question"
                 + (f" ({named}: {question[:300]!r})" if named or question else "")
-                + " — review slots are non-interactive, so the slot terminated "
-                  "early and typed ("
+                + " — review slots are non-interactive, so the slot terminated early and typed ("
                 + _cancel_honesty_clause(outcome, state)
-                + ") instead of silently burning its whole budget waiting"
-            )
+                + ") instead of silently burning its whole budget waiting")
+            error.checking_terminal_detail = carried
+            raise error
         if time.monotonic() >= deadline:
             outcome, state, carried = _slot_cancel_outcome(
                 gateway, custody, custody_drive, entry, run_id, "review_slot_timeout")
             settled = _natural_success_terminal(gateway, custody, run_id, state, carried)
             if settled is not None:
                 return settled
-            raise TimeoutError(
-                f"delegated review session {run_id} exceeded the slot budget "
-                f"of {seconds:g}s ("
-                + _cancel_honesty_clause(outcome, state) + ")"
-            )
+            # Blind on both reads (the cancel/verify raised, or its verify read reached no
+            # state either): nothing terminal is known, so the run is not "timed out".
+            if unobserved is not None and (outcome == "cancel_attempt_exception" or (
+                    outcome == custody.CANCEL_CONTAINMENT_FAULT and not state)):
+                raise ReviewPollUnavailable(
+                    f"delegated review session {run_id} could not be observed within the slot "
+                    f"budget of {seconds:g}s and the deadline cancel/verify was unreachable too; "
+                    "the run remains the slot's paid attempt and stays in flight", run_id=run_id) from unobserved
+            error = TimeoutError(f"delegated review session {run_id} exceeded the slot budget "
+                                 f"of {seconds:g}s (" + _cancel_honesty_clause(outcome, state) + ")")
+            error.checking_terminal_detail = carried
+            raise error
         remaining = max(0.0, deadline - time.monotonic())
         if remaining <= 0:
             continue
         time.sleep(min(_SESSION_POLL_SEC, remaining))
-        remaining = max(0.0, deadline - time.monotonic())
-        detail = _poll_detail(gateway, run_id, remaining)
+        detail, unobserved = _observe_session(
+            gateway, run_id, max(0.0, deadline - time.monotonic()), unobserved)
     return detail
 def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str:
     """The session's final answer from the verified FULL primary output (D7).
@@ -1233,12 +1272,10 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
 
     @property
     def session_prompt(self) -> str:
-        """The compact task this route sends — the slot's own work order when the
-        surface supplies one (``slot_session_tasks``), else the shared
-        ``session_task``: the SAME task, criteria and output contract as the api
-        pack, minus the assembled evidence unless the surface chose to include
-        it — a delegated reviewer retrieves context with its tools (D12), so
-        the api pack is never assembled here (plan 5.2)."""
+        """The slot's work order, else the shared session task: same criteria and
+        output contract as the API pack, but evidence is retrieved with tools.
+        The surface may inline evidence; this executor never assembles the API pack.
+        """
         if self._session_prompt is None:
             request, slot = self.assignment.request, self.assignment.slot
             task = str((getattr(request, "slot_session_tasks", None) or {}).get(slot.slot_id)
@@ -1265,11 +1302,10 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         except BaseException as exc:
             self._run_id = self._run_id or str(getattr(exc, "delegated_run_id", "") or "")
             started = bool(self._run_id or getattr(exc, "delegated_run_started", False))
+            if started:
+                self._session_usage = dict(getattr(exc, "delegated_usage", None) or session_usage_facts(self._run_id))
             if started and not self._session_usage_observed and session_usage_once(self._run_id):
-                self._observe_usage({
-                    "provider": "claudexor", "resolved_model": "",
-                    "delegated_run_started": True, "delegated_run_id": self._run_id, "cost": None,
-                })
+                self._observe_usage({**self._session_usage, "cost": None})
                 self._session_usage_observed = True
             if not self._retry_state.get("pending_invocation_id"):
                 self._settled_failure = exc
@@ -1277,14 +1313,20 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         if not self._session_usage_observed and session_usage_once(self._run_id):
             self._observe_usage(self._session_usage)
         self._session_usage_observed = True
-        return self._verdict_result()
+        # Already-paid evidence: extraction runs on the operation's own wait, past an
+        # expired SLOT deadline (#1547); calendar, Stop/Panic and ceiling still interrupt.
+        with operation_wait_scope(current_model_wait()):
+            return self._verdict_result()
 
     def failure_custody(self) -> Dict[str, Any]:
         failure = self._settled_failure
         run_id = self._run_id or str(getattr(failure, "delegated_run_id", "") or "")
         pending = str(self._retry_state.get("pending_invocation_id") or "")
-        return {"delegated_run_started": bool(run_id), "delegated_run_id": run_id,
-                "pending_invocation_id": pending}
+        evidence = getattr(failure, "checking_evidence", None)
+        return {**(session_failure_identity(self._session_usage) if run_id else {}),
+                "delegated_run_started": bool(run_id), "delegated_run_id": run_id,
+                "pending_invocation_id": pending, **({"checking_evidence": evidence} if evidence else {}),
+                **({"delegated_start_unrequested": True} if getattr(failure, "delegated_start_unrequested", None) is True else {})}
 
     def restore_custody(self, state: Dict[str, Any]) -> None:
         # The logical waiter and the physical worker share this small mutable
@@ -1308,28 +1350,19 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
 
     def _run_session(self) -> None:
         request, slot = self.assignment.request, self.assignment.slot
-        root = str(request.session_root or "").strip()
-        if not root:
-            raise ReviewRouteUnavailable(
-                "agent_session slot has no session root: the surface must name the "
-                "repository root the reviewer session runs in", code="session_root_missing")
-        from ouroboros.config import get_finalization_grace_sec
-        from ouroboros.deadline_utils import review_operation_timeout_sec
-        logical_deadline = getattr(self, "_logical_deadline_monotonic", None)
-        logical_timeout = (
-            max(0.001, float(logical_deadline) - monotonic_now())
-            if logical_deadline is not None else
-            review_operation_timeout_sec(getattr(slot, "timeout_sec", None),
-                route=getattr(slot, "route", None),
-                deadline_at=getattr(request, "deadline_at", "") or "",
-                transport_timeout_sec=getattr(slot, "transport_timeout_sec", None),
-                reserve_sec=get_finalization_grace_sec())
-        )
-        facts = run_delegated_review_session(
-            prompt=self.session_prompt,
-            root=root,
-            custody_drive=self._custody_drive(),
-            invocation=SessionInvocation(
+        try:  # Local argument preparation, before any delegated transport can run.
+            root, drive, prompt = str(request.session_root or "").strip(), self._custody_drive(), self.session_prompt
+            if not root:
+                raise ReviewRouteUnavailable("agent_session slot has no repository root", code="session_root_missing")
+            from ouroboros.config import get_finalization_grace_sec
+            from ouroboros.deadline_utils import review_operation_timeout_sec
+            logical_deadline = getattr(self, "_logical_deadline_monotonic", None)
+            logical_timeout = (
+                max(0.001, float(logical_deadline) - monotonic_now()) if logical_deadline is not None else
+                review_operation_timeout_sec(getattr(slot, "timeout_sec", None), route=getattr(slot, "route", None),
+                    deadline_at=getattr(request, "deadline_at", "") or "",
+                    transport_timeout_sec=getattr(slot, "transport_timeout_sec", None), reserve_sec=get_finalization_grace_sec()))
+            invocation = SessionInvocation(
                 task_id=str(request.task_id or ""),
                 surface=request.surface,
                 slot_id=slot.slot_id,
@@ -1346,8 +1379,14 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 pending_invocation_checkpoint=self._pending_invocation_checkpoint,
                 owner_deadline_at=str(getattr(request, "deadline_at", "") or ""),
                 source_delivery=(getattr(request, "slot_source_delivery", None) or {}).get(slot.slot_id),
-            ),
-        )
+                access=str(getattr(slot, "session_access", "") or ""),
+                checking_source=getattr(request, "checking_source", None) or None,
+            )
+        except BaseException as exc:
+            if not self._retry_state and not request.reconcile_only:
+                exc.delegated_start_unrequested = True
+            raise
+        facts = run_delegated_review_session(prompt=prompt, root=root, custody_drive=drive, invocation=invocation)
         self._run_id = facts["run_id"]
         conformance = facts["conformance"]
         self._conformance_passed = conformance == "passed"
@@ -1371,16 +1410,13 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "effective": f"outputConformance={conformance or 'absent'}",
                 "reason": "schema_not_conformed_on_effective_route",
             })
-        effective_routes = facts.get("effective_route_ids") or []
         self._deltas.extend(session_identity_deltas(slot, facts))
         spend, estimated = facts["spend"], facts["spend_estimated"]
         self._session_usage = {
-            "provider": "claudexor",
-            "resolved_model": facts["model"],
-            "delegated_run_id": facts["run_id"],
-            "delegated_route": effective_routes[0] if len(effective_routes) == 1 else "",
-            "requested_route": facts["route_id"],
-            "observed_attempt": facts.get("observed_attempt") or {},
+            # provider, resolved model, run, requested/delegated route, final observed attempt,
+            # the ``claudexor`` receipt and the run summary's disclosed counters (#1578).
+            **(facts.get("usage") or session_usage_facts(facts["run_id"], requested_route=facts["route_id"],
+                                                         observed_attempt=facts.get("observed_attempt"))),
             **({"effort_resolution": facts["observed_attempt"]["effort_resolution"]}
                if isinstance((facts.get("observed_attempt") or {}).get("effort_resolution"), dict) else {}),
             "review_thread_id": str(facts.get("thread_id") or ""),
@@ -1388,16 +1424,18 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "review_thread_receipt": facts.get("thread_receipt") or {},
             "auth_route_receipt": facts.get("auth_route_receipt") or {},
             "profile_continuity_receipt": facts.get("profile_continuity_receipt") or {},
-            # APPLIED account/access (D29): what the engine's receipt disclosed,
-            # '' when telemetry predates it — shown as absent, never as the
-            # requested value dressed up as applied.
+            # APPLIED account/access (D29): what the engine's receipt disclosed, '' when
+            # telemetry predates it — absent, never the requested value dressed as applied.
             "applied_profile": facts.get("applied_profile", ""),
             "applied_access": facts.get("applied_access", ""),
-            # Whether the durable start row actually landed. `record_started`'s answer
-            # is already a fact the caller acts on; carrying it into the actor record
-            # too means a verdict delivered by a run with NO durable custody is legible
-            # afterwards instead of looking identical to a custodied one.
+            # The rights this seat asked for and what its private checking copy produced.
+            "requested_access": facts.get("requested_access", ""),
+            **({"checking_evidence": facts["checking_evidence"]} if facts.get("checking_evidence") else {}),
+            # Whether the durable start row landed: a verdict delivered by a run with NO
+            # durable custody stays legible instead of looking identical to a custodied one.
             "custody_durable": bool(facts.get("custody_durable")),
+            # A natural `succeeded` the slot-deadline read discovered, accepted (#1547).
+            "late_success_accepted": bool(facts.get("late_success_accepted")),
             "output_conformance": conformance,
             "settlement": facts["settlement"],
             # The ledger row is written by settle_run (record_subscription_session);
@@ -1498,9 +1536,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             from ouroboros import delegate_custody as custody
 
             custody.emit(self._custody_drive(), "review_slot_capability_delta", {
-                "run_id": self._run_id,
-                "surface": self.assignment.request.surface,
-                "slot_id": self.assignment.slot.slot_id,
+                "run_id": self._run_id, **review_event_identity(self.assignment.request),
+                "surface": self.assignment.request.surface, "slot_id": self.assignment.slot.slot_id,
                 "verdict_method": method,
                 "deltas": deltas,
             })

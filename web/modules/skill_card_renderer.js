@@ -1,4 +1,5 @@
 import {
+    boundedText,
     escapeHtmlAttr as escapeHtml,
     grantReady,
     isRateLimitError,
@@ -11,6 +12,7 @@ import {
 } from './utils.js';
 import { formatRelativeAge, installedTime, renderToneBadge } from './ui_helpers.js';
 import { hubListingRowFor, hubSubmissionFacts, hubSyncVerdict } from './hub_sync.js';
+import { hasSemanticVerdict, lifecycleMeta } from './review_presentation.js';
 
 function hasSkillUiTab(skill, live = {}) {
     return (live?.ui_tabs || []).some((tab) => (tab?.skill || tab?.skill_name || tab?.extension || '') === skill.name);
@@ -218,6 +220,35 @@ function reviewRunTitle(run) {
     return `Skill review round ${round} — snapshot ${snapshot} (attempt ${attempt})${revised}`;
 }
 
+/**
+ * A run's job lifecycle and its review verdict are separate recorded facts:
+ * the current job file keeps the lifecycle in `status` and the verdict in
+ * `review_status`; a history row keeps the lifecycle in `job_status` and the
+ * verdict — or the lifecycle word when no verdict arrived — in `status`. A
+ * failed, timed-out, cancelled or interrupted job is named beside the verdict
+ * with its recorded `terminal_reason`, so it never reads as an open `pending`;
+ * a successful job shows its verdict alone, as do legacy verdict-only rows.
+ */
+function reviewRunOutcome(run) {
+    const lifecycle = String(run.lifecycle_status || run.job_status || run.status || '');
+    const verdict = String(run.review_status || run.status || '');
+    const failure = lifecycleMeta(lifecycle);
+    if (!failure) return { label: verdict || lifecycle || 'unknown', reason: '' };
+    const reason = String(run.terminal_reason || '').trim();
+    return {
+        label: `${hasSemanticVerdict(verdict) ? verdict : 'review verdict unavailable'} · ${failure}`,
+        reason: reason.toLowerCase() === lifecycle.toLowerCase() ? '' : reason,
+    };
+}
+
+// Keep a long recorded reason readable by keyboard and touch as well as hover.
+function reviewReasonRow(reason) {
+    if (!reason) return '';
+    const shown = boundedText(reason, 400);
+    const complete = shown === reason ? '' : `<details class="skills-review-reason"><summary>Full reason</summary><div>${escapeHtml(reason)}</div></details>`;
+    return `<div class="skills-review-reason"${shown === reason ? '' : ` title="${escapeHtml(reason)}"`}>Reason: ${escapeHtml(shown)}</div>${complete}`;
+}
+
 function reviewHistory(skill) {
     const review = skill.skill_review && typeof skill.skill_review === 'object'
         ? skill.skill_review : {};
@@ -229,16 +260,16 @@ function reviewHistory(skill) {
         ? review.current : history[history.length - 1];
     if (!current) return '';
     const rows = history.map((run) => {
-        const status = run.review_status || run.status || run.job_status || 'unknown';
+        const outcome = reviewRunOutcome(run);
         const source = run.source ? ` · ${run.source}` : '';
-        return `<li>${escapeHtml(reviewRunTitle(run))} · ${escapeHtml(status)}${escapeHtml(source)}</li>`;
+        return `<li>${escapeHtml(reviewRunTitle(run))} · ${escapeHtml(outcome.label)}${escapeHtml(source)}${reviewReasonRow(outcome.reason)}</li>`;
     }).join('');
     const omitted = Number(review.history_omitted);
     const historyLabel = Number.isFinite(omitted) && omitted > 0
         ? `${history.length} of ${history.length + omitted}`
         : `${history.length}`;
-    const currentStatus = current.review_status || current.status || current.job_status || 'unknown';
-    return `<div class="skills-review-current"><strong>${escapeHtml(reviewRunTitle(current))}</strong> · ${escapeHtml(currentStatus)}</div>
+    const currentOutcome = reviewRunOutcome(current);
+    return `<div class="skills-review-current"><strong>${escapeHtml(reviewRunTitle(current))}</strong> · ${escapeHtml(currentOutcome.label)}</div>${reviewReasonRow(currentOutcome.reason)}
         ${rows ? `<details class="skills-review-history ui-rich-content"><summary class="muted">Skill Review history (${historyLabel})</summary><ol>${rows}</ol></details>` : ''}`;
 }
 
@@ -354,7 +385,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
             ${makeRunnable ? `<button type="button" role="menuitem" class="skills-menu-item skills-make-runnable" data-skill="${safeName}" data-skill-action="repair" title="Author a runnable script for this instruction skill via the repair agent">Make runnable</button>` : ''}
             ${!reviewInProgress && !(preflightFailed(skill) && repairReady(skill)) ? `<button type="button" role="menuitem" class="skills-menu-item skills-review" data-skill="${safeName}">${skill.review_status === 'pending' ? 'Review' : (skill.review_stale ? 'Re-review' : 'Review again')}</button>` : ''}
             ${!reviewInProgress && !repairInProgress && staleRepairOffer(skill) ? `<button type="button" role="menuitem" class="skills-menu-item skills-repair-stale" data-skill="${safeName}" data-skill-action="repair" title="Repair based on the last recorded preflight — the payload changed since that run, so Re-review would recheck it first">Repair and run</button>` : ''}
-            ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">⚠️ Skip review</button>` : ''}
+            ${ownerAttestable ? `<button type="button" role="menuitem" class="skills-menu-item skills-attest-review skills-attest-warn" data-skill="${safeName}" title="Skip the expensive LLM review for your own or verified official-hub skill. The deterministic safety preflight still runs, and this is logged for audit.">Skip review</button>` : ''}
             ${submit.visible ? `<button type="button" role="menuitem" class="skills-menu-item skills-submit-hub ${submit.disabled ? 'is-disabled' : ''}" data-skill="${safeName}" title="${escapeHtml(submit.reason)}" data-submit-disabled="${submit.disabled ? 'true' : 'false'}" data-submit-reason="${escapeHtml(submit.reason)}" data-submit-state="${escapeHtml(submit.state || '')}" data-publication-ready="${submit.publication_ready === true ? 'true' : 'false'}" aria-disabled="${submit.disabled ? 'true' : 'false'}">Publish to OuroborosHub</button>` : ''}
             ${market ? `<button type="button" role="menuitem" class="skills-menu-item skills-update" data-skill="${safeName}" data-source="${escapeHtml(source)}">Update</button><button type="button" role="menuitem" class="skills-menu-item skills-uninstall" data-skill="${safeName}" data-source="${escapeHtml(source)}">Uninstall</button>` : ''}
             ${localDelete ? `<button type="button" role="menuitem" class="skills-menu-item skills-delete-local" data-skill="${safeName}" data-payload-root="${escapeHtml(payloadRoot)}">Delete</button>` : ''}

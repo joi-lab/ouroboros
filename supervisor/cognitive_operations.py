@@ -1,4 +1,10 @@
-"""Typed active-operation facts shared by supervisor idle enforcement."""
+"""Typed active-operation facts shared by supervisor idle enforcement.
+
+In-flight LLM, review, VLM and tool work is leased as typed ``cognitive_operation``
+facts for the idle rail: a typed in-flight call is not idleness, while silent
+reasoning alone is not host progress. A lease is bounded by the task deadline and
+absolute ceiling; deadlines, budget, cancellation and ceilings never read it.
+"""
 
 from __future__ import annotations
 
@@ -93,17 +99,17 @@ def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
         requested_until = float(evt.get("lease_until") or 0.0)
     except (TypeError, ValueError):
         requested_until = 0.0
-    from ouroboros.config import OPERATION_WINDOW_FALLBACK_SEC, get_task_abs_ceiling_sec
+    from ouroboros.config import OPERATION_WINDOW_FALLBACK_SEC, resolve_task_execution_timeout_sec
     from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import execution_elapsed_seconds
 
-    started_at = float(meta.get("started_at") or now)
-    ceiling = get_task_abs_ceiling_sec()
-    # A finite task lifetime bounds the lease from task start; without one the operation's
-    # own finite window bounds it from this start fact, so a lost terminal never spares the
-    # idle rail forever.
-    hard_until = (started_at + float(ceiling) if ceiling is not None
-                  else now + float(OPERATION_WINDOW_FALLBACK_SEC))
     task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
+    ceiling = resolve_task_execution_timeout_sec(task)
+    # A finite execution bound ends the lease where the task's remaining execution ends
+    # (the timeout rail's own clock); without one the operation's own finite window bounds
+    # it from now, so a lost terminal never spares the idle rail forever.
+    hard_until = (now + max(0.0, float(ceiling) - execution_elapsed_seconds(meta, now)) if ceiling is not None
+                  else now + float(OPERATION_WINDOW_FALLBACK_SEC))
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     deadline = parse_deadline_ts(task.get("deadline_at") or metadata.get("deadline_at"))
     if deadline is not None:
@@ -136,9 +142,9 @@ def _handle_review_late_result(evt: Dict[str, Any], ctx: Any) -> None:
     except Exception:
         log.debug("late review result persistence failed", exc_info=True)
     try:
-        from ouroboros.tools.plan_review_collect import attach_late_plan_event
+        from ouroboros.tools.plan_ask import attach_late_reply
 
-        attach_late_plan_event(ctx.DRIVE_ROOT, payload)
+        attach_late_reply(ctx.DRIVE_ROOT, payload)
     except Exception:
         log.warning("historical plan review remains unresolved", exc_info=True)
     try:

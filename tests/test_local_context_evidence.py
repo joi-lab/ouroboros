@@ -27,7 +27,7 @@ def main_plan(manager, monkeypatch, tmp_path):
 
     monkeypatch.setattr(config, "runtime_settings", lambda: {"OUROBOROS_MODEL_CONTEXT_WINDOWS": {}})
     monkeypatch.setenv("OUROBOROS_MODEL_CONTEXT_WINDOWS", "{}")
-    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: [])
+    monkeypatch.setattr(context_fit, "reference_doc_sections", lambda *a, **k: ([], ""))
 
     def build(mode="max", text="source", *, use_local=True, resolver=None):
         core = context_fit.ContextCore(

@@ -10,10 +10,12 @@ from ouroboros.subagents import (
 from ouroboros.tools.delegate import _start_request
 
 
-def _request(version: str, *, acting: bool) -> dict:
-    shape = delegated_run_shape(acting)
+def _request(version: str, *, acting: bool, access: str = "workspace_write") -> dict:
+    shape = delegated_run_shape(acting, access)
     stable_root = "/tmp/stable-project"
-    snapshot_root = "/tmp/private-execution-snapshot" if acting else stable_root
+    # Every live shape (#1609: an acting run or an evidence-only investigation) executes
+    # in a private copy; only an explicitly read-only run reads the stable root itself.
+    snapshot_root = "/tmp/private-execution-snapshot" if shape.isolation == "live" else stable_root
     gateway = SimpleNamespace(engine_version=version)
     execution_root = delegated_execution_workspace_root(gateway, shape, snapshot_root)
     scope_root = stable_root if execution_root else snapshot_root
@@ -40,8 +42,24 @@ def test_new_schema_receives_the_private_snapshot_as_execution_workspace():
 
 
 def test_readonly_shape_never_sends_a_live_execution_workspace():
+    # #1609: technical access alone decides the shape, so "read-only" is the explicit
+    # readonly access, whatever the run's write authority.
+    for acting in (False, True):
+        request = _request("99.0.0", acting=acting, access="readonly")
+        assert request["mode"] == "ask" and "execution" not in request
+
+
+def test_an_investigation_receives_its_private_copy_as_execution_workspace():
+    # #1609: a non-acting run that captured writable access is an evidence-only
+    # investigation; it rides the same live wire contract as an acting run.
     request = _request("99.0.0", acting=False)
-    assert request["mode"] == "ask" and "execution" not in request
+    assert request["mode"] == "agent" and request["access"] == "workspace_write"
+    assert request["scope"]["root"] == "/tmp/stable-project"
+    assert request["execution"] == {
+        "isolation": "live",
+        "delegated": True,
+        "workspaceRoot": "/tmp/private-execution-snapshot",
+    }
 
 
 def test_retry_binding_keeps_snapshot_as_host_execution_root(tmp_path, monkeypatch):

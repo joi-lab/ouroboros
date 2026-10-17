@@ -144,67 +144,6 @@ def test_cancel_running_subagent_leaves_its_drive_to_the_off_loop_settlement(tmp
     assert kept.is_dir() and report["skipped"] == [{"task_id": "young2", "reason": "younger_than_retention"}]
 
 
-# ───────────────────────── #9: orphan worker reaping ────────────────────────
-
-def test_reap_orphaned_workers(tmp_path, monkeypatch):
-    import ouroboros.platform_layer as pl
-    from ouroboros.utils import atomic_write_json
-    from supervisor import workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path, raising=False)
-    workers.WORKERS.clear()
-    (tmp_path / "logs").mkdir(parents=True, exist_ok=True)
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-    atomic_write_json(
-        workers._worker_pids_path(),
-        {"server_pid": 999999, "workers": [{"pid": 111}, {"pid": 222}, {"pid": 333}]},
-    )
-
-    # 111 = alive + ours (own session leader) → must be killed
-    # 222 = dead (empty cmdline) → skipped
-    # 333 = alive but unrelated process (pid reused) → skipped
-    cmds = {111: "python -B -c multiprocessing.spawn", 222: "", 333: "/usr/bin/SomethingElse"}
-    monkeypatch.setattr(pl, "process_command", lambda pid: cmds.get(int(pid), ""))
-    monkeypatch.setattr(pl, "process_group_id", lambda pid: int(pid))  # session leader
-    killed_groups, killed_trees = [], []
-    monkeypatch.setattr(pl, "kill_process_group_id", lambda pgid: killed_groups.append(int(pgid)))
-    # The shared tree owner is the platform boundary. Mock it on every OS so
-    # this unit never executes taskkill against a synthetic PID on Windows;
-    # native leaf mechanics have their own real-process tests.
-    monkeypatch.setattr(
-        pl,
-        "kill_pid_tree",
-        lambda pid, **kwargs: killed_trees.append((int(pid), kwargs)),
-    )
-
-    n = workers.reap_orphaned_workers()
-
-    assert n == 1
-    assert killed_trees == [(111, {"exclude_pids": set()})]
-    assert killed_groups == [111]
-
-
-def test_record_worker_pids_roundtrip(tmp_path, monkeypatch):
-    from ouroboros.utils import read_json_dict
-    from supervisor import workers
-
-    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path, raising=False)
-    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
-
-    class _FakeProc:
-        def __init__(self, pid):
-            self.pid = pid
-
-    monkeypatch.setattr(
-        workers, "WORKERS",
-        {0: workers.Worker(wid=0, proc=_FakeProc(4242), in_q=None)},
-        raising=False,
-    )
-    workers._record_worker_pids()
-    data = read_json_dict(workers._worker_pids_path()) or {}
-    assert {"pid": 4242} in (data.get("workers") or [])
-
-
 # ───────────────────── #4/#6 + #7: source contracts ─────────────────────────
 
 def test_respawn_closes_old_queue_under_lock():
@@ -213,14 +152,6 @@ def test_respawn_closes_old_queue_under_lock():
     assert "with _queue_lock:" in src
     assert "old.in_q.close()" in src
     assert "old.in_q.cancel_join_thread()" in src
-
-
-def test_spawn_reaps_orphans_and_records_pids():
-    src = _read("supervisor/workers.py")
-    assert "reap_orphaned_workers()" in src
-    assert "_record_worker_pids()" in src
-    # reap guards against PID reuse and only group-kills its own setsid session
-    assert "if pgid and pgid == pid and not shares_retained_group:" in _read("supervisor/worker_pool_lifecycle.py")
 
 
 def test_emergency_cleanup_joins_children():

@@ -6,7 +6,7 @@ core membership, registry and schema visibility, the required-capability
 fail-fast, the top-level control surface under workspace focus, executor-ref
 inheritance, and the capability omission manifest.
 """
-import json
+from tests._store_shared import read_result
 
 
 # ---------------------------------------------------------------------------
@@ -296,7 +296,7 @@ def test_schedule_subagent_inherits_workspace_executor_ref(tmp_path, monkeypatch
     assert event["executor_ref"] == executor_ref
     assert event["metadata"]["executor_ref"] == executor_ref
     child_id = event["task_id"]
-    persisted = json.loads((data / "task_results" / f"{child_id}.json").read_text(encoding="utf-8"))
+    persisted = read_result(data, child_id)
     assert persisted["executor_ref"] == executor_ref
     assert persisted["task_contract"]["resource_policy"]["protected_artifacts"][0]["paths"] == ["/workspace/executable"]
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.task_carrier import inline_execution
+
 from ouroboros.config import runtime_setting
 
 import logging
@@ -21,6 +23,7 @@ _PROGRESS_ID_UNSET = object()
 
 from ouroboros.utils import (
     append_jsonl,
+    atomic_write_json,
     emit_log_event,
     get_git_info,
     read_json_dict,
@@ -37,6 +40,8 @@ from ouroboros.tools.registry import ToolContext
 from ouroboros.memory import Memory
 from ouroboros.context import build_llm_messages
 from ouroboros.loop import run_llm_loop
+from ouroboros.observability import task_timing_scope
+from ouroboros.process_custody import current_custody_session_id
 from ouroboros.config import EFFORT_SCALE, resolve_effort  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
 from ouroboros.agent_startup_checks import (
     persist_early_origin_stub as _persist_early_origin_stub_impl,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
@@ -47,18 +52,19 @@ from ouroboros.agent_startup_checks import (
 from ouroboros.agent_task_pipeline import (
     emit_task_results, build_review_context,
 )
-from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
+from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, terminal_result_fields
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.outcomes import infra_failed_axes
-from ouroboros import subagent_bootstrap, subagent_runtime
+from ouroboros import body_candidate, subagent_bootstrap, subagent_runtime
 from ouroboros.subagents import (
     CapabilityDelta,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     SubagentExecutorResolution,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     SUBAGENT_RESOLUTION_FIELDS,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     SubagentDispatch,
+    effort_result_fields,
     capability_delta_disclosures,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     envelope_from_task,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
     resolve_subagent_dispatch,  # noqa: F401 -- the agent module keeps its historical import surface for the dispatch leaf
@@ -93,12 +99,15 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
 
 
-def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, drive_logs: pathlib.Path):
+def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, drive_logs: pathlib.Path,
+                             *, keep_terminal: bool = False):
     """Project captured loop evidence, or its explicit absence, without recovery.
 
     A failed cold-source read is never permission to read unverified checkpoint
     bytes as usage. The loop tally stays in loop_outcome; top-level money and
-    counters remain the existing ledger reconstruction's answer.
+    counters remain the existing ledger reconstruction's answer. ``keep_terminal``
+    (the worker's ``handle_task`` boundary) never replaces a row that is already
+    truly terminal: a late exception does not rewrite an earlier outcome.
     """
     captured_usage = getattr(exc, "_ouroboros_loop_usage", None)
     captured_trace = getattr(exc, "_ouroboros_loop_trace", None)
@@ -117,20 +126,113 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
     try:
         from ouroboros.outcomes import collect_trace_refs, derive_loop_outcome
         from ouroboros.agent_task_pipeline import build_trace_summary
-        from ouroboros.task_results import STATUS_FAILED, write_task_result
+        from ouroboros.task_results import STATUS_FAILED, _TRULY_TERMINAL_STATUSES, write_task_result
 
         loop_outcome = derive_loop_outcome(text, usage, llm_trace)
         write_task_result(
             env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
+            _field_projector=(lambda current, incoming: None if current.get("status") in _TRULY_TERMINAL_STATUSES
+                              else incoming) if keep_terminal else None,
             _terminal_observed=True, result=text, reason_code="task_exception", loop_outcome=loop_outcome,
             outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
                 "task_exception", review_trigger="agent_exception"),
             trace_summary=build_trace_summary(llm_trace),
             trace_refs=loop_outcome.get("trace_refs") or collect_trace_refs(usage, llm_trace),
+            **effort_result_fields(task), **terminal_result_fields(usage),
         )
     except Exception:
         log.debug("Failed to persist task exception projection", exc_info=True)
     return text, usage, llm_trace
+
+
+def _settle_start_origin(task: Dict[str, Any]) -> float:
+    """This start's clock origin: a continuation's preserved original start, else now; the
+    carried pre-origin offset follows the same decision assignment made (#939)."""
+    from ouroboros.model_wait import settle_execution_carry
+
+    continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or task.get("_working_recovery") or {}
+    settle_execution_carry(task, origin_preserved=bool(continuation.get("started_at")))
+    return float(continuation.get("started_at") or time.time())
+
+
+def _load_start_continuation(ctx: Any, task: Dict[str, Any]) -> dict:
+    """Read the existing validated continuation before dispatch or context assembly."""
+    ctx.owner_wait_resume = task.get("_owner_wait_resume")
+    ctx.budget_pause_resume = task.get("_budget_pause_resume")
+    ctx.working_recovery = task.get("_working_recovery")
+    from ouroboros.owner_wait import load_owner_wait
+    saved_wait = load_owner_wait(ctx)
+    if not saved_wait and ctx.budget_pause_resume:
+        from ouroboros.budget_pause import load_budget_pause
+        saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
+    if not saved_wait and isinstance(ctx.working_recovery, dict):
+        from ouroboros.working_checkpoint import load_recovery
+        try:
+            saved_wait = load_recovery(ctx)  # same/new-ID recovery continues its clocks
+        except Exception:
+            saved_wait = {}  # the loop discloses the unreadable source itself
+    return saved_wait
+
+
+def _restore_saved_clocks(ctx: Any, task: Dict[str, Any], saved_wait: Optional[dict] = None) -> None:
+    """Restore clocks from the same start capture; the loop later revalidates its grant."""
+    if saved_wait is None:
+        saved_wait = _load_start_continuation(ctx, task)
+    else:
+        ctx.owner_wait_resume = task.get("_owner_wait_resume")
+        ctx.budget_pause_resume = task.get("_budget_pause_resume")
+        ctx.working_recovery = task.get("_working_recovery")
+    if saved_wait:
+        from ouroboros.settings_integrity import restore_cognition
+        from ouroboros.task_pacing import restore_cost_ceiling
+
+        restore_cognition(saved_wait.get("cognition"))
+        ctx._cost_ceiling = restore_cost_ceiling(ctx, saved_wait.get("cost_ceiling"))
+    if saved_wait and ctx.model_wait_context is not None:
+        from ouroboros.model_wait import adopt_handoff_clock, native_sleep_started_at
+
+        model_state = saved_wait.get("model_wait") or {}
+        # Both native waits and working recovery carry confirmed post-checkpoint clocks.
+        model_state = adopt_handoff_clock(model_state, ctx.working_recovery if saved_wait.get("_working_handoff") else ctx.owner_wait_resume)
+        if (saved_wait.get("_working_handoff") or {}).get("source_task_id", ctx.task_id) != ctx.task_id:
+            # A new execution keeps the cumulative clock, without importing
+            # the old task owner's model-choice/control overrides.
+            model_state = {key: model_state[key] for key in ("quota_clock", "budget_paused_sec")
+                           if key in model_state}
+        # Preserve the original origin; budget grants supply their own current total.
+        ctx.model_wait_context.restore_continuation(
+            model_state, started_at=ctx.task_started_at,
+            budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
+        if (sleep_started := native_sleep_started_at(ctx.owner_wait_resume)) is not None:
+            from ouroboros.model_sleep import begin
+            begin(ctx, started_at=sleep_started)  # controls see the open sleep before the loop rejoins it
+
+
+def _retire_working_checkpoint(ctx: Any, task: Dict[str, Any]) -> None:
+    """This attempt's working checkpoint after its result/pause became durable (#1563)."""
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    from ouroboros.working_checkpoint import discard, live_park
+    from supervisor.terminal_delivery import terminal_answer_receipts
+
+    root = getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None)
+    task_id = str(task.get("id") or "")
+    if not task_id or not root:
+        return
+    # Result and outbox writers have fail-soft paths: their return is not proof
+    # of persistence. Keep the only saved cognition until a durable owner holds it.
+    try:
+        attempt = int(getattr(ctx, "task_attempt", None) or task.get("_attempt") or 1)
+        for source_root in {pathlib.Path(root), pathlib.Path(getattr(ctx, "drive_root", None) or root)}:
+            row = load_task_result(source_root, task_id, strict=True) or {}
+            if (row.get("status") in _TRULY_TERMINAL_STATUSES
+                    and int(row.get("task_attempt") or 0) == attempt) or live_park(
+                        source_root, task_id, attempt, verify_source=True):
+                discard(root, task_id)
+                return
+        if terminal_answer_receipts(root, task_id).get("state") in {"owed", "delivered"}:
+            discard(root, task_id)
+    except Exception:
+        log.warning("Working checkpoint retained for %s: terminal persistence unconfirmed", task_id, exc_info=True)
 
 
 def _sync_task_project_scope(task: Dict[str, Any], ctx: Any) -> None:
@@ -168,26 +270,20 @@ def _emit_budget_pause_checkpoint(
 ) -> None:
     """Publish the owner-visible budget-pause checkpoint on the registered path.
 
-    The enveloped log_event route is the ONE registered checkpoint channel
-    (_handle_log_event persists task_checkpoint rows and pushes them live);
-    a bare task_checkpoint on _pending_events has no handler and died as
-    unknown_worker_event, silently losing the owner-visible toast.
+    The enveloped log_event route is the ONE registered checkpoint channel: the
+    producer appends the durable events.jsonl row itself and then emits the one
+    live frame (``loop_messages._emit_checkpoint_event``); a bare task_checkpoint
+    on _pending_events has no handler and died as unknown_worker_event, silently
+    losing the owner-visible toast.
     """
-    checkpoint = {
-        "type": "task_checkpoint",
-        "task_id": task_id,
+    from ouroboros.loop_messages import _emit_checkpoint_event
+
+    _emit_checkpoint_event(event_queue, task_id, drive_logs, {
         "checkpoint_kind": "budget_scope_paused",
         "owner_visible": True,
         "toast_once": f"{task_id}:budget-paused:{resource_limit['scope']}",
         **resource_limit,
-    }
-    if event_queue is not None:
-        emit_log_event(event_queue, checkpoint)
-    elif drive_logs:
-        try:
-            append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **checkpoint})
-        except Exception:
-            log.debug("budget-pause checkpoint append failed", exc_info=True)
+    })
 
 
 class OuroborosAgent:
@@ -256,6 +352,8 @@ class OuroborosAgent:
         threads. A missing/None chat_id stays main-routed downstream.
         """
         payload: Dict[str, Any] = {"type": event_type, "ts": utc_now_iso(), **fields}
+        if event_type == "task_started":
+            self._activity_emitted_at = payload["activity_emitted_at"] = payload["ts"]
         if self._current_chat_id is not None and "chat_id" not in payload:
             payload["chat_id"] = self._current_chat_id
         emit_log_event(
@@ -283,9 +381,21 @@ class OuroborosAgent:
         elif self._event_queue is None:
             raise RuntimeError("acceptance fence requires a supervisor event queue")
         else:
+            if request["action"] == "begin":  # #1183: only the current RUNNING attempt may open a fence
+                ctx = getattr(getattr(self, "tools", None), "_ctx", None)
+                request["pooled_owner"] = {"task_attempt": int(getattr(ctx, "task_attempt", None) or 1),
+                                           "pid": os.getpid()}
             event = {"type": "acceptance_fence", "req": uuid.uuid4().hex, **request}
             ack = self._send_fence_event(event) or (request["action"] != "inspect" and self._send_fence_event(event)) or {}
             if not ack:
+                if request["action"] == "begin":
+                    # An unanswered begin may still apply late. FIFO puts this release of its
+                    # own token after both sends; it never seals, and no review was admitted on it.
+                    try:
+                        self._event_queue.put({**event, "action": "end", "outcome": "revision",
+                                               "req": uuid.uuid4().hex, "ts": utc_now_iso()})
+                    except Exception:
+                        log.warning("Could not release an unconfirmed acceptance fence", exc_info=True)
                 raise TimeoutError(f"supervisor did not acknowledge acceptance fence {request['action']}")
         status = str(ack.get("status") or "")
         if not ack.get("ok", True) or status not in accept:  # the row's typed state is the reason; only a malformed request keeps its error text
@@ -329,6 +439,13 @@ class OuroborosAgent:
             ("released", "sealed"), action="end", token=str(token), outcome=str(outcome), **generation)
 
     def _log_worker_boot_once(self) -> None:
+        """A ``worker_boot`` row per process; the startup verification once per server generation (P1).
+
+        Workers inherit the server's custody session id: the first process of a generation (and of
+        each checked-out code version) runs ``verify_restart`` and ``verify_system_state`` and stamps
+        ``state/startup_verification.json``; later ones, a pool re-grow, honour that stamp. A missing,
+        unreadable or different stamp runs both again; a failed run stamps nothing.
+        """
         global _worker_boot_logged
         try:
             with _worker_boot_lock:
@@ -340,8 +457,14 @@ class OuroborosAgent:
                 'ts': utc_now_iso(), 'type': 'worker_boot',
                 'pid': os.getpid(), 'git_branch': git_branch, 'git_sha': git_sha,
             })
-            verify_restart(self.env, git_sha)
-            verify_system_state(self.env, git_sha)
+            env, stamp = self.env, {'generation': current_custody_session_id(), 'git_sha': git_sha}
+            receipt = pathlib.Path(env.drive_root) / "state" / "startup_verification.json"
+            seen = read_json_dict(receipt) or {}
+            if stamp['generation'] and all(seen.get(key) == value for key, value in stamp.items()):
+                return
+            verify_restart(env, git_sha)
+            verify_system_state(env, git_sha)
+            atomic_write_json(receipt, {**stamp, 'pid': os.getpid(), 'verified_at': utc_now_iso()})
         except Exception:
             log.warning("Worker boot logging failed", exc_info=True)
             return
@@ -363,6 +486,7 @@ class OuroborosAgent:
             execution_kind = assigned_owner.get("kind") or (
                 "presence" if task.get("_presence_turn") else "direct" if task.get("_is_direct_chat") else "pooled")
             execution_owner = execution_owner_record(canonical, task, execution_kind)
+            task["_execution_owner"] = execution_owner
             started = getattr(self, "_task_started_ts", None)
             # A queue row's focus is a REPLAY (retry clone, owner-wait restart
             # handoff): it may be older than the focus the same task id already
@@ -425,6 +549,7 @@ class OuroborosAgent:
                 tool_profile=task.get("tool_profile"),
                 capability_delta=task.get("capability_delta"),
                 reasoning_effort=task.get("reasoning_effort"),
+                **effort_result_fields(task),
                 task_group_id=task.get("task_group_id"),
                 task_group=task.get("task_group"),
                 subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
@@ -482,7 +607,7 @@ class OuroborosAgent:
         attributed candidate set to consume."""
         if (
             str(task.get("id") or "").strip()
-            and not bool(task.get("_is_direct_chat"))
+            and not inline_execution(task)
             and str(task_metadata.get("delegation_role") or "").lower() != "subagent"
         ):
             try:
@@ -516,17 +641,27 @@ class OuroborosAgent:
             return None, [], {"authority_source_unavailable": authority_refusal}
         drive_logs = self.env.drive_path("logs")
         task = attach_task_contract(apply_consciousness_authority(task))
-        # THE resolution, before anything durable is written about this run: the
-        # RUNNING record below is the single atomic write that states model, effort,
-        # route, profile, effective executor and the one `capability_delta` together.
+        from types import SimpleNamespace
+        from ouroboros.settings_integrity import restore_cognition
+        saved_start = _load_start_continuation(SimpleNamespace(
+            task_id=str(task.get("id") or ""), task_attempt=task.get("_attempt"),
+            drive_root=self.env.drive_root, budget_drive_root=task.get("budget_drive_root"),
+            task_metadata=task.get("metadata") or {}, task_contract=task.get("task_contract") or {},
+        ), task)
+        restore_cognition(saved_start.get("cognition"))
+        # Resolve once, before the atomic RUNNING record stores all axes and capability_delta.
         dispatch = resolve_dispatch_axes(task)
+        from ouroboros.tool_access_roots import freeze_tool_profile
+        freeze_tool_profile(task)
         _record_executor_resolution(drive_logs, task, dispatch)
         sanitized_task = sanitize_task_for_event(task, drive_logs)
-        append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "task_received", "task": sanitized_task})
+        append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), "type": "task_received", "task": sanitized_task,
+                     # #1578: the task's own ids at top level beside its (content) task body.
+                     "task_id": str(task.get("id") or ""),
+                     **{key: str(task[key]) for key in ("root_task_id", "parent_task_id") if task.get(key)},
+                     "activity_emitted_at": getattr(self, "_activity_emitted_at", None)})
         self._persist_running_record(task)
-        # Durable record first, live mirror second: the supervisor's RUNNING copy
-        # (and therefore the queue snapshot) learns the same resolution the record
-        # just persisted, across the process boundary.
+        # After persistence, mirror the same resolution to the supervisor/queue.
         emit_dispatch_resolution(self._event_queue, task, dispatch)
         self._emit_live_log(
             "context_building_started",
@@ -535,11 +670,11 @@ class OuroborosAgent:
         )
         if str(task.get("delegation_role") or "") == "subagent" and self._event_queue is not None and self._current_chat_id is not None:
             try:
+                role = str(task.get("role") or "").strip()
                 self._event_queue.put({
-                    "type": "send_message",
-                    "chat_id": self._current_chat_id,
+                    "type": "send_message", "chat_id": self._current_chat_id,
                     "role": "system", "system_type": "subagent_started",
-                    "text": f"▶️ Subagent {task.get('id')} running ({task.get('role') or 'researcher'}).",
+                    "text": f"▶️ Subagent {task.get('id')} running{' (' + role + ')' if role else ''}.",
                     "format": "markdown",
                     "is_progress": True,
                     "task_id": str(task.get("id") or ""),
@@ -550,7 +685,6 @@ class OuroborosAgent:
                 })
             except Exception:
                 log.debug("Failed to emit subagent running progress", exc_info=True)
-
         task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
         for key in (
             "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role", "role",
@@ -569,7 +703,7 @@ class OuroborosAgent:
             "executor_ref",
             "original_task_id",
             "timeout_retry_from",
-            "timeout_retry_at",
+            "timeout_retry_at", "execution_timeout_sec", "_execution_consumed_sec",
             # v6.73.0: the ingress-captured origin rides BY VALUE into the tool
             # context, so a pooled promoted task that itself promotes/routes still
             # passes the start-message identity to the next binding.
@@ -579,7 +713,7 @@ class OuroborosAgent:
             # The complete work-order source reader needs the original typed
             # constraint mapping, not the normalized dataclass repr, to rebuild
             # the exact canonical serializer bytes during a source-range answer.
-            "task_constraint",
+            "task_constraint", "tool_profile", "_execution_owner", "detached_at", "detached_by",
         ):
             if task.get(key) not in (None, ""):
                 task_metadata[key] = task.get(key)
@@ -594,12 +728,10 @@ class OuroborosAgent:
             if _inherited_deadline:
                 task_metadata["deadline_at"] = _inherited_deadline
         _tc_meta = task.get("task_constraint")
-        _surface_meta = str((_tc_meta.get("surface") if isinstance(_tc_meta, dict) else "") or "")
-        if _surface_meta:
-            task_metadata["write_surface"] = _surface_meta
+        if isinstance(_tc_meta, dict) and _tc_meta.get("surface"):
+            task_metadata["write_surface"] = str(_tc_meta["surface"])
         with self._owner_message_admission_lock:
             self._current_task_metadata = dict(task_metadata)
-
         from ouroboros.project_facts import resolve_project_id
 
         # Project scope flows to tools via ctx.project_id and to context build via
@@ -650,6 +782,7 @@ class OuroborosAgent:
             task_constraint=normalize_task_constraint(task.get("task_constraint")),
             task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
         )
+        body_candidate.restore(ctx)  # a retry, Resume or new worker authors the candidate this lineage owns
         # Existing ToolContext stays the loop's carrier; these process-local
         # references are not serialized state or a new routing authority.
         ctx.owner_message_admission_lock = self._owner_message_admission_lock
@@ -664,22 +797,8 @@ class OuroborosAgent:
             ctx.model_wait_context.tool_context = ctx
         ctx.task_started_at = self._task_started_ts
         ctx.owner_wait_callback = getattr(self, "owner_wait_callback", None)
-        ctx.owner_wait_resume = task.get("_owner_wait_resume")
-        ctx.budget_pause_resume = task.get("_budget_pause_resume")
-        from ouroboros.owner_wait import load_owner_wait
-        saved_wait = load_owner_wait(ctx)  # Runtime/ContextFit must disclose the original ceiling.
-        if not saved_wait and ctx.budget_pause_resume:
-            from ouroboros.budget_pause import load_budget_pause
-            saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
-        if saved_wait and ctx.model_wait_context is not None:
-            # started_at stays the ORIGINAL start; the granted paused interval is
-            # the separate carrier the finite lifetime subtracts (#1196). A budget
-            # grant supplies the CURRENT cumulative value; an owner-wait restart
-            # of a previously paused task has none to supply, and the serializer's
-            # own saved carrier is used instead (``restore_continuation``, F5).
-            ctx.model_wait_context.restore_continuation(
-                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at,
-                budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
+        ctx.review_wait_callback = getattr(self, "review_wait_callback", None)  # Presence review park (#1536)
+        _restore_saved_clocks(ctx, task, saved_start)
 
         if self._event_queue is not None:
             # Optional runtime seam consumed by loop.py.  Unit/direct contexts
@@ -778,8 +897,8 @@ class OuroborosAgent:
             budget_root = pathlib.Path(budget_root_text) if budget_root_text else self.env.drive_root
             total_budget = resolve_total_budget_usd()
             projection = usage_projection(budget_root, global_limit_usd=total_budget)
-            if total_budget is not None:
-                budget_remaining = max(0.0, total_budget - float(projection.get("accounted_usd") or 0.0))
+            if total_budget is not None:  # room above KNOWN spend, the admission rule's own number (#1487)
+                budget_remaining = max(0.0, total_budget - float(projection.get("settled_usd") or 0.0))
         except Exception:
             budget_accounting_status = "unavailable"
             log.error("Budget authority unavailable while building task context", exc_info=True)
@@ -830,6 +949,7 @@ class OuroborosAgent:
 
         return emit_task_progress
 
+    @task_timing_scope()
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Run one task under the root/subtree monetary attribution scope."""
         # A reused worker agent still carries the PREVIOUS task's chat binding;
@@ -841,6 +961,10 @@ class OuroborosAgent:
         # restart; a failed reload is disclosed loudly, not swallowed (#285).
         settings_snapshot = subagent_runtime.apply_task_start_settings_or_disclose(
             str(task.get("id") or ""), self._emit_live_log)
+        from ouroboros.settings_integrity import actor_settings_snapshot
+
+        settings_snapshot = actor_settings_snapshot(
+            settings_snapshot, task, getattr(self.env, "budget_drive_root", None) or self.env.drive_root)
 
         from ouroboros.usage_accounting import UsageScope, usage_scope
         from ouroboros.model_wait import task_model_wait_scope
@@ -870,6 +994,16 @@ class OuroborosAgent:
                     if root_limit_known and math.isfinite(root_limit) else
                     {"state": "unknown", "source": "invalid_admission_setting"})
             from ouroboros.usage_admission import task_billing_fields
+            from ouroboros.usage_ledger import BillingAuthorityUnavailable
+            try:
+                # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
+                billing = task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None,
+                                              budget_root, pin_initial=True)
+            except BillingAuthorityUnavailable as exc:
+                # Never bound as a stand-in: the group stays unbound, each send rereads it, and a
+                # failure that persists meets the loop's own technical rail before any paid call.
+                log.warning("Billing authority unavailable at start of %s: %s", task_id, exc)
+                billing = {"root_limit_usd": root_limit if root_limit > 0 else None}
             scope = UsageScope(
                 drive_root=budget_root,
                 task_id=task_id,
@@ -878,8 +1012,7 @@ class OuroborosAgent:
                 category=str(metadata.get("usage_category") or task.get("type") or "task"),
                 source="agent.task",
                 root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
-                # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
-                **task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None, budget_root, pin_initial=True),
+                **billing,
             )
             with usage_scope(scope), task_model_wait_scope(
                 task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,
@@ -889,10 +1022,8 @@ class OuroborosAgent:
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True
-        _continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
-        start_time = float(_continuation.get("started_at") or time.time())
-        self._task_started_ts = start_time
-        self._last_progress_ts = start_time
+        start_time = self._task_started_ts = _settle_start_origin(task)
+        self._last_progress_ts = time.time()  # this worker is newly active; lifetime keeps its original start
         self._pending_events = []
         # Preserve chat_id=0; it is a real session, not missing.
         _raw_chat = task.get("chat_id")
@@ -909,7 +1040,7 @@ class OuroborosAgent:
                 if isinstance(task.get("metadata"), dict)
                 else {}
             )
-            self._accepting_owner_messages = bool(task.get("_is_direct_chat"))
+            self._accepting_owner_messages = inline_execution(task)
         authority_refusal = validate_task_authority_sources(self.env, task)
         if not authority_refusal:
             _persist_early_origin_stub(self.env.drive_root, task)
@@ -948,19 +1079,25 @@ class OuroborosAgent:
             elif str(cap_info.get("executor_blocked_reason") or ""):
                 text, usage, llm_trace = _blocked_executor_terminal(cap_info, task)
             elif task_type_str == "deep_self_review":
-                # Deep self-review bypasses the tool loop: it runs on the
-                # configured deep-review ROW (the row decides the delivery).
+                # Deep self-review bypasses the tool loop: review_change(subject=system,
+                # surface=system) on the row the request named, else Main (decision 3A).
+                # It writes memory/deep_review.md itself and keeps the last report on failure.
                 try:
-                    from ouroboros.deep_self_review import run_deep_self_review
+                    from ouroboros.deep_self_review import deep_review_unavailable_text
+                    from ouroboros.tools.review_change import ReviewChangeArgumentError, run_system_review
                     self._emit_progress("Starting deep self-review... This may take several minutes.")
-                    text, usage = run_deep_self_review(
-                        repo_dir=self.env.repo_dir,
-                        drive_root=self.env.drive_root,
-                        llm=self.llm,
-                        emit_progress=self._emit_progress,
-                        task_id=str(task.get("id") or ""),
-                        deadline_at=str((self._current_task_metadata or {}).get("deadline_at") or ""),
-                    )
+                    try:
+                        outcome = run_system_review(
+                            ctx, reviewer=str(task.get("reviewer") or ""), llm=self.llm,
+                            emit_progress=self._emit_progress,
+                            deadline_at=str((self._current_task_metadata or {}).get("deadline_at") or ""),
+                        )
+                        text, usage = str(outcome.get("report") or ""), dict(outcome.get("usage") or {})
+                        if outcome.get("record_id"):
+                            text += f"\n\nReview record: {outcome['record_id']} (surface=system)"
+                    except ReviewChangeArgumentError as exc:
+                        text = deep_review_unavailable_text(str(exc))
+                        usage = {"execution_status": "infra_failed", "reason_code": "deep_self_review_unavailable"}
                     if usage:
                         self._pending_events.append({
                             "type": "llm_usage",
@@ -978,12 +1115,6 @@ class OuroborosAgent:
                             "task_id": task.get("id"), "error": text,
                             "reason_code": str(usage.get("reason_code") or ""),
                         })
-                    else:
-                        try:
-                            review_path = pathlib.Path(self.env.drive_root) / "memory" / "deep_review.md"
-                            review_path.write_text(text, encoding="utf-8")
-                        except Exception as save_err:
-                            log.warning("Failed to save deep review to memory: %s", save_err)
                     llm_trace = {"reasoning_notes": ["deep_self_review"], "tool_calls": []}
                 except BudgetExceeded:
                     raise
@@ -1003,7 +1134,7 @@ class OuroborosAgent:
                     llm_trace = {"reasoning_notes": ["deep_self_review_error"], "tool_calls": []}
             else:
                 with self._owner_message_admission_lock:
-                    if task.get("_is_direct_chat"):
+                    if inline_execution(task):
                         self._accepting_owner_messages = True
                 try:
                     text, usage, llm_trace = run_llm_loop(
@@ -1047,21 +1178,14 @@ class OuroborosAgent:
                     except Exception:
                         log.debug("Failed to persist review continuation after task exception", exc_info=True)
 
-            intentional_empty = (
-                getattr(ctx, "_presence_completion_accepted", False)
-                and (getattr(ctx, "_presence_completion", None) or {}).get("outcome") in {"silent", "tool_delivered"}
-                and str(usage.get("execution_status") or usage.get("result_status") or "") not in {"failed", "infra_failed"}
-            )
-            if not isinstance(text, str) or (not text.strip() and not intentional_empty):
-                text = "⚠️ Model returned an empty response. Try rephrasing your request."
+            replaced, _, text = _resolve_intentional_empty(ctx, usage, text)
+            if replaced:
                 usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_NOTICE
                 usage.pop("presence_completion_outcome", None)
-                if ctx is not None:
-                    ctx._presence_completion_accepted = False
 
             # A task that scoped ITSELF mid-run (ensure_project_scope) set the scope on
             # ctx, but persistence/finalization read the task dict — sync it back so the
-            # stored result and project-task reflection see the project (C4.1 gap). Fill
+            # stored result and the post-task phase see the project (C4.1 gap). Fill
             # only, never overwrite, to preserve the "no re-scope" invariant.
             _sync_task_project_scope(task, ctx)
 
@@ -1072,6 +1196,7 @@ class OuroborosAgent:
                 ctx=ctx,
                 event_queue=self._event_queue,
             )
+            _retire_working_checkpoint(self.tools._ctx, task)  # retire only after durable persistence readback
             return list(self._pending_events)
 
         except BudgetPauseRequested as exc:
@@ -1082,6 +1207,7 @@ class OuroborosAgent:
             from ouroboros.budget_pause import pause_event
 
             self._pending_events.append(pause_event(task, exc.pause))
+            _retire_working_checkpoint(self.tools._ctx, task)  # its exact pause source supersedes it
             return list(self._pending_events)
 
         except BudgetExceeded as exc:
@@ -1089,7 +1215,7 @@ class OuroborosAgent:
             physical_calls = _physical_calls_after_budget_rail(
                 task.get("budget_drive_root") or self.env.drive_root, task_id)
             # Direct chats cannot honestly advertise the queued-task resume contract.
-            replay_safe = physical_calls == 0 and not bool(task.get("_is_direct_chat"))
+            replay_safe = physical_calls == 0 and not inline_execution(task)
             resource_limit = {
                 "status": "paused_before_dispatch" if replay_safe else "resource_limited",
                 "scope": str(getattr(exc, "limit_scope", "global") or "global"),
@@ -1099,10 +1225,10 @@ class OuroborosAgent:
                 "auto_resume": False,
                 "resume_policy": _budget_resume_policy(
                     replay_safe=replay_safe,
-                    direct_chat=bool(task.get("_is_direct_chat")),
+                    direct_chat=inline_execution(task),
                 ),
             }
-            if resource_limit["scope"] == "root" and not replay_safe and not task.get("_is_direct_chat"):
+            if resource_limit["scope"] == "root" and not replay_safe and not inline_execution(task):
                 # One root admission latch is enough. Existing siblings finish
                 # any sent request and meet the same ledger rail before another.
                 self._pending_events.append({
@@ -1130,7 +1256,7 @@ class OuroborosAgent:
                     "ts": utc_now_iso(),
                 })
                 return list(self._pending_events)
-            message_fn = _budget_exhausted_message if task.get("_is_direct_chat") else _queued_budget_exhausted_message
+            message_fn = _budget_exhausted_message if inline_execution(task) else _queued_budget_exhausted_message
             text = message_fn()
             usage = {
                 "execution_status": "failed",
@@ -1160,6 +1286,7 @@ class OuroborosAgent:
                 ctx=self.tools._ctx,
                 event_queue=self._event_queue,
             )
+            _retire_working_checkpoint(self.tools._ctx, task)
             return list(self._pending_events)
 
         finally:
@@ -1352,6 +1479,25 @@ class OuroborosAgent:
 
         threading.Thread(target=_loop, daemon=True).start()
         return stop
+
+
+def _resolve_intentional_empty(ctx: Any, usage: Dict[str, Any], text: Any) -> tuple[bool, bool, Any]:
+    """Resolve empty finals before outcome derivation; ``(replaced, intentional, text)``.
+
+    The loop's accepting exit stamps ``usage["wake_silent"]`` (loop_delivery): the wake's
+    words, even empty, are internal, and the pipeline decides what its outcome publishes.
+    """
+    ok_status = str(usage.get("execution_status") or usage.get("result_status") or "") not in {"failed", "infra_failed"}
+    presence = (getattr(ctx, "_presence_completion_accepted", False)
+                and (getattr(ctx, "_presence_completion", None) or {}).get("outcome") in {"silent", "tool_delivered"}
+                and ok_status)
+    intentional_empty = presence or usage.get("wake_silent") is True
+    if not isinstance(text, str) or (not text.strip() and not intentional_empty):
+        if ctx is not None:
+            ctx._presence_completion_accepted = False
+        usage.pop("wake_silent", None)
+        return True, False, "⚠️ Model returned an empty response. Try rephrasing your request."
+    return False, intentional_empty, text
 
 
 def make_agent(

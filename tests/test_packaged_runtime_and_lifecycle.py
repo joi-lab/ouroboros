@@ -216,16 +216,15 @@ def test_a_restart_with_a_failed_dependency_install_pauses_and_discloses(
     import launcher
 
     monkeypatch.setattr(launcher, "_shutdown_event", threading.Event())
-    monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: None)
-    monkeypatch.setattr(launcher, "_kill_stale_runtime_ports", lambda port: None)
+    monkeypatch.setattr(launcher, "_cleanup_recorded_server_process", lambda reason: [])
     # The per-generation stray sweep must never signal a real process from a test.
     monkeypatch.setattr(launcher, "_reap_same_install_strays", lambda reason: [])
     monkeypatch.setattr(
         launcher, "_cleanup_recorded_server_group_for_pid", lambda pid, reason: None,
     )
     monkeypatch.setattr(launcher, "_update_server_process_record_port", lambda pid, port: None)
-    monkeypatch.setattr(launcher, "_poll_port_file", lambda timeout=30, abort_event=None: 52123)
-    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=45, abort_event=None: True)
+    monkeypatch.setattr(launcher, "_await_generation_endpoint", lambda *a, **kw: 52123)
+    monkeypatch.setattr(launcher, "_wait_for_server", lambda port, timeout=45, abort_event=None, proc=None: True)
     monkeypatch.setattr(launcher, "PORT_FILE", tmp_path / "port")
     monkeypatch.setattr(launcher, "_sync_existing_repo_from_bundle", lambda: None)
     monkeypatch.setattr("time.sleep", lambda seconds: None)
@@ -798,6 +797,9 @@ def test_cancelling_a_subagent_rescues_its_partial_result(monkeypatch, tmp_path)
     monkeypatch.setattr(
         observability, "latest_llm_response_text", lambda root, tid: "half-written answer",
     )
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, "live-salvage", allow_settled_target=True)
 
     assert q.cancel_task_custody("live-salvage") == q.CANCEL_CANCELLED
     result = load_task_result(tmp_path, "live-salvage")
@@ -903,6 +905,9 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
         },
     }, raising=False)
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: None)
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, task_id, allow_settled_target=True)
 
     assert q.cancel_task_custody(task_id) == q.CANCEL_CANCELLED
 

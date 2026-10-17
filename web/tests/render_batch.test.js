@@ -65,11 +65,25 @@ test('history chrome shares one control and derives completeness from physical c
     assert.equal(controls.olderButton.hidden, true);
 });
 
-test('the empty-Main greeting and the reconnect notice are chrome: a read over them still shows its loading and failure', () => {
+test('at its older end a grown room offers the way on, a chain a navigation began does not', () => {
     const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
     const messages = new ElementStub('div', doc);
     messages.isConnected = true;
     const controls = createHistoryControls(messages);
+    const exhausted = { initialized: true, canOlder: false, canNewer: false, olderExhausted: true, loading: '', error: null };
+    controls.render(exhausted, { horizonGap: true });
+    assert.equal(controls.olderButton.hidden, false, 'a grown room re-anchors to the present from here');
+    controls.render({ ...exhausted, away: true }, { horizonGap: true });
+    assert.equal(controls.olderButton.hidden, true, 'a page around a task never sends Load more to the present');
+});
+
+test('the empty-Main greeting and the reconnect notice are chrome: a read over them still shows its loading and failure', () => {
+    const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc);
+    messages.isConnected = true;
+    const chrome = new ElementStub('div', doc);
+    chrome.isConnected = true;
+    const controls = createHistoryControls(messages, chrome);
     const node = (className) => { const element = doc.createElement('div'); element.className = className; return element; };
     messages.appendChild(node('chat-bubble assistant typing-bubble'));
     messages.appendChild(node('chat-empty-welcome'));
@@ -78,9 +92,10 @@ test('the empty-Main greeting and the reconnect notice are chrome: a read over t
     messages.appendChild(notice);
     assert.equal(feedIsEmpty(messages), true);
     assert.equal(controls.beginRecent(), true);
-    controls.render({ initialized: true });
-    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note').textContent,
-        'Loading saved history…');
+    controls.render({ initialized: false }, { gaps: true });
+    assert.equal(chrome.children.length, 0, 'unanswered first read is loading, not a known gap');
+    assert.equal(controls.olderButton.textContent, 'Loading saved history…');
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note').hidden, true);
     controls.endRecent(new Error('offline'));
     assert.equal(controls.recentFailed(), true);
     controls.endRecent();
@@ -94,19 +109,18 @@ test('the empty-Main greeting and the reconnect notice are chrome: a read over t
 test('sticky single-flight never swallows the post-completion resync', () => {
     // [GPT#12 + Fable#1] scheduleHistorySync (700ms debounce after task
     // completion) must do a REAL fetch — a lost task_done is healed only by
-    // refetching — so it calls syncHistory directly, never the sticky
-    // awaitInitialHydration shortcut.
+    // refetching — so it reads through the pager (what arrived since the newest
+    // read, else the newest page; chat_history_arrivals.test.js), never the
+    // sticky awaitInitialHydration shortcut.
     const fn = chatSource.slice(
         chatSource.indexOf('function scheduleHistorySync('),
         chatSource.indexOf('function applyLiveCardState('),
     );
-    assert.match(fn, /syncHistory\(\{ includeUser: false \}\)/);
+    assert.match(fn, /run: \(\) => historyPager\.read\(\)/);
     assert.doesNotMatch(fn, /awaitInitialHydration/);
-    // The reconnect branch of the open handler also always refetches.
-    assert.match(
-        chatSource,
-        /\? syncHistory\(\{ includeUser: !historyLoaded, fromReconnect: isReconnect \}\)/,
-    );
+    // The reconnect branch of the open handler reads the newest page whole (frames sent while away are lost),
+    // through the read that folds every reconnect arriving meanwhile into one more.
+    assert.match(chatSource, /\? syncHistory\(\{ fromReconnect: true \}\)/);
     // Every failed sync resets the sticky promise.
     assert.ok((chatSource.match(/initialHydrationPromise = null;/g) || []).length >= 3);
 });
@@ -289,8 +303,7 @@ test('chat.js wires the replay flag around the replay and keeps live callsites i
     // Both finished-transition paths share settleLiveCard; the task-bound
     // review lifecycle keeps its own trigger. The replay decision stays ONLY
     // behind the scheduler's gate, so sharing cleanup cannot mute either path.
-    assert.match(chatSource, /settleLiveCard\(record, summary\.phase \|\| 'done', wasFinished\);/);
-    assert.match(chatSource, /settleLiveCard\(record, activePhase, wasFinished\);/);
+    assert.equal((chatSource.match(/settleLiveCard\(record, wasFinished\);/g) || []).length, 2);
     assert.match(chatSource, /if \(!wasFinished && blockVisible\(record\)\) scheduleHistorySync\(\);/);
     // The third occurrence is the scheduler re-arming when a run settles with the bound
     // still armed, which is how a run that only JOINED an older in-flight fetch (and
@@ -491,6 +504,21 @@ test('a card crossing the top with nothing anchorable inside keeps the reader on
     bubble.bounds = box(84, 260);
     assert.equal(anchors.restoreVisibleTimelineAnchor(anchor), true);
     assert.equal(messages.scrollTop, 260, 'the reader stays on the same message');
+});
+
+test('a restore that finds its node in place writes nothing to the feed', () => {
+    // Even a write of the same scrollTop stops a scroll WebKit animates (End, PageDown).
+    let scrollTop = 500, writes = 0;
+    const bubble = { isConnected: true, bounds: { top: 40, width: 600, height: 80 },
+        getBoundingClientRect() { return this.bounds; }, getClientRects() { return [this.bounds]; } };
+    const messages = { getBoundingClientRect: () => ({ top: 0 }), contains: node => node === bubble,
+        get scrollTop() { return scrollTop; }, set scrollTop(value) { writes += 1; scrollTop = value; } };
+    const { restoreVisibleTimelineAnchor } = createTimelineAnchors({ messagesDiv: messages, liveCardRecords: new Map() });
+    assert.equal(restoreVisibleTimelineAnchor({ node: bubble, offset: 40 }), true);
+    assert.deepEqual({ writes, scrollTop }, { writes: 0, scrollTop: 500 });
+    bubble.bounds = { top: 70, width: 600, height: 80 }; // a card above grew 30 px
+    assert.equal(restoreVisibleTimelineAnchor({ node: bubble, offset: 40 }), true);
+    assert.deepEqual({ writes, scrollTop }, { writes: 1, scrollTop: 530 }, 'a moved node is put back');
 });
 
 // A small layout model: a child's top follows its parent's top, the parent's own

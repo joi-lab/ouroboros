@@ -116,8 +116,12 @@ def _save_state(ctx: Any, state: dict[str, Any]) -> None:
 
 
 def _emit(ctx: Any, kind: str, payload: dict[str, Any]) -> bool:
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    # #1578: the lineage this context already knows; an unknown id stays absent.
+    lineage = {key: str(metadata.get(key) or getattr(ctx, key, "") or "") for key in ("root_task_id", "parent_task_id")}
     return custody.emit(custody.custody_root(ctx), kind, {
-        "task_id": str(getattr(ctx, "task_id", "") or ""), **payload,
+        "task_id": str(getattr(ctx, "task_id", "") or ""), **{k: v for k, v in lineage.items() if v}, **payload,
     })
 
 
@@ -195,14 +199,9 @@ def _time_fact(ctx: Any) -> dict[str, Any]:
 
 
 def _settled_spend_fact(ctx: Any, root_task_id: str) -> dict[str, Any]:
-    """The tree's ledger-accounted spend, read through the canonical locked reader
-    (``usage_accounting.usage_breakdown``) in every state — an absent ledger is the reader's own
-    known-zero. The fact writes nothing of its own; it inherits the reader's bounded maintenance —
-    today: the torn-tail quarantine after a SINGLE crash mid-append (a crash inside that repair, a
-    torn quarantine sink, is a known residual, issue #586), the empty
-    ``state/`` lock directory on a never-initialized root, and owner-aware
-    ``usage_attempts.lock`` recovery (ARCHITECTURE §1 Platform substrate) —
-    each pinned by a regression."""
+    """The tree's accounted spend: the usage store's root summary read through
+    ``usage_accounting.usage_breakdown`` in every state (a root with no recorded
+    attempt is the reader's own known-zero). The fact writes nothing of its own."""
     try:
         from ouroboros.usage_accounting import usage_breakdown
 
@@ -316,13 +315,8 @@ def _active_descendants_fact(ctx: Any) -> dict[str, Any]:
 def coordination_live_context(ctx: Any) -> dict[str, Any]:
     """One LLM-first planning snapshot for startup and meaningful nanny wakes.
 
-    Polling writes nothing of its own; it inherits the canonical usage-ledger reader's bounded
-    maintenance — today: the torn-tail quarantine after a SINGLE crash mid-append
-    (``usage_ledger._read_records_locked``, identical for every reader; a crash inside that repair
-    is a known residual, issue #586), the empty ``state/`` lock directory
-    on a never-initialized root, and owner-aware ``usage_attempts.lock`` recovery
-    (ARCHITECTURE §1 Platform substrate) — each pinned by a regression;
-    the settled-spend fact reads the ledger through that reader.
+    Polling writes nothing of its own; the settled-spend fact is one read of the
+    usage store's root summary (``usage_accounting.usage_breakdown``).
     """
 
     root_task_id = _coordination_root_id(ctx)
@@ -740,6 +734,24 @@ def _pending_payload(ctx: Any, state: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _record_terminal_acknowledged(ctx: Any, state: dict[str, Any], pending: dict[str, Any],
+                                  wake_id: str, attempt: str) -> None:
+    """The custody-native half of an accepted TERMINAL wake (#1573).
+
+    Called only after the supervision acknowledgement landed, i.e. after the exact
+    wake (or its verified source envelope) was appended to this attempt's
+    transcript, and only for the run's own terminal payload. It proves that append in
+    ``attempt`` — not a physical send, a read or permanent transcript retention. A
+    row that fails to land only lets the own-run notice repeat (the safe direction).
+    """
+    payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else {}
+    run_id = str(state.get("run_id") or "")
+    if run_id and str(payload.get("status") or "") == "terminal" and str(payload.get("run_id") or "") == run_id:
+        _emit(ctx, custody.TERMINAL_ACKNOWLEDGED, {
+            "run_id": run_id, "wake_id": wake_id, "attempt_key": attempt,
+        })
+
+
 def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
     """Ack only after the exact wake or its verified source handle was delivered."""
 
@@ -812,6 +824,7 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         ),
     }):
         return False
+    _record_terminal_acknowledged(ctx, state, pending, expected, attempt)
     interaction_ids = frozenset(
         str(item) for item in (pending.get("interaction_ids") or []) if str(item)
     )
@@ -822,6 +835,11 @@ def acknowledge_pending_wake(ctx: Any, delivered: Any = None) -> bool:
         _REPORTED_INTERACTIONS[run_id] = frozenset(
             set(_REPORTED_INTERACTIONS.get(run_id, frozenset())) | set(interaction_ids)
         )
+        # Unlike the latest-run checkpoint, this map survives alternating A/B
+        # waits and travels with the transcript through a cold continuation.
+        seen = dict(getattr(ctx, "_sleep_interaction_seen", None) or {})
+        seen[run_id] = sorted(set(seen.get(run_id) or ()) | (set(interaction_ids) & _interaction_ids(payload)))
+        ctx._sleep_interaction_seen = seen
     prior_mailbox_ids = (
         state.get("mailbox_acknowledged_ids") or []
         if str(state.get("mailbox_acknowledged_attempt_key") or "") == attempt
@@ -998,7 +1016,18 @@ def supervised_wait(
     checkpoint_reason: str = "",
     wait_once: Optional[Callable[..., str]] = None,
 ) -> ToolResult:
-    """Renew quiet windows internally and return only a meaningful wake batch."""
+    """Renew quiet windows internally and return only a meaningful wake batch.
+
+    The journal cursor is durable, so it survives worker restarts. ``cache_horizon_note``
+    is attached once per wake, only when the time since the last model response exceeds
+    the applied cache horizon. ``checkpoint_after_sec`` is a one-shot wake: an earlier
+    real event consumes it, and it never repeats. Renewal runs on a fixed three-second
+    tick with no backoff and no durable outage latch. A read that delivered no daemon
+    answer is a quiet renewal: ``observation_read_timeout`` is our own read bound
+    expiring, ``daemon_unreachable`` a socket that carried nothing, an engine busy code a
+    GET the daemon could not serve; only ``daemon_unreachable`` opens an outage episode
+    (one owner line, plus one line when a read is answered again).
+    """
 
     reason_text = str(checkpoint_reason or "").strip()
     ignored_note = ""
@@ -1078,14 +1107,18 @@ def supervised_wait(
     outage_since = ""
     outage_stamp = ""
     # The loop's own transport, only when it built the observing wait.
-    gateway = _loop_gateway() if owns_transport else None
-    live_input = _leaf_live_input(ctx, run_id, gateway)
+    from ouroboros.tools.delegate_terminal_evidence import retained_terminal_result
+    retained = retained_terminal_result(ctx, run_id) if owns_transport else None
+    gateway = _loop_gateway() if owns_transport and retained is None else None
+    live_input = _leaf_live_input(ctx, run_id, gateway) if retained is None else "unknown"
     try:
         while True:
             # A control already present does not wait behind another HTTP read.
             observed = not _control_wakes(ctx)
             if not observed:
                 raw = json.dumps({"status": "no_progress", "run_id": str(run_id)})
+            elif retained is not None:
+                raw, retained = json.dumps(retained), None
             else:
                 if owns_transport and gateway is None:
                     gateway = _loop_gateway()
@@ -1093,15 +1126,19 @@ def supervised_wait(
                                 **({"gateway": gateway} if gateway is not None else {}))
             payload = _payload(raw)
             answered = str(payload.get("status") or "") not in _NO_DAEMON_ANSWER_STATUSES
+            # A typed 503 the engine itself sent to the read reached the daemon over an intact
+            # transport: rebuilding it would re-handshake into the same refusal and wake the
+            # model, and it is no outage either. Only a read nothing answered is a dead socket.
+            reached = answered or payload.get("answered") is True
             if observed:
                 _record_observation(state, payload, answered)
-            if not answered:
+            if not reached:
                 gateway = _drop_gateway(gateway)
             unreachable = (
                 payload.get("status") == "observation_pending"
-                and payload.get("reason") == _DAEMON_UNREACHABLE
+                and payload.get("reason") == _DAEMON_UNREACHABLE and not reached
             )
-            if observed and outage_since and answered:
+            if observed and outage_since and reached:
                 # The first read the daemon ANSWERED closes the episode. A refusal
                 # that never reached it (descriptor gone, token unreadable, engine
                 # too old) used to satisfy this and told the owner the daemon was

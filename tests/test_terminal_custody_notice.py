@@ -52,11 +52,15 @@ def test_cleanup_receipt_is_carried_before_final_delivery_without_rewriting_answ
     assert "terminal_host_notice" not in event
     # The leaf's own model rides the replayed row, so the nanny's terminal is
     # not read as a verdict about the role the host played (I9).
-    assert "run-one: cancelled on fixture-model" in event["terminal_custody_notice"]
-    assert "Pending patch decisions: run-one" in event["terminal_custody_notice"]
+    # The owner's card row lists only categories holding something (#1403); the
+    # stored join that parents, the CLI and the child hash read keeps every one.
+    assert event["terminal_custody_notice"] == (
+        "Confirmed delegated terminal receipts: run-one: cancelled on fixture-model.\n"
+        "Pending patch decisions: run-one.")
     joined = public_task_result({**stored, **usage})["terminal_host_notice"]
     assert joined.startswith("Budget stop retained.")
-    assert event["terminal_custody_notice"] in joined
+    assert joined.endswith(delegate_terminal.terminal_custody_notice(stored))
+    assert "Open delegated execution: none recorded by the current audit." in joined
     assert load_task_result(tmp_path, "root") == before
 
 
@@ -172,3 +176,43 @@ def test_the_tasks_own_open_run_still_shows_beside_its_reviewers(tmp_path):
     assert "Open delegated execution: run-leaf" in terminal_host_notice_text(
         load_task_result(tmp_path, "root"))
     custody._CUSTODY.clear()
+
+
+def _audit(**facts):
+    return {"task_id": "root", "result": "answer", "status": "completed",
+            "delegate_terminal_reconciliation": {"audit_status": "ok", "open_run_ids": [],
+                                                 "pending_invocation_ids": [], "undisposed_patch_run_ids": [],
+                                                 "terminal_runs": [], **facts}}
+
+
+def test_owner_row_drops_only_empty_categories_and_shared_text_keeps_its_bytes():
+    """#1403: the owner row omits empty audit categories; non-success, nonempty debt and
+    an unavailable audit stay. The default text, its public projection and the
+    child-result hash are pinned to their pre-#1403 bytes (computed on b6772cce)."""
+    from ouroboros.task_finalization import terminal_custody_notice_text, terminal_notice_text
+
+    failed = _audit(terminal_runs=[{"run_id": "run-7c1", "state": "failed", "model": "leaf-m"}])
+    assert terminal_custody_notice_text(failed) == "Confirmed delegated terminal receipts: run-7c1: failed on leaf-m."
+    full = ("Confirmed delegated terminal receipts: run-7c1: failed on leaf-m.\n"
+            "Open delegated execution: none recorded by the current audit.\n"
+            "Pending delegated invocations: none recorded by the current audit.\n"
+            "Pending patch decisions: none recorded by the current audit.")
+    assert terminal_host_notice_text(failed) == terminal_notice_text(failed) == full
+    assert public_task_result(failed)["terminal_host_notice"] == full
+    assert _child_result_sha256(failed) == "ea29f0d212c55c6df1fcb7d1db93ed6040e307c70712560b1eef0f9c5991786f"
+
+    debt = _audit(open_run_ids=["run-a"], pending_invocation_ids=["inv-b"])
+    assert terminal_custody_notice_text(debt) == ("Open delegated execution: run-a.\n"
+                                                  "Pending delegated invocations: inv-b.")
+    assert "Pending patch decisions: none recorded" in terminal_host_notice_text(debt)
+
+    patch = _audit(undisposed_patch_run_ids=["run-one"], terminal_runs=[{"run_id": "run-one", "state": "cancelled"}])
+    patch["terminal_host_notice"] = "Budget stop retained."
+    assert _child_result_sha256(patch) == "ddfff4f813d13a518cdeafb2be9ffabec50e09f28c768cc2784d7270f6144f34"
+
+    unknown = {"task_id": "root", "result": "answer", "status": "completed",
+               "delegate_terminal_reconciliation": {"audit_status": "failed"}}
+    unavailable = "Current delegated execution could not be verified; custody remains unresolved in task details."
+    assert terminal_custody_notice_text(unknown) == terminal_host_notice_text(unknown) == unavailable
+    assert _child_result_sha256(unknown) == "dd261cdf1be1f0fe34839dc19abafe911b37989e7bbd006a59dec16608b1574a"
+    assert terminal_custody_notice_text(_audit(terminal_runs=[{"run_id": "ok", "state": "succeeded"}])) == ""

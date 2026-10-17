@@ -13,6 +13,7 @@ import time
 import pytest
 
 from ouroboros.platform_layer import force_kill_pid, pid_is_alive
+from ouroboros.test_parallelism import WORKERS_ENV
 from ouroboros.settings_defaults import settings_env_keys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -121,10 +122,10 @@ def two_pass_env(monkeypatch, preflight_timeout_diagnostics):
     """Deterministic env for the real-spawn two-pass tests."""
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", raising=False)
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)
-    # Operator lever (scrubbed before the candidate ever sees it), clamped at the
-    # >=2 floor: the fixture repos below hold 1-3 probe tests, so a full `-n auto`
-    # fan-out would spend minutes on worker startup for nothing.
+    # These tiny fixture repos explicitly need two workers to prove concurrency;
+    # they must not inherit the surrounding battery's full fan-out.
     monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "2")
+    monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "2")  # These scenarios prove real xdist concurrency.
     # The operator-environment downgrade the scrub must defeat. Every real-spawn
     # test below therefore ALSO proves the parallel lane stayed parallel: if
     # PYTEST_XDIST_AUTO_NUM_WORKERS were inherited, `-n auto` would resolve to one
@@ -241,10 +242,11 @@ def _ci_pytest_suite_commands(job: str) -> list[tuple[str, str]]:
     )
     assert block, f"ci.yml has no `{job}:` job"
     # `tests/` only — the per-file guard steps run one file and are not the split.
-    return re.findall(r'run: python -m pytest tests/ -m "([^"]+)"(.*)', block.group(1))
+    # Each pass runs under the owned runner, which forwards its pytest arguments unchanged.
+    return re.findall(r'run: python (?:-m pytest|scripts/run_tests\.py) tests/ -m "([^"]+)"(.*)', block.group(1))
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
 def test_each_ci_job_runs_the_same_split_the_gate_runs(job, monkeypatch):
     """The gate's whole promise is "what CI will do, before you push". Both jobs
     must carry BOTH passes with the gate's own markexprs and the gate's own
@@ -426,7 +428,7 @@ def test_the_real_spawn_lane_declares_which_tests_go_dark_when_it_skips():
     # ...and CI, which provisions the plugins, declares the flag — otherwise no
     # shipped environment ever executes the lane and the pins stay inert.
     ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-    for job in ("quick-test", "full-test"):
+    for job in ("quick-test", "full-test-runs"):
         block = re.search(
             rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:$|\Z)", ci, re.MULTILINE | re.DOTALL
         )
@@ -464,24 +466,22 @@ def test_plugin_verification_ignores_the_candidate_working_directory(tmp_path):
 # ── Parallelism is real, not nominal (unit) ───────────────────────────
 
 
-def test_worker_count_can_never_fall_below_two(monkeypatch):
-    """A "parallel" pass on ONE worker exercises no concurrency at all, yet the
-    argv still says `-n` and the green return is accepted as proof. The count is
-    therefore clamped: the operator lever may only lower it TO the floor."""
+def test_worker_count_respects_physical_room_and_the_parent_allocation(monkeypatch):
+    """CPU defaults and operator requests cannot spend unavailable worker slots."""
     from ouroboros import preflight_runner as pr
+    from ouroboros import config, test_parallelism as budget
 
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "1")
-    assert pr._preflight_worker_count() == 2
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "0")
-    assert pr._preflight_worker_count() == 2
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "-4")
-    assert pr._preflight_worker_count() == 2
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "not-a-number")
-    assert pr._preflight_worker_count() >= 2
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "3")
+    monkeypatch.delenv(budget.NESTED_WORKERS_ENV, raising=False)
+    peak = config.TEST_WORKER_PEAK_RSS_BYTES
+    monkeypatch.setattr(budget, "physical_memory", lambda: budget.MemorySnapshot(10 * peak, 4 * peak))
+    monkeypatch.setenv(WORKERS_ENV, "1")
+    assert pr._preflight_worker_count() == 1
+    monkeypatch.setenv(WORKERS_ENV, "0")
+    assert pr._preflight_worker_count() == 1
+    monkeypatch.setenv(WORKERS_ENV, "16")
     assert pr._preflight_worker_count() == 3
-    monkeypatch.delenv(pr._PREFLIGHT_WORKERS_ENV, raising=False)
-    assert pr._preflight_worker_count() >= 2
+    monkeypatch.setenv(budget.NESTED_WORKERS_ENV, "2")
+    assert pr._preflight_worker_count() == 2
 
 
 @pytest.mark.parametrize("hostile", [
@@ -507,6 +507,7 @@ def test_external_pytest_controls_never_reach_the_candidate_suite(tmp_path, monk
     from ouroboros.preflight_runner import _preflight_env
 
     key, value = hostile
+    monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "2")
     monkeypatch.setenv(key, value)
     env = _preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
 
@@ -534,20 +535,6 @@ def test_projected_settings_keys_never_reach_the_candidate_suite(tmp_path, monke
     monkeypatch.setenv(key, "owner-runtime-state")
     env = _preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
     assert env.get(key) != "owner-runtime-state", f"{key} leaked into the candidate suite"
-
-
-def test_the_gate_pins_the_worker_count_it_verified(tmp_path, monkeypatch):
-    """The injected count is the clamped one, not whatever `os.cpu_count()` or
-    the operator environment happened to say."""
-    from ouroboros import preflight_runner as pr
-
-    monkeypatch.setenv(pr._PREFLIGHT_WORKERS_ENV, "3")
-    monkeypatch.setenv("PYTEST_XDIST_AUTO_NUM_WORKERS", "1")
-    env = pr._preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
-    assert env["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "3"
-    # ...and the seam itself is OUROBOROS_*, so the scrub removes it first: a
-    # candidate test can neither read nor re-lower it.
-    assert pr._PREFLIGHT_WORKERS_ENV not in env
 
 
 def test_the_worker_probe_is_prepended_to_pythonpath(tmp_path, monkeypatch):
@@ -2128,16 +2115,38 @@ def test_a_failing_post_commit_gate_stops_publication(monkeypatch):
     # starts at the TAG, not at the push. Pinned in source because driving the
     # whole commit path here would assert on mock scaffolding instead of the
     # ordering that matters.
+    import ast
+
     src = inspect.getsource(git_module._repo_commit_push)
     assert "gate_failure = _managed_post_commit_tests_gate(" in src
-    guard = src.index("if gate_failure:")
-    assert guard < src.index("_auto_tag_on_version_bump("), (
-        "the version tag is created before the gate's verdict is read"
-    )
-    assert guard < src.index("_auto_push("), "the push happens before the gate's verdict is read"
-    assert guard < src.index("managed_assisted_postcommit("), (
-        "the managed-update path runs before the gate's verdict is read"
-    )
+    tree = ast.parse(src)
+    guard = next(node for node in ast.walk(tree) if isinstance(node, ast.If)
+                 and isinstance(node.test, ast.Name) and node.test.id == "gate_failure")
+    assert isinstance(guard.body[0], ast.Return) and guard.body[0].value.id == "gate_failure"
+    effects = {"_auto_tag_on_version_bump": [], "_auto_push_after_review": [], "_auto_push": [],
+               "_finish_managed_commit": []}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        target = node.func.id
+        if target == "run_operation" and len(node.args) > 1 and isinstance(node.args[1], ast.Name):
+            target = node.args[1].id  # Pause now gates tagging through the real wrapper.
+        if target in effects:
+            effects[target].append(node.lineno)
+    assert {name: len(lines) for name, lines in effects.items()} == {
+        "_auto_tag_on_version_bump": 1, "_auto_push_after_review": 2, "_auto_push": 0,
+        "_finish_managed_commit": 1}
+    assert all(guard.lineno < line for lines in effects.values() for line in lines), effects
+    finish = ast.parse(inspect.getsource(git_module._finish_managed_commit))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "run_operation" and len(node.args) > 1
+               and isinstance(node.args[1], ast.Name) and node.args[1].id == "managed_assisted_postcommit"
+               for node in ast.walk(finish)), "the shared managed tail must gate smoke admission"
+    push = ast.parse(inspect.getsource(git_module._auto_push_after_review))
+    assert any(isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+               and node.func.id == "run_operation" and len(node.args) > 1
+               and isinstance(node.args[1], ast.Name) and node.args[1].id == "_auto_push"
+               for node in ast.walk(push)), "the guarded wrapper must still gate the actual push"
     # ...and the helper records the terminal failed attempt rather than dropping it.
     helper = inspect.getsource(git_module._managed_post_commit_tests_gate)
     assert 'block_reason="post_commit_tests_failed"' in helper
@@ -2623,7 +2632,7 @@ def test_a_second_timeout_keeps_the_excerpt_the_first_one_already_carried(tmp_pa
         def close(self):
             order.append("close")
 
-    monkeypatch.setattr(process_containment, "ProcessContainer", _FakeContainer)
+    monkeypatch.setattr(process_containment, "ProcessContainer", lambda **options: _FakeContainer())
     monkeypatch.setattr(pr, "_terminate_preflight_tree", lambda proc, temp_root: None)
 
     returncode, output, reap_error = pr._execute_pytest_pass(

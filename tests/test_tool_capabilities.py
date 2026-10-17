@@ -127,7 +127,7 @@ def test_top_level_workspace_focus_has_tool_and_schema_parity(tmp_path, monkeypa
         "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
         "delegate_message",
         "switch_model", "send_photo", "send_video", "send_file", "send_links",
-        "commit_reviewed", "promote_chat_to_task", "vcs_restore",
+        "commit_reviewed", "start_task", "vcs_restore",
     } <= names
 
     # Successor of the retired _WORKSPACE_ALLOWED_TOOLS subset invariant: the
@@ -616,13 +616,10 @@ def test_discovery_has_one_implementation_bound_by_the_loop(tmp_path):
     handlers to its resident list instead of carrying its own copies, so the
     hidden-vs-missing answer has exactly one author."""
     import ouroboros.loop as loop_mod
-    import ouroboros.tools.tool_discovery as td
     from ouroboros.tools.registry import ToolContext, ToolRegistry
 
-    label = "🚫 Hidden by policy (the tool exists but this task cannot use it)"
     loop_src = inspect.getsource(loop_mod)
-    assert label not in loop_src and "policy_hidden_reason(" not in loop_src
-    assert label in inspect.getsource(td)
+    assert "policy_hidden_reason(" not in loop_src
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
@@ -668,6 +665,15 @@ def test_burst_absorb_clause_states_the_prefix_write_cost():
         if s["function"]["name"] == "schedule_subagent"
     )
     description = schema["function"]["description"]
-    assert "BURST + ABSORB" in description
+    assert "one round run concurrently; wait_tasks(any_terminal) absorbs whichever finishes first" in description
     assert "prefix write" in description
-    assert "burst buys latency and spacing buys cash" in description
+    assert "choose burst latency or spaced cost savings" in description
+
+
+def test_escalate_is_available_wherever_planning_runs():
+    from ouroboros.tool_capabilities import (
+        ACTING_SUBAGENT_TOOL_NAMES, CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+    )
+
+    assert all("escalate" in names for names in
+               (CORE_TOOL_NAMES, LOCAL_READONLY_SUBAGENT_TOOL_NAMES, ACTING_SUBAGENT_TOOL_NAMES))

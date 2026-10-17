@@ -27,6 +27,7 @@ from ouroboros.task_results import (
 from tests._cancel_intents_shared import _live_split_drive_task, _write_root_retry_pair
 
 from tests._cancel_intents_shared import qenv as _qenv
+from tests._store_shared import delete_result
 
 # The fixture is requested by name as a test parameter, so it is re-bound through a
 # module attribute: a direct import of a name that reappears as a parameter is an F811
@@ -440,7 +441,6 @@ def test_timeout_precheck_yields_retry_leaf_to_logical_root_cascade(
     assert leaf_id in qenv.q.RUNNING
 
 def test_retry_boundary_refuses_missing_physical_leaf_authority(qenv, monkeypatch):
-    from ouroboros.task_results import task_result_path
     from supervisor import task_reaper as tr
 
     _patch_retry_input_handoff(monkeypatch)
@@ -464,7 +464,7 @@ def test_retry_boundary_refuses_missing_physical_leaf_authority(qenv, monkeypatc
         scope=ci.SCOPE_CASCADE,
         requested_stop_policy=ci.STOP_POLICY_FINALIZE,
     )
-    task_result_path(qenv.drive, leaf_id, create=False).unlink()
+    delete_result(qenv.drive, leaf_id)
 
     requeued, _attempt, reason, suppression = tr._enqueue_retry(
         qenv.q,
@@ -806,15 +806,22 @@ def test_custody_refuses_when_the_claim_cannot_be_read(qenv, monkeypatch):
     assert [t["id"] for t in qenv.q.PENDING] == ["claim-io"], "capture returned"
     assert load_task_result(qenv.drive, "claim-io")["status"] == "scheduled"
 
-def test_custody_without_any_intent_is_the_documented_legacy_path(qenv, monkeypatch):
-    """AR2-2: claim → None (no active intent) is the legacy/no-intent path —
-    capture under the queue lock is the mutual exclusion and custody proceeds."""
+def test_custody_without_any_intent_is_a_typed_noop(qenv, monkeypatch):
+    """A2 (invariant 14): claim → None (no active intent) is NO authority. Custody
+    captures nothing, kills nothing and writes nothing; the answer is typed from the
+    stored result (``not_found`` for a live task, ``already_settled`` for a settled one)."""
     qenv.q.PENDING[:] = [{"id": "no-intent", "chat_id": 1}]
     write_task_result(qenv.drive, "no-intent", "scheduled")
-    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: None)
+    emitted: list = []
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: emitted.append(_a))
 
-    assert qenv.tl.cancel_task_custody("no-intent") == qenv.tl.CANCEL_CANCELLED
-    assert load_task_result(qenv.drive, "no-intent")["status"] == STATUS_CANCELLED
+    assert qenv.tl.cancel_task_custody("no-intent") == qenv.tl.CANCEL_NOT_FOUND
+    assert [t["id"] for t in qenv.q.PENDING] == ["no-intent"]
+    assert load_task_result(qenv.drive, "no-intent")["status"] == "scheduled"
+    assert emitted == []
+    write_task_result(qenv.drive, "no-intent", "completed")
+    assert qenv.tl.cancel_task_custody("no-intent") == qenv.tl.CANCEL_ALREADY_SETTLED
+    assert [t["id"] for t in qenv.q.PENDING] == ["no-intent"]
 
 def test_two_concurrent_custodies_on_a_pending_task_settle_exactly_once(qenv, monkeypatch):
     """GR2-2 (sol's repro shape): two threads racing custody over one pending
@@ -883,31 +890,6 @@ def test_double_takeover_loser_restores_the_reaping_marker_as_found(qenv, monkey
     assert qenv.workers.WORKERS[0].reaping is True, (
         "the loser must restore the marker as found — the winner is mid-kill behind it"
     )
-
-def test_task_lifecycle_keeps_capture_miss_calling_convention(monkeypatch):
-    from supervisor import cancel_publication, task_lifecycle
-
-    queue_sentinel = object()
-    intent = {"request_id": "compat-request"}
-    seen = {}
-
-    def fake_finalize(q, task_id, *, intent=None):
-        seen.update(q=q, task_id=task_id, intent=intent)
-        return "compat-result"
-
-    monkeypatch.setattr(task_lifecycle, "_queue_module", lambda: queue_sentinel)
-    monkeypatch.setattr(cancel_publication, "_finalize_cancel_intent_on_miss", fake_finalize)
-
-    assert (
-        task_lifecycle._finalize_cancel_intent_on_miss("compat-task", intent=intent)
-        == "compat-result"
-    )
-    assert seen == {
-        "q": queue_sentinel,
-        "task_id": "compat-task",
-        "intent": intent,
-    }
-
 
 def _reaper_kill_audit(runs: list) -> dict:
     return {

@@ -13,7 +13,10 @@ const primitivesJs = await readFile(new URL('../modules/ui_primitives.js', impor
 test('neutral controls have one shared button role in both UI shells', () => {
     assert.match(sharedCss, /\.btn-default\s*\{/);
     assert.match(sharedCss, /\.btn:focus-visible\s*\{/);
-    for (const document of documents) assert.match(document, /href="\/static\/ui\.css"/);
+    // The app shell loads its main-interface /static; the wizard always loads the core's own tree.
+    const [indexHtml, wizardHtml] = documents;
+    assert.match(indexHtml, /href="\/static\/ui\.css"/);
+    assert.match(wizardHtml, /href="\/onboarding\/static\/ui\.css"/);
     assert.doesNotMatch(onboardingCss, /(?:^|\n)\.btn-default\s*\{/);
     assert.match(sharedCss, /--button-min-height:\s*34px/);
     assert.doesNotMatch(settingsCss, /settings-ghost-btn/);

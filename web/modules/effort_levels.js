@@ -1,0 +1,60 @@
+// The reasoning-effort vocabulary of the web UI: the 8-tier runtime scale (a mirror of
+// `ouroboros/config.py` EFFORT_SCALE, pinned by tests/test_available_subagents_ui_static.py),
+// the 7 owner tiers the range control offers (`minimal` is a runtime tier the owner never
+// sets as a standing level), the owner's range as the server reads it, and the English
+// label of a tier read through the catalog seam so a translated install hears the same word
+// the strip shows.
+import { tr } from './i18n.js';
+
+export const EFFORT_SCALE = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
+export const EFFORT_LABELS = Object.freeze({
+    none: 'None', minimal: 'Minimal', low: 'Low', medium: 'Medium', high: 'High', xhigh: 'X-High', max: 'Max', ultra: 'Ultra',
+});
+// The owner-facing subset: `minimal` is a valid runtime tier (bench adapters and a child's
+// own switch_model use it) but is deliberately not offered as an owner level — sub-`low`
+// thinking is a per-call tactical choice, not a standing configuration.
+export const EFFORT_OPTIONS = [
+    { value: 'none', label: 'None' }, { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'X-High' }, { value: 'max', label: 'Max' }, { value: 'ultra', label: 'Ultra' },
+];
+export const OWNER_TIERS = EFFORT_OPTIONS.map((option) => option.value);
+// The range the server reads when nothing is stored (config: OUROBOROS_EFFORT_MIN/TASK/MAX).
+export const EFFORT_RANGE_DEFAULT = Object.freeze({ min: 'low', recommended: 'medium', max: 'high' });
+
+export function effortTier(value) {
+    const tier = String(value || '').trim().toLowerCase();
+    return EFFORT_SCALE.includes(tier) ? tier : '';
+}
+
+/** The English word for a tier; an unknown value shows as it is. */
+export function effortLabel(tier) {
+    return EFFORT_LABELS[effortTier(tier)] || String(tier || '');
+}
+
+/** The tier's word through the catalog seam: a card or an aria text is never overlay-translated. */
+export function effortText(tier) {
+    const known = effortTier(tier);
+    return known ? tr(`effort.tier.${known}`, EFFORT_LABELS[known]) : String(tier || '');
+}
+
+export const effortRank = (tier) => EFFORT_SCALE.indexOf(effortTier(tier));
+
+/** The owner-tier index a stored tier is SHOWN at: `minimal` sits at Low (the nearest owner
+ *  tier above it); an unknown value is -1. */
+export function ownerLevelIndex(tier) {
+    const known = effortTier(tier);
+    if (!known) return -1;
+    const exact = OWNER_TIERS.indexOf(known);
+    if (exact >= 0) return exact;
+    const rank = effortRank(known);
+    return OWNER_TIERS.findIndex((owner) => effortRank(owner) >= rank);
+}
+
+/** The primary is independent; tolerant helper bounds are ordered without moving it. */
+export function normalizeEffortRange(range = {}) {
+    const pick = key => effortTier(range?.[key]) || EFFORT_RANGE_DEFAULT[key];
+    const min = pick('min'), max = pick('max');
+    const ordered = effortRank(min) <= effortRank(max);
+    return { min: ordered ? min : max, recommended: pick('recommended'), max: ordered ? max : min };
+}

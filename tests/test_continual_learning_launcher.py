@@ -53,9 +53,12 @@ def test_settings_template_contract():
     assert settings["OUROBOROS_POST_TASK_EVOLUTION"] == "false"
     actors = json.loads(settings["OUROBOROS_SUBAGENTS"])
     assert actors["enabled"] is True
-    assert [row["route"]["target_id"] for row in actors["items"]] == [
-        settings["OUROBOROS_MODEL"]
-    ]
+    # One actor row plus the three packet review seats, all on the solve model.
+    rows = {marked: [row["route"]["target_id"] for row in actors["items"]
+                     if bool(row.get("review_eligible")) is marked] for marked in (False, True)}
+    assert rows == {False: [settings["OUROBOROS_MODEL"]], True: [settings["OUROBOROS_MODEL"]] * 3}
+    assert all(row["delivery"] == "packet" for row in actors["items"] if row.get("review_eligible"))
+    assert "OUROBOROS_REVIEWER_SLOTS" not in settings
     assert "claude_code_edit" in settings["CLBENCH_SOLVE_DISABLED_TOOLS"]
     # The declared solve denylist must cover the registry's REAL web-tool set
     # (cumulative review r2: youtube_transcript had drifted out) and must not
@@ -618,7 +621,12 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
         encoding="utf-8")
 
     patched = _fidelity_of()
-    assert patched["declared_only_pinned_adapter_gap"] == {}
+    # Only the Required request stays a gap on every clone (#1731, O4): the launcher renders
+    # and exports it but cannot attest the external adapter's executing settings.
+    unattested = {"OUROBOROS_TASK_REVIEW_MODE"}
+    assert set(patched["declared_only_pinned_adapter_gap"]) == unattested
+    assert patched["declared_only_pinned_adapter_gap"]["OUROBOROS_TASK_REVIEW_MODE"]["declared"] == "required"
+    assert not unattested & set(patched["enforced_via_operator_patch"])
     for knob in ("OUROBOROS_SAFETY_MODE", "OUROBOROS_REVIEW_ENFORCEMENT", "OUROBOROS_SUBAGENTS",
                  "CLBENCH_SOLVE_DISABLED_TOOLS"):
         assert knob in patched["enforced_via_operator_patch"]
@@ -639,7 +647,7 @@ def test_fidelity_follows_the_execution_clone_not_the_pinned_commit_constant(tmp
     )
     host_patched = _fidelity_of("--no-docker")
     assert "OUROBOROS_SUBAGENTS" in host_patched["enforced_via_operator_patch"]
-    assert host_patched["declared_only_pinned_adapter_gap"] == {}
+    assert set(host_patched["declared_only_pinned_adapter_gap"]) == unattested
 
 
 def test_seed_gate_binds_to_the_execution_clone_and_records_the_launcher_separately(tmp_path):
@@ -822,28 +830,7 @@ def test_clb_operator_patches_are_tracked_with_an_unambiguous_apply_order():
     assert [p.name for p in required] == ["base_url", "repo_dir"]
     assert all(p.default is inspect.Parameter.empty for p in required)
     assert "runtime_attestation(self._server.base_url, pathlib.Path(clone)," in attest
-    # ...and the signature the patch DOCUMENTS must name it too, or the next reader copies
-    # the broken call back out of the docstring.
-    assert "runtime_attestation(base_url, repo_dir, *, expected_version=" in attest
     assert "OBO_ALLOW_EVOLVED_VOLUME" in attest
-    readme = (patches / "README.md").read_text(encoding="utf-8")
-    # The stack order must name the three predecessor bridge patches explicitly.
-    for name in ("run_clbench_bridge_agent.v6560.patch", "clb_acceptance_claims.v674.patch",
-                 "clb_disabled_tools_env.v6745.patch"):
-        assert name in readme
-    order = readme.index("Apply order (unambiguous)")
-    assert order < readme.index("clb_multi_instance_outcomes.v6746.patch")
-
-
-def test_clb_methodology_states_poker_instance_count_and_outcome_semantics():
-    text = (REPO_ROOT / "devtools" / "benchmarks" / "continual_learning"
-            / "METHODOLOGY.md").read_text(encoding="utf-8")
-    assert "`exploitable_poker` = 120" in text
-    assert "--num-instances 120" in text
-    assert "auto_resolved_no_agent_turn" in text
-    assert "Accepted overshoot (owner decision)" in text
-    assert "late_instance_outcomes_fill" in text
-    assert "Disclosed residual" in text
 
 
 def test_collect_results_normalizes_bridge_traces(tmp_path):

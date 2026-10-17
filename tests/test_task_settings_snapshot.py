@@ -2,7 +2,6 @@
 
 import contextvars
 import json
-import socket
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -11,6 +10,7 @@ import pytest
 
 from ouroboros import config, model_wait, subagent_runtime
 from ouroboros.settings_integrity import task_settings_snapshot
+from tests._socket_seal import block_network_except_socketpair
 
 
 @pytest.fixture(autouse=True)
@@ -43,12 +43,14 @@ def isolated_runtime(tmp_path, monkeypatch):
     def no_network(*args, **kwargs):
         raise AssertionError("Snapshot regressions must never contact a provider")
 
-    monkeypatch.setattr(socket.socket, "connect", no_network)
+    block_network_except_socketpair(monkeypatch, no_network)
     yield data
 
 
 def document(label, *, safety="full", enforcement="blocking"):
-    row = {"slot_id": "critic", "route": {"kind": "api_chat", "target_id": f"openai::{label}"},
+    # The review pool: one marked catalog row whose model and effort name the document.
+    row = {"subagent_id": "critic", "recommended_use": "Reviews.", "review_eligible": True,
+           "route": {"kind": "api_model", "target_id": f"openai::{label}"},
            "effort": "high" if label == "old" else "low"}
     return {
         "OUROBOROS_MODEL": f"openai::{label}",
@@ -60,8 +62,7 @@ def document(label, *, safety="full", enforcement="blocking"):
         "OUROBOROS_MODEL_CONTEXT_WINDOWS": json.dumps({"main": 200000 if label == "old" else 400000}),
         "OUROBOROS_PROCESSING_PREFERENCE": "fast" if label == "old" else "economy",
         "OUROBOROS_EFFORT_TASK": "high" if label == "old" else "low",
-        "OUROBOROS_REVIEWER_SLOTS": json.dumps({"triad": [row], "scope": [dict(row, slot_id="scope")],
-                                                "advisory": {"enabled": False}}),
+        "OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": [row]}),
         "OUROBOROS_SAFETY_MODE": safety,
         "OUROBOROS_REVIEW_ENFORCEMENT": enforcement,
         "OUROBOROS_CONTEXT_MODE": "max" if label == "old" else "low",
@@ -85,12 +86,12 @@ def observe():
     from ouroboros.context_fit import _context_route
     from ouroboros.llm import LLMClient
     from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, model_role_option
-    from ouroboros.reviewer_slot_config import commit_triad_rows
+    from ouroboros.reviewer_slot_config import review_pool_rows
     from ouroboros.review_cycles import review_max_cycles
     from ouroboros.usage_accounting import current_usage_scope
 
     client = LLMClient()
-    row = commit_triad_rows()[0]
+    row = review_pool_rows()[0]
     route, settings = _context_route({})
     return {
         "model": client.default_model(), "light": config.get_light_model(),
@@ -306,7 +307,7 @@ def test_task_snapshot_does_not_become_explicit_probe_settings(monkeypatch):
     with config.task_settings_scope(snapshot):
         assert [client._resolve_remote_target(model) for model in models] == before
         assert before[0]["base_url"] == "https://api.openai.com/v1"
-        assert before[1]["api_key"] == "legacy"
+        assert before[1]["api_key"] == ""  # one compatible pair: a dedicated URL never borrows the legacy key
         explicit = client._resolve_remote_target("openai-compatible::model", settings=env)
         assert explicit["api_key"] == ""  # Request-local probe pair semantics unchanged.
         explicit = client._resolve_remote_target("openrouter::model", settings=env)
@@ -385,7 +386,9 @@ def test_simultaneous_admission_cannot_capture_half_projected_credentials(monkey
     with config.task_settings_scope(snapshot):
         assert config.runtime_setting("OPENAI_API_KEY") == "test-key-old"
         assert config.runtime_setting("OPENROUTER_API_KEY") == "test-router-old"
-        assert config.runtime_setting("OUROBOROS_MODEL") == "openai::old"
+        # Main is absent on disk: the publisher's projected Main is its own echo, not a choice (owner 2A),
+        # so the task captures the proposal for the access it captured — the credentials above say which.
+        assert config.runtime_setting("OUROBOROS_MODEL") == config.SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
 
 
 def test_real_immediate_consumers_remain_live():
@@ -417,16 +420,16 @@ def test_real_immediate_consumers_remain_live():
 
 
 def test_private_projection_uses_incoming_roster_and_keeps_empty_env(monkeypatch):
-    from ouroboros.reviewer_slot_config import commit_triad_rows
+    """A task's frozen settings carry its catalog, so the review pool a task sees is
+    the pool of ITS document even after the owner saves another; an empty string
+    the owner saved stays an empty string in the projection."""
+    from ouroboros.reviewer_slot_config import review_pool_rows
 
     def values(label):
         result = document(label)
         result["OUROBOROS_SUBAGENTS"] = json.dumps({"enabled": True, "items": [{
-            "subagent_id": "actor", "name": "Actor", "recommended_use": "Review",
+            "subagent_id": "actor", "name": "Actor", "recommended_use": "Review", "review_eligible": True,
             "route": {"kind": "api_model", "target_id": f"openai::{label}"}, "effort": "high"}]})
-        result["OUROBOROS_REVIEWER_SLOTS"] = json.dumps({
-            "triad": [{"slot_id": "critic", "subagent_id": "actor"}],
-            "scope": [{"slot_id": "scope", "subagent_id": "actor"}]})
         return result
 
     save_owner(values("old"))
@@ -436,14 +439,14 @@ def test_private_projection_uses_incoming_roster_and_keeps_empty_env(monkeypatch
         assert config.runtime_setting("OUROBOROS_RETURN_REASONING", "missing") == ""
         save_owner(values("new"))
         new = subagent_runtime.apply_task_start_settings()
-        assert commit_triad_rows()[0].target_id == "openai::old"
+        assert [row.target_id for row in review_pool_rows()] == ["openai::old"]
         with config.task_settings_scope(new):
-            assert commit_triad_rows()[0].target_id == "openai::new"
-            assert config.runtime_setting("OUROBOROS_REVIEW_MODELS") == "openai::new"
-        assert commit_triad_rows()[0].target_id == "openai::old"
+            assert [row.target_id for row in review_pool_rows()] == ["openai::new"]
+            assert json.loads(config.runtime_setting("OUROBOROS_SUBAGENTS"))["items"][0]["route"]["target_id"] == "openai::new"
+        assert [row.target_id for row in review_pool_rows()] == ["openai::old"]
 
 
-def test_plugin_settings_reader_keeps_grants_and_uses_task_values(tmp_path):
+def test_plugin_settings_reader_keeps_grants_and_reads_current_values(tmp_path):
     from ouroboros import extension_loader
 
     save_owner(document("old"))
@@ -457,9 +460,47 @@ def test_plugin_settings_reader_keeps_grants_and_uses_task_values(tmp_path):
     allowed, denied = impl(keys), impl([])
     save_owner(document("new"))
     with config.task_settings_scope(snapshot):
-        assert allowed.get_settings(keys) == {"OPENAI_API_KEY": "test-key-old", "CUSTOM_SERVICE_KEY": "test-custom-old"}
+        # A skill's permitted configuration is current; the task's own reads keep the snapshot.
+        assert allowed.get_settings(keys) == {"OPENAI_API_KEY": "test-key-new", "CUSTOM_SERVICE_KEY": "test-custom-new"}
         assert denied.get_settings(keys) == {}
-    assert allowed.get_settings(keys)["OPENAI_API_KEY"] == "test-key-new"
+        assert config.runtime_settings()["CUSTOM_SERVICE_KEY"] == "test-custom-old"
+        assert observe()["key"] == "test-key-old"
+
+
+def test_script_and_companion_env_read_current_permitted_values(tmp_path):
+    from ouroboros.extension_companion import companion_spawn_env
+    from ouroboros.skill_loader import SkillReviewState, find_skill, save_enabled, save_review_state, save_skill_grants
+    from ouroboros.tools import skill_exec
+    from ouroboros.tools.registry import ToolContext
+
+    skills, keys = tmp_path / "skills", ["CUSTOM_SERVICE_KEY", "OPENAI_API_KEY"]
+    (skills / "envreader" / "scripts").mkdir(parents=True)
+    (skills / "envreader" / "SKILL.md").write_text(
+        "---\nname: envreader\ndescription: Prints its env.\nversion: 0.1.0\ntype: script\n"
+        f"runtime: python3\nenv_from_settings: {json.dumps(keys)}\n"
+        "scripts:\n  - name: show.py\n    description: Print env.\n---\nbody\n", encoding="utf-8")
+    (skills / "envreader" / "scripts" / "show.py").write_text(
+        f"import json, os\nprint(json.dumps({{k: os.environ.get(k) for k in {keys!r}}}))\n", encoding="utf-8")
+    save_owner({**document("old"), "OUROBOROS_SKILLS_REPO_PATH": str(skills)})
+    data = config.DATA_DIR
+    loaded = find_skill(data, "envreader", repo_path=str(skills))
+    save_review_state(data, "envreader", SkillReviewState(status="pass", content_hash=loaded.content_hash))
+    save_enabled(data, "envreader", True)
+    save_skill_grants(data, "envreader", keys, content_hash=loaded.content_hash,
+                      requested_keys=keys, granted_permissions=[], requested_permissions=[])
+    snapshot = subagent_runtime.apply_task_start_settings()
+    save_owner({**document("new"), "OUROBOROS_SKILLS_REPO_PATH": str(skills)})
+    with config.task_settings_scope(snapshot):
+        raw = skill_exec._handle_skill_exec(ToolContext(repo_dir=tmp_path, drive_root=data),
+                                            skill="envreader", script="scripts/show.py")
+        printed = json.loads(json.loads(raw)["stdout"].strip().splitlines()[-1])
+        # Both granted keys are current, the shared model key included.
+        assert printed == {"CUSTOM_SERVICE_KEY": "test-custom-new", "OPENAI_API_KEY": "test-key-new"}
+        # A key without a grant is still never forwarded.
+        env = companion_spawn_env({"env": {}}, "token", env_allow=keys, granted_upper={"CUSTOM_SERVICE_KEY"},
+                                  skill="envreader", skill_dir=None, state_dir=tmp_path / "state")
+        assert env["CUSTOM_SERVICE_KEY"] == "test-custom-new" and "OPENAI_API_KEY" not in env
+        assert config.runtime_settings()["CUSTOM_SERVICE_KEY"] == "test-custom-old"
 
 
 def test_vision_child_gets_snapshot_env_without_snapshot_in_ipc(monkeypatch):

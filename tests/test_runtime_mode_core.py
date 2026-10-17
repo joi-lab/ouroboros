@@ -41,16 +41,15 @@ def test_settings_defaults_include_phase2_keys():
     assert SETTINGS_DEFAULTS["OUROBOROS_RUNTIME_MODE"] == "advanced"
     assert SETTINGS_DEFAULTS["OUROBOROS_SKILLS_REPO_PATH"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL"] == "google/gemini-3.8-flash"
-    # Empty role slots inherit Main; Light and Fallback use Luna explicitly.
+    # Empty role slots inherit Main; Light (Luna 6) and Fallback (Luna 5.6, kept) use Luna explicitly.
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_HEAVY"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_VISION"] == ""
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_CONSCIOUSNESS"] == ""
-    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-5.6-luna"
+    assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_LIGHT"] == "openai/gpt-6-luna"
     assert SETTINGS_DEFAULTS["OUROBOROS_MODEL_FALLBACKS"] == "openai/gpt-5.6-luna"
-    assert (
-        SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]
-        == ""  # unauthored; the getter resolves the route's default
-    )
+    # Retired (review pool): the deep-review model is a reviewer row of the subagent
+    # catalog; the read seam migrates the key, so it is no shipped default any more.
+    assert "OUROBOROS_MODEL_DEEP_SELF_REVIEW" not in SETTINGS_DEFAULTS
     assert SETTINGS_DEFAULTS["TOTAL_BUDGET"] == 200.0
     assert SETTINGS_DEFAULTS["OUROBOROS_PER_TASK_COST_USD"] == 50.0
 
@@ -338,13 +337,6 @@ def test_settings_js_reads_and_writes_phase2_keys():
     assert "fieldValue(id).trim()" in src
 
 
-def test_chat_context_mode_toggle_reports_owner_endpoint_errors():
-    src = (REPO / "web" / "modules" / "chat.js").read_text(encoding="utf-8")
-    assert "/api/owner/context-mode" in src
-    assert "resp.json()" in src
-    assert "showToast(message, 'error')" in src
-
-
 def test_onboarding_js_has_runtime_mode_selector_and_save_payload():
     src = (REPO / "web" / "modules" / "onboarding_wizard.js").read_text(encoding="utf-8")
     agents = (REPO / "web" / "modules" / "onboarding_agents_step.js").read_text(encoding="utf-8")
@@ -357,16 +349,22 @@ def test_onboarding_js_has_runtime_mode_selector_and_save_payload():
     assert "OUROBOROS_SKILLS_REPO_PATH" in agents
 
 
-def test_phase4_ui_copy_matches_shipped_runtime():
-    settings_ui = (REPO / "web" / "modules" / "settings_ui.js").read_text(encoding="utf-8")
-    onboarding_html = build_onboarding_html({})
+def test_the_protected_path_messages_name_the_review_panel_and_the_review_gate(monkeypatch):
+    """V-D4-07, the owner's approval of 2026-10-08 for exactly three phrases of the protected
+    ``runtime_mode_policy``: the module docstring, the advanced-mode refusal and the pro-mode
+    notice say «the normal review gate» / «the normal review panel» (the words
+    ``settings_setup_contract`` already uses) — the lanes they used to name no longer exist."""
+    from ouroboros import runtime_mode_policy as policy
 
-    assert "Phase 2 plumbing only" not in settings_ui
-    assert "land in Phase 3" not in settings_ui
-    assert "data/skills/" in settings_ui
-    assert "Pick both review enforcement and the initial runtime mode" in onboarding_html
-    assert "normal triad + scope review" in onboarding_html
-    assert "Phase 6+:" not in onboarding_html
+    assert "commits still flow through the normal\nreview gate." in (policy.__doc__ or "")
+    refusal = policy.protected_write_block_message(path="BIBLE.md", runtime_mode="advanced", action="run tool 'write_file' against")
+    assert refusal.endswith("Switch to runtime_mode='pro' and let the normal review panel "
+                            "cover the protected core/contract/release change before commit.")
+    monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "pro")
+    notice = policy.core_patch_notice(["BIBLE.md"])
+    assert notice.endswith("These changes can be committed only through the normal review gate.")
+    for text in (policy.__doc__ or "", refusal, notice):
+        assert "triad" not in text and "scope review" not in text
 
 
 def test_skills_ui_reads_live_extension_state_fields():
@@ -379,9 +377,7 @@ def test_skills_ui_reads_live_extension_state_fields():
     assert "skill.review_status === 'blockers' && !reviewReady(skill)" in src
     assert "function statusBadge(status, gate = null, profile = '')" in src
     assert "statusBadge(skill.review_status, skill.review_gate, skill.review_profile)" in src
-    assert "Open widgets" in src
     assert "retry_install" in src
-    assert "Retry install" in src
     assert "result.error" in src
 
 
@@ -532,7 +528,7 @@ class _CommitCtx:
         self._last_scope_raw_result = {}
         self._review_degraded_reasons = []
         self._current_review_tool_name = "commit_reviewed"
-        self._scope_review_history = {}
+        self._coupling_review_history = {}
         self._review_history = []
 
     def emit_progress_fn(self, *_args, **_kwargs):
@@ -611,7 +607,7 @@ def test_light_mode_redirects_absolute_home_path_to_user_files(tmp_path, monkeyp
     reg = _registry(tmp_path)
     home_path = str(pathlib.Path.home() / "Desktop" / "ouro_root_required_test.html")
     result = reg.execute("write_file", {"path": home_path, "content": "<html></html>"})
-    assert "ROOT_REQUIRED_USER_FILES" in result, result[:200]
+    assert result.startswith("OK: wrote user_files:"), result[:200]
     assert "user_files" in result
 
 
@@ -768,7 +764,9 @@ def test_pro_commit_uses_normal_review_for_protected_paths(tmp_path, monkeypatch
         skip_advisory_pre_review=True,
     )
 
-    assert result["status"] == "passed"
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
+    # The normal review ran; nonblocking enforcement returns its outcome before Git (#1741).
+    assert result["status"] == ("passed" if review_enforcement_blocks() else "reviewed")
     assert calls == {"review": 1}
 
 

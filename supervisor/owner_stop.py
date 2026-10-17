@@ -259,11 +259,12 @@ def _task_hard_bound_reached(q: Any, task_id: str, *, now: float) -> bool:
             # The SAME clock the queue's timeout rail reads: wall time minus the
             # quota union minus the separate budget-paused interval (#1196).
             clock = {key: meta.get(key) for key in
-                     ("started_at", "model_wait_quota_clock", "budget_paused_sec")}
+                     ("task", "started_at", "model_wait_quota_clock", "budget_paused_sec", "sleep_parked_at")}
         deadline_ts = float(q._task_deadline_ts(task) or 0.0)
         if deadline_ts and now >= deadline_ts:
             return True
-        absolute_ceiling = q.get_task_abs_ceiling_sec()  # None = no lifetime bound
+        from ouroboros.runtime_limits import resolve_task_execution_timeout_sec
+        absolute_ceiling = resolve_task_execution_timeout_sec(task, global_ceiling=q.get_task_abs_ceiling_sec())
         if float(clock.get("started_at") or 0.0) > 0 and absolute_ceiling is not None:
             return execution_elapsed_seconds(clock, now) >= float(absolute_ceiling)
         return False

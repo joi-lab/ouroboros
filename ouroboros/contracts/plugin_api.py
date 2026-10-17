@@ -344,6 +344,10 @@ class PluginAPI(Protocol):
 
         ``name`` is alphanumeric/underscore and <=24 chars. Handlers may be sync
         or async; async handlers run on a helper-thread event loop with timeout.
+        A JSON result may carry ``observed_effect: true`` only after the producer
+        observed an executed external effect. Proposals, reads and unconfirmed
+        requests omit it. The host retains the exact receipt for result review;
+        this fact proves neither goal success nor permission for another action.
         """
         ...
 

@@ -6,14 +6,17 @@
 // buttons and the agent's tool mean exactly the same thing. Skill rows retain an
 // owner override in the existing schedule store, so a lifecycle resync cannot undo it.
 
-import { fetchJson } from './api_client.js';
+import { fetchJson, isStoreMigrating } from './api_client.js';
 import { setInlineStatus } from './ui_helpers.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { taskCancelPending } from './log_events.js';
+import { waitingModel } from './project_activity.js';
+import { censusTaskFacts, censusTaskPhase, paintTaskPhase } from './task_phase_chip.js';
 import {
     ACTION_HURRY,
     ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
+    heldWorkFacts,
     hurryTaskAction,
     isRootTaskRow,
     openTaskControlMenu,
@@ -32,16 +35,50 @@ function esc(value) {
 
 const getJson = (url) => fetchJson(url, { cache: 'no-store' });
 
+// Census phases that only say the task is still active.
+const ACTIVE_PHASES = new Set(['working', 'thinking', 'finalizing']);
+
+/** The shared chip for a row whose OWN census facts (its activity_id, never its root's: a
+ * child must not borrow a parent's result) know its outcome; null keeps the row's own word.
+ * The outcome is the status and an unfinished fact its quieter second one (DESIGN "Status and
+ * chips"). A queue row passes its own wait or hold word (`queueFact`, '' for plain running),
+ * which outranks a merely active census phase; membership and controls stay with the queue
+ * and census. Activity shows no model-call telemetry, so `model_activity` never reaches it. */
+export function ownOutcomePhase(activity, queueFact = null) {
+    const facts = activity ? censusTaskFacts(activity) : null;
+    if (!facts?.outcome || !(facts.ended || facts.finalizing)) return null;
+    const { model_activity: _telemetry, ...own } = activity;
+    if (queueFact !== null) delete own.project_admission_hold;  // the queue line already names it
+    const view = censusTaskPhase(own, null, true, waitingModel(own));
+    return queueFact && (!view.secondary || (ACTIVE_PHASES.has(own.phase) && !view.waiting))
+        ? { ...view, secondary: queueFact, secondaryMotion: false } : view;
+}
+
+/** An answered root whose late work remains (D10) names its own work, when it answered,
+ * and that only the work left after the delivered answer waits — never a generic turn. */
+function lateWorkHtml(a, late) {
+    const at = new Date(String(late.answered_at || ''));
+    const iso = Number.isNaN(at.getTime()) ? '' : at.toISOString();
+    const when = iso ? ` <time datetime="${esc(iso)}" title="${esc(iso)}">${esc(at.toLocaleString([], {
+        month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }))}</time>` : '';
+    const state = { budget_paused: 'paused', budget_pausing: 'pausing', unknown: 'status unknown' }[a.phase] || 'running';
+    // The state leads: a narrow row's ellipsis may cut the time, never what waits.
+    return { name: esc(late.title || 'Answered task'), sub: `Remaining work ${state} · answer delivered${when}` };
+}
+
 /** A census-only live root (a direct turn, or an answered root whose late work the owner
- * paused, D10): its phase, and the shared control — Resume once the census says Paused. */
-export function liveActivityRowHtml(a, nowMs = Date.now()) {
+ * paused, D10): its phase, and the shared control — Resume once the census says Paused.
+ * `slot` marks where the caller paints a known outcome (`ownOutcomePhase`). */
+export function liveActivityRowHtml(a, nowMs = Date.now(), slot = null) {
     const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
     const started = Number(a.started_at) || 0;
     const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(nowMs / 1000 - started))}s` : '';
+    const late = a.late_work && typeof a.late_work === 'object' ? lateWorkHtml(a, a.late_work) : null;
+    const outcome = !late && slot && ownOutcomePhase(a);
     return `<div class="activity-row">
                 <div class="activity-row-main">
-                    <span class="activity-name">${esc(names[a.kind] || 'Live turn')}</span>
-                    <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
+                    <span class="activity-name">${late ? late.name : esc(names[a.kind] || 'Live turn')}</span>
+                    <span class="activity-sub">${late ? late.sub : `${outcome ? slot(outcome) : esc(a.phase || '')}${elapsed}`}</span>
                 </div>
                 <div class="activity-row-actions">
                     <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1"${a.phase === 'budget_paused' ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
@@ -205,6 +242,7 @@ export function initActivity({ mount, ws } = {}) {
     if (!mount) return { refresh: () => {} };
     let busy = false;
     let refreshRevision = 0;
+    let migrationTimer = null, destroyed = false;
     // Remembered across re-renders: the owner's retained-history disclosure state.
     let historyOpen = false;
     mount.innerHTML = `<div class="activity-scroll">
@@ -222,10 +260,24 @@ export function initActivity({ mount, ws } = {}) {
         root.append(status, content);
         return { root, status, content, loaded: false };
     });
+    // Known-outcome chips of the last queue render; paintTaskPhase writes them into
+    // their slots once the markup is mounted. The words come from the translation seam.
+    let phaseViews = [];
+    const phaseSlot = (view) => `<span class="activity-phase" data-i18n-skip><span data-activity-phase="${
+        phaseViews.push(view) - 1}"></span><span class="chat-live-phase-secondary" hidden></span></span>`;
 
     function renderQueue(queue, census) {
         if (!Array.isArray(queue?.running) || !Array.isArray(queue?.pending)) throw new Error('Queue unavailable');
         const { running, pending } = queue;
+        const activities = Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [];
+        const phases = new Map(activities.map((a) => [String(a?.activity_id || ''), a?.phase]));
+        const rootPhases = new Map();
+        for (const q of [...running, ...pending]) {
+            const t = q?.task || {}, id = String(q.id || t.id || '');
+            // The census contains roots only; compact pending snapshots may omit retry lineage.
+            if (phases.has(id)) rootPhases.set(String(t.root_task_id || id), phases.get(id));
+        }
+        phaseViews = [];
         // #322: the snapshot already carries the pause truth — a member's own
         // _budget_pause row, or a root fence covering its tree.
         const liveFences = ((queue && queue.budget_root_fences) || [])
@@ -247,42 +299,56 @@ export function initActivity({ mount, ws } = {}) {
             const id = esc(q.id || t.id || '');
             const label = esc(t.title || t.objective || t.text || q.type || id || 'task');
             const rt = kind === 'running' && q.runtime_sec != null ? ` · ${Math.round(q.runtime_sec)}s` : '';
-            const paused = rowBudgetPaused(q, t, kind);
             // The owner's Restart holds never-started work under the same
             // hold carrier (restart_retention.py): same Resume, its own words.
-            const restartHeld = heldRow(t) && t._budget_pause_hold.reason === 'owner_restart_hold';
+            // Work saved before an application stop (saved_work_hold, #1563) has
+            // the census's same "after restart" cause; it is never a money pause.
+            const restartHeld = heldRow(t)
+                && ['owner_restart_hold', 'saved_work_hold'].includes(t._budget_pause_hold.reason);
+            // A held Continue waits on its predecessor's unsettled work, not on money (#1721).
+            const continueHeld = heldRow(t) && t._budget_pause_hold.reason === 'continuation_writer_unsettled';
             const waiting = q.owner_wait;
             const warmSleeping = kind === 'running' && waiting?.state === 'waiting'
                 && waiting.reason === 'sleep' && waiting.sleep?.mode === 'warm';
             const sleeping = t._budget_pause?.reason === 'sleep' || warmSleeping;
             const ownerPaused = t._budget_pause?.reason === 'owner'
                 || ownerFencedRoots.has(String(t.root_task_id || t.id || q.id || ''));
-            const phase = (census?.active_chat_activities || []).find((entry) =>
-                entry.activity_id === String(t.root_task_id || t.id || q.id || ''))?.phase;
+            const authorityPaused = t._budget_pause?.reason === 'authority';
+            // Census addresses the current physical retry. Children use that actor's phase,
+            // while a separate late-work row keeps its own identity and controls.
+            const ownId = String(q.id || t.id || ''), rootId = String(t.root_task_id || ownId);
+            const phase = phases.get(ownId) ?? rootPhases.get(rootId) ?? phases.get(rootId);
+            const paused = rowBudgetPaused(q, t, kind) || (ownerPaused && phases.get(ownId) === 'budget_paused');
             const resumable = paused && (!ownerPaused || phase === 'budget_paused');
             const kindLabel = phase === 'unknown' ? 'pause status unknown'
                 : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
-                : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping' : 'paused (budget)') : sleeping ? 'sleeping' : kind);
-            const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+                : continueHeld ? 'held: earlier work not proven settled'
+                : (paused ? (ownerPaused ? 'paused' : sleeping ? 'sleeping'
+                    : authorityPaused ? 'paused (technical)' : 'paused (budget)') : sleeping ? 'sleeping' : kind);
+            // A result is still the row's own, beside its wait word.
+            const outcome = ownId && ownOutcomePhase(activities.find((entry) => entry?.activity_id === ownId),
+                kindLabel === 'running' ? '' : kindLabel);
+            const heldFacts = continueHeld ? heldWorkFacts(t._budget_pause_hold.blockers) : '';
+            const meta = `${outcome ? phaseSlot(outcome) : esc(kindLabel)}${heldFacts ? ` · ${esc(heldFacts)}` : ''}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             const hold = t.project_admission_hold;
             const projectWait = hold?.label ? ` · ${esc(hold.label)}: ${esc(hold.detail || hold.reason)}` : '';
-            return `<div class="activity-row">
+            // The held cause is what the owner reads before Resume: it wraps, never ellipsized.
+            return `<div class="activity-row${continueHeld ? ' activity-held' : ''}">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
                     <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${resumable ? ' data-budget-paused="1"' : ''}${isRootTaskRow(t, q.id || t.id) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${resumable ? ' data-budget-paused="1"' : ''}${phases.has(ownId) || isRootTaskRow(t, ownId) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
         // Queue facts keep their runtime/budget controls. The census adds only
         // missing identities; queued direct turns can appear in both sources.
         const known = new Set([...running, ...pending].map((q) => String(q.id || q.task?.id || '')));
-        const live = (Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [])
-            .filter((a) => a && !known.has(String(a.activity_id || '')));
+        const live = activities.filter((a) => a && !known.has(String(a.activity_id || '')));
         const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')),
-            ...live.map((a) => liveActivityRowHtml(a))];
+            ...live.map((a) => liveActivityRowHtml(a, Date.now(), phaseSlot))];
         if (parts.length) return parts.join('');
         return census?.active_chat_activities_complete === true
             ? '<div class="activity-empty">Nothing running or queued.</div>'
@@ -368,6 +434,8 @@ export function initActivity({ mount, ws } = {}) {
     }
 
     async function refresh() {
+        if (destroyed) return;
+        clearTimeout(migrationTimer); migrationTimer = null;
         const revision = ++refreshRevision;
         rememberDisclosure();
         const focused = focusedControl();
@@ -383,7 +451,7 @@ export function initActivity({ mount, ws } = {}) {
             getJson('/api/state'),
             getJson('/api/schedules'),
         ]);
-        if (revision !== refreshRevision) return;
+        if (destroyed || revision !== refreshRevision) return;
         // A request can take long enough for the owner to move focus elsewhere.
         // Only restore the original control when it is still the active owner;
         // if this render detaches it, activeElement is still the original node
@@ -403,9 +471,16 @@ export function initActivity({ mount, ws } = {}) {
                 // while a poll is pending is not undone by a stale snapshot.
                 if (index === 2) rememberDisclosure();
                 content.innerHTML = renderers[index](result.value);
+                content.querySelectorAll('[data-activity-phase]').forEach((el) => paintTaskPhase(
+                    el, phaseViews[Number(el.dataset.activityPhase)], el.nextElementSibling));
                 section.loaded = true;
                 setInlineStatus(status, '');
-            } catch {
+            } catch (error) {
+                if (isStoreMigrating(error)) {
+                    setInlineStatus(status, 'Saved tasks are being upgraded…');
+                    migrationTimer ??= setTimeout(refresh, 700);
+                    return;
+                }
                 setInlineStatus(status, section.loaded
                     ? 'Could not refresh. Previously loaded values shown; current state is unknown. Reopen Activity to try again.'
                     : 'Could not load. Current state is unknown. Reopen Activity to try again.', 'error');
@@ -471,9 +546,10 @@ export function initActivity({ mount, ws } = {}) {
                         }
                         // Same declared semantics as the chat card (v6.82): the
                         // task AND its live subtree, so stopping an orchestrator
-                        // never orphans its running subagents. Soft stop answers
-                        // 202 with the intent open; immediate answers after the
-                        // teardown — either way the refresh shows honest state.
+                        // never orphans its running subagents. A soft stop answers
+                        // 202 with the intent open; an immediate stop answers 200
+                        // once torn down or 202 pending while the intent is still
+                        // being driven — either way the refresh shows honest state.
                         await requestStop(id, action);
                     } catch (exc) {
                         // A 404 is the documented completion race (the run
@@ -534,9 +610,14 @@ export function initActivity({ mount, ws } = {}) {
         }
     });
 
-    window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
+    const shown = (event) => {
         if (event?.detail?.tab === 'activity') refresh();
-    });
+    };
+    window.addEventListener('ouro:dashboard-subtab-shown', shown);
 
-    return { refresh };
+    return { refresh, destroy() {
+        destroyed = true;
+        clearTimeout(migrationTimer);
+        window.removeEventListener('ouro:dashboard-subtab-shown', shown);
+    } };
 }

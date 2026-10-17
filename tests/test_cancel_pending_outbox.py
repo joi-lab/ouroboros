@@ -87,6 +87,7 @@ def test_pending_outbox_gives_up_loudly_instead_of_retrying_forever(tmp_path, mo
         assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == [
             event["delivery_id"],
         ]
+        queue.release_all()  # the handler returned without a receipt: the copy is no longer outstanding
     assert notices == [], "no give-up notice while attempts remain"
     _age_pending_rows(tmp_path)
     assert td.replay_pending_deliveries(tmp_path, event_queue=queue) == []

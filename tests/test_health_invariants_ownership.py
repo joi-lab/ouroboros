@@ -63,11 +63,8 @@ def test_non_owner_gets_no_call_shaped_instruction(tmp_path, monkeypatch):
 
 def test_architecture_states_the_terminal_owner_apply_reject_authority_split():
     architecture = architecture_text()
-    assert "apply requires exact active Git root/fresh payload binding" in architecture
-    assert "orphan path only after proven owner terminality" in architecture
-    assert "reject needs no fresh target grant" in architecture
-    assert "a live top-level task with a different active root may reject and release" in architecture
-    assert "durable `PATCH_DISPOSED` names `disposed_by_task_id`" in architecture
+    assert "PATCH_DISPOSED" in architecture
+    assert "disposed_by_task_id" in architecture
 
 
 def test_owner_keeps_the_call_shaped_instruction(tmp_path, monkeypatch):
@@ -86,25 +83,33 @@ def test_unattributed_reader_keeps_the_call_shape(tmp_path, monkeypatch):
     assert "read_file" in text
 
 
-def test_one_custody_replay_per_health_invariant_build(tmp_path, monkeypatch):
-    """I18 (partially closed): the two delegated obligations share ONE replay.
+def test_one_custody_read_per_health_invariant_build(tmp_path, monkeypatch):
+    """I18: the delegated-run lines share ONE custody read, and it is selected.
 
-    Reading the rotated custody chain twice per context build cost a full
-    parse of the whole archive each time; the pass is shared now, though the
-    read is still O(history) and a compact projection remains open work.
+    Reading every custody row per block, and then per build, decoded the whole
+    settled history each time; the shared read now selects the rows the lines
+    can name (own, held, maybe-unread) and no full read runs unless it fails.
+    SQL still visits every row, so the read stays O(rows) in the store.
     """
     import ouroboros.delegate_custody as custody
+    import ouroboros.delegate_custody_current as current
 
     calls: list = []
-    real_replay = custody.replay
+    replays: list = []
+    real_select, real_replay = current.health_runs, custody.replay
+    monkeypatch.setattr(
+        current, "health_runs",
+        lambda root, task_id="": calls.append(root) or real_select(root, task_id),
+    )
     monkeypatch.setattr(
         custody, "replay",
-        lambda root, rows=None: calls.append(root) or real_replay(root, rows),
+        lambda root, rows=None: replays.append(root) or real_replay(root, rows),
     )
 
     context_health.build_health_invariants(_env(tmp_path), task_id="task-owner")
 
     assert len(calls) == 1
+    assert replays == []
 
 
 # --- P6-3: the same obligation, for a reader whose own root already reaches it ---

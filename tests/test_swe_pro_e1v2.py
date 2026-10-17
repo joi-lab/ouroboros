@@ -236,7 +236,8 @@ def test_e1v2_run_instance_runtime_mode_passthrough(tmp_path, monkeypatch):
            "problem_statement": "p", "requirements": "", "interface": ""}
     base = dict(out_dir=str(tmp_path), self_improve=False, model_name="m", mem_limit="",
                 solve_model="openai/gpt-5.5", per_task_cost=5.0, solve_timeout=10, absorb_max=10,
-                reflect_min=1, reflect_max=1, quiet_stable=1, memory_mode="empty", disable_tools="x")
+                reflect_min=1, reflect_max=1, quiet_stable=1, memory_mode="empty", disable_tools="x",
+                review_slots=3, review_effort="")
 
     run_pro.run_instance("inst__a", row, _types.SimpleNamespace(runtime_mode="light", **base),
                          "key", tmp_path / "seed.json", 5.0)
@@ -689,7 +690,7 @@ def test_e1v2_auto_run_gates_before_docker_and_records_the_final_outcome(tmp_pat
         manifest_seen_by[name] = (out_dir / "auto_run_manifest.json").is_file()
         return value
 
-    monkeypatch.setattr(auto_run, "reflections", lambda vsuf: _mark("reflections", 0))
+    monkeypatch.setattr(auto_run, "knowledge_revisions", lambda vsuf: _mark("knowledge_revisions", 0))
     monkeypatch.setattr(auto_run, "seed_stamp", lambda vsuf: _mark("seed_stamp", "6.75.0 abc"))
     monkeypatch.setattr(auto_run, "snapshot", lambda lg, vsuf: _mark("snapshot", False))
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
@@ -707,7 +708,7 @@ def test_e1v2_auto_run_gates_before_docker_and_records_the_final_outcome(tmp_pat
     # `assert_seed` moved AFTER `manifest`: it is a FILESYSTEM assertion, so refusing on it before
     # admission left that refusal with no durable record (the earlier order asserted the opposite
     # and was wrong). Everything with a cost or a side effect still follows the manifest.
-    assert order == ["manifest", "assert_seed", "ensure_util_image", "reflections", "seed_stamp",
+    assert order == ["manifest", "assert_seed", "ensure_util_image", "knowledge_revisions", "seed_stamp",
                      "snapshot"]
     assert manifest_seen_by["assert_seed"] is True           # durable before the seed-shape check
     assert manifest_seen_by["ensure_util_image"] is True     # durable before the first docker call
@@ -897,7 +898,7 @@ def test_e1v2_auto_run_records_a_crash_instead_of_leaving_started(tmp_path, monk
 
     out_dir = tmp_path / "auto"
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
-    monkeypatch.setattr(auto_run, "reflections", lambda vsuf: 0)
+    monkeypatch.setattr(auto_run, "knowledge_revisions", lambda vsuf: 0)
 
     def _boom(vsuf):
         raise RuntimeError("docker volume inspect failed")
@@ -929,7 +930,7 @@ def test_e1v2_auto_run_records_a_campaign_fatal_refusal_with_its_real_exit_statu
 
     out_dir = tmp_path / "auto"
     monkeypatch.setenv("OPENROUTER_API_KEY", "k")
-    monkeypatch.setattr(auto_run, "reflections", lambda vsuf: 0)
+    monkeypatch.setattr(auto_run, "knowledge_revisions", lambda vsuf: 0)
     monkeypatch.setattr(auto_run, "seed_stamp", lambda vsuf: "6.75.0 abc")
     monkeypatch.setattr(auto_run, "snapshot", lambda lg, vsuf: True)
 

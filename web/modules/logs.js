@@ -1,4 +1,4 @@
-import { escapeHtml } from './utils.js';
+import { escapeHtml, escapeHtmlAttr } from './utils.js';
 import { apiFetch } from './api_client.js';
 import { setInlineStatus } from './ui_helpers.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
@@ -184,10 +184,11 @@ export function initLogs({ ws, state, mount }) {
                 phase: view.phase || 'info',
                 headline: view.headline || 'Event',
             })}
-            ${execution ? `<div class="harness-chip log-executor-chip" title="${escapeHtml(execution.title || '')}">${harnessIdentityMarkup(execution.harness, {
+            ${execution ? `<div class="harness-chip log-executor-chip" title="${escapeHtmlAttr(execution.title || '')}">${harnessIdentityMarkup(execution.harness, {
                 label: execution.label || '',
                 className: 'log-executor-identity',
             })}</div>` : ''}
+            ${execution?.title ? `<div class="log-body log-executor-detail">${escapeHtml(execution.title)}</div>` : ''}
             ${metaPills(view.meta)}
             ${bodyHtml}
             <div class="log-actions">
@@ -228,6 +229,7 @@ export function initLogs({ ws, state, mount }) {
             })}
             <div class="log-task-summary" data-task-summary></div>
             <div class="harness-chip log-executor-chip" data-task-executor hidden></div>
+            <div class="log-body log-executor-detail" data-task-executor-detail hidden></div>
             <div class="log-body log-task-review" data-task-review hidden></div>
             <details class="log-task-details">
                 <summary>Timeline</summary>
@@ -243,11 +245,13 @@ export function initLogs({ ws, state, mount }) {
             count: entry.querySelector('[data-task-count]'),
             summary: entry.querySelector('[data-task-summary]'),
             executor: entry.querySelector('[data-task-executor]'),
+            executorDetail: entry.querySelector('[data-task-executor-detail]'),
             review: entry.querySelector('[data-task-review]'),
             timeline: entry.querySelector('[data-task-timeline]'),
             events: 0,
             category,
             recent: [],
+            terminal: false,
         };
         taskGroups.set(groupId, record);
         return record;
@@ -308,9 +312,18 @@ export function initLogs({ ws, state, mount }) {
         record.ts.textContent = ts;
         record.kind.textContent = kindLabel;
         record.kind.className = `log-type ${category}`;
-        record.phase.textContent = view.phase || 'info';
-        record.phase.className = `log-phase ${view.phase || 'info'}`;
-        record.headline.textContent = view.headline || 'Task activity';
+        // The card's headline settles only on the typed task_done frame. The bus
+        // serves control before telemetry, so a task's late tool or round frame
+        // (its own `done`/`error` phase included) can arrive after its task_done:
+        // it stays a timeline row and never reopens or rewrites the settled
+        // headline. Until then the headline follows the latest frame.
+        const settles = evt.type === 'task_done';
+        if (settles || !record.terminal) {
+            record.phase.textContent = view.phase || 'info';
+            record.phase.className = `log-phase ${view.phase || 'info'}`;
+            record.headline.textContent = view.headline || 'Task activity';
+        }
+        if (settles) record.terminal = true;
         record.count.textContent = `x${record.events}`;
         record.count.hidden = record.events <= 1;
         record.summary.innerHTML = metaPills([`task=${groupId}`, ...view.meta]);
@@ -322,6 +335,9 @@ export function initLogs({ ws, state, mount }) {
                 className: 'log-executor-identity',
             });
             record.executor.hidden = false;
+            // The chip stays quiet; its detail sentence is text, never only a title.
+            record.executorDetail.textContent = execution.title || '';
+            record.executorDetail.hidden = !execution.title;
         }
         const reviewDetails = formatReviewProjection(evt.review_projection);
         if (reviewDetails && record.review) {

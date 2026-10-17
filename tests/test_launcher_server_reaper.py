@@ -351,34 +351,31 @@ def test_windows_sweeps_nothing(monkeypatch):
 # Launcher wiring
 # ---------------------------------------------------------------------------
 
-def test_the_sweep_runs_per_generation_between_record_cleanup_and_the_port_sweep(monkeypatch):
-    """Behavioural: the per-generation helper really wires the three phases in order
-    and hands the sweep's survivors through to the caller."""
+def test_the_sweep_runs_per_generation_after_record_cleanup_and_no_port_sweep(monkeypatch):
+    """Behavioural: the per-generation helper runs the record cleanup, then the stray
+    sweep, and hands BOTH kinds of unresolved PIDs to the caller; no port is swept."""
     import launcher
 
     calls: list = []
     monkeypatch.setattr(
-        launcher, "_cleanup_recorded_server_process", lambda reason: calls.append(("record", reason))
+        launcher, "_cleanup_recorded_server_process", lambda reason: calls.append(("record", reason)) or [17]
     )
     monkeypatch.setattr(
         launcher, "_reap_same_install_strays",
-        lambda reason: calls.append(("sweep", reason)) or [4242],
-    )
-    monkeypatch.setattr(
-        launcher, "_kill_stale_runtime_ports", lambda port: calls.append(("ports", port))
+        lambda reason: calls.append(("sweep", reason)) or [4242, 17],
     )
 
-    survivors = launcher._pre_generation_cleanup(8765)
+    unresolved = launcher._pre_generation_cleanup()
 
-    assert calls == [("record", "startup"), ("sweep", "startup"), ("ports", 8765)]
-    assert survivors == [4242]
+    assert calls == [("record", "startup"), ("sweep", "startup")]
+    assert unresolved == [17, 4242]
     # The lifecycle loop consumes exactly this helper before any start.
     loop_src = inspect.getsource(launcher.agent_lifecycle_loop)
-    assert loop_src.index("_pre_generation_cleanup(port)") < loop_src.index("proc = start_agent(port)")
+    assert loop_src.index("_pre_generation_cleanup()") < loop_src.index("proc = start_agent(port)")
 
 
 def test_a_proven_survivor_skips_start_agent_for_that_generation(monkeypatch):
-    """Behavioural: with a proven survivor reported, the generation must not start —
+    """Behavioural: with an unresolved predecessor reported, the generation must not start —
     the loop logs, waits, and comes back around instead of calling start_agent."""
     import threading
 
@@ -387,7 +384,7 @@ def test_a_proven_survivor_skips_start_agent_for_that_generation(monkeypatch):
     started: list = []
     shutdown = threading.Event()
 
-    def fake_cleanup(port):
+    def fake_cleanup():
         # First generation reports a survivor; ending the loop here keeps the
         # test to exactly one iteration.
         shutdown.set()
@@ -400,21 +397,15 @@ def test_a_proven_survivor_skips_start_agent_for_that_generation(monkeypatch):
 
     launcher.agent_lifecycle_loop(8765)
 
-    assert started == [], "a proven surviving stray must suppress start_agent"
+    assert started == [], "an unresolved predecessor must suppress start_agent"
 
 
-def test_the_preflight_sweep_follows_the_recorded_process_cleanup():
+def test_main_leaves_predecessor_cleanup_to_the_lifecycle_loop():
+    """main() no longer runs its own preflight copy: the loop's first generation does it."""
     import launcher
 
     src = inspect.getsource(launcher.main)
-    order = [
-        "acquire_pid_lock()",
-        '_cleanup_recorded_server_process("preflight")',
-        '_reap_same_install_strays("preflight")',
-        "_kill_stale_runtime_ports(port)",
-    ]
-    positions = [src.index(marker) for marker in order]
-    assert positions == sorted(positions)
+    assert "_cleanup_recorded_server_process(" not in src and "_reap_same_install_strays(" not in src
 
 
 def test_the_panic_and_window_close_path_performs_no_stray_sweep():

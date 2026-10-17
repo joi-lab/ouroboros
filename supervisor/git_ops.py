@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import datetime
 import json
 import logging
 import os
@@ -297,7 +296,11 @@ def _run_git_process_bounded(
             _active_subprocesses.discard(proc)
 
 
-def git_capture(cmd: List[str], *, timeout: Optional[float] = None) -> Tuple[int, str, str]:
+def git_capture(
+    cmd: List[str], *, timeout: Optional[float] = None, repair_index: bool = True,
+) -> Tuple[int, str, str]:
+    # A caller interpreting one physical command's effects can opt out of repair/retry;
+    # the final stderr alone cannot describe an earlier attempt or its index rebuild.
     # Same reason as utils.run_cmd: this stderr is PARSED (`_maybe_repair_git_index`
     # matches English git diagnostics), so the operator's locale must not decide
     # whether a repairable index error is recognised.
@@ -320,7 +323,7 @@ def git_capture(cmd: List[str], *, timeout: Optional[float] = None) -> Tuple[int
         stderr = str(raw_stderr or "").strip()
         if returncode == 0:
             return returncode, str(stdout or "").strip(), stderr
-        if _maybe_repair_git_index(stderr, timeout=timeout):
+        if repair_index and _maybe_repair_git_index(stderr, timeout=timeout):
             continue
         return returncode, str(stdout or "").strip(), stderr
     return returncode, str(stdout or "").strip(), stderr
@@ -355,62 +358,34 @@ def _resolve_managed_update_target(
     )
 
 
-def _stale_git_lock_paths(max_age_sec: float = 15.0) -> List[pathlib.Path]:
-    git_dir = current_repo_dir() / ".git"
-    if not git_dir.exists():
-        return []
-    candidates = [git_dir / "index.lock"]
-    stale_paths: List[pathlib.Path] = []
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    for path in candidates:
-        try:
-            age = now - path.stat().st_mtime
-        except FileNotFoundError:
-            continue
-        except Exception:
-            continue
-        if age >= max_age_sec:
-            stale_paths.append(path)
-    return stale_paths
-
-
 def _maybe_repair_git_index(stderr: str, *, timeout: Optional[float] = None) -> bool:
-    error_text = str(stderr or "")
-    error_lower = error_text.lower()
-    repaired = False
+    """Back up and rebuild an index whose content Git reports corrupt; True only once rebuilt.
 
-    if "index.lock" in error_lower:
-        for lock_path in _stale_git_lock_paths():
-            try:
-                lock_path.unlink()
-                repaired = True
-                log.warning("Removed stale git lock: %s", lock_path)
-            except Exception:
-                log.warning("Failed to remove stale git lock: %s", lock_path, exc_info=True)
-
-    corrupt_markers = (
-        "index file smaller than expected",
-        "index file corrupt",
-        "fatal: .git/index:",
-    )
-    if not any(marker in error_lower for marker in corrupt_markers):
-        return repaired
+    A held ``index.lock`` (its age proves no owner gone) or an index Git cannot
+    open, stat or map is returned to the caller as Git's own refusal; so is a
+    rebuild that fails, after the original index is put back beside its backup.
+    While the lock exists the index is not touched at all: the rebuild needs that
+    lock, and every read would otherwise leave one more backup behind.
+    """
+    error_lower = str(stderr or "").lower()
+    if not any(marker in error_lower for marker in ("index file smaller than expected", "index file corrupt")):
+        return False
 
     repo = current_repo_dir()
     git_dir = repo / ".git"
-    if not git_dir.exists():
-        return repaired
+    if not git_dir.exists() or (git_dir / "index.lock").exists():
+        return False
 
+    backup_path = None
     index_path = git_dir / "index"
     if index_path.exists():
         backup_path = git_dir / f"index.corrupt.{uuid.uuid4().hex[:8]}.bak"
         try:
             index_path.replace(backup_path)
-            repaired = True
             log.warning("Backed up corrupt git index to %s", backup_path)
         except Exception:
             log.warning("Failed to back up corrupt git index %s", index_path, exc_info=True)
-            return repaired
+            return False
 
     rebuild_cmd = ["git", "reset", "--mixed", "HEAD"]
     rebuild_env = {**os.environ, "LC_ALL": "C", "LANG": "C"}
@@ -437,7 +412,17 @@ def _maybe_repair_git_index(stderr: str, *, timeout: Optional[float] = None) -> 
         "Failed to rebuild git index after corruption: %s",
         rebuild_error,
     )
-    return repaired
+    if backup_path is not None:
+        # A missing index reads as every tracked file deleted, so the caller must not retry
+        # against it: the original bytes return under their own identity (a hard link keeps
+        # the backup and never replaces an index another writer published meanwhile).
+        try:
+            os.link(backup_path, index_path)
+        except FileExistsError:
+            pass
+        except OSError:
+            log.warning("Corrupt git index remains only at %s", backup_path, exc_info=True)
+    return False
 
 
 _REPO_GITIGNORE = """\

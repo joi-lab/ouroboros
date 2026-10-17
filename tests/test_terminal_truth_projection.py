@@ -17,6 +17,7 @@ from ouroboros.post_task_checkpoint import (
 )
 from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
 from ouroboros.task_status import load_effective_task_result
+from tests._store_shared import result_exists
 
 
 def _seed_atomic_race(tmp_path):
@@ -411,7 +412,7 @@ def test_terminal_truth_is_stable_before_and_after_physical_copyback(
     copied = copy_child_task_result(data, {"id": task_id, "drive_root": str(child)})
 
     assert copied is not None
-    assert (child / "task_results" / f"{task_id}.json").is_file()
+    assert result_exists(child, task_id)
     retained_child = load_task_result(child, task_id)
     assert retained_child["root_phase_checkpoint"]["post_task_synthesis"] == "running"
     _assert_terminal_projection(
@@ -736,7 +737,6 @@ def test_startup_recovery_merges_child_acceptance_after_stale_scan(
 ):
     import ouroboros.agent_task_pipeline as pipeline
     import ouroboros.headless as headless
-    import ouroboros.task_results as task_results
     import ouroboros.usage_accounting as usage_accounting
     import supervisor.state as supervisor_state
 
@@ -755,16 +755,17 @@ def test_startup_recovery_merges_child_acceptance_after_stale_scan(
     )
     scan_complete = threading.Event()
     release_scan = threading.Event()
-    real_list = task_results.list_task_results
+    from ouroboros import obligations
+    real_list = obligations.result_rows
     outcome = {}
 
-    def delayed_list(root):
-        rows = real_list(root)
+    def delayed_list(root, name, **kwargs):
+        rows = list(real_list(root, name, **kwargs))
         scan_complete.set()
         assert release_scan.wait(5)
         return rows
 
-    monkeypatch.setattr(task_results, "list_task_results", delayed_list)
+    monkeypatch.setattr(obligations, "result_rows", delayed_list)
     monkeypatch.setattr(
         supervisor_state,
         "reconstruct_task_cost",
@@ -910,7 +911,7 @@ def test_failed_checkpoint_write_emits_no_finalized_event(tmp_path, monkeypatch)
     assert appended == []
 
 
-def test_startup_recovery_surfaces_failed_running_checkpoint_persistence(tmp_path, monkeypatch):
+def test_startup_recovery_surfaces_failed_running_checkpoint_persistence(tmp_path, monkeypatch, caplog):
     import ouroboros.agent_task_pipeline as pipeline
     import ouroboros.post_task_checkpoint as checkpoint
 
@@ -925,10 +926,15 @@ def test_startup_recovery_surfaces_failed_running_checkpoint_persistence(tmp_pat
         },
     )
 
-    monkeypatch.setattr(checkpoint, "write_task_result", Mock(side_effect=TimeoutError))
+    error = TimeoutError("checkpoint write remained unavailable")
+    writer = Mock(side_effect=error)
+    monkeypatch.setattr(checkpoint, "write_task_result", writer)
 
-    with pytest.raises(RuntimeError, match="did not persist a terminal checkpoint"):
-        pipeline.recover_pending_root_post_task_synthesis(tmp_path, tmp_path / "repo")
+    assert pipeline.recover_pending_root_post_task_synthesis(tmp_path, tmp_path / "repo") == 0
+    failed = [record for record in caplog.records if "Post-task recovery remains owed" in record.getMessage()]
+    assert len(failed) == 1 and task_id in failed[0].getMessage()
+    assert failed[0].exc_info and failed[0].exc_info[1] is error
+    writer.assert_called_once()
 
     stored = load_task_result(tmp_path, task_id)
     assert stored["root_phase_checkpoint"]["post_task_synthesis"] == "running"

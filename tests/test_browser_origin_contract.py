@@ -1,7 +1,6 @@
 """An ordinary parent names concrete task targets; descendants only narrow them."""
 from __future__ import annotations
 
-import json
 import queue
 
 import pytest
@@ -13,6 +12,7 @@ from ouroboros.tools.control_subagent_spec import _validated_schedule_fields
 from ouroboros.tools.registry import ToolContext
 from supervisor.task_dispatch import build_scheduled_task_payload
 from tests._shared import configure_test_subagent
+from tests._store_shared import read_result
 
 
 @pytest.mark.parametrize("source,expected", [
@@ -49,7 +49,7 @@ def test_main_schedule_persists_target_and_child_can_only_inherit_or_narrow(tmp_
                             expected_output="Screenshot and findings", allowed_origins=origins)
     assert "error" not in answer.lower(), answer
     event = ctx.event_queue.get_nowait()
-    saved = json.loads((canonical / "task_results" / f"{event['task_id']}.json").read_text())
+    saved = read_result(canonical, event['task_id'])
     contract = event["task_contract"]
     assert saved["task_contract"]["resource_policy"]["allowed_origins"] == origins
     assert contract["source"] == "parent_delegation"
@@ -70,7 +70,7 @@ def test_main_schedule_persists_target_and_child_can_only_inherit_or_narrow(tmp_
     answer = _schedule_task(child, subagent_id=subagent, **request, allowed_origins=origins[:1])
     assert "error" not in answer.lower(), answer
     grandchild = child.event_queue.get_nowait()
-    saved = json.loads((canonical / "task_results" / f"{grandchild['task_id']}.json").read_text())
+    saved = read_result(canonical, grandchild['task_id'])
     assert saved["task_contract"]["resource_policy"]["allowed_origins"] == origins[:1]
     assert grandchild["task_contract"]["resource_policy"]["allowed_origins"] == origins[:1]
     assert child.task_contract["resource_policy"]["allowed_origins"] == origins

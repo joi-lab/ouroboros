@@ -41,6 +41,7 @@ HOT_CODE_PATHS = frozenset({
     # monoliths keeps the label (same parity rule as the D04 block above).
     "ouroboros/tools/control_events.py",
     "ouroboros/tools/control_routing.py",
+    "ouroboros/tools/control_relay.py",
     "ouroboros/tools/control_runtime.py",
     # v7 D07 split leaves: the rest of the hot control monolith moved out with
     # the D07 lane and keeps the label (same parity rule as the D04 block).
@@ -179,8 +180,9 @@ def assisted_objective(tx: Dict[str, Any]) -> str:
         "supervisor: MERGE_HEAD is set and the combined tree is staged for review. Do NOT run any git "
         "command (fetch/merge/commit/checkout are blocked) — the merge is already staged for you. "
         f"{work} Do not discard either side merely because a file is normally restricted. When ready, "
-        "run `preflight_review` with the commit message, then `commit_reviewed` (it will create the reviewed "
-        "2-parent merge commit), then `request_restart` to finish landing the update. "
+        "run `commit_reviewed` with the commit message (it will create the reviewed 2-parent merge commit; "
+        "`preflight_reviewer` optionally buys one early look first), then `request_restart` to finish landing the "
+        "update. "
         f"Terminal contract: if this task ends WITHOUT that reviewed merge commit landing (given up, "
         f"cancelled, or review not passed), the supervisor rolls the repository back to the pre-update "
         f"state; your resolution work is normally preserved (best-effort) on branch failed-update-{target} "

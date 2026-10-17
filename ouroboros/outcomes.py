@@ -4,7 +4,9 @@ Lifecycle, execution health, artifacts, review, and objective evaluation are
 separate axes. Tool errors remain evidence without degrading a delivered answer.
 Task acceptance or qualified Advisory author completion establishes objective
 success; neither final text nor absent tool errors can. Typed runtime evidence may conservatively
-degrade an otherwise ``not_evaluated`` objective.
+degrade an otherwise ``not_evaluated`` objective. An oversized ledger rides as
+a stub whose ``summary`` is re-projected from the artifact file; the stub is
+never a source for entries or axes.
 """
 
 from __future__ import annotations
@@ -459,8 +461,6 @@ _EFFECT_COMMIT_TOOLS = frozenset({"commit_reviewed", "vcs_commit_reviewed"})
 # runtime_data). Excluding by scratch — not enumerating "deliverable" roots —
 # keeps the immune gate complete as roots evolve and errs toward reviewing work.
 _SCRATCH_ROOTS = frozenset({"task_drive"})
-# Process/service tools that produce a registered deliverable when given outputs=[...].
-_EFFECT_PROCESS_TOOLS = frozenset({"run_command", "run_script", "start_service"})
 # Substantial cwd-based coding tools: none since D10 retired the SDK edit
 # gateway; the set stays so the projection shape (and its consumers) hold.
 _EFFECT_CODING_TOOLS = frozenset()
@@ -470,35 +470,38 @@ _EFFECT_CODING_TOOLS = frozenset()
 _EFFECT_INTEGRATION_TOOLS = frozenset({"integrate_subagent_patch", "integrate_delegated_patch"})
 
 
-def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, Any]]:
+def reviewable_effect_projection(llm_trace: Dict[str, Any], *, observed_only: bool = False) -> List[Dict[str, Any]]:
     """Return the structured tool effects shared by review and delivery binding.
 
     Reviewable effects are a successful repo commit; a successful write_file/
     edit_text/apply_patch/edit_batch to any non-scratch root; a successful
-    run_command/run_script/start_service that declared deliverable outputs; or any
-    successful tool that registered a canonical artifact (artifact_registered — a
+    tool that registered a canonical artifact (including partial output on error;
+    artifact_registered — a
     stopped service's outputs or a user_files write). Pure scratch (root=task_drive)
     write_file/edit_text does NOT count. Cognitive-memory updates go through
     update_identity/update_scratchpad/knowledge_write (not write tools) and are
     intentionally not effects; a light-mode generic cognitive write is
     advisory-redirected and never succeeds here. This is a P3 deterministic immune
     signal over observable runtime facts, never message-content inspection.
+    ``observed_only`` keeps calls whose outcome the host recorded (the loop always
+    stores a boolean ``is_error``; ``artifact_registered`` comes from the full
+    result): arguments without a recorded result are an intention, not production.
     """
     effects: List[Dict[str, Any]] = []
     for index, call in enumerate(llm_trace.get("tool_calls") or []):
-        if not isinstance(call, dict) or call.get("is_error"):
+        if not isinstance(call, dict):
             continue
-        if str(call.get("status") or "ok") not in _OK_TOOL_STATUSES:
+        artifact = call.get("artifact_registered") is True
+        if observed_only and not (artifact or isinstance(call.get("is_error"), bool)):
+            continue
+        succeeded = not call.get("is_error") and str(call.get("status") or "ok") in _OK_TOOL_STATUSES
+        if not (succeeded or artifact):
             continue
         tool = str(call.get("tool") or "")
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        is_effect = tool in _EFFECT_COMMIT_TOOLS or tool in _EFFECT_CODING_TOOLS or tool in _EFFECT_INTEGRATION_TOOLS
-        if tool in _ROOT_WRITE_TOOLS and str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
+        is_effect = succeeded and (tool in _EFFECT_COMMIT_TOOLS or tool in _EFFECT_CODING_TOOLS or tool in _EFFECT_INTEGRATION_TOOLS)
+        if succeeded and tool in _ROOT_WRITE_TOOLS and str(args.get("root") or "active_workspace") not in _SCRATCH_ROOTS:
             is_effect = True
-        if tool in _EFFECT_PROCESS_TOOLS:
-            outputs = args.get("outputs")
-            if isinstance(outputs, list) and any(str(item or "").strip() for item in outputs):
-                is_effect = True
         # Structured flag set from the full (untruncated) tool result at capture time;
         # covers stopped-service outputs and user_files writes regardless of preview length.
         if call.get("artifact_registered"):
@@ -515,9 +518,9 @@ def reviewable_effect_projection(llm_trace: Dict[str, Any]) -> List[Dict[str, An
     return effects
 
 
-def turn_has_reviewable_effects(llm_trace: Dict[str, Any]) -> bool:
+def turn_has_reviewable_effects(llm_trace: Dict[str, Any], *, observed_only: bool = False) -> bool:
     """True when the shared structured projection contains a real effect."""
-    return bool(reviewable_effect_projection(llm_trace))
+    return bool(reviewable_effect_projection(llm_trace, observed_only=observed_only))
 
 
 def _extract_outcome_tiers(runs: List[Dict[str, Any]]) -> List[str]:
@@ -694,6 +697,17 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
         "source": "task_acceptance_review" if objective != OBJECTIVE_NOT_EVALUATED else "none",
         "review_status": status,
     }
+
+
+def selected_final_answer(text: str, trace: Dict[str, Any]) -> str:
+    """The exact answer protocol selection shared by retention and final consumers."""
+    if any(line.strip().startswith(FINAL_ANSWER_MARKER) for line in str(text or "").splitlines()):
+        return extract_final_answer(text)  # an explicit empty selection withdraws the old answer
+    return (
+        str(trace.get("best_valid_final_answer") or "")
+        if len(trace.get("tool_calls") or []) <= int(trace.get("best_valid_final_answer_tools") or 0)
+        else ""
+    )
 
 
 def extract_final_answer(text: str) -> str:
@@ -1087,7 +1101,9 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_DEGRADED
         reason_code = usage_reason or REASON_AUTHORING_HANDOVER_INCOMPLETE
         failure = {"kind": "authoring_handover", "reason_code": reason_code}
-    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
+    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"} \
+            and not usage.get("wake_silent"):
+        # A typed wake-silent finish is intentional, unlike an ordinary empty final.
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
@@ -1141,25 +1157,10 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     objective = _objective_axis(review)
     execution_status, reason_code = _host_acceptance_failure_axes(
         acceptance_decision, llm_trace, objective, execution_status, reason_code)
+    # The planning gate holds or releases the final answer; it names no objective of its
+    # own (plans have no cycle cap, no quorum and no author stop: the stop path is the
+    # task's). Its open objections and pending asks ride ``execution.plan_review`` below.
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
-    _plan_gate_status = str(plan_gate.get("status") or "")
-    if _plan_gate_status == "author_stopped" or (str(plan_gate.get("enforcement") or "") == "blocking" and (
-        _plan_gate_status == "cycles_exhausted"
-        or (_plan_gate_status == "open" and plan_gate.get("quorum_unreachable"))
-    )):
-        # D27: a blocking plan review whose cycle cap is spent never closed — the
-        # task terminalizes BLOCKED, never best_effort. B2b extends the same honest
-        # terminal to a structurally unreachable reviewer quorum (the agent CHOSE to
-        # finalize; the review itself stays open and implementation stayed held).
-        _quorum_case = _plan_gate_status != "cycles_exhausted"
-        objective.update({
-            "status": OBJECTIVE_FAIL,
-            "source": ("plan_review_author_stop" if _plan_gate_status == "author_stopped" else "plan_review_quorum_unreachable" if _quorum_case
-                       else "plan_review_cycles_exhausted"),
-            "outcome_tier": OUTCOME_TIER_BLOCKED,
-            "reason": (str(plan_gate.get("review_capacity_reason") or "author_stop") if _plan_gate_status == "author_stopped" else REASON_REVIEW_QUORUM_UNREACHABLE if _quorum_case
-                       else REASON_REVIEW_CYCLES_EXHAUSTED),
-        })
     if deferred_child_count and objective.get("status") != OBJECTIVE_FAIL:
         objective.update({
             "status": OBJECTIVE_BEST_EFFORT,
@@ -1201,14 +1202,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
     # failure or an automatic review. Any recorded critic already judged its subject.
     if (cosmetic_tool_errors or tool_errors) and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
         _merge_objective_warning(objective, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
-    final_answer_payload = (
-        extract_final_answer(text)
-        or (
-            str(llm_trace.get("best_valid_final_answer") or "")
-            if len(llm_trace.get("tool_calls") or []) <= int(llm_trace.get("best_valid_final_answer_tools") or 0)
-            else ""
-        )
-    )
+    final_answer_payload = selected_final_answer(text, llm_trace)
     headline_reason = reason_code
     headline_failure = failure
     if (
@@ -1264,6 +1258,9 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # answer under review PRESSURE, which BIBLE Q7 says review must not let DOWNGRADE a
         # produced answer; new grounding (a higher tool count) instead invalidates the latch.
         "final_answer": final_answer_payload,
+        **({"selected_answer": llm_trace["acceptance_material"]["selected_answer"]}
+           if (llm_trace.get("acceptance_material") or {}).get("selected_answer", {}).get("text") == final_answer_payload
+           and final_answer_payload else {}),
         # v6.60.0: keyed on the TYPED final_answer payload (extracted OR latch-recovered),
         # not a re-scan of the final text — a task whose earlier-round answer was latched
         # is not "missing" one; marker-free tasks (no answer_protocol) simply read True,
@@ -1385,9 +1382,7 @@ def refresh_verification_ledger_artifacts(
     """Return ``ledger`` with artifact status synchronized after finalization."""
     if not isinstance(ledger, dict):
         return ledger
-    # An omitted-to-artifact stub is a PROJECTION of the artifact file, not a
-    # source: it carries no entries, so rebuilding from it would mint "0
-    # entries / no failures / execution ok" over the real ledger's summary.
+    # A stub has no entries: rebuilding from it would mint a clean "0 failures" summary.
     if ledger.get("omitted_to_artifact"):
         return ledger
     entries = [

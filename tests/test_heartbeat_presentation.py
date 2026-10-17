@@ -17,14 +17,6 @@ def _heartbeat_ctx(tmp_path, task):
     ), pushed
 
 
-def test_routine_heartbeat_is_not_rendered_as_chat_message() -> None:
-    from supervisor import queue
-
-    source = inspect.getsource(queue._enforce_task_timeouts_locked)
-    assert "running for" not in source
-    assert "heartbeat_lag=" not in source
-
-
 def test_liveness_and_incident_controls_remain_active() -> None:
     from supervisor import queue
 
@@ -185,16 +177,23 @@ def test_owner_visible_incidents_use_canonical_message_seam() -> None:
         assert "bridge.send_message(" not in source
 
 
-def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> None:
+def test_cancel_failure_wakes_the_intent_driver_and_says_nothing(monkeypatch) -> None:
+    """The cancel_task event is a wake for the durable intent's driver. A FAILED
+    outcome used to send a "❌ cancel … did not settle" row to the owner chat;
+    seven of the eight phantom cancelled-subagent cards in Main were that row,
+    drained 23–58 minutes after the watchdog had already settled the intent.
+    The intent stays open for the watchdog; the card and supervisor.jsonl are
+    the record, so the event publishes nothing for any outcome."""
     import supervisor.queue as q
     from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
     sent = []
-    # Phase A: the handler drives the TYPED custody outcome directly (the boolean
-    # facade collapsed already_settled into a false "✅ cancel").
+    seen = []
     monkeypatch.setattr(
-        q, "cancel_task_custody",
-        lambda task_id, **_kw: q.CANCEL_FAILED if task_id == "cancel-me" else q.CANCEL_NOT_FOUND,
+        q, "drive_cancel_intent_scope",
+        lambda task_id, **_kw: seen.append(task_id) or (
+            q.CANCEL_FAILED if task_id == "cancel-me" else q.CANCEL_NOT_FOUND
+        ),
     )
 
     class _Ctx:
@@ -208,32 +207,22 @@ def test_cancel_failure_is_progress_incident_not_chat_bubble(monkeypatch) -> Non
 
     _handle_cancel_task({"task_id": "cancel-me"}, _Ctx())
 
-    assert len(sent) == 1
-    args, kwargs = sent[0]
-    assert args[0] == 9
-    assert args[1].startswith("❌ cancel cancel-me")
-    assert "watchdog" in args[1]  # the intent stays open and is retried
-    assert kwargs == {
-        "role": "system", "system_type": "cancellation_notice",
-        "is_progress": True,
-        "task_id": "cancel-me",
-        "progress_meta": {
-            "task_incident": "cancellation_fault",
-            "toast_once": "cancel-me:cancellation_fault",
-        },
-    }
+    assert seen == ["cancel-me"]
+    assert sent == []
 
 
-def test_cancel_event_keeps_requested_retry_id_for_owner_presentation(monkeypatch) -> None:
+def test_cancel_event_drives_the_physical_retry_id_without_owner_presentation(monkeypatch) -> None:
+    """The event names the physical id the tool resolved; the logical
+    ``requested_task_id`` used to shape an owner notice and now shapes nothing."""
     import supervisor.queue as q
     from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
     captured = []
     monkeypatch.setattr(
         q,
-        "cancel_task_custody",
+        "drive_cancel_intent_scope",
         lambda task_id, **_kwargs: (
-            captured.append(("custody", task_id)) or q.CANCEL_FAILED
+            captured.append(("driver", task_id)) or q.CANCEL_FAILED
         ),
     )
 
@@ -253,16 +242,7 @@ def test_cancel_event_keeps_requested_retry_id_for_owner_presentation(monkeypatc
         _Ctx(),
     )
 
-    assert captured[0] == ("custody", "physical-retry-7f3a")
-    args, kwargs = captured[1]
-    assert args[1].startswith("❌ cancel stable-root")
-    assert "physical-retry-7f3a" not in args[1]
-    assert kwargs["task_id"] == "stable-root"
-    assert kwargs["progress_meta"] == {
-        "task_incident": "cancellation_fault",
-        "toast_once": "stable-root:cancellation_fault",
-        "cancel_physical_task_id": "physical-retry-7f3a",
-    }
+    assert captured == [("driver", "physical-retry-7f3a")]
 
 
 def test_routine_cancel_outcomes_publish_nothing_to_the_owner_chat(monkeypatch) -> None:
@@ -271,16 +251,16 @@ def test_routine_cancel_outcomes_publish_nothing_to_the_owner_chat(monkeypatch) 
     acknowledgement for cancelled / already-settled / not-found reached the
     GLOBAL owner chat as an untyped assistant row with no task identity — and
     for a pending-drop race the "had already finished" wording misstated the
-    causal history. Those three outcomes now publish nothing; only FAILED keeps
-    its typed progress incident (the test above)."""
+    causal history. The event is a wake for ``drive_cancel_intent_scope`` and
+    publishes nothing for any outcome, FAILED included (the test above)."""
     import supervisor.queue as q
     from supervisor.events_runtime_controls import _drive_cancel_task_event as _handle_cancel_task
 
-    for outcome in (q.CANCEL_CANCELLED, q.CANCEL_ALREADY_SETTLED, q.CANCEL_NOT_FOUND):
+    for outcome in (q.CANCEL_CANCELLED, q.CANCEL_ALREADY_SETTLED, q.CANCEL_NOT_FOUND, q.CANCEL_FAILED):
         sent = []
         seen = []
         monkeypatch.setattr(
-            q, "cancel_task_custody",
+            q, "drive_cancel_intent_scope",
             lambda task_id, **_kw: seen.append(task_id) or outcome,
         )
 
@@ -299,9 +279,9 @@ def test_routine_cancel_outcomes_publish_nothing_to_the_owner_chat(monkeypatch) 
         assert seen == ["child-A"], outcome  # custody still runs
         assert sent == [], (outcome, sent)   # no Main-chat speech, no untyped row
 
-    # A missing task id never reaches custody and still says nothing.
+    # A missing task id never reaches the driver and still says nothing.
     sent = []
-    monkeypatch.setattr(q, "cancel_task_custody", lambda task_id, **_kw: q.CANCEL_CANCELLED)
+    monkeypatch.setattr(q, "drive_cancel_intent_scope", lambda task_id, **_kw: q.CANCEL_CANCELLED)
 
     class _Ctx2:
         @staticmethod
@@ -314,7 +294,5 @@ def test_routine_cancel_outcomes_publish_nothing_to_the_owner_chat(monkeypatch) 
 
     _handle_cancel_task({"task_id": ""}, _Ctx2())
     assert sent == []
-    # The handler no longer carries the prose that leaked: source pin.
-    src = inspect.getsource(_handle_cancel_task)
-    for leaked in ("teardown confirmed", "had already finished", "no such live task"):
-        assert leaked not in src
+    # Custody owns presentation; this event handler must not send its own row.
+    assert "send_with_budget(" not in inspect.getsource(_handle_cancel_task)

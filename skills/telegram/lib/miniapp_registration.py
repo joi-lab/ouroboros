@@ -99,7 +99,7 @@ def _seed_starting_status(api: Any) -> None:
         except (TypeError, ValueError):
             age = 999
             pid = 0
-        if -60 <= age <= 45 and process_alive(pid):
+        if -60 <= age <= 45 and pid > 1 and process_alive(pid):
             return
     _atomic_json(
         path,
@@ -167,7 +167,8 @@ def _read_status(api: Any) -> dict[str, Any]:
             and result["state"] == "starting"
             and _bounded_text(value.get("reason_code"), 64) == "registered"
         )
-        alive = registration_pending or process_alive(pid)
+        # The companion is never PID 1: it is always the server's child.
+        alive = registration_pending or (pid > 1 and process_alive(pid))
         try:
             updated_at = int(value.get("updated_at_epoch") or 0)
         except (TypeError, ValueError):

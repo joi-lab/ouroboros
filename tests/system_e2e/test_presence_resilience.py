@@ -793,8 +793,8 @@ def _assert_panic_tears_down(server, oracle, member: str, diagnosis) -> None:
 def s33_candidate(tmp_path_factory):
     """The tree every S33 server runs. Preferred: ONE byte-faithful
     ``candidate_checkout`` of the working tree (uncommitted changes included),
-    which needs a dependency-only interpreter. The nightly lane installs the
-    checkout editable, which the candidate probe refuses; a CLEAN tree is then
+    which needs a dependency-only interpreter, as the dispatch/tag lane uses.
+    An editable install is refused by the probe; a CLEAN tree is then
     byte-identical to HEAD, so a HEAD clone serves the same bytes. A dirty tree
     under such an interpreter is refused, never silently tested as HEAD."""
     require_lane(LANE_MOCK)

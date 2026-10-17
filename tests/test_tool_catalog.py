@@ -61,6 +61,8 @@ def test_tool_entry_is_shallow_frozen():
         # tip drift: upstream added the compat-alias field after the reference
         # cutoff (pinned in tests/test_tool_owner_facades.py as well).
         "alias_for": str,
+        # A built-in's own safety routing (tests/test_safety_policy.py).
+        "safety_policy": str,
     }
     fields = {item.name: item for item in dataclasses.fields(ToolEntry)}
     assert fields["is_code_tool"].default is False
@@ -69,6 +71,7 @@ def test_tool_entry_is_shallow_frozen():
     assert type(fields["timeout_sec"].default) is int
     assert fields["mutates_worktree"].default is False
     assert type(fields["mutates_worktree"].default) is bool
+    assert fields["safety_policy"].default == ""
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         entry.name = "changed"

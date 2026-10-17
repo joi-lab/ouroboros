@@ -16,10 +16,11 @@ does with the affordance is a separate, parent-owned live probe.
   selected original to P. Every participant waits with `await_messages` (worker slot
   held, no model rounds) and ends its participation with a `FINAL:` answer only AFTER
   the reply it waited for landed — a contribution is not the end of participation.
-  P then plans with `plan_task` declaring `task:<A>`/`task:<B>` evidence: the plan
-  review request bodies and the durable wave carry the published originals and the
-  children's finals, and NOT the sibling-only originals (negative control: A→B→A
-  reaches the planner only when a participant addresses it to P).
+  P then plans with `plan_task` (one revision, one ask of the council) attaching
+  `task:<A>`/`task:<B>` evidence: every participant's delivery and the durable plan
+  record's own-room snapshot carry the published originals and the children's finals,
+  and NOT the sibling-only originals (negative control: A→B→A reaches the planner only
+  when a participant addresses it to P).
 * S29 — SESSION, SAME RUN, TWO QUESTIONS. P starts one `[FAKE:TURN]` run that pauses
   on two sequential questions. P re-waits on the question it already saw — which is
   the host's event-only sleep (`delegate_supervision.supervised_wait`): nothing wakes
@@ -57,6 +58,7 @@ from tests.system_e2e.harness import (
     body_text,
     canned_review_answer,
     classify_call,
+    keyless_review_rows,
     keyless_settings,
     require_lane,
     start_server,
@@ -71,7 +73,7 @@ from tests.system_e2e.interfaces import (
     FakeClaudexorDaemon,
 )
 from tests.system_e2e.test_system_scenarios_w2 import _s6_slot_binder
-from tests.system_e2e.test_system_scenarios_w3a import _ROOT_TASK_ID_RE, _Again, _after_wave_settled
+from tests.system_e2e.test_system_scenarios_w3a import _ROOT_TASK_ID_RE, _WAIT_ROUNDS_MAX, _WAIT_WINDOW_SEC, _Again
 from tests.system_e2e.test_system_scenarios_w3b import _RUN_ID_RE, _SCOUT_ROW, _custody_rows, _roster
 from tests.system_e2e.test_system_scenarios_w4 import _IID_RE
 
@@ -176,25 +178,17 @@ PARTICIPATION_RULES = (
 )
 
 
-_REFLECTION_MARKER = "Write the reflection now."  # ouroboros/reflection.py, the post-task reflection turn
-_REFLECTION_ANSWER = ("Scripted scenario; nothing to persist.\nMEMORY_ACTIONS_JSON: []\n"
-                      "BACKLOG_CANDIDATES_JSON: []")
-
-
 class _PeerReplayModel(ReplayModel):
     """``ReplayModel`` whose host-side turns are answered canned without consuming the
     fixture: TOOL-LESS non-review calls (the supervisor's semantic duplicate probe on
-    the light slot, and any other plain host probe) and the post-task REFLECTION turn
-    (tool-bearing, after the final answer). The actors under test are the scripted
-    tool-bearing rounds; host probe and reflection counts are not part of the wiring
-    being proved."""
+    the light slot, and any other plain host probe). The actors under test are the
+    scripted tool-bearing rounds; host probe counts are not part of the wiring being
+    proved."""
 
     def _answer(self, body: dict, seq: int) -> tuple[str, dict]:
         kind = classify_call(body)
         if canned_review_answer(kind) is None and not body.get("tools"):
             return "plain", {"role": "assistant", "content": "No existing task duplicates this request."}
-        if canned_review_answer(kind) is None and _REFLECTION_MARKER in body_text(body):
-            return "reflection", {"role": "assistant", "content": _REFLECTION_ANSWER}
         return super()._answer(body, seq)
 
 
@@ -245,6 +239,34 @@ def _forward_to_parent(message: str):
 
 def _child_ids(text: str) -> dict:
     return {label: tid for tid, label in _CHILD_RECEIPT_RE.findall(text)}
+
+
+# The ONE mailbox frame the planning organ writes when custody has nothing more to deliver
+# for an ask (plan_packet.settled_frame): every participant answered, failed or was lost.
+_ASK_SETTLED_RE = re.compile(r"Plan ask (a\d+): (?:every participant settled|custody has nothing more to deliver)")
+
+
+def _after_ask_settled(ask_ordinal: int, then: dict):
+    """Hold the script until the organ says plan ask ``ask_ordinal`` settled, then emit
+    ``then`` (the free ``plan_task()`` read that shows the answers). Until the frame is
+    visible the step waits on this task's own id (``wait_task`` returns early on
+    ``owner_mailbox_pending``) — the route the organ's own text names."""
+    waits = {"rounds": 0}
+
+    def step(body: dict) -> dict:
+        text = body_text(body)
+        settled = list(dict.fromkeys(_ASK_SETTLED_RE.findall(text)))
+        if len(settled) >= ask_ordinal:
+            return then
+        waits["rounds"] += 1
+        task_ids = _ROOT_TASK_ID_RE.findall(text)
+        if not task_ids or waits["rounds"] > _WAIT_ROUNDS_MAX:
+            return {"final": (
+                f"E2E_SCRIPT_ERROR: no settled frame for plan ask {ask_ordinal} after {waits['rounds']} round(s); "
+                f"frames seen: {settled}; own task id visible: {bool(task_ids)}")}
+        return _Again({"tool": "wait_task", "arguments": {"task_id": task_ids[-1], "timeout_sec": _WAIT_WINDOW_SEC}})
+
+    return step
 
 
 def _replay_hold(step_fn):
@@ -381,12 +403,11 @@ def _s28_fixture(n: dict) -> dict:
         return {"tool": "plan_task", "arguments": {
             "goal": S28_GOAL,
             "plan": "Weigh both published originals, draft the note, verify, finish.",
-            "spec": {
-                "in_scope": ["w7 serial-turns planning smoke"],
-                "acceptance_claims": ["The plan cites both participants' published originals."],
-                "affected_paths": [],
-                "evidence": [f"task:{ids['PEER A']}", f"task:{ids['PEER B']}"],
-            },
+            "done_when": [{"id": "c1", "claim": "The plan cites both participants' published originals.",
+                           "support": "read the plan beside the two published originals"}],
+            "affected_paths": [],
+            "attach": [f"task:{ids['PEER A']}", f"task:{ids['PEER B']}"],
+            "ask": "council",
         }}
 
     def sibling_of(original: str):
@@ -417,7 +438,7 @@ def _s28_fixture(n: dict) -> dict:
         ("root", "mock-model|tools", 5): dispose("PEER A"),
         ("root", "mock-model|tools", 6): dispose("PEER B"),
         ("root", "mock-model|tools", 7): plan,
-        ("root", "mock-model|tools", 8): _replay_hold(_after_wave_settled(1, plan)),
+        ("root", "mock-model|tools", 8): _replay_hold(_after_ask_settled(1, {"tool": "plan_task", "arguments": {}})),
         ("root", "mock-model|tools", 9): {"final": f"S28_PARENT_FINAL {n['pf']}: planned with both published originals."},
         # A
         ("root", "mock-peer-a|tools", 1): _forward_to_parent(ready_a),
@@ -444,9 +465,11 @@ def test_s28_native_peers_exchange_addressed_turns_and_the_planner_receives_sele
                              model_ids=["mock-model", "mock-peer-a", "mock-peer-b"])
     before = _home_sentinel()
     with model:
+        # A scenario that passes its own catalog owns its review pool: the planner's
+        # wave below seats the keyless reviewer rows beside the two exchange peers.
         settings = keyless_settings(
             model, OUROBOROS_RUNTIME_MODE="advanced",
-            OUROBOROS_SUBAGENTS=_roster(_peer_row("peer-a"), _peer_row("peer-b")),
+            OUROBOROS_SUBAGENTS=_roster(_peer_row("peer-a"), _peer_row("peer-b"), *keyless_review_rows()),
             **_isolation_settings(pathlib.Path(root)))
         server = start_server(e2e_clone, root, settings)
         try:
@@ -554,24 +577,23 @@ def test_s28_native_peers_exchange_addressed_turns_and_the_planner_receives_sele
                     assert present in review, present
                 for absent in (n["sib_a1"], n["sib_b1"], n["sib_a2"]):
                     assert absent not in review, absent
-            state = stored.get("plan_review_state")
-            assert isinstance(state, dict) and int(state.get("cycles_paid") or 0) == 1, state
-            waves = [w for w in (state.get("waves") or []) if isinstance(w, dict)]
-            assert waves and waves[-1].get("aggregate") == "GREEN" and waves[-1].get("closed") is True, waves
-            from ouroboros.tools.plan_review_artifacts import read_wave
-            wave = read_wave(oracle.data_root, parent_id, waves[-1]["wave_artifact"])
-            manifest = wave.get("evidence_manifest_full") or {}
-            own = manifest.get("own_dialogue") or {}
-            assert own.get("text") and not own.get("gap"), own
-            assert n["pub_a"] in own["text"] and n["pub_b"] in own["text"]
-            assert n["sib_a1"] not in own["text"] and n["sib_b1"] not in own["text"]
-            dialogue_rows = [json.loads(line) for line in own["text"].splitlines()[1:] if line.strip()]
+            record = stored.get("plan_record")
+            assert isinstance(record, dict) and len(record.get("asks") or []) == 1, record
+            ask = record["asks"][0]
+            assert record["revisions"][0]["goal"] == S28_GOAL and ask["revision"] == 1, record
+            assert sorted(p["status"] for p in ask["participants"]) == ["answered"] * 3, ask["participants"]
+            assert sorted(a["locator"] for a in ask["attached"]) == sorted([f"task:{a_id}", f"task:{b_id}"]), ask["attached"]
+            assert "mailbox_incomplete" not in json.dumps(ask.get("omissions") or [])
+            # The own-room snapshot every participant saw rides the ask row's carrier (its exact bytes).
+            from ouroboros.artifacts import read_actor_source_bytes
+            carrier = ask["dialogue_ref"]
+            own_text = read_actor_source_bytes(oracle.data_root, parent_id, carrier["ref"]).decode("utf-8")
+            assert n["pub_a"] in own_text and n["pub_b"] in own_text
+            assert n["sib_a1"] not in own_text and n["sib_b1"] not in own_text
+            dialogue_rows = [json.loads(line) for line in own_text.splitlines()[1:] if line.strip()]
             published = [r for r in dialogue_rows if n["pub_a"] in str(r.get("text")) or n["pub_b"] in str(r.get("text"))]
             assert {r.get("author") for r in published} == {"peer_task"}, published
             assert {r.get("source_task_id") for r in published} == {a_id, b_id}, published
-            assert "mailbox_incomplete" not in json.dumps(manifest.get("omissions") or [])
-            attached = {row.get("locator"): row for row in manifest.get("attached") or []}
-            assert n["fin_a"] in str(attached[f"task:{a_id}"].get("text")) and n["fin_b"] in str(attached[f"task:{b_id}"].get("text"))
 
             # (g) exactly the scripted exchange, nothing missed, nothing left unserved.
             assert wait_until(lambda: parent_id not in oracle.running_ids(), 60)

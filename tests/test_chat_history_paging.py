@@ -9,6 +9,7 @@ import pytest
 
 from ouroboros.gateway import history
 from ouroboros.gateway.history_paging import HistorySource, decode_cursor, encode_cursor
+from tests._store_shared import seed_result
 
 
 @pytest.fixture(autouse=True)
@@ -150,17 +151,20 @@ def test_page_handle_replays_its_exact_archive_range(tmp_path):
     assert replayed["next_cursor"] == second["next_cursor"]
 
 
-def test_accepted_quiz_answer_is_hidden_replay_evidence_across_pages(tmp_path):
+@pytest.mark.parametrize("kind", ["quiz_answer", "quiz_closed"])
+def test_quiz_disposition_is_hidden_replay_evidence_across_pages(tmp_path, kind):
     quiz = {"quiz_id": "old", "question": "Choose?", "state": "open",
             "options": [{"label": "First"}, {"label": "Second", "recommended": True}]}
-    winning = {**quiz, "state": "answered", "comment": "  My own answer\nnext line  "}
+    winning = ({**quiz, "state": "answered", "comment": "  My own answer\nnext line  "} if kind == "quiz_answer"
+               else {**quiz, "state": "closed", "closed_reason": "Superseded", "closed_actor": "owner",
+                     "closed_request_id": "close-1"})
     write(tmp_path / "logs" / "chat.jsonl", [
         row(0, direction="out", type="quiz", task_id="quiz-task", quiz=quiz),
         *[row(index) for index in range(1, 170)],
-        row(171, direction="system", type="quiz_answer", task_id="quiz-task", quiz=winning),
+        row(171, direction="system", type=kind, task_id="quiz-task", quiz=winning),
     ])
     loaded = list(pages(tmp_path))
-    [evidence] = [message for message in loaded[0]["messages"] if message.get("system_type") == "quiz_answer"]
+    [evidence] = [message for message in loaded[0]["messages"] if message.get("system_type") == kind]
     assert evidence["text"] == "" and evidence["quiz"] == winning
     assert "answered_index" not in evidence["quiz"]
     [ask] = [message for page in loaded[1:] for message in page["messages"] if message.get("msg_type") == "quiz"]
@@ -179,11 +183,15 @@ def test_historical_terminal_never_overrides_current_result_authority(tmp_path, 
     result.parent.mkdir(exist_ok=True)
     if current == "malformed":
         result.write_text("{broken", encoding="utf-8")
+    elif current == "future":
+        result.write_text(json.dumps({"_schema_version": 2, "task_id": "old-task", "status": "running"}), encoding="utf-8")
     elif current != "missing":
-        result.write_text(json.dumps({"_schema_version": 2 if current == "future" else 1,
+        seed_result(tmp_path, "old-task", {"_schema_version": 1,
                                       "task_id": "old-task", "status": "completed" if current == "finalizing" else "running",
                                       **({"root_phase_checkpoint": {"post_task_synthesis": "running"}}
-                                         if current == "finalizing" else {})}), encoding="utf-8")
+                                         if current == "finalizing" else {})})
+    from ouroboros.store_import import ensure_current_store
+    ensure_current_store(tmp_path)  # the boot door's import judges the planted file; a GET never imports
     status, payload = request(tmp_path)
     assert status == 200
     [narration] = [message for message in payload["messages"] if message.get("is_progress")]
@@ -309,7 +317,7 @@ def test_de_roled_recent_child_final_is_enriched_when_older_parent_arrives(tmp_p
     for task in ("parent", "child"):
         result = tmp_path / "task_results" / f"{task}.json"
         result.parent.mkdir(exist_ok=True)
-        result.write_text(json.dumps({"_schema_version": 1, "task_id": task, "status": "completed"}), encoding="utf-8")
+        seed_result(tmp_path, task, {"_schema_version": 1, "task_id": task, "status": "completed"})
     loaded = list(pages(tmp_path, n_human="1"))
     first = next(message for message in loaded[0]["messages"] if message.get("task_id") == "child")
     assert "parent_task_id" not in first

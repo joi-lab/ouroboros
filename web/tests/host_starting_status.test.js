@@ -15,16 +15,16 @@ import { installDom, restoreDom } from './chat_dom_fixture.js';
 
 test('the reducer says Starting… only where it would say Online', () => {
     assert.deepEqual(computeDerivedChatStatus({ supervisorStarting: true }),
-        { kind: 'starting', text: 'Starting…', showDots: false });
+        { kind: 'starting', text: 'Starting…', tone: 'starting', showDots: false, dots: 'one' });
     assert.equal(computeDerivedChatStatus({ supervisorStarting: false }).text, 'Online');
     assert.equal(computeDerivedChatStatus({}).text, 'Online', 'callers that state nothing keep Online');
     const outranks = [
-        [{ isConnected: false }, 'Reconnecting...'],
-        [{ hasActiveLiveCard: true }, 'Working...'],
-        [{ activeManagedCount: 1 }, 'Working...'],
-        [{ activeDirectCount: 1 }, 'Thinking...'],
-        [{ pendingSubmissionsCount: 1 }, 'Sending...'],
-        [{ queuedManagedCount: 1 }, 'Queued...'],
+        [{ isConnected: false }, 'Reconnecting…'],
+        [{ hasActiveLiveCard: true }, 'Working'],
+        [{ activeManagedCount: 1 }, 'Working'],
+        [{ activeDirectCount: 1 }, 'Working'],
+        [{ pendingSubmissionsCount: 1 }, 'Sending'],
+        [{ queuedManagedCount: 1 }, 'Queued'],
         [{ waitingModelCount: 1 }, 'Waiting for access'],
         [{ pausingManagedCount: 1 }, 'Pausing…'],
         [{ pausedManagedCount: 1 }, 'Paused'],
@@ -109,7 +109,7 @@ test('Main: Starting… until supervisor_ready is true, error or not, then Onlin
         assert.equal(chat.kind(), 'status-badge starting');
         chat.snapshot({ supervisor_ready: false, supervisor_error: CRASH,
             active_chat_activities: [{ activity_id: 'q-1', chat_id: 1, kind: 'managed_task', phase: 'queued' }] });
-        assert.equal(chat.status(), 'Queued...', 'known work keeps its own word beside the error');
+        assert.equal(chat.status(), 'Queued', 'known work keeps its own word beside the error');
         chat.snapshot({ supervisor_ready: true, supervisor_error: CRASH });
         assert.equal(chat.status(), 'Online', 'only the typed readiness moves the pill; the error lives elsewhere');
     } finally { chat.close(); }
@@ -151,7 +151,7 @@ test('Main: a disconnect forgets readiness, so a reconnect never flashes a stale
         chat.snapshot({ supervisor_ready: true });
         assert.equal(chat.status(), 'Online');
         chat.setConnected(false);
-        assert.equal(chat.status(), 'Reconnecting...');
+        assert.equal(chat.status(), 'Reconnecting…');
         chat.setConnected(true);
         assert.equal(chat.status(), 'Starting…', 'the host may have restarted: readiness is proven again');
         chat.snapshot({ supervisor_ready: true });
@@ -165,9 +165,9 @@ test('Main: work during the start keeps its own word; only a ready census clears
     try {
         chat.snapshot({ supervisor_ready: false,
             active_chat_activities: [{ activity_id: 'q-1', chat_id: 1, kind: 'managed_task', phase: 'queued' }] });
-        assert.equal(chat.status(), 'Queued...', 'a restored queue row is a fact about work, not the start');
+        assert.equal(chat.status(), 'Queued', 'a restored queue row is a fact about work, not the start');
         chat.snapshot({ supervisor_ready: false });
-        assert.equal(chat.status(), 'Queued...', 'a not-ready census cannot prove the row gone');
+        assert.equal(chat.status(), 'Activity unconfirmed', 'an incomplete census retains the row without claiming its old phase is current');
         chat.snapshot({ supervisor_ready: true });
         assert.equal(chat.status(), 'Online');
     } finally { chat.close(); }
@@ -218,7 +218,7 @@ test('Project panel: a late mount after a reconnect never seeds from the body be
         page.apply(page.begin(), { supervisor_ready: true });
         assert.equal(panel.status(), 'Online', 'a post-reconnect ready body settles it');
         panel.setConnected(false);
-        assert.equal(panel.status(), 'Reconnecting...');
+        assert.equal(panel.status(), 'Reconnecting…');
         panel.setConnected(true);
         assert.equal(panel.status(), 'Starting…', 'the panel re-proves readiness after its own reconnect');
         await panel.settle();

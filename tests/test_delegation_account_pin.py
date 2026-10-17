@@ -13,6 +13,7 @@ from ouroboros import subagents
 from tests._delegated_transport_shared import (  # noqa: F401 — autouse fixture
     _owned_gateway_uses_each_test_transport,
     _plain_ctx,
+    _select_transport_access,
 )
 
 
@@ -194,6 +195,9 @@ def test_the_account_pin_rides_the_start_body_and_the_custody_row(tmp_path, monk
     from ouroboros.gateways import claudexor as gw
 
     seen = {}
+    # A READ-ONLY child (the stub advertises readonly only): technical access alone
+    # decides the run shape now (#1609), so the premise is stated explicitly.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_PROFILE", "koshak")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _PinStubGateway(seen))
@@ -212,6 +216,7 @@ def test_an_unpinned_start_sends_no_credential_profile_field(tmp_path, monkeypat
     from ouroboros.gateways import claudexor as gw
 
     seen = {}
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.delenv("OUROBOROS_SUBAGENT_PROFILE", raising=False)
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _PinStubGateway(seen))
@@ -261,6 +266,7 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
             return {"runId": "run-1"}
         def close(self): pass
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_PROFILE", "stored-pin")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())

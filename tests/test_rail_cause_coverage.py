@@ -76,6 +76,16 @@ def test_the_twins_carry_byte_identical_sentences_for_every_key():
         assert f'{code}: "{sentence}",' in twin, code
 
 
+def test_browser_bypass_dedup_map_matches_the_producer_vocabulary():
+    import re
+
+    text = TWIN.read_text(encoding="utf-8")
+    block = text.split("const bypass = {", 1)[1].split("};", 1)[0]
+    pairs = re.findall(r"(\w+): '([^']+)'", block)
+    assert len(pairs) == len(dict(pairs))
+    assert dict(pairs) == outcomes.ACCEPTANCE_BYPASS_REASON_BY_RAIL
+
+
 def test_the_timeout_rails_are_one_typed_tuple_in_priority_order():
     from supervisor import queue_timeouts
 

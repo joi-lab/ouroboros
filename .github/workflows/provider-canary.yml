@@ -1,26 +1,26 @@
 # The ONE provider-canary definition: real requests to model providers, called by
 #   - .github/workflows/ci.yml → manual runs and `v*` tags, where
 #     `release-preflight` requires this job's result
-#   - .github/workflows/provider-canary-push.yml → path-filtered pushes to
-#     `main` / `ouroboros` / `ouroboros-stable`
+#   - .github/workflows/provider-canary-push.yml → standalone manual runs
 # Never wired to `pull_request` or `schedule`: the lane spends provider credit
 # and reads repository secrets.
 #
-# OPENROUTER_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY are required in the
-# official trusted job; MiniMax / DeepSeek / Cloud.ru / GigaChat credentials are
-# optional and their absent rows remain visible as skips. pytest decides both,
-# so every secret is declared optional here: a fork without keys reaches the
-# test run instead of failing workflow validation. The `integration` pytest
-# marker controls inclusion via `-m integration`. Confirmed provider-contract
-# failures fail the job; the test classifier keeps quota/rate-limit/5xx/timeout
-# outcomes inconclusive, which pytest reports as skips. The last step reads the
-# producer's own JUnit: on a release tag in the official repository every
-# required canary must have passed, so such a skip blocks the release there;
-# forks and branch runs only report what a tag at that commit would meet.
+# The matrix owns required/optional credential policy. Its disjoint markers let
+# manual/tag callers keep optional qualification honestly red outside release
+# dependencies; the standalone caller keeps all. Every producer exit remains authoritative.
+# All secrets are optional at this reusable boundary so pytest can report a fork's
+# missing credentials. Quota/rate-limit/5xx/timeout remain inconclusive skips.
+# The required floor is enforced on official release tags. Pre-tag qualification
+# reads each required result too: a green producer containing skips is not enough.
 name: Provider canary lane
 
 on:
   workflow_call:
+    inputs:
+      scope:
+        description: "Canary subset: all, required or optional; failures remain visible"
+        type: string
+        default: all
     secrets:
       OPENROUTER_API_KEY:
         required: false
@@ -54,6 +54,7 @@ jobs:
       - name: Run integration tests
         id: provider_tests
         env:
+          SCOPE: ${{ inputs.scope }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -62,17 +63,23 @@ jobs:
           CLOUDRU_FOUNDATION_MODELS_API_KEY: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_API_KEY }}
           CLOUDRU_FOUNDATION_MODELS_BASE_URL: ${{ secrets.CLOUDRU_FOUNDATION_MODELS_BASE_URL }}
           GIGACHAT_CREDENTIALS: ${{ secrets.GIGACHAT_CREDENTIALS }}
-        run: >-
-          python -m pytest tests/test_provider_integration.py -m integration -q -rs --tb=short
-          --junitxml="${{ runner.temp }}/ci-private/provider/results.xml"
-          --ci-evidence-dir="${{ runner.temp }}/ci-evidence/provider"
+        run: |
+          case "$SCOPE" in
+            all) selection='integration' ;;
+            required) selection='integration and required_provider' ;;
+            optional) selection='integration and optional_provider' ;;
+            *) echo '::error::Unknown provider canary scope'; exit 2 ;;
+          esac
+          python -m pytest tests/test_provider_integration.py -m "$selection" -q -rs --tb=short \
+            --junitxml="${{ runner.temp }}/ci-private/provider/results.xml" \
+            --ci-evidence-dir="${{ runner.temp }}/ci-evidence/provider"
       - name: Upload provider test evidence
         id: provider_evidence
         if: ${{ !cancelled() }}
         continue-on-error: true
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: provider-ci-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: provider-ci-${{ inputs.scope }}-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ci-evidence/provider/
           retention-days: 30
           if-no-files-found: warn
@@ -103,7 +110,7 @@ jobs:
           echo "Provider diagnostics_incomplete. The original test outcome is unchanged." >> "$GITHUB_STEP_SUMMARY"
       # Not tolerant on purpose: with `--enforce` this step's exit is the release floor.
       - name: Release floor for required provider canaries
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && inputs.scope != 'optional' }}
         env:
           FLOOR_ENFORCE: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'razzant/ouroboros' && '--enforce' || '' }}
         run: >-

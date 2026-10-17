@@ -6,14 +6,15 @@ import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx, _parked
 from tests.test_g1_followup_policy import world, register, restore, row, ORIGIN, BINDING  # noqa: F401
+from tests.worker_pool_support import affirm_ready
 
 pytestmark = pytest.mark.serial
 
 
 def _worker(workers):
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task)))))
     return sent
 
 
@@ -112,7 +113,7 @@ def test_immediate_launch_refusal_uses_existing_poll_before_retry(monkeypatch):
     @contextmanager
     def gate(*_a, **_kw):
         if len(events) == 1:
-            raise owner_pause.OwnerPauseRefused("owner_launch_authority_unavailable")
+            raise owner_pause.LaunchBusy("contention")
         yield
     monkeypatch.setattr(owner_pause, "launch_admission", gate)
     assert loop_round_limits._handle_model_wait_control(SimpleNamespace(),

@@ -7,20 +7,19 @@ import functools
 import logging
 import pathlib
 import shutil
-import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments
+from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, migrating_error, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments, task_time_limits
 from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view  # noqa: F401
 from ouroboros.gateway.contracts import TaskCreateRequest
 from ouroboros.gateway.schema import validate_ingress
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.project_naming import admission_names
+from ouroboros.settings_scales import requested_effort
 from supervisor.log_addressing import ProjectThreadConflict, ingress_chat_id
 # Re-exported SSE surface (split out by the 1600-line module gate): route
 # wiring, the CLI, and long-standing monkeypatch pins address these names on
@@ -62,17 +61,11 @@ from ouroboros.contracts.task_contract import (
 )
 from ouroboros.outcomes import public_task_result
 from ouroboros import artifacts as artifact_store
-from ouroboros.task_result_schema import (
-    emit_quarantine_event,
-    quarantine_task_result,
-    task_result_schema_refusal,
-)
+from ouroboros.store import StoreError, StoreMigrating
 from ouroboros.task_results import (
     STATUS_FAILED,
     STATUS_SCHEDULED,
-    list_task_results,
     load_task_result,
-    task_results_dir,
     validate_task_id,
     write_task_result,
 )
@@ -82,7 +75,7 @@ from ouroboros.task_status import (
     load_effective_task_result,
     observe_cancellation_target,
 )
-from ouroboros.utils import read_json_dict, utc_now_iso
+from ouroboros.utils import utc_now_iso
 from ouroboros.tool_access import path_is_relative_to, paths_overlap_casefold
 from ouroboros.workspace_preflight import (
     collect_workspace_preflight,
@@ -157,19 +150,6 @@ def _external_subagent_label(body: Dict[str, Any], metadata: Dict[str, Any]) -> 
         str(source.get("delegation_role") or "").strip().lower() == "subagent"
         for source in (body, metadata)
     )
-
-
-def _normalize_deadline_at(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        return ""
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError("deadline_at must be an ISO-8601 datetime") from exc
-    if parsed.tzinfo is None:
-        raise ValueError("deadline_at must include a timezone offset or Z")
-    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _fold_contract_policies(body: Dict[str, Any], raw_metadata: Dict[str, Any], metadata: Dict[str, Any]):
@@ -365,7 +345,8 @@ def _complete_api_task_admission(
         "artifacts": artifacts,
         "artifact_status": ARTIFACT_STATUS_PENDING if workspace_root else "",
         "metadata": metadata,
-        **{key: task[key] for key in ("attachment_manifest", "attachment_manifest_ref") if key in task},
+        **{key: task[key] for key in ("attachment_manifest", "attachment_manifest_ref", "reasoning_effort",
+                                      "execution_timeout_sec") if key in task},
         "api_admission": {"token": admission_token, "status": "accepted"},
         "result": "Task accepted and durably scheduled.",
     }
@@ -414,11 +395,11 @@ def _task_identity_occupied(drive_root: pathlib.Path, task_id: str) -> bool:
     stored row as a side effect of this check and then report "no result",
     letting the endpoint reuse that row's task id; strict raises WITHOUT
     moving anything, and any stored row — admissible or not — keeps its
-    identity occupied.
+    identity occupied. A store that cannot answer is the same unknown.
     """
     try:
         return load_task_result(drive_root, task_id, strict=True) is not None
-    except ValueError:
+    except (ValueError, StoreError):
         return True
 
 
@@ -493,11 +474,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     if not description:
         return json_error("description is required", 400)
 
-    ready_error = _supervisor_ready_error(request)
+    drive_root = request_drive_root(request)
+    ready_error = _supervisor_ready_error(request) or migrating_error(drive_root)  # P1: 503 while the store imports
     if ready_error:
         return ready_error
-
-    drive_root = request_drive_root(request)
     repo_dir = request_repo_dir(request)
     try:
         task_id = validate_task_id(body.get("task_id") or uuid.uuid4().hex[:16])
@@ -571,11 +551,15 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         return json_error("delegation_role=subagent is only allowed through the internal schedule_subagent tool", 400)
     if str(body.get("parent_task_id") or "").strip() or str(body.get("root_task_id") or "").strip():
         return json_error("parent_task_id and root_task_id are internal lineage fields; external tasks must start as roots", 400)
-    for _top_level_only in ("project_id", "title"):
-        # Top-level fields; silently dropping either from metadata would let a
-        # caller believe isolation is active, or a name was accepted, when it was not.
+    for _top_level_only in ("project_id", "title", "reasoning_effort", "execution_timeout_sec"):
+        # Top-level fields; silently dropping one from metadata would let a caller
+        # believe isolation, a name or a starting effort was accepted when it was not.
         if _top_level_only in raw_metadata:
             return json_error(f"{_top_level_only} must be a top-level field, not metadata", 400)
+    try:  # an explicit starting effort; absent = the task type's configured effort
+        effort = {"reasoning_effort": requested_effort(body["reasoning_effort"])} if "reasoning_effort" in body else {}
+    except ValueError as exc:
+        return json_error(str(exc), 400)
     metadata = {str(k): v for k, v in raw_metadata.items() if str(k) not in _RESERVED_METADATA_KEYS}
     allowed_resources, resource_policy, disabled_tools, acceptance_claims, policy_error = (
         _fold_contract_policies(body, raw_metadata, metadata)
@@ -587,15 +571,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     except ValueError as exc:
         return json_error(str(exc), 400)
     try:
-        deadline_at = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
+        time_limits = task_time_limits(body, raw_metadata)
     except ValueError as exc:
         return json_error(str(exc), 400)
-    try:
-        timeout_sec = float(body.get("timeout_sec") or body.get("timeout") or 0)
-    except (TypeError, ValueError):
-        timeout_sec = 0.0
-    if not deadline_at and timeout_sec > 0:
-        deadline_at = datetime.fromtimestamp(time.time() + timeout_sec, timezone.utc).isoformat().replace("+00:00", "Z")
+    deadline_at = time_limits.pop("deadline_at")
     if deadline_at:
         metadata["deadline_at"] = deadline_at
     admission_token = uuid.uuid4().hex
@@ -703,11 +682,12 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         "expected_output": str(body.get("expected_output") or ""),
         "constraints": str(body.get("constraints") or ""),
         "context_requires_self_body_docs": normalize_bool(body.get("context_requires_self_body_docs")),
+        **effort,
         "allowed_resources": allowed_resources,
         "resource_policy": resource_policy,
         "disabled_tools": disabled_tools,
         "acceptance_claims": acceptance_claims,
-        "deadline_at": deadline_at,
+        "deadline_at": deadline_at, **time_limits,  # execution_timeout_sec: top-level, never metadata
         "depth": depth,
         "parent_task_id": None,
         "root_task_id": task_id,
@@ -777,15 +757,6 @@ _LIST_ROW_OMITTED_FIELDS = frozenset({
     "subagent_envelope",
 })
 
-# The raw creation-ts sort scan and the ABI-2 malformed-candidate admission
-# live in ouroboros/task_result_facts.py (module-size split); imported
-# here so this module keeps the endpoint wiring surface.
-from ouroboros.task_result_facts import (  # noqa: E402
-    _quarantine_malformed_candidates,
-    _raw_sorted_result_names,
-)
-
-
 def _compact_list_row(row: Dict[str, Any]) -> Dict[str, Any]:
     """Compact LIST projection: drop the five bulk evidence fields, keep the
     summary contract (task_id, status, ts/updated_at, result, description/
@@ -829,55 +800,38 @@ def _tasks_list_payload(
     # List view is a status/cost projection: never materialize artifacts (no child
     # rebase copies, no artifact-dir scans, no disposition/sha claims) on a GET list.
     if wanted:
+        # The stored status is the WHERE prefilter; the filter below runs on the EFFECTIVE status
+        # (the overlay may rename a stored status), so the prefilter admits every row whose stored
+        # status could project into a wanted one: the wanted ones themselves plus the live rows.
+        from ouroboros.task_store import list_documents
+        stored = list_documents(drive_root, statuses=wanted | _OVERLAY_SOURCE_STATUSES)
         rows = [
             _compact_list_row(public_task_result(effective_task_result(
                 drive_root, row, materialize_artifacts=False, _events_index=events_index,
             )))
-            for row in list_task_results(drive_root)
+            for row in stored
         ]
         rows = [row for row in rows if str(row.get("status") or "").lower() in wanted]
         rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
         if limit is not None:
             rows = rows[:limit]
         return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
-    results_dir = task_results_dir(drive_root, create=False)
-    names, malformed_names = _raw_sorted_result_names(results_dir)
-    if limit is not None:
-        names = names[:limit]
-    rows = []
-    quarantined: List[Dict[str, str]] = []
-    for name in names:
-        path = results_dir / name
-        raw = read_json_dict(path)
-        if raw is None and not path.is_file():
-            continue  # vanished/torn between the scandir and this read
-        # ABI-2: the sliced fast path is admission-aware like every other
-        # reader — an inadmissible row is quarantined and never projected,
-        # with ONE batched durable event for the whole scan (6.3=B), the
-        # same semantics as the list_task_results fail-soft scan.
-        refusal = task_result_schema_refusal(raw)
-        if refusal:
-            outcome = quarantine_task_result(path, refusal)
-            if outcome == "kept_admissible":
-                raw = read_json_dict(path)
-                if raw is None or task_result_schema_refusal(raw):
-                    continue
-            else:
-                if outcome == "moved":
-                    quarantined.append({"task_id": path.stem, "reason": refusal})
-                continue
-        rows.append(_compact_list_row(public_task_result(effective_task_result(
-            drive_root, raw, materialize_artifacts=False, _events_index=events_index,
-        ))))
-    # ABI-2: a candidate whose bytes failed to parse is NOT silently dropped —
-    # it reaches the same admission reader (quarantine + the batched event)
-    # even beyond the slice window (see task_result_facts).
-    quarantined.extend(_quarantine_malformed_candidates(results_dir, malformed_names))
-    emit_quarantine_event(drive_root, quarantined)
+    from ouroboros.task_store import documents_by_ids, newest_ids
+    # The unfiltered list keeps the raw-``ts`` slice: the newest ``limit`` stored rows, read whole.
+    ids = newest_ids(drive_root, limit)
+    stored = documents_by_ids(drive_root, ids)
+    rows = [_compact_list_row(public_task_result(effective_task_result(
+        drive_root, stored[task_id], materialize_artifacts=False, _events_index=events_index,
+    ))) for task_id in ids if task_id in stored]
     # Re-sort the slice by effective ts: the child-drive merge may have replaced
     # ts, and the response order is the displayed order.
     rows.sort(key=lambda item: str(item.get("ts") or ""), reverse=True)
     return {"tasks": rows, "queue": _queue_snapshot(drive_root)}
+
+
+# Stored statuses the effective overlay can still project into another status (a live or
+# interrupted row may read as scheduled/running/failed): a filtered list prefilters them in too.
+_OVERLAY_SOURCE_STATUSES = frozenset({"running", "interrupted", "scheduled", "requested", "cancel_requested"})
 
 
 async def api_tasks_list(request: Request) -> JSONResponse:
@@ -898,8 +852,34 @@ async def api_tasks_list(request: Request) -> JSONResponse:
     queue_only = str(request.query_params.get("queue_only") or "").strip().lower() in {"1", "true", "yes"}
     drive_root = request_drive_root(request)
     wanted = {status.lower() for status in statuses}
-    payload = await asyncio.to_thread(_tasks_list_payload, drive_root, wanted, limit, queue_only)
+    try:
+        payload = await asyncio.to_thread(_tasks_list_payload, drive_root, wanted, limit, queue_only)
+    except StoreMigrating:
+        return json_error("the task store is importing; retry shortly", 503, reason_code="migrating")
     return JSONResponse(payload)
+
+
+def _plan_objections_view(drive_root: pathlib.Path, task_id: str, result: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The host's objection fold for the task detail: which objections stand (an imported
+    earlier-schema finding included, with ``holds`` / ``not_adjudicated``) and every withdrawal,
+    from ``plan_record.read_view`` over the record and the one legacy loader. The panel renders
+    this and re-derives nothing (one owner of the standing rule). ``None`` when the task never
+    planned; an unreadable record or earlier state is named, never shown as "no objection"."""
+    from ouroboros import plan_record
+
+    try:
+        record = plan_record.validate_record(result.get(plan_record.PLAN_RECORD_KEY))
+    except plan_record.PlanRecordInvalid as exc:
+        return {"unreadable": f"{type(exc).__name__}: {exc}"}
+    legacy, legacy_error = plan_record.legacy_facts(drive_root, task_id)
+    if not plan_record.engaged(record) and not legacy.get("engaged"):
+        return None
+    view = plan_record.read_view(record, legacy)
+    out: Dict[str, Any] = {"open_objections": view["open_objections"], "withdrawn": view["withdrawn"],
+                           "legacy_engaged": bool(legacy.get("engaged"))}
+    if legacy_error:
+        out["legacy_unreadable"] = legacy_error
+    return out
 
 
 async def api_task_get(request: Request) -> JSONResponse:
@@ -913,18 +893,26 @@ def _task_get_response(request: Request) -> JSONResponse:
     except ValueError as exc:
         return json_error(str(exc), 400)
     drive_root = request_drive_root(request)
-    data = load_effective_task_result(drive_root, task_id)
+    try:
+        data = load_effective_task_result(drive_root, task_id)
+        if not data:
+            from ouroboros.task_store import exists
+            if not exists(drive_root, task_id):
+                return json_error("task not found", 404)
+    except StoreMigrating:
+        return json_error("the task store is importing; retry shortly", 503, reason_code="migrating")
+    except StoreError:
+        data = None  # the store cannot answer for this id: unavailable, not absent
     if not data:
-        try:
-            (task_results_dir(drive_root, create=False) / f"{task_id}.json").stat()
-        except FileNotFoundError:
-            return json_error("task not found", 404)
-        except OSError:
-            pass
         return json_error("task result is unavailable", 503)
     payload = public_task_result(data)
+    from ouroboros.gateway.main_decisions import question_display_rooms
+    payload["question_rooms"] = question_display_rooms(drive_root, task_id, payload.get("owner_quiz"))
     from ouroboros.owner_continue import continuation_offer  # Batch4: a Continue, or its accepted successor
     payload["continuation_offer"] = continuation_offer(data, task_id)
+    objections = _plan_objections_view(drive_root, task_id, data)  # the host's fold; the browser never re-derives it
+    if objections is not None:
+        payload["plan_objections"] = objections
     if isinstance(payload.get("artifacts"), list):  # what ``?archive=<dir>`` would stream now, per top-level dir
         payload["artifact_archives"] = directory_archives(task_artifact_stores(drive_root, task_id),
                                                           payload["artifacts"], anchor=drive_root)
@@ -1034,11 +1022,11 @@ def _record_cascade_incident(task_id: str, kind: str, detail: str = "") -> None:
 
 
 def _run_cascade_cancel(task_id: str) -> bool:
-    """Subtree cancel for the HTTP cascade path, AWAITED by its caller.
+    """Subtree cancel for the Host Service ``/chat/cancel`` path, AWAITED by its caller.
 
     Returns True when the subtree is settled — cancelled, or already terminal
     (the benign completion-wins race) — and False when the teardown failed or
-    refused while the tree is STILL live, which the endpoint reports rather than
+    refused while the tree is STILL live, which the caller reports rather than
     answering ok:true for a cancellation that did not happen. Failures stay
     durable and owner-visible as incidents either way.
     """
@@ -1061,6 +1049,104 @@ def _run_cascade_cancel(task_id: str) -> bool:
         log.warning("Cascade cancel failed for %s", task_id, exc_info=True)
         _record_cascade_incident(task_id, "task_cancel_cascade_error", repr(exc))
         return False
+
+
+def _record_stop(task_id: str, *, cascade: bool, stop_action_id: str) -> Optional[Dict[str, Any]]:
+    """Record a hard Stop's durable intent before anything is torn down.
+
+    No liveness probe precedes it: a live, queued, or persisted but never
+    admitted target gets its intent first, so an admission racing the click is
+    never torn down without its watchdog-replayable fence. A settled target
+    mints nothing (completion wins) unless live ownership remains — stored
+    completion can precede the worker's exit, and a settled root can still
+    coordinate live descendants — so ownership is asked only once the request
+    found the target settled, and the intent is then requested with
+    ``allow_settled_target``. A cascade needs a recorded tree: over an id with
+    no durable row it is minted only while something of it is live, because
+    the cascade postcondition would settle that phantom tree as cancelled.
+    Returns the intent, or None when there is nothing to stop.
+    """
+    from supervisor.queue import DRIVE_ROOT, task_has_live_ownership, task_subtree_is_live
+
+    from ouroboros.cancel_intents import SCOPE_CASCADE, STOP_POLICY_IMMEDIATE, request_cancel
+
+    def still_owned() -> bool:
+        return task_has_live_ownership(task_id) or (cascade and task_subtree_is_live(task_id))
+
+    if cascade:
+        from supervisor.cancel_publication import live_presence_row
+
+        row = load_task_result(DRIVE_ROOT, task_id, strict=True)
+        # A live Presence turn is its runner's (as on the single Stop's miss lane).
+        if live_presence_row(row) or (not row and not still_owned()):
+            return None
+    source = "http_cascade" if cascade else "http_single"
+    record = functools.partial(
+        request_cancel, DRIVE_ROOT, task_id, source=source, stop_action_id=stop_action_id,
+        observation=observe_cancellation_target(
+            DRIVE_ROOT, task_id, request_origin={"kind": "http_client", "source": source}),
+        # §13.1: an omitted/empty-body or explicit-immediate request IS the
+        # immediate policy — it monotonically HARDENS a pending graceful
+        # intent (Stop-now during the wait) and mints a legacy row otherwise.
+        requested_stop_policy=STOP_POLICY_IMMEDIATE,
+        **({"scope": SCOPE_CASCADE} if cascade else {}),
+    )
+    intent = record(allow_settled_target=False)
+    if intent.get("already_settled") and still_owned():
+        intent = record(allow_settled_target=True)
+    return None if intent.get("already_settled") else intent
+
+
+def _drive_stop(task_id: str, intent: Dict[str, Any], *, cascade: bool) -> JSONResponse:
+    """Drive a recorded hard Stop through its canonical owner, then answer.
+
+    ``drive_cancel_intent_scope`` re-reads the durable scope right before the
+    teardown, so an intent already widened to a cascade runs as one whatever
+    this request's body said; kills and joins run off the event loop and
+    outside the queue lock, and a large tree makes the caller wait for the
+    kills it asked for. Cancelled answers 200 with the legacy envelope;
+    nothing to cancel — completion won, or an unknown id settled ``not_found``
+    without a task row — is the legacy 404. Any other outcome is judged by the
+    durable intent alone: still open (busy store, unknown ownership, a refused
+    or failed teardown, an unmet cascade postcondition) answers 202
+    ``cancel_state: "pending"``, which the cancel-intent watchdog settles and
+    task detail shows meanwhile; closed by a concurrent settle, 404. A cascade
+    that raised or did not settle is also an owner-visible incident.
+    """
+    from supervisor.queue import (
+        CANCEL_ALREADY_SETTLED, CANCEL_CANCELLED, CANCEL_NOT_FOUND, DRIVE_ROOT,
+        drive_cancel_intent_scope,
+    )
+
+    from ouroboros.cancel_intents import SCOPE_CASCADE, active_intent, stop_policy
+
+    target = str(intent.get("task_id") or task_id)
+    cascade = cascade or str(intent.get("scope") or "") == SCOPE_CASCADE
+    echo = {"cascade": True} if cascade else {}
+    try:
+        outcome = drive_cancel_intent_scope(target)
+    except Exception as exc:
+        log.warning("Stop teardown for %s raised; its intent stays open", target, exc_info=True)
+        if cascade:
+            _record_cascade_incident(target, "task_cancel_cascade_error", repr(exc))
+        outcome = ""
+    if outcome == CANCEL_CANCELLED:
+        return JSONResponse({"ok": True, "task_id": task_id, **echo})
+    if outcome not in (CANCEL_ALREADY_SETTLED, CANCEL_NOT_FOUND):
+        try:
+            pending = active_intent(DRIVE_ROOT, target, strict=True)
+        except Exception:
+            pending = intent  # recorded; an unreadable projection proves no settle
+        if pending:
+            if cascade and outcome:
+                _record_cascade_incident(target, "task_cancel_cascade_noop")
+            return JSONResponse({
+                "ok": True, "task_id": task_id, "cancel_state": "pending",
+                "stop_policy": stop_policy(pending),
+                "request_id": str(pending.get("request_id") or ""),
+                "reason_code": "teardown_unconfirmed", **echo,
+            }, status_code=202)
+    return json_error("task not found or not active", 404, task_id=task_id)
 
 
 # Sentinel telling "the body did not parse" apart from a legitimate JSON null.
@@ -1183,192 +1269,52 @@ async def api_task_cancel(request: Request) -> JSONResponse:
     action_id = body.get("stop_action_id", "")
     if not isinstance(action_id, str) or len(action_id) > 200:
         return json_error("stop_action_id must be a string of at most 200 characters", 400, task_id=task_id)
+    if migrating := await run_sync_to_completion(migrating_error, request_drive_root(request)):
+        return migrating  # P1: Cancel writes the result's custody; 503 while the boot import owns the store
     if stop_policy_value == "finalize_then_cancel":
-        # Graceful ingress: immediate typed pending acknowledgement; the
-        # synchronous teardown contract below stays hard/legacy-only.
+        # Graceful ingress: immediate typed pending acknowledgement; the hard
+        # Stop below records its intent first and answers once it was driven.
         return await _graceful_stop_acknowledgement(task_id, cascade=cascade, stop_action_id=action_id)
+    from supervisor.followup_policy import StopActionConflict
 
-    intent_target = {"task_id": task_id, "scope": ""}
+    from ouroboros.cancel_intents import CancelIntentProjectionCorrupt
 
-    def _record_http_intent(
-        source: str, *, cascade_scope: bool = False, allow_settled: bool = False,
-    ) -> bool:
-        """Persist the watchdog fence before teardown; failure refuses ingress.
-
-        Cascade ingress records widen-only scope and allows settled roots with
-        live descendants. Single ingress supplies allow_settled from live physical
-        ownership, since stored completion can precede worker exit. Return an
-        empty string on success or a typed write/corruption/action-conflict refusal.
-        """
-        try:
-            from supervisor.followup_policy import StopActionConflict
-            from supervisor.queue import DRIVE_ROOT as _drive_root
-
-            from ouroboros.cancel_intents import (
-                CancelIntentProjectionCorrupt,
-                SCOPE_CASCADE,
-                STOP_POLICY_IMMEDIATE,
-                request_cancel,
-            )
-        except Exception:
-            log.warning("HTTP cancel-intent machinery unavailable for %s", task_id,
-                        exc_info=True)
-            return "write_failed"
-        try:
-            intent = request_cancel(
-                _drive_root, task_id, source=source,
-                stop_action_id=action_id,
-                observation=observe_cancellation_target(_drive_root, task_id, request_origin={"kind": "http_client", "source": source}),
-                **({"scope": SCOPE_CASCADE} if cascade_scope else {}),
-                allow_settled_target=bool(cascade_scope or allow_settled),
-                # §13.1: an omitted/empty-body or explicit-immediate request IS
-                # the immediate policy — it monotonically HARDENS a pending
-                # graceful intent (Stop-now during the wait) and mints a
-                # byte-identical legacy row when no intent exists.
-                requested_stop_policy=STOP_POLICY_IMMEDIATE,
-            )
-            intent_target["task_id"] = str(intent.get("task_id") or task_id)
-            intent_target["scope"] = str(intent.get("scope") or "")
-            return ""
-        except StopActionConflict:
-            return "stop_action_conflict"
-        except CancelIntentProjectionCorrupt:
-            log.error("HTTP cancel refused for %s: intent projection corrupt", task_id)
-            return "projection_corrupt"
-        except Exception:
-            log.warning("HTTP cancel-intent write failed for %s; cancel refused",
-                        task_id, exc_info=True)
-            return "write_failed"
-
-    def _intent_write_refused(kind: str) -> JSONResponse:
-        if kind == "stop_action_conflict":
-            return json_error("stop_action_id reused with a different action", 409,
-                              task_id=task_id, reason_code=kind)
-        if kind == "projection_corrupt":
-            # GR4-8: honest wording — "retry" cannot succeed while the file is
-            # malformed. The corrupt state/cancel_intents.json was PRESERVED
-            # (never overwritten) and a projection_corrupt_refused forensic row
-            # was recorded in logs/supervisor.jsonl.
-            return json_error(
-                "the cancel-intent projection (state/cancel_intents.json) is corrupt; "
-                "nothing was cancelled and retrying cannot succeed until the file is "
-                "repaired — the malformed file was preserved (no overwrite) and a "
-                "projection_corrupt_refused forensic row was recorded in "
-                "logs/supervisor.jsonl",
-                503, task_id=task_id, reason_code="cancel_intent_projection_corrupt",
-            )
+    try:
+        intent = await asyncio.to_thread(functools.partial(
+            _record_stop, task_id, cascade=cascade, stop_action_id=action_id,
+        ))
+    except StopActionConflict:
+        return json_error("stop_action_id reused with a different action", 409,
+                          task_id=task_id, reason_code="stop_action_conflict")
+    except CancelIntentProjectionCorrupt:
+        # GR4-8: honest wording — "retry" cannot succeed while the file is
+        # malformed. The corrupt state/cancel_intents.json was PRESERVED
+        # (never overwritten) and a projection_corrupt_refused forensic row
+        # was recorded in logs/supervisor.jsonl.
+        log.error("HTTP cancel refused for %s: intent projection corrupt", task_id)
+        return json_error(
+            "the cancel-intent projection (state/cancel_intents.json) is corrupt; "
+            "nothing was cancelled and retrying cannot succeed until the file is "
+            "repaired — the malformed file was preserved (no overwrite) and a "
+            "projection_corrupt_refused forensic row was recorded in "
+            "logs/supervisor.jsonl",
+            503, task_id=task_id, reason_code="cancel_intent_projection_corrupt",
+        )
+    except Exception:
+        # Nothing was recorded, so nothing was torn down: no teardown without
+        # the watchdog-replayable fence.
+        log.warning("HTTP cancel-intent write failed for %s; cancel refused", task_id, exc_info=True)
         return json_error(
             "durable cancel intent could not be recorded; nothing was cancelled — retry",
             503, task_id=task_id, reason_code="cancel_intent_write_failed",
         )
-
-    if not cascade:
-        try:
-            from supervisor.queue import (
-                CANCEL_CANCELLED, CANCEL_FAILED, cancel_task_custody,
-                task_has_live_ownership as _live_ownership,
-                task_subtree_is_live as _live_check,
-            )
-
-            # Intent only for a LIVE task: the plain path's legacy contract
-            # answers 404 for an inactive id, and an intent minted for a dead id
-            # would sit open until the watchdog settles it as not_found.
-            # LIVE OWNERSHIP (GR6-1) widens the gate: a settled result whose
-            # worker is still alive is not "inactive" — the intent is minted
-            # with ``allow_settled`` so custody kills the spending worker.
-            live_own = await asyncio.to_thread(_live_ownership, task_id)
-            if live_own or await asyncio.to_thread(_live_check, task_id):
-                refused = await asyncio.to_thread(functools.partial(
-                    _record_http_intent, "http_single", allow_settled=live_own,
-                ))
-                if refused:
-                    return _intent_write_refused(refused)
-            if intent_target["scope"] == "cascade":
-                # Scope is widen-only durable authority.  Stop-now over an
-                # existing graceful cascade must execute that cascade now even
-                # when the new HTTP body omitted ``cascade``; replaying the raw
-                # single shape can kill only the root or fail on a retry leaf.
-                settled = await asyncio.to_thread(
-                    _run_cascade_cancel, intent_target["task_id"],
-                )
-                if not settled:
-                    return json_error(
-                        "subtree cancellation did not settle; the tree is still live",
-                        503,
-                        task_id=task_id,
-                    )
-                return JSONResponse({
-                    "ok": True,
-                    "task_id": task_id,
-                    "cascade": True,
-                })
-            # The TYPED outcome, not a boolean: a task whose worker refused to die
-            # is neither cancelled nor absent, and answering 404 for it would tell
-            # the caller the task is gone while it keeps running.
-            outcome = await asyncio.to_thread(
-                cancel_task_custody, intent_target["task_id"],
-            )
-        except Exception as exc:
-            return json_exception(exc, 503)
-        if outcome == CANCEL_FAILED:
-            return json_error(
-                "cancellation did not settle; the task is still live",
-                503, task_id=task_id,
-            )
-        if outcome != CANCEL_CANCELLED:
-            # LEGACY CONTRACT preserved: the plain path has always answered 404 for
-            # an INACTIVE task, and one that already settled on its own is exactly
-            # that — the typed outcome must not silently widen the envelope.
-            return json_error("task not found or not active", 404, task_id=task_id)
-        return JSONResponse({"ok": True, "task_id": task_id})
-    # Cascade path: ONE synchronous transaction. The caller is answered only once
-    # the subtree is actually torn down, which is what makes the whole
-    # split-transaction family (durable pre-acknowledgement latch, partial-latch
-    # taxonomy, ownership handed to a background teardown, rollbacks that could
-    # withdraw a concurrent cascade's fences) unnecessary rather than merely
-    # guarded. The cost is honest and bounded: a large tree makes the caller wait
-    # for the worker kills and joins it asked for. Off the event loop; process
-    # kills and joins deliberately happen outside the supervisor queue lock. Repeats are
-    # idempotent (the per-task cancel finalizes-on-miss) and a fully-cancelled tree
-    # is no longer live, so it answers 404 like any other inactive task.
-    try:
-        from supervisor.queue import (
-            task_has_live_ownership as _cascade_live_ownership,
-            task_subtree_is_live,
-        )
-
-        # GR7-1b: the 404 pre-check consults the SAME live-ownership predicate
-        # the single lane uses. `task_subtree_is_live` deliberately excludes a
-        # settled-but-RUNNING root (so the cascade postcondition can converge
-        # over a winding-down finalizer), which made this pre-check answer 404
-        # for a settled root whose worker was still burning post-task
-        # cognition — before any intent was minted. A settled-but-LIVE root
-        # proceeds to mint + custody (the kill path preserves the stored
-        # result); a genuinely settled-AND-dead tree keeps the 404 envelope.
-        if not await asyncio.to_thread(
-            _cascade_live_ownership, task_id,
-        ) and not await asyncio.to_thread(task_subtree_is_live, task_id):
-            return json_error("task not found or not active", 404, task_id=task_id)
-        refused = await asyncio.to_thread(
-            functools.partial(_record_http_intent, "http_cascade", cascade_scope=True),
-        )
-        if refused:
-            return _intent_write_refused(refused)
-        settled = await asyncio.to_thread(_run_cascade_cancel, task_id)
-        if not settled:
-            # The teardown refused or failed while the subtree is STILL live: an
-            # ok:true here would report a cancellation that did not happen.
-            return json_error(
-                "subtree cancellation did not settle; the tree is still live",
-                503, task_id=task_id,
-            )
-    except Exception as exc:
-        return json_exception(exc, 503)
-    return JSONResponse({"ok": True, "task_id": task_id, "cascade": True})
+    if intent is None:
+        return json_error("task not found or not active", 404, task_id=task_id)
+    return await asyncio.to_thread(functools.partial(_drive_stop, task_id, intent, cascade=cascade))
 
 
 async def api_task_resume(request: Request) -> JSONResponse:
-    """Explicit owner Resume of a budget-paused task.
+    """Explicit owner Resume of a saved budget, owner or technical pause.
 
     A replay-safe zero-dispatch row is released; an exact mid-run continuation
     (#1196) receives ONE single-use grant and continues under the same task id.
@@ -1394,12 +1340,19 @@ async def api_task_resume(request: Request) -> JSONResponse:
     if result.get("ok"):
         return JSONResponse(result)
     error = str(result.get("error") or "resume_refused")
+    if error == "billing_authority_unavailable":
+        message = ("This task's billing lineage does not authorize a return; repair it or cancel the task."
+                   if result.get("billing_authority") == "refused" else
+                   "This task's billing conditions could not be read. Fix that cause, then try Resume again.")
+        return json_error(message + " The task stays paused; budget exhaustion was not established.", 409,
+                          code=error, reason_code=result.get("cause", ""), task_id=task_id,
+                          **({"action": result["action"]} if result.get("action") else {}))
     status = 409 if error in {
         "task_not_budget_paused", "replay_unsafe", "root_budget_fence_missing",
         # exact-continuation refusals (#1196): the task stays paused
         "budget_still_exhausted", "root_hard_cap_exhausted", "cancel_intent_active",
         "deadline_passed", "lifetime_exhausted", "root_still_paused", "resume_already_granted",
-        "restart_no_resume", "pause_record_missing", "pause_source_unreadable",
+        "restart_no_resume", "pause_record_missing", "pause_source_missing", "pause_source_unreadable",
         "pause_record_unreadable", "grant_not_recorded", "snapshot_not_persisted",
         "monetary_authority_unavailable", "cancellation_authority_unavailable", "task_terminal",
         # holds and root-grant refusals (#1196, owner Q9): the row stays paused/held
@@ -1410,8 +1363,11 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # terminal keeps the task paused; a marker/attempt drift is typed too
         "external_runs_unsettled", "pause_attempt_mismatch",
         "owner_pause_effects_unsettled", "owner_pause_custody_unreadable", "selection_authority_changed",
+        # a held Continue's observed blockers (#1721): an existing successor, never Not Found
+        "predecessor_writers_unsettled", "selection_owner_held",
     } else 404
-    return json_error(error, status, task_id=task_id, **({"action": result["action"]} if result.get("action") else {}))
+    return json_error(error, status, task_id=task_id, **{key: result[key] for key in ("action", "blockers")
+                                                          if result.get(key)})
 
 
 # The task-event SSE endpoint and its follower live in gateway/task_events.py
@@ -1538,10 +1494,11 @@ def _render_attachment_lines(attachments: Any) -> str:
 
 
 def _queue_snapshot(drive_root: pathlib.Path) -> Dict[str, Any]:
-    path = pathlib.Path(drive_root) / "state" / "queue_snapshot.json"
+    from ouroboros.queue_observation import load_queue_document
     try:
         from ouroboros.project_admission import project_hold_fact
-        snapshot = read_json_dict(path) or {}
+        snapshot = load_queue_document(drive_root)
+        snapshot.pop("_queue_alive", None)
         for row in [*snapshot.get("pending", []), *snapshot.get("running", [])]:
             task = row.get("task")
             if isinstance(task, dict):

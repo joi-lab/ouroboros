@@ -84,9 +84,23 @@ def test_chunked_merges_results_into_one_object():
     assert len(parsed["results"]) == 3  # every chunk's record merged
 
 
-def test_chunked_passes_keep_the_full_row_plan_and_exact_session_evidence():
+def _frozen_skill(tmp_path):
+    """A real payload, its loader hash, and the skill object the pass runner binds."""
+    from types import SimpleNamespace
+
+    from ouroboros.skill_loader import compute_content_hash
+
+    skill_dir = tmp_path / "skills" / "demo"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text("---\nname: demo\ndescription: Fixture.\n---\nBody.\n", encoding="utf-8")
+    skill = SimpleNamespace(name="demo", skill_dir=skill_dir, manifest=SimpleNamespace(entry="", scripts=[]))
+    return skill, compute_content_hash(skill_dir)
+
+
+def test_mixed_chunked_panel_sends_retrieving_seats_once_and_packets_every_chunk(tmp_path):
     from ouroboros.review_execution import ReviewRouteKind
 
+    skill, content_hash = _frozen_skill(tmp_path)
     row_plan = {
         "routes": [ReviewRouteKind.AGENT_SESSION, ReviewRouteKind.API_CHAT],
         "efforts": ["high", "medium"],
@@ -99,33 +113,47 @@ def test_chunked_passes_keep_the_full_row_plan_and_exact_session_evidence():
     def fake_run_review(ctx, **kwargs):
         calls.append(kwargs)
         return json.dumps({"results": [
-            {"model": model, "text": json.dumps([
+            {"model": model, "slot_id": slot, "text": json.dumps([
                 {"item": "x", "verdict": "PASS", "reason": "ok"},
             ])}
-            for model in kwargs["models"]
+            for model, slot in zip(kwargs["models"], kwargs["row_plan"]["slot_ids"])
         ]})
 
-    _prompt, _adv, _text, err = _run(
-        ["p1", "p2"], fake_run_review, models=["session-model", "api-model"],
-        row_plan=row_plan,
+    _prompt, _adv, text, err = run_skill_review_passes(
+        None, tmp_path / "drive", skill,
+        evidence={"manifest_dump": "", "content_hash": content_hash, "history": [],
+                  "review_rebuttal": "", "required_items": ("x",)},
+        file_packs=["p1", "p2"], models=["session-model", "api-model"], row_plan=row_plan,
+        session_root="/repo", build_prompt=_fake_build_prompt, run_review=fake_run_review,
     )
 
     assert err == ""
-    assert len(calls) == 2
-    for idx, call in enumerate(calls, 1):
-        assert call["routes"] == row_plan["routes"]
-        assert call["row_plan"] is row_plan
-        assert call["session_root"] == "/repo"
-        assert "exact frozen skill evidence" in call["session_task"]
-        assert f"DYNAMIC[p{idx}]" in call["session_task"]
-        assert "STABLE::" not in call["session_task"]
-        assert all(path in call["session_task"] for path in (
-            "BIBLE.md", "docs/CHECKLISTS.md", "ouroboros/contracts/plugin_api.py"))
-        assert "every physical chapter" in call["session_task"]
-        assert "`Chapters` membership list in full, in the order you choose" in call["session_task"]
-        assert "legacy monolith without `Chapters`" in call["session_task"]
-        assert "physical file paths and file-local lines" in call["session_task"]
-        assert f"PART {idx} of 2" in call["session_task"]
+    # The first pass carries both seats; the second only the packet seat.
+    assert [call["models"] for call in calls] == [["session-model", "api-model"], ["api-model"]]
+    assert [call["row_plan"]["slot_ids"] for call in calls] == [["session-slot", "api-slot"], ["api-slot"]]
+    first, second = calls
+    assert first["session_root"] == second["session_root"] == "/repo"
+    session_task = first["row_plan"]["session_tasks"][0]
+    assert first["row_plan"]["session_tasks"][1] == ""  # a packet seat receives the pack
+    # The retrieving seat reviews the WHOLE payload once, never "PART i of n".
+    assert "DYNAMIC[p1\n\np2]" in session_task and "PART 1 of 2" not in session_task
+    assert "exact frozen copy" in session_task and "STABLE::" not in session_task
+    assert all(path in session_task for path in (
+        "BIBLE.md", "docs/CHECKLISTS.md", "ouroboros/contracts/plugin_api.py"))
+    assert "every physical chapter" in session_task
+    assert "`Chapters` membership list in full, in the order you choose" in session_task
+    assert "legacy monolith without `Chapters`" in session_task
+    assert "physical file paths and file-local lines" in session_task
+    policy = first["row_plan"]["session_policies"][0]
+    rows = policy["native_required_sources"]
+    payload = [row for row in rows if row["disposition"] == "skill_payload"]
+    assert [row["path"].rsplit("/", 1)[-1] for row in payload] == ["SKILL.md"]
+    assert payload[0]["file"].startswith(policy["skill_payload_delivery"]["frozen_view"])
+    assert {row["path"] for row in rows if row["disposition"] == "governance"} >= {
+        "BIBLE.md", "docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md", "docs/CREATING_SKILLS.md"}
+    assert "PART 2 of 2" in second["content"]
+    # Both merged chunks carry the packet seat; the retrieving seat answered once.
+    assert [row["slot_id"] for row in json.loads(text)["results"]] == ["session-slot", "api-slot", "api-slot"]
 
 
 def test_retry_identity_separates_skill_waves_and_exact_chunks():

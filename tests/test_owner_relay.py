@@ -1,0 +1,191 @@
+"""A relay's authority follows exact retained owner rows, independently of lane."""
+import json
+import queue
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros.chat_chain import format_address, row_address
+from ouroboros.owner_relay import held_owner_messages, quote_rows, write_relay, select_return
+from ouroboros.loop_round_limits import _drain_incoming_messages
+from ouroboros.owner_mailbox import drain_owner_entries
+from ouroboros.utils import append_jsonl
+
+
+def source(tmp_path):
+    row = {"chat_id": 1, "direction": "in", "ts": "2026-10-01T00:00:00Z", "text": "  exact\nowner words  ",
+           "client_message_id": "owner-1", "attachments": []}
+    append_jsonl(tmp_path / "logs/chat.jsonl", row)
+    return row, format_address(row_address(row))
+
+
+def context(tmp_path, row=None):
+    from ouroboros.project_dialogue import build_owner_message_ref
+    metadata = {} if row is None else {"origin_message_ref": build_owner_message_ref(
+        chat_id=row["chat_id"], client_message_id=row["client_message_id"], ts=row["ts"], text=row["text"])}
+    return SimpleNamespace(task_id="teller", drive_root=tmp_path, budget_drive_root=tmp_path,
+                           current_chat_id=1, task_metadata=metadata, pending_events=[], event_queue=None,
+                           drive_logs=lambda: tmp_path / "logs")
+
+
+def test_only_held_rows_can_be_quoted_and_note_is_never_substituted(tmp_path, monkeypatch):
+    from ouroboros.tools.control_relay import _tell_task
+    row, handle = source(tmp_path)
+    ctx = context(tmp_path, row)
+    events = []
+    monkeypatch.setattr("ouroboros.tools.control_routing._emit_and_wait_for_routing",
+                        lambda ctx, evt: (events.append(evt) or "live", {"status": "delivered"}))
+    assert "QUOTE_NOT_HELD" in _tell_task(ctx, "receiver", "note", [handle + "0"])
+    assert not events
+    _tell_task(ctx, "receiver", "my own note", [handle])
+    assert events[0]["message"] == "my own note"
+    assert events[0]["quotes"][0]["text"] == row["text"]
+    assert events[0]["quotes"][0]["source"]["address"] == handle
+    _tell_task(ctx, "receiver", "later note")
+    assert events[1]["message"] == "later note" and events[1]["quotes"] == []
+
+
+def test_atomic_relay_is_idempotent_and_note_never_enters_owner_corpus(tmp_path):
+    row, handle = source(tmp_path)
+    sender = context(tmp_path, row)
+    quotes, error = quote_rows(sender, [handle])
+    assert not error
+    args = dict(relay_id="r1", note="MODEL NOTE", quotes=quotes, chat_id=1, teller_task_id="teller")
+    assert write_relay(tmp_path, "receiver", **args)[1]
+    assert not write_relay(tmp_path, "receiver", **args)[1]
+    assert len(drain_owner_entries(tmp_path, "receiver")) == 1
+    with pytest.raises(ValueError, match="different words"):
+        write_relay(tmp_path, "receiver", **{**args, "note": "changed"})
+    receiver = context(tmp_path)
+    receiver.task_id = "receiver"
+    messages = []
+    _drain_incoming_messages(messages, queue.Queue(), tmp_path, "receiver", None, set(), owner_ctx=receiver)
+    assert [r["content"] for r in receiver._owner_directives] == [row["text"]]
+    assert "MODEL NOTE" in str(messages)
+    assert handle in held_owner_messages(receiver)
+    assert select_return(receiver, "")[0]["source"]["chat_id"] == 1
+    assert not drain_owner_entries(tmp_path, "receiver")
+
+
+def test_cross_room_paused_target_keeps_mail_without_resuming_and_dedupes_generation(tmp_path, monkeypatch):
+    from supervisor.steering import _handle_steer_task
+    from supervisor import queue as q
+    row, handle = source(tmp_path)
+    quotes, _ = quote_rows(context(tmp_path, row), [handle])
+    target = {"id": "receiver", "chat_id": 42, "drive_root": str(tmp_path), "_owner_hold": True}
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, PENDING=[target],
+                          persist_queue_snapshot=lambda **kw: None)
+    monkeypatch.setattr(q, "ACCEPTANCE_FENCES", {"receiver": {"status": "active", "owner_message_generation": 2}})
+    event = {"target_task_id": "receiver", "message": "note", "quotes": quotes, "relay_id": "r1",
+             "routing_token": "r1", "chat_id": 1, "client_message_id": "owner-1", "issuer": {"kind": "task"}}
+    _handle_steer_task(event, ctx)
+    _handle_steer_task(event, ctx)
+    assert q.ACCEPTANCE_FENCES["receiver"]["owner_message_generation"] == 3
+    assert ctx.PENDING == [target] and target["_owner_hold"] is True
+    assert len(drain_owner_entries(tmp_path, "receiver")) == 1
+    rows = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    relays = [r for r in rows if r.get("type") == "relay_entry"]
+    assert len(relays) == 1 and relays[0]["text"] == "note"
+    assert relays[0]["relay"]["text"] == row["text"]
+
+
+def test_empty_return_is_ambiguous_but_omitted_route_remains_ordinary(tmp_path):
+    from ouroboros.tools.control_runtime import _send_user_message
+    ctx = context(tmp_path)
+    assert "RELAY_RETURN_UNRESOLVED" in _send_user_message(ctx, "reply", reply_to_relay="")
+    assert not ctx.pending_events
+    _send_user_message(ctx, "ordinary")
+    assert ctx.pending_events[0]["chat_id"] == 1
+
+
+def test_return_survives_teller_end_and_refuses_ambiguous_or_hidden_sender(tmp_path):
+    from ouroboros.tools.control_runtime import _send_user_message
+    row, handle = source(tmp_path)
+    recipient = context(tmp_path)
+    recipient.current_chat_id = 42
+    recipient.task_metadata = {"origin_suppressed": True}
+    relay = {"relay_id": "r", "source": {"chat_id": 1, "address": handle}}
+    recipient._open_relays = {"r": relay, "s": {**relay, "relay_id": "s"}}
+    assert "RELAY_RETURN_UNRESOLVED" in _send_user_message(recipient, "answer", reply_to_relay="")
+    assert not recipient.pending_events
+    recipient.current_chat_id = 0
+    assert "hidden" in _send_user_message(recipient, "answer", reply_to_relay="r")
+    assert not recipient.pending_events and len(recipient._open_relays) == 2
+    recipient.current_chat_id = 42
+    assert _send_user_message(recipient, "answer", reply_to_relay="r").startswith("OK:")
+    [event] = recipient.pending_events
+    assert event["chat_id"] == 1 and event["system_type"] == "relay_reply"
+    assert event["progress_meta"]["reply_to"]["snippet"] == "exact owner words"
+    assert event["progress_meta"]["reply_to_relay"] == "r"
+    assert "r" not in recipient._open_relays and "s" in recipient._open_relays
+
+
+def test_saved_ack_updates_each_quoted_owner_row(tmp_path):
+    from ouroboros.owner_relay import retain_owner_message
+    from ouroboros.project_dialogue import latest_chat_annotations
+    row, handle = source(tmp_path)
+    sender = context(tmp_path, row)
+    second = {**row, "client_message_id": "owner-2", "text": "second exact words"}
+    retain_owner_message(sender, second)
+    quotes, error = quote_rows(sender, [handle, format_address(row_address(second))])
+    assert not error
+    write_relay(tmp_path, "receiver", relay_id="both", note="context", quotes=quotes,
+                chat_id=1, teller_task_id="teller")
+    receiver = context(tmp_path)
+    receiver.task_id = "receiver"
+    events = queue.Queue()
+    _drain_incoming_messages([], queue.Queue(), tmp_path, "receiver", events, set(), owner_ctx=receiver)
+    annotations = latest_chat_annotations(tmp_path)
+    assert all(annotations[key]["status"] == "read" for key in ("owner-1", "owner-2"))
+    assert all(annotations[key]["target_task_ids"] == ["receiver"] for key in ("owner-1", "owner-2"))
+    assert events.get_nowait()["relay_ack"]["relay_id"] == "both"
+
+
+def test_retained_current_quotes_extend_owner_corpus_without_the_note(tmp_path):
+    from ouroboros.task_results import write_task_result
+    from ouroboros.owner_words import task_owner_words
+    row, handle = source(tmp_path)
+    quotes, _ = quote_rows(context(tmp_path, row), [handle])
+    write_task_result(tmp_path, "receiver", "running", origin_message_text="Original task")
+    write_relay(tmp_path, "receiver", relay_id="r", note="NOT OWNER", quotes=quotes,
+                chat_id=1, teller_task_id="teller")
+    receiver = context(tmp_path)
+    receiver.task_id = "receiver"
+    _drain_incoming_messages([], queue.Queue(), tmp_path, "receiver", None, set(), owner_ctx=receiver)
+    words, absent = task_owner_words(tmp_path, "receiver")
+    assert not absent and [r["text"] for r in words] == ["Original task", row["text"]]
+    assert "NOT OWNER" not in str(words)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_quoted_file_is_staged_on_the_recipient_drive_with_its_original_hash(tmp_path, changed):
+    from ouroboros.chat_uploads import store_upload, claim_refs, uploads_dir
+    from ouroboros.owner_relay import retain_owner_message
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
+    _path, ref = store_upload(b"exact attached words", "note.txt", data_dir=tmp_path)
+    claim_refs([ref], tmp_path)
+    row, _ = source(tmp_path)
+    row["attachments"] = [ref]
+    sender = context(tmp_path)
+    retain_owner_message(sender, row)
+    quotes, _ = quote_rows(sender, [format_address(row_address(row))])
+    child = tmp_path / "child"
+    child.mkdir()
+    write_relay(child, "receiver", relay_id="file", note="context", quotes=quotes,
+                chat_id=1, teller_task_id="teller", canonical_root=tmp_path)
+    if changed:
+        (uploads_dir(tmp_path) / ref["upload"]).write_bytes(b"substituted bytes")
+    receiver = context(child)
+    receiver.task_id = "receiver"
+    messages = []
+    _drain_incoming_messages(messages, queue.Queue(), child, "receiver", None, set(), owner_ctx=receiver)
+    if changed:
+        assert "rejected" in str(messages)
+        assert "substituted bytes" not in str(messages)
+    else:
+        artifact = child / "task_results/artifacts/receiver/attachments" / ref["upload"]
+        assert artifact.read_bytes() == b"exact attached words"
+        reader = ToolContext(repo_dir=tmp_path, drive_root=child, task_id="receiver")
+        assert "exact attached words" in _read_file(reader, "attachments/" + ref["upload"], root="artifact_store")
+        assert "read_file" in str(messages)

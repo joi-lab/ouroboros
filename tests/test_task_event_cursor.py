@@ -10,7 +10,6 @@ import pytest
 from starlette.requests import Request
 
 from ouroboros.gateway.task_events import _TaskEventCursorFollower, api_task_events, iter_task_events
-from ouroboros.task_result_facts import raw_result_facts
 from ouroboros.task_results import write_task_result
 
 
@@ -191,43 +190,24 @@ def test_terminal_snapshot_materializes_once_and_legacy_ts_never_bounds_history(
     assert content(iter_task_events(root, "root")) == ["early"]
 
 
-def test_result_memo_reconnect_and_same_size_rewrite_invalidation(tmp_path, monkeypatch):
-    from ouroboros.gateway import tasks
+def test_lineage_discovery_reads_typed_facts_and_sees_a_changed_lineage(tmp_path, monkeypatch):
+    """Discovery selects children from the store's typed columns: no body is decoded, and a
+    row whose lineage changes is seen on the next refresh; a deleted row leaves the view."""
+    from ouroboros import task_store
+    from ouroboros.task_store import delete_document
+
     root = seed(tmp_path / "data")
     write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="aaaa")
-    reads = []
-    real = tasks.read_json_dict
-    monkeypatch.setattr(tasks, "read_json_dict", lambda path: reads.append(path.name) or real(path))
-    stream(root)
-    reads.clear()
-    stream(root)
-    assert reads == []
-    path = root / "task_results" / "child.json"
-    before = path.stat()
-    from ouroboros.utils import write_bytes_atomic
-
-    # Production writes atomically replace the file. Windows ctime is creation
-    # time, so an in-place write with restored mtime cannot test that contract.
-    write_bytes_atomic(path, path.read_bytes().replace(b'"aaaa"', b'"root"'))
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    monkeypatch.setattr(task_store, "_decode", lambda *a, **kw: pytest.fail("lineage discovery decoded a body"))
     follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
     follower.refresh_view()
-    assert "child" in follower.task_filter_ids
-    assert reads == ["child.json"]
-
-
-def test_result_memo_drops_deleted_and_never_caches_torn_or_changed_read(tmp_path):
-    root = seed(tmp_path / "data")
-    path = root / "task_results" / "child.json"
-    path.write_text('{"torn":', encoding="utf-8")
-    rows, errors = raw_result_facts(path.parent)
-    assert "child.json" in errors and "child.json" not in rows
-    path.unlink()
+    assert "child" not in follower.task_filter_ids
     write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root")
-    rows, errors = raw_result_facts(path.parent)
-    assert rows["child.json"]["parent_task_id"] == "root" and not errors
-    path.unlink()
-    assert "child.json" not in raw_result_facts(path.parent)[0]
+    follower.refresh_view()
+    assert "child" in follower.task_filter_ids
+    delete_document(root, "child")
+    follower.refresh_view()
+    assert "child" not in follower.task_filter_ids
 
 
 def test_main_dialogue_uses_tail_and_preserves_original_ids(tmp_path, monkeypatch):
@@ -351,45 +331,32 @@ def test_reconnect_gets_fresh_terminal_result_without_replaying_consumed_logs(tm
 
 
 @pytest.mark.parametrize("schema", [None, 999])
-def test_refused_result_facts_are_cached_until_the_file_changes(tmp_path, monkeypatch, schema):
-    from ouroboros.gateway import tasks
-
-    root = seed(tmp_path / "data")
-    path = root / "task_results" / "child.json"
-    raw = {"task_id": "child", "status": "running", "parent_task_id": "root"}
+def test_a_refused_legacy_result_file_never_reaches_the_lineage(tmp_path, schema):
+    """A file the importer refuses (unstamped, or a future schema) is not a row: discovery
+    never lists it, the strict reader and create-only writer refuse the occupied identity,
+    and the bytes stay where the importer left them."""
+    from ouroboros.task_results import load_task_result
+    path = tmp_path / "data" / "task_results" / "child.json"
+    path.parent.mkdir(parents=True)
+    raw = {"task_id": "child", "status": "running", "parent_task_id": "root", "delegation_role": "subagent"}
     if schema is not None:
         raw["_schema_version"] = schema
-    path.write_text(json.dumps(raw), encoding="utf-8")
-    reads = []
-    reader = tasks.read_json_dict
-    monkeypatch.setattr(tasks, "read_json_dict", lambda p: reads.append(p.name) or reader(p))
+    path.write_text(json.dumps(raw), encoding="utf-8")  # before the first touch: the import judges it
+    root = seed(tmp_path / "data")
     follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
     for _ in range(3):
         follower.refresh_view()
         assert "child" not in follower.task_filter_ids
-    assert reads.count("child.json") == 1
-    path.unlink()
+    assert load_task_result(root, "child") is None
+    with pytest.raises(ValueError, match="authority is unreadable or invalid"):
+        load_task_result(root, "child", strict=True)
+    with pytest.raises(ValueError, match="authority is unreadable or invalid"):
+        write_task_result(root, "child", "running", create_only=True)
+    kept = path if path.exists() else next((root / "task_results" / "quarantine").glob("child*.json"))
+    assert json.loads(kept.read_text(encoding="utf-8")) == raw
     write_task_result(root, "child", "running", parent_task_id="root", delegation_role="subagent")
     follower.refresh_view()
     assert "child" in follower.task_filter_ids
-    assert reads.count("child.json") == 2
-
-
-def test_result_facts_cannot_admit_an_invalid_schema(tmp_path):
-    from ouroboros.task_results import load_task_result
-    root = seed(tmp_path / 'data')
-    path = root / 'task_results' / 'child.json'
-    raw = {'_schema_version': 999, 'task_id': 'child', 'status': 'running',
-           'delegation_role': 'subagent', 'parent_task_id': 'root'}
-    path.write_text(json.dumps(raw), encoding='utf-8')
-    rows, _ = raw_result_facts(path.parent)
-    assert rows['child.json']['schema_refusal'] == 'future_schema'
-    follower = _TaskEventCursorFollower(root, 'root', {'v': 2, 'seq': 0, 'view': '', 'positions': {}})
-    follower.refresh_view()
-    assert 'child' not in follower.task_filter_ids
-    with pytest.raises(ValueError, match='future_schema'):
-        load_task_result(root, 'child', strict=True)
-    assert json.loads(path.read_text()) == raw
 
 
 def test_many_archives_use_bounded_handles_and_consumed_prefix_is_not_opened(tmp_path, monkeypatch):
@@ -600,31 +567,28 @@ def test_post_keeps_gateway_additive_unknown_fields(tmp_path):
     asyncio.run(consume())
 
 
-def test_unreadable_results_are_disclosed_without_an_empty_view(tmp_path, monkeypatch, caplog):
-    import pathlib
-    from ouroboros import task_result_facts as task_list_scan
+def test_an_unavailable_store_is_disclosed_without_an_empty_view(tmp_path, monkeypatch):
+    from ouroboros import task_store
+    from ouroboros.gateway import task_events
     from ouroboros.server_routing_context import _main_routing_manifest
+    from ouroboros.store import StoreBusy
 
     root = seed(tmp_path / "data")
+    write_task_result(root, "child", "running", delegation_role="subagent", parent_task_id="root")
     cursor = stream(root)[-1]["cursor"]
-    real = os.scandir
-    def scandir(path):
-        if pathlib.Path(path) == root / "task_results":
-            raise PermissionError("result directory denied")
-        return real(path)
-    monkeypatch.setattr(os, "scandir", scandir)
-    assert task_list_scan._raw_sorted_result_names(root / "task_results") == ([], [])
-    assert "Task-result directory is unreadable" in caplog.text
+
+    def busy(*args, **kwargs):
+        raise StoreBusy("current store busy")
+
+    monkeypatch.setattr(task_events, "task_facts", busy)
+    monkeypatch.setattr(task_store, "task_facts", busy)
     manifest = _main_routing_manifest(SimpleNamespace(DRIVE_ROOT=root, RUNNING={}, PENDING=[]))
     assert manifest["omissions"]["final_results"] is None
-    assert "result_directory_unreadable" in manifest["omissions"]["final_results_error"]
+    assert "result_store_unreadable" in manifest["omissions"]["final_results_error"]
     events = stream(root, cursor)
-    assert [row["type"] for row in events] == ["error"]
-    assert events[0]["cursor"]["positions"] == cursor["positions"]
-    async def legacy():
-        req = request(root)
-        req.scope["method"] = "GET"
-        req.scope["query_string"] = b"wait=0"
-        response = await api_task_events(req)
-        return [frame async for frame in response.body_iterator]
-    assert '"reason": "history_unavailable"' in asyncio.run(legacy())[0]
+    gaps = [row for row in events if row["type"] == "history_gap"]
+    assert gaps and gaps[0]["reason"] == "lineage_incomplete" and gaps[0]["data"]["store_unavailable"] is True
+    monkeypatch.undo()
+    follower = _TaskEventCursorFollower(root, "root", {"v": 2, "seq": 0, "view": "", "positions": {}})
+    follower.refresh_view()
+    assert "child" in follower.task_filter_ids

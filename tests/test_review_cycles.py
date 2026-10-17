@@ -23,7 +23,7 @@ from ouroboros import config as cfg
 from ouroboros import review_cycles as rc
 from ouroboros import task_pacing
 from ouroboros.contracts.task_contract import normalize_budget_profile
-from tests._governance_docs_shared import architecture_text, development_text
+from tests._store_shared import result_signature, unreadable_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
@@ -260,8 +260,11 @@ def test_empty_root_contract_cannot_mint_acceptance_wallet(tmp_path):
         )
 
 
-def test_corrupt_claimant_cancel_latch_cannot_spend_root_wallet(tmp_path):
+def test_unreadable_claimant_cancel_latch_cannot_spend_root_wallet(tmp_path, monkeypatch):
+    """The claimant's own cancel latch is read strictly inside the claim: a claimant row the
+    store cannot answer for refuses the claim and the root's wallet is left untouched."""
     from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.store import StoreError
     from ouroboros.task_results import (
         STATUS_RUNNING, claim_task_acceptance_review_cycle, review_binding_hash,
         write_task_result,
@@ -271,23 +274,24 @@ def test_corrupt_claimant_cancel_latch_cannot_spend_root_wallet(tmp_path):
         tmp_path, "root-corrupt-claimant", STATUS_RUNNING,
         root_task_id="root-corrupt-claimant", task_contract=build_task_contract({}),
     )
-    root_path = tmp_path / "task_results" / "root-corrupt-claimant.json"
-    before = root_path.read_bytes()
-    claimant_path = tmp_path / "task_results" / "corrupt-claimant.json"
-    claimant_path.write_text("{", encoding="utf-8")
+    before = result_signature(tmp_path, "root-corrupt-claimant")
+    write_task_result(tmp_path, "corrupt-claimant", STATUS_RUNNING, root_task_id="root-corrupt-claimant")
+    claimant_before = result_signature(tmp_path, "corrupt-claimant")
+    unreadable = unreadable_result(monkeypatch, "corrupt-claimant")
     fields = {
         "candidate_hash": "b" * 64,
         "evidence_revision": "c" * 64,
         "fence_hash": "d" * 64,
     }
-    with pytest.raises(ValueError, match="task result authority is unreadable"):
+    with pytest.raises(StoreError):
         claim_task_acceptance_review_cycle(
             tmp_path, "root-corrupt-claimant",
             {**fields, "binding_hash": review_binding_hash(**fields)},
             claimed_by_task_id="corrupt-claimant",
         )
-    assert root_path.read_bytes() == before
-    assert claimant_path.read_text(encoding="utf-8") == "{"
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "root-corrupt-claimant") == before
+    assert result_signature(tmp_path, "corrupt-claimant") == claimant_before
 
 
 def test_author_rails_separate_paid_cap_from_local_passes(monkeypatch):
@@ -360,6 +364,28 @@ def test_commit_gate_ceiling_reads_live_setting(monkeypatch, tmp_path):
     assert check_review_cycles_ceiling(ctx, root_task_id="root-1") is not None
 
 
+@pytest.mark.parametrize("enforcement, reason", [
+    ("blocking", "identical_diff_refused"), ("blocking", "review_cycles_exhausted"), ("advisory", "identical_diff_refused"),
+])
+def test_replay_disclosure_preserves_recorded_outcome(monkeypatch, enforcement, reason):
+    """Every replay emits one progress note and one disclosure carrying the prior outcome."""
+    from ouroboros.tools.commit_gate import disclose_commit_review_replay
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    notes, advisory = [], []
+    ctx = types.SimpleNamespace(_review_advisory=advisory, emit_progress_fn=notes.append)
+    disclose_commit_review_replay(ctx, {"replay_reason": reason, "advisory_replay": "Prior outcome: FAIL."})
+    [_note], [disclosure] = notes, advisory
+    assert reason in disclosure
+    assert disclosure.endswith("Prior outcome: FAIL.")
+
+
+def test_commit_scope_supplies_intent_when_goal_is_empty():
+    from ouroboros.tools.review_helpers import resolve_intent
+
+    assert resolve_intent("", "only the gate wording", "subject: x") == ("only the gate wording", "scope")
+
+
 def test_paid_cycle_count_counts_dispatched_money_only(tmp_path, monkeypatch):
     """machine-5 contract: the ceiling counts MONEY. Every row that physically
     dispatched a wave (paid=True) counts whatever its terminal — verdict-block,
@@ -398,30 +424,6 @@ def test_commit_gate_has_no_import_time_cap_constant():
     # refused free from the first verdict-block, not re-reviewed up to a cap.
     assert not hasattr(commit_gate, "check_blocked_attempt_cap")
     assert not hasattr(commit_gate, "blocked_attempt_fingerprint_cap")
-
-
-def test_advisory_review_schema_note_states_paid_cycle_semantics(monkeypatch):
-    from ouroboros.tools.claude_advisory_review import _identical_diff_cap_note
-
-    note = _identical_diff_cap_note()
-    assert "identical bytes are never re-reviewed for pay" in note
-    assert "identical_diff_refused" in note
-    assert "after 2 paid cycle(s)" in note
-    assert "per ROOT task" in note  # wording-5: the tree shares one ceiling
-    # Honesty caveat (synthesis F6): the identical-diff refusal replays only
-    # recorded VERDICT blocks, which a pure advisory line never mints — there
-    # the no-new-spend guarantee is the exhaustion free replay.
-    assert "Under blocking enforcement an identical resubmission after a recorded" in note
-    assert "a pure advisory line never mints verdict blocks" in note
-    assert "exhaustion free replay" in note
-    monkeypatch.setenv(KEY, "5")
-    assert "after 5 paid cycle(s)" in _identical_diff_cap_note()
-    monkeypatch.setenv(KEY, "unlimited")
-    note = _identical_diff_cap_note()
-    assert "no per-root-task ceiling" in note
-    assert "identical bytes are never re-reviewed for pay" in note  # knob-independent
-    source = (REPO / "ouroboros" / "tools" / "claude_advisory_review.py").read_text(encoding="utf-8")
-    assert "after 3 genuine" not in source
 
 
 # ---------------------------------------------------------------------------
@@ -475,15 +477,15 @@ def test_settings_ui_knob_and_js_binding():
     css = (REPO / "web" / "settings.css").read_text(encoding="utf-8")
     assert '<input id="s-review-max-cycles" type="hidden" value="2">' in ui
     section = ui[ui.index("<h3>Max Review Cycles</h3>"):]
-    section = section[:section.index("<h3>Image Input</h3>")]
+    section = section[:section.index("<h3>", 1)]  # the card alone, up to the next one
     assert "target: 's-review-max-cycles'" in section
     for value in ("'1'", "'2'", "'3'", "'5'", "'unlimited'"):
         assert f"value: {value}" in section
     assert "\\u221E" in section  # the ∞ label maps to the "unlimited" value
     assert "['s-review-max-cycles', 'OUROBOROS_REVIEW_MAX_CYCLES', '2']" in js
     assert "[data-review-cycles-group].settings-effort-group" in css
-    # Behavior tab: the knob sits between the review controls and Image Input.
-    assert ui.index("<h3>Task Result Review</h3>") < ui.index("<h3>Max Review Cycles</h3>") < ui.index("<h3>Image Input</h3>")
+    # Behavior tab: the knob closes the review trio that opens the tab, before Access.
+    assert ui.index("<h3>Review Enforcement</h3>") < ui.index("<h3>Task Result Review</h3>") < ui.index("<h3>Max Review Cycles</h3>") < ui.index("<h3>Access</h3>")
 
 
 def test_legacy_acceptance_key_migrates_into_the_shared_knob(tmp_path, monkeypatch):
@@ -542,17 +544,68 @@ def test_exhausted_event_is_durable_even_with_a_live_queue(tmp_path):
     assert len(lines) == 2 and events.empty()
 
 
-def test_docs_describe_shared_key_and_new_module_size():
-    dev = development_text(REPO)
-    arch = architecture_text(REPO)
-    assert dev.count(KEY) >= 2 and "review_cycles.py" in dev
-    assert f"| {KEY} |" in arch
-    # the LEGACY row documents the load-time migration, not a runtime binding
-    assert f"| {LEGACY} |" in arch and "MIGRATED into" in arch
-    assert "Required+Blocking without one has no local count cap" not in dev
-    assert "Required+Blocking with no explicit cap has no local count cap" not in arch
+def test_review_cycle_modules_respect_size_bounds():
     module_lines = (REPO / "ouroboros" / "review_cycles.py").read_text(encoding="utf-8").splitlines()
     # Brief-level target for this module (the repo ratchet is 1000/1600).
     assert len(module_lines) <= 200
     config_lines = (REPO / "ouroboros" / "config.py").read_text(encoding="utf-8").splitlines()
     assert len(config_lines) <= 1600
+
+
+# ------------------------------------------------- acceptance at the shared cap (D27)
+
+
+def _acceptance_ctx(tmp_path, *, passes_done, events=None):
+    import ouroboros.loop as loop_mod
+
+    tool_ctx = types.SimpleNamespace(
+        _task_acceptance_reviewed=False, _task_acceptance_improvement_passes=passes_done,
+        drive_root=str(tmp_path), budget_drive_root=str(tmp_path), task_id="acc-1",
+        task_metadata={}, task_contract={}, is_direct_chat=False, event_queue=events,
+        end_acceptance_fence=lambda **_k: {"ok": True}, _task_acceptance_fence_token="tok",
+    )
+    return loop_mod._TaskAcceptanceContext(
+        tools=types.SimpleNamespace(_ctx=tool_ctx), content="done", task_id="acc-1", task_type="task",
+        llm_trace={"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}, drive_root=None,
+        messages=[{"role": "user", "content": "goal"}], emit_progress=lambda _m, *, incident=None: None, mode="required",
+        subtree_statuses=[], budget_profile={}, passes_done=passes_done,
+    )
+
+
+def _fail_result():
+    import ouroboros.review_substrate as rs
+
+    return rs.ReviewRunResult(
+        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
+        actors=[{"slot_id": "s0", "signal": "FAIL", "parsed": {
+            "verdict": "FAIL", "outcome_tier": "best_effort", "completion_coach": "fix it",
+            "dialogue_status": "continue_actionable"}}],
+        parsed_findings=[{"slot_id": "s0", "severity": "critical", "item": "broken",
+                          "recommendation": "fix", "verdict": "FAIL"}],
+        aggregate_signal="FAIL",
+    )
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_last_paid_acceptance_result_returns_to_author(tmp_path, monkeypatch, enforcement):
+    import ouroboros.loop as loop_mod
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
+    monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: enforcement)
+    ctx = _acceptance_ctx(tmp_path, passes_done=1)
+    assert loop_mod._apply_task_acceptance_result(ctx, _fail_result(), record_run=True) is True
+    assert ctx.llm_trace["acceptance_decision"]["status"] == "revision_requested"
+    assert ctx.llm_trace["review_runs"][-1]["aggregate_signal"] == "FAIL"
+    assert ctx.messages[-1]["review_feedback"]
+
+
+def test_explicit_author_limit_still_binds(monkeypatch):
+    from ouroboros import task_pacing
+    from ouroboros.contracts.task_contract import normalize_budget_profile
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
+    snap = task_pacing.BudgetSnapshot(has_deadline=False)
+    shared = normalize_budget_profile({})
+    assert task_pacing.improvement_pass_allowed(snap, 1, shared, required_blocking=True) == (True, "")
+    explicit = normalize_budget_profile({"max_improvement_passes": 0})
+    assert task_pacing.improvement_pass_allowed(snap, 0, explicit, required_blocking=True) == (False, "improvement_passes_exhausted")

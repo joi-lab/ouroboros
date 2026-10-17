@@ -100,7 +100,7 @@ def test_cascade_replay_after_crash_delivers_exactly_one_summary(qenv, monkeypat
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
     # The crash shape: every task of the tree is already durably settled, but
     # the root's cascade intent is still open (crash before summary + settle).
@@ -109,7 +109,7 @@ def test_cascade_replay_after_crash_delivers_exactly_one_summary(qenv, monkeypat
         qenv.drive, "cr1", scope=ci.SCOPE_CASCADE, allow_settled_target=True,
     )
 
-    assert qenv.tl.cancel_task_by_id("cr1", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cr1") is True
 
     sends = [e for e in queue.events if e.get("type") == "send_message"]
     assert len(sends) == 1, "the replay/already-down path still owes the summary"
@@ -130,7 +130,7 @@ def test_cascade_replay_after_crash_delivers_exactly_one_summary(qenv, monkeypat
         qenv.drive, "cr1", scope=ci.SCOPE_CASCADE, allow_settled_target=True,
     )
     assert second["request_id"] != minted["request_id"]
-    assert qenv.tl.cancel_task_by_id("cr1", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("cr1") is True
     later = [e for e in queue.events if e.get("type") == "send_message"]
     assert len(later) == 1
     assert later[0]["delivery_id"] == f"cascade:cr1:{second['request_id']}"
@@ -448,7 +448,7 @@ def test_reaper_already_terminal_recovery_registers_the_answer_owed(qenv, monkey
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(services_mod, "archive_task_service_logs", lambda *a, **k: None)
     qenv.workers.WORKERS[0] = types.SimpleNamespace(
         wid=0, proc=_DeadProc(), busy_task_id=None, reaping=True,
@@ -576,8 +576,13 @@ def test_delegated_audit_failure_is_typed_unknown_never_clean(qenv, monkeypatch)
     )
     assert "DELEGATED RUN STATE UNKNOWN" in event["text"]
 
-    # The pending-invocation audit failure surfaces the same way.
+    # The pending-invocation audit failure surfaces the same way (the shared snapshot
+    # read failed first, so each projection reads for itself).
+    from ouroboros import delegate_terminal
+
     monkeypatch.setattr(dc, "open_runs", lambda *a, **kw: [])
+    monkeypatch.setattr(delegate_terminal, "custody_audit_snapshot",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("snapshot unreadable")))
 
     def _boom2(*a, **kw):
         raise RuntimeError("pending rows unreadable")
@@ -625,7 +630,7 @@ def test_stale_sweep_failures_do_not_veto_a_converged_tree(qenv, monkeypatch):
 
     monkeypatch.setattr(qenv.q, "cancel_task_custody", _concurrently_settled)
 
-    assert qenv.tl.cancel_task_by_id("st-root", cascade=True) is True
+    assert qenv.tl.cancel_task_by_id("st-root") is True
     assert delivered == ["st-root"], "one summary; no 503 over a settled tree"
     assert ci.active_intent(qenv.drive, "st-root") is None
 

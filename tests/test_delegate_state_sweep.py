@@ -15,6 +15,7 @@ import time
 
 from ouroboros.delegate_state_sweep import sweep_settled_delegate_state
 from ouroboros.task_result_schema import stamp_task_result_schema
+from tests._store_shared import seed_result
 
 _OLD = time.time() - 400 * 86400
 
@@ -32,7 +33,7 @@ def _settle_task(root, task_id):
     results = root / "task_results"
     results.mkdir(parents=True, exist_ok=True)
     row = stamp_task_result_schema({"task_id": task_id, "status": "completed"})
-    (results / f"{task_id}.json").write_text(json.dumps(row), encoding="utf-8")
+    seed_result(root, task_id, row)
 
 
 def test_terminal_old_rows_swept_live_rows_kept(tmp_path):
@@ -123,4 +124,5 @@ def test_startup_custody_sweep_runs_the_state_sweep():
 
     import ouroboros.server_maintenance as sm
 
-    assert "sweep_settled_delegate_state" in inspect.getsource(sm._startup_custody_sweep)
+    assert "sweep_settled_delegate_state" in inspect.getsource(sm._run_deferred_startup_prunes)
+    assert "sweep_settled_delegate_state" not in inspect.getsource(sm._startup_custody_sweep)

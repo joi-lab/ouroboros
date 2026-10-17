@@ -1,3 +1,0 @@
-90
-The provider-failure classification rule names output exhaustion: an empty reply that ended on the output
-limit is never resent as is.

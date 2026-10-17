@@ -17,6 +17,14 @@ every ceiling; a worker that outlives its logical caller cannot race the
 write-ahead fact, and a crash after dispatch keeps the durable paid fact.
 Commit review verifies this write fail-closed; other callers retain historical
 fail-open accounting. This seam also hosts the L-review lane's two-phase admission.
+
+Task acceptance binds one strict, exact-hash claim on the locked
+``task_acceptance_review_accounting`` tree wallet per panel to this stamp
+(``task_acceptance_paid_dispatch_stamp``); a binding or paid identity already
+claimed is ``unknown``, never resend authority. Before a new panel is prepared,
+``reconcile_pending_acceptance_runs`` collects already-paid panels at $0 from
+their original requests and rosters, and concurrent progress forces recollection
+so publication keeps the settled facts.
 """
 
 from __future__ import annotations
@@ -278,7 +286,7 @@ def slot_id_for_row(index: int, *, prefix: str = SLOT_ID_PREFIX) -> str:
     The single mint for reviewer-slot identity, and the reason the substrate
     contract says slot identity is separate from model identity. Naming a row
     after its own model instead collides two rows that share a model (a supported
-    configuration — ``get_scope_review_models`` preserves duplicates on purpose),
+    configuration — the factory pool repeats Main on purpose),
     collides two model spellings that sanitize alike (``openai::gpt-5`` and
     ``openai/gpt/5``), and moves a row's identity the moment the owner edits its
     model, so the row's receipts stop lining up with its own history. The model,
@@ -292,17 +300,13 @@ class TaskAcceptanceDispatchUnavailable(RuntimeError):
 
 
 class ReviewPaidStamp:
-    """Idempotent, thread-safe once-only wrapper around one durable write.
+    """Idempotent, thread-safe stamp shared by the seats of one review wave.
 
-    Parallel dispatch means two sides can race to be "the first transport
-    call" (the commit gate dispatches triad and scope concurrently): the first
-    caller performs the durable write-ahead, later callers block on the lock
-    until it lands and then no-op — so EVERY side is guaranteed the paid fact
-    is durable before its own transport begins. A failing default write is not
-    retried and still marks the stamp fired: the terminal record is the primary
-    ledger, and ordinary cost accounting remains fail-open. Task acceptance
-    uses ``fail_closed=True`` for its already-hard shared wallet authority;
-    every parallel caller then observes the same failure and no reviewer
+    The first caller attempts the durable write-ahead; siblings wait for its
+    result. A failed write is not retried here and still marks the stamp fired.
+    Ordinary cost accounting fails open, with the terminal record authoritative.
+    Commit-gate, review_change, acceptance and resumed-skill stamps use
+    ``fail_closed=True``: every caller observes the failure and no reviewer
     transport proceeds.
     """
 
@@ -461,6 +465,22 @@ def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict
     }
 
 
+def recorded_binding_conflicts(binding: Any, expected: dict) -> bool:
+    """Does a recorded binding name another operation than ``expected``? An absent or
+    empty one is no conflict; its pending invocation token is a separate fact."""
+    if binding is None:
+        return False
+    return not isinstance(binding, dict) or bool(binding) and (
+        {key: value for key, value in binding.items() if key != "pending_invocation_id"} != expected)
+
+
+def recorded_invocation_tokens(row: dict) -> set:
+    """Every pending invocation token a frozen seat row recorded (row, usage, binding)."""
+    return {str(value) for value in (
+        row.get("pending_invocation_id"), (row.get("usage") or {}).get("pending_invocation_id"),
+        (row.get("recovery_binding") or {}).get("pending_invocation_id")) if value}
+
+
 def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: str, contract: Any = "") -> dict:
     """Reuse the caller's material/cycle identity and the exact configured roster."""
     import hashlib
@@ -476,9 +496,12 @@ def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: s
     roster = []
     for slot in slots:
         values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
+        # A read-only seat keeps the roster identity recorded before seats carried
+        # rights (#1609); writable rights are identity, as in ``_attempt_key``.
         roster.append({k: v for k, v in values.items()
                        if k not in {"timeout_sec", "transport_timeout_sec"}
-                       and (k != "processing_preference" or v)})
+                       and (k != "processing_preference" or v)
+                       and (k != "session_access" or str(v or "readonly") != "readonly")})
     retry_key = getattr(request, "retry_key", None)
     return {
         "subject_hash": digest(retry_key or {

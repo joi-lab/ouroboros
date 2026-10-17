@@ -28,6 +28,7 @@ from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies
     _init_repo_with_file,
     _managed_worker_pool_available,
 )
+from tests._store_shared import read_result
 
 
 def test_workspace_patch_includes_tracked_and_untracked_files(tmp_path):
@@ -354,7 +355,7 @@ def test_failed_refinalization_drops_stale_workspace_patch_metadata(tmp_path):
     task = {"id": "task-stale", "workspace_root": str(repo)}
     write_task_result(parent, "task-stale", "completed", workspace_root=str(repo), artifact_status="finalizing")
     finalize_task_artifacts(parent, task)
-    result = json.loads((parent / "task_results" / "task-stale.json").read_text(encoding="utf-8"))
+    result = read_result(parent, "task-stale")
     assert any(item.get("kind") == "workspace_patch" for item in result["artifacts"])
 
     # A sensitive-shaped file no longer fails the patch (#447); break the HEAD
@@ -363,7 +364,7 @@ def test_failed_refinalization_drops_stale_workspace_patch_metadata(tmp_path):
     (repo / ".git" / head_ref).unlink()
     finalize_task_artifacts(parent, task)
 
-    result = json.loads((parent / "task_results" / "task-stale.json").read_text(encoding="utf-8"))
+    result = read_result(parent, "task-stale")
     assert result["artifact_status"] == ARTIFACT_STATUS_FAILED
     assert not any(item.get("kind") == "workspace_patch" for item in result["artifacts"])
 
@@ -403,7 +404,7 @@ def test_finalize_workspace_patch_allows_external_workspace_head_changed(tmp_pat
 
     finalize_task_artifacts(parent, task)
 
-    result = json.loads((parent / "task_results" / "task-head.json").read_text(encoding="utf-8"))
+    result = read_result(parent, "task-head")
     assert result["artifact_status"] == ARTIFACT_STATUS_READY_WITH_CHANGES
     manifest = json.loads((task_artifacts_dir(parent, "task-head") / "workspace_patch.json").read_text(encoding="utf-8"))
     assert manifest["errors"] == []
@@ -425,7 +426,7 @@ def test_finalize_workspace_patch_exception_manifest_keeps_base_fields(tmp_path,
     monkeypatch.setattr(headless, "write_workspace_patch_artifacts", boom)
     headless.finalize_task_artifacts(parent, task)
 
-    result = json.loads((parent / "task_results" / "task-exception.json").read_text(encoding="utf-8"))
+    result = read_result(parent, "task-exception")
     manifest = json.loads((task_artifacts_dir(parent, "task-exception") / "workspace_patch.json").read_text(encoding="utf-8"))
     assert result["artifact_status"] == ARTIFACT_STATUS_FAILED
     assert manifest["status"] == ARTIFACT_STATUS_FAILED

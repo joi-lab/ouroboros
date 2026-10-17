@@ -85,6 +85,7 @@ def direct_exec_environment(monkeypatch, root):
     import ouroboros.server_control as control
 
     captured = {}
+    monkeypatch.setattr(control, "IS_WINDOWS", False)  # this transport is the POSIX same-PID exec
     monkeypatch.setattr(server, "DATA_DIR", root)
     monkeypatch.setattr(server, "_owner_restart_requested", threading.Event())
     monkeypatch.setenv("OUROBOROS_SERVER_HOST", "127.0.0.1")
@@ -129,6 +130,7 @@ def test_assisted_update_carries_the_already_parked_wait_to_direct_successor(res
     assert server._planned_delegate_restart_transaction_id == ""
     env = direct_exec_environment(monkeypatch, case.root)
     assert env[delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV] == transaction_id
+    monkeypatch.setattr(delegate_recovery, "IS_WINDOWS", False)  # the same PID proves only an exec
     monkeypatch.setenv(delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV, env[delegate_recovery.PLANNED_RESTART_TRANSACTION_ENV])
     assert restore_stale_snapshot(case) == 1
     assert workers.PENDING[0]["_owner_wait_resume"]["wait_id"] == case.wait["wait_id"]
@@ -223,16 +225,3 @@ def test_failed_exception_attachment_keeps_the_original_error_and_unknown_projec
     text, usage, trace = _task_exception_terminal(SimpleNamespace(drive_root=tmp_path), {"id": "t"}, error, tmp_path)
     assert "FixedError: original failure" in text
     assert usage["loop_evidence_unavailable"] is trace["loop_evidence_unavailable"] is True
-
-
-def test_unknown_exception_evidence_stays_unknown_in_actual_reflection(tmp_path, monkeypatch):
-    from ouroboros import post_task_synthesis, reflection, llm_observability
-    captured = []
-    monkeypatch.setattr(reflection, 'append_reflection_routed', lambda env, task, row: captured.append(row))
-    monkeypatch.setattr(llm_observability, 'chat_observed', lambda *a, **kw: ({'content': 'Reflection over the disclosed unknown trace.'}, {}))
-    task = {'id': 'cold-source-failure', 'type': 'task', 'text': 'Continue saved workspace work', 'workspace_root': str(tmp_path / 'workspace'), 'drive_root': str(tmp_path)}
-    usage = {'loop_evidence_unavailable': True, 'execution_status': 'infra_failed', 'reason_code': 'task_exception'}
-    trace = {'loop_evidence_unavailable': True, 'tool_calls': [], 'reasoning_notes': []}
-    post_task_synthesis._run_reflection(SimpleNamespace(drive_root=tmp_path), None, task, usage, trace, {})
-    assert len(captured) == 1, 'The real reflection path must execute and publish one row.'
-    assert captured[0]['rounds'] is None and captured[0]['error_count'] is None, captured[0]

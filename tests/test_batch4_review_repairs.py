@@ -16,6 +16,7 @@ from tests.test_batch4_full_repair import _park
 from tests.test_batch4_producer_custody import _registry
 from tests.test_batch4_repair_compositions import _running
 from tests.test_owner_pause import _owner_park
+from tests.worker_pool_support import affirm_ready
 
 pytestmark = pytest.mark.serial
 
@@ -40,8 +41,8 @@ def _granted_and_handed(tmp_path, monkeypatch):
     install_exact_budget_pause(ctx, "solo", budget_pause.exact_pause_marker(row)["checkpoint"])
     assert queue.resume_budget_paused_task("solo")["ok"] is True
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task)))))
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ["solo"]
     loop_ctx, limit_ctx = _loop_ctx(tmp_path, "solo")
@@ -113,8 +114,8 @@ def test_a_pause_before_dispatch_returns_the_grant_and_a_later_resume_releases_o
     second = request_owner_pause("solo", request_id="pause-b")
     assert second["ok"] is True and second["fence_id"] != first["fence_id"]
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task)))))
     workers.assign_tasks()
     assert sent == [], "the superseded grant is never dispatched"
     assert owner_pause.read_fence(tmp_path, "solo")["fence_id"] == second["fence_id"]
@@ -211,7 +212,7 @@ def test_returned_github_parse_error_does_not_keep_local_execution_alive(tmp_pat
     result = registry.execute_result("get_github_issue", {"number": 5})
     assert "failed to parse issue JSON" in result.text
     assert result.meta.get("operation_outcome") != "completed_no_effect"
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
     _park(tmp_path, monkeypatch, queue, workers)
     assert queue.resume_budget_paused_task("root")["ok"]
 

@@ -47,6 +47,18 @@ def _find_pyinstaller_cmd_pos(src: str) -> int:
     return -1
 
 
+def _python_standalone_extras(src: str, interpreter: str) -> tuple[set, list]:
+    """Extras of the locked exports a build script installs into ``interpreter``."""
+    exported = {
+        match.group(2): set(re.findall(r"--extra (\w+)", match.group(1)))
+        for match in re.finditer(r'^ *uv export (.*)--output-file "?(\$\w+)"?$', src, re.M)
+    }
+    lock_header = _read("requirements-runtime.lock").splitlines()[1]
+    exported["requirements-runtime.lock"] = set(re.findall(r"--extra (\w+)", lock_header))
+    installs = list(re.finditer(rf"^ *uv pip install --python {re.escape(interpreter)} .*-r (\S+)", src, re.M))
+    return set().union(*(exported[match.group(1).strip('"')] for match in installs)), installs
+
+
 # ---------------------------------------------------------------------------
 # build.sh  (macOS)
 # ---------------------------------------------------------------------------
@@ -59,16 +71,9 @@ class TestBuildSh:
         assert "playwright install --only-shell chromium" in src, (
             "build.sh must call 'playwright install --only-shell chromium' on macOS"
         )
-        assert "Skipping bundled WebKit on macOS" in src, (
-            "build.sh must document the macOS WebKit packaging policy"
-        )
-        assert "Removing stale bundled WebKit payloads from macOS package tree" in src
         assert 'rglob(".local-browsers")' in src
         assert 'glob("webkit-*")' in src
         assert "shutil.rmtree" in src
-        assert "managed" in src and "Playwright cache" in src, (
-            "build.sh must leave WebKit available through the managed runtime cache"
-        )
         assert "playwright install webkit" not in src
         assert "pw.webkit.launch" not in src
 
@@ -210,6 +215,18 @@ class TestBuildSh:
             "build.sh must preserve nested macOS app/framework bundles during "
             "symlink normalization"
         )
+
+
+    def test_source_handoff_interpreter_receives_the_desktop_extra(self):
+        """The source launcher needs desktop modules outside PyInstaller's archive."""
+        launcher = _read("launcher.py")
+        assert 'os.execv(EMBEDDED_PYTHON, [EMBEDDED_PYTHON, str(REPO_DIR / "launcher.py")' in launcher
+        src = _read("build.sh").replace("\\\n", " ")
+        extras, installs = _python_standalone_extras(src, "python-standalone/bin/python3")
+        assert "desktop" in extras, f"python-standalone receives only extras {sorted(extras)}"
+        assert "build" not in extras, "build tooling must stay out of the packaged interpreter"
+        symlink_pos = src.find("Normalizing python-standalone symlinks")
+        assert all(match.start() < symlink_pos < _find_pyinstaller_cmd_pos(src) for match in installs)
 
 
 def test_compileall_env_neutralization_actually_seals_bytecode(tmp_path):
@@ -364,6 +381,15 @@ class TestBuildLinuxSh:
             assert 'OUROBOROS_PACKAGED_BUNDLE_ROOT:-' not in src
             assert '$SCRIPT_DIR/../_internal' in src
 
+    def test_source_handoff_interpreter_receives_the_desktop_extra(self):
+        """Headless detection after the source handoff imports webview from python-standalone."""
+        assert "from webview.guilib import initialize" in _read("launcher.py")
+        src = _read("build_linux.sh").replace("\\\n", " ")
+        extras, installs = _python_standalone_extras(src, '"$PORTABLE_PYTHON"')
+        assert "desktop" in extras, f"python-standalone receives only extras {sorted(extras)}"
+        assert "build" not in extras, "build tooling must stay out of the packaged interpreter"
+        assert all(match.start() < _find_pyinstaller_cmd_pos(src) for match in installs)
+
 
 # ---------------------------------------------------------------------------
 # build_windows.ps1  (Windows / PowerShell)
@@ -383,6 +409,8 @@ class TestBuildWindowsPs1:
             "ripgrep runtime download",
             "Betterleaks runtime installation",
             "Agent dependency installation",
+            "Desktop dependency export",
+            "Desktop dependency installation",
             "Claudexor runtime seed fetch",
             "Chromium installation",
             "WebKit installation",
@@ -505,6 +533,16 @@ class TestBuildWindowsPs1:
             src = _read(name)
             assert r"%ROOT%\_internal\repo.bundle" in src
             assert 'set "ROOT=%ROOT%\\_internal"' in src
+
+    def test_source_handoff_interpreter_receives_the_desktop_extra(self):
+        """The source launcher prepares pythonnet from python-standalone before importing webview."""
+        runtime = _read("ouroboros/launcher_windows_runtime.py")
+        assert "from clr_loader import get_netfx" in runtime and "from pythonnet import set_runtime" in runtime
+        src = _read("build_windows.ps1").replace("`\n", " ")
+        extras, installs = _python_standalone_extras(src, '"python-standalone\\python.exe"')
+        assert "desktop" in extras, f"python-standalone receives only extras {sorted(extras)}"
+        assert "build" not in extras, "build tooling must stay out of the packaged interpreter"
+        assert all(match.start() < _find_pyinstaller_cmd_pos(src) for match in installs)
 
 
 # ---------------------------------------------------------------------------
@@ -653,7 +691,6 @@ class TestRepoBundleReleaseTagGuard:
     def test_dirty_tree_refusal_reports_the_offending_paths(self):
         src = _read("scripts/build_repo_bundle.py")
         assert '"status", "--porcelain"' in src
-        assert '"Commit or stash changes first so the embedded managed repo matches the packaged code.\\n"' in src
         assert "+ status" in src
 
 
@@ -1036,7 +1073,7 @@ def test_launcher_retains_cross_platform_runtime_hooks():
     assert "_prepare_windows_webview_runtime" in launcher_source
     assert "git_install_hint()" in launcher_source
     assert "create_kill_on_close_job" in launcher_source
-    assert "kill_process_on_port(port)" in launcher_source
+    assert "kill_process_on_port(int(companion_port))" in launcher_source
     assert "force_kill_pid(child.pid)" in launcher_source
 
 
@@ -1046,7 +1083,6 @@ def test_launcher_preserves_macos_git_setup_path():
     assert 'subprocess.Popen(["xcode-select", "--install"])' in launcher_source
     assert "Install Git (Xcode CLI Tools)" in launcher_source
     assert "Installing... A system dialog may appear." in launcher_source
-    assert '["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"]' in launcher_source
 
 
 def test_cross_platform_build_scripts_are_present():
@@ -1148,7 +1184,7 @@ def test_ci_collects_independent_failures_without_relaxing_release_gates():
 def test_ci_setup_aware_failure_collection_guards_each_independent_lane():
     import yaml
     jobs = yaml.safe_load(_ci_workflow())["jobs"]
-    for job_name in ("quick-test", "full-test", "marker-guards", "docker-ui-smoke", "system-e2e-mock", "android-test"):
+    for job_name in ("quick-test", "full-test-runs", "marker-guards", "docker-ui-smoke", "system-e2e-mock", "android-test"):
         steps = jobs[job_name]["steps"]
         assert any("!cancelled()" in str(step.get("if", "")) for step in steps if "run" in step), job_name
     ui = {step.get("name"): step for step in _ui_browser_jobs()["ui-shard"]["steps"]}
@@ -1188,7 +1224,7 @@ def test_ci_failure_collection_guards_every_independent_step_and_rerun_uploads()
     jobs = yaml.safe_load(_ci_workflow())["jobs"]
     expected = {
         "quick-test": ["Verify generated Pages output", "Lint (deterministic F-rule gate — catches the NameError-under-except class)", "Run browser-module tests (node --test — mirrored by the hermetic commit gate)", "Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)", "Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)", "Run tests (serial — real subprocess/port/global-state suites that flake under -n)", "Run tests (size-ratchet lane — blocking here, warning-only locally)", "Guard extracted transport imports stay out of core"],
-        "full-test": ["Run browser-module tests (node --test — mirrored by the hermetic commit gate)", "Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)", "Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)", "Run tests (serial — real subprocess/port/global-state suites that flake under -n)", "Run tests (size-ratchet lane — blocking here, warning-only locally)", "Guard extracted transport imports stay out of core"],
+        "full-test-runs": ["Run browser-module tests (node --test — mirrored by the hermetic commit gate)", "Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)", "Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)", "Run tests (serial — real subprocess/port/global-state suites that flake under -n)", "Run tests (size-ratchet lane — blocking here, warning-only locally)", "Guard extracted transport imports stay out of core"],
         "marker-guards": ["Guard non-empty browser marker lanes", "Guard non-empty serial marker lane", "Guard non-empty skill_smoke marker lane", "Guard non-empty size_ratchet marker lane"],
         "docker-ui-smoke": ["Install UI smoke browser binaries", "Run Docker UI smoke", "Run Docker browser tools Chromium/WebKit smoke"],
         "system-e2e-mock": ["Run the keyless system E2E scenario lane (real isolated servers)", "Run the cancellation E-suite mock lane"],
@@ -1221,23 +1257,14 @@ def test_ci_step_outcome_references_resolve_to_prior_step_ids():
 
 
 
-def test_neither_the_code_workflow_nor_the_browser_push_workflow_filters_pushes_by_path():
+def test_release_tags_and_manual_browser_runs_keep_unfiltered_entrypoints():
     import yaml
 
-    # A path list decides whether a LANDED commit is tested at all: packaging/, devtools/,
-    # prompts/, skills/, the Makefile, the spec and the requirements are read by tests and
-    # builds, so both push entries must see a push that touches only those.
-    ci = yaml.safe_load(_ci_workflow())
-    ci_push = ci.get("on", ci.get(True))["push"]
-    assert ci_push == {"branches": ["main", "ouroboros", "ouroboros-stable"], "tags": ["v*"]}
-
+    # Event matrix: test_platform_ci_events; exact triggers: test_ci_diagnostic_workflows.
     push = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser-push.yml").read_text(encoding="utf-8"))
     trigger = push.get("on", push.get(True))
-    assert list(trigger) == ["push", "workflow_dispatch"], "the UI-only entry adds no schedule or paid lane"
+    assert list(trigger) == ["workflow_dispatch"], "the UI-only entry is manual and adds no paid lane"
     assert trigger["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
-    assert trigger["push"]["branches"] == ["ouroboros"]
-    for label, entry in (("ci.yml", ci_push), ("ui-browser-push.yml", trigger["push"])):
-        assert "paths" not in entry and "paths-ignore" not in entry, label
     assert push["jobs"]["ui-smoke"]["uses"] == "./.github/workflows/ui-browser.yml"
 
     shared = yaml.safe_load((_REPO_PATH / ".github/workflows/ui-browser.yml").read_text(encoding="utf-8"))

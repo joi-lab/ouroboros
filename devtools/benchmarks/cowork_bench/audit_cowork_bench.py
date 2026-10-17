@@ -25,6 +25,7 @@ if __package__ in {None, ""}:
 
 from devtools.benchmarks.cowork_bench import eval_attempt
 from devtools.benchmarks.cowork_bench.resource_limits import ADMISSION_DIR_NAME
+from ouroboros.event_token_totals import event_token_totals
 
 # Diagnostic source/artifact references, not a semantic cheating classifier.
 _REFERENCE = re.compile(
@@ -237,6 +238,7 @@ def audit_task(task_dump: Path, ledger: dict[str, Any], facts: dict[str, Any] | 
     models: set[str] = set()
     findings: list[dict[str, Any]] = []
     omission_refs: list[dict[str, Any]] = []
+    token_rows: list[dict[str, Any]] = []
     for source in (events, tools):
         for line, record in _records(source, gaps):
             if record.get("capability_omissions"):
@@ -245,6 +247,7 @@ def audit_task(task_dump: Path, ledger: dict[str, Any], facts: dict[str, Any] | 
             if record.get("response_provider"):
                 response_providers.add(str(record["response_provider"]))
             if source == events and record.get("type") == "llm_usage":
+                token_rows.append(record)
                 activity["usage_records"] += 1
                 usage = record.get("usage")
                 usage = usage if isinstance(usage, dict) else {}
@@ -252,7 +255,6 @@ def audit_task(task_dump: Path, ledger: dict[str, Any], facts: dict[str, Any] | 
                 for key, value in tokens.items():
                     if value is None:
                         gaps.append({"source": source.name, "line": line, "reason": f"unknown_{key}"})
-                    activity[key] += value or 0
                 activity["nonempty_usage_records"] += int(token_bearing(tokens))
                 cost = _number(record.get("cost", usage.get("cost")))
                 if cost is None or record.get("cost_known") is False:
@@ -285,6 +287,10 @@ def audit_task(task_dump: Path, ledger: dict[str, Any], facts: dict[str, Any] | 
     # Lack of telemetry is an audit gap, never a reason to rewrite its verdict.
     log_incomplete = any(g["source"] == "events.jsonl" for g in gaps)
     cost_complete = bool(activity["usage_records"]) and not unknown_cost and not log_incomplete
+    # Keep token provenance separate from the existing money/gap projection.
+    # Unknown or historical zeros cannot turn a partial count into a total.
+    activity["token_evidence"] = event_token_totals(token_rows)
+    activity.update({name: item["total"] for name, item in activity["token_evidence"].items()})
     official_status = str(ledger.get("official_eval_status") or "unreported")
     # Literal evaluator truth is independent of agent execution and the scoring classification.
     # Legacy rows without receipt metadata retain their previously recorded scored verdict.

@@ -5,6 +5,7 @@ honest receipt, and every effective read stays pure."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 from pathlib import Path
@@ -237,29 +238,37 @@ def test_every_observation_surface_is_pure(tmp_path, monkeypatch):
 
 
 def test_the_terminal_capture_reads_the_mailbox_before_the_row_lock(tmp_path, monkeypatch):
-    """V10: the mailbox bytes are read outside the task-result row lock; only the bounded
-    union runs under it (no file read inside a 4 s lock hold)."""
-    from ouroboros import platform_layer, task_results
+    """V10: the mailbox bytes are read before the result's write transaction opens; only the
+    bounded union runs inside it (no file read while the store's write lock is held)."""
+    from ouroboros import store, task_results
 
     data = tmp_path / "data"
     owner_mailbox.write_owner_message(data, "unread words", TASK, msg_id="u1")
     events = []
-    real_capture, real_acquire = task_custody.capture_unread_mail, platform_layer.acquire_exclusive_file_lock
+    real_capture, real_open = task_custody.capture_unread_mail, store.open_store
 
     def capture(*args, **kwargs):
         events.append("capture")
         return real_capture(*args, **kwargs)
 
-    def acquire(path, **kwargs):
-        if str(path).endswith(f"{TASK}.json.lock"):
+    @contextlib.contextmanager
+    def opened(root, *, write, **kwargs):
+        if write:
             events.append("row_lock")
-        return real_acquire(path, **kwargs)
+        with real_open(root, write=write, **kwargs) as txn:
+            yield txn
 
     monkeypatch.setattr(task_results, "capture_unread_mail", capture, raising=False)
     monkeypatch.setattr(task_custody, "capture_unread_mail", capture)
-    monkeypatch.setattr(platform_layer, "acquire_exclusive_file_lock", acquire)
+    monkeypatch.setattr(store, "open_store", opened)
+    monkeypatch.setattr("ouroboros.task_store.open_store", opened)
     stored = write_task_result(data, TASK, "cancelled", result="x")
     assert _msg_ids(stored["unread_mailbox"]) == ["u1"]
+    # A first row repeats its write once to prepare the swarm rollup outside the lock; the
+    # capture happened once, before the first lock, and is kept across the rounds.
+    assert events[0] == "capture" and events.count("capture") == 1 and set(events[1:]) == {"row_lock"}, events
+    events.clear()
+    write_task_result(data, TASK, "cancelled", result="y")  # an existing row: one capture, one lock
     assert events == ["capture", "row_lock"], events
 
 
@@ -321,6 +330,8 @@ def test_the_drive_custody_pass_sweeps_the_canonical_mailboxes_the_seam_left(tmp
     from ouroboros import server_maintenance as sm
 
     data = tmp_path / "data"
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(data)
     monkeypatch.setattr(sm, "DATA_DIR", data)
     monkeypatch.setattr(sm, "_DRIVE_PRUNE_CURSOR", {"headless": "", "direct": ""})
     write_task_result(data, TASK, "completed", result="done", root_phase_checkpoint={"post_task_synthesis": "completed"})

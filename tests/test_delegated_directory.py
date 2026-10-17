@@ -308,3 +308,100 @@ def test_lost_start_replays_original_processing_facts_after_setting_changes(tmp_
     record_session_execution(ctx.drive_root, held,
         {"summary": {"state": "succeeded", "finishedAt": "2099-01-01T00:00:00Z"}}, {})
     assert subagent_last_delegation(ctx.drive_root)["identity"]["processing_preference"] == "economy"
+
+
+@pytest.mark.parametrize('access', ['workspace_write', 'full'])
+def test_research_folder_uses_copy_retains_evidence_and_never_applies(tmp_path, monkeypatch, access):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.gateways import claudexor
+    from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
+    from ouroboros.tools.subagent_integration_delegated import _delegated_disposition_refusal
+    import tests._delegated_transport_shared as shared
+
+    ctx, target = context(tmp_path, monkeypatch)
+    ctx.task_constraint = TaskConstraint(mode='local_readonly_subagent')
+    engine = DirectoryEngine(target, 'copy')
+    engine.profiles = ('readonly', 'workspace_write', 'full')
+    monkeypatch.setattr(engine, 'ensure_full_access', lambda root: None, raising=False)
+    snapshot = shared._transport_snapshot
+    monkeypatch.setattr(shared, '_transport_snapshot', lambda route: {**snapshot(route), 'access': access})
+    monkeypatch.setattr(claudexor, 'ClaudexorGateway', lambda *a, **k: engine)
+    result = json.loads(delegate._delegate_start(ctx, 'Investigate these documents').text)
+    assert result['status'] == 'started', result
+    wire, key = engine.posts[0]
+    assert wire['access'] == access and wire['execution']['workspaceKind'] == 'directory'
+    assert wire['execution']['isolation'] == 'envelope' and wire['execution']['scopePaths'] == ['.']
+    held = custody.replay(ctx.drive_root)['directory-run']
+    assert held.authority_source == 'investigation' and held.resource_ref['strategy'] == 'copy'
+    held.settled = True
+    captured = capture_terminal_patch_for_drive(ctx.drive_root, held, gateway=engine)
+    assert captured['disposition'] == 'evidence_retained'
+    assert not engine.applies and not (target / 'out.bin').exists()
+    assert 'INVESTIGATION_EVIDENCE' in _delegated_disposition_refusal(custody.OWNED, held, held.run_id)
+    assert engine.decisions[0][0] == {'action': 'discard'}
+    assert not custody.undisposed_patches(ctx.drive_root, {held.run_id: held})
+
+
+def test_research_folder_cannot_select_direct_writes(tmp_path, monkeypatch):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.gateways import claudexor
+
+    ctx, target = context(tmp_path, monkeypatch)
+    ctx.task_constraint = TaskConstraint(mode='local_readonly_subagent')
+    engine = DirectoryEngine(target, 'copy')
+    monkeypatch.setattr(claudexor, 'ClaudexorGateway', lambda *a, **k: engine)
+    refused = json.loads(delegate._delegate_start(ctx, 'Investigate', directory_strategy='direct').text)
+    assert refused['status'] == 'refused' and refused['definitely_unrun']
+    assert refused['reason'] == 'directory_execution_unavailable'
+    assert not engine.posts
+
+
+class _NoProductEngine(DirectoryEngine):
+    """A finished run whose engine answer carries no file work product."""
+
+    state = "succeeded"
+
+    def get_run(self, rid):
+        return {"summary": {"state": self.state, "result": {"applyState": "not_applied"}}}
+
+
+@pytest.mark.parametrize("strategy", ["direct", "copy"])
+@pytest.mark.parametrize("decision", ["apply", "reject"])
+def test_a_finished_run_without_file_work_product_is_finished_with_no_changes(tmp_path, monkeypatch, strategy, decision):
+    """VERIFY_SWEEPS S3: such a run stayed collection-pending, re-collected every sweep pass
+    (a daemon read, a capture attempt, a money read) because the engine's final answer was
+    kept as a retryable capture failure."""
+    from ouroboros.delegate_custody_current import collection_pending
+
+    ctx, target = context(tmp_path, monkeypatch)
+    engine, held = _NoProductEngine(target, strategy), entry(ctx, target, strategy)
+    captured = capture_directory_result(ctx.drive_root, held, engine)
+    assert captured["status"] == "ready" and captured["no_changes"] is True and captured["file_outputs"] == []
+    assert held.patch_captured and capture_directory_result(ctx.drive_root, held, engine) == captured
+    held.terminal_source = {"sha256": "t"}  # every other collection duty done: only the capture was open
+    held.ledger_recorded = held.output_complete = True
+    held.output_source, held.output_terminal_sha = "final/answer.md", "t"
+    assert not collection_pending(held)
+    response = json.loads(integrate_directory_result(ctx, held, decision, "nothing to take", engine))
+    assert response["status"] == ("applied" if decision == "apply" else "rejected")
+    assert held.patch_disposed == response["status"] and not engine.applies
+    assert engine.decisions == ([] if strategy == "direct" else [({"action": "discard"}, engine.decisions[0][1])])
+
+
+@pytest.mark.parametrize("strategy", ["direct", "copy"])
+def test_an_unsuccessful_run_without_file_work_product_is_never_reported_as_no_changes(tmp_path, monkeypatch, strategy):
+    """Absence after a failed run proves nothing: its capture is closed (no sweep redo), Apply applies
+    nothing and keeps the engine copy, and only Reject releases it."""
+    ctx, target = context(tmp_path, monkeypatch)
+    engine, held = _NoProductEngine(target, strategy), entry(ctx, target, strategy)
+    engine.state = "failed"
+    captured = capture_directory_result(ctx.drive_root, held, engine)
+    assert captured["status"] == "ready" and captured["no_changes"] is False and captured["work_product"] == "absent"
+    assert "changes, if any, were not captured" in captured["note"]
+    assert ("already in the folder" in captured["note"]) is (strategy == "direct")
+    refused = integrate_directory_result(ctx, held, "apply", "take it", engine)
+    assert refused.startswith("⚠️ INTEGRATE_DELEGATED_NOTHING_CAPTURED") and not engine.decisions and not engine.applies
+    assert not held.patch_disposed
+    response = json.loads(integrate_directory_result(ctx, held, "reject", "nothing to take", engine))
+    assert response["status"] == "rejected" and held.patch_disposed == "rejected" and not engine.applies
+    assert engine.decisions == ([] if strategy == "direct" else [({"action": "discard"}, engine.decisions[0][1])])

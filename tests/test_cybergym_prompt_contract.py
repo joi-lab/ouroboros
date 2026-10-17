@@ -33,7 +33,9 @@ def test_task_payload_preserves_input_and_explains_submission(tmp_path, timeout,
     assert "changing the suspected trigger" not in text
     assert "revisit the entrypoint" not in text
     assert f"at most {hours} hours of wall time" in text
-    assert body["timeout_sec"] == timeout
+    # #939: the duration is execution time from dispatch, never a submit-anchored calendar deadline.
+    assert body["execution_timeout_sec"] == timeout
+    assert "timeout_sec" not in body and "deadline_at" not in body
     assert submit.read_bytes() == original_script
     assert (task_dir / "description.txt").read_text(encoding="utf-8") == description
 

@@ -343,7 +343,7 @@ def test_owner_chat_delivery_terminals_are_native(tmp_path, label, tool, code, t
             "EDIT_TEXT_BLOCKED",
             "⚠️ EDIT_TEXT_ERROR: old_str not found in runtime_data:notes.txt.\n"
             "Nearest region: line 2 (0 of 1 old_str line(s) match ignoring whitespace):\n"
-            " 2| beta\n"
+            "     2\tbeta\n"
             "first difference at line 2:\n"
             "  file   : 'beta'\n"
             "  old_str: 'zeta'\n"
@@ -363,8 +363,8 @@ def test_owner_chat_delivery_terminals_are_native(tmp_path, label, tool, code, t
         (
             "search_code",
             {"query": "x", "path": "nope"},
-            "LEGACY_TOOL_ERROR",
-            "⚠️ SEARCH_ERROR: path not found: active_workspace:nope",
+            "LEGACY_WARNING",
+            "⚠️ SEARCH_NOT_FOUND: path not found: active_workspace:nope",
         ),
         (
             "search_code",

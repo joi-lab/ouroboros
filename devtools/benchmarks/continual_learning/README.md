@@ -51,6 +51,14 @@ separately:
 The launcher fails loudly when any of these are absent; `--dry-run` works
 without them.
 
+The launcher renders and exports Required result review. Its fidelity report
+separates that request from the external adapter's executing configuration and
+pre-review output producer, which this tree cannot attest. Checked-in patch
+recipes are historical examples, not deployment evidence. Qualification of the
+launcher with synthetic callable inputs establishes neither a live external
+adapter nor score parity; the selected external `src/systems/ouroboros/` source
+and its runtime configuration are needed to establish that chain.
+
 ## v6.56.0 operator patches for the pinned adapter
 
 See `operator_patches/README.md` — three host/runtime incompatibilities of the

@@ -18,6 +18,16 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
         evidence["error"] = "delegated baseline is missing"
         return evidence
     if not (target / ".git").exists():
+        # An investigation started in a Git SUBDIRECTORY copied the enclosing worktree
+        # its snapshot recorded; drift is read against that same tree.
+        try:
+            from ouroboros.subagent_worktrees import find_execution_snapshot
+            recorded = str((find_execution_snapshot(getattr(entry, "snapshot_id", "")) or {}).get("target_root") or "")
+        except (OSError, RuntimeError, ValueError):  # an unreadable registry keeps the error below
+            recorded = ""
+        if recorded and target.is_relative_to(pathlib.Path(recorded).resolve(strict=False)):
+            target = pathlib.Path(recorded).resolve(strict=False)
+    if not (target / ".git").exists():
         evidence["error"] = f"authority target is not a Git worktree: {target}"
         return evidence
     try:

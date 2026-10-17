@@ -43,6 +43,7 @@
     --accent-08: rgba(201, 53, 69, 0.08);
     --accent-10: rgba(201, 53, 69, 0.10);
     --accent-12: rgba(201, 53, 69, 0.12);
+    --accent-14: rgba(201, 53, 69, 0.14);
     --accent-18: rgba(201, 53, 69, 0.18);
     --accent-22: rgba(201, 53, 69, 0.22);
     --accent-25: rgba(201, 53, 69, 0.25);
@@ -112,6 +113,9 @@
     --ui-card-bg-soft: var(--surface-card-soft);
     --ui-card-border: var(--surface-border);
     --ui-modal-bg: rgba(var(--modal-rgb), 0.98);
+    /* A live task card's lift off the transcript: soft in light (a near-black shadow that suits the
+       dark shell reads as grime on white), unchanged in dark. */
+    --live-card-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(var(--neutral-rgb), 0.03);
     /* Status triples: fg/bg/border named together, never derived
        (docs/DESIGN.md "Status and chips"). The fg tints are readable at 12px on
        near-black; the saturated --green/--amber/--red stay for dots, tracks and
@@ -150,6 +154,44 @@
     --button-padding-x: 16px;
     --button-font-size: 13px;
     --button-min-height: 34px;
+    /* Floating chrome (the recipe at the end): one height for a floating group's text controls, and the
+       group's inset, which its negative margin cancels so grouping moves no control. */
+    --chrome-control-h: 30px;
+    --chrome-navigation-shadow: 0 6px 18px rgba(0, 0, 0, 0.22);
+    --chrome-inset: calc(var(--space-1) + 1px);
+    /* Airy dopamine seed (DESIGN.md design bible): the dark values; the light theme's follow in its block. One set of
+       recipes reads them in both themes. The dark theme keeps its own materials: a near-black violet room, the voices
+       as crimson and blue glass, controls as glass over what scrolls under them. */
+    --elev-rest: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 24px rgba(0, 0, 0, 0.35);
+    --elev-float: 0 2px 8px rgba(0, 0, 0, 0.55), 0 20px 50px rgba(0, 0, 0, 0.6);
+    --chrome-shade-shadow: var(--elev-float);
+    --radius-object: 18px;
+    --radius-inner: 12px;
+    --radius-sheet: 24px;
+    --surface-object: rgba(255, 255, 255, 0.035);
+    --surface-capsule: rgba(44, 34, 52, 0.62);
+    --surface-capsule-hover: rgba(60, 46, 70, 0.72);
+    --surface-float: rgba(38, 31, 46, 0.94);
+    --surface-tray: rgba(var(--neutral-rgb), 0.035);
+    --surface-side: #0d0b0f;
+    --glass: blur(18px);
+    --voice-owner: linear-gradient(135deg, rgba(80, 120, 190, 0.16), rgba(55, 85, 155, 0.13));
+    --voice-ouroboros: linear-gradient(135deg, rgba(201, 53, 69, 0.20), rgba(120, 24, 36, 0.20));
+    --voice-ouroboros-card: rgba(201, 53, 69, 0.06);
+    --tone-crimson: rgba(240, 90, 106, 0.18);
+    --tone-crimson-hover: rgba(240, 90, 106, 0.24);
+    /* A tonal capsule's crimson ink: on a dark fill the accent text is too dark for 4.5:1, so it steps lighter. */
+    --tone-crimson-ink: #ffa0aa;
+    --tone-green: rgba(34, 197, 94, 0.16);
+    --tone-green-hover: rgba(34, 197, 94, 0.24);
+    --tone-red: rgba(239, 68, 68, 0.16);
+    --tone-red-hover: rgba(239, 68, 68, 0.24);
+    --tone-amber: rgba(245, 158, 11, 0.16);
+    --tone-amber-hover: rgba(245, 158, 11, 0.24);
+    --tone-quiet-hover: rgba(var(--neutral-rgb), 0.07);
+    /* A state changes colour, never height: hover and press deepen a capsule's own fill (a press lightens on dark). */
+    --press: brightness(1.12);
+    --motion-tone: background 0.12s ease, box-shadow 0.12s ease, color 0.12s ease, filter 0.12s ease;
     --widget-fault-status-max-width: min(240px, 35vw);
     /* App shell: persistent desktop sidebar + optional project detail pane. */
     --sidebar-width: 280px;
@@ -170,12 +212,29 @@
     /* Bounded scroll region for the Updates restore list (DESIGN section 5:
        a new visual dimension becomes a variable before a page-local literal). */
     --updates-list-max-height: 320px;
+    /* The delivered-document reader (DESIGN "Document reading"): the dialog's
+       largest side on a wide screen, and its one reading measure. */
+    --document-reader-size: 920px;
+    --document-reader-measure: 76ch;
     /* Bounded scroll window for the sidebar project list (v6.32.0 geometry): a
        share of the visual viewport height below, so the navigation column keeps
        its height whatever the project count. Distinct from the fixed Updates
        window above: one is a page-local list, this one follows the viewport. */
     --nav-projects-list-max-height: calc(var(--vvh) * 0.38);
+    /* Chat media (DESIGN "Chat attachments"): a whole single photo keeps its own
+       ratio up to this height, a bubble carrying several media stops at this
+       width, and a staged composer file shows a thumbnail of this size. */
+    --chat-photo-max-height: min(340px, calc(var(--vvh) * 0.5));
+    /* A single photo's smallest box: its `•••` (a touch target at the actions'
+       7px inset on each side) stays whole inside however small the photo is. */
+    --chat-photo-min-box: calc(var(--touch-target-min) + 14px);
+    --chat-media-bubble-max: 520px;
+    --chat-attach-thumb-size: 28px;
+    /* The smallest comfortable touch target for a coarse pointer (a phone). */
+    --touch-target-min: 36px;
     --vvh: 100dvh;
+    /* Quote panel glass (DESIGN "Replies"): the shell colour at one alpha, so a quote reads lighter than the bubble it sits in. */
+    --quote-glass: rgba(var(--shell-rgb), 0.7);
 }
 
 :root[data-theme="light"] {
@@ -196,19 +255,19 @@
     --text-meta: #555d69;
     --text-secondary: #626977;
     --text-disabled: #89909b;
-    --accent-light: #a82c3b;
+    --accent-light: #bf2f40;
     --project: #8f2499;
     --user-sender: #24558d;
     --user-text: #233b58;
     --system-sender: #805000;
     --system-text: #58451f;
-    --assistant-sender: #a82c3b;
+    --assistant-sender: #bf2f40;
     --assistant-text: #35272c;
     --status-ok-fg: #176b49;
     --status-warn-fg: #805300;
     --status-error-fg: #b42332;
     --status-info-fg: #24558d;
-    --focus-accent-border: #a82c3b;
+    --focus-accent-border: #bf2f40;
     --chart-grid: rgba(var(--neutral-rgb), 0.14);
     --chart-text: #4a515d;
     --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%2320232b' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
@@ -219,6 +278,33 @@
     --diagram-line: #66606e;
     --diagram-secondary: #edf0f5;
     --diagram-tertiary: #f5f6f8;
+    --live-card-shadow: 0 6px 20px rgba(var(--neutral-rgb), 0.06), 0 1px 3px rgba(var(--neutral-rgb), 0.05);
+    /* Airy dopamine seed, light values (the dark ones are in :root): white objects and capsules on two soft shadows. */
+    --elev-rest: 0 1px 2px rgba(28, 33, 51, 0.05), 0 6px 18px rgba(28, 33, 51, 0.06);
+    --elev-float: 0 2px 6px rgba(28, 33, 51, 0.06), 0 18px 44px rgba(28, 33, 51, 0.11);
+    --surface-object: #ffffff;
+    --surface-capsule: #ffffff;
+    --surface-capsule-hover: #f5f6f8;
+    --surface-float: #ffffff;
+    --surface-tray: rgba(var(--neutral-rgb), 0.03);
+    --surface-side: #fafbfc;
+    --glass: none;
+    --voice-owner: #e9eef9;
+    --voice-ouroboros: #fdf2f4;
+    --voice-ouroboros-card: #fff8f9;
+    /* The crimson tone is the accent ladder's; its hover stops at 14 % so the ink keeps 4.5:1 on it. */
+    --tone-crimson: var(--accent-10);
+    --tone-crimson-hover: var(--accent-14);
+    /* One step deeper than the accent text, so a tonal capsule keeps 4.5:1 on a voice-tinted backing too. */
+    --tone-crimson-ink: #b52b3b;
+    --tone-green: rgba(34, 197, 94, 0.14);
+    --tone-green-hover: rgba(34, 197, 94, 0.22);
+    --tone-red: rgba(239, 68, 68, 0.10);
+    --tone-red-hover: rgba(239, 68, 68, 0.16);
+    --tone-amber: rgba(245, 158, 11, 0.18);
+    --tone-amber-hover: rgba(245, 158, 11, 0.26);
+    --tone-quiet-hover: rgba(28, 33, 51, 0.06);
+    --press: brightness(0.95);
 }
 
 .ouro-ui { font-family: var(--font-sans); color-scheme: var(--native-color-scheme); }
@@ -541,11 +627,13 @@ textarea.ui-control { resize: vertical; }
     width: var(--ui-popup-anchor-width);
     margin: 0;
     padding: var(--space-1);
-    border: 1px solid var(--surface-border);
-    border-radius: var(--radius);
-    background: var(--ui-modal-bg);
+    border: 1px solid transparent;
+    border-radius: var(--radius-object);
+    background: var(--surface-float);
     color: var(--text-primary);
-    box-shadow: 0 20px 45px rgba(0, 0, 0, 0.35);
+    box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass);
+    backdrop-filter: var(--glass);
     list-style: none;
 }
 .ui-model-option, .ui-model-empty {
@@ -560,18 +648,20 @@ textarea.ui-control { resize: vertical; }
 .ui-model-option[aria-selected="true"] { color: var(--accent-light); background: var(--accent-12); }
 .ui-model-empty { color: var(--text-meta); }
 
-/* One menu surface; callers retain only domain meaning such as danger. */
+/* One menu surface, a float sheet like the model list above; callers retain only domain meaning such as danger. */
 .ui-popup[role="menu"] {
     display: flex;
     flex-direction: column;
     width: max-content;
     min-width: min(160px, var(--ui-popup-max-width));
     padding: var(--space-1);
-    border: 1px solid var(--surface-border);
-    border-radius: var(--radius);
-    background: var(--ui-modal-bg);
+    border: 1px solid transparent;
+    border-radius: var(--radius-object);
+    background: var(--surface-float);
     color: var(--text-primary);
-    box-shadow: 0 18px 44px rgba(0, 0, 0, 0.32);
+    box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass);
+    backdrop-filter: var(--glass);
 }
 .ui-popup [role^="menuitem"] {
     flex: 0 0 auto;
@@ -605,3 +695,74 @@ textarea.ui-control { resize: vertical; }
 }
 
 .ui-popup[hidden], dialog.ui-popup:not([open]) { display: none; }
+
+/* ---- Floating chrome ----------------------------------------------------------------------------------------------
+   Controls that float over scrolling content (Main's header group) share one box: height, baseline and the pill
+   corner; words, width, weight and tone stay the control's own (DESIGN §5). The group is invisible at rest and its
+   padding is cancelled by an equal negative margin, so grouping moves no control. A room's bar keeps its own reading
+   backing (Main: `.chat-page-header::before`), and what a bar discloses unfolds from the bar's bottom edge as one
+   Shade (room_work.css), never as a box glued to one control or one group. */
+@media (pointer: coarse) {
+    /* A coarse pointer (a phone) raises the whole family together to the shared touch minimum. */
+    :root { --chrome-control-h: var(--touch-target-min); }
+}
+.ui-chrome-group {
+    position: relative;
+    box-sizing: border-box;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: calc(-1 * var(--chrome-inset));
+    padding: var(--space-1);
+    border: 1px solid transparent;
+    border-radius: var(--radius-lg);
+}
+.ui-chrome-control {
+    box-sizing: border-box;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    height: var(--chrome-control-h);
+    padding: 0 var(--pill-padding-x);
+    border-radius: var(--pill-radius);
+    line-height: 1;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+}
+
+/* ---- One control, three tones (DESIGN.md design bible) ---------------------------------------------------------
+   Everything pressable with a body is a capsule standing on the rest shadow, in every state and either theme:
+   neutral (the capsule surface), tonal (its hue's tint and ink: crimson for the primary action and the chosen tab or
+   place, green for save, red for danger, amber for the owner's turn). A quiet control (ghost, link, filter) has no
+   body and no shadow. A state changes colour, never height: hover deepens the fill a step, a press deepens it again
+   (--press), a chosen one takes its tone; what cannot be pressed now loses its shadow. `.ui-chrome-control` stays
+   geometry only (a floating control's own tone is its page's): page styles map their controls onto these tones and
+   add no fourth recipe and no outline. These recipes are the product documents' own (their root is `.ouro-ui`);
+   `:where` keeps the specificity, and an author frame that sets `data-theme` keeps the overridable base recipe. */
+:root[data-theme]:where(.ouro-ui) .btn { border-color: transparent; border-radius: var(--pill-radius); font-weight: 600; transition: var(--motion-tone); }
+:root[data-theme]:where(.ouro-ui) :is(.btn-default, .btn-secondary) {
+    border-color: transparent; background: var(--surface-capsule); color: var(--text-primary); box-shadow: var(--elev-rest);
+}
+:root[data-theme]:where(.ouro-ui) :is(.btn-default, .btn-secondary):not(:disabled):hover { border-color: transparent; background: var(--surface-capsule-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-ghost { border-color: transparent; background: transparent; box-shadow: none; }
+:root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):hover { background: var(--tone-quiet-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-primary { background: var(--tone-crimson); color: var(--tone-crimson-ink); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-primary:not(:disabled):hover { background: var(--tone-crimson-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-save { background: var(--tone-green); color: var(--status-ok-fg); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-save:not(:disabled):hover { background: var(--tone-green-hover); }
+:root[data-theme]:where(.ouro-ui) .btn-danger { border-color: transparent; background: var(--tone-red); color: var(--status-error-fg); box-shadow: var(--elev-rest); }
+:root[data-theme]:where(.ouro-ui) .btn-danger:not(:disabled):hover { border-color: transparent; background: var(--tone-red-hover); }
+:root[data-theme]:where(.ouro-ui) .btn:hover { transform: none; }
+:root[data-theme]:where(.ouro-ui) :is(.btn, .theme-choice):not(:disabled):active { transform: none; filter: var(--press); }
+:root[data-theme]:where(.ouro-ui) .btn-ghost:not(:disabled):active { box-shadow: none; }
+:root[data-theme]:where(.ouro-ui) .btn:disabled { box-shadow: none; }
+/* The Appearance choice is one control in both documents (the SPA and the served setup page load only this sheet
+   in common): neutral capsules, the chosen one in the crimson tone, all standing. */
+:root[data-theme]:where(.ouro-ui) .theme-choice {
+    border-color: transparent; border-radius: var(--pill-radius); background: var(--surface-capsule); box-shadow: var(--elev-rest);
+    transition: var(--motion-tone);
+}
+:root[data-theme]:where(.ouro-ui) .theme-choice:hover { border-color: transparent; background: var(--surface-capsule-hover); }
+:root[data-theme]:where(.ouro-ui) .theme-choice[aria-checked="true"] { border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); }
+:root[data-theme]:where(.ouro-ui) :is(.ui-chip, .status-badge) { border-color: transparent; }

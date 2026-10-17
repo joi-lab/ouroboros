@@ -33,7 +33,13 @@ def test_render_prompt_requires_outcome_tier_and_independence():
     assert "PREMISE ARGUMENT, not the named artifact" in prompt
     assert "FULL goal/spec narrative" in prompt
     assert "affected components/surfaces" in prompt
-    assert "per-criterion evidence" in prompt
+    # Evidence fits the criterion's kind, not one grader-mirroring check for everything.
+    assert "evidence each criterion calls for" in prompt
+    assert "inspection of the actual artifact" in prompt and "grounded in cited sources" in prompt
+    assert "A simpler method that keeps the outcome is fulfilment" in prompt
+    assert "demanding person who made this request" in prompt
+    assert "a sufficient result needs no invented improvement" in prompt
+    assert "MIRRORS what the real grader" not in prompt and "grader-mirroring" not in prompt
     assert "VISIBLE UI EVIDENCE" in prompt
     assert "real consumer flow" in prompt
     assert "screenshot file or attachment" in prompt
@@ -74,8 +80,8 @@ def test_render_prompt_requires_outcome_tier_and_independence():
 _PRE_SEAM_PROMPT_DIGESTS = [
     "0261c7c7fe477ad7f8901a28bee1ad23905d40c3c62825d2bc406ecd9ca37f82",
     "9cf4de6f66001c3b4cec7fdd3d8552ecf83fc886004a7020e98a4c28c022c4e3",
-    "c10f29dba99ae7d0d284916dad47f554368361a48ca17fdcf776e28d17be3f2d",
-    "f4125ec5a987ff9ea35f7dd497a57ab4eeb9c935d6eb2cb100d56c6475a70e37",
+    "ead62c88bbc615c48296b4aebf510548ba7eb63ed2c1e238742b7dc188735c55",
+    "de2f13f4e45527aec32af8aeafd9cd9b225ab8646bcc5696775efdab5873d9c5",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
     "fca0f9401e544e371338f20effa6206db783e7098ff4d11ee2a980ebbe81ecb0",
 ]

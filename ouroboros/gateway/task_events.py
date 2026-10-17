@@ -3,6 +3,13 @@
 The existing ``gateway.tasks`` exports remain the route and injection surface.
 Both transports share current result/lineage projections and all five sources;
 v2 owns only read positions, never event persistence or task state.
+
+v2 cursor: one byte offset per root and source over the complete
+archive-plus-live chain, valid while archives stay immutable and retained.
+Only an explicit ``created_at`` on the task result bounds the scan (API
+admission stamps it for generated ids); a result without it, such as a
+caller-supplied id, keeps the full cold scan. Skipped archive bytes still
+count in the offset.
 """
 
 from __future__ import annotations
@@ -22,9 +29,10 @@ from starlette.responses import JSONResponse, StreamingResponse
 from ouroboros.gateway._helpers import coerce_int, request_drive_root, run_sync_to_completion
 from ouroboros.headless import ARTIFACT_STATUS_FINALIZING, ARTIFACT_STATUS_PENDING
 from ouroboros.outcomes import public_task_result
-from ouroboros.task_results import load_task_result, task_results_dir, validate_task_id
+from ouroboros.task_results import load_task_result, validate_task_id
 from ouroboros.task_status import FINAL_STATUSES
-from ouroboros.task_result_facts import raw_result_facts
+from ouroboros.store import StoreError
+from ouroboros.task_store import task_facts
 from ouroboros.gateway.contracts import TaskEventsRequest
 from ouroboros.gateway.schema import validate_ingress
 from ouroboros.utils import jsonl_archive_segments, jsonl_chain_handles
@@ -271,12 +279,12 @@ class _TaskEventFollower:
         self.suppress_task_done = False
         self.filter_grew = False
         self._queue_snapshot_mtime: Any = None
-        self._results_dir = task_results_dir(self.drive_root, create=False)
-        # Per-file proof belongs to this live follower, never a client cursor
-        # or the shared current-facts memo. Failed reads may retain this proof.
-        self._seen_result_names: Dict[str, tuple[str, str]] = {}
-        self._lineage_failed_names: set[str] = set()
+        # A lineage notice is raised when the store cannot answer the lineage query (a
+        # migration window); it clears once the query answers again. The last answered
+        # lineage survives a replay rebuild so an outage never narrows a live stream.
+        self._lineage_unavailable = False
         self._lineage_notice: Optional[dict] = None
+        self._lineage_proof: Optional[tuple] = None
         # Only an explicit creation fact may bound the scan. Legacy ``ts`` can
         # describe finalization and must never hide earlier task history.
         raw = load_task_result(self.drive_root, task_id) or {}
@@ -295,7 +303,7 @@ class _TaskEventFollower:
 
     def queue_snapshot_changed(self) -> bool:
         try:
-            mtime = (self.drive_root / "state" / "queue_snapshot.json").stat().st_mtime_ns
+            mtime = (self.drive_root / "state" / "queue.alive").stat().st_mtime_ns
         except OSError:
             mtime = None
         changed = mtime != self._queue_snapshot_mtime
@@ -303,43 +311,40 @@ class _TaskEventFollower:
         return changed
 
     def _discover_roots(self) -> bool:
-        """Rebuild the filter from current compact facts, reusing unchanged rows.
+        """Rebuild the filter from the store's current lineage facts (one query).
 
-        Results are written with lineage before enqueue. Stat invalidation also
-        sees later changes to an existing row; reconnects share that same memo.
-        Discovery is a read-only projection, never result/schema authority.
+        Results are written with lineage before enqueue. Discovery is a read-only
+        projection, never result/schema authority. The last answered lineage is the
+        follower's proof: while the store cannot answer, that proof stands (through a
+        replay rebuild too) and the gap is disclosed once; a follower without proof
+        reads the roots its own result names.
         """
         candidates = [self.drive_root]
         child = str(self.result.get("child_drive_root") or self.result.get("headless_child_drive_root") or "").strip()
         if child:
             candidates.append(pathlib.Path(child))
-        facts, malformed = raw_result_facts(
-            self._results_dir, reader=_tasks_namespace().read_json_dict,
-        )
-        failed = set(malformed)
-        bindings = {name: binding for name, binding in self._seen_result_names.items() if name in failed}
-        retained_count = len(bindings)
-        for name, row in facts.items():
-            if row["schema_refusal"] or row["delegation_role"] != "subagent":
-                continue
-            child_id = row["task_id"] or row["id"]
-            if not child_id or not (row["parent_task_id"] == self.task_id or row["root_task_id"] == self.task_id):
-                continue
-            child_root = row["child_drive_root"] or row["headless_child_drive_root"]
-            bindings[name] = (child_id, child_root)
-        ids = {self.task_id, *(child_id for child_id, _root in bindings.values())}
-        for _child_id, child_root in bindings.values():
-            if child_root:
-                candidates.append(pathlib.Path(child_root))
-        self._seen_result_names = bindings
-        if failed != self._lineage_failed_names:
-            self._lineage_notice = ({"type": "history_gap", "source": "task_result",
-                "task_id": self.task_id, "reason": "lineage_incomplete",
-                "data": {"failed_result_reads": len(failed), "retained_result_bindings": retained_count,
-                         "unknown_result_membership": len(failed) - retained_count}}
-                if failed else None)
-        self._lineage_failed_names = failed
-        roots = sorted(set(candidates), key=str)
+        try:
+            facts = task_facts(self.drive_root, where="delegation_role='subagent' AND (parent_task_id=? OR root_task_id=?)",
+                               params=(self.task_id, self.task_id))
+        except StoreError:
+            if not self._lineage_unavailable:
+                self._lineage_notice = {"type": "history_gap", "source": "task_result",
+                    "task_id": self.task_id, "reason": "lineage_incomplete",
+                    "data": {"store_unavailable": True}}
+            self._lineage_unavailable = True
+            if self._lineage_proof is not None:
+                ids, roots = set(self._lineage_proof[0]), list(self._lineage_proof[1])
+            else:
+                ids, roots = {self.task_id}, sorted(set(candidates), key=str)
+        else:
+            if self._lineage_unavailable:
+                self._lineage_notice = None
+            self._lineage_unavailable = False
+            bindings = {child_id: row["child_drive_root"] or row["headless_child_drive_root"] for child_id, row in facts.items()}
+            ids = {self.task_id, *bindings}
+            candidates.extend(pathlib.Path(child_root) for child_root in bindings.values() if child_root)
+            roots = sorted(set(candidates), key=str)
+            self._lineage_proof = (frozenset(ids), tuple(roots))
         changed = ids != self.task_filter_ids or roots != self.roots
         self.filter_grew = self.filter_grew or changed
         self.task_filter_ids, self.roots = ids, roots

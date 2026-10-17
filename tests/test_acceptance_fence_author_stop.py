@@ -10,6 +10,7 @@ from ouroboros import cancel_intents
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.utils import utc_now_iso
 from tests._cancel_intents_shared import qenv as _qenv
+from tests._store_shared import result_signature
 
 qenv = _qenv
 
@@ -51,7 +52,7 @@ def _stopped_parent_snapshot(qenv, monkeypatch, *, saved=True, status="sealed",
 
 def test_saved_author_stop_restores_queued_child_without_cancelling_it(qenv, monkeypatch):
     root_id, child_id = _stopped_parent_snapshot(qenv, monkeypatch)
-    parent_before = (qenv.drive / "task_results" / f"{root_id}.json").read_bytes()
+    parent_before = result_signature(qenv.drive, root_id)
 
     fenced = []
     assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 1
@@ -61,7 +62,7 @@ def test_saved_author_stop_restores_queued_child_without_cancelling_it(qenv, mon
     assert load_task_result(qenv.drive, child_id)["status"] == "scheduled"
     assert cancel_intents.active_intent(qenv.drive, root_id) is None
     assert cancel_intents.active_intent(qenv.drive, child_id) is None
-    assert (qenv.drive / "task_results" / f"{root_id}.json").read_bytes() == parent_before
+    assert result_signature(qenv.drive, root_id) == parent_before
 
 
 @pytest.mark.parametrize("status,outcome", [

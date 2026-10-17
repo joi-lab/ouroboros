@@ -1,4 +1,11 @@
-"""Task-scoped long-running service manager."""
+"""Task-scoped long-running service manager.
+
+``service_execution_facts`` is the only source of the sleep ``services`` selector:
+the real Popen return code for host and local-executor services; a Docker service
+reports no return code (its in-container leader observation is not the service's)
+and an inconclusive probe reads ``unknown``. The park loop polls it about every
+second as host work, never a model round.
+"""
 
 from __future__ import annotations
 
@@ -14,7 +21,8 @@ from typing import Any, Dict, List
 
 from ouroboros.owner_pause import OwnerPauseRefused
 from ouroboros.tools.tool_result import launch_refusal_result
-from ouroboros.observability import redact_projection, write_blob
+from ouroboros.artifacts import persist_exact_text_source
+from ouroboros.observability import read_blob_ref, redact_projection, write_blob
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.platform_layer import (
     bootstrap_process_path,
@@ -46,6 +54,7 @@ from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import overlay_env, resolve_process_env, service_env, validate_process_env
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
 from ouroboros.workspace_executor import _read_local_service_marker
+from ouroboros.workspace_executor import service_execution_facts as executor_service_execution_facts
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
 from ouroboros.workspace_executor import start_service as executor_start_service
@@ -190,6 +199,15 @@ def _stop_record(record: ServiceRecord, *, wait: bool = True) -> None:
 def _finalize_service_log_for_drive(
     drive_root: pathlib.Path, record: ServiceRecord, *, log_path: pathlib.Path | None = None,
 ) -> Dict[str, Any]:
+    """Capture a service log's tail and full blob, then delete the live log.
+
+    Secrets known to ``record`` are masked in both. The live log is deleted only
+    once its blob is stored (or it is already gone); an oversized log
+    (``full_log_omitted``) or a failed capture (``errors``) leaves it in place and
+    reports ``retained_live_log_path``. The executor stop path calls this before it
+    forgets the record's secret values, and only after termination is confirmed; an
+    unconfirmed stop keeps the record for a later cleanup.
+    """
     result: Dict[str, Any] = {"deleted_live_log": False, "full_log_ref": {}, "tail": "", "errors": []}
     log_path = log_path if log_path is not None else record.log_path
     try:
@@ -215,6 +233,42 @@ def _finalize_service_log_for_drive(
     elif log_path.exists():
         result["retained_live_log_path"] = str(log_path)
     return result
+
+
+def _without_log_tail(finalization: Dict[str, Any]) -> Dict[str, Any]:
+    """The compact log shape: the display tail becomes its ``tail_chars`` size."""
+    compact = dict(finalization)
+    tail = compact.pop("tail", "")
+    if tail:
+        compact["tail_chars"] = len(str(tail))
+    return compact
+
+
+def retained_log_display(service: Dict[str, Any], *, drive_root: Any = None, task_id: str = "") -> Dict[str, Any]:
+    """A service row whose tail gives way to a readable copy of its complete masked log.
+
+    ``full_log_ref`` is gzip, which ``read_file`` does not open, so the verified
+    blob text also becomes this task's exact text source (``source_ref``). Only
+    then does the tail become ``tail_chars``. Without a readable source (no blob,
+    ``full_log_omitted``, capture ``errors``, no task store) the tail stays; an
+    unreadable blob keeps its digest marked ``unavailable``, with no path a review
+    closure would have to fetch. Errors, gaps and sizes are never dropped.
+    """
+    finalization = service.get("log_finalization")
+    ref = finalization.get("full_log_ref") if isinstance(finalization, dict) else None
+    if not (drive_root and task_id and isinstance(ref, dict) and ref.get("sha256")):
+        return service
+    try:
+        text = read_blob_ref(pathlib.Path(drive_root), ref, expected_kind="txt")
+    except Exception as exc:
+        unavailable = {key: ref[key] for key in ("kind", "sha256", "size", "encoding") if key in ref}
+        return {**service, "log_finalization": {**finalization, "full_log_ref": {
+            **unavailable, "availability": "unavailable", "reason": type(exc).__name__}}}
+    _exact, source, failure = persist_exact_text_source(
+        drive_root, task_id, source_id=f"service-log-{ref['sha256'][:16]}", text=text)
+    if failure:
+        return service
+    return {**service, "log_finalization": {**_without_log_tail(finalization), "source_ref": source}}
 
 
 def _archive_stale_service_log(
@@ -455,6 +509,8 @@ def _start_service(
         # Retire the exited host record before a new process can append to its
         # log with a different environment (or switch to an executor backend).
         _stop_service(ctx, name=service_name)
+    from ouroboros import body_candidate
+
     if _executor_can_run_cwd(ctx, workdir):
         try:
             payload = executor_start_service(
@@ -476,19 +532,34 @@ def _start_service(
             )
             return json.dumps(payload, ensure_ascii=False, indent=2)
         except OwnerPauseRefused as exc:
-            return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
+            return _publish_tool_result(ctx, launch_refusal_result(exc))
+        except body_candidate.CandidateRefused:
+            raise
         except Exception as exc:
             text = redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
             if getattr(exc, "process_not_started", False) is True:
                 return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR",
-                    text=text, meta={"operation_outcome": "completed_no_effect"}))
+                    text=text, meta={"process_not_started": True,
+                                     **({"previous_service_retired": True} if existing is not None else {})}))
             return text
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     log_dir = pathlib.Path(ctx.drive_root) / "services" / task_id
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{service_name}.log"
 
+    from ouroboros.owner_pause import _member_coordinates
+    from ouroboros.process_scope import record_task_group, scoped_child_env, task_launch_target
+    from ouroboros.tool_custody import invocation_binding
+
+    # A task-scoped service belongs to the task (task marker, group recorded); a keep /
+    # session service is handed to the installation and sheds every task marker.
+    scope_root, _, scope_task = _member_coordinates(ctx)
+    scope_target = None if keep_alive else task_launch_target(
+        invocation_binding(), drive_root=scope_root, task_id=scope_task)
+
     def publish_process(proc):
+        if scope_target is not None:
+            record_task_group(*scope_target, proc.pid)
         record = ServiceRecord(
             name=service_name,
             service_id=key,
@@ -512,6 +583,11 @@ def _start_service(
         _SERVICES[key] = record
         if _panic_requested:
             raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
+
+    # Inside the bound candidate a failure to isolate refuses the start on either backend
+    # (the registry types CandidateRefused); it never falls back to the serving environment.
+    candidate_env = body_candidate.process_environment(ctx, workdir)
+    service_base_env = candidate_env if candidate_env is not None else _service_env()
 
     log_fh = log_path.open("ab")
     try:
@@ -537,12 +613,13 @@ def _start_service(
             # The attested emergency bundled-node PATH prepend (post-gates
             # node resolver) applies on top of the allowlisted service env;
             # a healthy resolution leaves the env byte-identical.
-            env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
+            env=scoped_child_env(
+                overlay_env(apply_env_path_prepend(service_base_env, active_node_resolution(ctx)), env), scope_target),
         )
         log_fh.close()
     except OwnerPauseRefused as exc:
         log_fh.close()
-        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
+        return _publish_tool_result(ctx, launch_refusal_result(exc))
     except Exception as exc:
         log_fh.close()
         return redact_known_values(f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}", secret_values)
@@ -609,6 +686,24 @@ def _status_payload(record: ServiceRecord) -> Dict[str, Any]:
     }
 
 
+def service_execution_facts(service_id: str) -> Dict[str, Any] | None:
+    """One task service's start identity and execution state, for a sleep selector.
+
+    Execution facts only: no readiness refresh, no log read. ``service_id`` is the
+    ``task_id:name`` lookup key a stop/start reuses, so ``started_at`` with the
+    process identity pins ONE start. ``returncode`` is the real exit status where
+    this process holds the child, else ``None``. ``None`` = no record in this
+    process: never started, stopped, or a registry a restart did not carry.
+    """
+    with _LOCK:
+        record = _SERVICES.get(service_id)
+    if record is None:
+        return executor_service_execution_facts(service_id)
+    rc = record.proc.poll()
+    return {"service_id": service_id, "started_at": record.started_at, "pid": record.proc.pid,
+            "pgid": record.pgid, "state": "running" if rc is None else "exited", "returncode": rc}
+
+
 def _service_status(ctx: ToolContext, name: str = "service") -> str:
     service_name, name_error = _sanitize_service_name(name)
     if name_error:
@@ -665,9 +760,15 @@ def _service_logs(ctx: ToolContext, name: str = "service", tail: int = 8000) -> 
             return "⚠️ TOOL_ARG_ERROR (service_logs): tail must be an integer."
         payload = executor_service_logs(ctx, service_name, tail_chars)
         if payload is None:
-            return f"⚠️ SERVICE_NOT_FOUND: {name}"
+            return _publish_tool_result(ctx, ToolResult(
+                status="unavailable", code="LEGACY_UNAVAILABLE",
+                text=f"⚠️ SERVICE_NOT_FOUND: {name}"))
         return json.dumps(payload, ensure_ascii=False, indent=2)
-    return f"⚠️ SERVICE_NOT_FOUND: {name}"
+    # Status discovery and idempotent stop use this same marker as a warning.
+    # A logs request has no requested payload to return; type only this branch.
+    return _publish_tool_result(ctx, ToolResult(
+        status="unavailable", code="LEGACY_UNAVAILABLE",
+        text=f"⚠️ SERVICE_NOT_FOUND: {name}"))
 
 
 def _stop_service(ctx: ToolContext, name: str = "service") -> str:
@@ -822,10 +923,14 @@ def stop_task_services(ctx: ToolContext) -> List[Dict[str, Any]]:
             continue
         try:
             raw = _stop_service(ctx, name=name)
-            if raw.startswith("⚠️ ARTIFACT_OUTPUT_ERROR") and "\n\n{" in raw:
+            if raw.startswith(("⚠️ ARTIFACT_OUTPUT_ERROR", "⚠️ SERVICE_STOP_ERROR")) and "\n\n{" in raw:
                 raw = raw.split("\n\n", 1)[1]
             payload = json.loads(raw)
-            payload["lifecycle"] = "stopped"
+            payload["lifecycle"] = (
+                "cleanup_pending"
+                if payload.get("stop_failed") or payload.get("cleanup_dispatched") is False
+                else "stopped"
+            )
             results.append(payload)
         except Exception:
             pass
@@ -848,7 +953,11 @@ def stop_task_services(ctx: ToolContext) -> List[Dict[str, Any]]:
         else:
             for payload in executor_stop_task_services(ctx):
                 payload = dict(payload)
-                payload.setdefault("lifecycle", "stopped")
+                if (payload.get("stop_failed") or payload.get("cleanup_dispatched") is False
+                        or payload.get("state") == "cleanup_pending"):
+                    payload["lifecycle"] = "cleanup_pending"
+                else:
+                    payload.setdefault("lifecycle", "stopped")
                 results.append(payload)
     except Exception:
         pass
@@ -861,13 +970,16 @@ def kill_all_services(
     wait: bool = True,
     include_keep_alive: bool = True,
     request_only: bool = False,
+    durable: bool = True,
 ) -> List[Dict[str, Any]]:
     """Stop every tracked service process group for panic/shutdown paths.
 
     ``include_keep_alive=False`` (graceful shutdown/restart) leaves keep_alive
     services running: they are session-scoped in the process custody ledger,
     so the next server generation's reaper still collects them. Panic and
-    emergency cleanup keep the default and kill everything.
+    emergency cleanup keep the default and kill everything. ``durable=False``
+    stops only this process's in-memory services: the exit stop
+    (``owned_shutdown.stop_owned_work``) settles the durable records itself.
     """
 
     global _panic_requested
@@ -898,24 +1010,16 @@ def kill_all_services(
             payload["log_finalization"] = _finalize_service_log_for_drive(pathlib.Path(drive_root), record)
         stopped.append(payload)
     try:
-        stopped.extend(executor_kill_all_services(drive_root, wait=wait))
+        stopped.extend(executor_kill_all_services(drive_root, wait=wait, durable=durable))
     except Exception:
         pass
     if wait and drive_root is not None and stopped:
-        def _compact(payload: Dict[str, Any]) -> Dict[str, Any]:
-            item = dict(payload)
-            finalization = dict(item.get("log_finalization") or {})
-            tail = finalization.pop("tail", "")
-            if tail:
-                finalization["tail_chars"] = len(str(tail))
-            item["log_finalization"] = finalization
-            return item
-
         try:
             append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "services_shutdown_cleanup",
-                "services": [_compact(payload) for payload in stopped],
+                "services": [{**payload, "log_finalization": _without_log_tail(payload.get("log_finalization") or {})}
+                             for payload in stopped],
             })
         except Exception:
             pass
@@ -990,7 +1094,7 @@ def get_tools() -> List[ToolEntry]:
                     "default": "",
                     "description": (
                         "Omit for active_workspace; use system_repo[/subdir] for Ouroboros. "
-                        "Skill payload services are not supported."
+                        "Docker backend aliases inside active_workspace are accepted; skill payload services are not supported."
                     ),
                 },
                 "name": {"type": "string", "default": "service"},

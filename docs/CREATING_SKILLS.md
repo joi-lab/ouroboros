@@ -29,7 +29,7 @@ can run.
 **Owner attestation (skip review for your own or verified official skill).** For
 an external or self-authored skill, and for a hash-verified official
 OuroborosHub payload, the OWNER may skip the expensive LLM review via the
-**⚠️ Skip review** action on the skill card (owner-only
+**Skip review** action on the skill card (owner-only
 `POST /api/owner/skills/{skill}/attest-review`). The deterministic preflight +
 manifest-validation floor STILL runs (an invalid or unsafe payload is refused),
 and official-hub payloads are freshly rechecked against the live catalog before
@@ -165,9 +165,10 @@ automatically disabling, deleting, or moving either payload.
 model's point of view: `what_model_sees` (what the skill adds to the model's
 context — tools, sections, attachments) and `token_effect` (roughly what that
 costs and when it is loaded). A bare string is shorthand for
-`what_model_sees`. The prose travels verbatim (bounded) to the model-visible
-surfaces — the `list_skills` JSON and the "Installed Skills" context section —
-so write it for the model, not for the human reviewer. Unknown keys or
+`what_model_sees`. The prose travels to the model-visible surfaces — bounded in
+the `list_skills` index and the "Installed Skills" context section, whole in
+`list_skills(name=...)`, which also returns the `read_file` call for this
+manifest — so write it for the model, not for the human reviewer. Unknown keys or
 non-string values are refused at parse time.
 
 Manifest refusals teach: every `SkillManifestError` carries the problem plus,
@@ -180,7 +181,7 @@ manifest instead of only what was wrong.
 ```mermaid
 flowchart LR
     install[install] --> review[skill_review]
-    review --> triad[reviewer-slot skill review]
+    review --> triad[skill review by the review panel]
     triad -- PASS --> deps
     deps --> enable[owner toggles enabled=true]
     enable --> execute[skill_exec / dispatch]
@@ -426,9 +427,7 @@ unrecognised frontmatter key is kept as an extra rather than refused —
 `install_specs` and the forward-compatible `presence:` block are both read that
 way — so `companion_process:` in the singular parses, declares no companions,
 and currently produces no warning from the parser, `validate()`, or
-`skill_preflight`. The error you eventually meet names the
-plural key and cannot tell you that the singular one was sitting in the
-manifest all along.
+`skill_preflight`. The eventual error names only the plural key.
 
 There is no `on_enable` trigger and no `once` flag. After a skill is enabled, the
 host starts a companion whose name `register()` has registered; for an
@@ -441,11 +440,12 @@ happen before the first tool call, remember that an out-of-process extension
 already runs `register()` in every per-call child — see the out-of-process
 caveats above — so cheap idempotent setup belongs there, not in a companion.
 
-`env` and `ports` may also be declared on the descriptor. Neither is passed
-through as written: the host drops `HOST_SERVICE_TOKEN`, `HOST_SERVICE_URL` and
-any forbidden settings key out of `env` (and sets the first two itself), and it
-keeps only all-digit entries from `ports`, so a negative or non-numeric one is
-dropped in silence.
+`env` and `ports` may also be declared on the descriptor. Neither passes as
+written: the host drops `HOST_SERVICE_TOKEN`, `HOST_SERVICE_URL`,
+`OUROBOROS_PARENT_PID` and any forbidden settings key from `env` and sets the
+first three itself; the last is the server's PID, telling a container's PID-1
+server from an init adoption. `ports` keeps only all-digit entries; a negative
+or non-numeric one is silently dropped.
 
 ## The `skill_preflight` tool
 
@@ -593,7 +593,7 @@ calls and runtime behaviours:
 | `supervised_task` | The skill may register an in-process host-supervised async task. |
 | `companion_process` | The skill may register a manifest-declared companion subprocess supervised by the host. |
 | `subscribe_event` | The skill may subscribe to manifest-declared host event topics such as `chat.outbound` or `skill.lifecycle`. Chat topics require owner permission grants; `skill.lifecycle` does not. |
-| `inject_chat` | The skill may request Host Service chat injection after an explicit owner permission grant: `POST /chat/inject` carries text, an inline image, or `attachments` (`[{path, name?, mime?}]` — regular files under the skill's own state root, at most 25 per message, which the host copies without the former 50 MiB upload cap into the shared `data/uploads` chat-upload store and stages for the task; a file-only message needs no text). The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
+| `inject_chat` | With the owner's `inject_chat` grant, `POST /chat/inject` accepts text, an inline image or `attachments` (`[{path, name?, mime?}]`: up to 25 regular files confined to the skill's state root, copied without the former 50 MiB cap to `data/uploads` and staged for the task; file-only messages need no text). Optional `reply_to` carries a host row or `task:<task_id>` address as a reference, never routing. The same grant lets the skill relay the owner's decision-card answer through `POST /chat/decision` (`{request_id, decision_id, option_index?, comment?}`, the `POST /api/decisions` contract). A message that carries a `client_message_id` becomes an addressable operation: the host answers with its `operation_ref` (`<chat_id>:<client_message_id>`) on 202, 200 and 504; a repeated delivery of the same message — the same words AND the same ordered attachment content (inline image and files, compared by bytes and name, not by the host's stored copy) — rejoins it instead of enqueueing again (a different message under a reused id is refused with 409); an inline image and the attachments also appear in the owner's chat bubble from the host's stored copy, while the image still reaches the model as before (inline bytes that are not a proven image are kept as an ordinary file and never sent as an image; base64 over 50 MiB decoded is refused with 413); `GET /chat/operations/{operation_ref}` reports the skill's own accepted message (`pending`, `running` with its task or turn, the durable answer, a terminal task status, or `lost` after a host restart or when the host's own acceptance write failed); and `POST /chat/cancel` (`{operation_ref, reason?}`) runs the existing cancellation owner on work that message started, answering `cancelled`, `already_terminal`, `unresolved` or `cancel_unsupported` — never a cancellation that did not happen. |
 | `presence` | A reviewed transport skill may submit authenticated non-owner conversation events to the Host Service Presence boundary and poll only their correlated late work. Requires an explicit content-hash-bound owner grant. |
 | `notify_owner` | The skill may tell the owner one thing through `POST /notify` after an explicit owner permission grant (see "Telling the owner something" below): one bounded plain sentence the host shows in the owner's chat as a System row signed with the skill's name. It wakes no model; narrower than `inject_chat`. |
 
@@ -609,7 +609,11 @@ Some settings keys are protected: `OPENROUTER_API_KEY`,
 `GITHUB_TOKEN`, `OUROBOROS_NETWORK_PASSWORD`. These keys are NEVER
 forwarded to a skill by default, even when listed in
 `env_from_settings`. Custom secret keys stored in Settings → Secrets
-are treated the same way. Host permissions such as `inject_chat`, `presence`,
+are treated the same way. A granted key is read as currently saved: each
+`api.get_settings` call, script run, out-of-process call and companion start sees a
+value the owner saved, rotated or deleted during a running task, while that task keeps
+its own model, account and review settings; a value your code already copied or cached,
+a running companion's environment included, is not refreshed for you. Host permissions such as `inject_chat`, `presence`,
 `notify_owner` and chat event subscriptions also require explicit, content-hash-bound owner
 consent. The desktop launcher's owner-grant bridge records these grants.
 
@@ -709,11 +713,13 @@ A transport extension declares `permissions: [presence]`, obtains its ordinary
 content-hash-bound skill token, and sends:
 
 - `POST /presence/turn` with exactly `binding_id`, `event`, and optional
-  `staged_files` and negotiated `delivery_reporting_version`. The event carries the provider/account/conversation/thread,
+  `staged_files` and negotiated `delivery_reporting_version` and `continuation_version`. The event carries the provider/account/conversation/thread,
   stable source-event and conversation ids, structured actor/conversation/message
   facts, and text. Files must already be under that transport skill's state root.
 - `GET /presence/work/{work_ref}?binding_id=...` to poll only late work created
   by the same owner binding.
+- `POST /presence/work/{continuation_ref}` with `binding_id` and `transport_queue`
+  to refresh the same continuing turn's observed transport inbox facts, under the same token and binding.
 
 The nested fact maps may include optional provider evidence such as the agent's
 own account identity, explicit mention occurrences and the thread-root author.
@@ -748,16 +754,102 @@ A turn's source identity is its binding, source event ID, provider/account,
 conversation/thread, actor ID and text. Keep those facts stable on retry;
 `staged_files` paths and delivery-reporting negotiation may change. A collision
 returns HTTP 409 `presence_event_identity_conflict` with `disposition: rejected`,
-not another room's answer. HTTP 409 `presence_attempt_outcome_unknown` and
-`presence_resources_unavailable` carry `disposition: retry` and no external
-text: retain the original event in the transport. A refusal may carry a
-previously admitted child's `work_ref`; poll it through `/presence/work`,
-not as a completed reply to the original event. A failed durable start is
-also retryable; no agent effect began unless its start was recorded. A quota
-refusal after a terminal task does not itself prove safe regeneration on the
-same ID; if prior effects remain unproven the conversation may need explicit
-owner recovery. Never treat these refusals as `completed/silent` or resend a
-confirmed provider effect merely because a Host receipt failed.
+not another room's answer. Admitted attempts with an unknown outcome, lost local
+stack or cancellation return `disposition: retained`, `turn_ref` for the original,
+optional `work_ref` for a real admitted child, and `delivery_reporting_version`.
+Persist the full receipt and source event, release the input FIFO, and observe
+both references independently through `/presence/work`; never resubmit the event
+as new work. An unresolved work view has `status: unresolved`, the retained code
+and references, no authored outcome/text, and any already released continuation
+outputs. Keep observing for canonical late evidence without erasing the retained
+receipt when a child finishes. Deduplicate output by its original source identity.
+Cancelled attempts remain observed without new generation. A live turn's model
+recovery keeps its conversation under existing controls until it finishes or
+returns a retained refusal; input custody is not released merely by a stream loss.
+`retry` preserves temporary failures and quota refusals with a source-bound
+pre-dispatch retry certificate; `blocked` needs configuration repair, whereas
+`rejected` is an event-specific permanent refusal. HTTP status alone decides none
+of these. Missing or unknown dispositions remain retryable for compatibility.
+Older Host/consumer pairs may still hold input queues until both are upgraded.
+Never project a retained refusal as `completed/silent` or as a successful handoff.
+
+#### Presence continuation
+
+`GET /identity` advertises `presence_continuation_version: 1` on supporting hosts. Request
+`continuation_version: 1` beside `binding_id` and `event` on `/presence/turn` (negotiation is not
+event identity). An author whose result waits for acceptance review then yields the conversation
+and answers early: `status: "continuing"` with `continuation_ref` (equal to `turn_ref`) and an
+initial `outcome`/`text`/`output_ref`. `deferred` with empty text means a result may follow; an
+author-selected early output (Advisory `pending_review=finish`) is speech to send once under its
+`output_ref`; `silent`/`tool_delivered` send nothing. A promoted child keeps its own `work_ref`; poll
+both independently. `status: "completed"` (with `continuation_ref: ""`) means the author ended
+within the request. A retry of the same event returns the identical stored envelope, never a rerun;
+`continuing` releases text to you and is not proof of provider delivery.
+
+Poll `GET /presence/work/{continuation_ref}?binding_id=...` like other late work. Ordinary pending
+and terminal continuation views carry `work_ref` and `continuation_ref` naming the author, plus
+`child_work_ref` for its promoted independent work (empty if none). An unresolved retained view
+names the author with `turn_ref` and any retained `continuation_ref`; its optional `work_ref`
+names the actual child, and any `child_work_ref` is retained too. Discover and retain the child
+before handling author status; poll it independently. A child promoted after the first yield
+appears at the next park even if the immutable initial envelope has an empty `work_ref`.
+While the author lives it answers HTTP 202 `pending` with `outputs`: the ordered
+`{output_ref, outcome, text}` the author released so far. Its terminal answers 200 with
+`outcome`/`text`/`output_ref` holding only a new terminal output (a re-finalized released selection
+yields `silent` and empty text), the child reference, and the same `outputs`.
+A retained lost author answers HTTP 200 `status: "unresolved"`, `disposition: "retained"` and a
+typed `code`, with no authored `outcome` or `text`. The view preserves released `outputs` and
+the actual child references. Loss is established under the conversation gate or by the retained
+controller's absence; missing or unobservable identity alone proves no crash. Polling starts no
+new generation and never regenerates the original event. An explicit new event may request
+continuation after checking prior effects; it creates a new turn and retains the original reference.
+Old consumers accepting only `interrupted` for a lost author can reject the unresolved view and
+miss a child first discovered there until upgraded; `interrupted` remains the legacy wire shape
+on hosts without retained-work support. Send each `output_ref` at most once:
+deduplicate by `output_ref`, never by text, since an identical correction is new speech. Without
+`continuation_version` the legacy shape is unchanged and the request waits for the author's terminal.
+
+Before speaking again, the same author reacquires the conversation and active slot and receives
+observed conversation and delivery facts since its yield. Reentry retains the exact observed text,
+explicit read gaps and frozen history descriptor in the existing task artifact store. Through the
+turn's already granted reader, `get_task_result(task_id, presence_reentry_sha256)` returns the
+checkpoint's character count/hash and `history_start`/`history_end`. Character ranges
+(`source_start_char`, `source_end_char`) read the retained checkpoint. To read the full frozen
+canonical interval, start `presence_reentry_offset` at `history_start` and follow `next_offset`
+until `interval_exhausted`; pages contain complete rows from this conversation and explicit gaps.
+For an oversized page, keep its `presence_reentry_offset` and use the character-range arguments
+to read its serialized text. Later appends are outside this interval. Missing, replaced or truncated
+history is unavailable, never empty-complete; concurrent in-place edits plus append remain outside
+the shared reader's non-atomic capture guarantee. Canonical history follows ordinary archive
+retention, while the checkpoint retains its originally observed facts.
+
+An inline note can omit whole rows only with an accessible source. Frozen ceilings lacking the
+reader walk the interval and keep all available text inline; this can increase context and memory,
+without widening permissions. Complete observed text does not erase history gaps. The initial
+yield anchors the previous-turn pointer across repeated parks and final completion, so the
+returning author cannot replace a newer turn's pointer. Unsubmitted transport facts remain unknown.
+
+Supply an initial inbox observation in `event.conversation.transport_queue`. To refresh it while
+an author waits, post `{binding_id, transport_queue}` to its continuation work URL; `GET` remains
+a read-only poll. The snapshot has `schema_version: 1`, `source`, timezone-qualified ISO
+`observed_at`, the exact derived `conversation_key`, `after_source_event_id` matching the turn's
+original source event, `complete: true`, `pending_count` equal to `len(events)`, and
+`omitted_count: 0`. `source` is a nonempty attribution string. Each event has a unique nonempty
+`source_event_id` and string `text`; optional `text_chars` equals the text's character count,
+and `text_truncated` is absent or false. Other provider facts are retained. These are transport
+observations of queued events, not admissions, owner instructions, or provider-delivery receipts.
+Keep the snapshot's identity and content unchanged when retrying its report.
+
+The original event retains the initial snapshot; refresh snapshots use the existing task artifact
+store, with `presence_transport_queue` pointing at the latest one. A successful refresh returns
+`{ok: true, status: "recorded" | "duplicate" | "stale", observed_at: ...}`. Older observations cannot
+replace a newer timestamp; `stale` returns the retained observation's time. Malformed snapshots or
+different content at the same timestamp return HTTP 400 `presence_observation_invalid` with
+`disposition: "rejected"`. Reentry carries the full latest received
+snapshot in its exact source and dates the observation: it is not proof that the transport inbox
+still has those contents. No received snapshot means unknown, never an empty inbox. Posting facts
+neither dequeues nor executes the events; the transport retains its ordinary admission and outbox
+custody. A later arrival can still race the author's decision and delivery.
 
 #### Reporting actual Presence delivery
 
@@ -806,6 +898,7 @@ exact `text`, `format`, provider facts in `message`, and
 sets kind explicitly. A tool handler may use its supported first `ctx` argument
 to retain compact task provenance; never serialize the full context or secrets.
 The Host establishes source identity, and a task reference grants no authority.
+Reports stay in chat history, where the room view names them as delivery facts.
 
 Report physical parts separately. Preserve resolved DM IDs, actual chunk or
 fallback text, captions and provider message IDs in the receipt snapshot.
@@ -1048,7 +1141,9 @@ allow-downloads"`, never `allow-same-origin`; see "What the frame may do"
 below), and injects the host bridge (`window.OuroborosWidget`, below) that
 forwards only `/api/extensions/<skill>/...` requests and the skill's own
 WebSocket events. The `widget_module_safety` review item still checks the
-source; do not rely on the sandbox alone.
+source; do not rely on the sandbox alone. A replacement interface keeps the
+same promises through the host-side protocol in
+[`WIDGET_HOST_PROTOCOL.md`](WIDGET_HOST_PROTOCOL.md).
 
 Framed render declarations may add a bounded `height` (320–8,192 pixels).
 When a module omits `height`, the host starts at 320px and measures its
@@ -1082,7 +1177,12 @@ guidance, not a restriction: legal width-sensitive CSS remains supported by the
 host-owned resize contract. For auto-height modules, the host bootstrap
 suppresses only document-viewport `overflow-y` below the ceiling and releases
 it at the ceiling; horizontal document overflow remains author-controlled and
-reachable.
+reachable. After a `ResizeObserver` notice the bootstrap re-measures and
+toggles in the next animation frame, never inside observer delivery: a layout
+write there can leave a size change undelivered, and the browser's loop error
+would reach the fault channel as a widget script error (WebKit reports
+`Script error.`). An author observer that writes layout in its own callback
+can raise the same error.
 
 #### The in-frame bridge (`window.OuroborosWidget`)
 
@@ -1373,12 +1473,12 @@ from your routes. Two rules come with that:
   face (`FontFace.status === "error"`; WebKit is lenient, so test on Chromium).
   Images and media are plain no-cors loads and need no header; the module
   endpoint already sends it for scripts.
-- **Passive loads carry no session on network installs.** On a
-  password-protected install reached over the network (not loopback, not the
-  desktop shell), the owner's session cookie is `SameSite=Lax` and an opaque
-  frame's `<img>`/`<audio>`/`<video>`/`@font-face` requests are cross-site, so
-  they arrive without it and get 401. Loopback and the desktop shell are exempt.
-  For an asset that must work everywhere, go through the bridge — the parent
+- **Passive network loads are browser-dependent.** On a password-protected
+  install, an opaque frame's requests may lack the `SameSite=Lax` session and
+  get 401. A passive image was refused in Chromium but sent the cookie and
+  loaded in WebKit in the separate-host tests; this is not a guarantee for
+  other browsers or request modes. Loopback remains exempt from the gate.
+  For an asset that must work across browsers, use the bridge — the parent
   sends the session — and hand the bytes to the element as a `blob:` URL, which
   `img-src`/`media-src`/`font-src` admit:
 
@@ -1416,12 +1516,10 @@ The endpoint sends `Access-Control-Allow-Origin: *`, which the opaque-origin
 frame needs for `import()`; relative specifiers inside a module loaded this way
 resolve against its URL, so `import './y.mjs'` reaches `module/lib/y.mjs`.
 
-A sibling loaded this way carries no session, for the same reason passive image
-and font loads do not (above): on a password-protected install reached over the
-network, the frame's request for `module/lib/x.js` is cross-site, arrives without
-the `SameSite=Lax` session cookie and gets 401. The declared entry is unaffected
-— the host fetches it with the owner's session and inlines it — and loopback and
-the desktop shell are exempt. For a skill that must load siblings on a network
+A sibling loaded directly may be refused by the network gate: do not assume
+that an opaque frame's request carries the session (see the browser-dependent
+asset behaviour above). The declared entry is fetched by the host with the
+owner's session and inlined. For portable sibling loading on a network
 install, fetch the source through the bridge and run it from a `blob:` URL, which
 `script-src` admits:
 

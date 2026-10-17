@@ -251,7 +251,9 @@ def test_widgets_frame_geometry_and_teardown_contract():
     assert "--widget-frame-height" in source
     assert "height: var(--widget-frame-height, 320px);" in style
     assert "type: 'ouro-widget-resize'" in source
-    assert "new ResizeObserver(report)" in source
+    assert "new ResizeObserver(scheduleReport)" in source
+    assert "window.requestAnimationFrame" in source
+    assert "window.cancelAnimationFrame(resizeFrame)" in source
     assert "box.bottom - bodyTop + bodyBottomSpacing" in source
     assert "fixedViewportBody" in source
     assert 'scrolling="no"' not in source
@@ -364,7 +366,6 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert "export function effectiveStartMode(tab, prefs)" in card
     assert "export function isRetainedWidget(tab, prefs)" in card
     assert "return isFramedWidget(tab) && effectiveStartMode(tab, prefs) === 'retain';" in card
-    assert "? 'Keeps running'" in card
     assert "const retainsWhileHidden = (key) => isRetainedWidget(tabByKey(key), uiPreferences);" in page
     assert "if (!keep?.(key)) disposeWidgetByKey(key);" in page
     hidden_branch = page.split("async function stopVanishedRetainedWidgets() {", 1)[1].split("async function syncWidgets", 1)[0]
@@ -383,9 +384,6 @@ def test_widgets_launch_policy_controls_and_stop_suppression():
     assert '<dialog class="skills-card-menu-dialog ui-popup" role="menu"' in card
     assert 'class="skills-card-menu-trigger"' in card
     assert '<span class="ui-status" data-tone="neutral" data-widget-status hidden>' in card
-    # Owner-facing menu wording, not the enum name (CA-11).
-    assert "retain: 'Keep running'," in card
-    assert "(retain)" not in card
     # Facade: never over a settling frame (CA-13); `icon` is a glyph — an
     # identifier-like NAME (the `extension` default) falls back to the page glyph (CA-15).
     assert "mount.querySelector('[data-widget-facade], iframe')" in card
@@ -527,7 +525,6 @@ def test_widgets_card_width_is_owner_ui_preference():
     card = _read("web/modules/widget_card.js")
     css = _read("web/style.css")
     assert "data-widget-resize-handle" in source
-    assert "Resize width: drag or use arrow keys" in source
     assert "data-widget-arrange-status role=\"status\" aria-live=\"polite\"" in source
     sync = source.split("async function syncWidgets(generation) {", 1)[1].split("\n    }\n", 1)[0]
     assert sync.index("const readSizes = widths.beginRead();") < sync.index("requestWidgetListPayload(apiClient, controller)")
@@ -608,7 +605,6 @@ def test_widgets_card_order_is_owner_ui_preference():
     assert "export function sortTabsByWidgetOrder" in reorder
     assert "originalIndex" in reorder
     assert "return a.originalIndex - b.originalIndex;" in reorder
-    assert "Move widget: drag or use arrow keys" in source
     assert "handle.addEventListener('keydown'" in reorder
     assert "event.key === 'ArrowUp'" in reorder
     assert "apiClient.uiPreferences()" in source

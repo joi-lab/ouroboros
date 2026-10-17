@@ -23,6 +23,7 @@ from devtools.benchmarks.cybergym.cybergym_executor import (
 )
 from devtools.benchmarks.cybergym.cybergym_wire import _CostGraceTracker
 from tests.test_cybergym_executor import _config, dataclasses_replace
+from tests._store_shared import seed_result
 
 
 def _completed_abandoned_residue_frame(task_id, *, residue=0.035398, age_sec=3600):
@@ -217,7 +218,7 @@ def test_isolate_disk_terminal_record_grace_accepts_abandoned_residue(tmp_path):
     frame = _completed_abandoned_residue_frame(task_id)
     target = isolate_root / "task_results" / f"{task_id}.json"
     target.parent.mkdir(parents=True)
-    target.write_text(json.dumps(frame), encoding="utf-8")
+    seed_result(isolate_root, task_id, frame)
 
     accepted = executor._terminal_result_from_isolate_disk(task_id)  # noqa: SLF001
     assert accepted is not None
@@ -225,7 +226,7 @@ def test_isolate_disk_terminal_record_grace_accepts_abandoned_residue(tmp_path):
 
     pending = dict(frame)
     pending["reserved_usd"] = 0.5
-    target.write_text(json.dumps(pending), encoding="utf-8")
+    seed_result(isolate_root, task_id, pending)
     sparse = executor._terminal_result_from_isolate_disk(task_id)  # noqa: SLF001
     assert sparse is not None
     assert "cost_grace_acceptance" not in sparse

@@ -9,11 +9,12 @@ the same truncation / parse-failure bugs.
 from __future__ import annotations
 
 import json
+import pathlib
 import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from ouroboros.utils import append_jsonl, utc_now_iso
+from ouroboros.utils import append_jsonl, truncate_review_artifact, utc_now_iso
 
 
 @dataclass
@@ -24,7 +25,7 @@ class ReviewActorRecord:
     parsed_items: List[Dict[str, Any]] = field(default_factory=list)
     tokens_in: int = 0
     tokens_out: int = 0
-    cost_usd: float = 0.0
+    cost_usd: Optional[float] = None
     slot: int = 0
     slot_id: str = ""  # the id the row physically ran under, carried not re-derived
     prompt_ref: Dict[str, Any] = field(default_factory=dict)
@@ -33,13 +34,23 @@ class ReviewActorRecord:
     reset_at: str = ""
     http_status: Optional[int] = None
     transport_status: str = ""
-    reported_cause: str = ""  # the engine's reported words for a failed run; opaque, "" = none
+    reported_cause: str = ""  # the failing owner's reported cause; opaque, "" = none
     operation_id: str = ""
     operation_state: str = "settled"
     late_result_pending: bool = False
     pending_invocation_id: str = ""
     delegated_run_id: str = ""
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
+    # One brief, two parts: the parts this seat was asked and its answer per part
+    # (``parse_seat_answers``); empty on a record that predates the vector.
+    parts: List[str] = field(default_factory=list)
+    answers: Dict[str, Any] = field(default_factory=dict)
+    coverage: str = ""  # observed read coverage of the required-source manifest ("" = not a retrieving seat)
+    context_manifest: Dict[str, Any] = field(default_factory=dict)
+    # A durable ``review_model_error`` append already succeeded for this actor (#1578):
+    # a positive receipt, never inferred from the status. The wave it ran in.
+    error_event_logged: bool = False
+    review_wave_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         # The durable id is the one the review substrate actually ran this row
@@ -76,6 +87,11 @@ class ReviewActorRecord:
             "pending_invocation_id": self.pending_invocation_id,
             "delegated_run_id": self.delegated_run_id,
             "recovery_binding": dict(self.recovery_binding),
+            **({"parts": list(self.parts), "answers": dict(self.answers)} if self.parts else {}),
+            **({"coverage": self.coverage} if self.coverage else {}),
+            **({"context_manifest": dict(self.context_manifest)} if self.context_manifest else {}),
+            "error_event_logged": self.error_event_logged,
+            **({"review_wave_id": self.review_wave_id} if self.review_wave_id else {}),
         }
 
 
@@ -119,7 +135,7 @@ def _actor_record(
         parsed_items=parsed_items or [],
         tokens_in=int(actor.get("tokens_in", 0) or 0),
         tokens_out=int(actor.get("tokens_out", 0) or 0),
-        cost_usd=float(actor.get("cost_estimate", 0.0) or 0.0),
+        cost_usd=(float(actor["cost_estimate"]) if actor.get("cost_estimate") is not None else None),
         slot=idx + 1,
         slot_id=str(actor.get("slot_id") or ""),
         prompt_ref=dict(actor.get("prompt_ref") or {}),
@@ -135,6 +151,8 @@ def _actor_record(
         pending_invocation_id=str(actor.get("pending_invocation_id") or ""),
         delegated_run_id=str(actor.get("delegated_run_id") or ""),
         recovery_binding=dict(actor.get("recovery_binding") or {}),
+        error_event_logged=actor.get("error_event_logged") is True,
+        review_wave_id=str(actor.get("review_wave_id") or ""),
     )
 
 
@@ -251,8 +269,17 @@ def extract_fenced_json(text: str) -> Any:
 REVIEW_OUTPUT_SHAPES: Dict[str, str] = {
     "task_acceptance": "object",
     "deep_self_review": "report",
+    # The commit gate's retrieving seats answer the two-part brief (contract B):
+    # one object {change, change_clean, coupling}. Packet seats on the same
+    # surface answer contract A over direct chat and are never canonicalized.
+    "multi_model_review": "two_part",
+    # The planning organ's participants answer ONE reply object {prose, objections,
+    # withdrawn} (tools/plan_packet.PLAN_REPLY_CONTRACT). It is no verdict: the host
+    # never extracts or aggregates it; the whole text reaches plan_record.parse_reply.
+    "plan_review": "plan_reply",
 }
 OBJECT_VERDICT_REQUIRED_KEYS = ("verdict",)
+TWO_PART_KEYS = ("change", "change_clean", "coupling")
 
 # Default output contract per SHAPE for a retrieving delivery whose surface did
 # not hand over its own `policy["output_contract"]`: the prompt must ask for the
@@ -273,7 +300,7 @@ evidence you read; mark anything you could not verify as unverified.
 
 
 def review_output_shape(surface: str) -> str:
-    """``array`` | ``object`` | ``report`` for one review surface."""
+    """``array`` | ``object`` | ``two_part`` | ``report`` | ``plan_reply`` for one review surface."""
     return REVIEW_OUTPUT_SHAPES.get(str(surface or ""), "array")
 
 
@@ -281,9 +308,224 @@ def default_output_contract(shape: str) -> str:
     """The prompt contract a retrieving row is asked for when its surface hands
     over no ``policy["output_contract"]`` — keyed by the same shape the
     canonicalizer parses, so the ask and the parse can never disagree."""
+    if str(shape or "") == "plan_reply":
+        from ouroboros.tools.plan_packet import PLAN_REPLY_CONTRACT
+
+        return PLAN_REPLY_CONTRACT
     return {
         "object": REVIEW_JSON_OBJECT_CONTRACT, "report": REVIEW_REPORT_CONTRACT,
+        "two_part": REVIEW_TWO_PART_OBJECT_CONTRACT,
     }.get(str(shape or ""), REVIEW_JSON_ARRAY_CONTRACT)
+
+
+def two_part_payload(payload: Any) -> Optional[Dict[str, Any]]:
+    """The two-part answer (contract B) as ONE object, or None when the payload is
+    not one. Form only: ``coupling`` must be a list of dicts; ``change`` (when
+    present) a list of dicts; ``change_clean`` (when present) a bool. A bare
+    ARRAY is accepted as the ``change`` answer alone — the seat spoke but left the
+    coupling block out, which the gate records as ``coupling_block_missing``
+    rather than as silence."""
+    if isinstance(payload, list):
+        if not all(isinstance(item, dict) for item in payload):
+            return None
+        return {"change": list(payload), "change_clean": not payload}
+    if not isinstance(payload, dict) or not any(key in payload for key in TWO_PART_KEYS):
+        return None
+    out: Dict[str, Any] = {}
+    for key in ("change", "coupling"):
+        if key in payload:
+            if not isinstance(payload[key], list) or not all(isinstance(item, dict) for item in payload[key]):
+                return None
+            out[key] = list(payload[key])
+    if "change_clean" in payload:
+        clean = payload["change_clean"]
+        if isinstance(clean, str) and clean.strip().lower() in ("true", "false"):
+            clean = clean.strip().lower() == "true"  # the bool spelled as its JSON word
+        if not isinstance(clean, bool):
+            return None
+        out["change_clean"] = clean
+    return out
+
+
+def _whole_json(raw_text: str) -> Any:
+    """The response as ONE JSON value — bare, or inside one code fence that opens
+    on the first line and closes on the last; prose around the value is a
+    non-response (the same discipline as the array contract). The whole text is
+    parsed first, and a fence is recognized by its fence LINES only, so a fence
+    spelling inside a JSON string is content, never a split point."""
+    text = str(raw_text or "").strip()
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
+    lines = text.splitlines()
+    if len(lines) < 3 or not lines[0].startswith("```") or lines[-1].strip() != "```":
+        return None
+    tag = lines[0][3:].strip()
+    if tag and not tag.isalnum():
+        return None
+    try:
+        return json.loads("\n".join(lines[1:-1]).strip())
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return None
+
+
+def _change_items(entries: List[Dict[str, Any]], *, model_label: str, slot_id: str) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for entry in entries:
+        item = str(entry.get("item") or "")
+        verdict = str(entry.get("verdict") or "").upper()
+        if not item or verdict not in {"PASS", "FAIL"}:
+            continue
+        items.append({
+            "item": item, "verdict": verdict,
+            "severity": str(entry.get("severity") or "advisory").lower(),
+            "reason": str(entry.get("reason") or "").strip(),
+            "model": model_label, "slot_id": slot_id,
+            **({"obligation_id": str(entry.get("obligation_id") or "")} if entry.get("obligation_id") else {}),
+        })
+    return items
+
+
+def _change_answer(items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """``findings`` are the FAIL items (what the gate and the record reason over);
+    ``items`` is every normalized row, PASS included, for the actor record's
+    forensic ``parsed_items`` — stripped before the answer is recorded."""
+    failed = [i for i in items if i["verdict"] == "FAIL"]
+    critical = [i for i in failed if i["severity"] == "critical"]
+    return {"status": "responded", "verdict": "FAIL" if critical else "PASS", "findings": failed,
+            "critical": len(critical), "coverage": "n/a", "items": list(items)}
+
+
+def _unanswered(part: str, error: str = "") -> Dict[str, Any]:
+    answer = {"status": "unanswered", "verdict": "", "findings": [], "critical": 0,
+              "coverage": "n/a" if part == "change" else "missing"}
+    if error:
+        answer["error"] = error
+    return answer
+
+
+def parse_two_part_answer(raw_text: str, parts: Sequence[str], *, model_label: str = "reviewer",
+                          slot_id: str = "") -> Optional[Dict[str, Dict[str, Any]]]:
+    """Contract B → ``{part: answer}`` for the parts a seat was asked, or None when
+    the response is a non-response (no JSON value, prose around it, wrong form).
+    ``change: []`` is a clean answer only with ``change_clean: true``; a
+    ``coupling`` block that fails the required matrix (``normalize_scope_items``)
+    is ``unanswered`` with its ``error`` (its FAIL rows kept as ``discarded``
+    diagnostics, not counted) while ``change`` still counts; a bare
+    array from a seat asked both parts answers ``change`` and leaves ``coupling``
+    unanswered (``coupling_block_missing``). A seat asked ``coupling`` alone may
+    answer the object with only that key or the bare matrix array."""
+    asked = [p for p in ("change", "coupling") if p in tuple(parts)]
+    value = _whole_json(raw_text)
+    if value is None:
+        return None
+    if isinstance(value, list) and asked == ["coupling"]:
+        value = {"coupling": value}
+    payload = two_part_payload(value)
+    if payload is None:
+        return None
+    answers: Dict[str, Dict[str, Any]] = {}
+    if "change" in asked:
+        if "change" not in payload:
+            answers["change"] = _unanswered("change", "the change block is missing")
+        elif not payload["change"] and not payload.get("change_clean"):
+            answers["change"] = _unanswered("change", "an empty change block needs change_clean: true")
+        else:
+            items = _change_items(payload["change"], model_label=model_label, slot_id=slot_id)
+            if payload["change"] and not items:
+                # The seat wrote entries the gate cannot read (no ``item``, a verdict
+                # outside PASS/FAIL): that is no answer, not a clean one — whatever
+                # ``change_clean`` says beside it.
+                answers["change"] = _unanswered("change", (
+                    f"none of the {len(payload['change'])} change entries has an item and a PASS/FAIL verdict"))
+            else:
+                answers["change"] = _change_answer(items)
+    if "coupling" in asked:
+        if "coupling" not in payload:
+            answers["coupling"] = _unanswered("coupling", "coupling_block_missing")
+        else:
+            from ouroboros.tools.scope_review_contract import (
+                SCOPE_REQUIRED_ITEMS, classify_scope_findings, normalize_scope_items,
+            )
+
+            items, error = normalize_scope_items(payload["coupling"])
+            covered = {str(i.get("item") or "") for i in (items or payload["coupling"]) if isinstance(i, dict)}
+            n_required = sum(1 for item in SCOPE_REQUIRED_ITEMS if item in covered)
+            coverage = "full" if n_required == len(SCOPE_REQUIRED_ITEMS) else "partial" if n_required else "missing"
+            critical, advisory = classify_scope_findings(items or [])
+            for finding in critical + advisory:  # the projection's placeholder model → this seat
+                finding.update(model=model_label, slot_id=slot_id)
+            if error or items is None:
+                # The matrix is not countable (contract §1.7: ``unanswered`` with
+                # its error), but the FAIL rows it did spell out are kept beside
+                # the error as ``discarded`` diagnostics — never counted, never
+                # silently lost (a critical in a broken matrix stays visible even
+                # when the panel's other seats carry the question to PASS).
+                answers["coupling"] = {**_unanswered("coupling", error or "coupling matrix invalid"),
+                                       "coverage": coverage, "discarded": critical + advisory}
+            else:
+                answers["coupling"] = {"status": "responded", "verdict": "FAIL" if critical else "PASS",
+                                       "findings": critical + advisory, "critical": len(critical), "coverage": coverage,
+                                       "items": [dict(i, model=model_label, slot_id=slot_id) for i in items]}
+    return answers
+
+
+def parse_seat_answers(result_json: Dict[str, Any], row_parts: Dict[str, Sequence[str]]) -> ParsedTriadReview:
+    """Every seat of ONE wave → one actor record with ``parts`` and ``answers``.
+    ``row_parts`` maps slot id → the parts that seat was asked; a seat asked only
+    ``change`` answers contract A (the findings array, ``[]`` + NO_FINDINGS clean),
+    a seat asked ``coupling`` answers contract B (``parse_two_part_answer``). A
+    seat is *responsive* for quorum when at least one asked part has a usable
+    answer; ``findings`` carries every FAIL item of every responsive seat."""
+    from ouroboros.tools.scope_required_sources import coverage_state
+
+    findings: List[Dict[str, Any]] = []
+    responsive: List[str] = []
+    records: List[ReviewActorRecord] = []
+    for idx, actor in enumerate(result_json.get("results") or []):
+        if not isinstance(actor, dict):
+            continue
+        model = str(actor.get("model") or actor.get("request_model") or "").strip()
+        raw_text = str(actor.get("text") or "")
+        model_label = model or "reviewer"
+        slot_id = str(actor.get("slot_id") or "")
+        parts = [p for p in ("change", "coupling") if p in tuple(row_parts.get(slot_id) or ("change",))]
+        if str(actor.get("operation_state") or "") == "not_dispatched":
+            record = _actor_record(actor, idx=idx, model_label=model_label, status="not_dispatched", raw_text=raw_text)
+        elif str(actor.get("verdict") or "").upper() == "ERROR":
+            record = _actor_record(actor, idx=idx, model_label=model_label, status="error", raw_text=raw_text)
+        else:
+            if parts == ["change"]:
+                parsed = extract_json_array(raw_text, normalize=True)
+                if parsed is None or (not parsed and not empty_array_is_verified_clean(raw_text)):
+                    answers = None
+                else:
+                    answers = {"change": _change_answer(_change_items(
+                        [e for e in parsed if isinstance(e, dict)], model_label=model_label, slot_id=slot_id))}
+            else:
+                answers = parse_two_part_answer(raw_text, parts, model_label=model_label, slot_id=slot_id)
+            if answers is None:
+                record = _actor_record(actor, idx=idx, model_label=model_label, status="parse_failure", raw_text=raw_text)
+            else:
+                usable = [p for p in parts if answers[p]["status"] == "responded"]
+                items = [f for p in usable for f in answers[p].pop("items", answers[p]["findings"])]
+                record = _actor_record(actor, idx=idx, model_label=model_label,
+                                       status="responded" if usable else "parse_failure", raw_text=raw_text,
+                                       parsed_items=items)
+                record.answers = answers
+                if usable:
+                    findings.extend(f for p in usable for f in answers[p]["findings"])
+                    responsive.append(f"{model_label} [{slot_id}]" if slot_id else f"{model_label}#{idx + 1}")
+        record.parts = parts
+        if "coupling" in parts:
+            fact = actor.get("native_read_coverage")
+            record.coverage = coverage_state(fact)
+            if isinstance(fact, dict):
+                record.context_manifest = {"native_read_coverage": fact,
+                                           "read_provenance": str(actor.get("read_provenance") or "")}
+        records.append(record)
+    return ParsedTriadReview(findings=findings, responsive_models=responsive, actor_records=records)
 
 
 def object_verdict_payload(payload: Any) -> Optional[Dict[str, Any]]:
@@ -370,6 +612,53 @@ Return ONLY a JSON array with one entry per required checklist item. Each elemen
 There is no all-clear shortcut in this mode: an empty array is a non-response.
 Report PASS explicitly for every item you reviewed and found clean.
 """
+
+# Contract B — the two-part brief's answer (one brief, two parts): the change
+# findings array of contract A under ``change`` plus the required coupling
+# matrix under ``coupling``, in ONE object. ``change_clean`` replaces the
+# NO_FINDINGS sentinel inside the object.
+REVIEW_TWO_PART_OBJECT_CONTRACT = f"""\
+Return ONLY one JSON object with exactly these keys:
+{{
+  "change": [<Part 1 findings — each element as below>],
+  "change_clean": true | false,
+  "coupling": [<Part 2 — one entry per required coupling question, each element as below>]
+}}
+Each element of "change" and "coupling":
+{_REVIEW_JSON_ELEMENT_SCHEMA}
+"change" lists what you found reviewing the change itself; an empty "change"
+array is a clean answer ONLY together with "change_clean": true. "coupling"
+must carry one PASS or FAIL entry for EVERY required coupling question named in
+Part 2 (a PASS reason is one line: a pointer to what you checked, or "N/A — <reason>";
+a FAIL names file:line and the violated invariant; there is no all-clear shortcut
+and no empty "coupling"). A seat asked only Part 2 returns
+the object with the "coupling" key alone. Prose around the object, a missing
+"coupling" block or a malformed matrix is recorded against that part; anything
+that is not the object is a non-response excluded from quorum.
+"""
+
+_TWO_PART_ELEMENT_JSON_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "item": {"type": "string"},
+        "verdict": {"type": "string", "enum": ["PASS", "FAIL"]},
+        "severity": {"type": "string", "enum": ["critical", "advisory"]},
+        "reason": {"type": "string"},
+    },
+    "required": ["item", "verdict", "reason"],
+}
+# The session output schema for the ``two_part`` shape: ``coupling`` is the key a
+# retrieving seat always owes; ``change`` is owed by the seats asked Part 1 and is
+# enforced per seat by the parser, since one surface shares one schema.
+TWO_PART_SESSION_OUTPUT_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "change": {"type": "array", "items": _TWO_PART_ELEMENT_JSON_SCHEMA},
+        "change_clean": {"type": "boolean"},
+        "coupling": {"type": "array", "items": _TWO_PART_ELEMENT_JSON_SCHEMA, "minItems": 1},
+    },
+    "required": ["coupling"],
+}
 
 
 # The sentinel is optional whitespace-separated trailer, not a stricter shape than
@@ -485,33 +774,137 @@ def parse_model_review_results(
 
 
 def emit_review_model_error_events(ctx: Any, parsed: ParsedTriadReview, *, source: str, skill_name: str = "") -> None:
-    """Persist model error / parse-failure events for observability."""
-    try:
-        log_path = ctx.drive_logs() / "events.jsonl"
-    except Exception:
-        return
+    """Parser-level failures (error, parse_failure, partial) through the one durable owner.
+
+    An actor whose run-level failure already has a successful append is skipped.
+    """
     for record in parsed.actor_records:
-        if record.status not in {"error", "parse_failure", "partial"}:
+        if record.status not in {"error", "parse_failure", "partial"} or record.error_event_logged:
             continue
-        if source == "skill_review":
-            note = (
-                "Full raw response preserved in review.json raw_actor_records "
-                "when quorum succeeds; otherwise in review_history.jsonl."
-            )
-        else:
-            note = "Full raw response preserved in triad_raw_results."
-        try:
-            append_jsonl(log_path, {
-                "ts": utc_now_iso(),
-                "type": "review_model_error",
-                "source": source,
-                "skill": skill_name,
-                "model": record.model_id,
-                "status": record.status,
-                "error_note": note,
-            })
-        except Exception:
-            pass
+        row = asdict(record)
+        row["error"] = (record.raw_text if record.status == "error" else
+                        "Reviewer response omitted required checklist items." if record.status == "partial"
+                        else "Reviewer response did not contain a valid findings array.")
+        row["error_note"] = ("Full raw response preserved in review.json raw_actor_records when quorum "
+                             "succeeds; otherwise in review_history.jsonl." if source == "skill_review" else
+                             "Full raw response preserved in triad_raw_results.")
+        record.error_event_logged = _append_review_model_error(ctx, row, source=source, skill_name=skill_name)
+
+
+def emit_review_run_errors(ctx: Any, request: Any, actors: Sequence[Any], *, drive_root: Any = None) -> None:
+    """Run- and collection-level reviewer failures of one review wave (every surface).
+
+    The positive append receipt lands on the actor and rides its run result, and
+    reaches this process's custody copies of the same operation, so the downstream
+    parser and a later collection or replay of that settlement do not append it
+    again; a failed append leaves it unlogged for a later collection. An awaited
+    slot is not a failure. No history is read here.
+    """
+    for actor in actors:
+        actor.review_wave_id = str(getattr(actor, "review_wave_id", "") or getattr(request, "resolved_wave_id", "") or "")
+        if actor.error_event_logged or actor.parse_status == "awaiting" or actor.late_result_pending:
+            continue
+        if actor.status not in {"error", "not_dispatched", "empty"} and (
+                actor.parse_status != "malformed" or REVIEW_OUTPUT_SHAPES.get(request.surface) in ("report", "plan_reply")):
+            continue
+        row = asdict(actor)
+        row["task_id"] = str(getattr(request, "task_id", "") or "")
+        row["status"] = actor.status if actor.status in {"error", "not_dispatched"} else "parse_failure"
+        row["error"] = actor.error or actor.reason or "Reviewer response was malformed or absent."
+        meta = getattr(request, "usage_attribution", {}) or {}
+        actor.error_event_logged = _append_review_model_error(
+            ctx, row, source=str(request.surface or ""), skill_name=str(meta.get("review_skill") or ""),
+            drive_root=drive_root)
+        if actor.error_event_logged:
+            _keep_error_receipt(ctx, actor)
+
+
+def _keep_error_receipt(ctx: Any, actor: Any) -> None:
+    """Carry a successful append to this process's custody copies of the SAME operation
+    (#1578): the settled replay copy and a still-registered live entry were taken before
+    the coordinator logged. Another operation of the slot never inherits the receipt."""
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK
+
+    identity = (str(actor.slot_id or ""), str(actor.operation_id or ""))
+    settled = getattr(ctx, "_review_settled_attempts", None)
+    with _ACTIVE_LOCK:
+        for held in [*(settled.values() if isinstance(settled, dict) else ()),
+                     *(entry.actor for entry in _ACTIVE.values() if entry.actor is not None)]:
+            if identity[1] and (str(getattr(held, "slot_id", "") or ""),
+                                str(getattr(held, "operation_id", "") or "")) == identity:
+                held.error_event_logged = True
+
+
+def emit_review_execution_error(ctx: Any, assignment: Any, error: Any, *, usage: Dict[str, Any],
+                                prompt_ref: Optional[Dict[str, Any]] = None) -> bool:
+    """A direct (report) executor's failure, through the same one durable owner as a panel."""
+    request, slot = assignment.request, assignment.slot
+    row = {
+        "task_id": str(request.task_id or ""), "review_wave_id": str(request.resolved_wave_id or ""),
+        "model": str(usage.get("resolved_model") or slot.model or ""), "slot_id": slot.slot_id,
+        "operation_id": assignment.call_id, "operation_state": str(usage.get("operation_state") or "settled"),
+        "usage": usage, "status": "error", "error": str(error),
+        "failure_code": str(getattr(error, "code", "") or usage.get("failure_code") or ""),
+        "reported_cause": str(getattr(error, "reported_cause", "") or ""),
+        "http_status": getattr(error, "status_code", None), "reset_at": str(getattr(error, "reset_at", "") or ""),
+        "prompt_ref": prompt_ref or {},
+    }
+    return _append_review_model_error(ctx, row, source=str(request.surface or ""), drive_root=assignment.custody_root)
+
+
+def _review_event_log(ctx: Any, drive_root: Any = None) -> pathlib.Path:
+    """The CANONICAL events log: the task's budget (canonical) root first; a headless or
+    task-drive child drive anchors on the data root that owns it (#1578)."""
+    from ouroboros.task_custody import canonical_owner_root
+
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    root = next((str(value) for value in (metadata.get("budget_drive_root"), getattr(ctx, "budget_drive_root", ""),
+                                          drive_root, getattr(ctx, "drive_root", "")) if str(value or "").strip()), "")
+    if not root:  # a context that only exposes its log directory
+        root = str(pathlib.Path(ctx.drive_logs()).parent)
+    return canonical_owner_root(root) / "logs" / "events.jsonl"
+
+
+def _append_review_model_error(ctx: Any, row: Dict[str, Any], *, source: str,
+                               skill_name: str = "", drive_root: Any = None) -> bool:
+    """The one durable ``review_model_error`` owner; True only for a successful append.
+
+    ``append_jsonl``'s log sink owns the one live frame. Known task/root/parent/wave
+    identities come from the row, its recovery binding, the task metadata, the bound
+    usage scope or the context; the actual failure cause and refs ride as recorded.
+    """
+    try:
+        from ouroboros.usage_accounting import current_usage_scope
+
+        binding, usage = row.get("recovery_binding") or {}, row.get("usage") or {}
+        receipt = usage.get("claudexor") if isinstance(usage.get("claudexor"), dict) else {}
+        metadata = getattr(ctx, "task_metadata", None)
+        metadata = metadata if isinstance(metadata, dict) else {}
+        scope = current_usage_scope()
+        identity = {key: str(row.get(key) or binding.get(key) or metadata.get(key) or getattr(scope, key, "")
+                             or getattr(ctx, key, "") or "")
+                    for key in ("task_id", "root_task_id", "parent_task_id", "review_wave_id")}
+        payload = {
+            "ts": utc_now_iso(), "type": "review_model_error", "source": source, "skill": skill_name,
+            **{key: value for key, value in identity.items() if value},
+            "model": str(row.get("model_id") or row.get("model") or ""),
+            "provider": str(usage.get("provider") or row.get("provider") or ""),
+            # A preview with a disclosed cut; the full response stays behind response_ref/the actor record.
+            "status": str(row.get("status") or ""), "error": truncate_review_artifact(str(row.get("error") or "")),
+            **{key: str(row.get(key) or "") for key in (
+                "reported_cause", "failure_code", "transport_status", "reset_at", "slot_id",
+                "operation_id", "operation_state")},
+            "http_status": row.get("http_status") if isinstance(row.get("http_status"), int) else None,
+            "delegated_run_id": str(row.get("delegated_run_id") or usage.get("delegated_run_id")
+                                    or receipt.get("run_id") or ""),
+            "pending_invocation_id": str(row.get("pending_invocation_id") or usage.get("pending_invocation_id") or ""),
+            "prompt_ref": dict(row.get("prompt_ref") or {}), "response_ref": dict(row.get("response_ref") or {}),
+            "error_note": str(row.get("error_note") or "See response_ref and the raw actor record for the full response."),
+        }
+        return append_jsonl(_review_event_log(ctx, drive_root), payload) is True
+    except Exception:
+        return False
 
 
 # ── Reviewer prompt rule texts (byte-stable governance, cache-marked) ─────────
@@ -528,10 +921,12 @@ TIER_CLASSIFICATION_RULES = (
         "claims is the point of this review. A real partial deliverable with honestly marked "
         "gaps is best_effort, not a failure; it does not discharge useful work still owed to the "
         "accepted goal. completion_coach is separate advice: the most useful authorized next "
-        "action under the real constraints, not necessarily a higher tier. A sufficient result "
-        "needs no invented improvement. For an incomplete tier, keep the coach nonempty: name "
-        "a reachable action or explain concretely why none remains for the author and whose "
-        "action is needed. Keep that advice consistent with DIALOGUE STATUS / REACHABILITY; "
+        "action under the real constraints, not necessarily a higher tier. Ask whether a "
+        "demanding person who made this request, seeing the result, would call it done well; "
+        "a sufficient result needs no invented improvement. For an incomplete tier, keep the "
+        "coach nonempty: name a reachable action or explain concretely why none remains for the "
+        "author and whose action is needed. Keep that advice consistent with DIALOGUE STATUS / "
+        "REACHABILITY; "
         "the coach is neither evidence of success nor authority to stop or change the goal. "
 )
 
@@ -546,8 +941,11 @@ ACCEPTANCE_SURFACE_RULES = (
         "`support` text names expected evidence; it is NOT evidence unless a receipt/tool/artifact/source "
         "ref actually supports it. "
         "Record in criteria_used which claims were supported, missing, partial, or rejected, and why. "
-        "Require per-criterion evidence: an EXECUTED check that MIRRORS what the real grader would run "
-        "(the actual test/command and its observed output) — not a narrative that it passes. "
+        "Require the evidence each criterion calls for: observed execution for runnable behaviour "
+        "(the actual test/command and its observed output, not a narrative that it passes), "
+        "inspection of the actual artifact for content or visual claims, and reasoned judgment "
+        "grounded in cited sources for qualitative claims. A simpler method that keeps the outcome "
+        "is fulfilment; an owner- or parent-fixed method stays a constraint. "
         "If the evidence covers only part of the affected surface list, do not classify solved; "
         "name the uncovered criteria/surfaces in findings or completion_coach. "
         "EVIDENCE INDEPENDENCE: from the diff and tool trace, identify which test/check files "
@@ -651,8 +1049,8 @@ ACCEPTANCE_SURFACE_RULES = (
         "that finding: if the argument is genuinely valid, do not re-raise the same finding; if it "
         "is not, re-raise the finding and explain why the rebuttal fails. A rebuttal may dismiss or "
         "reframe an obligation, but it is NEVER itself evidence for a criterion — 'supported' still "
-        "requires an independent host/tool/artifact receipt and 'solved' still requires the real "
-        "grader-mirroring check to pass. "
+        "requires an independent host/tool/artifact receipt and 'solved' still requires the "
+        "evidence each criterion calls for. "
         "REVIEW REGISTER: you are an outside perspective helping the task land, not a gate of last "
         "resort. Concrete, reachable-now defects block; hypotheticals, style preferences, and hygiene "
         "are advisory findings, not blockers. "

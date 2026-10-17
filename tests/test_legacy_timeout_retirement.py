@@ -16,7 +16,6 @@ surface that used to carry the ghost.
 
 from __future__ import annotations
 
-import ast
 import inspect
 import pathlib
 import subprocess
@@ -83,37 +82,16 @@ def test_neither_init_still_asks_a_caller_for_a_value_it_discards():
     assert "hard_timeout" not in inspect.signature(workers.init).parameters
 
 
-def test_the_deprecation_event_path_is_gone_with_its_keys():
-    """A retired key has nothing left to be loud about; keeping the emitter
-    would leave a dead branch that only a future non-default value could
-    reach — and there can be no future value."""
-    from supervisor import queue
-
-    source = inspect.getsource(queue)
-    assert "deprecated_settings_ignored" not in source
-    assert not hasattr(queue, "_emit_timeout_deprecation_once")
-    assert not hasattr(queue, "_timeout_deprecation_emitted")
-
-
-def test_status_no_longer_renders_a_legacy_timeout_line():
-    """``/status`` printed ``legacy_timeouts_ignored: soft=600s, hard=1800s``
-    on every request — an owner-visible report of two constants."""
-    from supervisor import state
-
-    assert list(inspect.signature(state.status_text).parameters) == [
-        "workers_dict", "pending_list", "running_dict",
-    ]
-    assert "legacy_timeouts_ignored" not in inspect.getsource(state.status_text)
-
-
 def test_no_runtime_or_settings_surface_still_names_either_key():
-    """The grep-class assertion. The N−1 audit fixture is the ONE file that
-    must keep them: it is a frozen byte-copy of a v6.113.4 settings document,
-    and the RC auditor's retired-setting finding is proven against it."""
+    """The grep-class assertion. The N−1 and N−2 audit fixtures are the files
+    that must keep them: frozen byte-copies of real v6.113.4 / v6.87.5 settings
+    documents (the RC auditor's retired-setting finding is proven against the
+    first; the review-pool migration reads the second as written)."""
     allowed = {
         "ouroboros/settings_defaults.py",       # the RETIRED_SETTING_KEYS entry
         "scripts/rc_audit.py",                  # RETIRED_IN_THIS_ABI
         "tests/fixtures/nminus1/settings_v6.113.4.json",
+        "tests/fixtures/nminus1/settings_v6.87.5.json",
         "tests/test_legacy_timeout_retirement.py",
         "tests/test_rc_audit_fixture_suite.py",
         "tests/test_settings_honesty.py",
@@ -186,14 +164,3 @@ def test_surface_scan_excludes_ignored_exports_but_checks_tracked_and_new_source
         test_no_runtime_or_settings_surface_still_names_either_key()
     (tmp_path / 'new.py').write_text('current = True')
     test_no_runtime_or_settings_surface_still_names_either_key()
-
-
-def test_the_ledger_row_is_not_a_second_dispatcher_for_the_status_line():
-    """Guards the shape of the removal itself: ``status_text`` must not have
-    grown a replacement knob while losing the old one."""
-    tree = ast.parse((REPO / "supervisor" / "state.py").read_text(encoding="utf-8"))
-    fn = next(node for node in tree.body
-              if isinstance(node, ast.FunctionDef) and node.name == "status_text")
-    names = {node.value for node in ast.walk(fn)
-             if isinstance(node, ast.Constant) and isinstance(node.value, str)}
-    assert not any("TIMEOUT_SEC" in name for name in names)

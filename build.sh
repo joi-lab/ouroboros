@@ -55,13 +55,18 @@ python-standalone/bin/python3 -m ouroboros.betterleaks_runtime install \
 
 echo "--- Installing launcher dependencies ---"
 BUILD_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-build-requirements.XXXXXX")"
-trap 'rm -f "$BUILD_REQUIREMENTS"' EXIT
+DESKTOP_REQUIREMENTS="$(mktemp "${TMPDIR:-/tmp}/ouroboros-desktop-requirements.XXXXXX")"
+trap 'rm -f "$BUILD_REQUIREMENTS" "$DESKTOP_REQUIREMENTS"' EXIT
 uv export --locked --no-dev --extra browser --extra desktop --extra build \
     --no-emit-project --no-hashes --no-annotate --output-file "$BUILD_REQUIREMENTS"
 uv pip install --python python3 -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
 uv pip install --python python-standalone/bin/python3 -q -r requirements-runtime.lock
+# The source-launcher handoff cannot import the frozen launcher's private PYZ.
+uv export --locked --no-dev --extra desktop \
+    --no-emit-project --no-hashes --no-annotate --output-file "$DESKTOP_REQUIREMENTS"
+uv pip install --python python-standalone/bin/python3 -q -r "$DESKTOP_REQUIREMENTS"
 
 echo "--- Fetching exact Claudexor runtime seed ---"
 python-standalone/bin/python3 scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime

@@ -60,38 +60,21 @@ def test_context_injects_protocol_rule_only_when_declared(tmp_path):
     assert "FINAL ANSWER" not in without_rule
 
 
-def test_system_prompt_carries_no_marker_doctrine():
-    """The SYSTEM.md marker rule moved to the per-task contract: the default prompt
-    must NOT instruct every task to emit FINAL ANSWER lines. Whitespace-NORMALIZED
-    check (adversarial r1: a line-wrapped 'FINAL\\nANSWER' slipped past the plain
-    substring assert — the guard must be wrap-insensitive)."""
-    text = (pathlib.Path(__file__).resolve().parents[1] / "prompts" / "SYSTEM.md").read_text(encoding="utf-8")
-    normalized = " ".join(text.split())
-    assert "FINAL ANSWER" not in normalized
-    assert "CANDIDATES:" not in normalized
-
-
-def test_pacing_marker_phrases_are_protocol_gated():
+def test_protocol_facts_state_the_latch_without_marker_instructions():
+    """The 10% FINAL ANSWER flush and the pacing marker tail are gone (#1748); under
+    the protocol the facts line states whether a FINAL ANSWER line is latched, and
+    ordinary tasks get no marker wording at all."""
     from types import SimpleNamespace
 
-    from ouroboros.task_pacing import build_intrinsic_pacing_note
-    from ouroboros.deadline_utils import utc_now
-    import datetime
+    from ouroboros.loop_messages import _final_answer_fact
 
-    created = utc_now() - datetime.timedelta(minutes=90)
-
-    def _note(ctx):
-        return build_intrinsic_pacing_note(
-            ctx, created=created, now=utc_now(), round_idx=5, accumulated_usage={"cost": 1.0},
-        )
-
-    plain = SimpleNamespace(task_contract={}, task_metadata={})
-    note_plain = _note(plain)
-    assert note_plain is not None and "FINAL ANSWER" not in note_plain.text
-
-    protocol = SimpleNamespace(task_contract={"answer_protocol": "final_answer_line"}, task_metadata={})
-    note_protocol = _note(protocol)
-    assert note_protocol is not None and "FINAL ANSWER" in note_protocol.text
+    plain = SimpleNamespace(task_contract={}, task_metadata={}, _execution_trace={})
+    assert _final_answer_fact(plain) == ""
+    protocol = SimpleNamespace(task_contract={"answer_protocol": "final_answer_line"}, task_metadata={},
+                               _execution_trace={"tool_calls": []})
+    assert _final_answer_fact(protocol) == "FINAL ANSWER line latched: none"
+    protocol._execution_trace["best_valid_final_answer"] = "42"
+    assert _final_answer_fact(protocol) == "FINAL ANSWER line latched: yes, current"
 
 
 # --- 4.2 blocking widening --------------------------------------------------------
@@ -130,16 +113,6 @@ def test_obligations_widen_to_high_only_on_failing_aggregate():
         trace_blocked, _result("PASS", [high_finding], tiers=("blocked_with_evidence",))
     )
     assert {o["item"] for o in trace_blocked["acceptance_obligations"]} == {"missed requirement"}
-
-
-def test_verdict_is_advisory_flag_is_gone():
-    """The dead policy KEY is removed from every ReviewRequest (comments may still
-    name it historically); enforcement semantics live in OUROBOROS_REVIEW_ENFORCEMENT."""
-    hits = []
-    for path in (pathlib.Path(__file__).resolve().parents[1] / "ouroboros").rglob("*.py"):
-        if '"verdict_is_advisory":' in path.read_text(encoding="utf-8", errors="replace"):
-            hits.append(str(path))
-    assert hits == [], f"dead policy key still set in: {hits}"
 
 
 # --- 4.3 bytes_equal ---------------------------------------------------------------
@@ -183,7 +156,7 @@ def test_bytes_equal_compare(tmp_path):
 
     # Missing file is a fail, not an exception.
     equal4, detail4 = _compare_files_bytes_equal(ctx, [str(a), str(work / "nope")], work, use_executor=False)
-    assert equal4 is False and "not found" in detail4
+    assert equal4 is None and "not found" in detail4  # no byte verdict
 
     # Relative paths resolve against the workspace.
     b.write_bytes(a.read_bytes())
@@ -210,7 +183,7 @@ def test_bytes_equal_confines_operands(tmp_path, monkeypatch):
     equal, detail = _compare_files_bytes_equal(
         ctx, ["/etc/passwd", str(inside)], work, use_executor=False
     )
-    assert equal is False and "refused" in detail
+    assert equal is None and "refused" in detail
     assert "sizes" not in detail and "@" not in detail
 
     # Control-plane (the data drive) is refused even though it exists on disk.
@@ -219,7 +192,7 @@ def test_bytes_equal_confines_operands(tmp_path, monkeypatch):
     equal2, detail2 = _compare_files_bytes_equal(
         ctx, [str(secret), str(inside)], work, use_executor=False
     )
-    assert equal2 is False and "refused" in detail2
+    assert equal2 is None and "refused" in detail2
 
     # Relative traversal out of the workspace: refused.
     outside = tmp_path / "outside.bin"
@@ -227,18 +200,18 @@ def test_bytes_equal_confines_operands(tmp_path, monkeypatch):
     equal3, detail3 = _compare_files_bytes_equal(
         ctx, ["../outside.bin", str(inside)], work, use_executor=False
     )
-    assert equal3 is False and "refused" in detail3
+    assert equal3 is None and "refused" in detail3
 
     # Executor surface: absolute and traversing operands are refused BEFORE any cmp
     # runs (same rule as _probe_artifact_lifecycle — no hidden-grader oracle).
     equal4, detail4 = _compare_files_bytes_equal(
         ctx, ["/hidden/tests/expected.bin", "golden.bin"], work, use_executor=True
     )
-    assert equal4 is False and "workspace-relative" in detail4
+    assert equal4 is None and "workspace-relative" in detail4
     equal5, detail5 = _compare_files_bytes_equal(
         ctx, ["golden.bin", "../peer/graded.bin"], work, use_executor=True
     )
-    assert equal5 is False and "workspace-relative" in detail5
+    assert equal5 is None and "workspace-relative" in detail5
 
 
 def test_bytes_equal_user_files_lane_is_deliberate(tmp_path, monkeypatch):
@@ -268,7 +241,7 @@ def test_bytes_equal_user_files_lane_is_deliberate(tmp_path, monkeypatch):
     equal2, detail2 = _compare_files_bytes_equal(
         ctx, [str(owner_file), str(inside)], work, use_executor=False
     )
-    assert equal2 is False and "refused" in detail2
+    assert equal2 is None and "refused" in detail2
 
 
 def test_bytes_equal_refuses_protected_black_box_reference(tmp_path):
@@ -293,7 +266,7 @@ def test_bytes_equal_refuses_protected_black_box_reference(tmp_path):
     equal, detail = _compare_files_bytes_equal(
         ctx, [str(ref), str(probe)], work, use_executor=False
     )
-    assert equal is False and "refused" in detail
+    assert equal is None and "refused" in detail
 
 
 def test_review_output_budget_knob_lowers_never_raises(monkeypatch):
@@ -331,7 +304,7 @@ def test_bytes_equal_executor_infra_exit_is_not_a_byte_verdict(tmp_path, monkeyp
         lambda *a, **k: SimpleNamespace(returncode=127, stdout="", stderr="cmp: not found"),
     )
     equal, detail = _compare_files_bytes_equal(ctx, ["a.bin", "b.bin"], work, use_executor=True)
-    assert equal is False
+    assert equal is None  # still a FAIL; no byte verdict either way
     assert "infra error" in detail and "bytes differ" not in detail
 
 

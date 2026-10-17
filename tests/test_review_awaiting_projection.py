@@ -2,7 +2,7 @@
 substrate: never a transport failure, a malformed answer or a verdict.
 
 Two halves, both directions each. The WORDS about an awaited slot change (the
-per-actor projection, the panel fold, the aggregate's reasons, the prompt row).
+per-actor projection, the panel fold, the aggregate's reasons).
 The ARITHMETIC does not: aggregate, quorum and the per-actor gate fields equal the
 literal values pinned below for every input, and the loud rows (expired window, lost
 custody, settled failure, typed refusal, reservation shape) keep their words. A slot
@@ -21,7 +21,6 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.review_actor_aggregation import aggregate_review_actors, contract_valid_actors
-from ouroboros.review_evidence import _acceptance_panel_prompt_row
 from ouroboros.review_projection import (
     AWAITING_PROJECTION,
     _review_actor_projection,
@@ -426,10 +425,7 @@ def test_a_run_recorded_with_failure_words_about_a_wait_reprojects_as_awaiting()
                        transport_status="provider_transport_error", parse_status="malformed")
     assert (waiting["transport_status"], waiting["parse_status"]) == ("awaiting", "awaiting")
     assert waiting["reason"] == "awaiting 3 of 3 reviewer slot(s): s1, s2, s3 — no verdict"
-    prompt_row = _acceptance_panel_prompt_row(waiting)
-    assert (prompt_row["transport_status"], prompt_row["parse_status"], prompt_row["aggregate_signal"]) == (
-        "awaiting", "awaiting", "DEGRADED")
-    assert prompt_row["reason"] == waiting["reason"] and "Pending dispatch" not in json.dumps(prompt_row)
+    assert waiting["aggregate_signal"] == "DEGRADED" and "Pending dispatch" not in waiting["reason"]
 
 
 def test_a_superseded_awaited_panel_keeps_its_words_and_its_flag():

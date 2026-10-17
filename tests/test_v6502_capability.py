@@ -1,9 +1,8 @@
-"""v6.50.2 capability changes: A1 expected_match, A3 no-op-nudge gate reader, B1 swarm rollup."""
+"""v6.50.2 capability changes: A1 expected_match and B1 swarm rollup (the A3 no-op nudge is gone, #1748)."""
 
 import json
 
 from ouroboros.tools.verify import _expected_matches
-from ouroboros.loop_nudges import _contract_expected_output
 from ouroboros.agent_task_pipeline import _build_swarm_efficiency
 
 
@@ -35,24 +34,6 @@ def test_expected_match_json_equals_non_json_is_false_not_raise():
     # malformed output / empty must return False, never raise
     assert _expected_matches("", "{}", "json_equals") is False
     assert _expected_matches("not json", '{"a":1}', "json_equals") is False
-
-
-# --- A3: the no-op-nudge gate reads the declared expected_output ---
-
-class _Ctx:
-    def __init__(self, task_contract=None, task_metadata=None):
-        self.task_contract = task_contract or {}
-        self.task_metadata = task_metadata or {}
-
-
-def test_contract_expected_output_reads_contract_then_metadata():
-    assert _contract_expected_output(_Ctx(task_contract={"expected_output": "a CSV"})) == "a CSV"
-    # falls back to metadata when contract empty
-    assert _contract_expected_output(_Ctx(task_metadata={"expected_output": "from meta"})) == "from meta"
-    # falls back to nested metadata.task_contract
-    assert _contract_expected_output(_Ctx(task_metadata={"task_contract": {"expected_output": "nested"}})) == "nested"
-    # no declared output (e.g. a direct-chat turn) -> "" so the nudge never fires
-    assert _contract_expected_output(_Ctx()) == ""
 
 
 # --- B1: swarm-efficiency rollup ---
@@ -185,7 +166,7 @@ def test_verify_timeout_receipt_carries_matched_and_expected_match(tmp_path):
     r = receipts[-1]
     assert r["status"] == "fail"
     assert r["expected_match"] == "substring"   # default carried even on the failure path
-    assert r["matched"] is False                # explicit False, not null (ledger projects this)
+    assert r["matched"] is None                 # timeout never evaluated a comparison
 
 
 # --- A2: ignored read-only access-policy block must NOT count as a ledger failure ---

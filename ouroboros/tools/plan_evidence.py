@@ -20,11 +20,10 @@ import pathlib
 import json
 import re
 import stat
-from typing import Any, Callable, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from ouroboros.tools.plan_spec import (
     _TASK_LOCATOR_PREFIX,
-    _canonical_hash,
     _is_url,
     _resolve_locator_path,
     _under,
@@ -379,27 +378,6 @@ def resolve_evidence(
         "declared": declared, "attached": attached, "omissions": omissions,
         "bounds": {"per_item_bytes": per_item, "total_bytes": max(0, int(total_bytes))},
     }
-
-
-def evidence_manifest_hash(manifest: Mapping[str, Any]) -> str:
-    """Identity of the evidence set for the plan fingerprint (F4): declared locators,
-    attached (locator, sha256, bytes), omission (locator, reason) and the locators
-    reviewers requested (W3: a request for something already declared still changes
-    what the next wave is about) — NEVER the text."""
-    return _canonical_hash({
-        **({"own_dialogue": {key: manifest["own_dialogue"].get(key) for key in ("chat_id", "sha256", "bytes", "gap")}}
-           if "own_dialogue" in manifest else {}),
-        "declared": list(manifest.get("declared") or []),
-        "reviewer_requested": list(manifest.get("reviewer_requested") or []),
-        "attached": [
-            {"locator": a.get("locator"), "sha256": a.get("sha256"), "bytes": a.get("bytes")}
-            for a in manifest.get("attached") or []
-        ],
-        "omissions": [
-            {"locator": o.get("locator"), "reason": o.get("reason")}
-            for o in manifest.get("omissions") or []
-        ],
-    })
 
 
 def task_evidence_reader(root: pathlib.Path) -> Callable[[str], Optional[str]]:

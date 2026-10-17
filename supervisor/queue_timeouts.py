@@ -2,8 +2,14 @@
 
 A task is judged on its own progress AND on its subtree's - a coordinator whose
 children are working is not idle - then against the idle window, its explicit
-deadline and the absolute ceiling. The decision is taken under the queue lock; the
-teardown it decides on is handed to the off-loop reaper.
+deadline and the execution ceiling (the narrower of the global ceiling and the task's
+``execution_timeout_sec``). The decision is taken under the queue lock; the teardown
+it decides on is handed to the off-loop reaper.
+
+An explicit calendar deadline also expires a never-started PENDING row (owner choice,
+#939): the row is marked under Q and settled by the same reaper without a model start;
+ordinary resource holds do not erase it. Stop, saved terminals, owner Pause and
+unconfirmed continuations keep their custody. Queue age and the execution duration never create one.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from typing import Any, Dict
 
 from supervisor.cognitive_operations import _active_operation_progressing
 from ouroboros.model_wait import execution_elapsed_seconds
+from ouroboros.runtime_limits import resolve_task_execution_timeout_sec
 from supervisor.task_model_wait import model_waiting
 from supervisor.task_reaper import (
     resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
@@ -40,6 +47,11 @@ def _queue():
 
 
 log = logging.getLogger(__name__)
+
+# Reaper reservations for expired pending rows, keyed by row identity. The row's
+# ``_terminalization_retry`` marker stays the durable custody; a lost reservation
+# is re-made by the next timeout tick or assignment pass.
+_pending_deadline_jobs: Dict[int, Dict[str, Any]] = {}
 
 # The supervisor's timeout rails in priority order: the typed ``terminal_reason``
 # the reaper stamps as the task_done ``reason_code`` and the ``task_incident`` key.
@@ -85,25 +97,385 @@ def _task_drive_for_task(task: Dict[str, Any], task_id: str) -> pathlib.Path:
     return pathlib.Path(child) if child else pathlib.Path(_queue().DRIVE_ROOT)
 
 
-def enforce_task_timeouts() -> None:
-    """Enforce soft/hard timeouts for running tasks.
+def enforce_task_timeouts(*, pending_events: set[str] | None = frozenset()) -> None:
+    """Expire explicit pending calendar deadlines, then enforce running-task rails.
 
     Holds the queue lock for the whole pass: RUNNING pops and worker respawn
     decisions raced with HTTP cancel handlers (double respawn → orphaned
     worker; wrong-task dequeue). The RLock keeps nested respawn/assign calls
-    re-entrant.
+    re-entrant. The server supplies its pending event snapshot (None means
+    unreadable) from outside Q; synchronous callers with already-current
+    observations retain the empty default. Pending inputs defer only idle.
     """
     # Avoid circular dependency during module load.
     from supervisor import workers
 
-    if not _queue().RUNNING:
+    if not _queue().RUNNING and not _queue().PENDING:
         return
     now = time.time()
     st = _queue().load_state()
     owner_chat_id = int(st.get("owner_chat_id") or 0)
 
     with _queue()._queue_lock:
-        _queue()._enforce_task_timeouts_locked(workers, now, owner_chat_id, st)
+        _queue()._expire_pending_deadlines_locked(workers, now)
+        if _queue().RUNNING:
+            _queue()._enforce_task_timeouts_locked(workers, now, owner_chat_id, st,
+                                                 pending_events=pending_events)
+
+
+def _pending_continuation(task: Dict[str, Any]) -> str:
+    """The carrier the loop resumes (``task_admission.governing_continuation``), else an assisted update.
+
+    An exact pause can retain an older working carrier after that recovery started."""
+    from supervisor.task_admission import governing_continuation
+
+    governing = governing_continuation(task)
+    if governing:
+        return {"owner_wait": "_owner_wait_resume", "exact_pause": "_budget_pause_resume",
+                "working": "_working_recovery"}[governing]
+    return "_managed_update_resume" if task.get("_managed_update_resume") is not None else ""
+
+
+def _deadline_launch_claim(stored: dict) -> dict:
+    return {key: stored[key] for key in ("task_id", "status", "task_attempt", "execution_owner",
+                                        "admitted_dispatch", "admitted_dispatch_attempt") if key in stored}
+
+
+def _retain_unsubmitted_deadline(task: dict, before: dict) -> None:
+    """Q + launch_admission caller ONLY, after its claim and before any put.
+
+    Preserve this working successor's known non-handoff on the existing retry
+    marker. Its monotonic possible claim stays intact; another owner or source
+    cannot inherit the fact. Unknown remote effects/cost are still unknown.
+    """
+    import copy
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import execution_owner_record
+    from supervisor import workers
+
+    q, task_id = _queue(), str(task.get("id") or "")
+    root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    stored = load_task_result(root, task_id, strict=True) or {}
+    attempt = before["task_attempt"]
+    owner = execution_owner_record(root, task, "pooled")
+    claimed = {**before["claim"], "admitted_dispatch": "possible", "admitted_dispatch_attempt": attempt}
+    mirrored = {**claimed, "status": "running", "task_attempt": attempt, "execution_owner": owner}
+    claim = _deadline_launch_claim(stored)
+    if (task.get("_terminalization_retry") or before["task_id"] != task_id
+            or task.get("_attempt") != attempt or _pending_continuation(task) != "_working_recovery"
+            or task.get("_working_recovery") != before["source"]
+            or claim not in (claimed, mirrored)):
+        return
+    retry = workers._make_terminalization_retry_task(
+        task, task_id, status="failed", trigger=REASON_DEADLINE,
+        reason="The explicit task deadline elapsed before worker dispatch.")
+    retry["_terminalization_retry"]["unsubmitted_launch"] = copy.deepcopy({
+        "task_id": task_id, "task_attempt": attempt, "data_root": str(root.resolve()),
+        "source": before["source"], "claim": claim,
+    })
+    if pending_deadline_expirable(retry):
+        task.update(retry)
+        q.persist_queue_snapshot(reason="pending_deadline_unsubmitted")
+        _queue_pending_deadline(task)
+
+
+def pending_deadline_expirable(task: Dict[str, Any]) -> bool:
+    """Expire ordinary waits and positively authorized, unstarted continuations.
+
+    The selected continuation must retain its authority; historical carriers
+    neither veto it nor grant a fallback. A caller-owned non-put marker binds
+    only its own working claim. Pause and unknown facts keep custody; the
+    reaper reads source, claim and controls again before settlement.
+    """
+    from types import SimpleNamespace
+    from ouroboros.owner_pause import member_fence
+    from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+    from supervisor.events_budget import (
+        HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION, HOLD_SAVED_WORK,
+        HOLD_OWNER_RESTART, budget_hold_fact, budget_resume_dispatch_allowed,
+    )
+
+    if any(task.get(key) for key in (
+        "_owner_hold", "_continuation_prepared", "_cancel_intent_authority_hold",
+    )) or task.get("_owner_wait_resume") and not isinstance(task["_owner_wait_resume"], dict):
+        return False
+    pause, hold = task.get("_budget_pause"), budget_hold_fact(task)
+    project = task.get("_project_admission_restore_hold")
+    if task.get("_budget_pause_hold") and not isinstance(task["_budget_pause_hold"], dict):
+        return False
+    if pause and (not isinstance(pause, dict) or pause.get("exact_continuation")
+                  or pause.get("reason") == "owner" or pause.get("cause") == "owner_pause"
+                  or pause.get("status") != "paused_before_dispatch"
+                  or pause.get("replay_safe") is not True
+                  or type(pause.get("physical_calls")) is not int or pause["physical_calls"] != 0):
+        return False
+    if hold is not None and (hold.get("reason") not in (
+            HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION,
+            HOLD_SAVED_WORK, HOLD_OWNER_RESTART) or hold.get("cause") == "owner_pause"):
+        return False
+    if project and (not isinstance(project, dict)
+                    or project.get("reason") not in ("project_routing_fence_lookup_failed", "deadline")):
+        return False
+    q, task_id = _queue(), str(task.get("id") or "")
+    root_id = str(task.get("root_task_id") or task_id)
+    fence = q.BUDGET_ROOT_FENCES.get(root_id) or {}
+    if not isinstance(fence, dict) or fence.get("cause") == "owner_pause":
+        return False
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    try:
+        # The durable Pause precedes its queue latch; an unavailable root is not open.
+        if member_fence(SimpleNamespace(task_id=task_id, root_task_id=root_id, budget_drive_root=result_root)):
+            return False
+        try:
+            if (result_root / "state" / "panic_stop.flag").read_text(encoding="utf-8").strip() == "panic":
+                return False
+        except FileNotFoundError:
+            pass
+        selected = _pending_continuation(task)
+        marker = task.get("_terminalization_retry") or {}
+        unsubmitted = marker.get("unsubmitted_launch")
+        if selected or pause or hold is not None or project or fence or unsubmitted is not None:
+            stored = load_task_result(result_root, task_id, strict=True) or {}
+            if (stored.get("_owner_hold") or stored.get("admission_outcome") == "never_admitted"
+                    or stored.get("status") in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}):
+                return False
+            if unsubmitted is not None and not (
+                    isinstance(unsubmitted, dict) and marker.get("trigger") == REASON_DEADLINE
+                    and selected == "_working_recovery" and unsubmitted.get("task_id") == task_id
+                    and stored.get("task_id") == task_id and type(task.get("_attempt")) is int
+                    and type(unsubmitted.get("task_attempt")) is int
+                    and task["_attempt"] == unsubmitted.get("task_attempt")
+                    and type(stored.get("admitted_dispatch_attempt")) is int
+                    and stored["admitted_dispatch_attempt"] == task["_attempt"]
+                    and unsubmitted.get("data_root") == str(result_root.resolve())
+                    and unsubmitted.get("source") == task[selected]
+                    and unsubmitted.get("claim") == _deadline_launch_claim(stored)):
+                return False
+            if selected:
+                from ouroboros.budget_pause import load_budget_pause
+                from ouroboros.owner_wait import restore_owner_wait_allowed
+                from supervisor.task_admission import _exact_resume_granted, _working_resume_granted, _working_source
+                from supervisor.update_merge import assisted_resume_authorizes
+
+                if hold is not None or not isinstance(task[selected], dict) or not task[selected]:
+                    return False
+                if selected == "_owner_wait_resume":
+                    return restore_owner_wait_allowed(result_root, task, strict=True, expiring=True)
+                if selected == "_budget_pause_resume":
+                    if not (_exact_resume_granted(task, result_root) and budget_resume_dispatch_allowed(q, task)):
+                        return False
+                    source = load_budget_pause(SimpleNamespace(task_id=task_id, task_attempt=task.get("_attempt") or 1,
+                        budget_drive_root=result_root, drive_root=result_root), task[selected])
+                    return source["_pause_row"].get("source_ref") == task[selected].get("source_ref")
+                if selected == "_working_recovery":
+                    return (bool(_working_source(task, result_root)) if unsubmitted is not None
+                            else _working_resume_granted(task, result_root, existing=stored))
+                return assisted_resume_authorizes(task, stored)
+            if (task.get("admitted_dispatch") == "none" and stored.get("status") == "scheduled"
+                    and not stored.get("started_at") and stored.get("admitted_dispatch", "none") == "none"):
+                return True
+            from supervisor.schedule_occurrence import first_dispatch_unsent
+
+            if task.get("admitted_dispatch") == "none" and first_dispatch_unsent(task):
+                return True  # an earlier launcher's Project mark; its receipt proves no handoff
+            # With no carrier selected, Project release's exact planned grant (#1500) is the
+            # other positive authority, only while its successor attempt was never claimed.
+            from ouroboros.delegate_recovery import planned_handoff_resume_allowed
+
+            attempt, marked = task.get("_attempt"), stored.get("admitted_dispatch_attempt")
+            observed = stored.get("task_attempt")
+            return (type(attempt) is int and type(marked) is int and 0 < marked < attempt
+                    and ("task_attempt" not in stored or type(observed) is int and 0 < observed < attempt)
+                    and planned_handoff_resume_allowed(q.DRIVE_ROOT, task))
+        return True
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):  # a store that cannot answer (StoreError) is not open
+        return False
+
+
+def _expire_pending_deadlines_locked(workers: Any, now: float) -> None:
+    """Hand rows whose explicit calendar deadline passed to non-dispatch custody (#939, owner A).
+
+    Called under Q. Only an explicit ``deadline_at`` (or legacy submit-relative
+    ``timeout_sec``) expires a queued row: queue age and ``execution_timeout_sec``
+    never create one, and a row without a deadline waits as before. The existing
+    ``_terminalization_retry`` marker carries the outcome; an earlier marker keeps
+    its own outcome and owner. Settlement and publication run on the reaper.
+    """
+    changed, expired = False, []
+    for task in _queue().PENDING:
+        if not isinstance(task, dict):
+            continue
+        marker = task.get("_terminalization_retry")
+        if marker:
+            if isinstance(marker, dict) and marker.get("trigger") == REASON_DEADLINE:
+                expired.append(task)
+            continue
+        deadline = _task_deadline_ts(task)
+        if not deadline or now < deadline or not pending_deadline_expirable(task):
+            continue
+        task.update(workers._make_terminalization_retry_task(
+            task, str(task.get("id") or ""), status="failed", trigger=REASON_DEADLINE,
+            reason="The explicit task deadline elapsed before worker dispatch.",
+        ))
+        expired.append(task)
+        changed = True
+    if changed:
+        _queue().persist_queue_snapshot(reason="pending_deadline_expired")
+    for task in expired:
+        _queue_pending_deadline(task, listed=True)
+
+
+def _queue_pending_deadline(task: Dict[str, Any], *, listed: bool = False) -> None:
+    """Reserve one exact pending row on the existing reaper, once.
+
+    ``listed``: this locked pass just read the row from PENDING, so a batch is not
+    rescanned per row; the reaper still re-checks membership before settling."""
+    q = _queue()
+    with q._queue_lock:
+        if id(task) in _pending_deadline_jobs or not (listed or any(row is task for row in q.PENDING)):
+            return
+        job = {"kind": "pending_deadline", "task_id": str(task.get("id") or ""), "task": task,
+               "marker": task.get("_terminalization_retry"), "drive_root": q.DRIVE_ROOT}
+        try:
+            q._ensure_reaper_started()
+            _pending_deadline_jobs[id(task)] = job
+            q._reap_queue.put(job)
+        except Exception:
+            _pending_deadline_jobs.pop(id(task), None)
+            log.warning("Pending deadline reaper submission deferred", exc_info=True)
+
+
+def _reap_pending_deadline(job: Dict[str, Any]) -> None:
+    """Reaper thread: settle off Q; remove only the captured row after durable publication."""
+    q, task = _queue(), job["task"]
+    try:
+        with q._queue_lock:
+            if (q.DRIVE_ROOT != job["drive_root"] or task.get("_terminalization_retry") is not job["marker"]
+                    or not any(row is task for row in q.PENDING)):
+                return
+        settled = _settle_pending_deadline(task, event_already_published=bool(job["marker"].get("event_published")))
+        with q._queue_lock:
+            if settled and task.get("_terminalization_retry") is job["marker"]:
+                q.PENDING[:] = [row for row in q.PENDING if row is not task]
+                q.persist_queue_snapshot(reason="pending_deadline_settled")
+    finally:
+        with q._queue_lock:
+            _pending_deadline_jobs.pop(id(task), None)
+
+
+def _settle_pending_deadline(task: Dict[str, Any], *, event_already_published: bool = False) -> bool:
+    """Write and deliver the deadline outcome without any model dispatch.
+
+    A live owner, an active Stop (task or retry root) and an already saved
+    terminal result each win; the row stays in custody on any failure.
+    """
+    from ouroboros.cancel_intents import (
+        _validated_retry_root_cancel_key, active_intents, cancellation_projection_lock,
+    )
+    from ouroboros.outcomes import EXECUTION_INFRA_FAILED, terminal_outcome_axes
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result, write_task_result
+    from supervisor import workers
+    from supervisor.worker_assignment import _direct_actor_still_registered
+
+    q, task_id, marker = _queue(), str(task.get("id") or ""), task.get("_terminalization_retry")
+    with q._queue_lock:
+        if not task_id or task_id in q.RUNNING or any(
+                worker.busy_task_id == task_id for worker in workers.WORKERS.values()):
+            return False
+    if task.get("_is_direct_chat") and _direct_actor_still_registered(task_id):
+        return False
+    try:
+        # Do not recreate a held row's lost receipt as fresh scheduled authority.
+        if not pending_deadline_expirable(task):
+            existing = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+            if existing.get("status") not in _TRULY_TERMINAL_STATUSES:
+                return False
+        # The create-only seeding seam takes Q itself: do it before cancel authority (Q -> cancel order).
+        q.ensure_control_task_result(task_id)
+        workers._audit_delegate_terminal_custody(task_id, REASON_DEADLINE)
+        try:
+            cost_fields = q.reconstruct_task_cost(task_id, fields=True)
+        except Exception:
+            cost_fields = {"cost_accounting_status": "unavailable", "cost_final": False}
+        # The durable outbox owes delivery before the terminal frame; a root reaches its
+        # own lineage, a child its parent through the ordinary handoff.
+        from supervisor.terminal_delivery import (
+            build_unreviewed_salvage_event, deliver_miss_lane_outcome, deliver_unreviewed_salvage,
+            register_pending_delivery, salvage_cancelled_output,
+        )
+
+        drive = _task_drive_for_task(task, task_id)
+        salvage_root = str(task.get("delegation_role") or "") != "subagent"
+
+        def owe_salvage(current: Dict[str, Any]) -> "Dict[str, Any] | None":
+            """Register the deadline salvage answer as OWED; None when the registration failed."""
+            text, path = salvage
+            delivery = dict(outcome="", reason_code=REASON_DEADLINE, salvaged_text=text, preserved_path=path,
+                            settled_status="failed",
+                            unreconciled_runs=list(current.get("delegated_runs_unreconciled") or []))
+            event = build_unreviewed_salvage_event(q.DRIVE_ROOT, {**task, **current}, task_id, **delivery)
+            if event is not None and not register_pending_delivery(q.DRIVE_ROOT, event):
+                return None
+            return delivery
+
+        delivery, salvage = None, ("", "")
+        if salvage_root:  # the response-history read and copy run before Q; only the owed registration rides it
+            salvage = tuple(salvage_cancelled_output(q.DRIVE_ROOT, drive, task_id)[1:])
+        # Only the terminal write is serialized against Stop; custody and delivery
+        # never make a Q-held cancel wait on this projection.
+        with q._queue_lock, cancellation_projection_lock(q.DRIVE_ROOT):
+            if task.get("_terminalization_retry") is not marker or not any(row is task for row in q.PENDING):
+                return False
+            # Custody ran off Q: a live owner may have appeared while it waited.
+            if (task_id in q.RUNNING or any(worker.busy_task_id == task_id for worker in workers.WORKERS.values())
+                    or task.get("_is_direct_chat") and _direct_actor_still_registered(task_id)):
+                return False
+            retry_root = _validated_retry_root_cancel_key(q.DRIVE_ROOT, task_id, task_hint=task)
+            intents = active_intents(q.DRIVE_ROOT, strict=True)
+            if task_id in intents or retry_root and retry_root in intents:
+                return False
+            stored = load_task_result(q.DRIVE_ROOT, task_id, strict=True) or {}
+            if stored.get("status") not in _TRULY_TERMINAL_STATUSES:
+                if not pending_deadline_expirable(task):  # Pause/authority can change while custody runs off Q.
+                    return False
+                # Owe the salvage answer BEFORE the terminal row exists (owner Fork 2): a
+                # settle landing between the write and the registration sees the debt and
+                # never publishes a card without the answer. A refused registration keeps
+                # the row in custody, exactly as the post-write refusal used to.
+                if salvage_root:
+                    delivery = owe_salvage(stored)
+                    if delivery is None:
+                        return False
+                stored = write_task_result(
+                    q.DRIVE_ROOT, task_id, "failed", strict_existing_dict=True, reason_code=REASON_DEADLINE,
+                    outcome_axes=terminal_outcome_axes(
+                        lifecycle="failed", execution=EXECUTION_INFRA_FAILED,
+                        reason_code=REASON_DEADLINE, review_trigger="supervisor_terminal"),
+                    result=str((marker or {}).get("reason") or "The explicit task deadline elapsed before worker dispatch."),
+                    **cost_fields,
+                )
+        status = str(stored.get("status") or "")
+        if status not in _TRULY_TERMINAL_STATUSES:
+            return False
+        if event_already_published:
+            return True
+        row = {**task, **stored}
+        unreconciled = list(stored.get("delegated_runs_unreconciled") or [])
+        if status == "failed" and stored.get("reason_code") == REASON_DEADLINE:
+            if salvage_root:
+                if delivery is None:  # the row was already terminal when custody caught up: owe its answer now
+                    delivery = owe_salvage(stored)
+                    if delivery is None:
+                        return False
+                deliver_unreviewed_salvage(q.DRIVE_ROOT, row, task_id, **delivery)
+        elif not deliver_miss_lane_outcome(q.DRIVE_ROOT, drive, row, task_id, status,
+                                           unreconciled_runs=unreconciled):
+            return False
+        return workers._emit_task_done_terminal(task, task_id, status, reason_code=str(stored.get("reason_code") or ""),
+                                                cost_fields=cost_fields)
+    except Exception:
+        log.warning("Pending deadline custody deferred for %s", task_id, exc_info=True)
+        return False
 
 
 def _is_descendant_of(task: Dict[str, Any], ancestor_id: str) -> bool:
@@ -191,8 +563,19 @@ def _has_pending_descendant(task_id: str) -> bool:
     return False
 
 
+def _idle_observation_pending(task_id: str, pending_events: set[str] | None) -> bool:
+    if pending_events is None or task_id in pending_events:
+        return True
+    # A descendant's progress is already an input to its parent's idle policy.
+    # Its producer need not stamp lineage: the current RUNNING owner has it.
+    return any(tid in pending_events and isinstance(meta, dict)
+               and _queue()._is_descendant_of(meta.get("task") or {}, task_id)
+               for tid, meta in _queue().RUNNING.items())
+
+
 def _enforce_task_timeouts_locked(
-    workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any]
+    workers: Any, now: float, owner_chat_id: int, st: Dict[str, Any], *,
+    pending_events: set[str] | None = frozenset(),
 ) -> None:
     # ONE typed owner-stop predicate before the generic idle/grace consumers (S3
     # §12.2 item 8): an OPEN owner-requested finalization intent suppresses the
@@ -201,14 +584,15 @@ def _enforce_task_timeouts_locked(
     # intent stays the one owner will and cancellation custody stays the killer;
     # a later graceful request can never extend either hard axis.
     from supervisor.owner_stop import running_owner_stop_tasks
-    from supervisor.worker_owner_wait import has_owner_wait_checkpoint
+    from supervisor.restart_retention import RETAINED_FOR_BOOT
+    from supervisor.worker_owner_wait import has_owner_wait_checkpoint, waiting_on_owner
 
     owner_stop_held = running_owner_stop_tasks(
         _queue().DRIVE_ROOT, grace_sec=_queue().FINALIZATION_GRACE_SEC,
     )
     for task_id, meta in list(_queue().RUNNING.items()):
-        if not isinstance(meta, dict):
-            continue
+        if not isinstance(meta, dict) or meta.get(RETAINED_FOR_BOOT):
+            continue  # a stop already ended this attempt; its saved work belongs to the next boot
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
         if started_at <= 0:
@@ -239,7 +623,8 @@ def _enforce_task_timeouts_locked(
         # ceilings still apply independently.
         if task_type == "deep_self_review":
             idle_timeout = max(idle_timeout, 3600.0)
-        abs_ceiling = _queue().get_task_abs_ceiling_sec()  # None = no lifetime bound
+        abs_ceiling = resolve_task_execution_timeout_sec(  # None = no execution bound (#939)
+            task, global_ceiling=_queue().get_task_abs_ceiling_sec())
         last_progress_at = float(meta.get("last_progress_at") or started_at)
         idle_sec = max(0.0, now - last_progress_at)
         subtree_progressing = _queue()._subtree_progressing(task_id, now, idle_timeout)
@@ -250,13 +635,10 @@ def _enforce_task_timeouts_locked(
         lease_ts = meta.get("external_wait_lease_until")
         active_llm_call = meta.get("active_llm_call")
         llm_call_in_flight = isinstance(active_llm_call, dict) and active_llm_call.get("task_attempt") == attempt
-        owner_wait = meta.get("owner_wait")
-        waiting_on_owner = (isinstance(owner_wait, dict) and owner_wait.get("state") == "waiting"
-                            and owner_wait.get("task_attempt") == attempt)
         progressing = (own_progress or subtree_progressing or _queue()._has_pending_descendant(task_id)
                        or (isinstance(lease_ts, (int, float)) and float(lease_ts) > now)
                        or llm_call_in_flight
-                       or model_waiting(meta) or waiting_on_owner
+                       or model_waiting(meta) or waiting_on_owner(meta, attempt)
                        or _active_operation_progressing(meta, now))
         ceiling_reached = abs_ceiling is not None and runtime_sec >= float(abs_ceiling)
         if (ceiling_reached and not task.get("parent_task_id")
@@ -290,6 +672,11 @@ def _enforce_task_timeouts_locked(
             # machinery.  Explicit task deadline and the absolute safety
             # ceiling remain independent hard axes and may never be extended
             # by a later graceful-stop request.
+            continue
+
+        if not ceiling_reached and not deadline_reached and _idle_observation_pending(str(task_id), pending_events):
+            # Missing observation is neither progress nor permission to stop.
+            # Do not create/withdraw an idle control or reap on a stale mirror.
             continue
 
         # Hard axes (deadline_at, abs ceiling) stop the task regardless of activity; the

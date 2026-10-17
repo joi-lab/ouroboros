@@ -18,6 +18,7 @@ from tests.test_acceptance_history import _caller, _request, _source
 from tests.test_acceptance_late_consumers import delivered, late as late
 from tests.test_review_operation_collection import _send_ctx, fresh_sends as fresh_sends
 from tests.test_review_operation_lifetime import until
+from tests._usage_store_testing import ledger_rows
 
 
 def _unpaid(f, late):
@@ -25,7 +26,7 @@ def _unpaid(f, late):
     row = load_task_result(f.root, f.tid)
     assert not late.calls and row['acceptance_debt'] and not row.get('review_projection', {}).get('panels')
     assert not load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting')
-    assert not (f.root / 'state' / 'usage_attempts.jsonl').exists()
+    assert not ledger_rows(f.root)
     return row
 
 
@@ -133,14 +134,15 @@ def test_existing_paid_or_unknown_panel_collects_after_calendar_closes(late, tmp
     _request(f, ctx, _source(ctx))
     until(lambda: not review_operation._LIVE)
     assert len(late.calls) == 3
-    before = (f.root / 'state' / 'usage_attempts.jsonl').read_bytes()
+    before = ledger_rows(f.root)
+    monkeypatch.setenv('OUROBOROS_TASK_REVIEW_MODE', 'off')
     monkeypatch.setattr('ouroboros.deadline_utils.utc_now', lambda: now + timedelta(seconds=3601))
     debt = load_task_result(f.root, f.tid)['acceptance_debt']
     automatic = run_historical_acceptance(ctx, task_id=f.tid, debt_id=debt['debt_id'], automatic=True)
     assert automatic['reason'] == 'existing_operation_collection_owned'
     explicit = _request(f, ctx, _source(ctx))
     assert explicit['reason'] == 'existing_paid_operation'
-    assert len(late.calls) == 3 and (f.root / 'state' / 'usage_attempts.jsonl').read_bytes() == before
+    assert len(late.calls) == 3 and ledger_rows(f.root) == before
 
 
 @pytest.mark.parametrize('venue,evidence,buy', [
@@ -166,6 +168,7 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
     snapshot = {'ts': utc_now_iso(), 'running': [], 'pending': []}
     fragment = {'ts': utc_now_iso(), 'roots': [], 'incomplete': False}
     target = snapshot if venue == 'pooled' else fragment
+    snapshot['generation'] = fragment['generation'] = 'fixture-generation'
     if evidence == 'live':
         target['running' if venue == 'pooled' else 'roots'] = [{'task_id': f.tid}]
     elif evidence == 'stale':
@@ -177,7 +180,14 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
         if selected and evidence == 'missing':
             continue
         (f.root / 'state' / f'{name}.json').write_text(
-            '{' if selected and evidence == 'invalid' else json.dumps(payload))
+            '{' if selected and evidence == 'invalid' else json.dumps(payload), encoding='utf-8')
+    from ouroboros.utils import atomic_write_json
+    atomic_write_json(f.root / 'state/queue.alive', {
+        'generation': 'fixture-generation', 'ts': target['ts'], 'heartbeats': {},
+    })
+    atomic_write_json(f.root / 'state/queue_dispatch.json', {
+        'generation': 'fixture-generation', 'budget_root_fences': [], 'members': {},
+    })
     ctx = _caller(f)
     ctx.event_queue = queue.Queue()  # This consumer owns a live notification sink.
     source = _source(ctx)
@@ -200,22 +210,46 @@ def test_worker_public_adapter_uses_venue_authority(late, tmp_path, monkeypatch,
 
 def _spawned_request(root, worker, workspace, tid, source, results):
     """Fresh process, real registered tool/operation; only the paid transport is synthetic."""
+    import sys
+    import tempfile
+    from ouroboros.llm import LLMClient
     from supervisor import queue as task_queue, workers
+    from tests._shared import _provider_catalog_snapshot, offline_provider_catalog
     os.environ['OUROBOROS_IN_WORKER'] = '1'
     f = SimpleNamespace(root=Path(root), worker=Path(worker), tmp_path=Path(workspace), tid=tid)
-    with pytest.MonkeyPatch.context() as patch:
-        fixture = late.__wrapped__(f.tmp_path, patch, None)
+
+    def isolation():
+        return ({key: os.environ.get(key) for key in (
+                    'HOME', 'OUROBOROS_DATA_DIR', 'OUROBOROS_SETTINGS_PATH', 'TMPDIR', 'PYTHONPYCACHEPREFIX')},
+                sys.pycache_prefix, tempfile.gettempdir(), 'tests.conftest' in sys.modules)
+    inherited, cold = isolation(), _provider_catalog_snapshot(LLMClient)
+    # Spawn does not inherit pytest's fixture injection or parent monkeypatches.
+    with (pytest.MonkeyPatch.context() as patch, offline_provider_catalog(patch) as catalog):
+        catalogue_requests = []
+        def no_catalogue_request(url, *_args, **_kwargs):
+            catalogue_requests.append(url)
+            raise AssertionError('the synthetic child panel must not fetch a live catalogue')
+        patch.setattr('requests.get', no_catalogue_request)
+        fixture = late.__wrapped__(f.tmp_path, patch, None, catalog)
         transport = next(fixture)
+        report = {'isolation': (inherited, isolation()),
+                  'catalog': (cold, catalog, _provider_catalog_snapshot(LLMClient))}
         try:
             ctx = _caller(f)
             ctx.drive_root = f.worker
             result = _request(f, ctx, source)
             until(lambda: not review_operation._LIVE)
-            results.put({'result': result, 'calls': len(transport.calls),
-                         'initialized': task_queue.INITIALIZED,
-                         'maps_empty': not task_queue.RUNNING and not workers.WORKERS})
+            assert not catalogue_requests, catalogue_requests
+            report.update({'result': result, 'calls': len(transport.calls),
+                           'initialized': task_queue.INITIALIZED,
+                           'maps_empty': not task_queue.RUNNING and not workers.WORKERS})
+            # As a live fetch would: leaving the helper must hand the found state back.
+            LLMClient._CONTEXT_LENGTH_CACHE['probe/model'] = 128_000
+            LLMClient._CAPABILITIES_FETCH_OK = True
         finally:
             next(fixture, None)
+    report['catalog'] += (_provider_catalog_snapshot(LLMClient),)
+    results.put(report)
 
 
 @pytest.mark.serial
@@ -223,30 +257,30 @@ def _spawned_request(root, worker, workspace, tid, source, results):
 def test_spawned_worker_public_request_waits_for_real_original_owner(late, tmp_path, monkeypatch, venue):
     from ouroboros import agent_task_pipeline as pipeline
     from supervisor import queue as task_queue
-    from supervisor.direct_roots import publish_direct_roots
     from supervisor.queue_snapshot import persist_queue_snapshot
     f = delivered(tmp_path, monkeypatch)
     source = _source(_caller(f))
     entered, release = threading.Event(), threading.Event()
     postwork = None
+    monkeypatch.setattr(task_queue, "DRIVE_ROOT", f.root)
+    monkeypatch.setattr(task_queue, "QUEUE_SNAPSHOT_PATH", f.root / "state/queue_snapshot.json")
     if venue == 'pooled':
         monkeypatch.setattr(task_queue, 'QUEUE_SNAPSHOT_PATH', f.root / 'state' / 'queue_snapshot.json')
         monkeypatch.setattr(task_queue, 'RUNNING', {f.tid: {'task': f.task, 'worker_id': 4}})
         assert persist_queue_snapshot('synthetic original writer still owns its slot')
     else:
         write_task_result(f.root, f.tid, 'completed', _is_direct_chat=True)
-        publish_direct_roots(f.root)  # direct turn ended; its postwork has not
+        persist_queue_snapshot("direct owner observation")  # direct turn ended; its postwork has not
         def hold(*_a, **_kw):
             entered.set()
             assert release.wait(20)
         monkeypatch.setattr(pipeline, '_record_task_facts', hold)
-        for name in ('_run_scratchpad_consolidation', '_run_reflection', '_update_improvement_backlog'):
-            monkeypatch.setattr(pipeline, name, lambda *_a, **_k: None)
+        monkeypatch.setattr(pipeline, '_run_scratchpad_consolidation', lambda *_a, **_k: None)
         monkeypatch.setattr('ouroboros.post_task_evolution.maybe_promote', lambda *_a, **_k: None)
         task = {**f.task, 'drive_root': str(f.root), '_is_direct_chat': True}
         task.pop('_skip_post_task_synthesis')
         postwork = threading.Thread(target=lambda: pipeline._run_post_task_processing_async(
-            SimpleNamespace(drive_root=f.root, repo_dir=tmp_path), task, {}, {}, {}, f.root / 'logs', blocking=True))
+            SimpleNamespace(drive_root=f.root, repo_dir=tmp_path), task, {}, {}, f.root / 'logs', blocking=True))
         postwork.start()
         assert entered.wait(5)
     mp = multiprocessing.get_context('spawn')
@@ -260,6 +294,11 @@ def test_spawned_worker_public_request_waits_for_real_original_owner(late, tmp_p
                 assert process.exitcode == 0
                 result = results.get(timeout=2)
                 assert not result['initialized'] and result['maps_empty']
+                # Child fixture setup kept the inherited isolation and the catalog state;
+                # leaving it handed back the found catalog the child had dirtied.
+                inherited, setup = result['isolation']
+                assert setup == inherited and not inherited[-1], result['isolation']
+                assert all(state == result['catalog'][0] for state in result['catalog']), result['catalog']
                 if live:
                     assert result['result']['reason'] == 'historical_writer_still_live', result
                     assert result['calls'] == 0
@@ -278,7 +317,7 @@ def test_spawned_worker_public_request_waits_for_real_original_owner(late, tmp_p
                 release.set()
                 postwork.join(5)
                 assert not postwork.is_alive()
-                publish_direct_roots(f.root)
+                persist_queue_snapshot("direct owner observation")
     finally:
         release.set()
         if postwork is not None:

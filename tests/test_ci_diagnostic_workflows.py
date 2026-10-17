@@ -1,6 +1,8 @@
 """Public CI exports preserve producer exits, secret boundaries and full UI proof."""
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 from types import SimpleNamespace
 
 import pytest
@@ -20,16 +23,6 @@ PROVIDER_SECRETS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY", "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "GIGACHAT_CREDENTIALS",
 )
-SHARED_BRANCHES = ["main", "ouroboros", "ouroboros-stable"]
-# What starts a PAID canary run on a branch push. The code workflow has no path list, so this
-# one is spelled out here: a prompts- or skills-only push runs the code workflow and no canary.
-CANARY_PUSH_PATHS = [
-    "ouroboros/**", "supervisor/**", "server.py", "tests/**", "web/**", "site/**", "docs/**", "assets/**",
-    "requirements-runtime.lock", "uv.lock", "pyproject.toml", ".github/workflows/**", ".github/actions/**",
-    "build.sh", "build_linux.sh", "build_windows.ps1", "Dockerfile", "scripts/**", "devtools/**",
-    "packaging/**", "android/**", "VERSION", "README.md", "CONTRIBUTING.md", "LICENSE",
-    ".github/PULL_REQUEST_TEMPLATE.md", "launcher.py",
-]
 DOWNLOAD_ACTION = "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
 UI_JOBS = ["scope", "ui-shard", "ui-manifest", "ui-smoke"]
 # The complete lane takes no selection: its jobs run whenever browsers are needed.
@@ -53,7 +46,7 @@ def test_provider_diagnostics_stay_outside_test_and_release_authority():
     producer = steps["provider_tests"]
     assert "continue-on-error" not in job and "continue-on-error" not in producer
     assert "continue-on-error" not in workflow["jobs"]["integration-test"]
-    assert "pytest tests/test_provider_integration.py -m integration -q -rs --tb=short" in producer["run"]
+    assert 'pytest tests/test_provider_integration.py -m "$selection" -q -rs --tb=short' in producer["run"]
     assert "--ci-evidence-dir=" in producer["run"] and "--junitxml=" in producer["run"]
     assert "ci-private/provider/results.xml" in producer["run"]
     assert "ci-evidence/provider" in producer["run"]
@@ -67,6 +60,7 @@ def test_provider_diagnostics_stay_outside_test_and_release_authority():
     assert upload["with"]["path"] == "${{ runner.temp }}/ci-evidence/provider/"
     assert upload["with"]["retention-days"] == 30
     assert "github.sha" in upload["with"]["name"] and "github.run_attempt" in upload["with"]["name"]
+    assert "${{ inputs.scope }}" in upload["with"]["name"]
     assert summary["env"]["PRODUCER_OUTCOME"] == "${{ steps.provider_tests.outcome }}"
     assert summary["env"]["ARTIFACT_URL"] == "${{ steps.provider_evidence.outputs.artifact-url }}"
     assert "python -m tests.ci_evidence summarize" in summary["run"]
@@ -74,6 +68,9 @@ def test_provider_diagnostics_stay_outside_test_and_release_authority():
     assert workflow["jobs"]["release-preflight"]["needs"] == ["full-test", "integration-test", "system-e2e-mock"]
     release = workflow["jobs"]["release"]
     assert "needs.release-preflight.result == 'success'" in release["if"]
+    optional = workflow["jobs"]["integration-optional"]
+    assert "continue-on-error" not in optional
+    assert not any("integration-optional" in job.get("needs", []) for job in workflow["jobs"].values())
 
 
 def test_only_informational_steps_tolerate_errors_and_report_missing_uploads():
@@ -105,32 +102,39 @@ def _triggers(workflow):
 
 
 def _canary_wiring_faults(ci, shared, push):
-    """Name every way the canary body and its two callers can drift apart."""
+    """One body, two disjoint release groups and an explicit all-canary dispatch."""
     faults = []
     passed = {name: f"${{{{ secrets.{name} }}}}" for name in PROVIDER_SECRETS}
-    for label, jobs in (("ci.yml", ci["jobs"]), (CANARY_PUSH, push["jobs"])):
-        caller = jobs["integration-test"]
+    for label, caller, scope in (("ci.yml", ci["jobs"]["integration-test"], {"scope": "required"}),
+                                ("ci.yml optional", ci["jobs"]["integration-optional"], {"scope": "optional"}),
+                                (CANARY_PUSH, push["jobs"]["integration-test"], {})):
         if caller.get("uses") != f"./.github/workflows/{CANARY}":
             faults.append(f"{label} does not call the shared job")
         if caller.get("secrets") != passed:
             faults.append(f"{label} does not pass exactly the eight provider secrets by name")
         if caller.get("permissions") != {"contents": "read"}:
             faults.append(f"{label} widens the called job's permissions")
-    # Exact key sets: a condition or a group on any of the three jobs changes how often the paid job runs.
-    for label, job, keys in (("ci.yml", ci["jobs"]["integration-test"], {"if", "uses", "secrets", "permissions"}),
+        if caller.get("with", {}) != scope:
+            faults.append(f"{label} does not select its disjoint canary scope")
+    if ci["jobs"]["integration-test"].get("if") != ci["jobs"]["integration-optional"].get("if"):
+        faults.append("required/optional callers do not share the manual/tag admission")
+    # Exact key sets keep an added condition/group from silently changing paid admission.
+    for label, job, keys in (("ci.yml", ci["jobs"]["integration-test"], {"if", "uses", "with", "secrets", "permissions"}),
+                             ("ci.yml optional", ci["jobs"]["integration-optional"], {"if", "uses", "with", "secrets", "permissions"}),
                              (CANARY_PUSH, push["jobs"]["integration-test"], {"uses", "secrets", "permissions"}),
                              (CANARY, shared["jobs"]["integration-test"], {"runs-on", "steps"})):
         if set(job) != keys:
             faults.append(f"{label} canary job carries keys other than {sorted(keys)}")
     declared = {name: {"required": False} for name in PROVIDER_SECRETS}
-    if _triggers(shared) != {"workflow_call": {"secrets": declared}}:
-        faults.append("the shared job is not call-only with eight optional secrets")
-    # One paid run per push that touches the canary path list, on the three shared branches only.
-    if _triggers(push) != {"push": {"branches": SHARED_BRANCHES, "paths": CANARY_PUSH_PATHS}}:
-        faults.append("the push wrapper's trigger is not the three shared branches with the canary path list")
-    # The code workflow sees EVERY push to those branches: a path list here leaves a landed commit untested.
-    if _triggers(ci)["push"] != {"branches": SHARED_BRANCHES, "tags": ["v*"]}:
-        faults.append("ci.yml's push trigger is not the three shared branches plus v* tags with no path filter")
+    inputs = {"scope": {"description": "Canary subset: all, required or optional; failures remain visible",
+                        "type": "string", "default": "all"}}
+    if _triggers(shared) != {"workflow_call": {"secrets": declared, "inputs": inputs}}:
+        faults.append("the shared job is not call-only with scoped input and eight optional secrets")
+    if _triggers(push) != {"workflow_dispatch": None}:
+        faults.append("the standalone provider wrapper must be manual-only")
+    # Tags-only is not an unfiltered push: GitHub excludes the undefined branch ref type.
+    if set(_triggers(ci)) != {"push", "workflow_dispatch"} or _triggers(ci).get("push") != {"tags": ["v*"]}:
+        faults.append("ci.yml must admit only manual dispatch and v* tags without a path filter")
     for label, workflow in ((CANARY, shared), (CANARY_PUSH, push)):
         if list(workflow["jobs"]) != ["integration-test"]:
             faults.append(f"{label} holds more than the canary job")
@@ -142,7 +146,7 @@ def _canary_wiring_faults(ci, shared, push):
     return faults
 
 
-def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push_wrapper():
+def test_provider_canaries_share_one_body_between_release_and_manual_callers():
     assert _canary_wiring_faults(*map(_workflow, ("ci.yml", CANARY, CANARY_PUSH))) == []
     callers = []
     for path in sorted((ROOT / ".github/workflows").glob("*.yml")):
@@ -150,37 +154,44 @@ def test_provider_canaries_share_one_body_between_the_code_workflow_and_the_push
             assert job.get("secrets") != "inherit", path.name  # Would hand over signing and live-stand keys.
             if str(job.get("uses", "")).endswith(f"/{CANARY}"):
                 callers.append((path.name, name))
-    # A third caller is a second paid run for some event.
-    assert callers == [("ci.yml", "integration-test"), (CANARY_PUSH, "integration-test")]
+    # Two release groups partition one matrix; a further caller could duplicate paid tests.
+    assert callers == [("ci.yml", "integration-test"), ("ci.yml", "integration-optional"),
+                       (CANARY_PUSH, "integration-test")]
 
 
-def test_provider_canary_workflows_are_protected_exactly_like_ci_yml():
-    """`release-preflight` requires the provider-canary job, whose body and
-    branch-push trigger live in two workflow files beside ci.yml; an inventory
-    naming only the parent would leave the release canary editable."""
+def test_provider_canary_workflows_are_editable_while_ci_yml_stays_protected():
+    """`release-preflight` requires the provider-canary job, but ci.yml, which
+    wires that job into the release chain, is the protected release invariant;
+    the canary body and its manual wrapper reach no install, so Advanced
+    may edit them. The contributor review label still follows the body."""
     from ouroboros.runtime_mode_policy import RELEASE_INVARIANT_PATHS, protected_path_category
     from scripts.run_external_review import _RELEASE_MACHINERY_PATHS
 
-    parent = protected_path_category(".github/workflows/ci.yml")
+    parent = ".github/workflows/ci.yml"
+    assert parent in RELEASE_INVARIANT_PATHS
+    assert protected_path_category(parent) == protected_path_category(f"./{parent}") == "release-invariant"
     for name in (CANARY, CANARY_PUSH):
         path = f".github/workflows/{name}"
         assert (ROOT / path).is_file(), path
-        assert path in RELEASE_INVARIANT_PATHS, path
+        assert path not in RELEASE_INVARIANT_PATHS, path
         assert path in _RELEASE_MACHINERY_PATHS, path  # The contributor label follows the body too.
-        assert protected_path_category(path) == protected_path_category(f"./{path}") == parent, path
-    # The category follows the listed files, not the directory.
-    assert protected_path_category(".github/workflows/unlisted.yml") == ""
+        assert protected_path_category(path) == protected_path_category(f"./{path}") == "", path
 
 
 CANARY_DRIFTS = {
-    "wrapper also fires on tags": lambda w: _triggers(w.push)["push"].update(tags=["v*"]),
-    "wrapper gains a second trigger": lambda w: _triggers(w.push).update(workflow_dispatch=None),
-    "wrapper drops a branch": lambda w: _triggers(w.push)["push"]["branches"].remove("main"),
-    "wrapper drops a path": lambda w: _triggers(w.push)["push"]["paths"].pop(),
-    "wrapper gains a path": lambda w: _triggers(w.push)["push"]["paths"].append("prompts/**"),
+    "optional repeats required": lambda w: w.ci["jobs"]["integration-optional"]["with"].update(scope="required"),
+    "required repeats all": lambda w: w.ci["jobs"]["integration-test"]["with"].update(scope="all"),
+    "optional admission diverges": lambda w: w.ci["jobs"]["integration-optional"].update({"if": "true"}),
+    "wrapper also fires on tags": lambda w: _triggers(w.push).update(push={"tags": ["v*"]}),
+    "wrapper restores branch pushes": lambda w: _triggers(w.push).update(push={"branches": ["ouroboros"]}),
+    "wrapper restores PRs": lambda w: _triggers(w.push).update(pull_request=None),
+    "wrapper loses dispatch": lambda w: _triggers(w.push).pop("workflow_dispatch"),
     "ci.yml regains a path filter": lambda w: _triggers(w.ci)["push"].update(paths=["ouroboros/**"]),
     "ci.yml ignores a path": lambda w: _triggers(w.ci)["push"].update({"paths-ignore": ["prompts/**"]}),
-    "ci.yml drops a branch": lambda w: _triggers(w.ci)["push"]["branches"].remove("main"),
+    "ci.yml restores branches": lambda w: _triggers(w.ci)["push"].update(branches=["ouroboros"]),
+    "ci.yml restores PRs": lambda w: _triggers(w.ci).update(pull_request={"branches": ["ouroboros"]}),
+    "ci.yml drops tags": lambda w: _triggers(w.ci)["push"].pop("tags"),
+    "ci.yml drops dispatch": lambda w: _triggers(w.ci).pop("workflow_dispatch"),
     "wrapper concurrency": lambda w: w.push.update(concurrency="canary"),
     "shared job concurrency": lambda w: w.shared["jobs"]["integration-test"].update(concurrency="canary"),
     "inherited secrets": lambda w: w.ci["jobs"]["integration-test"].update(secrets="inherit"),
@@ -219,17 +230,15 @@ def _selected(job, event, selection):
 def test_manual_ui_selection_is_fixed_partial_and_never_a_paid_or_full_check():
     caller = _workflow("ui-browser-push.yml")
     triggers = caller.get("on", caller.get(True))
-    assert set(triggers) == {"push", "workflow_dispatch"}
-    assert triggers["push"] == {"branches": ["ouroboros"]}
+    assert set(triggers) == {"workflow_dispatch"}
     selection = triggers["workflow_dispatch"]["inputs"]["diagnostic"]
     assert selection["type"] == "choice" and selection["default"] == "full"
     assert selection["options"] == ["full", "viewport", "inflight"]
     assert "PARTIAL DIAGNOSTIC" in caller["run-name"]
     assert list(caller["jobs"]) == ["ui-smoke", "ui-diagnostic"] and "secrets" not in str(caller)
     lane, partial_job = caller["jobs"]["ui-smoke"], caller["jobs"]["ui-diagnostic"]
-    # Exactly one job runs: the complete lane for a push (no selection exists there) and
-    # a manual `full`, the scenario for every other manual selection, a foreign one included.
-    for event, choice, runs_lane in (("push", "", True), ("workflow_dispatch", "full", True),
+    # Exactly one job runs for a dispatch: full or a clearly partial diagnostic.
+    for event, choice, runs_lane in (("workflow_dispatch", "full", True),
                                      ("workflow_dispatch", "viewport", False),
                                      ("workflow_dispatch", "inflight", False),
                                      ("workflow_dispatch", "", False), ("workflow_dispatch", "tests", False)):
@@ -331,14 +340,17 @@ def test_ui_producers_have_distinct_reports_and_only_the_public_parent_is_upload
     assert "ci-evidence/ui/host" in annotate and "ci-evidence/ui/tools" in annotate
 
 
-def _run_shell(step, tmp_path, *, diagnostic="viewport", result=0):
+def _run_shell(step, tmp_path, *, diagnostic="viewport", result=0, scope="all"):
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("workflow shell unavailable on this host")
     args = tmp_path / "args"
     command = step["run"].replace("${{ runner.temp }}", str(tmp_path)).replace("${{ matrix.shard }}", "2")
+    command = command.replace("${{ runner.os == 'Windows' && format('--default-suite-shard={0}/4', matrix.shard) || '' }}",
+                              "--default-suite-shard=2/4")
     stub = 'python() { printf "%s\\n" "$@" > "$ARGV_FILE"; return "$PRODUCER_EXIT"; }\n'
-    env = {**os.environ, "ARGV_FILE": str(args), "PRODUCER_EXIT": str(result), "DIAGNOSTIC": diagnostic}
+    env = {**os.environ, "ARGV_FILE": str(args), "PRODUCER_EXIT": str(result),
+           "DIAGNOSTIC": diagnostic, "SCOPE": scope}
     completed = subprocess.run([bash, "-e", "-o", "pipefail", "-c", stub + command],
                                env=env, capture_output=True, text=True, encoding="utf-8", timeout=10)
     return completed, args.read_text(encoding="utf-8").splitlines() if args.exists() else []
@@ -351,13 +363,14 @@ def _run_shell(step, tmp_path, *, diagnostic="viewport", result=0):
     (*PARTIAL, "ui_diagnostic"),
     ("ui-browser.yml", "ui-shard", "browser_tools"),
     ("ui-browser.yml", "ui-manifest", "ui_manifest"),
-    *[("ci.yml", job, f"tests_{label}") for job in ("quick-test", "full-test")
+    *[("ci.yml", job, f"tests_{label}") for job in ("quick-test", "full-test-runs")
       for label in ("parallel", "serial", "size")],
 ])
 def test_actual_producer_shell_preserves_success_and_failure_exit(tmp_path, workflow, job, step, result):
     completed, args = _run_shell(_steps(workflow, job)[step], tmp_path, result=result)
     assert completed.returncode == result, completed.stderr
-    assert args.count("pytest") == 1 and "summarize" not in args
+    # One producer: pytest itself, or the owned runner that forwards its pytest arguments.
+    assert args.count("pytest") + args.count("scripts/run_tests.py") == 1 and "summarize" not in args
 
 
 OFFICIAL, FORK, TAG = "razzant/ouroboros", "someone/private-copy", "refs/tags/v7.5.2"
@@ -381,8 +394,9 @@ def test_release_floor_is_the_last_canary_step_and_enforces_only_on_an_official_
     job = _workflow(CANARY)["jobs"]["integration-test"]
     floor = job["steps"][-1]
     assert floor["name"] == "Release floor for required provider canaries"
-    # Its exit IS the floor: a tolerated or conditional step would let a tag release past it.
-    assert set(floor) == {"name", "if", "env", "run"} and floor["if"] == "${{ !cancelled() }}"
+    # Its exit IS the floor for required/all; optional-only contains no required results.
+    assert set(floor) == {"name", "if", "env", "run"}
+    assert floor["if"] == "${{ !cancelled() && inputs.scope != 'optional' }}"
     assert "secrets." not in str(floor) and list(floor["env"]) == ["FLOOR_ENFORCE"]
     # It reads the report the producer wrote, by the same path string.
     produced = re.search(r'--junitxml=("[^"]+")', _steps(CANARY, "integration-test")["provider_tests"]["run"])
@@ -397,6 +411,85 @@ def test_release_floor_is_the_last_canary_step_and_enforces_only_on_an_official_
     assert args[:3] == ["-m", "tests.provider_release_floor", "--junit"] and args[4] == "--summary"
     assert args[3].endswith("/ci-private/provider/results.xml") and args[5].endswith("summary.md")
     assert args[6:] == ([flag] if flag else [])
+
+
+EXACT = "refs/tags/v7.7.0"
+PREDICATE = "github.ref == 'refs/tags/v7.7.0' && github.repository == 'razzant/ouroboros'"
+
+
+def test_release_records_every_consumed_gate_and_names_one_exact_exception():
+    from tests.test_release_proof import release_proof
+
+    release = _workflow("ci.yml")["jobs"]["release"]
+    assert set(release["needs"]) - {"android-build"} == set(release_proof.RELEASE_GATES)
+    assemble = next(step for step in release["steps"] if step.get("name") == "Assemble release proof capsule and notes")
+    assert assemble["env"]["RELEASE_GATE_RESULTS"] == " ".join(
+        f"{name}=${{{{ needs.{name}.result }}}}" for name in release_proof.RELEASE_GATES)
+    assert 'ARGS+=(--gate-result "$GATE")' in assemble["run"]
+    # One literal predicate, equal to the proof's own constants; no other ref names the tag.
+    text = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert text.count(EXACT) == text.count(PREDICATE) == 4
+    assert (release_proof.OWNER_EXCEPTION_REPOSITORY, f"refs/tags/{release_proof.OWNER_EXCEPTION_TAG}") == (OFFICIAL, EXACT)
+    assert release_proof.OWNER_WAIVABLE_GATES == ("full-test", "system-e2e-mock", "ui-smoke")
+
+
+@pytest.mark.parametrize("ref,repository,exact", [
+    (EXACT, OFFICIAL, True), (EXACT, FORK, False), ("refs/tags/v7.7.1", OFFICIAL, False),
+    ("refs/tags/v7.7.0-rc.1", OFFICIAL, False), (TAG, OFFICIAL, False),
+])
+def test_only_the_exact_official_tag_passes_concluded_red_tests_and_it_stops_at_draft(ref, repository, exact):
+    from tests.test_windows_signing_release import expression_value
+
+    jobs = _workflow("ci.yml")["jobs"]
+    release = jobs["release"]
+    green = {"github.ref": ref, "github.repository": repository,
+             **{f"needs.{name}.result": "success" for name in release["needs"]}}
+
+    def admitted(results, cancelled=False):
+        context = {**green, "cancelled": cancelled, **{f"needs.{job}.result": r for job, r in results.items()}}
+        return bool(expression_value(release["if"], context))
+
+    assert admitted({}) and not admitted({}, cancelled=True)
+    for red in ({"full-test": "failure"}, {"system-e2e-mock": "cancelled"}, {"ui-smoke": "failure"},
+                {"full-test": "cancelled", "system-e2e-mock": "failure", "ui-smoke": "cancelled"}):
+        assert admitted(red) is exact and not admitted(red, cancelled=True)
+    for strict in ({"ui-smoke": "skipped"}, {"full-test": "skipped"}, {"system-e2e-mock": "skipped"},
+                   *({job: "failure"} for job in set(release["needs"]) - {"android-build", "full-test",
+                                                                           "system-e2e-mock", "ui-smoke"})):
+        assert not admitted({"full-test": "failure", **strict}), strict
+    names = [step.get("name") for step in release["steps"]]
+    hold = release["steps"][names.index("Hold the v7.7.0 owner-exception release at its verified draft")]
+    publish = release["steps"][names.index("Publish verified GitHub Release")]
+    assert names.index("Verify remote release tag before publish") < names.index(hold["name"]) < names.index(publish["name"])
+    assert bool(expression_value(hold["if"], green)) is exact
+    assert bool(expression_value(publish["if"], green)) is not exact
+    preflight = next(step for step in jobs["release-preflight"]["steps"]
+                     if step.get("name") == "Require test prerequisites for publication")
+    assert expression_value(preflight["env"]["V7_7_0_OWNER_EXCEPTION"], green) is exact
+
+
+@pytest.mark.parametrize("exception,full,integration,system,passes", [
+    ("true", "failure", "success", "cancelled", True), ("true", "cancelled", "success", "failure", True),
+    ("true", "success", "success", "success", True), ("true", "failure", "failure", "success", False),
+    ("true", "success", "cancelled", "success", False), ("true", "skipped", "success", "success", False),
+    ("true", "", "success", "success", False), ("true", "success", "success", "skipped", False),
+    ("false", "failure", "success", "success", False), (None, "success", "success", "failure", False),
+    ("false", "success", "success", "success", True),
+])
+def test_preflight_shell_admits_concluded_red_tests_only_under_the_exact_exception(
+        exception, full, integration, system, passes):
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("workflow shell unavailable on this host")
+    step = next(step for step in _workflow("ci.yml")["jobs"]["release-preflight"]["steps"]
+                if step.get("name") == "Require test prerequisites for publication")
+    env = {**os.environ, "FULL_TEST_RESULT": full, "INTEGRATION_RESULT": integration, "SYSTEM_E2E_RESULT": system}
+    env.pop("V7_7_0_OWNER_EXCEPTION", None)
+    if exception is not None:
+        env["V7_7_0_OWNER_EXCEPTION"] = exception
+    done = subprocess.run([bash, "-c", step["run"]], env=env, capture_output=True, text=True, timeout=10)
+    assert done.returncode == (0 if passes else 1), done.stderr
+    assert ("::warning::v7.7.0 owner exception" in done.stdout) is (passes and (full, system) != ("success", "success"))
 
 
 @pytest.mark.parametrize("selection,target", [
@@ -459,6 +552,72 @@ def test_full_lane_runs_as_four_guarded_shards_under_step_ceilings(tmp_path):
     # Browser tools keep their manual/tag condition, independent of the host lane's outcome, on one shard.
     assert "matrix.shard == 1" in tools["if"] and "steps.ui_tests" not in tools["if"]
     assert "github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')" in tools["if"]
+
+
+# The GitHub-published SHA-256 of caddy_2.11.7_linux_amd64.tar.gz; that archive's SHA-512 is the
+# line in the release's sigstore-signed caddy_2.11.7_checksums.txt.
+CADDY_SHA256 = "727b91701a392de6ebc5027509f548bf39979e5216340d0faed8fa5e69c84f8b"
+
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["pinned-bytes", "foreign-bytes"])
+def test_every_shard_installs_the_digest_pinned_official_caddy_its_lane_needs(tmp_path, pinned):
+    """tests/test_separate_ui_browser.py needs a real Caddy. Its skip without one is no reviewed
+    platform gate (the required lane fails it), so every shard installs the official release asset
+    by the digest GitHub publishes for it and hands that binary to the lane."""
+    from tests.browser_lane import permitted_skip
+    from tests.separate_ui_support import CADDY_ENV
+
+    job = _workflow("ui-browser.yml")["jobs"]["ui-shard"]
+    steps = _steps("ui-browser.yml", "ui-shard")
+    install, lane = steps["install_caddy"], steps["ui_tests"]
+    order = [step.get("id") for step in job["steps"]]
+    assert order.index("setup_python") < order.index("install_caddy") < order.index("ui_tests")
+    assert install["env"] == {"CADDY_VERSION": "2.11.7", "CADDY_SHA256": CADDY_SHA256}
+    assert "if" not in install and "continue-on-error" not in install
+    assert ("https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/"
+            "caddy_${CADDY_VERSION}_linux_amd64.tar.gz") in install["run"]
+    assert lane["env"][CADDY_ENV] == "${{ steps.install_caddy.outputs.path }}"
+    assert sum(step.get("timeout-minutes", 0) for step in job["steps"]) < job["timeout-minutes"]
+    assert not permitted_skip("tests/test_separate_ui_browser.py::test_one_tls_origin_routes_each_prefix_to_its_owner"
+                              "_and_keeps_the_password_gate", f"set {CADDY_ENV} to an absolute Caddy v2 binary")
+
+    # The step's own shell over a stand-in release: only the pinned bytes give the lane a binary.
+    bash, tar = shutil.which("bash"), shutil.which("tar")
+    if bash is None or tar is None:
+        pytest.skip("workflow shell unavailable on this host")
+    release = tmp_path / "release.tar.gz"
+    with tarfile.open(release, "w:gz") as archive:
+        for name, data, mode in (("caddy", b"#!/bin/sh\necho 'v2.11.7 h1:stand-in'\n", 0o755),
+                                 ("LICENSE", b"stand-in", 0o644)):
+            member = tarfile.TarInfo(name)
+            member.size, member.mode = len(data), mode
+            archive.addfile(member, io.BytesIO(data))
+    runner, output = tmp_path / "runner", tmp_path / "github-output"
+    runner.mkdir()
+
+    def shell_path(path):
+        # The Ubuntu runner hands the step POSIX paths. A Windows (MSYS) bash stand-in gets the
+        # same spelling from its own cygpath: GNU tar reads a native `C:\...` as a remote host.
+        if os.name != "nt":
+            return str(path)
+        return subprocess.run([bash, "-c", 'cygpath -u "$1"', "_", str(path)], capture_output=True,
+                              text=True, encoding="utf-8", timeout=10, check=True).stdout.strip()
+
+    stub = 'curl() { cp "$STAND_IN_RELEASE" "${@: -1}"; }\npython() { "$PYTHON_BIN" "$@"; }\n'
+    env = {**os.environ, "RUNNER_TEMP": shell_path(runner), "GITHUB_OUTPUT": shell_path(output),
+           "CADDY_VERSION": "2.11.7",
+           "CADDY_SHA256": hashlib.sha256(release.read_bytes()).hexdigest() if pinned else CADDY_SHA256,
+           "STAND_IN_RELEASE": shell_path(release), "PYTHON_BIN": sys.executable}
+    done = subprocess.run([bash, "-e", "-o", "pipefail", "-c", stub + install["run"]], env=env,
+                          capture_output=True, text=True, encoding="utf-8", timeout=30)
+    binary = runner / "caddy-2.11.7" / "caddy"
+    if pinned:
+        assert done.returncode == 0, done.stderr
+        assert output.read_text(encoding="utf-8") == f"path={shell_path(runner)}/caddy-2.11.7/caddy\n"
+        assert [path.name for path in binary.parent.iterdir()] == ["caddy"]
+    else:
+        assert done.returncode != 0 and "Caddy digest mismatch" in done.stderr, done.stderr
+        assert not output.exists() and not binary.exists()
 
 
 @pytest.mark.serial
@@ -619,7 +778,7 @@ def _evidence_action():
 
 
 @pytest.mark.parametrize("jobname,artifact", [
-    ("quick-test", "quick-test"), ("full-test", "full-test-${{ matrix.os }}"),
+    ("quick-test", "quick-test"), ("full-test-runs", "full-test-${{ matrix.os }}${{ runner.os == 'Windows' && format('-shard-{0}', matrix.shard) || '' }}"),
 ])
 def test_ordinary_jobs_name_their_failures_without_owning_the_result(jobname, artifact):
     job = _workflow("ci.yml")["jobs"][jobname]
@@ -634,9 +793,36 @@ def test_ordinary_jobs_name_their_failures_without_owning_the_result(jobname, ar
     evidence = next(step for step in job["steps"] if step.get("uses") == EVIDENCE_ACTION)
     assert evidence["continue-on-error"] is True and "!cancelled()" in evidence["if"]
     assert evidence["with"] == {"name": artifact, "passes": " ".join(
-        f"{label}=${{{{ steps.tests_{label}.outcome }}}}" for label in PASSES)}
+        f"{label}=${{{{ " + (f"github.event_name == 'pull_request' && (steps.tests_selected.outputs.{label}_outcome"
+                             " || steps.tests_selected.outcome) || "
+                             if jobname == "quick-test" and label != "size" else "")
+        + f"steps.tests_{label}.outcome }}}}" for label in PASSES)}
     assert job["steps"].index(evidence) > max(job["steps"].index(steps[f"tests_{label}"])
                                               for label in PASSES)
+
+
+def test_pull_requests_run_the_selected_scope_on_windows_and_macos():
+    job = _workflow("ci.yml")["jobs"]["pr-selected-os"]
+    assert "pull_request" in job["if"] and job["strategy"]["matrix"]["os"] == ["windows-latest", "macos-latest"]
+    producer = _steps("ci.yml", "pr-selected-os")["tests_selected"]
+    assert "scripts/run_tests.py --selected --base ${{ github.event.pull_request.base.sha }} --sequential" in producer["run"]
+    # Unsharded Windows cannot finish a full escalation in its ceiling; its four landed shards run it.
+    assert producer["run"].endswith("${{ runner.os == 'Windows' && '--defer-full' || '' }}")
+    evidence = next(step for step in job["steps"] if step.get("uses") == EVIDENCE_ACTION)
+    # A step killed before run_tests.py writes its outputs still reports through its own outcome.
+    assert evidence["with"]["passes"] == " ".join(
+        f"{label}=${{{{ steps.tests_selected.outputs.{label}_outcome || steps.tests_selected.outcome }}}}"
+        for label in ("parallel", "serial"))
+
+
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
+def test_every_landed_test_producer_runs_under_the_owned_runner(job):
+    """One owner per test run: the full passes and the Node lane run through scripts/run_tests.py."""
+    steps = _workflow("ci.yml")["jobs"][job]["steps"]
+    producers = [step["run"] for step in steps if step.get("id") in {"tests_parallel", "tests_serial"}]
+    node = [step["run"] for step in steps if step.get("name", "").startswith("Run browser-module tests")]
+    assert len(producers) == 2 and all(run.startswith("python scripts/run_tests.py tests/ -m ") for run in producers)
+    assert node == ["python scripts/run_tests.py --node"]
 
 
 def test_evidence_action_steps_are_independent_diagnostics():

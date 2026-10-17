@@ -16,6 +16,7 @@ from typing import Any
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.owner_source import resolve_owner_source as resolve_skill_owner_source
 from ouroboros.skill_lifecycle_queue import LifecycleJobOptions, run_lifecycle_job_blocking
+from ouroboros.skill_review_status import executable_review_requirement
 from ouroboros.skill_loader import (
     discover_skills, find_skill, grant_status_for_skill, requested_core_setting_keys,
     requested_skill_permissions, save_enabled, save_skill_grants, skill_conflict_status,
@@ -111,7 +112,8 @@ def _toggle(skill: Any, drive_root: Path, repo_path: str, enabled: bool, actor: 
         if conflict:
             return _refusal("cannot enable while conflicting skills are enabled", conflict=conflict, **facts)
         if not facts["executable_review"]:
-            return _refusal("cannot enable until review status is a fresh executable review", **facts)
+            return _refusal("cannot enable until the review gate permits the current bytes: "
+                            f"{executable_review_requirement(facts['review_gate'])}", **facts)
         if not facts["grants"].get("all_granted", True):
             return _refusal("cannot enable until requested key and permission grants are approved", **facts)
         from ouroboros.skill_dependencies import skill_deps_not_ready
@@ -146,7 +148,8 @@ def prepare_skill_grant(skill: Any, drive_root: Path, items: list[str]) -> dict:
     if not (skill.manifest.is_script() or skill.manifest.is_extension()):
         return _refusal("key and permission grants are supported for script and extension skills", 400)
     if not facts["executable_review"]:
-        return _refusal("key and permission grants require a fresh executable review", **facts)
+        return _refusal("key and permission grants need the review gate to permit the current bytes: "
+                        f"{executable_review_requirement(facts['review_gate'])}", **facts)
     allowed_keys = requested_core_setting_keys(list(skill.manifest.env_from_settings or []))
     allowed_permissions = requested_skill_permissions(skill.manifest.permissions, skill.manifest.subscribe_events)
     permissions = {value.lower(): value for value in allowed_permissions}

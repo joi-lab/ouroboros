@@ -1,7 +1,14 @@
-import { apiFetch } from './api_client.js';
+import { apiFetch, openSignIn } from './api_client.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { pageOwnedByCore } from './ws.js';
 
 export const OVERLAY_ID = 'onboarding-overlay';
+
+// Pause before an unanswered readiness check repeats on its own; it grows 1.5x
+// per attempt up to the cap, the curve the socket's state reads use. A core that
+// is down when the page loads comes back without the owner pressing anything.
+export const READINESS_RETRY_MS = 2000;
+const READINESS_RETRY_MAX_MS = 30000;
 
 // The framed wizard's sandbox policy, in one place: it is a security boundary
 // AND the thing that has to change when a wizard step needs a new capability,
@@ -62,6 +69,8 @@ function setOverlayContent(overlay, node) {
 }
 
 function showSetupFrame(overlay) {
+    const surface = document.createElement('div');
+    surface.className = 'onboarding-surface';
     const frame = document.createElement('iframe');
     frame.className = 'onboarding-frame';
     frame.title = 'Ouroboros Setup';
@@ -70,22 +79,44 @@ function showSetupFrame(overlay) {
     // inlined srcdoc document. A srcdoc string cannot import web/modules/*,
     // and the wizard's steps need those ordinary ES modules.
     frame.src = '/onboarding';
-    return setOverlayContent(overlay, frame);
+    surface.appendChild(frame);
+    if (!pageOwnedByCore()) {
+        const actions = document.createElement('div');
+        actions.className = 'onboarding-recovery';
+        const recovery = document.createElement('button');
+        recovery.type = 'button';
+        recovery.className = 'btn btn-default';
+        recovery.textContent = 'Open built-in setup';
+        recovery.setAttribute('data-onboarding-recovery', '');
+        recovery.addEventListener('click', () => { frame.src = '/onboarding?builtin=1'; });
+        actions.appendChild(recovery);
+        surface.appendChild(actions);
+    }
+    return setOverlayContent(overlay, surface);
 }
 
 /**
  * The readiness probe failed. This is NOT "no onboarding is due" — that answer
  * is a 204 and nothing else. The overlay stays up and says what happened, with
- * the only action that can resolve it.
+ * the only action that can resolve it. A repeated failure updates the same card,
+ * so a focused Try again keeps its focus.
  */
 function showReadinessFailure(overlay, detail, onRetry) {
+    const text = `Could not check whether Ouroboros is configured (${detail}). `
+        + 'Setup stays blocked until that check succeeds; it is checked again automatically.';
+    const shown = overlay.querySelector('[data-onboarding-failure]');
+    if (shown) {
+        shown.querySelector('p').textContent = text;
+        return shown;
+    }
     const card = document.createElement('section');
     card.className = 'onboarding-restart-card';
+    card.setAttribute('data-onboarding-failure', '');
     const heading = document.createElement('h2');
     heading.textContent = 'Setup unavailable';
     const copy = document.createElement('p');
-    copy.textContent = `Could not check whether Ouroboros is configured (${detail}). `
-        + 'Setup stays blocked until that check succeeds.';
+    copy.setAttribute('role', 'status');
+    copy.textContent = text;
     const retry = document.createElement('button');
     retry.type = 'button';
     retry.className = 'btn btn-primary';
@@ -142,24 +173,54 @@ export async function initOnboardingOverlay() {
     // no outcome of the request can leave the app unblocked by accident — only
     // a verified 204 takes it down.
     const overlay = mountOverlayShell();
+    let retryTimer = null;
+    let retryDelay = READINESS_RETRY_MS;
+    let probing = false;
+    let disposed = false;
+    const clearRetry = () => {
+        clearTimeout(retryTimer);
+        retryTimer = null;
+    };
 
     async function probeReadiness() {
+        // One check at a time: Try again during a pending check joins it.
+        if (probing || disposed) return;
+        probing = true;
+        clearRetry();
         try {
             // Readiness probe only: 204 means the install is structurally
             // configured and no blocking overlay is due. The wizard itself is
             // served by the /onboarding page the frame loads.
             const response = await apiFetch('/api/onboarding', { cache: 'no-store' });
+            if (disposed) return;
             if (response.status === 204) {
                 removeOverlay();
+                return;
+            }
+            // Only the core's network gate answers 401 here: this page reached
+            // the app without signing in (a separately hosted interface, or an
+            // expired session). Its sign-in returns to this page.
+            if (response.status === 401) {
+                openSignIn();
                 return;
             }
             if (!response.ok) throw new Error(`HTTP ${response.status}`);
             showSetupFrame(overlay);
         } catch (error) {
+            if (disposed) return;
             console.error('Failed to load onboarding overlay:', error);
             showReadinessFailure(overlay, String(error?.message || error || 'unknown error'), probeReadiness);
+            retryTimer = setTimeout(probeReadiness, retryDelay);
+            retryDelay = Math.min(Math.round(retryDelay * 1.5), READINESS_RETRY_MAX_MS);
+        } finally {
+            probing = false;
         }
     }
 
     await probeReadiness();
+    return () => {
+        disposed = true;
+        clearRetry();
+        window.removeEventListener('message', handleMessage);
+    };
 }

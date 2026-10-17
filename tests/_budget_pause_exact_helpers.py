@@ -24,6 +24,8 @@ def _install_queue(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
     monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "MAX_WORKERS", 1)
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr(queue, "PENDING", workers.PENDING)
     monkeypatch.setattr(queue, "RUNNING", workers.RUNNING)
     queue.BUDGET_ROOT_FENCES.clear()

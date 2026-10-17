@@ -11,11 +11,11 @@ Pins the "ghost subagent" / status-corruption protections:
 - normal forward progress and same-status enrichment are unaffected
 """
 
-import json
 
 import pytest
 
 from ouroboros import task_results as tr
+from tests._store_shared import seed_result
 
 
 @pytest.fixture()
@@ -99,9 +99,8 @@ def test_root_retry_transition_uses_merged_lineage(drive):
 def test_terminal_enrichment_cannot_adopt_a_historical_result(drive, projector):
     from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 
-    path = tr.task_result_path(drive, "historical")
-    path.write_text(json.dumps({"_schema_version": tr.TASK_RESULT_SCHEMA_VERSION,
-                               "task_id": "historical", "status": tr.STATUS_COMPLETED}), encoding="utf-8")
+    seed_result(drive, "historical", {"_schema_version": tr.TASK_RESULT_SCHEMA_VERSION,
+                               "task_id": "historical", "status": tr.STATUS_COMPLETED})
 
     def enrich(_current, fields):
         return {**fields, "canonical_terminal_projection_origin": "terminal_transition"}
@@ -149,7 +148,10 @@ def test_writer_selects_current_review_before_locked_projector(drive):
     calls = []
 
     def project(current, fields):
-        assert (drive / "task_results" / "review.json.lock").exists()
+        from ouroboros import store
+        with pytest.raises(store.StoreBusy):  # the projector runs inside the write transaction
+            with store.open_store(drive, write=True, wait_sec=0.0):
+                pass
         assert fields["review_projection"] == current["review_projection"] == {"panels": [panel]}
         calls.append(True)
         return {**fields, "status": current["status"], "review_projection": {
@@ -239,17 +241,18 @@ def test_updated_at_is_written(drive):
     assert tr.load_task_result(drive, "t").get("updated_at")
 
 
-def test_lock_timeout_never_falls_back_to_an_unlocked_authoritative_write(
+def test_a_busy_store_never_falls_back_to_an_unlocked_authoritative_write(
     drive, monkeypatch,
 ):
-    """A timeout preserves prior lifecycle truth instead of accepting stale state."""
+    """A busy store preserves prior lifecycle truth instead of accepting stale state."""
+    from ouroboros.store import StoreBusy
     tr.write_task_result(drive, "locked", tr.STATUS_RUNNING, result="working")
 
-    def _timeout(*_args, **_kwargs):
-        raise TimeoutError("held by concurrent writer")
+    def _busy(*_args, **_kwargs):
+        raise StoreBusy("held by concurrent writer")
 
-    monkeypatch.setattr(tr, "update_json_locked", _timeout)
-    with pytest.raises(TimeoutError, match="concurrent writer"):
+    monkeypatch.setattr(tr, "patch_document", _busy)
+    with pytest.raises(StoreBusy, match="concurrent writer"):
         tr.write_task_result(drive, "locked", tr.STATUS_COMPLETED, result="done")
 
     stored = tr.load_task_result(drive, "locked")
@@ -272,16 +275,17 @@ def test_llm_project_name_uses_cleaned_model_title():
     assert name == "Cyber Racing Arena", f"expected cleaned title, got {name!r}"
 
 
-def test_read_paths_do_not_create_task_results_dir(tmp_path):
-    """v6.40.0: a READ/LIST scan of a never-provisioned root must NOT materialise the
-    ``task_results`` directory (regression: an unguarded scan created stray dirs)."""
+def test_read_paths_create_nothing_under_a_never_provisioned_root(tmp_path):
+    """A READ/LIST of a root that does not exist answers empty and materialises nothing (no
+    ``task_results`` directory, no store); a WRITE provisions the store, not the directory."""
+    from ouroboros import store
     root = tmp_path / "never_provisioned"
     assert tr.list_task_results(root) == []
     assert tr.load_task_result(root, "missing") is None
-    assert not (root / "task_results").exists(), "read must not create the dir"
-    # WRITE still provisions it.
+    assert not root.exists(), "read must not create the root"
     tr.write_task_result(root, "t", tr.STATUS_SCHEDULED)
-    assert (root / "task_results").is_dir()
+    assert store.store_path(root).is_file() and not (root / "task_results").exists()
+    assert tr.load_task_result(root, "t")["status"] == tr.STATUS_SCHEDULED
 
 
 def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):

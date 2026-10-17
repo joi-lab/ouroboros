@@ -14,6 +14,7 @@ import pytest
 
 from tests import test_ui_smoke_playwright as ui
 from tests.candidate_checkout import SENTINEL_ROUTE
+from tests._store_shared import read_result
 
 pytestmark = [pytest.mark.serial, pytest.mark.ui_browser]
 
@@ -77,9 +78,8 @@ def _running_ids(data_dir: Path) -> set:
 
 
 def _terminal_result(data_dir: Path, task_id: str):
-    path = data_dir / "task_results" / f"{task_id}.json"
     try:
-        row = json.loads(path.read_text(encoding="utf-8"))
+        row = read_result(data_dir, task_id)
     except (OSError, ValueError):
         return None
     return row if row.get("status") in {"completed", "failed", "cancelled", "rejected_duplicate"} else None

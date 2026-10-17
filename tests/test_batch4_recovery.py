@@ -8,6 +8,8 @@ import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
 from tests.test_owner_continue import _interrupted, NONCE
+from tests._usage_store_testing import ledger_rows
+from tests._store_shared import read_result, seed_result
 
 
 def test_publication_failure_cannot_dispatch_and_replay_repairs_same_action(tmp_path, monkeypatch):
@@ -43,15 +45,13 @@ def test_publication_failure_cannot_dispatch_and_replay_repairs_same_action(tmp_
 
 def test_no_initial_cap_continues_under_the_configured_cap_disclosed(tmp_path, monkeypatch):
     """A legacy predecessor that recorded no cap stays its own group under today's cap, named as such."""
-    from ouroboros.task_results import task_result_path
     from supervisor.continuation_admission import admit_continuation
 
     _queue, _state, workers = _install_queue(tmp_path, monkeypatch)
     _interrupted(tmp_path)
-    path = task_result_path(tmp_path, "pred-1")
-    row = json.loads(path.read_text())
+    row = read_result(tmp_path, "pred-1")
     row.pop("billing_group")
-    path.write_text(json.dumps(row))
+    seed_result(tmp_path, "pred-1", row)
     monkeypatch.setenv("OUROBOROS_PER_TASK_COST_USD", "999")
     assert admit_continuation("pred-1", action_nonce=NONCE)["ok"]
     binding = workers.PENDING[0]["metadata"]["continuation"]
@@ -145,7 +145,7 @@ def test_physical_claim_linearizes_with_pause_without_network_lock(tmp_path, mon
         else:
             assert future.result(timeout=4) == "response" and sent
     with ua._locked(tmp_path):
-        rows = list(ua._final_rows(ua._read_records_locked(tmp_path)).values())
+        rows = list({row['attempt_id']: row for row in ledger_rows(tmp_path)}.values())
     assert rows[-1]["state"] == ("released" if pause_before_claim else "settled")
 
 
@@ -168,11 +168,11 @@ def test_tool_body_is_owned_before_pause_and_until_its_return(tmp_path):
         assert entered.wait(4)
         try:
             install_fence(tmp_path, "root", request_id="pause")
-            assert load_task_result(tmp_path, "root")["launch_handoffs"]
+            assert load_task_result(tmp_path, "root").get("launch_handoffs", {})
         finally:
             release.set()
         assert future.result(timeout=4).text == "done"
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
     assert registry.execute_result("knowledge_read", {"topic": "x"}).code == "OWNER_PAUSE_NOT_STARTED"
 
 
@@ -194,8 +194,11 @@ def test_warm_sleep_refuses_selected_root_blocked_by_its_project_lease(tmp_path)
     ctx.project_id = "project"
     _result(tmp_path, "other-root", "scheduled", project_id="project")
     chosen = selectors(ctx, tasks=["other-root"])
-    with pytest.raises(ValueError, match="project lease"):
+    with pytest.raises(ValueError):
         request_sleep(ctx, chosen, "warm")
+    assert not getattr(ctx, "_model_sleep", None)
+    _result(tmp_path, "other-root", "scheduled", project_id="other-project")
+    assert request_sleep(ctx, chosen, "warm")["reason"] == "sleep_armed"
 
 
 def test_cold_sleep_retains_unknown_child_start_after_result_collection(tmp_path):
@@ -258,14 +261,15 @@ def test_zero_dispatch_hold_survives_malformed_snapshot_fences(tmp_path, monkeyp
     assert load_task_result(tmp_path, "zero")["status"] == "scheduled"
 
 
-def test_corrupt_pause_authority_refuses_repeated_real_tool_launches(tmp_path):
+def test_unreadable_pause_authority_refuses_repeated_real_tool_launches(tmp_path, monkeypatch):
     from ouroboros.owner_pause import install_fence
-    from ouroboros.task_results import write_task_result, task_result_path
+    from ouroboros.task_results import write_task_result
     from ouroboros.tools.registry import ToolRegistry
+    from tests._store_shared import unreadable_result
 
     write_task_result(tmp_path, "root", "running")
     install_fence(tmp_path, "root", request_id="pause")
-    task_result_path(tmp_path, "root").write_text('{broken')
+    unreadable_result(monkeypatch, "root")
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path)
     registry._ctx.task_id = registry._ctx.root_task_id = "root"
     registry.override_handler("knowledge_read", lambda *a, **kw: pytest.fail("body launched"))

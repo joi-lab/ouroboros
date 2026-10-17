@@ -9,12 +9,32 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from ouroboros.gateway.logs import api_logs_tail
+from tests._store_shared import seed_result
 
 
 def _app(data):
     app = Starlette(routes=[Route("/api/logs/{name}", endpoint=api_logs_tail, methods=["GET"])])
     app.state.drive_root = data
     return app
+
+
+def test_logs_tail_preserves_nullable_and_historical_token_rows(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    rows = [
+        {"ts": "2026-01-01T00:00:00Z", "type": "llm_usage", "task_id": "t1",
+         "prompt_tokens": 0, "completion_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0},
+        {"ts": "2026-10-09T00:00:00Z", "type": "llm_usage", "task_id": "t1", "root_task_id": "root",
+         "record_contract_version": 2, "provider": "claudexor", "session_id": "session",
+         "prompt_tokens": None, "completion_tokens": 0, "cached_tokens": 12, "cache_write_tokens": None,
+         "claudexor": {"run_id": "run"}},
+    ]
+    (logs / "events.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    entries = TestClient(_app(tmp_path)).get("/api/logs/events?limit=10").json()["entries"]
+    assert len(entries) == 2
+    for original, observed in zip(rows, entries):
+        assert all(observed[key] == value for key, value in original.items())
+    assert "record_contract_version" not in entries[0]
 
 
 def test_logs_tail_backfills_from_rotated_progress_archive(tmp_path):
@@ -160,11 +180,8 @@ def test_logs_tail_task_filter_counts_toward_backfill_quota(tmp_path):
         encoding="utf-8",
     )
     (data / "task_results").mkdir()
-    (data / "task_results" / "target.json").write_text(
-        json.dumps({"task_id": "target", "status": "completed", "result": "done"}),
-        encoding="utf-8",
-    )
-    (data / "state").mkdir()
+    seed_result(data, "target", {"task_id": "target", "status": "completed", "result": "done"})
+    (data / "state").mkdir(exist_ok=True)
     (data / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
 
     payload = TestClient(_app(data)).get("/api/logs/progress?task_id=target&limit=2").json()
@@ -225,11 +242,8 @@ def test_logs_tail_task_discovery_does_zero_artifact_work(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     (data / "task_results").mkdir()
-    (data / "task_results" / "target.json").write_text(
-        json.dumps({"task_id": "target", "status": "completed", "result": "done"}),
-        encoding="utf-8",
-    )
-    (data / "state").mkdir()
+    seed_result(data, "target", {"task_id": "target", "status": "completed", "result": "done"})
+    (data / "state").mkdir(exist_ok=True)
     (data / "state" / "queue_snapshot.json").write_text('{"pending": [], "running": []}', encoding="utf-8")
     calls = []
     monkeypatch.setattr(artifacts_mod, "collect_task_artifact_records", lambda *a, **k: calls.append("collect") or [])

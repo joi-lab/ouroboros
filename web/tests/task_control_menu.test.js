@@ -14,6 +14,7 @@ import {
     ACTION_STOP_NOW,
     TASK_CONTROL_LABELS,
     TASK_CONTROL_TRIGGER_LABEL,
+    heldWorkFacts,
     hurryRequestId,
     isRootTaskRow,
     pauseTaskAction,
@@ -58,7 +59,9 @@ test('Pause retries an unknown answer with the same id, then a new action gets a
     assert.equal(calls[0][1], calls[1][1], 'a retry reuses the SAME request id');
     assert.notEqual(calls[1][1], calls[2][1], 'a new owner Pause after Resume is a NEW action');
     assert.match(calls[0][1], /^pause-/);
-    assert.match(toasts[1][0], /^Pausing: .*work already sent finishes/);
+    // Owner S1: Pause abandons a model answer still awaited; it never promises sent work finishes.
+    assert.match(toasts[1][0], /^Pausing: new work is stopped; running work stops at its last saved point\. Reviews already started finish separately\.$/);
+    assert.doesNotMatch(toasts[1][0], /already sent|then the tree is saved/);
     assert.match(toasts[3][0], /^Paused: the whole task tree is saved/);
     assert.equal(await pauseTaskAction('root-2', { pause: async () => { throw new Error('cancel_pending'); }, toast }), false);
     assert.match(toasts.at(-1)[0], /^Pause refused: cancel_pending/);
@@ -113,7 +116,7 @@ test('a durable Pause with a pending queue latch is never reported refused; the 
     assert.equal(await pauseTaskAction('latch-1', { pause: completes, toast, wait }), true);
     assert.equal(ids.length, 3);
     assert.equal(new Set(ids).size, 1, 'every completion retry reuses the SAME request id');
-    assert.match(toasts.at(-1)[0], /^Pausing: .*work already sent finishes/);
+    assert.match(toasts.at(-1)[0], /^Pausing: new work is stopped; running work stops at its last saved point/);
     assert.equal(toasts.length, 1);
     // Never confirmed within the bound: still accepted and truthful; the id is kept.
     const stuck = [];
@@ -175,11 +178,14 @@ test('the hurry path never creates a chat bubble in either surface', () => {
 // --- both surfaces share the ONE control module (owner parity) ---
 
 test('Chat and Activity both wire the shared dropdown', () => {
-    for (const source of [chat, activity]) {
-        assert.match(source, /openTaskControlMenu\(/);
-        assert.match(source, /hurryTaskAction\(/);
-        assert.match(source, /requestStop\(/);
-    }
+    // Chat and its room header share the record-aware adapter. Activity still
+    // calls the same lower-level dropdown; the adapter owns its effect wiring.
+    assert.match(chat, /openTaskControls\(/);
+    // Exact adapter effects are exercised in test_room_work_review_browser.py;
+    // finding its own function names inside the adapter would prove nothing.
+    assert.match(activity, /openTaskControlMenu\(/);
+    assert.match(activity, /hurryTaskAction\(/);
+    assert.match(activity, /requestStop\(/);
     // The trigger renders the shared label on both surfaces.
     assert.match(chat, /TASK_CONTROL_TRIGGER_LABEL/);
     assert.match(activity, /TASK_CONTROL_TRIGGER_LABEL/);
@@ -255,7 +261,8 @@ test('isRootTaskRow mirrors the server lineage rule (task_results.resolve_task_l
 });
 
 test('Activity marks root rows and hides Pause for a child; Chat cards stay root-only', () => {
-    assert.match(activity, /isRootTaskRow\(t, q\.id \|\| t\.id\) \? ' data-root="1"' : ''/);
+    // A compact retry row can omit lineage; its own root-only census identity still counts.
+    assert.match(activity, /phases\.has\(ownId\) \|\| isRootTaskRow\(t, ownId\)/);
     assert.match(activity, /wholeTree: btn\.dataset\.root === '1'/);
     // Census rows are roots (the census lists root activities only).
     assert.match(activity, /data-id="\$\{esc\(a\.activity_id \|\| ''\)\}" data-root="1"/);
@@ -286,4 +293,43 @@ test('Stop producer reuses uncertain action identity and distinguishes acknowled
         assert.equal(calls[1].stop_policy, undefined); // immediate legacy encoding
         assert.ok(calls.every(call => call.cascade === true));
     } finally { globalThis.fetch = oldFetch; }
+});
+
+// --- #1721: a held Continue names what the census observed ---
+
+const UNBOUND = { kind: 'delegated_run', task_id: 'pred-1', run_id: '', invocation_id: 'inv-1', review_owned: false,
+    state: 'stop_unknown', stop_outcome: 'pending_invocation_unbound', source: 'delegated_subagent' };
+const RUNNING = { kind: 'delegated_run', task_id: 'pred-1', run_id: 'run-leaf', invocation_id: '', review_owned: false,
+    state: 'running', stop_outcome: '', source: 'delegated_subagent' };
+
+test('held-work facts say what is known, and an unknown start is never called running', () => {
+    assert.equal(heldWorkFacts([UNBOUND]), 'a delegated start has an unknown outcome (no run was recorded)');
+    assert.equal(heldWorkFacts([RUNNING]), 'delegated run run-leaf is running');
+    assert.equal(heldWorkFacts([{ kind: 'running_member', task_id: 'c-1' }, { kind: 'custody_unreadable', task_id: 'x' },
+        { kind: 'attempt_custody_unreadable' }]), 'task c-1 is still running; its custody record could not be read');
+    assert.equal(heldWorkFacts([{ kind: 'some_future_kind' }]), 'some_future_kind', 'a kind with no sentence stays raw');
+    assert.equal(heldWorkFacts([1, 2, 3, 4].map((n) => ({ kind: 'running_member', task_id: `c-${n}` }))),
+        'task c-1 is still running; task c-2 is still running; task c-3 is still running; and 1 more');
+    // The server sends the whole census: a model request listed after 21 running runs is counted.
+    const census = [...Array.from({ length: 21 }, (_, n) => ({ kind: 'delegated_run', run_id: `run-${n}`, state: 'running' })),
+        { kind: 'model_handoff' }];
+    assert.equal(heldWorkFacts(census),
+        'delegated run run-0 is running; delegated run run-1 is running; delegated run run-2 is running; and 19 more');
+    assert.ok(heldWorkFacts(census, 22).endsWith('; a model request has no recorded result'));
+    assert.equal(heldWorkFacts(null), '');
+});
+
+test('a refused Resume of a held Continue toasts its facts, with wait-or-stop only for running work', async () => {
+    const toasts = [];
+    const toast = (text, kind) => toasts.push([text, kind]);
+    const refuse = (body) => async () => { throw Object.assign(new Error(body.error), { status: 409, body }); };
+    await resumeTaskAction('succ-1', { resume: refuse({ error: 'predecessor_writers_unsettled', blockers: [UNBOUND] }), toast });
+    await resumeTaskAction('succ-2', { resume: refuse({ error: 'predecessor_writers_unsettled', blockers: [RUNNING],
+        action: 'wait_or_stop_the_previous_work' }), toast });
+    await resumeTaskAction('succ-3', { resume: refuse({ error: 'replay_unsafe' }), toast });
+    assert.deepEqual(toasts, [
+        ['Resume refused: a delegated start has an unknown outcome (no run was recorded).', 'error'],
+        ['Resume refused: delegated run run-leaf is running. Wait for that work or stop it.', 'error'],
+        ['Resume refused: replay_unsafe', 'error'],
+    ]);
 });

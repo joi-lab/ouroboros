@@ -27,6 +27,7 @@ from ouroboros.tools.chronicle import (
     _chronicle_write, _memory_mark, _memory_read, check_quotes, host_stamp, page_covers,
 )
 from ouroboros.tools.registry import ToolContext
+from tests._store_shared import result_exists, seed_result
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 LIMIT = tool_result_limit("memory_read")
@@ -242,6 +243,51 @@ def test_note_is_written_and_a_later_page_of_its_task_covers_it_once(tmp_path):
     assert later["ok"] and later["notes"] == 0
 
 
+def test_a_page_up_to_an_address_seals_exactly_the_rooms_open_rows_to_it(tmp_path):
+    """``covers: {to}`` alone takes the rows the view counts as open (``memory_inventory.open_room_rows``: after
+    the legacy frontier, outside what pages already seal) up to the address inclusive. The old-memory era before
+    the frontier (positions 0-9 here) stays out though the mind never named a ``from``; a row that came after the
+    address stays open; rows an earlier page sealed are left out, not refused; an empty selection publishes
+    nothing. ``{from, to}`` and ``{task_ids}`` behave as before, ``already_sealed`` included."""
+    from ouroboros import memory_inventory as mi
+    from ouroboros.chronicle_import import legacy_frontier
+    from tests import _memory_inventory_shared as shared
+
+    shared.world(tmp_path)
+    store, ctx = ChronicleStore(tmp_path), ctx_for(tmp_path)
+    assert legacy_frontier(store)["pos"] == 10
+    at = {pos: chat_chain.format_address(address) for address, _row, pos in chat_chain.iter_rows(tmp_path)}
+    shas = {pos: address["row_sha256"] for address, _row, pos in chat_chain.iter_rows(tmp_path)}
+    open_main = lambda: [pos for _address, _meta, pos in mi.open_room_rows(tmp_path, "1")]  # noqa: E731
+    assert open_main() == [10, 11, 12, 15, 16, 18, 19]  # the transport's row 15 is Main's too; 17 is the hidden chat's
+    first = write(ctx, kind="page", text="The morning began.", covers={"to": at[12]})
+    assert first["ok"] and first["rows"] == 3 and (first["first"], first["last"]) == (at[10], at[12])
+    page = store.get(first["node_id"])
+    assert page["covers"]["rows"] == [shas[10], shas[11], shas[12]]  # not 0, 1 or 5 of the era before the frontier
+    assert page["covers"]["mode"] == "open_to" and page["covers"]["request"] == {"to": at[12]}
+    assert page["covers"]["stream_span"] == [10, 12] and open_main() == [15, 16, 18, 19]
+    # A row arrives after the address the mind read to, and a task's page seals row 15 meanwhile: the next
+    # "up to here" leaves the late row open and skips the sealed one instead of refusing.
+    at[20] = addr(chat(tmp_path, [{"chat_id": 1, "direction": "in", "ts": "2026-09-03T00:10:00+00:00",
+                                   "text": "and later", "client_message_id": "m-late"}])[0])
+    by_task = write(ctx, kind="page", text="What I sent the transport.", covers={"task_ids": ["t3"]})
+    tasks = store.get(by_task["node_id"])["covers"]
+    assert by_task["ok"] and (tasks["rows"], tasks["mode"]) == ([shas[15]], "tasks") and open_main() == [16, 18, 19, 20]
+    second = write(ctx, kind="page", text="The rest of the morning.", covers={"to": at[19]})
+    assert second["ok"] and second["rows"] == 3 and (second["first"], second["last"]) == (at[16], at[19])
+    assert store.get(second["node_id"])["covers"]["rows"] == [shas[16], shas[18], shas[19]] and open_main() == [20]
+    # Nothing open up to an address already sealed: no page, and the head does not move.
+    empty = _chronicle_write(ctx, kind="page", text="nothing", covers={"to": at[12]})
+    assert "TOOL_ARG_ERROR" in empty and "covers resolve to no open row of room 1" in empty
+    assert store.room_head("1") == store.get(second["node_id"])["sequence"]
+    # {from, to} still seals the named range and refuses what a page already holds; both forms at once are refused.
+    again = write(ctx, kind="page", text="dup", covers={"from": at[15], "to": at[16]})
+    assert again["ok"] is False and again["reason"] == "already_sealed"
+    late = write(ctx, kind="page", text="the late word", covers={"from": at[20], "to": at[20]})
+    assert late["rows"] == 1 and store.get(late["node_id"])["covers"]["mode"] == "range" and open_main() == []
+    assert "not both" in _chronicle_write(ctx, kind="page", text="x", covers={"to": at[20], "task_ids": ["t2"]})
+
+
 def test_default_room_is_own_room_and_chat_id_zero_is_an_address(tmp_path):
     assert write(ctx_for(tmp_path, current_chat_id=0), kind="note", text="hidden")["room_id"] == "0"
     meta_only = ctx_for(tmp_path, current_chat_id=None, task_metadata={"chat_id": 0})
@@ -352,7 +398,6 @@ def test_an_install_without_any_lineage_row_attributes_old_outgoing_rows_by_task
     outgoing row was mine, so the task results decide and the rest is unattributed. Rows written
     after activation carry lineage when a child wrote them, so a lineage-free one is mine."""
     from ouroboros.task_result_schema import SCHEMA_VERSION_KEY, TASK_RESULT_SCHEMA_VERSION
-    from ouroboros.task_results import task_result_path
 
     rows = chat(tmp_path, [
         {"chat_id": 1, "direction": "in", "ts": ts(1), "text": "Review the patch."},
@@ -363,9 +408,8 @@ def test_an_install_without_any_lineage_row_attributes_old_outgoing_rows_by_task
     ])
     for task_id, fields in (("root0001", {}), ("kid00002", {"parent_task_id": "root0001", "root_task_id": "root0001",
                                                              "delegation_role": "subagent"})):
-        task_result_path(tmp_path, task_id).write_text(json.dumps({
-            SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id, "status": "completed", **fields}),
-            encoding="utf-8")
+        seed_result(tmp_path, task_id, {
+            SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id, "status": "completed", **fields})
     ctx = ctx_for(tmp_path)
     lines = _memory_read(ctx, rows=True).split("\n")[2:]
     assert lines[1].startswith(f"[{ts(2)}; outgoing, author not recorded; {addr(rows[1])}]")
@@ -658,11 +702,9 @@ def test_mark_view_and_release_including_an_imported_nomination(tmp_path):
 
 def test_host_stamp_prefers_terminal_then_host_facts_then_task_result(tmp_path):
     from ouroboros.task_result_schema import SCHEMA_VERSION_KEY, TASK_RESULT_SCHEMA_VERSION
-    from ouroboros.task_results import task_result_path
 
-    path = task_result_path(tmp_path, "fromfile", create=True)
-    path.write_text(json.dumps({SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": "fromfile",
-                                "status": "cancelled"}), encoding="utf-8")
+    seed_result(tmp_path, "fromfile", {SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": "fromfile",
+                                "status": "cancelled"})
     facts = {"type": "task_summary", "summary_kind": "host_task_facts", "task_id": "both", "status": "completed",
              "outcome": "Done", "outcome_phase": "done"}
     terminal = {**facts, "summary_kind": "terminal_root_projection", "status": "failed", "outcome_phase": "error"}
@@ -673,7 +715,7 @@ def test_host_stamp_prefers_terminal_then_host_facts_then_task_result(tmp_path):
     assert by_task["facts"]["source"] == "host_task_facts"
     assert by_task["fromfile"]["source"] == "task_results" and by_task["fromfile"]["status"] == "cancelled"
     assert by_task["nowhere"] == {"task_id": "nowhere", "status": "not_recorded"}
-    assert path.exists()  # the strict read never moves a result
+    assert result_exists(tmp_path, "fromfile")  # the strict read never moves a result
 
 
 def test_tools_module_imports_no_retired_memory_machinery_and_lazy_domains_stay_lazy():
@@ -691,6 +733,17 @@ def test_tools_module_imports_no_retired_memory_machinery_and_lazy_domains_stay_
     lazy = {"ouroboros.dialogue_evidence", "ouroboros.project_dialogue", "ouroboros.projects_registry",
             "ouroboros.terminal_projection", "ouroboros.artifacts"}
     assert lazy <= nested and not lazy & top
+
+
+def test_the_write_and_read_schemas_carry_account_selection_and_revision():
+    from ouroboros.tools.chronicle import chronicle_tools
+
+    schemas = {entry.name: entry.schema["parameters"]["properties"] for entry in chronicle_tools()}
+    assert schemas["chronicle_write"]["kind"]["enum"] == ["page", "part", "note", "correction", "decision", "account", "selection"]
+    assert {"sources", "replaces", "shown"} <= set(schemas["chronicle_write"])
+    assert schemas["chronicle_write"]["sources"]["type"] == "array" and schemas["chronicle_write"]["shown"]["type"] == "boolean"
+    assert schemas["memory_read"]["revision"]["type"] == "string"
+    assert "author" not in schemas["chronicle_write"] and "told_by" not in schemas["chronicle_write"]
 
 
 # --- through the registry (root task) --------------------------------------------------------------

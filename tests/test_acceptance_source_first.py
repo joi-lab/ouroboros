@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("provider_catalog_offline")
+
 from ouroboros import loop as loop_mod
 from tests.test_acceptance_delivery import (
     _ACCEPTANCE_PACKET,
@@ -36,6 +38,7 @@ from tests.test_acceptance_delivery import (
     _roots,
     _tool_call,
 )
+from tests._review_substrate_shared import user_text as _user_text
 
 _OVERFLOW = {**_ACCEPTANCE_PACKET, "__immutable_core_overflow__": {"reason": "owner requirements exceed the budget"}}
 _SOURCE_PATH = re.compile(r'path="(source_handles/context_checkpoints/acceptance-packet-[0-9a-f]{64}\.json)"')
@@ -47,7 +50,7 @@ class _ReadingLLM(_EpisodeLLM):
     def _reply(self, kwargs):
         self.calls.append(dict(kwargs))
         if "tools" in kwargs and len([c for c in self.calls if "tools" in c]) == 1:
-            prompt = kwargs["messages"][-1]["content"]
+            prompt = _user_text(kwargs["messages"][-1]["content"])
             path = _SOURCE_PATH.search(prompt).group(1)
             reply = {"tool_calls": [_tool_call("read_file", {"root": "artifact_store", "path": path})]}
         else:
@@ -89,7 +92,7 @@ def test_overflow_refuses_the_packet_row_and_the_native_row_reads_the_exact_sour
     assert "TRAJECTORY-RESULT-3-passed" in tool_result and "PREVIEW-BYTES-OF-THE-ARTIFACT" in tool_result
 
 
-def test_a_native_row_over_its_own_window_gets_the_compact_send_without_overflow(monkeypatch, tmp_path):
+def test_a_native_row_over_its_layout_hint_gets_the_compact_send_without_overflow(monkeypatch, tmp_path):
     from ouroboros import review_native_episode
 
     _offline_env(monkeypatch, _ROW_NATIVE)
@@ -102,9 +105,33 @@ def test_a_native_row_over_its_own_window_gets_the_compact_send_without_overflow
     assert result.actors[0]["parsed"]["verdict"] == "PASS"
     (request,) = seen
     delivery = request.slot_source_delivery["t_actor"]
-    assert delivery["status"] == "paged" and delivery["reason"] == "the whole first send does not fit this row"
+    assert delivery["status"] == "paged" and delivery["reason"] == "the whole first send exceeds this row's initial layout hint"
     assert delivery["first_send_chars"] < delivery["first_send_ceiling"] < delivery["inline_first_send_chars"]
     assert "+line\n+line" not in json.dumps(llm.calls[0]["messages"])
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_native_compact_send_above_layout_hint_still_dispatches_and_reads_source(monkeypatch, tmp_path, overflow):
+    from ouroboros import review_native_episode
+    from ouroboros.artifacts import read_actor_source_bytes
+
+    _offline_env(monkeypatch, _ROW_NATIVE)
+    governance, workspace = _roots(tmp_path)
+    monkeypatch.setattr(review_native_episode, "native_episode_transcript_bound", lambda *a, **k: 1000)
+    llm = _ReadingLLM(tmp_path, [])
+    seen = _real_panel(monkeypatch, llm)
+    result = _panel(tmp_path, dict(_OVERFLOW if overflow else _ACCEPTANCE_PACKET), workspace, governance)
+    assert result.aggregate_signal == "PASS", result.actors
+    (request,) = seen
+    delivery = request.slot_source_delivery["t_actor"]
+    assert delivery["status"] == "paged"
+    assert delivery["first_send_chars"] > delivery["first_send_ceiling"]
+    source = json.loads(read_actor_source_bytes(delivery["reader_root"], request.task_id, delivery["source"]))
+    assert source["evidence"] == request.evidence
+    native = [call for call in llm.calls if "tools" in call]
+    assert len(native) == 2
+    returned = json.dumps([m for m in native[1]["messages"] if m.get("role") == "tool"])
+    assert "TRAJECTORY-RESULT-3-passed" in returned and "PREVIEW-BYTES-OF-THE-ARTIFACT" in returned
 
 
 def test_a_small_panel_keeps_its_inline_delivery(monkeypatch, tmp_path):
@@ -213,12 +240,12 @@ def test_session_consumer_reads_exact_retained_file_without_attachments(monkeypa
 
 
 def test_complete_compact_send_must_fit_even_without_packet_overflow(monkeypatch, tmp_path):
-    from ouroboros.tools import scope_review_session
+    from ouroboros.tools import review_brief_coupling
 
     fake = _fake_session(monkeypatch)
     _offline_env(monkeypatch, _ROW_SESSION)
     governance, workspace = _roots(tmp_path)
-    monkeypatch.setattr(scope_review_session, "SESSION_INLINE_DIFF_CEILING_CHARS", 1_000)
+    monkeypatch.setattr(review_brief_coupling, "SESSION_INLINE_DIFF_CEILING_CHARS", 1_000)
     _real_panel(monkeypatch, _EpisodeLLM(tmp_path, []))
     result = _panel(tmp_path, dict(_ACCEPTANCE_PACKET), workspace, governance)
     assert result.aggregate_signal != "PASS"
@@ -384,7 +411,7 @@ def test_native_consumer_reports_lost_retained_reader_without_switching_to_packe
                 from ouroboros.review_native_episode import _wire_size
                 self.first_send_chars = _wire_size(kwargs["messages"], kwargs["tools"])
                 shutil.rmtree(Path(request.policy["native_data_root"]))
-                path = _SOURCE_PATH.search(kwargs["messages"][-1]["content"]).group(1)
+                path = _SOURCE_PATH.search(_user_text(kwargs["messages"][-1]["content"])).group(1)
                 reply = {"tool_calls": [
                     _tool_call("read_file", {"root": "artifact_store", "path": path}, "source"),
                     _tool_call("read_file", {"path": "greeting.txt"}, "workspace")]}
@@ -421,7 +448,7 @@ def test_native_consumer_reports_lost_retained_reader_without_switching_to_packe
 
 def test_session_rechecks_actual_request_after_packet_retention(monkeypatch, tmp_path):
     from ouroboros.review_substrate import run_review_request
-    from ouroboros.tools import scope_review_session
+    from ouroboros.tools import review_brief_coupling
 
     fake = _fake_session(monkeypatch)
     request, slot, _author, canonical, _workspace = _prepared_request(tmp_path)
@@ -431,7 +458,7 @@ def test_session_rechecks_actual_request_after_packet_retention(monkeypatch, tmp
     retain = acceptance_retrieving.retain_review_source
     def smaller_dispatch_window(*args):
         retain(*args)
-        monkeypatch.setattr(scope_review_session, "SESSION_INLINE_DIFF_CEILING_CHARS", 1000)
+        monkeypatch.setattr(review_brief_coupling, "SESSION_INLINE_DIFF_CEILING_CHARS", 1000)
     monkeypatch.setattr(acceptance_retrieving, "retain_review_source", smaller_dispatch_window)
     result = run_review_request(request, slots=[slot], drive_root=canonical, llm=_EpisodeLLM(canonical, []))
     assert result.aggregate_signal != "PASS"

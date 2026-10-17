@@ -33,6 +33,7 @@ import math
 import os
 import pathlib
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -72,7 +73,7 @@ MAX_LANES = 6
 STAGGER_BOUNDS = (2.0, 3.0)
 # The commit gate's hermetic pytest pass runs INSIDE each lane server and resolves ``-n auto`` to the host's
 # CPU count (128 here) with no ceiling: the paid run of 2026-09-04 started >= 104 xdist workers per self-mod
-# lane, three lanes at once, on a shared host. The runtime's own lever (``preflight_runner._PREFLIGHT_WORKERS_ENV``,
+# lane, three lanes at once, on a shared host. The runtime's own lever (``test_parallelism.WORKERS_ENV``,
 # floor 2 so PREFLIGHT_PARALLELISM_LOST can never trip) is set in this process and forwarded by ``IsolatedServer``
 # in settings-authoritative mode (its keep-list); the budget is split evenly across the concurrent lanes so the
 # whole stand stays within the shared-host rule of at most 16 pytest workers.
@@ -234,20 +235,19 @@ def credit_preflight(key: str, *, timeout: float = 10.0) -> dict:
 # --------------------------------------------------------------------------- #
 
 def lane_spend(data_root: pathlib.Path) -> tuple[float, int]:
-    """``(USD over the lane's SETTLED physical-attempt ledger rows, unknown-cost rows)``: ``state/usage_attempts.jsonl`` is
-    the product's money authority; ``llm_usage`` telemetry misses skill review/advisory/synthesis (run3: 114.81 vs 141.63)."""
-    path = pathlib.Path(data_root) / "state" / "usage_attempts.jsonl"
-    spent, unknown = 0.0, 0
-    for line in (path.read_text(encoding="utf-8").splitlines() if path.is_file() else []):
+    """``(USD over the lane's SETTLED physical-attempt rows, unknown-cost rows)`` from ``state/usage.sqlite``, the money authority (``llm_usage`` misses review/advisory/synthesis: 114.81 vs 141.63), or from the journal of a journal-era ``--seed`` lane, never zero."""
+    store, journal = (pathlib.Path(data_root) / "state" / name for name in ("usage.sqlite", "usage_attempts.jsonl"))
+    if store.is_file():
+        conn = sqlite3.connect(f"{store.resolve().as_uri()}?mode=ro", uri=True)
         try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict) and row.get("state") == "settled" and row.get("cost_final") is True:
-            cost = row.get("cost_usd")
-            priced = isinstance(cost, (int, float)) and not isinstance(cost, bool)
-            spent, unknown = spent + (float(cost) if priced else 0.0), unknown + (0 if priced else 1)
-    return spent, unknown
+            costs = [None if c is None else float(c) for (c,) in conn.execute("SELECT cost_usd FROM attempts WHERE state='settled' AND cost_final=1")]
+        finally:
+            conn.close()
+    else:
+        from ouroboros.utils import iter_jsonl_objects  # skips a torn line, as the journal reader always did
+        costs = [r["cost_usd"] if type(r.get("cost_usd")) in (int, float) else None for r in (iter_jsonl_objects(journal) if journal.is_file() else ()) if r.get("state") == "settled" and r.get("cost_final") is True]
+    priced = [c for c in costs if c is not None]
+    return sum(priced), len(costs) - len(priced)
 
 
 class RunBudget:
@@ -695,7 +695,7 @@ def run_lane(job: tuple[str, int], args: argparse.Namespace, out: pathlib.Path, 
             stub = stub_lane.routed_stub_model(scenario.stub_script(clone)).__enter__()
             child_model = stub_lane.STUB_CHILD_SLUG
             cfg = stub_lane.stub_settings(stub, template)
-        cfg.update(scenario.overrides(child_model))
+        cfg.update(scenario.overrides(child_model, cfg))
         if args.profile == "wiring":
             cfg["OUROBOROS_REVIEW_ENFORCEMENT"] = "advisory"
         # The lane's ceiling is its own reservation: disjoint from the other lanes', never the whole cap.

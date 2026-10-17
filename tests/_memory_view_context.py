@@ -1,4 +1,4 @@
-"""A built request over the shared memory installation: the three system blocks of one task.
+"""A built request over the shared memory installation: governance, story and changing facts.
 
 The installation is ``tests._memory_inventory_shared.world`` (Main, Projects alpha and beta,
 a transport chat, the hidden partition, legacy memory covering the first ten stream rows)
@@ -22,11 +22,12 @@ def world(tmp_path: pathlib.Path, **kwargs: Any) -> Tuple[Any, Any, Dict[str, in
 
 
 def blocks(env: Any, memory: Any, task: Dict[str, Any], **kwargs: Any) -> Tuple[str, str, str, Dict[str, Any]]:
-    """``(A, B, C, cap_info)``: governance, identity with my story, the changing block."""
+    """``(A', B, C, cap_info)``: common governance, identity/story, changing facts; omit optional D."""
     from ouroboros.context import build_llm_messages
 
     messages, cap = build_llm_messages(env=env, memory=memory, task={"type": "task", "text": "hi", **task}, **kwargs)
-    first, second, third = (block["text"] for block in messages[0]["content"])
+    first, *stable, third = (block["text"] for block in messages[0]["content"])
+    second = "\n\n".join(text for text in stable if not text.startswith("## DEVELOPMENT.md\n"))
     return first, second, third, cap
 
 

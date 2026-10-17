@@ -354,11 +354,12 @@
             "usage_model": "openai-compatible/glm-5",
             "api_key": "compatible-fixture-key",
             "base_url": "https://vllm.fixture.invalid/v1",
+            "keyless": false,
             "default_headers": {},
             "supports_openrouter_extensions": false,
             "supports_generation_cost": false
           },
-          "value_sha256": "b1a9cac753fd05a4d392dfacb460da2019ac80c00206bc3da3691f0981bc5ad8"
+          "value_sha256": "045d2f12800f3d144f61d669281e0a82c19a01e4e4bd8854d2ea24b68add9562"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -385,11 +386,12 @@
             "usage_model": "openai-compatible/glm-5",
             "api_key": "openai-fixture-key",
             "base_url": "https://legacy.fixture.invalid/v1",
+            "keyless": false,
             "default_headers": {},
             "supports_openrouter_extensions": false,
             "supports_generation_cost": false
           },
-          "value_sha256": "0b251390b23910d43711ca7ca4045c4a9868db9b6a09f2ad7ec33a8cf9c5ef9e"
+          "value_sha256": "495aa9ab4b2eacf87790078cf0304609ff2f260d8ba412b1ecd35ed414dfa9c7"
         },
         "sends": [],
         "unused_script_steps": 0

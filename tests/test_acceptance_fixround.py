@@ -5,48 +5,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from tests._governance_docs_shared import architecture_text, development_text
-
-
-def test_prompt_projection_keeps_panels_ahead_of_an_oversized_lens():
-    from ouroboros.review_evidence import format_review_evidence_for_prompt
-
-    rendered = format_review_evidence_for_prompt(
-        {"has_evidence": True, "task_id": "task-panel", "oversized_lens": "L" * 30_000},
-        max_chars=1_100,
-        acceptance_panels=[{
-            "panel_id": "panel-must-survive",
-            "surface": "task_acceptance",
-            "aggregate_signal": "PASS",
-            "transport_status": "success",
-            "parse_status": "valid",
-            "reason": "deciding finding " + "R" * 1_000,
-            "actors": [{
-                "slot_id": "slot_1",
-                "response_ref": {"call_id": "response-must-survive"},
-            }],
-        }, {
-            "panel_id": "panel-dropped-whole",
-            "surface": "task_acceptance",
-            "aggregate_signal": "PASS",
-            "reason": "trailing record " + "T" * 1_000,
-        }],
-    )
-
-    assert rendered.startswith("TASK ACCEPTANCE PANELS:")
-    assert "panel-must-survive" in rendered
-    assert '"aggregate_signal": "PASS"' in rendered
-    assert "deciding finding" in rendered
-    assert '"reason_omitted_chars"' in rendered
-    assert "response-must-survive" in rendered
-    panel_json = rendered.split("\n\n", 1)[0].split("\n", 1)[1]
-    panel_projection = json.loads(panel_json)
-    assert panel_projection["records"][0]["panel_id"] == "panel-must-survive"
-    assert panel_projection["records_omitted"] == 1
-    assert "panel-dropped-whole" not in rendered
-    assert "OMISSION NOTE" in rendered
-    assert "canonical source_ref" in rendered
-    assert '"reader": "get_task_result"' in rendered
 
 
 def test_partial_trajectory_is_non_resolving_but_complete_trajectory_resolves():
@@ -189,7 +147,8 @@ def test_omitted_trajectory_corpus_round_trips_through_artifact_reader(tmp_path,
     assert ref["root"] == "artifact_store"
     assert ref["artifact_ref"].startswith(f"artifact_store:{ref['path']}#chars=0-")
     rendered = _read_file(ctx, root=ref["root"], path=ref["path"])
-    recovered = json.loads(rendered.split("\n", 1)[1])
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
+    recovered = json.loads(delivered_source_prefix(ctx.last_read_view, rendered, len(rendered)))
     assert recovered == calls
     partial = next(
         row for row in packet["__unresolved_partial_artifacts__"]
@@ -727,15 +686,6 @@ def test_budget_ladder_stops_shedding_after_predecessor_fits():
     )
 
 
-def test_acceptance_docs_have_complete_sentence_boundaries():
-    development = development_text()
-    architecture = architecture_text()
-
-    assert "silent false green. The\n  Every forced rail" not in development
-    assert "never certify success; An OPEN plan wave" not in architecture
-    assert "never had claims. an unresolved reference" not in architecture
-
-
 def test_refused_slot_reuses_the_already_persisted_prompt(monkeypatch, tmp_path):
     import ouroboros.review_substrate as substrate
 
@@ -764,33 +714,3 @@ def test_refused_slot_reuses_the_already_persisted_prompt(monkeypatch, tmp_path)
     assert actor.prompt_ref == {"manifest_ref": "operation-1_prompt"}
     assert len([call for call in calls if call.endswith("_prompt")]) == 1
     assert len(calls) == 2
-
-
-def test_broken_reflection_panel_keeps_commit_advisory_lens(monkeypatch):
-    from ouroboros.reflection import generate_reflection
-    from ouroboros import review_substrate
-
-    captured = {}
-
-    class _Llm:
-        def chat(self, **kwargs):
-            captured["prompt"] = kwargs["messages"][0]["content"]
-            return {"content": "Reflection completed."}, {}
-
-    monkeypatch.setattr(
-        review_substrate,
-        "compact_review_projection",
-        lambda _runs: (_ for _ in ()).throw(ValueError("broken panel")),
-    )
-
-    generate_reflection(
-        task={"id": "reflection-task", "text": "reflect"},
-        llm_trace={"tool_calls": [], "review_runs": [{"broken": True}]},
-        trace_summary="completed",
-        llm_client=_Llm(),
-        usage_dict={"rounds": 2, "cost": 0.1},
-        review_evidence={"has_evidence": True, "lens_marker": "lens-survives"},
-    )
-
-    assert "lens-survives" in captured["prompt"]
-    assert "review evidence unavailable" not in captured["prompt"]

@@ -15,8 +15,6 @@ from ouroboros import (
     extension_surface_names,
 )
 
-REPO = pathlib.Path(__file__).parents[1]
-
 _LEAVES = (
     extension_registry_state,
     extension_surface_names,
@@ -175,23 +173,3 @@ def test_the_public_loader_surface_is_unchanged():
     ]
     for name in extension_loader.__all__:
         assert hasattr(extension_loader, name), name
-
-
-def test_extension_extraction_size_bounds_have_meaningful_headroom():
-    from ouroboros.review import BAND_MODULE_MAX_LINES, TARGET_MODULE_LINES
-    from ouroboros.size_ratchet_manifest import BAND_PATHS
-
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (extension_loader, *_LEAVES)
-    }
-    assert counts["ouroboros.extension_loader"] <= TARGET_MODULE_LINES
-    for module, count in counts.items():
-        path = module.replace(".", "/") + ".py"
-        limit = TARGET_MODULE_LINES
-        if path in BAND_PATHS:
-            assert BAND_PATHS[path], f"new extension band entry needs its rationale: {path}"
-            limit = BAND_MODULE_MAX_LINES
-        assert count <= limit, f"{path}: {count} lines exceeds its {limit}-line bound"

@@ -1,0 +1,69 @@
+# Ouroboros container recipes: the one executable carrier; docs/DEPLOYMENT.md
+# explains each choice. Build the images from the repository root (BuildKit):
+#   docker build -t ouroboros-web .
+#   docker build --target managed --build-context ouroboros-seed=<seed dir> -t ouroboros-managed .
+# Start exactly one profile per volume set; two containers never share a data volume:
+#   docker compose -f packaging/docker/compose.yaml --profile image up -d
+#   docker compose -f packaging/docker/compose.yaml --profile managed up -d
+#   docker compose -f packaging/docker/compose.yaml --profile managed-split up -d
+# Resume after Panic, as the owner, in the foreground with the same volumes:
+#   docker compose -f packaging/docker/compose.yaml run --rm --service-ports -e OUROBOROS_LAUNCH_INTENT=owner image
+#   docker compose -f packaging/docker/compose.yaml run --rm --service-ports managed --launch-intent owner
+
+name: ouroboros
+
+x-ouroboros: &ouroboros
+  init: true
+  restart: on-failure
+  stop_grace_period: 30s
+  ports:
+    - "127.0.0.1:8765:8765"
+
+services:
+  # Immutable image: code and packages come from the image; Update means a new image.
+  image:
+    <<: *ouroboros
+    profiles: ["image"]
+    image: ouroboros-web
+    environment:
+      OUROBOROS_LAUNCH_INTENT: automatic
+      OUROBOROS_DATA_DIR: /data
+      OUROBOROS_SUBAGENT_PROJECTS_ROOT: /work/projects
+      OUROBOROS_SUBAGENT_WORKTREE_ROOT: /work/subagent_worktrees
+      OUROBOROS_DELIVERABLES_ROOT: /work/Deliverables
+      HOME: /home/ouroboros
+    volumes:
+      - image-data:/data
+      - image-work:/work
+      - image-home:/home/ouroboros
+
+  # Managed body, one parent volume: body (repo + runtime venv), data, work and HOME
+  # live under /ouroboros (layout: the managed image's ENV).
+  managed:
+    <<: *ouroboros
+    profiles: ["managed"]
+    image: ouroboros-managed
+    volumes:
+      - managed:/ouroboros
+
+  # Managed body, split volumes: the same layout, one volume per kind. A volume is
+  # mounted at the parent of what bootstrap creates, never at the repository itself.
+  managed-split:
+    <<: *ouroboros
+    profiles: ["managed-split"]
+    image: ouroboros-managed
+    volumes:
+      - split-body:/ouroboros/body
+      - split-data:/ouroboros/data
+      - split-work:/ouroboros/work
+      - split-home:/ouroboros/home
+
+volumes:
+  image-data:
+  image-work:
+  image-home:
+  managed:
+  split-body:
+  split-data:
+  split-work:
+  split-home:

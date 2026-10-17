@@ -45,7 +45,7 @@ def test_browser_stops_native_post_task_wait_without_losing_answer(subscription_
             with model_wait.task_model_wait_scope(task=f.task, drive_root=f.root, event_queue=f.events,
                                                   worker_slot_held=False):
                 pipeline._dispatch_root_post_task(f.env, f.task, "Already answered", f.events, pending,
-                    {"rounds": 3}, {}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
+                    {"rounds": 3}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
                     project_scoped=False, project_task=False, parent_env=None, parent_task=None)
         finally:
             registry.unregister(task_id)

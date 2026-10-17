@@ -10,14 +10,22 @@ autouse, so importing it into a test module re-applies it there.
 from __future__ import annotations
 
 import json
+import sys
 import httpx
 import pytest
 from ouroboros import subagents
 from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 from ouroboros.gateways import claudexor as cx
 
+# The technical access the autouse fixture's selected session row captured (#1609).
+# ``None`` keeps the legacy snapshot with no "access" key (workspace_write), which an
+# acting child needs. Technical access alone now decides the run shape, so a test
+# about a READ-ONLY child must say so: ``_select_transport_access(monkeypatch,
+# "readonly")`` (or ``_started_request(..., access="readonly")``).
+_TRANSPORT_ACCESS = None
 
-def _transport_snapshot(route):
+
+def _transport_snapshot(route, access=None):
     target = route.route_id + (f"={route.model}" if route.model else "")
     return {
         "schema": 1, "selected_subagent_id": "transport-fixture",
@@ -25,7 +33,13 @@ def _transport_snapshot(route):
         "route": {"kind": "agent_session", "target_id": target,
                   "credential_profile_id": route.profile_id},
         "effort": route.effort,
+        **({"access": access} if access else {}),
     }
+
+
+def _select_transport_access(monkeypatch, access):
+    """Make the fixture's selected row capture ``access`` for the rest of this test."""
+    monkeypatch.setattr(sys.modules[__name__], "_TRANSPORT_ACCESS", access)
 
 
 @pytest.fixture(autouse=True)
@@ -40,6 +54,14 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
         "ensure_owned_gateway",
         lambda: gateway_module.ClaudexorGateway(),
     )
+    # The fixture models a SERVING daemon, so the attach-only release surfaces
+    # (loop exit, kill boundaries) reach the same test transport the admitted
+    # sweep does; neither starts anything here.
+    monkeypatch.setattr(
+        claudexor_daemon,
+        "read_owned_gateway",
+        lambda **_kw: gateway_module.ClaudexorGateway(),
+    )
     original_actor = delegate.prepare_delegate_start_actor
 
     def explicit_transport_actor(ctx, drive_root, **kwargs):
@@ -48,9 +70,11 @@ def _owned_gateway_uses_each_test_transport(monkeypatch):
         route = subagents.get_subagent_harness()
         if route is None:
             return original_actor(ctx, drive_root, **kwargs)
-        token = subagent_runtime._EXACT_START_SELECTION.set({
-            "snapshot": _transport_snapshot(route),
-        })
+        # A suite may swap `_transport_snapshot` for its own one-argument builder;
+        # only an explicit lowering passes the access through.
+        snapshot = (_transport_snapshot(route) if _TRANSPORT_ACCESS is None
+                    else _transport_snapshot(route, _TRANSPORT_ACCESS))
+        token = subagent_runtime._EXACT_START_SELECTION.set({"snapshot": snapshot})
         try:
             return original_actor(ctx, drive_root, **kwargs)
         finally:
@@ -155,21 +179,29 @@ def _delegating_ctx(tmp_path, *, acting: bool, task_id: str = "t-nanny"):
         ctx.workspace_mode = "self_worktree"
     ctx.task_id = task_id
     ctx.task_metadata = {"root_task_id": "t-root", "parent_task_id": "t-root"}
+    # A child's root exists before the child runs: its lineage is the delegated start's billing
+    # authority (a missing root is refused, never a stand-in bucket).
+    from ouroboros.task_results import load_task_result, write_task_result
+    if load_task_result(tmp_path, "t-root") is None:
+        write_task_result(tmp_path, "t-root", "running", root_task_id="t-root")
     return ctx
 
 
 def _started_request(tmp_path, *, acting: bool, monkeypatch,
                      engine_version=CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION, expect="started",
-                     start_kwargs=None):
+                     start_kwargs=None, access=None):
     """Run _delegate_start against a stubbed gateway and return the wire request.
 
     ``start_kwargs`` forwards optional model-issued arguments (folder geometry)
     unchanged, so a caller can compare an explicitly named shape against omission
-    on the SAME transport instead of rebuilding the stub.
+    on the SAME transport instead of rebuilding the stub. ``access`` is the selected
+    row's captured technical access (``None``: the legacy writable default).
     """
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
+    if access is not None:
+        _select_transport_access(monkeypatch, access)
     seen = {}
 
     class _Stub:
@@ -214,6 +246,9 @@ def _plain_ctx(tmp_path):
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     ctx.task_id = "t-nanny"
     ctx.task_metadata = {"root_task_id": "t-root", "parent_task_id": "t-root"}
+    from ouroboros.task_results import load_task_result, write_task_result
+    if load_task_result(tmp_path, "t-root") is None:  # the nanny's real root
+        write_task_result(tmp_path, "t-root", "running", root_task_id="t-root")
     return ctx
 
 
@@ -288,14 +323,23 @@ def _write_failed_attempt(run_dir, *, attempt="a01"):
     )
 
 
-def _waiting(tmp_path, monkeypatch, *, acting=True):
+def _waiting(tmp_path, monkeypatch, *, acting=True, access=""):
+    """One ``delegate_wait`` window over ``run-1``.
+
+    ``access`` records the GRANTED shape on the custody entry, as a STARTED row does
+    (#1609: technical access alone decides it); "" keeps a legacy entry with none, whose
+    wait re-derives its entitlement from the live context.
+    """
     import ouroboros.tools.delegate as delegate
 
     ctx = _delegating_ctx(tmp_path, acting=acting)
+    granted = subagents.delegated_run_shape(acting, access) if access else None
     delegate._CUSTODY.clear()
     delegate._CUSTODY["run-1"] = delegate._RunCustody(
         task_id="t-nanny", route_id="some-route", model="m",
         project_id="prj", project_owned=False,
+        **({"access": granted.access, "mode": granted.mode, "isolation": granted.isolation,
+            "delegated": granted.delegated} if granted else {}),
     )
     # since_seq=0 so a HEALTHY run records its advance and answers `progress` when the
     # one-second window expires; a BREACH is what returns immediately, mid-window. The

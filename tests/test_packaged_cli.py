@@ -578,3 +578,28 @@ def test_packaged_cli_install_delegates_macos_path_check_to_platform_layer():
     assert "is_unstable_macos_app_path" in source
     assert 'startswith("/Volumes/")' not in source
     assert '"AppTranslocation" in' not in source
+
+
+def test_packaged_endpoint_stays_with_its_desktop_root_and_explicit_url_wins(tmp_path, monkeypatch):
+    from ouroboros import packaged_cli
+
+    home = tmp_path / "home"
+    _set_test_home(monkeypatch, home)
+    bundle = _make_bundle_root(tmp_path)
+    monkeypatch.setattr(packaged_cli, "_find_bundle_root", lambda _: bundle)
+    foreign = tmp_path / "foreign-port"
+    foreign.write_text("41999")
+    monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path / "foreign-data"))
+    monkeypatch.setenv("OUROBOROS_PORT_FILE", str(foreign))
+    monkeypatch.delenv("OUROBOROS_URL", raising=False)
+    runtime = packaged_cli.resolve_packaged_runtime()
+    assert runtime.data_dir == home / "Ouroboros/data"
+    port = runtime.data_dir / "state/server_port"
+    port.parent.mkdir(parents=True)
+    port.write_text("41888")
+    assert packaged_cli._base_url_from_args([], runtime.data_dir) == "http://127.0.0.1:41888"
+    inner = packaged_cli._inner_cli_env(runtime)
+    assert "OUROBOROS_PORT_FILE" not in inner and inner["OUROBOROS_DATA_DIR"] == str(runtime.data_dir)
+    assert packaged_cli._base_url_from_args(["--url", "http://127.0.0.1:41999/"], runtime.data_dir) == "http://127.0.0.1:41999"
+    monkeypatch.setenv("OUROBOROS_URL", "http://127.0.0.1:41777")
+    assert packaged_cli._base_url_from_args([], runtime.data_dir) == "http://127.0.0.1:41777"

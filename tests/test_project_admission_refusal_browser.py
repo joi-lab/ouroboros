@@ -97,7 +97,17 @@ def _producers(monkeypatch, data_dir: Path, repo_dir: Path) -> SimpleNamespace:
     bridge, live_sends = _Bridge(), []
     monkeypatch.setattr(message_bus, "DATA_DIR", data_dir)
     monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
-    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=live_sends.append))
+    from supervisor.event_observation import ObservedEventQueue
+
+    class _Bus(ObservedEventQueue):
+        """The supervisor's real two-lane bus (membership and atomic put included), recording each live send."""
+
+        def _put(self, item):
+            live_sends.append(item)
+            super()._put(item)
+
+    bus = _Bus()
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: bus)
     monkeypatch.setattr("ouroboros.server_owner_routing.threading", SimpleNamespace(Thread=_ImmediateThread))
     ctx = SimpleNamespace(
         DRIVE_ROOT=data_dir, PENDING=pending, RUNNING=running, WORKERS=pool, bridge=bridge,
@@ -395,7 +405,8 @@ def test_never_admitted_project_refusal_stays_an_origin_receipt(
                 refused_after = load_task_result(data_dir, seed["refused"], strict=True)
                 record("custody_duty", {"settled": settled, "live_sends": live, "late_legacy": late_legacy,
                                         "refused_after": refused_after})
-                assert settled == 1 and live == [f"project-completion:{LEGACY_AT_DUTY}"], (settled, live)
+                # Main debt settles only on the sender's strict receipt; this live send is lost.
+                assert settled == 0 and live == [f"project-completion:{LEGACY_AT_DUTY}"], (settled, live)
                 assert not refused_after.get("canonical_terminal_projection_ready")
                 assert not refused_after.get("canonical_terminal_projection")
                 published.append(LEGACY_AT_DUTY)

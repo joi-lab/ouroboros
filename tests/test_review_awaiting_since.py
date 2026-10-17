@@ -235,7 +235,8 @@ def test_a_settled_row_never_carries_a_moment_even_when_one_was_stored():
 def test_a_row_recorded_before_the_field_existed_still_loads():
     """Every rebuild path of a stored actor row survives the older shape."""
     from ouroboros.review_custody import _frozen_actor
-    from ouroboros.tools.plan_review_runtime import plan_wave_actor_record
+    from ouroboros.tools.plan_ask import reply_facts_from_row
+    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor
 
     legacy = dataclasses.asdict(ReviewActorRecord(
         slot_id="slot-1", model="test/model", status="error", error="waiting",
@@ -249,18 +250,16 @@ def test_a_row_recorded_before_the_field_existed_still_loads():
     # 2. the frozen wave row, rebuilt for a free replay
     frozen = _frozen_actor(legacy, SimpleNamespace(slot_id="slot-1", model="test/model"))
     assert frozen.awaiting_since == ""
-    # 3. the durable plan-wave actor record
-    record = plan_wave_actor_record(
-        legacy, ok=False, error="waiting", disclosures=[], raw_text_preview_chars=100,
-    )
-    assert record["awaiting_since"] == ""
+    # 3. the plan record's participant facts, read off the plan row
+    assert reply_facts_from_row(_plan_row_from_actor(legacy, None))["awaiting_since"] == ""
     # 4. the projection every surface reads
     assert "awaiting_since" not in _review_actor_projection(legacy, "plan")
 
 
-def test_the_plan_wave_row_carries_the_moment_the_host_recorded(tmp_path):
-    """The field reaches wave.actors, not only the acceptance panel."""
-    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor, plan_wave_actor_record
+def test_the_plan_participant_row_carries_the_moment_the_host_recorded(tmp_path):
+    """The field reaches the plan record's participant row, not only the acceptance panel."""
+    from ouroboros.tools.plan_ask import reply_facts_from_row
+    from ouroboros.tools.plan_review_runtime import _plan_row_from_actor
 
     actor = dataclasses.asdict(ReviewActorRecord(
         slot_id="slot-1", model="test/model", status="error", error="waiting",
@@ -269,13 +268,10 @@ def test_the_plan_wave_row_carries_the_moment_the_host_recorded(tmp_path):
     ))
     row = _plan_row_from_actor(actor, None)
     assert row["awaiting_since"] == "2026-09-19T08:41:00+00:00"
-    record = plan_wave_actor_record(
-        row, ok=False, error="waiting", disclosures=[], raw_text_preview_chars=100,
-    )
-    assert record["awaiting_since"] == "2026-09-19T08:41:00+00:00"
+    facts = reply_facts_from_row(row)
+    assert facts["status"] == "pending" and facts["awaiting_since"] == "2026-09-19T08:41:00+00:00"
     # A settled plan row keeps the honest empty value it was recorded with.
-    settled = {**actor, "operation_state": "settled", "awaiting_since": ""}
-    assert plan_wave_actor_record(
-        _plan_row_from_actor(settled, None),
-        ok=True, error="", disclosures=[], raw_text_preview_chars=100,
-    )["awaiting_since"] == ""
+    settled = {**actor, "operation_state": "settled", "late_result_pending": False, "awaiting_since": "",
+               "status": "ok", "error": "", "raw_text": '{"prose": "fine"}'}
+    facts = reply_facts_from_row(_plan_row_from_actor(settled, None))
+    assert facts["status"] == "answered" and facts["awaiting_since"] == ""

@@ -125,7 +125,7 @@ PRE_ADMISSION_DENIED_NAMES = frozenset({
     # old local-only resolver. Leaving them unnamed is the point: the resolver reads their
     # bodies, so the NEXT imported mutator nobody enumerated is caught the same way.
     "assert_seed_is_git_directory", "ensure_util_image", "dump_state", "runtime_attestation",
-    "snapshot", "restore", "reflections", "seed_stamp", "run_one", "run_instance",
+    "snapshot", "restore", "knowledge_revisions", "seed_stamp", "run_one", "run_instance",
     "preflight_cleanroom_container", "prepare_seeded_workspace", "create_submission_tarball",
     "run_official_eval", "write_json", "write_jsonl", "write_result_index", "append_result_index",
     "write_text", "write_bytes", "mkdir", "unlink", "rmtree", "touch", "rename", "chmod",

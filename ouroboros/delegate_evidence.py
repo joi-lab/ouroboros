@@ -76,7 +76,7 @@ def record_nanny_nudge_stamp(ctx: Any, task_id: str, nanny_code: str) -> None:
 
 
 def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
-    """Aggregate ONE task's delegated-run facts from the durable custody rows.
+    """Aggregate ONE task's delegated-run facts from its custody rows (indexed reads).
 
     The completion-seam reconciliation reads this: `executor_route` is a DISPATCH
     decision, these rows are the EVIDENCE of what actually ran, and the two are
@@ -88,8 +88,12 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     A run a REVIEW surface registered is that panel's substrate, never this task's:
     its rows carry their own ``source``, and neither its attempt, its counters, its
     model, its applied access nor its failure state is evidence here (issue #1006).
+    The task-scoped facts without a run (the nudge stamp, a refused attempt) are the
+    task's ``custody_marks`` row, kept by the same reducer transaction.
     """
     from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_custody_current import marks, runs as current_runs
+    from ouroboros.store import StoreError
 
     tid = str(task_id or "")
     started: set = set()
@@ -99,119 +103,76 @@ def task_execution_evidence(drive_root: Any, task_id: str) -> Dict[str, Any]:
     models: List[str] = []
     applied_access_profiles: List[str] = []
     cost_total, cost_known, cost_estimated = 0.0, True, False
-    # Scope finding (a5e59bdf gate): an UNREADABLE log must not collapse into
-    # the same zero-count result as a proven empty one — a reader would then
-    # accuse a nanny of "zero attempts" on evidence it never saw. A missing
-    # file IS a positively-established empty state (no row could exist);
-    # existing-but-unreadable is not, and _iter_rows swallows its own OSError.
+    # Scope finding (a5e59bdf gate): UNREADABLE custody must not collapse into the
+    # same zero-count result as a proven empty one — a reader would then accuse a
+    # nanny of "zero attempts" on evidence it never saw. The store answers or raises;
+    # a raise is the typed unknown.
     evidence_read_failed = False
-    nudge_recorded = False
-    start_attempted = False
-    partial_work_order_seen = False
-    # Run ids a review-owned row has already named. The log is append-only, so a
-    # run's own STARTED (or START_REQUESTED, or its SETTLED receipt) is seen before
-    # the rest of its rows; a SETTLED row that outlived its start names itself.
-    review_ids: set = set()
-    _log_path = custody.event_log_path(drive_root)
     try:
-        if _log_path.exists():
-            with _log_path.open("rb"):
-                pass
-    except OSError:
-        evidence_read_failed = True
-    for row in custody.custody_rows(drive_root):
-        if str(row.get("task_id") or "") != tid:
+        runs = current_runs(drive_root, "task_id=?", (tid,))
+        mark = marks(drive_root, tid)
+    except StoreError:
+        runs, mark, evidence_read_failed = {}, {}, True
+    nudge_recorded = bool(mark.get("nanny_nudge"))
+    start_attempted = bool(mark.get("start_attempted"))
+    partial_work_order_seen = False
+    for run_id, entry in runs.items():
+        if entry.review_owned:
             continue
-        if str(row.get("type") or "") == NANNY_NUDGE_STAMP:
-            # Task-scoped stamp, no run_id — read here so the completion seam
-            # gets the fact from the scan it already pays for (B3).
-            nudge_recorded = True
+        start_attempted = True  # a bound run had a durable request
+        started.add(run_id)
+        source_request = entry.work_order_source_request
+        partial_work_order_seen = partial_work_order_seen or (
+            entry.work_order_coverage == "partial"
+            # a continuation that adopted a snapshot carries its predecessor's sources
+            or bool(isinstance(source_request, dict) and source_request.get("inherited_sources"))
+        )
+        if not entry.settled:
             continue
-        run_id = str(row.get("run_id") or "")
-        if custody.review_owned_source(row.get("source")):
-            if run_id:
-                review_ids.add(run_id)
-            continue
-        if run_id and run_id in review_ids:
-            continue
-        if str(row.get("type") or "") in (
-            START_BLOCKED, STARTUP_FAULT, custody.START_REQUESTED,
-        ):
-            # An ATTEMPT is evidence of obedience even when nothing started:
-            # a typed pre-mint refusal (START_BLOCKED) or a durable request
-            # whose POST then failed (START_REQUESTED with no STARTED row).
-            start_attempted = True
-        if not run_id:
-            continue
-        kind = str(row.get("type") or "")
-        if kind == custody.STARTED:
-            started.add(run_id)
-            partial_work_order_seen = partial_work_order_seen or (
-                str(row.get("work_order_coverage") or "") == "partial"
-            )
-        elif kind == custody.CLOSED_ABSENT and run_id not in settled:
+        settled.add(run_id)
+        if not entry.ledger_recorded and not entry.terminal_state:
             # Closed-without-settlement is still TERMINAL: leaving it in the
             # started-minus-settled gap would read as "still executing" to the
             # pending/settled readers (nanny reminder) forever. No ledger row was
             # written, so its spend is undisclosed, never zero.
-            settled.add(run_id)
             failure_states.append("closed_absent")
             cost_known = False
-        elif kind == custody.SETTLED and run_id not in settled:
-            settled.add(run_id)
-            state = str(row.get("state") or "")
-            if state in custody.SUCCEEDED_STATES:
-                succeeded.add(run_id)
-            elif state:
-                failure_states.append(state)
-            if row.get("spend_disclosed") and row.get("cost_usd") is not None:
-                try:
-                    cost_total += float(row.get("cost_usd") or 0.0)
-                except (TypeError, ValueError):
-                    cost_known = False
-                if row.get("spend_estimated"):
-                    cost_estimated = True
-            else:
-                cost_known = False
-        # ENGINE-reported models only (SETTLED rows): a STARTED row carries the
-        # requested pin, and with an owner default model that pin is routinely
-        # non-empty — listing it would name a model that never executed.
-        if kind == custody.SETTLED:
-            model = str(row.get("model") or "")
-            if model and model not in models:
-                models.append(model)
-            # D29 applied-access disclosure: the settlement row records the
-            # ACCESS the engine actually served (effectiveAccess), distinct
-            # from the STARTED row's granted shape. Projected so the chip and
-            # acceptance readers can answer asked-vs-applied without joining
-            # the ledger. Empty when telemetry predates the receipt.
-            # Bounded to the known access-profile vocabulary and a short cap:
-            # the value rides a durable evidence row and the chip tooltip, so a
-            # garbage/oversized engine string must not reach either verbatim.
-            applied_access = str(row.get("access_profile") or "")[:32]
-            if (
-                applied_access
-                and applied_access not in applied_access_profiles
-                and len(applied_access_profiles) < 8
-            ):
-                applied_access_profiles.append(applied_access)
+            continue
+        if entry.terminal_state in custody.SUCCEEDED_STATES:
+            succeeded.add(run_id)
+        elif entry.terminal_state:
+            failure_states.append(entry.terminal_state)
+        if entry.spend_disclosed and entry.cost_usd is not None:
+            cost_total += float(entry.cost_usd)
+            cost_estimated = cost_estimated or entry.spend_estimated
+        else:
+            cost_known = False
+        # ENGINE-reported models only (SETTLED facts): the STARTED row's requested pin
+        # with an owner default model is routinely non-empty and names a model that
+        # never executed.
+        if entry.engine_model and entry.engine_model not in models:
+            models.append(entry.engine_model)
+        # D29 applied-access disclosure: the settlement recorded the ACCESS the
+        # engine actually served (effectiveAccess), distinct from the granted shape.
+        # Bounded to the known vocabulary and a short cap: the value rides a durable
+        # evidence row and the chip tooltip.
+        if (entry.access_profile and entry.access_profile not in applied_access_profiles
+                and len(applied_access_profiles) < 8):
+            applied_access_profiles.append(entry.access_profile)
     # A partial work-order run is not a successful delegated substrate until the
     # durable verified-range union covers the complete canonical brief. Reuse the
-    # custody replay (the same SSOT used by wait/apply) so a restart cannot turn a
+    # custody rows (the same SSOT used by wait/apply) so a restart cannot turn a
     # prompt-only claim into ``harness_used``.
     source_unresolved = 0
     if partial_work_order_seen:
-        try:
-            for entry in custody.replay(drive_root).values():
-                if entry.task_id != tid or not entry.settled or entry.review_owned:
-                    continue
-                if custody.work_order_source_verification(entry).get("status") == "cannot_verify":
-                    source_unresolved += 1
-                    succeeded.discard(entry.run_id)
-                    if "source_incomplete" not in failure_states:
-                        failure_states.append("source_incomplete")
-        except Exception:
-            evidence_read_failed = True
+        for entry in runs.values():
+            if not entry.settled or entry.review_owned:
+                continue
+            if custody.work_order_source_verification(entry).get("status") == "cannot_verify":
+                source_unresolved += 1
+                succeeded.discard(entry.run_id)
+                if "source_incomplete" not in failure_states:
+                    failure_states.append("source_incomplete")
     return {
         # A settled row whose started row fell out of the log is still a run that ran.
         "delegated_runs_started": len(started | settled),
@@ -341,27 +302,25 @@ def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, An
     disposition recorded", never "reviewed clean"; an unreadable log is the
     typed ``evidence_read_failed`` marker, never an empty-therefore-clean
     section (the ``task_execution_evidence`` rule, GR6-4).
+
+    Rows keep the newest ``_ACCEPT_PATCH_DISPOSITION_CAP`` (20) entries and
+    ``omitted`` counts the rest. ``unreviewed_delegated_apply`` is set when any
+    applied row of the ``delegated`` pipeline exists, judged before the cap.
     """
-    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_custody_current import marks
+    from ouroboros.store import StoreError
     from ouroboros.utils import truncate_review_artifact
 
     tid = str(task_id or "")
     out: Dict[str, Any] = {}
-    log_path = custody.event_log_path(drive_root)
     try:
-        if log_path.exists():
-            with log_path.open("rb"):
-                pass
-        else:
-            return out
-    except OSError:
+        verdicts = marks(drive_root, tid).get("patch_verdicts", [])
+    except StoreError:
         return {"evidence_read_failed": True}
+    if not verdicts:
+        return out
     rows: List[Dict[str, Any]] = []
-    for row in custody.custody_rows(drive_root):
-        if str(row.get("type") or "") != "delegate_run_patch_verdict":
-            continue
-        if str(row.get("task_id") or "") != tid:
-            continue
+    for row in verdicts:
         rows.append({
             "child": str(row.get("child_task_id") or ""),
             "pipeline": str(row.get("pipeline") or ""),
@@ -369,6 +328,10 @@ def acceptance_patch_dispositions(drive_root: Any, task_id: str) -> Dict[str, An
             "applied": bool(row.get("applied")),
             "reason": truncate_review_artifact(str(row.get("reason") or ""), limit=600),
             "patch_sha256": str(row.get("patch_sha256") or ""),
+            **({"target_root": str(row["target_root"])} if row.get("target_root") else {}),
+            # An owner-Continue successor's decision names the child's own parent.
+            **({"original_parent_task_id": str(row["original_parent_task_id"])}
+               if row.get("original_parent_task_id") else {}),
             **({"verdict_artifact_write_failed": True}
                if row.get("verdict_artifact_write_failed") else {}),
         })

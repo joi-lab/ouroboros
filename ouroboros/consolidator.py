@@ -1,11 +1,12 @@
-"""Light memory operations shared by reflection and scratchpad upkeep.
+"""Light memory operations: the shared Light transport and scratchpad compression.
 
 The old dialogue writer (summary blocks of a hundred chat rows, eras, its cursor
 and nominations) is gone: the chronicle imports what it wrote once
 (``chronicle_import``) and the mind writes its own pages. What remains is the
 common Light transport (``_call_consolidation_llm`` with its route, fit and typed
-failures), the read context that binds knowledge nominations to what an
-operation actually read, scratchpad consolidation and the knowledge-note writer.
+failures), the read context that records what an operation actually read, and
+scratchpad compression. No Light operation writes knowledge: lessons, the Pattern
+Register and the backlog are the acting mind's (``knowledge_write``).
 """
 import hashlib
 import json
@@ -59,13 +60,6 @@ def _light_dispatch_binding() -> Dict[str, Any]:
     return binding
 
 
-def _route_stamp(usage: Any) -> Any:
-    """The route the usage says answered, for a history stamp; unknown without a physical fact."""
-    from ouroboros.knowledge import observed_route_stamp
-
-    return observed_route_stamp(usage)
-
-
 def _emit_event(logs_dir: pathlib.Path, kind: str, **fields: Any) -> None:
     """A memory-maintenance outcome is a typed fact beside the chat it concerns, never silence (I4)."""
     try:
@@ -96,7 +90,7 @@ def _merge_consolidation_usage(*usages: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class KnowledgeReadContext:
-    """Reads made by this existing Light operation, before its nominations."""
+    """The read tools of one Light operation and the exact source ranges it was shown."""
 
     def __init__(self, context: Any, call_type: str = "memory_consolidation"):
         from ouroboros.tools.knowledge import get_tools
@@ -122,7 +116,7 @@ class KnowledgeReadContext:
 
         function = call.get("function") or {}
         name = function.get("name")
-        meta, status = {}, "error"
+        meta, status, typed_result = {}, "error", None
         try:
             arguments = function.get("arguments") or "{}"
             args = json.loads(arguments) if isinstance(arguments, str) else arguments
@@ -132,10 +126,13 @@ class KnowledgeReadContext:
                 try:
                     if name == "read_file":
                         from ouroboros.tools.core_file_tools import _read_file
-                        text = _read_file(self.context, **args)
+                        from ouroboros.delegate_output import staged_read_delivery_scope
+                        with staged_read_delivery_scope():
+                            text = _read_file(self.context, **args)
                     else:
                         text = _knowledge_read(self.context, **args)
                     result = _published_tool_result(self.context, sentinel)
+                    typed_result = result if name == "read_file" else None
                     meta = dict(getattr(result, "meta", {}))
                     status = getattr(result, "status", "")
                     if name == "read_file" and self.context.last_read_view:
@@ -153,13 +150,20 @@ class KnowledgeReadContext:
         except (ValueError, KeyError, TypeError, OSError) as exc:
             text = f"Knowledge read unavailable: {type(exc).__name__}: {exc}"
         return {"tool_call_id": str(call.get("id") or ""), "fn_name": name,
-                "result": text, "result_meta": meta, "status": status}
+                "result": text, "result_meta": meta, "status": status, "tool_result": typed_result}
 
     def accept_delivery(self) -> None:
         """Credit only source characters in the request the model answered."""
         for row in self.pending_delivery:
             if row.get("status") != "ok":
                 continue
+            from ouroboros.delegate_output import acknowledge_staged_output_delivery
+
+            original = row.get("_original_result", row["result"])
+            shown = ((row.get("result_source_view") or {}).get("delivered_range")
+                     if row.get("result_partial") else [0, len(original)])
+            if isinstance(shown, list):
+                acknowledge_staged_output_delivery(self.context, {**row, "result": original}, row, shown_ranges=[shown])
             meta = row.get("result_meta") or {}
             source = meta.get("knowledge_source") or {}
             try:
@@ -182,7 +186,12 @@ class KnowledgeReadContext:
                          if row.get("result_partial") else len(row["result"]))
                 if shown < header:
                     continue
-                delivered_end = start + min(body, shown - header)
+                if file:
+                    from ouroboros.tools.core_file_tools import delivered_source_prefix
+
+                    delivered_end = start + len(delivered_source_prefix(file, row["result"], shown))
+                else:
+                    delivered_end = start + min(body, shown - header)
                 key = (scope, topic, revision)
                 old_total, ranges = self.read_ranges.get(key, (total, []))
                 self.reads.pop((scope, topic), None)
@@ -256,72 +265,11 @@ class KnowledgeReadContext:
         projected, projection = project_tool_result_batch(
             rows, before, values["tools"], drive_root=self.context.drive_root,
             task_id=str(self.context.task_id or "consolidation"), fit_candidate=fit_candidate)
-        self.pending_delivery = projected
+        self.pending_delivery = [{**view, "_original_result": row["result"]}
+                                 for row, view in zip(rows, projected)]
         if projection["status"] == "minimum_view_unfit":
             raise SummarizerContextOverflow("Memory tool-result source locators exceed the current working window")
         return [*before, *tool_messages(projected)]
-
-    def bind_entries(self, entries: Any) -> List[Dict[str, Any]]:
-        from ouroboros.tools.knowledge import _address
-
-        bound = []
-        for entry in entries if isinstance(entries, list) else []:
-            if not isinstance(entry, dict):
-                continue
-            try:
-                address = _address(self.context, entry.get("topic"), entry.get("scope", ""))
-            except (ValueError, TypeError):
-                continue
-            # The host records what THIS operation actually read. Model-supplied
-            # revision text cannot attest an unread note; absent read permits
-            # creation only, because the common writer requires existing CAS.
-            # Underscore keys are host facts (``_nomination_route`` and any later
-            # one): a model-supplied value is dropped here, so a forged route can
-            # never reach history — the host stamps only after this binding.
-            bound.append({**{key: value for key, value in entry.items() if not str(key).startswith("_")},
-                          "scope": address.scope,
-                          "expected_revision": self.reads.get((address.scope, address.topic)),
-                          "canonical_root": str(address.canonical_root),
-                          "task_id": str(getattr(self.context, "task_id", "") or "")})
-        return bound
-
-
-KNOWLEDGE_MAINTENANCE_PROMPT = """
-You may use knowledge_list and knowledge_read to understand existing notes before
-nominating a durable revision. An episodic summary describes only its supplied source;
-a knowledge note is cumulative understanding, grounded in the complete CURRENT note
-you read in this operation together with the new episode. Absence from this episode
-does not refute prior knowledge; an earlier episode cutoff does not undo later known
-events. Preserve useful established facts, sources, uncertainty, unknown metadata and
-links. Correct, remove or reorganize stale or unsupported understanding when the
-evidence warrants it; memory is revisable, not append-only. Read the whole current
-note before changing it, rather than merely repeating fragments. An existing note changes by
-"edits": [{"old_text": a passage occurring exactly once in its body, "new_text": its replacement,
-empty to remove it, "basis": source and reason}]; spans never overlap and unmentioned text stays,
-so a broader rewrite or reorganization quotes the whole span it replaces. Edits reach only the body;
-revise the summary with "summary": "new text" beside them (other metadata survives). A new topic
-takes only "content" with complete Markdown and needs no prior read.
-Understanding of the people involved — preferences, recurring reactions, shared history,
-tentative interpretations with their source — is ordinary knowledge to nominate in global scope;
-a pattern across several moments is worth more than one; revise the existing note rather than minting a rule,
-and an explicit standing request stays explicit. Author a YAML summary for a new or meaningfully revised note —
-the summary is what stays resident in the index — and revise it when the note's meaning changes.
-The note overview (scope global) is written by the acting mind; if this run changed what it says,
-name the stale passage in the text you return — do not nominate overview.
-Scope is a separate field, never a topic prefix.
-Do not treat the generated index or earlier previews as authored truth. Patterns and
-improvement-backlog retain their dedicated semantic maintainers; nominate ordinary
-knowledge here. If no memory change is useful, nominate none. This is the same memory
-operation, not another mandatory analysis or review.
-Read large notes using explicit start_char/end_char ranges. Read coverage belongs
-to one exact revision; repeat or overlapping reads do not fill unread gaps.
-Use compact_context(inspect=true) before the view fills, then give your own
-working_note and selected complete unit IDs to retain. Source checkpoints preserve
-the original reads; keep your current conclusions while reading the next range.
-This Light operation supports authored views; keep_last_n alone returns guidance
-without calling another helper. All tools remain available in this operation.
-"""
-
 
 def _call_consolidation_llm(
     llm_client: Any, prompt: str, label: str, *, fixed_prompt: str = "",
@@ -401,10 +349,12 @@ def _call_consolidation_llm(
                 provider=route["provider"], reasoning_effort=values["reasoning_effort"],
             ) * density)
         window = int(evidence.window_tokens) if is_known(evidence, require_fresh=True) else None
-        output_reserve = values["max_tokens"]
+        from ouroboros.response_limits import ResponseLimit
+        output_reserve = ResponseLimit(**(getattr(evidence, "response_limit", {}) or {})).ceiling(values["max_tokens"])
         if values["use_local"]:
             from ouroboros.llm_local import local_context_limits
             _local_window, output_reserve = local_context_limits(output_reserve)
+        values["max_tokens"] = output_reserve
         limit = window - output_reserve if window is not None else None
         binding = dict(route_fp=evidence.route_fp, capacity_tokens=window, output_reserve_tokens=output_reserve)
         byte_limit = (input_limit["input_bytes"] if input_limit
@@ -544,16 +494,6 @@ def _call_consolidation_llm(
     return "", {**_merge_consolidation_usage(*usages, usage), "_consolidation_errors": [fact]}
 
 
-def _rebuild_knowledge_index(knowledge_dir: pathlib.Path, *, _locked: bool = False) -> None:
-    """Compatibility entrypoint; the common knowledge owner renders every index."""
-    from contextlib import nullcontext
-    from ouroboros.knowledge import KnowledgeAddress, knowledge_write_lock, rebuild_knowledge_index
-
-    address = KnowledgeAddress(knowledge_dir.parent.parent, knowledge_dir, "overview")
-    with nullcontext() if _locked else knowledge_write_lock(knowledge_dir):
-        rebuild_knowledge_index(address)
-
-
 from ouroboros.context_budget import (
     SCRATCHPAD_CONSOLIDATION_THRESHOLD_CHARS as SCRATCHPAD_CONSOLIDATION_THRESHOLD,
 )
@@ -568,7 +508,7 @@ def should_consolidate_scratchpad(memory: Any) -> bool:
 
 
 def consolidate_scratchpad(
-    memory: Any, knowledge_dir: pathlib.Path, llm_client: Any, identity_text: str = "",
+    memory: Any, llm_client: Any, identity_text: str = "",
     *, pressure: bool = False, knowledge_context: Any = None,
 ) -> Optional[Dict[str, Any]]:
     blocks = memory.load_scratchpad_blocks()
@@ -590,15 +530,10 @@ The scratchpad working memory has {len(blocks)} blocks totaling {total_chars} ch
 The oldest {compress_count} blocks need compression.
 
 Rules:
-1. Identify insights, patterns, lessons, and architectural decisions worth
-   preserving long-term. Output them as knowledge_entries with topic + content
-   for a new note. Topics are source-relative Markdown paths; preserve their exact identities.
-   For an existing topic, read its complete current source using knowledge_read,
-   then propose its anchored edits, not a blind append of the new fragment.
-2. Compress the old blocks into a SINGLE shorter summary block. Keep active
+1. Compress the old blocks into a SINGLE shorter summary block. Keep active
    tasks, unresolved questions, admin instructions still in force. Remove
    stale/completed items and routine status updates.
-3. Write as Ouroboros (first person). Don't lose signal — keep uncertain items
+2. Write as Ouroboros (first person). Don't lose signal — keep uncertain items
    rather than dropping them.
 
 Identity context: {identity_text if identity_text else "(not available)"}
@@ -607,21 +542,19 @@ Identity context: {identity_text if identity_text else "(not available)"}
 
 {old_content}
 
-Respond with JSON only (no fences), after any useful knowledge reads:
-{{"knowledge_entries": [{{"topic": "topic/path", "scope": "global", "edits": [{{"old_text": "exact passage", "new_text": "revision", "basis": "source and reason"}}]}}], "compressed_block": "single compressed block text"}}
+Respond with JSON only (no fences):
+{{"compressed_block": "single compressed block text"}}
 """
 
     usage: Dict[str, Any] = {}
-    outcome, source_entry_id, writes, new_blocks = "failed", "", [], blocks
+    outcome, source_entry_id, new_blocks = "failed", "", blocks
     try:
         from ouroboros.tools.registry import ToolContext
 
         context = knowledge_context or ToolContext(repo_dir=getattr(memory, "repo_dir", None) or memory.drive_root,
                               drive_root=memory.drive_root)
         knowledge = KnowledgeReadContext(context, "scratchpad_consolidation")
-        raw, usage = _call_consolidation_llm(
-            llm_client, KNOWLEDGE_MAINTENANCE_PROMPT + prompt, "Scratchpad consolidation",
-            knowledge=knowledge)
+        raw, usage = _call_consolidation_llm(llm_client, prompt, "Scratchpad consolidation", knowledge=knowledge)
         raw = raw.strip()
         if not raw:
             outcome = "call_failed" if usage.get("_consolidation_errors") else "empty_response"
@@ -645,28 +578,20 @@ Respond with JSON only (no fences), after any useful knowledge reads:
             outcome = "not_shorter"
             return usage  # an authored expansion is not pressure relief
 
-        entries = knowledge.bind_entries(result.get("knowledge_entries"))
+        # Only the compressed block is read from the answer: any other key (an older
+        # prompt's knowledge nominations included) causes no effect; the raw answer
+        # stays in the call's observability record.
         compressed_block = {"ts": utc_now_iso(), "source": "consolidation", "content": compressed_text.strip()}
         source_bytes = json.dumps(old_blocks, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
         source_entry_id = "scratchpad-consolidation:" + hashlib.sha256(source_bytes).hexdigest()
         source_ref = memory.scratchpad_journal_source_ref(source_entry_id)
         if not append_jsonl(memory.journal_path(), {
                 "ts": utc_now_iso(), "type": "blocks_consolidated", "entry_id": source_entry_id,
-                "source_blocks": old_blocks, "source_ref": source_ref, "knowledge_entries": entries}):
+                "source_blocks": old_blocks, "source_ref": source_ref}):
             log.error("Scratchpad consolidation source journal write failed; preserving blocks")
             outcome = "journal_unavailable"
             return usage
         compressed_block["metadata"] = {"source_ref": source_ref}
-        writes = _write_knowledge_entries(knowledge_dir, entries, context=context, stamp={
-            "writer": "scratchpad_consolidation", "route": _route_stamp(usage), "writer_input_ref": source_ref})
-        if writes:
-            compressed_block["metadata"]["knowledge_writes"] = writes
-            if any(not row["ok"] for row in writes):
-                compressed_block["content"] += (
-                    "\n\nSome nominated knowledge updates were not published; their complete "
-                    "proposals and original episode remain in the source journal referenced by this block.")
-                append_jsonl(memory.journal_path(), {"ts": utc_now_iso(), "type": "knowledge_writes_incomplete",
-                                                     "source_ref": source_ref, "knowledge_writes": writes})
 
         # Merge-aware replace UNDER the write lock: blocks appended DURING the
         # slow LLM call live only on disk — building the new list from the
@@ -699,66 +624,5 @@ Respond with JSON only (no fences), after any useful knowledge reads:
                     pressure=pressure, blocks_before=len(blocks), chars_before=total_chars,
                     compressed_blocks=len(old_blocks), blocks_after=len(new_blocks),
                     chars_after=sum(len(b.get("content", "")) for b in new_blocks), source_entry_id=source_entry_id,
-                    knowledge_writes={"ok": sum(w["ok"] for w in writes), "failed": sum(not w["ok"] for w in writes)},
                     last_error_kind=(errors[-1] or {}).get("kind") if errors else None,
                     accounted_upper_bound_usd=round(float(usage["cost"]), 6) if usage.get("cost") is not None else None)
-
-
-def _write_knowledge_entries(
-    knowledge_dir: pathlib.Path, entries: List[Dict[str, Any]], *, context: Any = None,
-    stamp: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """Publish only source-aware nominations through the common note writer.
-
-    ``stamp`` is the caller's ``writer``/``route``/``writer_input_ref`` history
-    stamp (see ``write_knowledge_note``); an unnamed caller leaves ``unknown``. An
-    entry carrying its own ``_nomination_route`` outranks the caller's block-level
-    ``route``: provenance is per nomination. That field is HOST-authored only —
-    ``KnowledgeReadContext.bind_entries`` strips every underscore key a model
-    supplied — so the writer never trusts model output for it. A note this operation
-    read (``expected_revision``) takes anchored ``edits`` (+ ``summary``), never whole ``content``;
-    an unread topic is create-only (``nomination_write_form`` owns the shape). Every caller is a
-    Light operation (reflection, scratchpad consolidation), and the overview is written by the
-    acting mind (``knowledge_write``), so a nominated overview is refused as
-    ``overview_is_mind_authored`` while the rest of its batch is written as usual."""
-    from ouroboros.knowledge import (KnowledgeAddress, OVERVIEW_TOPIC, nomination_write_form, sanitize_topic,
-                                     write_knowledge_note)
-    from ouroboros.tools.knowledge import _address, _record_backlog_history
-
-    outcomes = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            outcomes.append({"topic": "", "ok": False, "reason": "malformed_nomination"})
-            continue
-        topic, content, revision = entry.get("topic"), entry.get("content"), entry.get("expected_revision")
-        if isinstance(topic, str) and topic.strip() == OVERVIEW_TOPIC:  # global, and only the acting mind writes it
-            outcomes.append({"topic": OVERVIEW_TOPIC, "scope": "global", "ok": False,
-                             "reason": "overview_is_mind_authored"})
-            continue
-        try:
-            form = nomination_write_form(entry)  # every refusal still leaves this entry's one outcome
-            topic = sanitize_topic(topic)
-            address = (_address(context, topic, str(entry.get("scope") or "")) if context is not None
-                       else KnowledgeAddress(knowledge_dir.parent.parent, knowledge_dir, topic))
-            if topic == "improvement-backlog":
-                from ouroboros.improvement_backlog import backlog_path, merge_backlog_text
-                merged = merge_backlog_text(address.canonical_root, content)
-                if merged >= 0:
-                    _record_backlog_history(backlog_path(address.canonical_root), topic, "overwrite",
-                                            str(entry.get("task_id") or ""))
-                outcomes.append({"topic": topic, "scope": "global", "ok": merged >= 0,
-                                 "reason": "backlog_merge" if merged >= 0 else "unparseable_backlog"})
-                continue
-            entry_stamp = dict(stamp or {})
-            if entry.get("_nomination_route") is not None:
-                entry_stamp["route"] = entry["_nomination_route"]
-            if form["mode"] == "overwrite" and revision is not None:  # a read existing note: never a whole replacement
-                outcomes.append({"topic": topic, "scope": address.scope, "ok": False, "reason": "existing_note_requires_edits"})
-                continue
-            result = write_knowledge_note(address, expected_revision=revision, task_id=str(entry.get("task_id") or ""),
-                                          **form, **entry_stamp)
-            outcomes.append({"topic": topic, "scope": address.scope, "ok": result.ok, "reason": result.reason,
-                             "source_ref": result.current.source_ref() if result.current else None})
-        except (ValueError, OSError) as exc:
-            outcomes.append({"topic": topic, "ok": False, "reason": str(exc)})
-    return outcomes

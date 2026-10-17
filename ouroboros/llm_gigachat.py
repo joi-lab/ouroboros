@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+from ouroboros.event_usage import REPORTED_TOKENS_KEY, token_count
 from ouroboros.llm_attempt import (
     _attempt_request,
     _candidate_before_dispatch,
@@ -114,11 +115,12 @@ class _GigaChatLaneMixin:
             for block in content:
                 if isinstance(block, dict):
                     if str(block.get("type") or "") in ("image_url", "image"):
-                        # Explicit placeholder instead of a silent drop: the
-                        # model (and the transcript reader) must know an image
-                        # was present but not deliverable on this lane.
-                        caption = str(block.get("_caption") or "").strip()
-                        parts.append(f"[image omitted: model has no vision{f' — {caption}' if caption else ''}]")
+                        # Explicit marker instead of a silent drop: the model
+                        # (and the transcript reader) must know an image was
+                        # present but our lane, not the model, could not carry it.
+                        from ouroboros.llm_messages import own_lane_image_marker
+
+                        parts.append(own_lane_image_marker("GigaChat", str(block.get("_caption") or "").strip()))
                         continue
                     parts.append(str(block.get("text", "")))
                 else:
@@ -324,6 +326,10 @@ class _GigaChatLaneMixin:
             "resolved_model": str(target.get("usage_model") or target.get("resolved_model") or ""),
             "cost": None,
             "cost_final": False,
+            # The counters above keep their billing shape; events read what was REPORTED (#1578).
+            REPORTED_TOKENS_KEY: {name: token_count(getattr(usage_obj, attr, None)) for name, attr in (
+                ("prompt_tokens", "prompt_tokens"), ("completion_tokens", "completion_tokens"),
+                ("cached_tokens", "precached_prompt_tokens"))},
         }
         # The provider's cut marker survives normalization: consolidation refuses
         # a clipped correction by usage.response_finish_reason on every lane.

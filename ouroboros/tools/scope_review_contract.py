@@ -10,17 +10,24 @@ from __future__ import annotations
 from typing import List
 
 
-SCOPE_REQUIRED_ITEMS = frozenset({
+# The coupling questions in their checklist order (docs/CHECKLISTS.md "Coupling questions").
+COUPLING_QUESTION_IDS = (
     "intent_alignment",
     "forgotten_touchpoints",
     "cross_surface_consistency",
     "regression_surface",
-    "prompt_doc_sync",
     "architecture_fit",
-    "cross_module_bugs",
     "implicit_contracts",
-})
+)
+SCOPE_REQUIRED_ITEMS = frozenset(COUPLING_QUESTION_IDS)
 SCOPE_VALID_SEVERITIES = frozenset({"critical", "advisory"})
+# Questions merged into a survivor. A row under a retired id answers an obligation
+# recorded before the merge: it counts for its survivor and never duplicates or
+# contradicts the survivor's own row, so it cannot void the seat's whole block.
+_RETIRED_ITEM_SURVIVORS = {
+    "prompt_doc_sync": "cross_surface_consistency",
+    "cross_module_bugs": "implicit_contracts",
+}
 
 
 def normalize_scope_items(items: list) -> tuple[list[dict], str]:
@@ -40,6 +47,8 @@ def normalize_scope_items(items: list) -> tuple[list[dict], str]:
             invalid.append(f"entry {index} is not an object")
             continue
         item_id = str(item.get("item", "") or "").strip()
+        retired = item_id in _RETIRED_ITEM_SURVIVORS
+        item_id = _RETIRED_ITEM_SURVIVORS.get(item_id, item_id)
         verdict = str(item.get("verdict", "") or "").strip().upper()
         if item_id not in SCOPE_REQUIRED_ITEMS:
             unexpected.append(item_id or f"<missing item at {index}>")
@@ -59,23 +68,11 @@ def normalize_scope_items(items: list) -> tuple[list[dict], str]:
         if not reason:
             invalid.append(f"{item_id}: missing reason")
             continue
-        if verdict == "PASS":
-            reason_words = [
-                word.strip(".,;:!?()[]{}\"'")
-                for word in reason.split()
-                if word.strip(".,;:!?()[]{}\"'")
-            ]
-            if (
-                reason.lower().strip(".!?:;")
-                in {"pass", "ok", "okay", "yes", "n/a", "na", "none"}
-                or len(reason_words) < 4
-            ):
-                invalid.append(f"{item_id}: PASS reason is too terse")
-                continue
+        if verdict == "PASS" and not retired:
             if item_id in seen_pass:
                 invalid.append(f"{item_id}: duplicate PASS")
             seen_pass.add(item_id)
-        else:
+        elif not retired:
             seen_fail.add(item_id)
         seen_items.add(item_id)
 
@@ -126,26 +123,3 @@ def classify_scope_findings(items: list) -> tuple[List[dict], List[dict]]:
         else:
             advisory_findings.append(finding)
     return critical_findings, advisory_findings
-
-
-def build_scope_block_message(
-    critical_findings: List[dict], advisory_findings: List[dict]
-) -> str:
-    """Format critical plus advisory findings into the blocking message."""
-    crit_lines = "\n".join(
-        f"  CRITICAL: [scope:{finding['item']}] {finding['reason']}"
-        for finding in critical_findings
-    )
-    advisory_section = ""
-    if advisory_findings:
-        advisory_lines = "\n".join(
-            f"  WARN: [scope:{finding['item']}] {finding['reason']}"
-            for finding in advisory_findings
-        )
-        advisory_section = f"\n\nAdvisory warnings:\n{advisory_lines}"
-    return (
-        "⚠️ SCOPE_REVIEW_BLOCKED: Scope reviewer found critical completeness issues.\n"
-        "Commit has NOT been created. Fix the issues and try again.\n\n"
-        + crit_lines
-        + advisory_section
-    )

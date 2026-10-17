@@ -72,7 +72,7 @@ def test_confirmed_death_retires_only_exact_consumer(tmp_path, monkeypatch, evid
     elif evidence == 'wrong_task':
         job['task']['id'] = 'other-task'
     elif evidence == 'write_failed':
-        monkeypatch.setattr(model_wait, 'update_json_locked', lambda *_a, **_k: (_ for _ in ()).throw(OSError('disk')))
+        monkeypatch.setattr(model_wait, 'put_handoffs', lambda *_a, **_k: (_ for _ in ()).throw(OSError('disk')))
     monkeypatch.setattr('ouroboros.headless.prepare_terminal_task_files',
                         lambda *_a, **_k: {'terminal_source_present': False})
     worker_health.recover_confirmed_dead_worker(job)
@@ -134,7 +134,7 @@ def test_real_process_death_uses_recorded_birth_and_retains_unknown_money(tmp_pa
         monkeypatch.setattr(workers, 'WORKERS', {0: slot})
         task = {'id': task_id, 'root_task_id': task_id, '_attempt': 3, 'type': 'task', 'chat_id': 1}
         workers.RUNNING[task_id] = {'task': task, 'attempt': 3, 'worker_id': 0}
-        worker_pool_lifecycle._record_worker_pids()
+        worker_pool_lifecycle._record_worker_processes()
         assert slot.process_birth
         end = time.monotonic() + 20
         while not marker.exists() and process.is_alive() and time.monotonic() < end:

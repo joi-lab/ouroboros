@@ -107,8 +107,7 @@ def test_foreign_absolute_address_does_not_acquire_the_process_cwd(environment, 
 
 
 @pytest.mark.parametrize('tool', ['edit_batch', 'apply_patch'])
-def test_repo_only_edit_refuses_unsupported_root_before_payload_resolution(environment, tool):
-    from ouroboros.loop_tool_execution import _extract_result_metadata
+def test_payload_edit_requires_a_skill_selector(environment, tool):
     reg, _ctx, _home, work, data = environment
     payload = {'root': 'skill_payload'}
     if tool == 'edit_batch':
@@ -116,10 +115,7 @@ def test_repo_only_edit_refuses_unsupported_root_before_payload_resolution(envir
     else:
         payload['patch'] = '*** Update File: mod.py\n-one\n+two\n'
     result = reg.execute(tool, payload)
-    expected = 'EDIT_BATCH_ERROR' if tool == 'edit_batch' else 'APPLY_PATCH_BLOCKED'
-    assert expected in result
-    assert 'write_file/edit_text' in result and 'TOOL_ERROR' not in result
-    assert _extract_result_metadata(tool, result, False)['status'] == 'edit_ops_blocked'
+    assert 'SKILL_PAYLOAD_ARG_ERROR' in result and 'TOOL_ERROR' not in result
     assert not (data / 'skills').exists() and not (work / 'mod.py').exists()
 
 
@@ -306,7 +302,10 @@ def test_child_source_names_and_certificates_do_not_confer_credential_authority(
     certificate = '-----BEGIN CERTIFICATE-----\n' + 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789' * 2 + '\n-----END CERTIFICATE-----\n'
     public = source.parent / 'public.pem'
     public.write_text(certificate, encoding='utf-8')
-    assert certificate in reg.execute('read_file', {'root': root, 'path': public.relative_to(base).as_posix()})
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
+
+    public_result = reg.execute('read_file', {'root': root, 'path': public.relative_to(base).as_posix()})
+    assert delivered_source_prefix(ctx.last_read_view, public_result, len(public_result)) == certificate
     private = source.parent / 'fixture.pem'
     material = 'fixture-private-material-0123456789'
     private.write_text('-----BEGIN PRIVATE KEY-----\n' + material + '\n-----END PRIVATE KEY-----\n', encoding='utf-8')
@@ -544,18 +543,27 @@ def test_parent_runtime_read_rules_follow_physical_files_across_root_labels(tmp_
     cached.parent.mkdir(parents=True, exist_ok=True)
     cached.write_text('{"synthetic": "unchanged cache"}', encoding='utf-8')
     cache_before = cached.read_bytes()
-    original_read = pathlib.Path.read_bytes
+    # Source readers use bounded Path.open('rb'); read_bytes/read_text also open.
+    original_open = pathlib.Path.open
+    hidden = project.resolve()
 
-    def permitted_read(path):
-        if path == project:
+    def permitted_open(path, *args, **kwargs):
+        if path.resolve() == hidden:
             pytest.fail('project-store source was read before admission')
-        return original_read(path)
+        return original_open(path, *args, **kwargs)
 
-    monkeypatch.setattr(pathlib.Path, 'read_bytes', permitted_read)
-    for op, options in [('symbols', {}), ('digest', {}), ('structural', {'query': 'FunctionDef'})]:
+    # A bare-symbol owner_of reads the inventory through that same admission.
+    (repo / 'ouroboros').mkdir()
+    (repo / 'ouroboros' / 'domains.toml').write_text(
+        '[domains]\nD01 = "Synthetic"\n\n[modules]\n"ouroboros/owned.py" = "D01"\n', encoding='utf-8')
+    (repo / 'ouroboros' / 'owned.py').write_text('def owned_fact():\n    pass\n', encoding='utf-8')
+    monkeypatch.setattr(pathlib.Path, 'open', permitted_open)
+    for op, options in [('symbols', {}), ('digest', {}), ('structural', {'query': 'FunctionDef'}),
+                        ('architecture', {'query': 'owner_of owned_fact'})]:
         result = registry.execute('query_code', {'op': op, **options})
         assert 'hidden_project_fact' not in result
         assert 'projects/other/hidden.py' not in result
+        assert op != 'architecture' or 'ouroboros/owned.py -> D01 (Synthetic) [symbol_definition]' in result, result
     assert cached.read_bytes() == cache_before
 
 

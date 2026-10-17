@@ -53,12 +53,14 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("timeout_sec", 360),
         ("mutates_worktree", False),
         ("alias_for", ""),
+        ("safety_policy", ""),
     )
     assert field_contract(tool_context.ToolContext) == (
         ("repo_dir", "required"),
         ("drive_root", "required"),
         ("branch_dev", "ouroboros"),
         ("system_repo_dir", None),
+        ("serving_repo_dir", None),
         ("workspace_root", None),
         ("workspace_mode", ""),
         ("memory_mode", ""),
@@ -66,6 +68,7 @@ def test_tool_descriptor_owner_facades_preserve_identity():
         ("project_id", ""),
         ("task_metadata", "factory:dict"),
         ("last_owner_delivery", None),
+        ("unconfirmed_routing_acts", "factory:list"),
         ("executor_ref", "factory:dict"),
         ("pending_events", "factory:list"),
         ("current_chat_id", None),

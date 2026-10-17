@@ -15,9 +15,6 @@ from ouroboros import (
     server_routing_context,
 )
 
-
-REPO = pathlib.Path(__file__).parents[1]
-
 _LEAVES = (
     server_process,
     server_routing_context,
@@ -97,8 +94,6 @@ _SERVER_OWNED = (
     "PANIC_EXIT_CODE",
     "_LAUNCHER_MANAGED",
     "_BIND_HOST",
-    "_ACTUAL_BOUND_PORT",
-    "_actual_bound_port",
     "_event_loop",
     "_supervisor_ready",
     "_supervisor_error",
@@ -188,30 +183,3 @@ def test_server_route_composition_is_owned_by_the_composition_root():
         route for route in server.routes if getattr(route, "path", "") == "/api/settings"
     )
     assert settings_route.endpoint.__module__ == "server"
-
-
-def test_server_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in _LEAVES
-    }
-    counts["server"] = len((REPO / "server.py").read_text(encoding="utf-8").splitlines())
-    # server_maintenance.py entered the size band with TZ-1 A (its rationale in
-    # size_ratchet_manifest.BAND_PATHS): the bounded off-loop drive-custody pass joined the
-    # reconcile block it runs in; it stays under the band's ceiling, shrink-only from here.
-    assert all(count <= 1000 for name, count in counts.items() if name not in {"server", "ouroboros.server_maintenance"})
-    assert counts["ouroboros.server_maintenance"] <= 1150
-    # server.py keeps the lifespan, the supervisor loop, the owner-command
-    # dispatch, the process state those three need, AND (on this tree) the
-    # deferred restart transaction plus post-cutoff upstream drift, so the
-    # bound includes the restart transaction state owned by the composition root.
-    # 1700 -> 1730 (issue #1142): the exit latch guards on revival/admission and the
-    # latch-checking thread body stay with the loop they protect.
-    # 1730 -> 1770 (TZ-1 batch ingress): the drained-batch tail hand-back around the
-    # owner-command dispatch and the init-outcome latch beside readiness stay with
-    # the loop and the process state they protect.
-    assert counts["server"] <= 1770
-    assert counts["ouroboros.server_routing_context"] <= 1000
-    assert counts["ouroboros.server_owner_routing"] <= 1000

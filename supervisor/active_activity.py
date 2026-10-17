@@ -24,11 +24,12 @@ class DirectActivityEntry:
     project_id: str = ""
     client_message_id: str = ""
     kind: str = "direct_chat"
-    phase: str = "thinking"
+    phase: str = "preparing"
     started_at: float = field(default_factory=time.time)
     origin_message_ref: Dict[str, Any] = field(default_factory=dict)
 
     actor: Any = field(default=None, repr=False, compare=False)
+    active_llm_call: Optional[Dict[str, Any]] = field(default=None, repr=False, compare=False)
 
     def _live_model_wait_projection(self, *, availability: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Read the direct turn's existing live ``TaskModelWait`` owner.
@@ -97,6 +98,9 @@ class DirectActivityEntry:
         # publish the same optional fields as managed/post-task activities.
         wait_availability: Dict[str, Any] = {}
         row.update(self._live_model_wait_projection(availability=wait_availability))
+        active = self.active_llm_call
+        if active and active.get("task_attempt") == row.get("task_attempt") and active.get("model_activity"):
+            row["model_activity"] = dict(active["model_activity"])
         if wait_availability.get("complete") is False:
             row["phase"] = "unknown"
             if availability is not None:
@@ -119,7 +123,7 @@ class DirectActivityRegistry:
         client_message_id: str = "",
         project_id: str = "",
         kind: str = "direct_chat",
-        phase: str = "thinking",
+        phase: str = "preparing",
         origin_message_ref: Optional[Dict[str, Any]] = None,
         actor: Any = None,
     ) -> DirectActivityEntry:
@@ -132,7 +136,7 @@ class DirectActivityRegistry:
             project_id=str(project_id or ""),
             client_message_id=str(client_message_id or ""),
             kind=str(kind or "direct_chat"),
-            phase=str(phase or "thinking"),
+            phase=str(phase or "preparing"),
             started_at=time.time(),
             origin_message_ref=dict(origin_message_ref or {}),
             actor=actor,
@@ -198,7 +202,7 @@ def track_direct_activity(
     client_message_id: str = "",
     project_id: str = "",
     kind: str = "direct_chat",
-    phase: str = "thinking",
+    phase: str = "preparing",
     origin_message_ref: Optional[Dict[str, Any]] = None,
 ) -> Iterator[DirectActivityEntry]:
     registry = get_direct_activity_registry()

@@ -53,6 +53,7 @@ def test_plan_reference_replays_from_progress_without_visible_text(tmp_path):
         "system_type": "review_reference", "surface": "plan_review",
         "presentation_owner_task_id": "task-1", "review_fingerprint": "a" * 64,
         "state_revision": "b" * 64,
+        "row_address": "row:1@2026-08-25T00:00:00Z#db40d2ce6697",
     }]
 
 

@@ -26,7 +26,11 @@ from tests.test_acceptance_fence import _isolated_queue
 WAIT_SEC = 0.4
 
 
-def _pooled_agent(tmp_path, events, task_id="root-1"):
+def _pooled_agent(tmp_path, events, task_id="root-1", *, running=None, attempt=1):
+    """A pooled worker agent. ``running`` (the test's monkeypatch) also registers it as the
+    CURRENT RUNNING attempt on a live worker, which a pooled begin must be (#1183)."""
+    import os
+
     from ouroboros.agent import Env, OuroborosAgent
 
     repo = tmp_path / "repo"
@@ -36,6 +40,15 @@ def _pooled_agent(tmp_path, events, task_id="root-1"):
     agent._current_task_metadata = {}
     agent._current_task_id = task_id
     agent._event_queue = events
+    agent.tools = SimpleNamespace(_ctx=SimpleNamespace(task_attempt=attempt))
+    if running is not None:
+        from supervisor import queue, workers
+
+        worker = SimpleNamespace(proc=SimpleNamespace(pid=os.getpid(), is_alive=lambda: True),
+                                 busy_task_id=task_id, reaping=False)
+        running.setitem(workers.WORKERS, -900, worker)
+        running.setitem(queue.RUNNING, task_id, {"task": {"id": task_id, "_attempt": attempt},
+                                                 "attempt": attempt, "worker_id": -900})
     return agent
 
 
@@ -227,7 +240,7 @@ def test_acceptance_ack_waiter_ignores_stale_operation_ack(monkeypatch, tmp_path
         path.write_text(json.dumps({"ok": True, "status": "active", "token": token}), encoding="utf-8")
 
     events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
     with pytest.raises(TimeoutError):
         agent._inspect_acceptance_fence(token=token)  # nobody answers THIS request
     assert all(path.exists() for path in stale)
@@ -250,7 +263,7 @@ def test_late_ack_of_a_previous_request_is_read_by_nobody(monkeypatch, tmp_path,
     operation on the same token — its late ``active`` ack was read as the end's answer."""
     queue_mod, _pending = _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
     supervisor = _Supervisor(events, tmp_path)
     try:
         token = agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")["token"]
@@ -278,7 +291,7 @@ def test_late_ack_of_a_previous_request_is_read_by_nobody(monkeypatch, tmp_path,
 def test_pooled_request_is_resent_once_with_the_same_identity(monkeypatch, tmp_path, short_wait):
     queue_mod, _pending = _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
     supervisor = _Supervisor(events, tmp_path, drop_events=1)
     try:
         ack = agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")
@@ -312,7 +325,7 @@ def test_pooled_request_is_resent_once_with_the_same_identity(monkeypatch, tmp_p
 def test_every_request_carries_a_fresh_req_and_one_token_per_logical_begin(monkeypatch, tmp_path, short_wait):
     _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
     supervisor = _Supervisor(events, tmp_path)
     try:
         token = agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")["token"]
@@ -330,6 +343,72 @@ def test_ack_wait_is_a_named_runtime_limit():
     from ouroboros import runtime_limits
 
     assert runtime_limits.get_acceptance_fence_ack_wait_sec() == 10.0
+
+
+@pytest.mark.parametrize("loss", ["lost_ack", "late_begin"])
+def test_unconfirmed_begin_only_releases_its_own_token(monkeypatch, tmp_path, short_wait, loss):
+    """#1183: an unanswered begin may still apply late; its own queued release follows it."""
+    from ouroboros.loop import _begin_task_acceptance_fence, _end_task_acceptance_fence
+    from tests.test_acceptance_fence_outcome import _loop_ctx
+
+    queue_mod, _ = _isolated_queue(monkeypatch, tmp_path)
+    events = stdqueue.Queue()
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
+    supervisor = _Supervisor(events, tmp_path, lose_acks=2 if loss == "lost_ack" else 0,
+                             paused=loss == "late_begin")
+    ctx = _loop_ctx(tmp_path, agent)
+    try:
+        outcome, token = _begin_task_acceptance_fence(ctx, "root-1")
+        assert outcome.status == "unknown" and token is None
+        assert ctx._task_acceptance_fence_token is None
+        _end_task_acceptance_fence(ctx, outcome="terminal")  # never promotes the unconfirmed begin to a seal
+        supervisor.resume()
+        assert [event["action"] for event in supervisor.seen] == ["begin", "begin", "end"]
+        assert supervisor.seen[-1]["outcome"] == "revision"
+        assert len({event["token"] for event in supervisor.seen}) == 1
+        assert queue_mod.ACCEPTANCE_FENCES == {}
+        admitted = queue_mod.enqueue_task({"id": "child-after-loss", "root_task_id": "root-1"})
+        assert not admitted.get("_admission_blocked")
+    finally:
+        supervisor.stop()
+
+
+@pytest.mark.parametrize("ownership", ["current", "missing", "old_attempt", "old_pid", "dead", "reaping",
+                                       "foreign_root"])
+def test_pooled_begin_requires_the_exact_current_owner(monkeypatch, tmp_path, short_wait, ownership):
+    import os
+
+    from supervisor import workers
+
+    queue_mod, _ = _isolated_queue(monkeypatch, tmp_path)
+    events = stdqueue.Queue()
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
+    meta = queue_mod.RUNNING["root-1"]
+    worker = workers.WORKERS[meta["worker_id"]]
+    if ownership == "missing":
+        queue_mod.RUNNING.clear()
+    elif ownership == "old_attempt":
+        meta["attempt"] = 2
+    elif ownership == "old_pid":
+        worker.proc.pid += 1
+    elif ownership == "dead":
+        worker.proc.is_alive = lambda: False
+    elif ownership == "reaping":
+        worker.reaping = True
+    elif ownership == "foreign_root":
+        meta["task"]["root_task_id"] = "foreign"
+    supervisor = _Supervisor(events, tmp_path)
+    try:
+        if ownership == "current":
+            ack = agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")
+            assert ack["status"] == "active"
+            assert queue_mod.ACCEPTANCE_FENCES["root-1"]["pooled_owner"] == {"pid": os.getpid(), "task_attempt": 1}
+        else:
+            with pytest.raises(RuntimeError, match="stale_attempt"):
+                agent._begin_acceptance_fence(root_task_id="root-1", task_id="root-1")
+            assert not queue_mod.ACCEPTANCE_FENCES
+    finally:
+        supervisor.stop()
 
 
 # --- direct turns: no event, no ack file, no wait ------------------------------------------
@@ -354,7 +433,7 @@ def test_direct_turn_uses_no_event_and_no_ack_file(monkeypatch, tmp_path, short_
     pooled_events: stdqueue.Queue = stdqueue.Queue()
     supervisor = _Supervisor(pooled_events, tmp_path)
     try:
-        _pooled_agent(tmp_path, pooled_events, task_id="root-9")._begin_acceptance_fence(
+        _pooled_agent(tmp_path, pooled_events, task_id="root-9", running=monkeypatch)._begin_acceptance_fence(
             root_task_id="root-9", task_id="root-9")
     finally:
         supervisor.stop()

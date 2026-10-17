@@ -257,14 +257,14 @@ class TestRestartRecoverySynthesis:
     """F11: an unknown cost must not become a confident $0.00 on recovery."""
 
     def test_recovered_usage_keeps_null(self):
-        from ouroboros.agent_task_pipeline import _synthesis_cost_text
+        from ouroboros.agent_task_pipeline import _summary_row_cost_fields
 
-        unknown = {"cost": cost_projection({"status": "running"})["accounted_upper_bound_usd"]}
-        assert unknown["cost"] is None
-        assert "$0.00" not in _synthesis_cost_text(unknown)
-        assert "unknown" in _synthesis_cost_text(unknown)
+        key = "accounted_upper_bound_usd_with_children"
+        unknown = {key: cost_projection({"status": "running"})["accounted_upper_bound_usd"]}
+        assert unknown[key] is None
+        assert _summary_row_cost_fields(unknown) == {key: None}
         # A REAL zero still reads as a zero.
-        assert _synthesis_cost_text({"cost": 0.0}) == "$0.00"
+        assert _summary_row_cost_fields({key: 0.0}) == {key: 0.0}
 
 
 class TestModelVisibleToolSurfaces:

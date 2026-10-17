@@ -237,16 +237,15 @@ def _compose_subagent_text(
     task_constraint=None,
     delegation_budget=None,
 ) -> str:
-    parts = [
-        "[SUBAGENT ROLE]",
-        role or "researcher",
-        "",
+    role = str(role or "").strip()
+    parts = ["[SUBAGENT ROLE]", role, ""] if role else []
+    parts.extend([
         "[OBJECTIVE]",
         objective,
         "",
         "[EXPECTED_OUTPUT]",
         expected_output,
-    ]
+    ])
     if constraints:
         parts.extend(["", "[CONSTRAINTS]", constraints])
     if context:
@@ -411,6 +410,7 @@ def _resolve_subagent_constraint(
     workspace_mode,
     base_sha,
     parent_task_id,
+    handle_out=None,
 ):
     """Authoritative supervisor-side gate for subagent authority.
 
@@ -419,6 +419,8 @@ def _resolve_subagent_constraint(
     self_worktree is provisioned here so the child sees a ready write root.
     Returns (constraint, workspace_root, workspace_mode, reject_detail); a
     non-empty reject_detail means the caller must reject the task.
+    ``handle_out`` (a dict) receives the exact identity of a surface this call
+    provisioned, so its owner can later dispose of that copy and no other.
     """
     readonly = {"mode": LOCAL_READONLY_SUBAGENT_MODE, "allow_enable": False, "allow_review": False}
     req = requested_constraint if isinstance(requested_constraint, dict) else {}
@@ -478,6 +480,9 @@ def _resolve_subagent_constraint(
             )
             constraint["write_root"] = handle.path
             constraint["base_sha"] = handle.base_sha
+            if handle_out is not None:
+                handle_out.update(surface="self_worktree", path=handle.path, branch=handle.branch,
+                                  created_at=handle.created_at, base_sha=handle.base_sha)
             return constraint, handle.path, "self_worktree", ""
         except Exception as exc:
             return readonly, workspace_root, workspace_mode, (
@@ -511,6 +516,8 @@ def _resolve_subagent_constraint(
                 )
             # Genesis is a standalone external git repo (not the system repo); ride
             # the external-workspace machinery for patch/artifact finalization.
+            if handle_out is not None:
+                handle_out.update(surface="genesis", path=handle.path, base_sha=handle.base_sha)
             return constraint, handle.path, "genesis", ""
         except Exception as exc:
             return readonly, workspace_root, workspace_mode, (

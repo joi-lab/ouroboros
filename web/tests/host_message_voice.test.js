@@ -41,7 +41,7 @@ test('a typed nonterminal host notice preserves its working card on live deliver
         is_progress: true, narration: true, system_type: 'model_narration',
         text: 'Reading a source', ts: '2026-09-19T00:00:00Z' };
     const notice = { chat_id: 1, role: 'system', task_id: 'voice-task',
-        system_type: 'attachment_notice', text: 'Some attachments were rejected.',
+        system_type: 'runtime_liveness_notice', text: 'A chat turn looks wedged.',
         ts: '2026-09-19T00:00:01Z' };
     const c = openChat([progress, notice]);
     try {

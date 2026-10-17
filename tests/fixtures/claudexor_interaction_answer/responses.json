@@ -1,0 +1,90 @@
+{
+  "_provenance": "Recorded by record.mjs beside this file from each listed engine build's real control server with a synthetic run facade and answer service; no harness, model or run.",
+  "engines": [
+    {
+      "version": "4.0.0",
+      "sha": "14d904f2207fffd62c856b2c302e2c25482b5571",
+      "sources": {
+        "packages/control-api/src/daemon-server.ts": "d91a7f41e8838c89fbf7b0a5006a0f03dd1bb684fa4e575da7fd7e4383f162fe",
+        "packages/control-api/src/problem-response.ts": "a91accc919a527d081ed17eb45df302ed0944ee164a231f3f00f515b4e2a58f2",
+        "packages/util/src/problem-safety.ts": "01dd95b9451394c5fdd07a1004b988dbb45603bdf88768e4636c2c9d0b2c6221",
+        "packages/schema/src/problem.ts": "2fc868e931eab9b71fb11e51f49a8cd06d0d5c04d77f734ffe46af38b66e94fa"
+      }
+    },
+    {
+      "version": "3.25.1",
+      "sha": "48809fe0cc658a7c793298dcb151d8df2a3fd85f",
+      "sources": {
+        "packages/control-api/src/daemon-server.ts": "2c0e9e4a6dbc621c423890622bfd6aba5e8622a27f278e208a46a5dc5249f2a6",
+        "packages/control-api/src/problem-response.ts": "a91accc919a527d081ed17eb45df302ed0944ee164a231f3f00f515b4e2a58f2",
+        "packages/util/src/problem-safety.ts": "01dd95b9451394c5fdd07a1004b988dbb45603bdf88768e4636c2c9d0b2c6221",
+        "packages/schema/src/problem.ts": "2fc868e931eab9b71fb11e51f49a8cd06d0d5c04d77f734ffe46af38b66e94fa"
+      }
+    }
+  ],
+  "responses": [
+    {
+      "case": "delivered",
+      "service_outcome": {
+        "status": "delivered",
+        "message": "delivered to the live session"
+      },
+      "status": 200,
+      "content_type": "application/json",
+      "body": "{\"accepted\":true,\"status\":\"delivered\",\"message\":\"delivered to the live session\"}"
+    },
+    {
+      "case": "already_resolved",
+      "service_outcome": {
+        "status": "already_resolved",
+        "message": "interaction was already resolved"
+      },
+      "status": 409,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_409\",\"message\":\"interaction was already resolved\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{\"accepted\":false,\"status\":\"already_resolved\"}}"
+    },
+    {
+      "case": "already_resolved_without_message",
+      "service_outcome": {
+        "status": "already_resolved"
+      },
+      "status": 409,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_409\",\"message\":\"request failed with status 409\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{\"accepted\":false,\"status\":\"already_resolved\"}}"
+    },
+    {
+      "case": "not_found",
+      "service_outcome": {
+        "status": "not_found",
+        "message": "no pending interaction"
+      },
+      "status": 404,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_404\",\"message\":\"no pending interaction\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{\"accepted\":false,\"status\":\"not_found\"}}"
+    },
+    {
+      "case": "rejected",
+      "service_outcome": {
+        "status": "rejected",
+        "message": "answer does not match the question set"
+      },
+      "status": 409,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_409\",\"message\":\"answer does not match the question set\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{\"accepted\":false,\"status\":\"rejected\"}}"
+    },
+    {
+      "case": "unknown_run",
+      "service_outcome": null,
+      "status": 404,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_404\",\"message\":\"no such run\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{}}"
+    },
+    {
+      "case": "no_answer_service",
+      "service_outcome": null,
+      "status": 501,
+      "content_type": "application/problem+json",
+      "body": "{\"code\":\"http_501\",\"message\":\"interaction answers are not supported by this engine build\",\"retryable\":false,\"fieldErrors\":{},\"requiredActions\":[],\"evidenceRefs\":[],\"context\":{}}"
+    }
+  ]
+}

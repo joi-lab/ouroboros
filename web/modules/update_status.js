@@ -78,7 +78,8 @@ export function initUpdateStatus({ showPage, openDashboardTab, ws } = {}) {
             return;
         }
         pill.textContent = updatePillText(status);
-        pill.classList.toggle('has-local', Boolean(status.dirty || status.ahead));
+        // Content or uncommitted work of the checkout's own, not a count of commits ahead.
+        pill.classList.toggle('has-local', Boolean(status.dirty || status.local_changes !== 'absent'));
         pill.hidden = false;
     }
 

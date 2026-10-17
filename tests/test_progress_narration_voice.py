@@ -197,16 +197,14 @@ def test_a_stored_row_without_the_key_replays_as_a_legacy_frame(tmp_path):
 def test_a_tool_may_speak_in_the_models_voice_only_with_the_narration_fact():
     """Through the real task binder, a tool that relays the model's own words passes the
     typed ``narration`` fact and the frame is the assistant's; the same text without the
-    keyword stays a host note. The plan-review author paths use exactly this seam."""
-    from ouroboros.tools.plan_review import _narrate_author_rationale
-
+    keyword stays a host note."""
     agent, events = _agent()
     agent._emit_progress = partial(OuroborosAgent._emit_progress, agent)
     agent._bind_task_progress = partial(OuroborosAgent._bind_task_progress, agent)
     agent._current_task_metadata = {}
     ctx = SimpleNamespace(emit_progress_fn=OuroborosAgent._bind_task_progress_for_task(agent, {"id": "task-a"}))
     words = "The reviewers' note assumes a second chart; the brief fixes one, so I go on."
-    _narrate_author_rationale(ctx, {"disposition": "accepted", "rationale": words})
+    ctx.emit_progress_fn(words, narration=True)
     ctx.emit_progress_fn(words)
     spoken, host = events.get_nowait(), events.get_nowait()
     assert (spoken["role"], spoken["system_type"], spoken["progress_meta"]["narration"]) == (
@@ -214,17 +212,14 @@ def test_a_tool_may_speak_in_the_models_voice_only_with_the_narration_fact():
     assert spoken["text"] == f"💬 {words}" and spoken["task_id"] == "task-a"
     assert (host["role"], host["system_type"], host["progress_meta"]["narration"]) == (
         "system", "host_progress", False)
-    _narrate_author_rationale(ctx, {"disposition": "accepted", "rationale": "  "})
-    assert events.empty()  # nothing to say is not a row
+    assert events.empty()
 
 
 def test_an_unbound_tool_context_swallows_the_narration_fact(tmp_path):
     """A ToolContext nobody bound to an agent (the dataclass default) accepts the same
-    keyword facts the real binder does, so an author finish can never raise on it."""
-    from ouroboros.tools.plan_review import _narrate_author_rationale
+    keyword facts the real binder does, so a tool relaying the model's words never raises on it."""
     from ouroboros.tools.tool_context import ToolContext
 
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     assert ctx.emit_progress_fn("x", narration=True) is None
     assert ctx.emit_progress_fn("x") is None
-    _narrate_author_rationale(ctx, {"disposition": "accepted", "rationale": "I go on."})  # no exception

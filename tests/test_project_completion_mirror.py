@@ -81,6 +81,8 @@ def test_the_row_carries_the_answer_and_its_text_does_not_change(tmp_path, monke
     pointer = _enqueue_row(tmp_path / "b", monkeypatch, _result(terminal_origin="host_salvage"))
 
     assert mirrored["progress_meta"]["completion_answer"] == ANSWER.strip()
+    assert mirrored["progress_meta"]["outcome_axes"]["execution"]["status"] == "ok"
+    assert "reply_to" not in mirrored["progress_meta"]  # system-origin work has no invented owner quote
     assert mirrored["role"] == "system"
     assert mirrored["system_type"] == "project_completion_summary"
     # Telegram, the model's own context and older clients read `text` alone:
@@ -100,13 +102,25 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     monkeypatch.setattr(message_bus, "load_state", lambda: {"session_id": "s", "owner_id": 7})
     monkeypatch.setattr(message_bus, "_advance_project_visible_revision", lambda _chat_id: None)
     monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
-
+    from ouroboros.chat_chain import format_address, row_address
+    from ouroboros.project_dialogue import build_owner_message_ref
+    # The request itself can quote an older message. The answer quotes this request.
+    origin = message_bus.log_chat("in", 1, 7, "Ship the release", client_message_id="owner-request",
+                                  message_meta={"reply_to": {"address": "task:older", "kind": "work_card"}})
+    origin_ref = build_owner_message_ref(chat_id=1, client_message_id="owner-request",
+                                         text=origin["text"], ts=origin["ts"])
+    event = _enqueue_row(tmp_path, monkeypatch, _result(origin_message_ref=origin_ref,
+        outcome_axes={"objective": {"status": "pass", "source": "author_acceptance"}}))
+    facts = {key: event["progress_meta"][key] for key in ("outcome_axes", "reply_to")}
+    assert facts["reply_to"]["address"] == format_address(row_address(origin))
+    assert facts["reply_to"]["snippet"] == "Ship the release"
     message_bus.send_with_budget(
         1, "Launch › Ship release · Done\nOpen the Project for details.",
         task_id="root-project", role="system", system_type="project_completion_summary",
-        progress_meta={"project_id": "launch", "project_name": "Launch",
+        progress_meta={**facts, "project_id": "launch", "project_name": "Launch",
                        "target_label": "Launch › Ship release", "status": "completed",
                        "completion_answer": ANSWER,
+                       "completion_notice": {"neutral": True, "detail": "", "phase": "warn", "salvage": ""},
                        "terminal_time": {"v": 1, "source": "executor_terminal", "occurred_at": "2026-09-24T18:18:27Z"}},
     )
 
@@ -132,6 +146,10 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     assert replayed["completion_answer"] == ANSWER
     assert replayed["text"] == stored["text"]
     assert replayed["terminal_time"] == stored["terminal_time"] == live["terminal_time"]
+    for key in ("outcome_axes", "reply_to"):
+        assert replayed[key] == stored[key] == live[key] == facts[key]
+    assert replayed["completion_notice"] == stored["completion_notice"] == live["completion_notice"] == {
+        "neutral": True, "detail": "", "phase": "warn", "salvage": ""}
 
 
 def test_a_row_without_the_key_replays_without_it(monkeypatch, tmp_path):
@@ -150,3 +168,24 @@ def test_a_row_without_the_key_replays_without_it(monkeypatch, tmp_path):
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"chat_id": "1"})))
     row = json.loads(response.body.decode("utf-8"))["messages"][0]
     assert "completion_answer" not in row
+
+
+def test_moved_direct_completion_uses_bound_main_request_without_a_result_origin(tmp_path, monkeypatch):
+    from ouroboros.chat_references import reference_from_row
+    from ouroboros.project_dialogue import build_owner_message_ref, enqueue_project_completion_summary
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", lambda: {"owner_id": 7})
+    origin = message_bus.log_chat("in", 1, 7, "Move this work", client_message_id="request")
+    ref = build_owner_message_ref(chat_id=1, client_message_id="request", text=origin["text"], ts=origin["ts"])
+    project = create_project(tmp_path, "room", name="Room")
+    bind_task_to_project(tmp_path, "moved", "room", project["chat_id"], origin={"ref": ref, "text": origin["text"]})
+    queued = []
+    monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery",
+                        lambda root, event, **kwargs: queued.append(event) or True)
+    assert enqueue_project_completion_summary(tmp_path, {}, "moved",
+        {"id": "moved", "_is_direct_chat": True, "project_id": "room", "chat_id": 1},
+        {"status": "failed", "project_id": "room", "result": "Explanation", "terminal_origin": "model_final",
+         "outcome_axes": {"execution": {"status": "infra_failed"}}}, {})
+    assert queued[0]["progress_meta"]["reply_to"] == reference_from_row(origin)
+    assert queued[0]["progress_meta"]["outcome_axes"]["execution"]["status"] == "infra_failed"

@@ -61,13 +61,13 @@ test after the lifecycle proof, so a projection defect there is a named red
 instead of a masked lifecycle: a paused root must not read as ``running``.
 
 S31 drives the SAME lifecycle for the owner's DIRECT chat turn over the /ws the SPA
-opens: no task contract disables its in-task graceful ceiling, so that (the other
-rail family, ``graceful_ceiling``) is what fires; the live in-process actor ends
+opens: ordinary turns have no default cost stop (#1643), so the known-spend
+``dispatch_refused`` rail fires; the live in-process actor ends
 and the turn's own record is parked INLINE as the PENDING carrier with its
 ``_is_direct_chat`` lane fact; the census reports it as ``direct_chat`` /
-``budget_paused``; the increase wakes nothing; the Resume grant carries the Q10
-planning-threshold refresh, a POOLED worker continues the checkpoint (the resumed
-round names the refreshed ceiling), and the turn concludes in the chat: the durable
+``budget_paused``; the increase wakes nothing; the Resume grant refreshes no
+planning threshold on this hard rail; a POOLED worker continues the checkpoint,
+and the turn concludes in the chat: the durable
 chat row and the keyed final frame over the same socket, the activity gone.
 
 The default-lane tests pin the literals the claims depend on (the paid wrap-up
@@ -185,9 +185,11 @@ def test_w8_literals_still_exist_in_the_tree():
     (MUST reach it on the resumed round). A literal that drifted upstream would
     make the first claim vacuously green and the second red by the wrong name."""
     # Runtime scenarios keep the concrete budget notice; source selects the
-    # owner/budget wording through the existing f-string. Pin that choice too.
+    # owner/authority/budget wording through the existing mapping. Pin those choices too.
     source = (REPO_ROOT / "ouroboros/budget_pause.py").read_text(encoding="utf-8")
-    assert 'kind = "owner Pause" if str(row.get("reason") or "") == REASON_OWNER else "budget pause"' in source
+    assert 'REASON_OWNER: "owner Pause"' in source
+    assert 'REASON_AUTHORITY: f"technical pause (' in source
+    assert 'str(row.get("reason") or ""), "budget pause")' in source
     for literal, relpath in LITERAL_SOURCES.items():
         source = (REPO_ROOT / relpath).read_text(encoding="utf-8")
         assert literal in source, f"{relpath} no longer carries {literal!r}"
@@ -731,11 +733,9 @@ S31_MARKER = "S31_DIRECT_TURN_e2e_w8"
 S31_PROBE = (f"[{S31_MARKER}] List the repository root and keep listing it; "
              "the owner controls your budget.")
 S31_FINAL = "S31_FINAL: the paused chat turn finished after its Resume."
-# A direct turn carries no task contract of its own, so its in-task GRACEFUL
-# ceiling (50% of the wallet at turn start, task_pacing.resolve_cost_ceiling)
-# is the rail that fires — the OTHER family from S30's hard ledger fence. Twice
-# S30's wallet so the ceiling lands after several rounds whatever the turn's
-# tool-less periphery (the proactive card namer) has already spent.
+# Ordinary direct turns have no hidden half-wallet ceiling (#1643). This wallet
+# reaches the known-spend dispatch fence after several rounds, including the
+# turn's tool-less periphery (the proactive card namer).
 S31_TOTAL_BUDGET = 2.0
 
 
@@ -761,12 +761,12 @@ def test_s31_direct_chat_turn_pauses_under_its_own_id_and_owner_resume_completes
     terminal, never a paid wrap-up), the census reports it as ``direct_chat`` in
     phase ``budget_paused``; a budget increase alone wakes nothing; the existing
     Resume endpoint grants it once, a POOLED worker continues the checkpointed
-    cognition cold (the host notice, the Q10 planning-threshold refresh of a
-    graceful pause), and the turn concludes IN THE CHAT: the durable chat row and
+    cognition cold (the host notice, no threshold refresh for the hard rail),
+    and the turn concludes IN THE CHAT: the durable chat row and
     the keyed final frame over the same /ws the SPA opens, the activity gone."""
     require_lane(LANE_MOCK)
     from ouroboros.budget_pause import (
-        GRACEFUL_RAILS, REASON_CODE, RESUME_POLICY, STATE_PAUSED, STATE_RESUMED, STATUS_PAUSED_EXACT,
+        RAIL_DISPATCH_REFUSED, REASON_CODE, RESUME_POLICY, STATE_PAUSED, STATE_RESUMED, STATUS_PAUSED_EXACT,
     )
     from ouroboros.task_results import STATUS_SCHEDULED
 
@@ -805,7 +805,7 @@ def test_s31_direct_chat_turn_pauses_under_its_own_id_and_owner_resume_completes
                 pause_id = str(paused.get("pause_id") or "")
                 assert _HEX32_RE.match(pause_id), paused
                 assert paused.get("is_direct_chat") is True, paused
-                assert paused.get("rail") in GRACEFUL_RAILS, paused
+                assert paused.get("rail") == RAIL_DISPATCH_REFUSED, paused
                 assert paused.get("exact_continuation") is True and paused.get("replay_safe") is False, paused
                 assert paused.get("resume_policy") == RESUME_POLICY, paused
                 assert paused.get("pause_source") == "direct_turn_inline_park", paused
@@ -888,8 +888,8 @@ def test_s31_direct_chat_turn_pauses_under_its_own_id_and_owner_resume_completes
                 grant = consumed.get("grant") or {}
                 assert grant.get("grant_id") == grant_id and grant.get("consumed_at"), grant
                 assert grant.get("single_use") is True and not grant.get("revoked_at"), grant
-                # A GRACEFUL pause: the explicit Resume refreshes the planning threshold (Q10).
-                assert grant.get("refresh_planning_threshold") is True, grant
+                # A hard dispatch fence resumes without inventing a graceful threshold.
+                assert grant.get("refresh_planning_threshold") is False, grant
                 stored = wait_durable_result(oracle, task_id, timeout=600)
                 assert stored.get("status") == "completed", stored
                 assert S31_FINAL in str(stored.get("result") or ""), stored.get("result")
@@ -899,7 +899,7 @@ def test_s31_direct_chat_turn_pauses_under_its_own_id_and_owner_resume_completes
                 assert done_rows and len(done_rows) == 1 and done_rows[0].get("status") == "completed", done_rows
                 resumed_bodies = _bodies_carrying(stub, RESUME_NOTICE_MARKER)
                 assert resumed_bodies, "no model round carried the resume notice: the turn did not continue"
-                assert REFRESHED_NOTICE_MARKER in body_text(resumed_bodies[0]), body_text(resumed_bodies[0])[-1500:]
+                assert REFRESHED_NOTICE_MARKER not in body_text(resumed_bodies[0]), body_text(resumed_bodies[0])[-1500:]
                 prior_batches = sum(
                     1 for m in resumed_bodies[0].get("messages") or []
                     if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"))

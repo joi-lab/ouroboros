@@ -16,6 +16,7 @@ from tests.test_delegate_retry_consumers import (
     isolated_retry_state as isolated_retry_state,  # re-export the autouse pytest fixture
 )
 from tests.test_delegated_directory import DirectoryEngine
+from tests._store_shared import result_signature
 
 
 pytestmark = pytest.mark.serial
@@ -24,7 +25,12 @@ pytestmark = pytest.mark.serial
 def directory_result(tmp_path, monkeypatch, *, chain=("retry-a", "retry-b"),
                      owner="retry-a", strategy="copy", lost_apply=False):
     ctx = retry_context(tmp_path, monkeypatch, chain=chain)
+    # The authority a real writable folder start records for this root's external
+    # workspace. #1609: the first-wins authority source is what separates a writable
+    # run from an evidence-only investigation, and a source-less direct run (no
+    # snapshot, no engine copy) reads as one with nothing to integrate.
     entry = durable_run(ctx, owner=owner, run_id="directory-run", access="workspace_write",
+                        authority_source="external_workspace_root",
                         resource_ref={"workspace_kind": "directory", "strategy": strategy,
                                       "scopePaths": ["."]})
     engine = DirectoryEngine(Path(ctx.workspace_root), strategy, lost_apply=lost_apply)
@@ -147,7 +153,8 @@ def captured_result(tmp_path, monkeypatch, kind):
     from tests.test_delegated_run_isolation import _seed_target
     from tests.test_delegated_skill_payload import _seed_skill
 
-    ctx = retry_context(tmp_path, monkeypatch, chain=("retry-a", "retry-b", "retry-c"), split=True)
+    ctx = retry_context(tmp_path, monkeypatch, chain=("retry-a", "retry-b", "retry-c"), split=True,
+                        fixed_ownership_clock=True)
     data = custody.custody_root(ctx)
     if kind == "git":
         seed = tmp_path / "git-project"
@@ -345,10 +352,9 @@ def test_disposition_retry_heals_failed_debt_write_without_reapplying(tmp_path, 
     assert "ALREADY_DISPOSED" in repeated.text
     assert load_task_result(drive, entry.task_id)["delegated_runs_unreconciled"] == []
     assert len(engine.applies) == 1
-    path = task_results.task_result_path(drive, entry.task_id)
-    retained = path.read_bytes()
+    retained = result_signature(drive, entry.task_id)
     call(ctx, "integrate_delegated_patch", run_id=entry.run_id)
-    assert path.read_bytes() == retained, "already-current disclosure must not churn"
+    assert result_signature(drive, entry.task_id) == retained, "already-current disclosure must not churn"
 
 
 def test_unwritten_disposition_never_clears_current_debt(tmp_path, monkeypatch):

@@ -97,6 +97,20 @@ def test_tool_timeout_is_immediate_the_outer_cap_reads_settings_live(monkeypatch
     assert not data.get("next_task_changed")
 
 
+def test_a_float_setting_resent_as_text_is_not_a_change(monkeypatch, isolated_settings):
+    """The Settings page sends every float field as its input text on each save;
+    "20" against the loaded 20.0 must not report a next-task change, or every
+    immediate-only save would also promise the next task (and its skill-key rule)."""
+    isolated_settings.write_text(json.dumps({"OUROBOROS_CONSCIOUSNESS_DAILY_USD": "20",
+                                             "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD": "0"}), encoding="utf-8")
+    resent = {"OUROBOROS_CONSCIOUSNESS_DAILY_USD": "20", "OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD": "0"}
+    data = _save(monkeypatch, isolated_settings, {**resent, "OUROBOROS_TOOL_TIMEOUT_SEC": "120"})
+    assert data.get("immediate_changed") is True and not data.get("next_task_changed")
+    assert _save(monkeypatch, isolated_settings, resent).get("no_changes") is True
+    data = _save(monkeypatch, isolated_settings, {**resent, "OUROBOROS_CONSCIOUSNESS_DAILY_USD": "20.5"})
+    assert data.get("next_task_changed") is True  # a real value change still counts
+
+
 def test_skills_repo_path_requires_a_restart_for_pooled_workers(monkeypatch, isolated_settings):
     """Pooled workers load the extension registry once at spawn and never
     reload it per task; the server-side hot reload alone cannot make the key
@@ -320,8 +334,8 @@ def test_handle_task_wires_the_disclosing_reload():
 
 
 def test_settings_ui_save_flow_pins():
-    """Static pins for the #285 UI surfaces (busy save, Restart now, standing
-    Review-lanes hint): the strings the flow depends on must survive edits."""
+    """Static pins for the #285 UI surfaces (busy save, Restart now, the standing
+    reviewer hint): the strings the flow depends on must survive edits."""
     import pathlib
 
     root = pathlib.Path(__file__).resolve().parents[1] / "web" / "modules"
@@ -336,8 +350,9 @@ def test_settings_ui_save_flow_pins():
     settings_ui_js = (root / "settings_ui.js").read_text(encoding="utf-8")
     assert 'id="btn-restart-now" hidden' in settings_ui_js
 
-    reviewer_slots_js = (root / "reviewer_slots.js").read_text(encoding="utf-8")
-    assert "keeps the reviewer configuration it started with" in reviewer_slots_js
+    # Reviewers are catalog rows marked Reviewer; their editor carries the standing hint.
+    subagents_js = " ".join((root / "subagents_settings.js").read_text(encoding="utf-8").split())
+    assert "a task that is already running keeps the reviewers it started with" in subagents_js
 
     costs_js = (root / "costs.js").read_text(encoding="utf-8")
     assert "'Saving…'" in costs_js

@@ -14,6 +14,7 @@ from ouroboros.presence_authority import presence_ceiling_payload
 from ouroboros.presence_runner import build_presence_result_event
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_presence_runner import _admission
+from tests._store_shared import read_result
 
 
 def _call(outcome="message", message="Ready"):
@@ -256,7 +257,7 @@ def test_pending_children_hold_until_an_explicit_unfinished_stop(turn, tmp_path,
     assert len(calls) == 3 and trace["task_completion"]["action"] == "stop"
     assert usage.get("reason_code") != "children_unabsorbed"
     assert trace["child_result_dispositions"]["current"] == []
-    saved = json.loads((tmp_path / "task_results" / "child1.json").read_text(encoding="utf-8"))
+    saved = read_result(tmp_path, "child1")
     assert saved["status"] == STATUS_RUNNING
     result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert (result["outcome"], result["text"]) == (outcome, spoken)

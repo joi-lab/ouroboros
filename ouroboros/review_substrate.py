@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional
 log = logging.getLogger("review_substrate")
 
 from ouroboros.llm import LLMClient
-from ouroboros.observability import new_call_id, persist_call, redact_projection  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
+from ouroboros.observability import new_call_id, persist_call, read_call_payload, redact_projection  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 from ouroboros.provider_models import provider_for_model  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 from ouroboros.review_execution_projection import (
     MAX_PROJECTED_ACTOR_FINDINGS, projected_finding_row,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
@@ -54,12 +54,13 @@ from ouroboros.review_custody import (
 # Reviewer-output JSON extraction lives in ONE place beside the array
 # extractor it falls back to (the fenced-object and verdict parsers were
 # split across two modules for no reason).
-from ouroboros.triad_review import parse_review_findings
+from ouroboros.triad_review import emit_review_run_errors, parse_review_findings
 from ouroboros.usage_accounting import (
     PhysicalAttemptLimitExceeded,
     UsageAccountingError,
     UsageScope,
     current_usage_scope,
+    last_physical_attempt_capture,
     usage_scope,
 )
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
@@ -95,10 +96,16 @@ def review_repo_dirs_for(ctx: Any) -> tuple[pathlib.Path, pathlib.Path]:
     workspace = pathlib.Path(workspace_raw) if isinstance(workspace_raw, (str, pathlib.Path)) else None
     if workspace is not None and not str(getattr(ctx, "workspace_mode", "") or "").strip():
         raise ValueError("workspace_root is set without workspace_mode")
-    system_raw = getattr(ctx, "system_repo_dir", None)
+    # A bound body candidate is the SUBJECT; the adopted (serving) body stays the governance.
+    system_raw = getattr(ctx, "serving_repo_dir", None) or getattr(ctx, "system_repo_dir", None)
     system = pathlib.Path(system_raw) if isinstance(system_raw, (str, pathlib.Path)) else None
     governance = (system or pathlib.Path(getattr(ctx, "repo_dir"))).resolve(strict=False)
-    subject = pathlib.Path(active_repo_dir_for(ctx)).resolve(strict=False)
+    from ouroboros import body_candidate
+
+    # The bound candidate is what the context authors and commits: it stays the subject
+    # even when the task also carries a workspace/project folder as its active root.
+    subject_raw = body_candidate.descriptor(ctx).get("path") if body_candidate.is_bound(ctx) else None
+    subject = pathlib.Path(subject_raw or active_repo_dir_for(ctx)).resolve(strict=False)
     if not governance.is_dir() or not subject.is_dir():
         raise ValueError(f"unavailable governance/subject root: {governance} / {subject}")
     return governance, subject
@@ -122,80 +129,16 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
 )
 
 
-# reviewer_slots()/triad_delivery_slots() live in reviewer_slot_config (altitude, P7); re-exported for callers here.
-from ouroboros.reviewer_slot_config import SCOPE_ROLE_HINT, reviewer_slots, triad_delivery_slots  # noqa: F401,E402
-
-
-def scope_reviewer_slots(
-    models: List[str] | None = None, *, effort: str | None = None,
-) -> List[ReviewSlot]:
-    """The configured scope-reviewer rows — the single owner of scope-slot identity.
-
-    Both scope surfaces read their ids from here: the substrate call that produces
-    the durable prompt/response refs, and the actor records the commit attempt
-    persists. One row therefore carries exactly one identity instead of two that
-    disagree. Each row also carries its configured delivery route (D14: every
-    scope slot is independently harness-or-API).
-
-    With no explicit ``models`` the rows come from the reviewer-slot SSOT
-    (6.1): stable owner ids, per-row route/target/effort. An explicit list
-    keeps the historical positional behavior for callers that rebuild one row;
-    such rows are pinned ``api_chat`` (the caller that fans out a delegated
-    row overrides the route itself — the phase-5 per-row route envs are
-    retired, ABI-10).
-
-    An omitted ``effort`` resolves to the configured scope-review effort: the
-    legacy path used to take this parameter's old literal default instead,
-    silently running the BLOCKING reviewer below configured strength (the
-    downgrade class the owner forbade).
-
-    Every scope row delivers by RETRIEVAL (owner decision 2026-09-17): an
-    ``api_chat`` row on this surface means a bounded native inspection episode
-    on that model, an ``agent_session`` row a delegated read-only session.
-    ``scope_delivery_rows`` states that on the row itself, so the transport
-    seam reads one fact instead of inferring delivery from an actor id the
-    scope surface does not require.
-    """
-    if effort is None:
-        from ouroboros.config import resolve_effort
-
-        effort = resolve_effort("scope_review")
-    if models is None:
-        from ouroboros.reviewer_slot_config import structured_scope_review_slots
-
-        structured = structured_scope_review_slots()
-        if structured is not None:
-            return scope_delivery_rows(structured)
-        # Resolved at call time so the configured list stays the live authority.
-        from ouroboros.config import get_scope_review_models
-
-        models = get_scope_review_models()
-    return scope_delivery_rows(reviewer_slots(
-        models, effort=effort, role_hint=SCOPE_ROLE_HINT, id_prefix=SCOPE_SLOT_ID_PREFIX,
-    ))
-
-
-def scope_delivery_rows(slots: List[ReviewSlot]) -> List[ReviewSlot]:
-    """Mark every ``api_chat`` scope row as a native retrieving reviewer.
-
-    The scope surface owns the delivery of its own rows, so the fact rides the
-    row rather than a synthesized ``subagent_id``: identity, route, model,
-    credential pin, effort, processing preference and local-route flag stay
-    exactly as configured.
-    """
-    return [
-        replace(slot, native_retrieval_override=True)
-        if str(getattr(slot.route, "value", slot.route) or "") == ReviewRouteKind.API_CHAT.value
-        else slot
-        for slot in slots
-    ]
+# triad_delivery_slots() (the pool under its historical name) lives in reviewer_slot_config (altitude, P7);
+# re-exported for the acceptance callers and their tests here.
+from ouroboros.reviewer_slot_config import triad_delivery_slots  # noqa: F401,E402
 
 
 def review_usage_category(surface: str) -> str:
     """The usage-scope category every send of a review surface is attributed
     under — the key the ledger's cache split and the root telemetry's
-    reservation identities carry, so the commit gate's admission and its
-    scope-first hold name the same scope the substrate sends under."""
+    reservation identities carry, so the commit gate's admission names the
+    same scope the substrate sends under."""
     return f"{surface}_review"
 
 
@@ -257,6 +200,10 @@ class ReviewCoordinator:
                 panel_id=_review_panel_id(request, []),
             )
 
+        if not request.reconcile_only and not request.checking_source:
+            from ouroboros.review_checking import wave_checking_source
+            request.checking_source = wave_checking_source(request.session_root, slots, data_root=self._custody_drive_root())
+
         base_scope = current_usage_scope() or UsageScope()
         usage_meta = (
             getattr(self.usage_ctx, "task_metadata", {})
@@ -311,7 +258,8 @@ class ReviewCoordinator:
                                         or (getattr(self.usage_ctx, "task_id", "")
                                             and getattr(self.usage_ctx, "task_lifecycle_bound", None) is not False)),
             review_skill=str(review_meta.get("review_skill") or base_scope.review_skill or ""),
-            review_wave_id=str(review_meta.get("review_wave_id") or base_scope.review_wave_id or ""),
+            review_wave_id=resolve_review_wave(request, review_meta, base_scope.review_wave_id),
+            cache_wave=str(review_meta.get("review_wave_id") or base_scope.cache_wave or ""),
             global_limit_usd=global_limit,
             global_limit_source=(base_scope.global_limit_source if base_scope.global_limit_usd is not None
                                  else "settings_budget_resolver"),
@@ -361,7 +309,6 @@ class ReviewCoordinator:
             "plan_review",
             "skill_review",
             "task_acceptance",
-            "advisory_review",
         }
         route_owned_executor = (
             str(getattr(getattr(self._run_slot, "__func__", None), "__module__", ""))
@@ -413,7 +360,8 @@ class ReviewCoordinator:
             # the row REALLY ran as last time. Disclosure only; best-effort.
             from ouroboros.reviewer_slot_config import record_reviewer_slot_executions
 
-            record_reviewer_slot_executions(request.surface, actors, slots_by_id)
+            # The wave keeps its OWN rows on its ctx for its ledger record (``keep_on``).
+            record_reviewer_slot_executions(request.surface, actors, slots_by_id, keep_on=self.usage_ctx)
         except Exception:
             log.debug("reviewer-slot last-execution write failed", exc_info=True)
 
@@ -428,6 +376,8 @@ class ReviewCoordinator:
             criteria_shape_valid=_criteria_shape_valid,
             advisory_hardness=HARDNESS_ADVISORY_VISIBLE,
         )
+        # #1578: every surface's reviewer failures reach the canonical log once.
+        emit_review_run_errors(self.usage_ctx, request, actors, drive_root=self.drive_root)
         return ReviewRunResult(
             request=asdict(request),
             actors=[asdict(actor) for actor in actors],
@@ -548,13 +498,19 @@ class ReviewCoordinator:
             if callable(pending_invocation_checkpoint):
                 pending_invocation_checkpoint(invocation_id)
         executor.set_pending_invocation_checkpoint(checkpoint)
+        from ouroboros.review_session_custody import exact_recovery_join
+        exact_recovery = exact_recovery_join(executor, self._custody_drive_root(), retry_state, operation_id, slot,
+                                             replay=request.reconcile_only)
         prompt_projection = executor.prompt_payload()
         prompt_ref: Dict[str, Any] = {}
         response_ref: Dict[str, Any] = {}
         start = time.time()
-        attempt_history = _ReviewAttemptHistory()
+        attempt_history = _ReviewAttemptHistory(incoming_capture=last_physical_attempt_capture())
         try:
-            prompt_ref = persist_call(
+            # A collector must not replace the original immutable prompt with
+            # today's reconstruction or a redacted projection of the raw request.
+            prompt_ref = read_call_payload(self._custody_drive_root(), task_id=request.task_id or "review",
+                                           call_id=f"{call_id}_prompt")[2] if exact_recovery else persist_call(
                 self._custody_drive_root(),
                 task_id=request.task_id or "review",
                 call_id=f"{call_id}_prompt",
@@ -564,7 +520,7 @@ class ReviewCoordinator:
                           "review_operation_binding": binding},
             )
         except Exception:
-            if request.slot_source_delivery.get(slot.slot_id):
+            if request.slot_source_delivery.get(slot.slot_id) and not exact_recovery:
                 # A sourced review must retain its canonical identity before
                 # dispatch, not only in a post-run result or a worker buffer.
                 raise
@@ -603,11 +559,6 @@ class ReviewCoordinator:
         # selected by ``run_custodied_review_slots`` must remain usable after the
         # owner deadline.  The executor still validates the token and refuses a
         # missing/mismatched durable record before any new POST.
-        recovery_token = str(
-            (retry_state or {}).get("pending_invocation_id") or ""
-        ).strip()
-        exact_recovery = bool(recovery_token and str(operation_id or "").strip()
-            and str(getattr(slot.route, "value", slot.route) or "") == "agent_session")
         if not exact_recovery and owner_deadline_exhausted(
             deadline_at=owner_deadline, reserve_sec=get_finalization_grace_sec(),
         ):
@@ -757,7 +708,8 @@ class ReviewCoordinator:
                 model=slot.model,
                 status="error",
                 error=sanitize_tool_result_for_log(error_msg),
-                transport_status=_transport_error_status(exc),
+                transport_status=_transport_error_status(
+                    exc, failure_phase=str(failure_custody.get("review_failure_phase") or "")),
                 failure_code=failure_code,
                 reset_at=str(getattr(exc, "reset_at", "") or ""),
                 reported_cause=str(getattr(exc, "reported_cause", "") or ""),
@@ -807,9 +759,12 @@ class ReviewCoordinator:
         try:
             from ouroboros.tools.review_helpers import emit_review_usage
 
+            session = bool(usage.get("delegated_run_started") or usage.get("delegated_run_id"))
             emit_review_usage(
                 self.usage_ctx,
-                model=str(usage.get("resolved_model") or slot.model),
+                # A session row names its OBSERVED model or none: the seat's requested route
+                # label rides the ``claudexor`` receipt, never this field (#1578).
+                model=str(usage.get("resolved_model") or ("" if session else slot.model)),
                 provider=str(usage.get("provider") or ""), usage=usage,
                 source=f"review_substrate:{request.surface}",
                 prompt_chars=prompt_chars,
@@ -822,14 +777,16 @@ class ReviewCoordinator:
 def run_review_request(
     request: ReviewRequest,
     *,
-    slots: List[ReviewSlot] | None = None,
+    slots: List[ReviewSlot],
     drive_root: pathlib.Path | None = None,
     llm: LLMClient | None = None,
     usage_ctx: Any = None,
 ) -> ReviewRunResult:
-    resolved_slots = reviewer_slots(role_hint=request.surface) if slots is None else slots
+    """Run ONE review wave on ``slots`` — the rows the caller took from the pool
+    (``review_pool_slots`` / ``triad_delivery_slots``) or composed for its wave;
+    the substrate never picks reviewers itself."""
     coordinator = ReviewCoordinator(llm=llm, drive_root=drive_root, usage_ctx=usage_ctx)
-    result = coordinator.run(request, resolved_slots)
+    result = coordinator.run(request, slots)
     if request.surface == "task_acceptance":
         # D-Q5 annotation-only pass: feeds the clean bit + disclosure, never parse
         # validity/quorum/verdicts. Called UNGUARDED on purpose — the annotator is
@@ -853,6 +810,7 @@ from ouroboros.review_records import (  # noqa: E402, F401 -- intentional public
     ReviewRunResult,
     ReviewSlot,
     TYPED_FAILURE_FACT_KEYS,
+    resolve_review_wave,
 )
 
 from ouroboros.review_verdict import (  # noqa: E402, F401 -- intentional public re-exports

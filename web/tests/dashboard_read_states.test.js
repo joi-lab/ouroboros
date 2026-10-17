@@ -5,6 +5,7 @@ import { initActivity } from '../modules/activity.js';
 import { initLogs } from '../modules/logs.js';
 import { initCosts } from '../modules/costs.js';
 import { initDashboard } from '../modules/dashboard.js';
+import { initStorage } from '../modules/storage.js';
 
 // DOM bookkeeping only: the production initializers, HTTP client, status helper,
 // stream subscription and log deduplication all run unchanged. Layout/AT behavior
@@ -47,6 +48,9 @@ class NodeStub {
     get nextElementSibling() { return this.parentElement?.children[this.parentElement.children.indexOf(this) + 1]; }
     get textContent() { return this._text + this.children.map((child) => child.textContent).join(''); }
     set textContent(text) { this._text = String(text); this.children = []; }
+    // escapeHtmlText's round trip (text written as textContent reads back escaped); markup
+    // children are not serialized back.
+    get innerHTML() { return this.textContent.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
     set innerHTML(html) {
         this.textContent = '';
         const stack = [this];
@@ -96,10 +100,15 @@ class NodeStub {
 function setup(t) {
     const mount = new NodeStub();
     const body = new NodeStub('body');
+    const documentEvents = new NodeStub('#document');
     const document = {
         body,
+        hidden: false,
         createElement: (tag) => new NodeStub(tag),
         getElementById: (id) => mount.querySelector(`#${id}`) || body.querySelector(`#${id}`),
+        addEventListener: (type, fn) => documentEvents.addEventListener(type, fn),
+        removeEventListener: (type, fn) => documentEvents.removeEventListener(type, fn),
+        dispatchEvent: (event) => documentEvents.dispatchEvent(event),
     };
     const window = new NodeStub();
     const routes = new Map();
@@ -136,7 +145,7 @@ function setup(t) {
         Object.assign(globalThis, previous);
     });
     const toasts = () => body.querySelectorAll('.toast').map((node) => node.textContent);
-    return { mount, window, ws, routes, calls, toasts };
+    return { mount, window, document, ws, routes, calls, toasts };
 }
 
 const response = (data, status = 200) => ({ ok: status < 400, status, json: async () => data });
@@ -153,6 +162,30 @@ function emptyActivity(routes) {
     routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, active_chat_activities: [], active_chat_activities_complete: true }));
     routes.set(schedulesUrl, response({ tasks: [] }));
 }
+
+test('Activity task list waits for migration and refreshes itself after publication', async t => {
+    const { mount, routes, ws, calls, toasts } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ reason_code: 'migrating' }, 503));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    assert.equal(message(section(mount, 'queue')), 'Saved tasks are being upgraded…');
+    assert.deepEqual(toasts(), []);
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(calls.filter(url => url === queueUrl).length, 2);
+    emptyActivity(routes);
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(calls.filter(url => url === queueUrl).length, 3);
+    assert.equal(message(section(mount, 'queue')), '');
+    assert.match(section(mount, 'queue').textContent, /Nothing running or queued/);
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(calls.filter(url => url === queueUrl).length, 3);
+    routes.set(queueUrl, response({ reason_code: 'migrating' }, 503));
+    await activity.refresh();
+    activity.destroy();
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(calls.filter(url => url === queueUrl).length, 4, 'destroy cancels migration retries');
+});
 
 test('Activity names known non-Project scope waits without implying a Project', async (t) => {
     const { mount, routes, ws } = setup(t);
@@ -488,6 +521,28 @@ test('Activity unites live direct turns with queue identities and preserves queu
     assert.deepEqual(calls, [queueUrl, backgroundUrl, schedulesUrl], 'reuse the existing state read');
 });
 
+test('Activity names work held by an application stop as held, never as a money pause', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [
+        { task: { id: 'saved-1', title: 'Saved before Quit', _budget_pause_hold: { reason: 'saved_work_hold' } } },
+        { task: { id: 'restart-1', title: 'Held by Restart', _budget_pause_hold: { reason: 'owner_restart_hold' } } },
+        { task: { id: 'released-1', title: 'Resumed already',
+            _budget_pause_hold: { reason: 'saved_work_hold', selected: true } } },
+    ] } }));
+    await initActivity({ mount, ws }).refresh();
+    const rows = section(mount, 'queue').querySelectorAll('.activity-row');
+    assert.equal(rows.length, 3);
+    for (const row of rows.slice(0, 2)) {
+        assert.match(row.textContent, /held after Restart/);
+        assert.doesNotMatch(row.textContent, /budget/);
+        assert.equal(row.querySelector('button').dataset.budgetPaused, '1', 'the same Resume is offered');
+    }
+    // The owner's Resume released this hold: it is neither held nor paused any more.
+    assert.doesNotMatch(rows[2].textContent, /held after Restart|paused/);
+    assert.equal(rows[2].querySelector('button').dataset.budgetPaused, undefined);
+});
+
 test('Activity complete empty census differs from unknown and failed state preserves queue facts', async (t) => {
     const { mount, routes, ws } = setup(t);
     emptyActivity(routes);
@@ -655,6 +710,30 @@ test('Logs files a wake-up group under Consciousness with its label, from the or
     assert.equal(card('turn-2').querySelector('[data-task-kind]').textContent, 'task turn-2');
 });
 
+test('Logs keeps the executor chip quiet and prints its detail sentence as text (#360 A)', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    for (const name of ['events', 'tools', 'progress', 'supervisor']) routes.set(logUrl(name), response({ entries: [] }));
+    initLogs({ mount, ws, state: { activePage: 'dashboard', dashboardActiveSubtab: 'logs' } });
+    const evidence = { delegated_runs_started: 2, delegated_runs_settled: 2, delegated_runs_succeeded: 1,
+        delegated_runs_failed: 1, subscription_cost_usd: null, harness_models: [] };
+    ws.emit('log', { data: { type: 'send_message', is_progress: true, task_id: 'child-x', ts: '2026-09-16T12:00:00Z',
+        content: 'done', executor_route: 'codex', execution_evidence: evidence } });
+    // An ungrouped row keeps the same pair: a quiet chip and its sentence beside it.
+    ws.emit('log', { data: { type: 'executor_note', executor_route: 'claude', ts: '2026-09-16T12:00:01Z' } });
+    await settle();
+    const entries = mount.querySelector('#log-entries');
+    const card = entries.children.find((node) => node.dataset.taskGroup === 'child-x');
+    const chip = card.querySelector('[data-task-executor]');
+    assert.equal(chip.hidden, false);
+    assert.match(chip.textContent, /Codex · 1 of 2 runs failed$/);
+    const detail = card.querySelector('[data-task-executor-detail]');
+    assert.equal(detail.hidden, false, 'the detail is visible text, not a hover-only title');
+    assert.equal(detail.textContent, chip.title);
+    assert.match(detail.textContent, /2 runs settled \(1 ok, 1 failed\)/);
+    const standalone = entries.children.find((node) => !node.dataset.taskGroup);
+    assert.match(standalone.querySelector('.log-executor-chip').textContent, /Claude Code$/);
+    assert.match(standalone.querySelector('.log-executor-detail').textContent, /^Dispatched to Claude Code/);
+});
 
 test('Activity names the typed no-change refusals and never calls a suppression "deleted"', async (t) => {
     const { mount, routes, ws, toasts } = setup(t);
@@ -763,4 +842,409 @@ test('Activity names saved sleep without claiming a budget pause and preserves o
     await activity.refresh();
     assert.match(section(mount, 'queue').textContent, /paused/);
     assert.doesNotMatch(section(mount, 'queue').textContent, /sleeping|budget/);
+});
+
+// Census rows as gateway/state.py publishes them: the row's own stored status, axes and checkpoint.
+const censusAxes = (status, execution) => ({ schema_version: 1, lifecycle: { status },
+    execution: { status: execution, reason_code: execution === 'ok' ? 'final_message' : 'provider_unavailable' },
+    artifacts: { status: 'not_applicable' }, objective: { status: 'not_evaluated', source: 'none' },
+    review: { status: 'skipped', trigger: 'not_evaluated' } });
+const outcomeRow = (activity_id, status, execution, phase, synthesis, extra = {}) => ({ activity_id, kind: 'managed_task',
+    phase, status, outcome_axes: censusAxes(status, execution), root_phase_checkpoint: { post_task_synthesis: synthesis }, ...extra });
+const chip = (row) => {
+    const status = row.querySelector('[data-activity-phase]');
+    const second = status?.nextElementSibling;
+    return status && { text: status.textContent, phase: status.dataset.phase, label: status.getAttribute('aria-label'),
+        secondary: second.hidden ? '' : second.textContent };
+};
+const rowOf = (mount, id) => section(mount, 'queue').querySelector(`[data-id="${id}"]`).parentElement.parentElement;
+
+test('Activity shows a row\'s own known outcome first and its unfinished finalization beside it', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const now = Date.now;
+    Date.now = () => 100000;
+    t.after(() => { Date.now = now; });
+    const running = (id, extra = {}) => ({ id, type: 'task', runtime_sec: 9, task: { id, root_task_id: id, title: `Work ${id}`, ...extra } });
+    routes.set(queueUrl, response({ queue: {
+        running: ['failed-root', 'done-root', 'warn-root', 'cancelled-root', 'live-root'].map((id) => running(id)).concat(
+            running('child-1', { root_task_id: 'failed-root', parent_task_id: 'failed-root', title: 'Child of the failed root' })),
+        pending: [{ id: 'queued-root', type: 'task', task: { id: 'queued-root', root_task_id: 'queued-root', title: 'Queued work' } }],
+    } }));
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, active_chat_activities_complete: true,
+        active_chat_activities: [
+            outcomeRow('failed-root', 'failed', 'infra_failed', 'finalizing', 'running'),
+            outcomeRow('done-root', 'completed', 'ok', 'finalizing', 'pending_once'),
+            outcomeRow('warn-root', 'completed', 'degraded', 'working', 'completed'),
+            outcomeRow('cancelled-root', 'cancelled', 'cancelled', 'working', ''),
+            { activity_id: 'live-root', kind: 'managed_task', phase: 'working', status: 'running', outcome_axes: censusAxes('running', 'ok') },
+            { activity_id: 'queued-root', kind: 'managed_task', phase: 'queued' },
+            outcomeRow('answered-direct', 'completed', 'ok', 'finalizing', 'running', { kind: 'direct_chat', started_at: 90 }),
+            outcomeRow('late-root', 'completed', 'ok', 'budget_paused', 'paused', { pause_cause: 'owner' }),
+            { activity_id: 'thinking-direct', kind: 'direct_chat', phase: 'thinking', started_at: 95 },
+        ] }));
+    await initActivity({ mount, ws }).refresh();
+    const queue = section(mount, 'queue');
+    assert.equal(queue.querySelectorAll('.activity-row').length, 10, 'every occupied row stays listed');
+    assert.deepEqual(chip(rowOf(mount, 'failed-root')), { text: 'Failed', phase: 'error',
+        label: 'Task status: Failed, Finalizing…', secondary: 'Finalizing…' });
+    assert.doesNotMatch(rowOf(mount, 'failed-root').textContent, /running/, 'the outcome replaces the occupancy word');
+    assert.match(rowOf(mount, 'failed-root').textContent, /· task · 9s/);
+    assert.deepEqual(chip(rowOf(mount, 'done-root')).text + chip(rowOf(mount, 'done-root')).secondary, 'DoneFinalizing…');
+    assert.deepEqual(chip(rowOf(mount, 'warn-root')), { text: 'Done with warnings', phase: 'warn',
+        label: 'Task status: Done with warnings', secondary: '' });
+    assert.equal(chip(rowOf(mount, 'cancelled-root')).text, 'Cancelled');
+    // No known outcome: the queue's own words, exactly as before.
+    for (const [id, word] of [['live-root', /running · task · 9s/], ['queued-root', /Queued work[\s\S]*pending · task/]]) {
+        assert.equal(chip(rowOf(mount, id)), null, id);
+        assert.match(rowOf(mount, id).textContent, word);
+    }
+    // A child never borrows its root's result, even while that root's census row is Failed.
+    assert.equal(chip(rowOf(mount, 'child-1')), null);
+    assert.match(rowOf(mount, 'child-1').textContent, /Child of the failed root[\s\S]*running/);
+    assert.doesNotMatch(rowOf(mount, 'child-1').textContent, /Failed/);
+    // Census-only rows: a known answer with late work, a late Pause beside its Done, a plain turn.
+    assert.deepEqual(chip(rowOf(mount, 'answered-direct')).text + '|' + chip(rowOf(mount, 'answered-direct')).secondary,
+        'Done|Finalizing…');
+    assert.match(rowOf(mount, 'answered-direct').textContent, /Direct turn[\s\S]*· 10s/);
+    assert.deepEqual(chip(rowOf(mount, 'late-root')), { text: 'Done', phase: 'done',
+        label: 'Task status: Done, Paused · owner pause', secondary: 'Paused · owner pause' });
+    assert.equal(chip(rowOf(mount, 'thinking-direct')), null);
+    assert.match(rowOf(mount, 'thinking-direct').textContent, /thinking · 5s/);
+    // Controls follow occupancy and the existing pause facts, never the outcome.
+    const controls = Object.fromEntries(queue.querySelectorAll('[data-act="task-control"]').map((button) =>
+        [button.dataset.id, [button.dataset.root, button.dataset.budgetPaused]]));
+    assert.deepEqual(controls, {
+        'failed-root': ['1', undefined], 'done-root': ['1', undefined], 'warn-root': ['1', undefined],
+        'cancelled-root': ['1', undefined], 'live-root': ['1', undefined], 'child-1': [undefined, undefined],
+        'queued-root': ['1', undefined], 'answered-direct': ['1', undefined], 'late-root': ['1', '1'],
+        'thinking-direct': ['1', undefined],
+    });
+    assert.ok(queue.querySelectorAll('[data-activity-phase]').every((node) => node.closest('[data-i18n-skip]')),
+        'chip words come from the translation seam, so the overlay leaves them alone');
+});
+
+test('Activity keeps pause words for members and paints a host hold beside a known outcome as text', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const member = (id) => ({ id, task: { id, root_task_id: 'paused-root', parent_task_id: id === 'paused-root' ? '' : 'paused-root',
+        type: 'task', title: id, _budget_pause: { reason: 'owner' } } });
+    routes.set(queueUrl, response({ queue: { running: [], pending: [member('paused-root'), member('member-1')],
+        budget_root_fences: [{ root_task_id: 'paused-root', status: 'paused', cause: 'owner_pause' }] } }));
+    const hold = { label: '<img src=x onerror="globalThis.pwned=1">', detail: 'binding unavailable' };
+    const activities = [outcomeRow('paused-root', 'completed', 'ok', 'budget_paused', 'paused', { pause_cause: 'owner' }),
+        outcomeRow('held-root', 'failed', 'infra_failed', 'finalizing', 'running', { project_admission_hold: hold })];
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, active_chat_activities: activities,
+        active_chat_activities_complete: false }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    // The root's own row knows its answer; its member keeps the tree's pause word and Resume.
+    assert.equal(chip(rowOf(mount, 'paused-root')).text, 'Done');
+    assert.equal(chip(rowOf(mount, 'member-1')), null);
+    assert.match(rowOf(mount, 'member-1').textContent, /paused/);
+    for (const id of ['paused-root', 'member-1']) {
+        assert.equal(section(mount, 'queue').querySelector(`[data-id="${id}"]`).dataset.budgetPaused, '1', id);
+    }
+    // A partial census still describes its own rows; the host's hold text never becomes markup.
+    assert.deepEqual(chip(rowOf(mount, 'held-root')).secondary, hold.label);
+    assert.equal(section(mount, 'queue').querySelectorAll('img').length, 0);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /Nothing running/);
+    // Without a census the queue rows keep their words; nothing is erased or called idle.
+    routes.set(backgroundUrl, response({}, 503));
+    await activity.refresh();
+    assert.equal(section(mount, 'queue').querySelectorAll('[data-activity-phase]').length, 0);
+    assert.match(rowOf(mount, 'paused-root').textContent, /paused/);
+    assert.equal(section(mount, 'queue').querySelectorAll('.activity-row').length, 2);
+});
+
+test('Activity keeps a queue row\'s own wait beside its known outcome and shows no model-call telemetry', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const hold = { label: 'Waiting for Project verification', detail: 'binding unavailable' };
+    const root = (id, title, extra = {}) => ({ id, type: 'task', task: { id, root_task_id: id, title, ...extra } });
+    routes.set(queueUrl, response({ queue: {
+        running: [
+            { ...root('sleep-root', 'Sleeping answered work'), owner_wait: { state: 'waiting', reason: 'sleep', sleep: { mode: 'warm' } } },
+            root('live-model', 'Finalizing with a model'),
+            root('held-queue', 'Held work', { project_admission_hold: hold }),
+        ],
+        pending: [
+            root('restart-root', 'Saved before Quit', { _budget_pause_hold: { reason: 'saved_work_hold' } }),
+            root('pending-root', 'Requeued'),
+        ],
+    } }));
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false, active_chat_activities_complete: true,
+        active_chat_activities: [
+            outcomeRow('sleep-root', 'completed', 'ok', 'finalizing', 'running'),
+            outcomeRow('live-model', 'completed', 'ok', 'working', 'running',
+                { model_activity: { phase: 'awaiting_response', task_attempt: 1 } }),
+            outcomeRow('held-queue', 'failed', 'infra_failed', 'finalizing', 'running', { project_admission_hold: hold }),
+            outcomeRow('restart-root', 'completed', 'ok', 'budget_paused', 'completed', { pause_cause: 'restart' }),
+            outcomeRow('pending-root', 'failed', 'infra_failed', 'queued', 'completed'),
+        ] }));
+    await initActivity({ mount, ws }).refresh();
+    const pair = (id) => [chip(rowOf(mount, id)).text, chip(rowOf(mount, id)).secondary];
+    // A queue wait outranks the census's merely active phase; the outcome still leads.
+    assert.deepEqual(pair('sleep-root'), ['Done', 'sleeping']);
+    assert.deepEqual(pair('restart-root'), ['Done', 'held after Restart']);
+    assert.deepEqual(pair('pending-root'), ['Failed', 'pending']);
+    assert.equal(chip(rowOf(mount, 'sleep-root')).label, 'Task status: Done, sleeping');
+    // Activity carries no model-call telemetry: finalization stays a generic fact.
+    assert.deepEqual(pair('live-model'), ['Done', 'Finalizing…']);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /request|response/i);
+    // The queue line names its own hold once; the chip does not repeat it.
+    assert.deepEqual(pair('held-queue'), ['Failed', 'Finalizing…']);
+    assert.equal(rowOf(mount, 'held-queue').textContent.split(hold.label).length, 2);
+    // Resume stays exactly where the queue facts put it.
+    const paused = Object.fromEntries(section(mount, 'queue').querySelectorAll('[data-act="task-control"]')
+        .map((button) => [button.dataset.id, button.dataset.budgetPaused]));
+    assert.deepEqual(paused, { 'sleep-root': undefined, 'live-model': undefined, 'held-queue': undefined,
+        'restart-root': '1', 'pending-root': undefined });
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard -> Storage: the real controller over the fixture's fetch, window and document.
+// ---------------------------------------------------------------------------
+
+const storageUrl = '/api/storage';
+const measureUrl = '/api/storage/measure';
+const storageBody = (overrides = {}) => ({ measuring: false, measurement: null, error: null, ...overrides });
+const measuredBody = () => storageBody({ measurement: {
+    finished_at: '2026-10-05T10:00:01Z', duration_seconds: 1, measured_bytes: 1400000, complete: true, free_bytes: null,
+    categories: [{ id: 'results', bytes: 1400000, files: 3, coverage: 'complete', stopped: '', errors: 0, skipped: 0 }],
+    not_measured: [],
+} });
+const deferred = () => {
+    const handle = {};
+    handle.promise = new Promise((resolve, reject) => Object.assign(handle, { resolve, reject }));
+    return handle;
+};
+const storageSummary = (mount) => mount.querySelector('[data-storage-summary]').textContent;
+
+/** Timers by hand: the poll is a scheduled callback the test can see, fire or see cleared. */
+function manualTimers(t) {
+    const pending = new Map();
+    let next = 1;
+    const realClear = globalThis.clearTimeout;
+    globalThis.setTimeout = (fn, ms) => { pending.set(next, { fn, ms }); return next++; };
+    globalThis.clearTimeout = (id) => { pending.delete(id); };
+    t.after(() => { globalThis.clearTimeout = realClear; });
+    return {
+        polls: () => [...pending.values()].filter((timer) => timer.ms === 1000).length,
+        async fire() {
+            const due = [...pending.values()];
+            pending.clear();
+            for (const timer of due) await timer.fn();
+        },
+    };
+}
+
+function openStorage(t) {
+    const fixture = setup(t);
+    const timers = manualTimers(t);
+    const state = { activePage: 'dashboard', dashboardActiveSubtab: 'storage' };
+    const show = (tab) => {
+        state.dashboardActiveSubtab = tab;
+        fixture.window.dispatchEvent({ type: 'ouro:dashboard-subtab-shown', detail: { tab } });
+    };
+    return { ...fixture, timers, state, show, start: () => initStorage({ state, mount: fixture.mount }) };
+}
+
+test('Storage opens with one passive read; only the button measures, then polls while visible', async (t) => {
+    const { mount, routes, calls, timers, start } = openStorage(t);
+    routes.set(storageUrl, response(storageBody()));
+    start();
+    await settle();
+    assert.deepEqual(calls, [storageUrl]);
+    assert.match(storageSummary(mount), /Not measured yet/);
+    assert.equal(timers.polls(), 0, 'nothing runs, so nothing is polled');
+
+    routes.set(measureUrl, (_url, init) => {
+        assert.equal(init.method, 'POST');
+        return response(storageBody({ measuring: true, started: true }), 202);
+    });
+    await mount.querySelector('[data-storage-action="measure"]').fire('click');
+    await settle();
+    assert.deepEqual(calls, [storageUrl, measureUrl]);
+    assert.equal(timers.polls(), 1);
+    routes.set(storageUrl, response(measuredBody()));
+    await timers.fire();
+    await settle();
+    assert.deepEqual(calls, [storageUrl, measureUrl, storageUrl]);
+    assert.match(storageSummary(mount), /Measured data/);
+    assert.match(storageSummary(mount), /1\.4 MB/);
+    assert.equal(timers.polls(), 0, 'a finished walk is not polled');
+});
+
+test('Storage holds one measurement busy from the click to the finished walk', async (t) => {
+    const { mount, routes, calls, timers, start } = openStorage(t);
+    routes.set(storageUrl, response(storageBody()));
+    start();
+    await settle();
+    const button = mount.querySelector('[data-storage-action="measure"]');
+    const posted = deferred();
+    routes.set(measureUrl, () => posted.promise);
+    const click = button.fire('click');
+    await settle();
+    // The one button stays focusable (aria-disabled, never disabled) and a second click sends nothing.
+    assert.equal(button.textContent, 'Measuring…');
+    assert.equal(button.getAttribute('aria-disabled'), 'true');
+    assert.equal(button.getAttribute('aria-busy'), 'true');
+    assert.equal(button.disabled, false);
+    await button.fire('click');
+    assert.deepEqual(calls, [storageUrl, measureUrl]);
+
+    posted.resolve(response(storageBody({ measuring: true, started: true }), 202));
+    await click;
+    await settle();
+    assert.equal(button.getAttribute('aria-disabled'), 'true', 'a running walk keeps it busy');
+    await button.fire('click');
+    assert.deepEqual(calls, [storageUrl, measureUrl]);
+    assert.equal(timers.polls(), 1);
+
+    routes.set(storageUrl, response(measuredBody()));
+    await timers.fire();
+    await settle();
+    assert.equal(button.textContent, 'Refresh');
+    assert.equal(button.getAttribute('aria-disabled'), 'false');
+    assert.equal(button.hasAttribute('aria-busy'), false);
+
+    // A walk that finished before its POST answered is shown at once, with nothing to poll.
+    routes.set(measureUrl, response({ ...measuredBody(), started: true }, 202));
+    await button.fire('click');
+    await settle();
+    assert.deepEqual(calls, [storageUrl, measureUrl, storageUrl, measureUrl]);
+    assert.equal(timers.polls(), 0);
+    assert.equal(button.textContent, 'Refresh');
+    assert.equal(button.getAttribute('aria-disabled'), 'false');
+});
+
+test('Storage says when a first measurement cannot be read, keeps polling and does not measure twice', async (t) => {
+    const { mount, routes, calls, timers, start } = openStorage(t);
+    routes.set(storageUrl, response(storageBody()));
+    start();
+    await settle();
+    const button = mount.querySelector('[data-storage-action="measure"]');
+    routes.set(measureUrl, response(storageBody({ measuring: true, started: true }), 202));
+    await button.fire('click');
+    await settle();
+    assert.match(storageSummary(mount), /Measuring…[\s\S]*Reading file sizes/);
+
+    routes.set(storageUrl, response({ error: 'synthetic storage read refusal' }, 503));
+    await timers.fire();
+    await settle();
+    assert.match(storageSummary(mount), /Measuring…/);
+    assert.match(storageSummary(mount), /Storage status could not be read\. The last answer was still measuring; checking again\./);
+    assert.doesNotMatch(storageSummary(mount), /Reading file sizes/);
+    assert.equal(timers.polls(), 1, 'the passive read is retried');
+    assert.equal(button.getAttribute('aria-disabled'), 'true');
+    await button.fire('click');
+    await settle();
+    assert.deepEqual(calls, [storageUrl, measureUrl, storageUrl], 'no second measurement');
+
+    routes.set(storageUrl, response(measuredBody()));
+    await timers.fire();
+    await settle();
+    assert.match(storageSummary(mount), /Measured data/);
+    assert.doesNotMatch(storageSummary(mount), /could not be read/);
+    assert.equal(mount.querySelector('[data-storage-notes]').textContent, '');
+    assert.equal(timers.polls(), 0);
+    assert.equal(button.getAttribute('aria-disabled'), 'false');
+});
+
+test('Storage drops a read answered after its tab was left, and does not poll for it', async (t) => {
+    const { mount, routes, calls, timers, show, start } = openStorage(t);
+    const late = deferred();
+    let signal = null;
+    routes.set(storageUrl, (_url, init) => { signal = init.signal; return late.promise; });
+    start();
+    show('logs');
+    assert.equal(signal.aborted, true, 'leaving the tab aborts its read');
+    late.resolve(response(storageBody({ measuring: true })));  // a server that answered anyway
+    await settle();
+    assert.match(storageSummary(mount), /Loading/);
+    assert.equal(timers.polls(), 0);
+    assert.deepEqual(calls, [storageUrl]);
+});
+
+for (const outcome of ['answers', 'fails']) {
+    test(`Storage reads nothing while hidden when a pending measure ${outcome} after the tab was left`, async (t) => {
+        const { mount, routes, calls, timers, show, start, toasts } = openStorage(t);
+        routes.set(storageUrl, response(storageBody()));
+        start();
+        await settle();
+        const posted = deferred();
+        routes.set(measureUrl, () => posted.promise);
+        const click = mount.querySelector('[data-storage-action="measure"]').fire('click');
+        await settle();
+        show('logs');
+        if (outcome === 'answers') posted.resolve(response(storageBody({ measuring: true, started: true }), 202));
+        else posted.resolve(response({ error: 'The measurement could not be started.' }, 500));
+        await click;
+        await settle();
+        assert.deepEqual(calls, [storageUrl, measureUrl], 'no read while the tab is hidden');
+        assert.equal(timers.polls(), 0);
+        if (outcome === 'fails') assert.deepEqual(toasts(), ['The measurement could not be started.']);
+
+        routes.set(storageUrl, response(measuredBody()));
+        show('storage');
+        await settle();
+        assert.deepEqual(calls, [storageUrl, measureUrl, storageUrl], 'showing the tab again reads once');
+        assert.match(storageSummary(mount), /Measured data/);
+    });
+}
+
+test('Storage stops polling while the page is hidden and resumes when it returns', async (t) => {
+    const { routes, calls, timers, document, start } = openStorage(t);
+    routes.set(storageUrl, response(storageBody({ measuring: true })));
+    start();
+    await settle();
+    assert.equal(timers.polls(), 1);
+    document.hidden = true;
+    document.dispatchEvent({ type: 'visibilitychange' });
+    assert.equal(timers.polls(), 0, 'a hidden page keeps no poll');
+    document.hidden = false;
+    document.dispatchEvent({ type: 'visibilitychange' });
+    await settle();
+    assert.deepEqual(calls, [storageUrl, storageUrl]);
+    assert.equal(timers.polls(), 1);
+});
+
+test('Storage destroy aborts its read and ignores late answers, tab events and clicks', async (t) => {
+    const { mount, routes, calls, timers, show, start } = openStorage(t);
+    const late = deferred();
+    let signal = null;
+    routes.set(storageUrl, (_url, init) => { signal = init.signal; return late.promise; });
+    const storage = start();
+    storage.destroy();
+    assert.equal(signal.aborted, true);
+    late.resolve(response(measuredBody()));
+    await settle();
+    assert.match(storageSummary(mount), /Loading/);
+    show('storage');
+    await mount.querySelector('[data-storage-action="measure"]').fire('click');
+    await settle();
+    assert.deepEqual(calls, [storageUrl]);
+    assert.equal(timers.polls(), 0);
+});
+
+test('Activity says why a held Continue waits, keeps its Resume, and never calls it a budget pause (#1721)', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'pred-1-s1', task: {
+        id: 'pred-1-s1', root_task_id: 'pred-1-s1', title: 'Continue Friday report',
+        _budget_pause_hold: { reason: 'continuation_writer_unsettled', selected: false, dispatchable: false,
+            detail: "the interrupted task's own work is not proven settled; this Continue waits",
+            predecessor_task_id: 'pred-1', blockers: [{ kind: 'delegated_run', task_id: 'pred-1', run_id: 'run-leaf',
+                invocation_id: '', state: 'running', stop_outcome: '', source: 'delegated_subagent' }] } } }] } }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    const row = section(mount, 'queue').querySelector('.activity-row');
+    assert.match(row.querySelector('.activity-sub').textContent,
+        /^held: earlier work not proven settled · delegated run run-leaf is running$/);
+    assert.ok(row.classList.contains('activity-held'), 'its cause wraps instead of ending in an ellipsis');
+    assert.doesNotMatch(row.textContent, /paused \(budget\)/);
+    const control = row.querySelector('[data-act="task-control"]');
+    assert.equal(control.getAttribute('data-budget-paused'), '1', 'the existing Resume rechecks it');
+    activity.destroy();
 });

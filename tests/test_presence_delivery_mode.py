@@ -8,8 +8,8 @@ import pytest
 
 from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
 from ouroboros.task_results import write_task_result
-from ouroboros.utils import atomic_write_json
 from tests.test_presence_runner import _admission, _event
+from tests._store_shared import seed_result
 
 
 @pytest.mark.parametrize("outcome", ["message", "deferred"])
@@ -44,7 +44,7 @@ def test_retry_echoes_original_mode_instead_of_new_request(tmp_path, original):
     event = replace(_event(), delivery_reporting_version=1)
     task_id = runner._task_id(_admission(), event)
     presence = {} if original is None else {"delivery_reporting_version": original}
-    atomic_write_json(tmp_path / "task_results" / f"{task_id}.json", {
+    seed_result(tmp_path, task_id, {
         "_schema_version": 1, "task_id": task_id, "status": "completed", "result": "Old reply",
         "metadata": {"presence": {
             **presence, "binding_id": _admission().binding_id, "observed_text": event.text,

@@ -365,10 +365,6 @@ def test_write_letter_stores_the_model_s_shape_without_policing_it(letter_env, m
     monkeypatch.setattr(ul, "_chat", lambda *a, **k: ({"content": odd}, {"ledger_attempt_ids": ["att"]}))
     record = ul.write_letter(_status(), _material(), drive_root=letter_env["drive"])
     assert record["state"] == "ready" and record["text"] == odd
-    # Nothing in the module promises the host enforces one paragraph.
-    source = (pathlib.Path(ul.__file__)).read_text(encoding="utf-8")
-    floor = source.split("Floor (host code):", 1)[1].split("Ceiling", 1)[0]
-    assert "paragraph" not in floor, "the floor must not claim a shape the host does not enforce"
 
 
 def test_write_letter_shares_one_ceiling_between_the_slot_wait_and_the_call(letter_env, monkeypatch):

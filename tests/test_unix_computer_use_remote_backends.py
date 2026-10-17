@@ -89,6 +89,7 @@ def test_remote_screenshot_result_confined_and_transform(tmp_path):
     )
 
     assert '"ok": true' in out
+    assert '"observed_effect"' not in out  # Reading a screenshot is not an input effect.
     # Path confinement: screenshots are returned in place (job/state dir), never
     # copied to a data/uploads directory (OS-agnostic: check both separators).
     assert "/uploads/" not in out and "\\uploads\\" not in out
@@ -136,7 +137,8 @@ def test_remote_scroll_is_one_to_one_wheel_detents(tmp_path):
 
     cap: list = []
     _mod, impl = _osworld_impl(tmp_path, cap, [_OK])
-    assert _json_mod.loads(impl.scroll(clicks=5, direction="down"))["ok"]
+    out = _json_mod.loads(impl.scroll(clicks=5, direction="down"))
+    assert out["ok"] and out["observed_effect"] is True
     assert "pyautogui.scroll(-5)" in cap[-1][-1]
     impl.scroll(clicks=50, direction="up")  # clamps to 20
     assert "pyautogui.scroll(20)" in cap[-1][-1]
@@ -154,6 +156,7 @@ def test_osworld_nonzero_returncode_is_not_ok(tmp_path):
     assert out["ok"] is False and "boom" in out["error"]
     out2 = _json_mod.loads(impl.click(x=10, y=10))
     assert out2["ok"] is False
+    assert "observed_effect" not in out2
 
     # status=="error" also not ok
     _mod, impl = _osworld_impl(tmp_path, [], [{"status": 200, "result": {"status": "error", "message": "kaboom"}}])
@@ -166,6 +169,8 @@ def test_osworld_nonzero_returncode_is_not_ok(tmp_path):
     # returncode 0 -> ok
     _mod, impl = _osworld_impl(tmp_path, [], [_OK])
     assert _json_mod.loads(impl.remote_exec(command="true"))["ok"] is True
+    assert "observed_effect" not in _json_mod.loads(impl.remote_exec(command="true"))
+    assert "observed_effect" not in _json_mod.loads(impl.cursor_position())
 
 
 def test_remote_type_text_unicode_uses_clipboard_ascii_uses_typewrite(tmp_path):
@@ -183,6 +188,7 @@ def test_remote_type_text_unicode_uses_clipboard_ascii_uses_typewrite(tmp_path):
     assert "hotkey('ctrl','v')" in code and "hotkey('ctrl','shift','v')" in code
     assert "getwindowclassname" in code
     assert out.get("method") == "clipboard"
+    assert out["observed_effect"] is True
 
     cap.clear()
     impl.type_text(text="hello world")
@@ -200,6 +206,7 @@ def test_remote_type_text_unicode_falls_back_to_typewrite(tmp_path):
     assert "pyperclip" in cap[0][-1]
     assert "pyautogui.typewrite('caf" in cap[1][-1]
     assert out.get("method") == "typewrite" and out.get("clipboard_fallback") is True
+    assert out["observed_effect"] is True
 
 
 def test_remote_backspace_and_delete_press_backspace(tmp_path):

@@ -12,6 +12,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.utils import append_jsonl
 from supervisor import worker_process
 from supervisor.terminal_delivery import cleanup_settled_owner_mailbox
+from tests._store_shared import result_signature
 
 
 @pytest.fixture
@@ -160,12 +161,11 @@ def test_post_task_cleanup_waits_for_pooled_files_only(tmp_path, monkeypatch, po
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_scratchpad_consolidation", "_record_task_facts",
-                 "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
+    for name in ("_run_scratchpad_consolidation", "_record_task_facts"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
     env = SimpleNamespace(drive_root=root, repo_dir=tmp_path, drive_path=lambda rel: root / rel)
-    pipeline._run_post_task_processing_async(env, task, {}, {}, {}, root / "logs", blocking=True)
+    pipeline._run_post_task_processing_async(env, task, {}, {}, root / "logs", blocking=True)
     assert mailbox.exists() is pooled
     if pooled:
         cleanup_settled_owner_mailbox(root, task["id"], task)
@@ -213,12 +213,11 @@ def test_pooled_post_work_preserves_real_followup_until_copyback(tmp_path, monke
     monkeypatch.setattr(pipeline, "_pre_synthesis_usage_snapshot", lambda *_a: {})
     monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
     monkeypatch.setattr("ouroboros.memory.Memory", lambda **_kw: object())
-    for name in ("_run_scratchpad_consolidation", "_record_task_facts",
-                 "_run_reflection", "_update_improvement_backlog", "_apply_reflection_memory_actions"):
+    for name in ("_run_scratchpad_consolidation", "_record_task_facts"):
         monkeypatch.setattr(pipeline, name, lambda *_a, **_kw: None)
     monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_a: None)
     env = SimpleNamespace(drive_root=child, repo_dir=tmp_path, drive_path=lambda rel: child / rel)
-    pipeline._run_post_task_processing_async(env, task, {}, {}, {}, child / "logs", blocking=True)
+    pipeline._run_post_task_processing_async(env, task, {}, {}, child / "logs", blocking=True)
     mailbox = owner_mailbox._mailbox_path(child, task_id)
     assert mailbox.is_file(), "post-task completion must not erase copyback's accepted input source"
     result = headless.copy_child_task_result(parent, task)
@@ -355,7 +354,7 @@ def test_canonical_write_outage_recovers_saved_child_without_model_replay(file_r
     write_task_result(child, "prepared", "completed", result="Saved child answer", artifact_status="ready")
     write_task_result(ctx.DRIVE_ROOT, "prepared", "completed",
                       root_phase_checkpoint={"post_task_synthesis": "completed"})
-    source = (child / "task_results" / "prepared.json").read_bytes()
+    source = result_signature(child, "prepared")
     event = {"type": "task_done", "task_id": "prepared", "worker_id": 7,
              "status": "completed", "_files_prepared_attempt": 3}
     with monkeypatch.context() as fault:
@@ -366,7 +365,7 @@ def test_canonical_write_outage_recovers_saved_child_without_model_replay(file_r
         assert jobs.qsize() == 1 and pushed == []
         task_reaper._recover_terminal_files(jobs.get_nowait())
         assert returned.empty() and pushed == [] and worker.busy_task_id == "prepared"
-        assert (child / "task_results" / "prepared.json").read_bytes() == source
+        assert result_signature(child, "prepared") == source
     task_reaper.retry_terminal_file_recoveries()
     assert jobs.qsize() == 1
     task_reaper._recover_terminal_files(jobs.get_nowait())

@@ -50,7 +50,8 @@ def test_run_llm_loop_preserves_assistant_tool_call_metadata(tmp_path, monkeypat
         seen_second_request["messages"] = [dict(item) for item in request_messages]
         return {"role": "assistant", "content": "done"}, 0.0
 
-    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, _trace, _progress):
+    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, _trace, _progress,
+                               *, fit_candidate=None, tool_schemas=None):
         request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "file"})
         return 0
 
@@ -222,7 +223,8 @@ def test_run_llm_loop_narrates_reasoning_to_bubble_not_trace(tmp_path, monkeypat
             return dict(tool_round), 0.0
         return {"role": "assistant", "content": "final answer"}, 0.0
 
-    def fake_handle_tool_calls(tool_calls, _tools, _dl, _tid, _ex, request_messages, _tr, _pg):
+    def fake_handle_tool_calls(tool_calls, _tools, _dl, _tid, _ex, request_messages, _tr, _pg,
+               *, fit_candidate=None, tool_schemas=None):
         request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "file body"})
         return 0
 
@@ -332,7 +334,8 @@ def test_run_llm_loop_keeps_task_model_override_across_tool_rounds(tmp_path, mon
             }, 0.0
         return {"role": "assistant", "content": "done"}, 0.0
 
-    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, _trace, _progress):
+    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, _trace, _progress,
+                               *, fit_candidate=None, tool_schemas=None):
         request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "file"})
         return 0
 
@@ -388,27 +391,28 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
 
     real_handle_tool_calls = loop_mod.handle_tool_calls
 
-    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress):
+    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress,
+                               *, fit_candidate=None, tool_schemas=None):
         if tool_calls[0]["function"]["name"] != "plan_task":
-            return real_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress)
-        from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
+            return real_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress,
+                                          fit_candidate=fit_candidate, tool_schemas=tool_schemas)
+        from ouroboros import plan_record
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
 
-        fingerprint = "a" * 64
+        # The plan was written and asked: one participant answered (the obligation is met).
         write_task_result(tmp_path, "task1", STATUS_RUNNING, result="running")
-        record_plan_review_wave(tmp_path, "task1", {
-            "schema_version": 2, "cycle_index": 1, "request_fingerprint": fingerprint,
-            "spec": {"goal": "g"}, "spec_hash": "b" * 64, "findings": [], "aggregate": "GREEN",
-            "closed": True, "dispositions": [], "paid": True,
-        })
+        plan_record.append_revision(tmp_path, "task1", plan_record.compose_revision(
+            None, goal="g", plan="p", done_when=["ship"], affected_paths=[]), body=False)
+        plan_record.append_ask(tmp_path, "task1", {"ask_id": "a1", "ts": "t", "revision": 1, "message": "", "participants": [
+            {"seat_id": "s1", "model": "m", "owner_marked": True, "dispatched": True, "status": "answered",
+             "reply": {"prose": "fine", "objections": [], "withdrawn": []}}]})
         trace["tool_calls"].append({
             "tool": tool_calls[0]["function"]["name"],
             "args": {},
-            "result": "## Plan Review Results\n\nAGGREGATE: GREEN",
+            "result": "Ask a1 on revision 1: sent to s1 (m).",
             "is_error": False,
-            "plan_review_outcome": "GREEN",
-            "plan_review_closed": True,
         })
-        request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "## Plan Review Results\n\nAGGREGATE: GREEN"})
+        request_messages.append({"role": "tool", "tool_call_id": tool_calls[0]["id"], "content": "Ask a1 on revision 1: sent to s1 (m)."})
         return 0
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
@@ -431,7 +435,8 @@ def test_run_llm_loop_enforces_swarm_force_plan_before_final(tmp_path, monkeypat
     assert calls["count"] == 3
     assert sum(row.get("role") == "assistant" and row.get("content") == "premature final"
                for row in seen_second_request["messages"]) == 1
-    assert any("Call plan_task" in str(item.get("content") or "") for item in seen_second_request["messages"])
+    assert any("[PLAN_REVIEW_HOLD]" in str(item.get("content") or "") and "planning obligation" in str(item.get("content") or "")
+               for item in seen_second_request["messages"])
     assert trace["tool_calls"][0]["tool"] == "plan_task"
 
 def test_force_plan_decision_does_not_treat_trace_marker_as_authority(tmp_path, monkeypatch):
@@ -453,7 +458,7 @@ def test_force_plan_decision_does_not_treat_trace_marker_as_authority(tmp_path, 
     })
 
     assert decision["allow"] is False
-    assert decision["status"] == "absent"
+    assert decision["status"] == "force_plan_unmet" and decision["force_plan_met"] is False
 
 def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_path, monkeypatch):
     from ouroboros.tools.registry import ToolRegistry
@@ -484,13 +489,18 @@ def test_run_llm_loop_does_not_accept_failed_plan_task_for_swarm_force_plan(tmp_
 
     real_handle_tool_calls = loop_mod.handle_tool_calls
 
-    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress):
+    def fake_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress,
+                               *, fit_candidate=None, tool_schemas=None):
         if tool_calls[0]["function"]["name"] != "plan_task":
-            return real_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress)
-        from ouroboros.task_results import STATUS_RUNNING, record_plan_review_attempt, write_task_result
+            return real_handle_tool_calls(tool_calls, _tools, _drive_logs, _task_id, _executor, request_messages, trace, _progress,
+                                          fit_candidate=fit_candidate, tool_schemas=tool_schemas)
+        from ouroboros import plan_record
+        from ouroboros.task_results import STATUS_RUNNING, write_task_result
 
+        # A plan exists, but its ask reached no reviewer (the planning call failed).
         write_task_result(tmp_path, "task1", STATUS_RUNNING, result="running")
-        record_plan_review_attempt(tmp_path, "task1", fingerprint="d" * 64)
+        plan_record.append_revision(tmp_path, "task1", plan_record.compose_revision(
+            None, goal="g", plan="p", done_when=["ship"], affected_paths=[]), body=False)
         trace["tool_calls"].append({
             "tool": tool_calls[0]["function"]["name"],
             "args": {},

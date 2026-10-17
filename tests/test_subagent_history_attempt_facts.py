@@ -11,6 +11,7 @@ from ouroboros.agent_task_pipeline import _store_task_result
 from ouroboros.loop_llm_call import call_llm_with_retry
 from ouroboros.outcomes import collect_trace_refs
 from ouroboros.subagent_history import record_task_execution, subagent_last_delegation
+from tests._store_shared import result_exists
 
 
 TARGET = "claudexor::codex-models=gpt-fixture"
@@ -152,8 +153,10 @@ def test_actual_start_failure_uses_captured_source_without_lookup(tmp_path, monk
     from ouroboros.subagent_history import session_request_facts
     from ouroboros.tools.delegate import _retire_orphaned_registration
     from ouroboros.tools.registry import ToolContext
+    from ouroboros.store_import import ensure_current_store
     facts = session_request_facts({"model": "fixture", "credentialProfileId": "original", "effort": "", "access": "full"},
         selected_subagent_id="worker", task_id="task", route="codex", processing={"requested": "economy"})
+    ensure_current_store(tmp_path)  # the one chain fold the first-touch import owns, before the probes
     monkeypatch.setattr(custody, "invocation_record", _no_history_scan)
     monkeypatch.setattr(custody, "_iter_rows", _no_history_scan)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="task")
@@ -169,7 +172,7 @@ def test_history_error_does_not_claim_successful_result_store_failed(tmp_path, m
         raise OSError("fixture history failure")
     monkeypatch.setattr("ouroboros.subagent_history.record_task_execution", fail)
     _store_task_result(SimpleNamespace(drive_root=tmp_path), _task(), "Done", {}, {"tool_calls": []})
-    assert (tmp_path / "task_results/history-actor.json").is_file()
+    assert result_exists(tmp_path, "history-actor")
     assert "Task result stored; subagent history unavailable" in caplog.text
     assert "Failed to store task result" not in caplog.text
 

@@ -26,6 +26,7 @@ from ouroboros.task_results import write_task_result
 from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies on import)
     _managed_worker_pool_available,
 )
+from tests._store_shared import seed_result
 
 
 def test_task_event_replay_uses_existing_logs_and_result(tmp_path):
@@ -39,11 +40,8 @@ def test_task_event_replay_uses_existing_logs_and_result(tmp_path):
     )
     result_dir = data / "task_results"
     result_dir.mkdir()
-    (result_dir / f"{task_id}.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": task_id, "status": "completed",
-                    "result": "done", "ts": "2026-01-01T00:00:01Z"}),
-        encoding="utf-8",
-    )
+    seed_result(data, task_id, {"_schema_version": 1, "task_id": task_id, "status": "completed",
+                    "result": "done", "ts": "2026-01-01T00:00:01Z"})
 
     events = iter_task_events(data, task_id)
 
@@ -256,11 +254,8 @@ def test_task_sse_emits_final_result_after_cursor_saw_scheduled_result(tmp_path)
     data = tmp_path / "data"
     (data / "task_results").mkdir(parents=True)
     task_id = "abc123"
-    (data / "task_results" / f"{task_id}.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": task_id, "status": "completed",
-                    "result": "done", "ts": "2026-01-01T00:00:01Z"}),
-        encoding="utf-8",
-    )
+    seed_result(data, task_id, {"_schema_version": 1, "task_id": task_id, "status": "completed",
+                    "result": "done", "ts": "2026-01-01T00:00:01Z"})
     app = Starlette(routes=[Route("/api/tasks/{task_id}/events", endpoint=api_task_events, methods=["GET"])])
     app.state.drive_root = data
 

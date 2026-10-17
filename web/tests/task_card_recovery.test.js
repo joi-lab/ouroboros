@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
+import { fetchTaskDetailStrict } from '../modules/api_client.js';
+import { createReviewHydrator } from '../modules/review_presentation.js';
 import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
 
 const chatId = 77;
@@ -21,6 +23,42 @@ const reference = (amount, final = false) => ({
     ts: '2026-09-15T10:00:01Z', history_id: 'progress:2', ...cost(amount, final),
 });
 
+test('task detail hydration retries migration quietly and cancels on disposal', async t => {
+    const previous = globalThis.fetch;
+    let migrating = true, reads = 0;
+    const statuses = [], applied = [];
+    globalThis.fetch = async () => {
+        reads += 1;
+        return { ok: !migrating, status: migrating ? 503 : 200,
+            json: async () => migrating ? { reason_code: 'migrating' } : { status: 'completed' } };
+    };
+    const hydrator = createReviewHydrator({ fetchDetail: fetchTaskDetailStrict,
+        applyDetail: (_id, row) => applied.push(row), onState: (_id, state) => statuses.push(state) });
+    t.after(() => { hydrator.clear(); globalThis.fetch = previous; });
+    await hydrator.hydrate('task1');
+    assert.equal(statuses.at(-1), 'loading');
+    assert.equal(hydrator.ready('task1'), false);
+    migrating = false;
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.deepEqual(applied, [{ status: 'completed' }]);
+    assert.equal(hydrator.ready('task1'), true);
+    assert.equal(statuses.includes('error'), false);
+    assert.equal(reads, 2);
+    migrating = true;
+    await hydrator.hydrate('task2');
+    hydrator.clear();
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(reads, 3, 'closing the consumer cancels the pending migration retry');
+    globalThis.fetch = async () => {
+        reads += 1;
+        return { ok: false, status: 503, json: async () => ({ reason_code: 'unavailable' }) };
+    };
+    await hydrator.hydrate('task3');
+    assert.equal(statuses.at(-1), 'error');
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(reads, 4, 'ordinary failures keep their existing Retry contract');
+});
+
 function fixture(rows = [progress]) {
     const data = { rows, detail: { task_id: taskId, status: 'running',
         review_projection: { panels: [{ panel_id: 'accept', surface: 'task_acceptance',
@@ -39,6 +77,7 @@ function fixture(rows = [progress]) {
         }
         if (String(url).startsWith('/api/tasks/')) {
             if (data.detailError) throw new Error('task detail unavailable');
+            if (data.detailMigrating) return { ok: false, status: 503, json: async () => ({ reason_code: 'migrating' }) };
             return { ok: true, json: async () => data.detail };
         }
         return { ok: true, json: async () => snapshot };
@@ -79,6 +118,40 @@ const anatomy = (card) => ({
     activity: card.querySelector('[data-live-activity]').textContent,
 });
 
+const findDescendant = (node, selector) => node.querySelector(selector)
+    || node.children.map(child => findDescendant(child, selector)).find(Boolean) || null;
+
+for (const kind of ['direct_chat', 'managed_task']) {
+    for (const censusFirst of [false, true]) {
+        test(`${kind} paused review work reaches the real card from census hydration (census first=${censusFirst})`, async () => {
+            const fx = fixture();
+            try {
+                const activity = fx.snapshot.active_chat_activities[0];
+                Object.assign(activity, { kind, phase: 'budget_paused', pause_cause: 'owner', finishing_reviews: true });
+                if (censusFirst) fx.hydrate();
+                await fx.replay();
+                if (!censusFirst) fx.hydrate();
+                const phase = () => fx.card().querySelector('[data-live-phase]').textContent;
+                assert.equal(phase(), 'Paused · owner pause · review work finishing');
+                assert.ok(findDescendant(fx.card(), '[data-resume-run]'), 'Resume is available while reviews finish');
+                assert.equal(fx.card().querySelector('[data-live-typing]').style.display, 'none');
+                for (const finishing of [true, false, true, undefined]) {
+                    if (finishing === undefined) delete activity.finishing_reviews;
+                    else activity.finishing_reviews = finishing;
+                    fx.hydrate();
+                    assert.equal(phase(), finishing ? 'Paused · owner pause · review work finishing'
+                        : 'Paused · owner pause', 'each census replaces the fact, including false or absence');
+                    assert.ok(findDescendant(fx.card(), '[data-resume-run]'));
+                }
+                Object.assign(activity, { phase: 'working', finishing_reviews: true });
+                fx.hydrate();
+                assert.equal(phase(), 'Working', 'a stale fact cannot keep the resumed task paused');
+                assert.equal(findDescendant(fx.card(), '[data-resume-run]'), null);
+            } finally { fx.destroy(); }
+        });
+    }
+}
+
 test('a bound direct activity restores its Project card and survives progress/history replay', async () => {
     const fx = fixture();
     try {
@@ -99,7 +172,7 @@ test('a bound direct activity restores its Project card and survives progress/hi
     } finally { fx.destroy(); }
 });
 
-for (const firstDetail of ['completed', 'running', 'unavailable']) {
+for (const firstDetail of ['completed', 'running', 'unavailable', 'migrating']) {
     test(`a vanished direct activity reconciles its visible card from durable detail: ${firstDetail}`, async () => {
         const fx = fixture();
         try {
@@ -109,6 +182,7 @@ for (const firstDetail of ['completed', 'running', 'unavailable']) {
             fx.snapshot.active_chat_activities = [];
             fx.data.detail.status = firstDetail === 'completed' ? 'completed' : 'running';
             fx.data.detailError = firstDetail === 'unavailable';
+            fx.data.detailMigrating = firstDetail === 'migrating';
             fx.hydrate();
             await new Promise((resolve) => setImmediate(resolve));
             assert.ok(fx.calls.some((url) => url.startsWith('/api/tasks/')),
@@ -117,6 +191,7 @@ for (const firstDetail of ['completed', 'running', 'unavailable']) {
                 assert.equal(fx.card().dataset.finished, '0', 'absence/failure is not a terminal fact');
                 fx.data.detail.status = 'completed';
                 fx.data.detailError = false;
+                fx.data.detailMigrating = false;
                 fx.hydrate();
                 await new Promise((resolve) => setImmediate(resolve));
             }

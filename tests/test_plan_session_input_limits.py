@@ -11,10 +11,10 @@ from ouroboros.gateways.claudexor import ClaudexorGateway, DaemonEndpoint, run_f
 from ouroboros.review_execution import ReviewRouteKind
 from ouroboros.review_session_preparation import render_review_session_prompt
 from ouroboros.review_substrate import ReviewSlot
-from ouroboros.tools import plan_dialogue, plan_review
-from ouroboros.tools.plan_spec import PLAN_FINDINGS_ARRAY_CONTRACT
+from ouroboros.tools import plan_dialogue
+from ouroboros.tools.plan_packet import PLAN_REPLY_CONTRACT
 from ouroboros.utils import append_jsonl
-from tests.test_plan_review_engine import CLEAN, _call, _state, harness as _harness
+from tests.test_plan_task_tool import harness as _harness
 
 harness = _harness
 
@@ -39,7 +39,7 @@ def _slot(sid="session", target="cursor=fixture-model"):
 
 
 def _prompt(slot, task):
-    request = SimpleNamespace(surface="plan_review", policy={"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT})
+    request = SimpleNamespace(surface="plan_review", policy={"output_contract": PLAN_REPLY_CONTRACT})
     return render_review_session_prompt(request, slot, task.strip())
 
 
@@ -51,14 +51,14 @@ def _delivery(harness, text, *, bound=None, asserted=0, monkeypatch):
     chat = harness.drive / "logs" / "chat.jsonl"
     for direction, body in [("in", "Preserve original files."), ("out", text), ("in", "LATEST: choose A.")]:
         append_jsonl(chat, {"direction": direction, "chat_id": 1, "text": body})
-    manifest = plan_dialogue.attach_own_dialogue(ctx, harness.drive, {}, "a" * 64, persist=True)
+    manifest = plan_dialogue.attach_own_dialogue(ctx, harness.drive, {}, f"plan-ask-{ctx.task_id}-a1", persist=True)
     packet = "OPERATIVE PLAN MUST STAY\n" + plan_dialogue.render_dialogue(manifest)
     monkeypatch.setattr(model_slots, "model_role_option", lambda *_a: asserted)
     slot = _slot()
     delivery = plan_dialogue.dialogue_slot_inputs([slot], system_prompt="g", user_content=packet,
         session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet),
         session_root=str(harness.workspace), task_id=ctx.task_id,
-        session_limits={slot.slot_id: bound} if bound else {})
+        session_limits={slot.slot_id: bound} if bound else {}, output_contract=PLAN_REPLY_CONTRACT)
     return slot, manifest, packet, delivery
 
 
@@ -136,14 +136,14 @@ def test_small_unicode_room_is_not_fitted_by_bytes_or_utf16(harness, monkeypatch
     bound = {**_native_limit(budget + 315), "prompt_budget": budget}
     fitted = plan_dialogue.dialogue_slot_inputs([slot], system_prompt="g", user_content=packet,
         session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet),
-        session_limits={slot.slot_id: bound})
+        session_limits={slot.slot_id: bound}, output_contract=PLAN_REPLY_CONTRACT)
     assert fitted["slot_session_tasks"][slot.slot_id] == original_task
     assert fitted["dialogue_delivery"][slot.slot_id]["conversation_inline_rows"] == 3
     # Tighten exactly one scalar: a row moves behind the pointer, never a chopped substring.
     bound["prompt_budget"] -= 1
     fitted = plan_dialogue.dialogue_slot_inputs([slot], system_prompt="g", user_content=packet,
         session_task=packet, manifest=manifest, slot_messages={}, native_mandatory_chars=len(packet),
-        session_limits={slot.slot_id: bound})
+        session_limits={slot.slot_id: bound}, output_contract=PLAN_REPLY_CONTRACT)
     assert len(_prompt(slot, fitted["slot_session_tasks"][slot.slot_id])) <= budget - 1
     assert fitted["dialogue_delivery"][slot.slot_id]["conversation_inline_rows"] < 3
 
@@ -168,34 +168,6 @@ def test_asserted_and_transport_bounds_are_independent(harness, monkeypatch, ass
     assert facts["input_limit"]["limit"] == transport_bound
 
 
-def test_free_replay_keeps_original_fitted_task_and_constraint(harness, monkeypatch):
-    import dataclasses
-    from ouroboros.tools.plan_review_artifacts import authority_wave
-
-    slot = dataclasses.replace(harness.state["slots"][0], route=ReviewRouteKind.AGENT_SESSION,
-                               session_target="cursor=fixture-model")
-    harness.state["slots"][0] = slot
-    probes = []
-    bound = {**_native_limit(), "prompt_budget": 11_685, "engine_version": "first"}
-    monkeypatch.setattr(plan_review, "session_input_limits", lambda _slots: probes.append(1) or {slot.slot_id: bound})
-    substrate = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    ctx = harness.make_ctx()
-    ctx.current_chat_id = 1
-    chat = harness.drive / "logs" / "chat.jsonl"
-    append_jsonl(chat, {"direction": "out", "chat_id": 1, "text": "OLD " * 80_000})
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "text": "LATEST: A"})
-    _call(ctx)
-    first = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
-    append_jsonl(chat, {"direction": "in", "chat_id": 1, "text": "Later message"})
-    monkeypatch.setattr(plan_review, "session_input_limits", lambda _slots: pytest.fail("replay queried new limits"))
-    _call(ctx)
-    replay = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
-    assert len(substrate.calls) == len(probes) == 1
-    assert replay["slot_prompt_chars"] == first["slot_prompt_chars"]
-    assert replay["dialogue_delivery"] == first["dialogue_delivery"]
-    assert replay["reviewer_outputs"][0]["session_task"] == first["reviewer_outputs"][0]["session_task"]
-
-
 def test_input_refusal_has_no_borrowed_quota_reset():
     error = run_failure_error("r", "failed", {"code": "input_too_large", "category": "validation",
         "safeMessage": "Input exceeds the native limit", "resetsAt": "2099-01-01T00:00:00Z"})
@@ -206,7 +178,7 @@ def test_input_refusal_has_no_borrowed_quota_reset():
 
 
 def test_unresolvable_slot_keeps_its_dispatch_refusal_without_hiding_sibling_health(monkeypatch):
-    from tests.test_plan_review_epoch import _patch_snapshot_health, _profile_slots, _SPENT
+    from tests.test_plan_panel_health import _patch_snapshot_health, _profile_slots, _SPENT
     from ouroboros.review_execution import ReviewRouteUnavailable, session_route_for_review_slot
     from ouroboros.tools.plan_review_runtime import plan_panel_health_snapshot
 

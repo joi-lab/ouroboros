@@ -63,7 +63,10 @@ def _root_pass(tmp_path, monkeypatch):
     monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "auto")
     monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
     monkeypatch.setattr(rs, "triad_delivery_slots", lambda **_kwargs: [object(), object(), object()])
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    # Auto is LLM-first: this fixture represents a root's typed nomination,
+    # independently of its write evidence. Production alone no longer nominates.
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}],
+             "acceptance_evidence_calls": [{"status": "deferred_to_host_acceptance", "authoritative": False}]}
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     progress: list = []
 
@@ -626,7 +629,7 @@ def test_already_reviewed_early_read_failure_enters_local_guard(tmp_path, monkey
     assert fx.trace["acceptance_preparation"]["attempts"] == 1 and calls == [1]
 
 
-def test_different_pending_panel_subject_failure_stays_with_its_custody(tmp_path, monkeypatch):
+def test_pending_panel_wait_precedes_fallible_new_subject_preparation(tmp_path, monkeypatch):
     from ouroboros import loop_acceptance_review as review, loop_delivery as delivery, review_evidence
 
     fx = _root_pass(tmp_path, monkeypatch)
@@ -639,17 +642,21 @@ def test_different_pending_panel_subject_failure_stays_with_its_custody(tmp_path
         "actors": [{"operation_state": "pending_dispatch", "custody": {"token": "original"}}]}]
     before = copy.deepcopy(fx.trace["review_runs"])
     original = delivery.delivery_subject_hash
+    reads = []
 
     def subject(ctx, trace, content):
+        reads.append(content)
         if content == "old answer":
             raise RuntimeError("pending panel subject unavailable")
         return original(ctx, trace, content)
 
     monkeypatch.setattr(delivery, "delivery_subject_hash", subject)
     assert fx.run() is True
-    assert fx.trace["review_runs"] == before and fx.ctx._task_acceptance_pending == "old"
-    assert fx.trace["review_decision"]["host_failure"]["stage"] == "reconcile"
-    assert fx.trace["acceptance_preparation"]["attempts"] == 0
+    assert len(fx.trace["review_runs"]) == 1 and fx.ctx._task_acceptance_pending == "old"
+    assert {key: fx.trace["review_runs"][0][key] for key in before[0]} == before[0]
+    assert reads == []  # Collection/wait needs no new subject, even a broken one.
+    assert "host_failure" not in fx.trace.get("review_decision", {})
+    assert "acceptance_preparation" not in fx.trace
 
 
 @pytest.mark.parametrize("stage", ["reconcile", "dispatch", "application"])

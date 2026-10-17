@@ -133,7 +133,7 @@ def test_retry_of_a_bound_root_is_in_the_project_before_its_first_round(qenv, mo
     assert project_id_for_task(qenv.drive, new_id) == pid
     # The UI census (/api/state) is what paints the card's room.
     assert all_task_project_bindings(qenv.drive)[new_id] == {
-        "project_id": pid, "chat_id": project_chat_id(pid),
+        "project_id": pid, "chat_id": project_chat_id(pid), "project_name": "Importer room",
     }
     # The retry joins the SAME owner-message unit: its origin is the predecessor's
     # stored one, carried by value rather than re-derived.
@@ -142,9 +142,8 @@ def test_retry_of_a_bound_root_is_in_the_project_before_its_first_round(qenv, mo
     assert binding["source_text"] == predecessor["source_text"]
 
 
-def test_retry_adopts_the_project_a_sibling_of_the_same_owner_message_holds(qenv, monkeypatch):
-    """The origin-keyed half: the timed-out root was never bound itself, but the
-    direct turn that received the same owner message was. One message, one room."""
+def test_retry_does_not_adopt_a_siblings_project(qenv, monkeypatch):
+    """A retry inherits exact lineage placement, never an origin sibling's room."""
     _patch_retry_input_handoff(monkeypatch)
     old_id, new_id, pid = "adopt-old", "adopt-new", "sibling-room"
     ref = _owner_ref("msg-retry-sibling")
@@ -156,7 +155,8 @@ def test_retry_adopts_the_project_a_sibling_of_the_same_owner_message_holds(qenv
     requeued, _attempt, _reason, suppression = _retry(qenv, root, old_id, new_id)
 
     assert (requeued, suppression) == (True, {})
-    assert project_id_for_task(qenv.drive, new_id) == pid
+    assert project_id_for_task(qenv.drive, new_id) == ""
+    assert not qenv.q.PENDING[0].get("project_id")
 
 
 def test_retry_of_a_cancelled_root_is_never_bound(qenv, monkeypatch):
@@ -220,7 +220,7 @@ def test_first_implicit_promote_from_a_retry_lands_in_the_origins_project(qenv, 
 
     # The retry worker's own scope copy is empty (a post-hoc conversion never
     # reached the dead attempt), so only the durable binding can answer.
-    ctx = types.SimpleNamespace(task_id=new_id, task_metadata={}, project_id="")
+    ctx = types.SimpleNamespace(task_id=new_id, task_metadata={}, project_id="", drive_root=qenv.drive)
     assert _inherited_project_scope(ctx) == pid
 
 
@@ -308,9 +308,14 @@ def test_legacy_retry_rejects_lost_known_room_before_enqueue(qenv, monkeypatch, 
     path = registry._registry_path(qenv.drive)
     path.write_text('{torn' if failure == "unreadable" else '{"projects": []}', encoding="utf-8")
     requeued, _attempt, reason, suppression = _retry(qenv, root, old_id, new_id)
-    assert not requeued and not suppression and reason == "idle_timeout_retry_admission_blocked"
-    assert not qenv.q.PENDING and project_binding_for_task(qenv.drive, new_id) is None
-    assert load_task_result(qenv.drive, old_id)["status"] == "failed"
+    if evidence == "origin":
+        assert requeued and not suppression
+        assert not qenv.q.PENDING[0].get("project_id")
+        assert project_binding_for_task(qenv.drive, new_id) is None
+    else:
+        assert not requeued and not suppression and reason == "idle_timeout_retry_admission_blocked"
+        assert not qenv.q.PENDING and project_binding_for_task(qenv.drive, new_id) is None
+        assert load_task_result(qenv.drive, old_id)["status"] == "failed"
 
 
 def test_unregistered_scope_retry_does_not_create_or_bind_a_room(qenv, monkeypatch):

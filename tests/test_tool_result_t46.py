@@ -269,153 +269,59 @@ def test_plan_handler_propagates_native_sidecar_through_running_loop_thread(
     tmp_path,
     monkeypatch,
 ) -> None:
+    """A plan_task call made inside a running event loop still publishes its typed result
+    natively (the ask path runs its coroutine in a pool thread under ``copy_context``)."""
     import asyncio
 
-    import ouroboros.safety as safety
-    from ouroboros.tools import plan_review
-
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
-    monkeypatch.setattr(
-        plan_review,
-        "_planning_state_location",
-        lambda _ctx: (tmp_path, "task"),
-    )
-    # Tip adaptation: the reference's sync-side raw-request recorder
-    # (_record_raw_plan_request_attempt) does not exist on this tree — recording
-    # happens inside _run_plan_review_async, which this test replaces whole.
-
-    async def fake_review(ctx, _request):
-        return plan_review._publish_plan_review_projection(
-            ctx,
-            {"aggregate_signal": "GREEN", "closed": True},
-            "exact async plan result",
-        )
-
-    monkeypatch.setattr(plan_review, "_run_plan_review_async", fake_review)
-    monkeypatch.setattr(
-        LegacyTextResultAdapter,
-        "from_text",
-        classmethod(
-            lambda *_args, **_kwargs: pytest.fail(
-                "native async plan result reached the legacy adapter"
-            )
-        ),
-    )
+    registry = _plan_registry(tmp_path, monkeypatch)
 
     async def exercise():
-        return registry.execute_result(
-            "plan_task",
-            {"plan": "P", "goal": "G"},
-        )
+        return registry.execute_result("plan_task", {"plan": "P", "goal": "G", "affected_paths": []})
 
     result = asyncio.run(exercise())
-    assert result == ToolResult(
-        status="ok",
-        code="OK",
-        text="exact async plan result",
-        meta={"plan_review_outcome": "GREEN", "plan_review_closed": True},
-    )
+    assert isinstance(result, ToolResult) and (result.status, result.code) == ("ok", "OK")
+    assert result.meta["plan_effect"] == "write" and result.meta["plan_revision"] == 1
 
 
-@pytest.mark.parametrize(
-    ("mode", "review", "args"),
-    (
-        (
-            "fresh",
-            {"aggregate_signal": "GREEN", "closed": True},
-            {"plan": "P", "goal": "G", "spec": {"acceptance_claims": []}},
-        ),
-        (
-            "vacuous_disposition",
-            {"aggregate_signal": "REVIEW_REQUIRED", "closed": False},
-            {"plan": "P", "goal": "G", "review_disposition": {}},
-        ),
-        (
-            "disposition",
-            {"aggregate_signal": "REVIEW_REQUIRED", "closed": True},
-            {"review_disposition": {"review_fingerprint": "a" * 64, "items": []}},
-        ),
-    ),
-)
-def test_plan_handler_wrapper_preserves_native_meta_for_all_projection_paths(
-    tmp_path,
-    monkeypatch,
-    mode,
-    review,
-    args,
-) -> None:
-    """Every projection path out of the plan handler keeps its native meta.
-
-    Tip adaptation of the reference pin: this tree has no vacuous-note wrapper
-    (`_reuse_or_disposition_plan_review` / `_VACUOUS_*_NOTE` are reference-only
-    structure), so the three tip paths are review mode, a vacuous disposition
-    falling through to review mode, and disposition mode via _apply_disposition.
-    The durable fact is unchanged: none of them reaches the legacy adapter, and
-    the loop-trusted control meta arrives from the typed projection."""
+def _plan_registry(tmp_path, monkeypatch):
     import ouroboros.safety as safety
-    from ouroboros.tools import plan_review
+    from ouroboros.task_results import write_task_result
 
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "t46"
+    registry._ctx.task_metadata = {"root_task_id": "t46"}
+    write_task_result(tmp_path, "t46", "running", root_task_id="t46", task_attempt=1)
     monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
-    monkeypatch.setattr(
-        plan_review,
-        "_planning_state_location",
-        lambda _ctx: (tmp_path, "task"),
-    )
-    base_text = f"{mode} public projection"
-
-    def apply_disposition(ctx, _disposition):
-        return plan_review._publish_plan_review_projection(ctx, review, base_text)
-
-    async def review_async(ctx, _request):
-        return plan_review._publish_plan_review_projection(ctx, review, base_text)
-
-    monkeypatch.setattr(plan_review, "_apply_disposition", apply_disposition)
-    monkeypatch.setattr(plan_review, "_run_plan_review_async", review_async)
     monkeypatch.setattr(
         LegacyTextResultAdapter,
         "from_text",
-        classmethod(
-            lambda *_args, **_kwargs: pytest.fail(
-                "native plan wrapper result reached the legacy adapter"
-            )
-        ),
+        classmethod(lambda *_args, **_kwargs: pytest.fail("a native plan result reached the legacy adapter")),
     )
+    return registry
 
-    result = registry.execute_result("plan_task", args)
-    assert result == ToolResult(
-        status="ok",
-        code="OK",
-        text=base_text,
-        meta={
-            "plan_review_outcome": review["aggregate_signal"],
-            "plan_review_closed": review["closed"],
-        },
-    )
+
+def test_plan_task_write_publishes_its_typed_facts_at_the_registry_boundary(tmp_path, monkeypatch) -> None:
+    """A write is free, calls nobody and arrives as one typed result whose meta carries the
+    record's facts (effect, revision, open objections, holds, pending asks)."""
+    registry = _plan_registry(tmp_path, monkeypatch)
+    monkeypatch.setattr("ouroboros.tools.plan_ask.dispatch_ask", lambda *_a, **_k: pytest.fail("a write dispatches nobody"))
+
+    result = registry.execute_result("plan_task", {"goal": "G", "plan": "P", "affected_paths": []})
+
+    assert isinstance(result, ToolResult) and (result.status, result.code) == ("ok", "OK")
+    assert "Revision 1 recorded" in result.text
+    assert dict(result.meta) == {"plan_effect": "write", "plan_revision": 1, "plan_open_objections": 0,
+                                 "plan_holding": 0, "plan_pending_asks": 0}
 
 
 @pytest.mark.parametrize(
     ("args", "marker"),
     (
-        (
-            {
-                "plan": "P changed",
-                "goal": "G",
-                "spec": {"in_scope": ["a"]},
-                "review_disposition": {
-                    "review_fingerprint": "f" * 64,
-                    "items": [
-                        {"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"},
-                    ],
-                },
-            },
-            "PLAN_RESOURCE_FORM_REQUIRED",
-        ),
-        (
-            {"review_disposition": {"review_fingerprint": "", "items": []}},
-            "PLAN_REVIEW_DISPOSITION_EMPTY",
-        ),
+        ({"plan": "P", "goal": "G", "spec": {"affected_paths": []}}, "PLAN_FORM_RETIRED"),
+        ({"review_disposition": {"review_fingerprint": "f" * 64, "items": []}}, "PLAN_FORM_RETIRED"),
+        ({"plan": "P", "goal": "G"}, "PLAN_FIRST_REVISION_NEEDS_AFFECTED_PATHS"),
+        ({"ask": "council"}, "PLAN_ASK_NEEDS_A_PLAN"),
+        ({"message": "hello"}, "PLAN_ARGS_INVALID"),
     ),
 )
 def test_plan_task_argument_refusals_are_typed_at_the_registry_boundary(
@@ -424,72 +330,46 @@ def test_plan_task_argument_refusals_are_typed_at_the_registry_boundary(
     args,
     marker,
 ) -> None:
-    """A refusal the producer ALREADY knows about must not be recorded as execution.
+    """A refusal the producer ALREADY knows about must not be recorded as execution: the
+    texts are identifier-less ``ERROR:`` prose the legacy adapter would read as ``status=ok``,
+    so the producer publishes the typed result instead — and writes nothing."""
+    from ouroboros import plan_record
 
-    Both texts are identifier-less ``ERROR:`` prose, which the legacy adapter reads as
-    ``status=ok``; the producer publishes the typed result instead."""
-    import ouroboros.safety as safety
-    from ouroboros.tools import plan_review
-
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    registry._ctx.task_id = "t46"  # answers beside an envelope are validated against the task's state
-    from ouroboros.task_results import write_task_result
-
-    write_task_result(tmp_path, "t46", "running", root_task_id="t46", task_attempt=1)
-    monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
-    monkeypatch.setattr(
-        plan_review,
-        "_run_plan_review_async",
-        lambda *_a, **_k: pytest.fail("a refused envelope must dispatch no reviewer"),
-    )
+    registry = _plan_registry(tmp_path, monkeypatch)
+    monkeypatch.setattr("ouroboros.tools.plan_ask.dispatch_ask", lambda *_a, **_k: pytest.fail("a refused call dispatches nobody"))
 
     result = registry.execute_result("plan_task", args)
 
     assert isinstance(result, ToolResult)
     assert (result.status, result.code) == ("error", "TOOL_ARG_ERROR")
     assert marker in result.text
+    assert plan_record.load_plan_record(tmp_path, "t46") == plan_record.empty_record()
 
 
 @pytest.mark.parametrize(
-    ("reason", "text", "expected"),
+    ("refusal", "expected"),
     (
-        (
-            "review_budget_unavailable",
-            "⚠️ PLAN_REVIEW_SKIPPED_BUDGET: the reviewer wave was declined before dispatch.",
-            ("unavailable", "CAPABILITY_UNAVAILABLE"),
-        ),
-        ("review_failed", "ERROR: Plan review failed: synthetic", ("error", "TOOL_ERROR")),
+        (("CAPABILITY_UNAVAILABLE", "ERROR: PLAN_ASK_SKIPPED_BUDGET: the ask was declined before dispatch."),
+         ("unavailable", "CAPABILITY_UNAVAILABLE")),
+        (("TOOL_ERROR", "ERROR: PLAN_ASK_PACK_INCOMPLETE: synthetic"), ("error", "TOOL_ERROR")),
     ),
 )
-def test_plan_unavailable_outcomes_are_typed_by_their_reason(
-    tmp_path,
-    monkeypatch,
-    reason,
-    text,
-    expected,
-) -> None:
-    """A declined review is an availability outcome, a broken one a fault — neither is ok.
+def test_plan_ask_refusals_are_typed_by_their_reason(tmp_path, monkeypatch, refusal, expected) -> None:
+    """A declined ask is an availability outcome, a broken pack a fault — neither is ok, and
+    neither writes the revision the call carried."""
+    from ouroboros import plan_record
+    from ouroboros.tools import plan_ask
 
-    The budget-declined text carries a typed marker the legacy adapter read as a
-    warning (``status=ok``); the exception path is identifier-less ``ERROR:`` prose.
-    Both reach the registry with the status their reason means."""
-    import ouroboros.safety as safety
-    from ouroboros.tools import plan_review
+    registry = _plan_registry(tmp_path, monkeypatch)
+    code, text = refusal
+    monkeypatch.setattr(plan_ask, "prepare_ask", lambda *_a, **_k: (_ for _ in ()).throw(plan_ask.PlanAskRefused(code, text)))
 
-    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
-    monkeypatch.setattr(safety, "check_safety", lambda *_args, **_kwargs: (True, ""))
-    monkeypatch.setattr(plan_review, "_planning_state_location", lambda _ctx: (tmp_path, "task"))
-
-    async def declined(ctx, _request):
-        return plan_review._plan_unavailable(ctx, text, reason)
-
-    monkeypatch.setattr(plan_review, "_run_plan_review_async", declined)
-
-    result = registry.execute_result("plan_task", {"plan": "P", "goal": "G", "spec": {}})
+    result = registry.execute_result("plan_task", {"plan": "P", "goal": "G", "affected_paths": [], "ask": "council"})
 
     assert isinstance(result, ToolResult)
     assert (result.status, result.code) == expected
     assert result.text == text
+    assert plan_record.load_plan_record(tmp_path, "t46") == plan_record.empty_record()
 
 
 def test_native_review_and_git_producers_bypass_adapter_and_keep_legacy_loop_fields(
@@ -610,7 +490,7 @@ def test_review_cycle_publishes_only_structural_critical_finding_rejection(
 
     Tip adaptation of the reference pin: this tree's stage cycle reads its
     collaborators through the call-time facade handle _git() and gates with
-    _free_cycle_gate/_advisory_and_tests_gate (the reference's
+    _free_cycle_gate/_preflight_and_tests_gate (the reference's
     _check_advisory_freshness/advisory_gate_unavailable/_refuse_capped_attempt
     spellings do not exist here), so the facade is the patch point and the
     aggregate verdict is stubbed per scenario. The durable fact is unchanged."""
@@ -637,7 +517,7 @@ def test_review_cycle_publishes_only_structural_critical_finding_rejection(
     monkeypatch.setattr(git_facade, "_current_runtime_mode", lambda: "advanced")
     monkeypatch.setattr(git_facade, "_fingerprint_staged_diff", lambda *_a: fingerprint)
     monkeypatch.setattr(git_facade, "_free_cycle_gate", lambda *_a, **_k: None)
-    monkeypatch.setattr(git_facade, "_advisory_and_tests_gate", lambda *_a, **_k: None)
+    monkeypatch.setattr(git_facade, "_preflight_and_tests_gate", lambda *_a, **_k: None)
     monkeypatch.setattr(git_facade, "_review_binding_precondition_error", lambda *_a, **_k: "")
     monkeypatch.setattr(git_facade, "_record_commit_attempt", lambda *_a, **_k: None)
     monkeypatch.setattr(git_facade, "_install_paid_dispatch_stamp", lambda *_a, **_k: None)

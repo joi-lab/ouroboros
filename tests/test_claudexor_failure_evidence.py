@@ -82,10 +82,21 @@ def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeyp
         tool_context=SimpleNamespace(task_id="task-one", is_direct_chat=False), control_reason=lambda: None))
     monkeypatch.setattr(transport.config, "NETWORK_WAIT_BACKOFF_START_SEC", 0.001)
     monkeypatch.setattr(transport.config, "NETWORK_WAIT_BACKOFF_MAX_SEC", 0.001)
-    manifests = []
+    manifests, request_writes = [], []
+    persist_call = transport.persist_call
+
+    def persist(*args, **kwargs):
+        receipt = persist_call(*args, **kwargs)
+        if kwargs["call_type"] == "llm_claudexor_request":
+            request_writes.append(json.loads(
+                Path(receipt["manifest_ref"]["path"]).read_text(encoding="utf-8")))
+        return receipt
+
+    monkeypatch.setattr(transport, "persist_call", persist)
 
     def observe(receipt):
-        manifests.append(json.loads(Path(receipt["request_manifest_ref"]["path"]).read_text()))
+        manifests.append(json.loads(
+            Path(receipt["request_manifest_ref"]["path"]).read_text(encoding="utf-8")))
 
     answer, usage = call(client, asynchronous, model_operation_observer=observe)
     assert answer == result()["message"]
@@ -93,7 +104,13 @@ def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeyp
     expected = {key: True for key, enabled in (
         ("capture_failure_evidence", failure), ("capture_effort_evidence", effort)) if enabled}
     assert gateway.capture_requests == [expected] * 2
-    assert len(manifests) == 3  # Before lost create, before rejoin, then accepted custody.
+    # Phase observations may repeat a checkpoint, but cannot rewrite or rewind custody.
+    versions = [item for index, item in enumerate(manifests)
+                if index == 0 or item != manifests[index - 1]]
+    assert [item.get("operation_id") for item in versions] == [None, "op-0"]
+    assert [item.get("operation_id") for item in request_writes] == [None, "op-0"]
+    assert len({item["invocation_id"] for item in manifests}) == 1
+    assert len({item["full_payload_ref"]["sha256"] for item in manifests}) == 1
     assert all(item["capture_failure_evidence"] is failure and
                item["capture_effort_evidence"] is effort for item in manifests)
     assert len(gateway.uploads) == 1 and not replacement.uploads
@@ -101,7 +118,8 @@ def test_lost_create_and_gateway_replacement_reuse_frozen_capture(setup, monkeyp
     assert len(gateway.creates) == 2 and len(set(gateway.creates)) == 1
     assert len(gateway.accepted_operations) == len(usage["ledger_attempt_ids"]) == 1
     assert gateway.closed == replacement.closed == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    # One current row per attempt; revision 3 = reserved, dispatched, settled.
+    assert [(row["state"], row["revision"]) for row in ledger(root)] == [("settled", 3)]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -117,7 +135,7 @@ def test_catalog_read_failure_does_not_guess_unsupported_or_dispatch(setup, monk
     assert caught.value.code == "daemon_unreachable"
     assert caught.value.physical_attempt_capture.state == "released"
     assert not gateway.uploads and not gateway.creates and gateway.closed == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "released"]
+    assert [(row["state"], row["revision"]) for row in ledger(root)] == [("released", 2)]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -157,7 +175,8 @@ def test_known_terminal_null_message_settles_then_rejects_without_private_projec
     classified = classify_llm_exception(error)
     assert classified.kind == "provider_error" and not classified.retry_same_request
     assert plan_next_wire_retry({}, error=error) is None
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    # One current row per attempt; revision 3 = reserved, dispatched, settled.
+    assert [(row["state"], row["revision"]) for row in ledger(root)] == [("settled", 3)]
     assert len(gateway.creates) == len(gateway.acks) == 1
     assert not hasattr(error, "model_result")
     public = json.dumps({"usage": error.usage, "ledger": ledger(root), "detail": gateway.detail(0)}) + caplog.text

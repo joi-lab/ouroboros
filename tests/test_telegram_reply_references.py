@@ -1,0 +1,371 @@
+"""Telegram references are transport facts; the host owns their meaning and routing."""
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import httpx
+import pytest
+
+from tests.test_telegram_format_parity import _load_skill
+
+# The shared native-skill loader replaces its package entries in sys.modules.
+pytestmark = pytest.mark.serial
+
+
+class Api:
+    def __init__(self, state_dir):
+        self.state_dir = Path(state_dir)
+        self.logs = []
+
+    def get_state_dir(self):
+        return str(self.state_dir)
+
+    def get_runtime_info(self):
+        return {"data_dir": str(self.state_dir / "data")}
+
+    def get_settings(self, _keys):
+        return {"TELEGRAM_BOT_TOKEN": "test-token"}
+
+    def log(self, level, message):
+        self.logs.append((level, message))
+
+
+@pytest.fixture
+def bridge(tmp_path, monkeypatch):
+    plugin, telegram_api = _load_skill()
+    api = Api(tmp_path)
+    (tmp_path / "settings.json").write_text(json.dumps({"TELEGRAM_CHAT_ID": "42"}), encoding="utf-8")
+    calls, replies = [], []
+
+    class Wire:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            pass
+
+        async def post(self, url, *, data, files):
+            calls.append((url.rsplit("/", 1)[-1], dict(data or {})))
+            if replies:
+                value = replies.pop(0)
+                if isinstance(value, Exception):
+                    raise value
+                return httpx.Response(value[0], json=value[1])
+            mid = (data or {}).get("message_id") or (100 + len(calls))
+            return httpx.Response(200, json={"ok": True, "result": {"message_id": int(mid)}})
+
+    monkeypatch.setattr(telegram_api.httpx, "AsyncClient", Wire)
+    return SimpleNamespace(plugin=plugin, transport=telegram_api, api=api, calls=calls, replies=replies)
+
+
+def _state(plugin):
+    import sys
+    return sys.modules[plugin.__package__ + ".lib.telegram_state"]
+
+
+def test_every_chunk_id_is_retained_across_reload_and_nonlast_resolves(bridge):
+    b = bridge
+    state = _state(b.plugin)
+    record = {"row_address": "row:1@2026-10-16T12:00:00Z#123456789abc", "task_id": "work-1", "kind": "message"}
+    client = b.transport.TelegramClient("test-token", on_message=lambda chat, mid: state._remember_message(b.api, chat, mid, record))
+    last = asyncio.run(client.send_message(42, "word " * 2000, parse_mode=""))
+    assert len(b.calls) >= 3 and last == 100 + len(b.calls)
+    plugin, _transport = _load_skill()  # no in-memory map survives a plugin restart
+    restored = _state(plugin)
+    for mid in range(101, last + 1):
+        assert restored._reply_reference(Api(b.api.state_dir), 42, mid) == record["row_address"]
+    assert restored._reply_reference(b.api, 43, 101) == ""
+    assert restored._reply_reference(b.api, 42, 9999) == ""
+
+
+def test_confirmed_chunk_survives_later_unknown_send(bridge):
+    b = bridge
+    seen = []
+    b.replies.extend([(200, {"ok": True, "result": {"message_id": 51}}), httpx.ReadTimeout("offline")])
+    client = b.transport.TelegramClient("test-token", on_message=lambda chat, mid: seen.append((chat, mid)))
+    with pytest.raises(b.transport.TelegramTransportError):
+        asyncio.run(client.send_message(42, "x" * 5000, parse_mode=""))
+    assert seen == [(42, 51)] and len(b.calls) == 2
+
+
+def test_fallback_media_keyboard_and_edit_share_confirmed_message_observer(bridge):
+    b = bridge
+    seen = []
+    client = b.transport.TelegramClient("test-token", on_message=lambda chat, mid: seen.append((chat, mid)), reply_to_message_id=17)
+    b.replies.extend([(400, {"ok": False}), (200, {"ok": True, "result": {"message_id": 61}})])
+
+    async def run():
+        await client.send_message(42, "**Hello**")
+        await client.send_photo(42, "eA==")
+        await client.send_document(42, b"file")
+        await client.send_audio(42, b"file", "a.mp3")
+        await client.send_message_with_inline_keyboard(42, "Choose", [[{"text": "A", "callback_data": "a"}]])
+        await client.call("sendVideo", data={"chat_id": "42"})
+        assert await client.edit_message_text(42, 61, "Updated")
+        b.replies.append((400, {"ok": False, "description": "Bad Request: message is not modified"}))
+        assert await client.edit_message_text(42, 61, "Updated")
+
+    asyncio.run(run())
+    assert [mid for _, mid in seen] == [61, 103, 104, 105, 106, 107, 61, 61]
+    for method, data in b.calls:
+        assert (data.get("reply_to_message_id") == 17) is method.startswith("send")
+    assert b.calls[1][1]["text"] == "Hello"
+
+
+def test_message_reference_retention_is_bounded_and_work_cards_use_task_address(bridge, monkeypatch):
+    state, api = _state(bridge.plugin), bridge.api
+    monkeypatch.setattr(state, "_MAX_MESSAGE_REFS", 3)
+    for mid in range(1, 6):
+        state._remember_message(api, 42, mid, {"row_address": f"row-{mid}", "kind": "work_card", "task_id": f"task-{mid}"})
+    state._remember_message(api, 42, 3, {"row_address": "updated-row", "kind": "message"})
+    assert list(state._message_refs(api)) == ["42:4", "42:5", "42:3"]
+    assert state._reply_reference(api, 42, 1) == ""
+    assert state._reply_reference(api, 42, 4) == "task:task-4"
+    assert state._reply_reference(api, 42, 3) == "updated-row"
+
+
+def _owner(mid=50, text="Explain this", *, reply=0, chat=42):
+    return {"message_id": mid, "chat": {"id": chat, "type": "private"}, "from": {"id": chat},
+            "text": text, **({"reply_to_message": {"message_id": reply}} if reply else {})}
+
+
+def _host_posts(b, monkeypatch):
+    posts = []
+
+    async def post(_api, path, payload):
+        posts.append((path, payload))
+        return 202, {"ok": True, "status": "queued"}
+
+    monkeypatch.setattr(b.plugin, "_host_post", post)
+    return posts
+
+
+def _receive(b, message, *, update_id=70):
+    asyncio.run(b.plugin._handle_owner_message(b.api, b.plugin._telegram_client(b.api),
+                {"message": message}, update_id, "full_access", "en"))
+
+
+@pytest.mark.parametrize("kind,address,expected", [
+    ("message", "row:1@time#123456789abc", "row:1@time#123456789abc"),
+    ("work_card", "row:1@time#123456789abc", "task:work-1"),
+    ("message", "", "task:work-1"),
+    ("completion", "row:1@later#123456789abc", "row:1@later#123456789abc"),
+])
+def test_reply_to_mirrored_work_goes_through_normal_ingress_as_reference(bridge, monkeypatch, kind, address, expected):
+    b = bridge
+    event = {"text": "Explanation " * 1000, "task_id": "work-1", "chat_id": 1,
+             "kind": kind, "row_address": address}
+    asyncio.run(b.plugin._make_outbound(b.api)(event))
+    assert len(b.calls) > 1
+    posts = _host_posts(b, monkeypatch)
+    _receive(b, _owner(reply=101))  # the FIRST chunk, not the last one
+    path, payload = posts[0]
+    assert path == "/chat/inject" and payload["reply_to"] == expected
+    assert payload["text"] == "Explain this" and payload["chat_id"] == 42
+    assert "task_id" not in payload and "task_metadata" not in payload
+    assert payload["client_message_id"] == "tg:42:50"
+    _receive(b, _owner(reply=101), update_id=71)
+    assert posts[1][1]["client_message_id"] == payload["client_message_id"]
+    assert b.api.logs == []
+
+
+def test_unmapped_or_other_chat_reply_has_no_reference_and_no_notice(bridge, monkeypatch):
+    b = bridge
+    _state(b.plugin)._remember_message(b.api, 43, 101, {"row_address": "other-chat"})
+    posts = _host_posts(b, monkeypatch)
+    _receive(b, _owner(reply=101))
+    _receive(b, _owner(51, reply=999))
+    assert all("reply_to" not in payload for _, payload in posts)
+    assert b.calls == [] and b.api.logs == []
+
+
+def _accept_owner(b, mid, *, text="Same owner words", chat=42):
+    """Use the real canonical ingress writer; owner lookup must never use text."""
+    from supervisor.message_bus import accept_local_message
+    from ouroboros.chat_chain import format_address, row_address
+
+    state = _state(b.plugin)
+    state._owner_message_seen(b.api, chat, mid)
+    fields = state._owner_ingress_fields(b.api, chat, _owner(mid, text, chat=chat), mid)
+    receiver = SimpleNamespace(enqueue_local_message=lambda *args, **kwargs: None)
+    row, _ = accept_local_message(receiver, b.api.state_dir / "data", text,
+                                 chat_id=chat, user_id=chat, source="skill:telegram", **fields)
+    return {"address": format_address(row_address(row)), "chat_id": chat, "role": "user",
+            "author_label": "You", "kind": "message", "snippet": text, "ts": row["ts"], "task_id": ""}
+
+
+@pytest.mark.parametrize("target", ["earlier", "latest", "other_chat", "unmapped", "system", "unresolved"])
+def test_native_reply_only_for_nonlatest_owner_from_same_telegram_chat(bridge, target):
+    b = bridge
+    earlier = _accept_owner(b, 10)
+    latest = _accept_owner(b, 11)  # deliberately identical text; identity decides
+    other = _accept_owner(b, 12, chat=43)
+    reference = {"earlier": earlier, "latest": latest, "other_chat": other,
+                 "unmapped": {**earlier, "address": "row:1@unknown#000000000000"},
+                 "system": {**earlier, "role": "system"},
+                 "unresolved": {**earlier, "unresolved": True}}[target]
+    # Reload before the first answer: pending ingress associations also survive restart.
+    b.plugin, _ = _load_skill()
+    asyncio.run(b.plugin._make_outbound(b.api)({"chat_id": 1, "text": "Answer " * 1000,
+                "row_address": "answer-row", "reply_to": reference}))
+    assert len(b.calls) > 1
+    for _, data in b.calls:
+        assert data.get("reply_to_message_id") == (10 if target == "earlier" else None)
+    assert b.api.logs == []
+    if target == "earlier":
+        assert _state(b.plugin)._message_ref(b.api, 42, 10)["row_address"] == earlier["address"]
+
+
+def test_local_owner_command_breaks_native_reply_adjacency(bridge, monkeypatch):
+    b = bridge
+    ref = _accept_owner(b, 10)
+    _receive(b, _owner(11, "/help"))
+    b.calls.clear()
+    asyncio.run(b.plugin._make_outbound(b.api)({"text": "Earlier answer", "reply_to": ref}))
+    assert b.calls[0][1]["reply_to_message_id"] == 10
+
+
+def test_latest_owner_identity_survives_reference_eviction(bridge, monkeypatch):
+    b = bridge
+    state = _state(b.plugin)
+    monkeypatch.setattr(state, "_MAX_MESSAGE_REFS", 2)
+    ref = _accept_owner(b, 10)
+    _accept_owner(b, 11)
+    # A late binding refreshes an old record; it must not make it the latest input.
+    record = {**state._message_ref(b.api, 42, 10), "row_address": ref["address"]}
+    state._remember_message(b.api, 42, 10, record)
+    state._remember_message(b.api, 42, 100, {"row_address": "bot-row"})
+    assert state._message_ref(b.api, 42, 11) == {}
+    assert state._native_reply_id(b.api, 42, {"reply_to": ref}) == 10
+
+
+@pytest.mark.parametrize("surface,extra", [
+    ("photo", {"image_base64": "eA=="}),
+    ("video", {"video_base64": "eA=="}),
+    ("document", {"file_base64": "eA==", "filename": "note.txt"}),
+    ("document", {"file_base64": "eA==", "filename": "note.mp3", "mime": "audio/mpeg"}),
+    ("links", {"title": "Read this", "actions": [{"label": "Source", "url": "https://example.com"}]}),
+])
+def test_every_mirrored_media_surface_retains_reference_and_native_reply(bridge, surface, extra):
+    b = bridge
+    ref = _accept_owner(b, 10)
+    _accept_owner(b, 11)
+    event = {"chat_id": 1, "row_address": "host-media-row", "task_id": "work", "reply_to": ref, **extra}
+    asyncio.run(getattr(b.plugin, "_make_" + surface)(b.api)(event))
+    assert len(b.calls) == 1 and b.calls[0][1]["reply_to_message_id"] == 10
+    assert _state(b.plugin)._reply_reference(b.api, 42, 101) == "host-media-row"
+    assert b.api.logs == []
+
+
+def test_long_quiz_keeps_answer_door_and_earlier_parts_carry_references(bridge, monkeypatch):
+    b = bridge
+    event = {"chat_id": 1, "row_address": "question-row", "quiz_id": "quiz", "task_id": "task",
+             "question": "Long question " * 900, "options": [{"label": "A"}, {"label": "B"}]}
+    asyncio.run(b.plugin._make_quiz(b.api)(event))
+    assert len(b.calls) > 2
+    last = 100 + len(b.calls)
+    state = _state(b.plugin)
+    assert all(state._reply_reference(b.api, 42, mid) == "question-row" for mid in range(101, last + 1))
+    assert state._message_ref(b.api, 42, 101)["kind"] == "question"
+    posts = _host_posts(b, monkeypatch)
+    _receive(b, _owner(50, "Please explain", reply=101))
+    assert posts[0][0] == "/chat/inject" and posts[0][1]["reply_to"] == "question-row"
+    _receive(b, _owner(51, "B", reply=last))
+    assert posts[1][0] == "/chat/decision"
+    assert posts[1][1]["decision_id"] == "quiz:task:quiz" and posts[1][1]["comment"] == "B"
+
+
+def test_silent_mode_edits_same_episode_but_never_continue_or_reply_origin(bridge):
+    b = bridge
+    b.plugin.merge_settings(b.api.state_dir, {"TELEGRAM_SILENT_MODE": "on"})
+    handle = b.plugin._make_outbound(b.api)
+
+    async def run():
+        await handle({"text": "First", "task_id": "episode-1", "row_address": "row-first"})
+        await handle({"text": "Update", "task_id": "episode-1", "row_address": "row-update"})
+        await handle({"text": "Continue", "task_id": "episode-2", "row_address": "row-continue"})
+        await handle({"text": "Other origin", "task_id": "episode-2", "row_address": "row-origin",
+                      "reply_to": {"address": "other-owner"}})
+
+    asyncio.run(run())
+    assert [method for method, _ in b.calls] == ["sendMessage", "editMessageText", "sendMessage", "sendMessage"]
+    assert _state(b.plugin)._reply_reference(b.api, 42, 101) == "row-update"
+    assert _state(b.plugin)._reply_reference(b.api, 42, 103) == "row-continue"
+    assert _state(b.plugin)._reply_reference(b.api, 42, 104) == "row-origin"
+
+
+def test_silent_mode_starts_new_message_when_native_reply_anchor_changes(bridge):
+    b = bridge
+    b.plugin.merge_settings(b.api.state_dir, {"TELEGRAM_SILENT_MODE": "on"})
+    ref = _accept_owner(b, 10)
+    event = {"text": "First answer", "task_id": "same-episode", "reply_to": ref}
+    handle = b.plugin._make_outbound(b.api)
+    asyncio.run(handle(event))
+    _state(b.plugin)._owner_message_seen(b.api, 42, 11)
+    asyncio.run(handle({**event, "text": "More about the earlier request"}))
+    assert [method for method, _ in b.calls] == ["sendMessage", "sendMessage"]
+    assert "reply_to_message_id" not in b.calls[0][1] and b.calls[1][1]["reply_to_message_id"] == 10
+
+
+def test_completion_notifier_maps_persisted_summary_and_keeps_episodes_separate(bridge, monkeypatch):
+    import sys
+    from ouroboros.chat_chain import format_address, row_address
+
+    b = bridge
+    notifier = sys.modules[b.plugin.__package__ + ".lib.telegram_notifier"]
+    summary = {"type": "task_summary", "summary_kind": "terminal_root_projection", "chat_id": 1,
+               "task_id": "episode-1", "ts": "2026-10-16T12:00:00Z", "outcome_phase": "done"}
+    monkeypatch.setattr(notifier, "_summary_ids_in_tail", lambda _api: [("episode-1", summary)])
+    state = {"notified_task_ids": []}
+    asyncio.run(notifier._check_tasks_notify(b.api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
+    summary2 = {**summary, "task_id": "episode-2"}
+    monkeypatch.setattr(notifier, "_summary_ids_in_tail", lambda _api: [("episode-2", summary2)])
+    asyncio.run(notifier._check_tasks_notify(b.api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
+    assert [method for method, _ in b.calls] == ["sendMessage", "sendMessage"]
+    mapping = _state(b.plugin)
+    assert mapping._reply_reference(b.api, 42, 101) == "task:episode-1"
+    assert mapping._message_ref(b.api, 42, 101)["row_address"] == format_address(row_address(summary))
+    assert mapping._reply_reference(b.api, 42, 102) == "task:episode-2"
+
+
+def test_relay_success_silent_named_failure_one_line_synthetic_uses_host_row(bridge):
+    from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX, routing_refusal_cause
+
+    b = bridge
+    handle = b.plugin._make_outbound(b.api)
+    ack = {"annotation_type": "routing_ack", "action": "steer_task", "client_message_id": "tg:42:10",
+           "target": "work-1", "target_label": "Parser", "status": "delivered", "cause": ""}
+    asyncio.run(handle(ack))
+    assert not b.calls
+    cause = routing_refusal_cause("steer_task", "rejected", "cancel_pending")
+    asyncio.run(handle({**ack, "status": "rejected", "cause": cause}))
+    assert len(b.calls) == 1 and b.calls[0][1]["text"] == f"Parser · {cause}"
+    assert "\n" not in b.calls[0][1]["text"]
+    asyncio.run(handle({**ack, "client_message_id": AGENT_RECEIPT_ID_PREFIX + "1", "status": "rejected", "cause": cause}))
+    assert len(b.calls) == 1
+    asyncio.run(handle({"role": "system", "system_type": "steer_not_delivered", "text": f"Parser · {cause}"}))
+    assert len(b.calls) == 2 and all(method == "sendMessage" for method, _ in b.calls)
+
+
+def test_relay_quotes_the_owners_words_and_files_above_the_note_verbatim(bridge):
+    first = {"text": "Please deploy *now*", "attachments": [], "source": {"chat_id": 1, "label": "Main"}}
+    second = {"text": "", "attachments": [{"name": "config.json"}], "source": {"chat_id": 7, "label": "Alpha"}}
+    event = {"role": "assistant", "text": "Apply this constraint.", "chat_id": 7, "task_id": "receiver",
+             "system_type": "relay_entry", "kind": "relay_entry",
+             "relay": {"relay_id": "r", **first, "quotes": [first, second]}}
+    asyncio.run(bridge.plugin._make_outbound(bridge.api)(event))
+    [(method, data)] = bridge.calls
+    assert method == "sendMessage"
+    assert data["text"] == ("Your message in Main:\nPlease deploy *now*\n\n"
+                            "Your message in Alpha:\nAttached: config.json\n\nApply this constraint.")
+    assert not data.get("parse_mode"), "his words are sent verbatim, never re-read as markup"
+    bridge.calls.clear()
+    asyncio.run(bridge.plugin._make_outbound(bridge.api)({**event, "relay": {"relay_id": "r2", "text": "", "quotes": []}}))
+    [(_method, plain)] = bridge.calls
+    assert plain["text"] == "Apply this constraint.", "a relay without quoted words is just its note"

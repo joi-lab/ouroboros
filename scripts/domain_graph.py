@@ -397,6 +397,14 @@ def duplicate_bodies(manifest: Manifest, root: pathlib.Path = REPO_ROOT,
             continue
         source = src_path.read_text(encoding="utf-8")
         tree = ast.parse(source, filename=path)
+        # read_text normalizes CR/CRLF to LF; AST columns count UTF-8 bytes.
+        # Index this same parsed source once, rather than having get_source_segment
+        # split the entire file again for every function. splitlines would also
+        # split form feeds and Unicode separators that are NOT parser line breaks.
+        source_utf8 = source.encode("utf-8")
+        line_starts = [0]
+        for line in source_utf8.split(b"\n"):
+            line_starts.append(line_starts[-1] + len(line) + 1)
 
         def walk(node: ast.AST, prefix: str) -> None:
             for child in ast.iter_child_nodes(node):
@@ -405,7 +413,11 @@ def duplicate_bodies(manifest: Manifest, root: pathlib.Path = REPO_ROOT,
                     # For ordinary source line endings, normalization cannot grow
                     # the raw span. Embedded splitlines-only separators are not counted.
                     span = (getattr(child, "end_lineno", None) or child.lineno) - child.lineno + 1
-                    segment = ast.get_source_segment(source, child) if span >= min_lines else None
+                    segment = None
+                    if span >= min_lines and child.end_lineno is not None and child.end_col_offset is not None:
+                        start = line_starts[child.lineno - 1] + child.col_offset
+                        end = line_starts[child.end_lineno - 1] + child.end_col_offset
+                        segment = source_utf8[start:end].decode("utf-8")
                     if segment is not None:
                         norm = _normalize_body(segment)
                         if norm.count("\n") + 1 >= min_lines:

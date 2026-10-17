@@ -10,15 +10,18 @@ second scheduler, queue, or durable wait store.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from ouroboros.owner_wait import set_owner_wait
 from supervisor.queue import _queue_lock
 from supervisor.worker_pool_lifecycle import (
-    _serialized_worker_lifecycle, _spawn_worker_slot, kill_worker_tree, retire_worker,
+    _serialized_worker_lifecycle, request_worker_quiescence, retire_or_replace_worker,
+    retire_quiescent_worker, retire_worker, worker_ready,
 )
 
 log = logging.getLogger(__name__)
+_PENDING_PARK = "owner_wait_park_pending"
 
 
 def _pool():
@@ -29,10 +32,40 @@ def _pool():
 def has_owner_wait_checkpoint(meta: dict, task_attempt: int) -> bool:
     """Whether this attempt saved work that an automatic retry would replay."""
     task = meta.get("task")
-    wait = meta.get("owner_wait") or (
+    wait = ((meta.get(_PENDING_PARK) or {}).get("event") or {}).get("checkpoint") or meta.get("owner_wait") or (
         task.get("_owner_wait_resume") if isinstance(task, dict) else None)
     return (isinstance(wait, dict) and wait.get("task_attempt") == task_attempt
             and bool(wait.get("source_ref")))
+
+
+def waiting_on_owner(meta: dict, task_attempt: int) -> bool:
+    """A current park request spares idle time before ACK too; refusal retains only custody."""
+    pending = meta.get(_PENDING_PARK) or {}
+    wait = (pending.get("event") or {}).get("checkpoint") if pending else meta.get("owner_wait")
+    return (not pending.get("refused") and isinstance(wait, dict)
+            and wait.get("task_attempt") == task_attempt
+            and (bool(wait.get("source_ref")) if pending else wait.get("state") == "waiting"))
+
+
+def _park_clock(meta: dict, wait: dict, pending: dict) -> tuple[bool, Any, Any]:
+    """Validate this worker's closed total and actual open interval; missing is not zero."""
+    cold = (meta["task"].get("_budget_pause_resume") or {}).get("sleep_exclusion_since")
+    sleeping = isinstance(wait.get("sleep"), dict) or wait.get("reason") == "owner_pause"
+    paused, started = wait.get("budget_paused_sec"), wait.get("sleep_started_at") if sleeping else None
+    if sleeping and started is None and wait.get("reason") == "owner_pause":
+        from ouroboros.deadline_utils import parse_deadline_ts
+
+        recorded = parse_deadline_ts((wait.get("owner_pause") or {}).get("parked_at"))
+        started = recorded.timestamp() if recorded else None
+    def number(value):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if (paused is not None or cold or sleeping or pending.get("clock_error")) and (
+            not number(paused) or paused < float(meta.get("budget_paused_sec") or 0)):
+        return False, None, None
+    if (sleeping and (not number(started) or started <= 0)
+            or cold and not pending.get("clock_projected") and meta.get("sleep_parked_at") != cold):
+        return False, None, None
+    return True, paused, started
 
 
 def _command(worker: Any, task_id: str, wait: dict, phase: str, **extra: Any) -> None:
@@ -41,8 +74,21 @@ def _command(worker: Any, task_id: str, wait: dict, phase: str, **extra: Any) ->
                      "phase": phase, **extra})
 
 
+def retry_pending_owner_waits(ctx: Any) -> None:
+    """The existing assignment tick retries each still-owned park once, without a store wait."""
+    with _queue_lock:
+        pending = [(task_id, meta, meta[_PENDING_PARK]) for task_id, meta in ctx.RUNNING.items()
+                   if meta.get(_PENDING_PARK) and not meta[_PENDING_PARK].get("refused")]
+    for task_id, meta, request in pending:
+        with _queue_lock:
+            if ctx.RUNNING.get(task_id) is not meta or meta.get(_PENDING_PARK) is not request:
+                continue
+        handle_owner_wait(request["event"], ctx)
+
+
 def handle_owner_wait(event: dict, ctx: Any) -> None:
     """Acknowledge only the current physical attempt's durable park or wake."""
+    from ouroboros.store import acquisition_budget, StoreBusy
     from supervisor import queue
 
     task_id, wait_id = str(event.get("task_id") or ""), str(event.get("wait_id") or "")
@@ -80,25 +126,49 @@ def handle_owner_wait(event: dict, ctx: Any) -> None:
         if current.get("wait_id") == wait_id and not getattr(worker, "active_capacity", True):
             _command(worker, task_id, current, "parked")
             return
+        pending = meta.get(_PENDING_PARK)
+        if pending and pending["event"].get("wait_id") != wait_id:
+            return  # One physical stack can owe only its current park acknowledgement.
+        if pending and pending.get("refused"):
+            return  # The rejected checkpoint prevents replay; it is not another park attempt.
+        if pending is None:
+            pending = meta[_PENDING_PARK] = {"event": {**event, "checkpoint": dict(wait)}}
         wait = {**wait, "started_at": meta["started_at"], "state": "waiting"}
+        resume = meta["task"].get("_budget_pause_resume") or {}
+        cold_interval = resume.get("sleep_exclusion_since")
+        valid_clock, paused, parked_at = _park_clock(meta, wait, pending)
+        if not valid_clock:
+            if not pending.get("clock_error"):
+                log.warning("Owner wait clock unavailable or contradictory for %s; park retained", task_id)
+                pending["clock_error"] = True
+            return
+        if paused is not None:
+            # Current worker/source facts govern its LIVE clock even before the
+            # park commits. Neither this projection nor its pending request lends capacity.
+            meta["budget_paused_sec"] = float(paused)
+            if parked_at is not None:
+                meta["sleep_parked_at"] = parked_at
+            elif cold_interval:
+                meta.pop("sleep_parked_at", None)
+            pending["clock_projected"] = True
+        park_written = False
         try:
-            # A warm wait may arrive before the cold consumption notification
-            # (or its repair tick). Fold that exact interval before installing
-            # the new one; a stale consumed event cannot own the warm interval.
-            resume = meta["task"].get("_budget_pause_resume") or {}
-            if resume.get("sleep_exclusion_since"):
-                from supervisor.events_budget import _handle_budget_pause
+            # A contended write rolls back before the next tick. Never hold Q or
+            # the event loop waiting for SQLite; the physical request stays owned.
+            with acquisition_budget(0):
+                wait = set_owner_wait(ctx.DRIVE_ROOT, task_id, wait,
+                                      expected_wait_id=current.get("wait_id"),
+                                      expected_state=current.get("state"))
+            park_written = True
+            if cold_interval:
+                from supervisor.events_budget import finish_resume_clock
 
-                _handle_budget_pause({"phase": "consumed", "task_id": task_id,
-                    "task_attempt": attempt, "pause_id": resume.get("pause_id"),
-                    "grant_id": resume.get("grant_id")}, ctx)
-                if meta["task"].get("_budget_pause_resume"):
-                    raise RuntimeError("cold sleep consumption is not yet confirmed")
-            wait = set_owner_wait(ctx.DRIVE_ROOT, task_id, wait)
+                # The committed park retires only the old clock marker. Explicit
+                # Resume selection and the truthful new open interval stay intact.
+                finish_resume_clock(meta, float(paused))
+                if parked_at is not None:
+                    meta["sleep_parked_at"] = parked_at
             meta["owner_wait"] = wait
-            if isinstance(wait.get("sleep"), dict):
-                # A model sleep is not execution: excluded live until the task runs again.
-                meta.setdefault("sleep_parked_at", _pool().time.time())
             # A spent exact-budget carrier still on this row is retired by the
             # revocation seam's ``_owner_wait_resume`` branch when the restart
             # reads the durable grant as consumed (#1196, F3); it decides nothing
@@ -107,24 +177,18 @@ def handle_owner_wait(event: dict, ctx: Any) -> None:
             if not queue.persist_queue_snapshot(reason="owner_wait_parked"):
                 raise RuntimeError("owner wait queue snapshot was not persisted")
         except Exception as exc:
+            if (not park_written and isinstance(exc, StoreBusy) and exc.reason == "contention"
+                    and getattr(exc, "rollback_confirmed", None) is not False):
+                return
+            pending["refused"] = str(exc) or type(exc).__name__
             worker.active_capacity = True
             meta.pop("owner_wait", None)
+            # The worker is still in this wait until it receives the refusal.
+            # Keep its known clock/checkpoint facts, without a parked ACK or retry.
             _command(worker, task_id, wait, "refused", reason=str(exc))
             return
+        meta.pop(_PENDING_PARK, None)
         _command(worker, task_id, wait, "parked")
-
-
-def _retire_idle(worker: Any) -> bool:
-    """Retire an idle replacement while assignment cannot reuse its slot."""
-    with _queue_lock:
-        if _pool().WORKERS.get(worker.wid) is not worker or worker.busy_task_id is not None:
-            return False
-        worker.reaping = True
-        worker.active_capacity = False
-    if worker.proc.is_alive():
-        kill_worker_tree(worker.proc.pid, keep_services=True)
-        worker.proc.join(timeout=2)
-    return retire_worker(worker.wid, worker)
 
 
 def _resume_allowed(task_id: str, meta: dict, worker: Any) -> bool:
@@ -138,7 +202,30 @@ def _resume_allowed(task_id: str, meta: dict, worker: Any) -> bool:
     except Exception:
         log.warning("Owner wait cannot read cancellation authority for %s", task_id, exc_info=True)
         return False
-    return (not intent or intent.get("stop_policy") == "finalize_then_cancel") and _pool().repo_writer_task_allowed(meta["task"])
+    if not ((not intent or intent.get("stop_policy") == "finalize_then_cancel")
+            and _pool().repo_writer_task_allowed(meta["task"])):
+        return False
+    return _owner_pause_wake_still_authorized(task_id, meta)
+
+
+def _owner_pause_wake_still_authorized(task_id: str, meta: dict) -> bool:
+    """A warm owner-Pause park woken by the Resume needs that Resume still standing
+    at the grant: a newer Pause of the root keeps the stack parked. A control
+    wake (Stop, Panic, a deadline) ends the park whatever the fence says."""
+    wait = meta.get("owner_wait") or {}
+    if wait.get("reason") != "owner_pause" or wait.get("resume_reason") != "control:owner_resume":
+        return True
+    from types import SimpleNamespace
+    from ouroboros.owner_pause import member_fence
+
+    task = meta.get("task") or {}
+    try:
+        return not member_fence(SimpleNamespace(
+            task_id=task_id, root_task_id=str(task.get("root_task_id") or task_id),
+            budget_drive_root=task.get("budget_drive_root") or _pool().DRIVE_ROOT))
+    except Exception:
+        log.warning("Owner pause authority unreadable for %s; its warm park stays parked", task_id, exc_info=True)
+        return False
 
 
 def _grant_resume(
@@ -159,14 +246,21 @@ def _grant_resume(
             return False
         wait = meta["owner_wait"]
         cold_handoff = meta["task"].get("_owner_wait_resume")
+        parked_at = meta.get("sleep_parked_at")
+        prior_paused = float(meta.get("budget_paused_sec") or 0.0)
+        paused = prior_paused + (max(0.0, _pool().time.time() - float(parked_at))
+                                 if isinstance(parked_at, (int, float)) else 0.0)
         try:
-            resumed = set_owner_wait(_pool().DRIVE_ROOT, task_id, {**wait, "state": "resumed"},
+            resumed = set_owner_wait(_pool().DRIVE_ROOT, task_id,
+                                     {**wait, "state": "resumed", "budget_paused_sec": paused},
                                      expected_wait_id=wait["wait_id"])
             if replacement is not None:
                 replacement.active_capacity = False
             worker.active_capacity = True
             meta["owner_wait"] = resumed
             meta["task"].pop("_owner_wait_resume", None)
+            meta["budget_paused_sec"] = paused
+            meta.pop("sleep_parked_at", None)
             if not queue.persist_queue_snapshot(reason="owner_wait_resumed"):
                 raise RuntimeError("owner wait resume snapshot was not persisted")
             _command(worker, task_id, resumed, "resume_granted")
@@ -177,6 +271,9 @@ def _grant_resume(
             if cold_handoff is not None:
                 meta["task"]["_owner_wait_resume"] = cold_handoff
             meta["owner_wait"] = wait
+            meta["budget_paused_sec"] = prior_paused
+            if parked_at is not None:
+                meta["sleep_parked_at"] = parked_at
             try:
                 set_owner_wait(_pool().DRIVE_ROOT, task_id, wait,
                                expected_wait_id=wait["wait_id"])
@@ -185,10 +282,6 @@ def _grant_resume(
                 log.warning("Owner-wait rollback remains unpersisted for %s", task_id, exc_info=True)
             raise
         meta.pop("owner_wait_resume_requested", None)
-        parked_at = meta.pop("sleep_parked_at", None)
-        if isinstance(parked_at, (int, float)):  # the ONE paused carrier every lifetime reader subtracts
-            meta["budget_paused_sec"] = float(meta.get("budget_paused_sec") or 0.0) + max(
-                0.0, _pool().time.time() - float(parked_at))
         if (str(resumed.get("quiz_id") or "")
                 and not str(resumed.get("resume_reason") or "").startswith("control:")):
             # The bound closed and the pooled task resumed: one seam with the direct lane.
@@ -203,7 +296,25 @@ def _grant_resume(
 
 @_serialized_worker_lifecycle
 def maintain_owner_wait_capacity() -> None:
-    """Resume original stacks before assigning fresh work, then fill lent slots."""
+    """Resume original stacks first; assignment owns demand-sized replacement.
+
+    At full capacity an authorized warm Resume keeps ONE idle slot from fresh work
+    until it acknowledges and retires; other probes stay optional, and a slot
+    already retiring pays for one Resume. The parked author's slot carries the same
+    mark, and growth leaves capacity only for marked authors. Holds are recomputed
+    every tick, so they lapse with the authorization (Stop, Panic, a newer Pause,
+    the grant itself).
+    """
+    holds: dict = {}
+    try:
+        _resume_original_stacks(holds)
+    finally:
+        with _queue_lock:
+            for slot in _pool().WORKERS.values():
+                slot.resume_hold = holds.get(slot.wid, "")
+
+
+def _resume_original_stacks(holds: dict) -> None:
     pool = _pool()
     if pool.disable_exhausted_worker_pool():
         return
@@ -214,10 +325,18 @@ def maintain_owner_wait_capacity() -> None:
         retired = [w for w in pool.WORKERS.values()
                    if not getattr(w, "active_capacity", True) and w.busy_task_id is None]
     for worker in retired:
-        _retire_idle(worker)
+        if not worker.proc.is_alive():
+            try:
+                retire_or_replace_worker(worker.wid, worker)
+            except Exception:
+                log.warning("Dead lent worker %s stays for the next tick", worker.wid, exc_info=True)
+        else:
+            retire_quiescent_worker(worker)
     with _queue_lock:
         waiting = [(tid, meta) for tid, meta in pool.RUNNING.items()
                    if meta.get("owner_wait_resume_requested")]
+        freeing = sum(1 for w in pool.WORKERS.values()
+                      if getattr(w, "active_capacity", True) and getattr(w, "retiring", False))
     for task_id, meta in waiting:
         with _queue_lock:
             worker = pool.WORKERS.get(meta.get("worker_id"))
@@ -225,30 +344,30 @@ def maintain_owner_wait_capacity() -> None:
                 continue
             if not _resume_allowed(task_id, meta, worker):
                 continue
+            holds[worker.wid] = task_id  # authorized this tick: owed its lent capacity back
             active = [w for w in pool.WORKERS.values() if getattr(w, "active_capacity", True)]
             exhausted = next((w for w in active
                               if getattr(w, "readiness_exhausted", False)
                               and not w.proc.is_alive()), None)
-            idle = next((w for w in active if w.busy_task_id is None and not w.reaping), None)
-            if len(active) >= pool.MAX_WORKERS and idle is None and exhausted is None:
-                continue
+            idle = [w for w in active if w.busy_task_id is None and worker_ready(w)]
+            if len(active) >= pool.MAX_WORKERS and exhausted is None:
+                for slot in idle:
+                    request_worker_quiescence(slot)
+                quiet = next((slot for slot in idle if slot.quiescence_confirmed), None)
+                held = next((slot for slot in idle if slot.wid not in holds), None)
+                if freeing:
+                    freeing -= 1  # an earlier retirement already frees this Resume's slot
+                elif quiet is not None:
+                    retire_quiescent_worker(quiet)
+                elif held is not None:
+                    holds[held.wid] = task_id
+                continue  # grant after the reaper confirms death, on a later tick
         if len(active) < pool.MAX_WORKERS:
             exhausted = None
-        elif exhausted is None and not _retire_idle(idle):
-            continue
         try:
             if _grant_resume(task_id, meta, worker, exhausted_replacement=exhausted):
+                holds.pop(worker.wid, None)
                 if exhausted is not None:
                     retire_worker(exhausted.wid, exhausted)
         except Exception:
             log.warning("Owner wait resume remains pending for %s", task_id, exc_info=True)
-    with _queue_lock:
-        missing = pool.MAX_WORKERS - sum(1 for w in pool.WORKERS.values()
-                                         if getattr(w, "active_capacity", True))
-        next_id = max(pool.WORKERS, default=-1) + 1
-    for wid in range(next_id, next_id + missing):
-        try:
-            _spawn_worker_slot(wid)
-        except Exception:
-            log.warning("Failed to replenish owner-wait capacity", exc_info=True)
-            break

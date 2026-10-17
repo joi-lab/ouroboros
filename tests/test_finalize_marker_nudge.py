@@ -1,6 +1,7 @@
 """P2: the one-shot final-answer-marker nudge. The agent did real work and has prose but no
-FINAL ANSWER marker -> remind it to mark its OWN answer (no extractor change). Ordered AFTER
-the skill/red/FR3-verify and A3 no-op nudges; mutually exclusive with the A3 no-op case.
+FINAL ANSWER marker -> state the protocol's capture rule (no extractor change). Ordered AFTER
+the skill/red/FR3-verify notices. The A3 "expected output but nothing attempted" re-loop is
+gone (#1748): prose can itself be the deliverable.
 v6.60.0: the marker nudge is PROTOCOL-GATED — it fires only for tasks whose contract
 declares answer_protocol="final_answer_line" (the fixtures declare it)."""
 from __future__ import annotations
@@ -13,7 +14,7 @@ from ouroboros import loop as L
 
 
 def _ctx_tools(monkeypatch, expected_output="The answer is 42", answer_protocol="final_answer_line"):
-    # Pre-latch the earlier nudges so we exercise the A3 / marker decision in isolation.
+    # Pre-latch the earlier nudges so we exercise the marker decision in isolation.
     monkeypatch.setattr(L, "_skill_finalization_message", lambda *a, **k: "")
     contract = {"expected_output": expected_output}
     if answer_protocol:
@@ -76,12 +77,26 @@ def test_marker_nudge_suppressed_without_answer_protocol(monkeypatch):
     assert getattr(ctx, "_final_marker_nudged", False) is False
 
 
-def test_marker_nudge_yields_to_a3_no_op(monkeypatch):
-    # No tool calls + no reviewable effects + no marker -> A3 no-op nudge owns this turn,
-    # NOT the marker nudge (mutual exclusivity).
+def test_prose_only_deliverable_buys_no_extra_round(monkeypatch):
+    """A3 removed (#1748; base witness: the former ``test_marker_nudge_yields_to_a3_no_op``
+    asserted this exact turn re-looped with "without having attempted it"). An expected
+    output answered in plain prose with no tool calls gets no re-loop, no latch and no
+    injected text, with or without the answer protocol (the marker notice needs real work)."""
+    for protocol in ("final_answer_line", ""):
+        dr, ctx, tools = _ctx_tools(monkeypatch, answer_protocol=protocol)
+        msgs: list = []
+        notes: list = []
+        fired = L._maybe_inject_finalization_nudges(
+            tools, dr, "t", _trace(tool_calls=[]), "The answer is 42, because 6 x 7.", msgs, notes.append)
+        assert fired is False and msgs == [] and notes == []
+        assert not hasattr(ctx, "_noop_attempt_nudged")
+        assert getattr(ctx, "_final_marker_nudged", False) is False
+
+
+def test_marker_notice_states_the_protocol_without_commands(monkeypatch):
     dr, ctx, tools = _ctx_tools(monkeypatch)
     msgs: list = []
-    fired = L._maybe_inject_finalization_nudges(tools, dr, "t", _trace(tool_calls=[]), "I cannot proceed", msgs, lambda *_: None)
-    assert fired is True
-    assert getattr(ctx, "_noop_attempt_nudged", False) is True
-    assert getattr(ctx, "_final_marker_nudged", False) is False
+    assert L._maybe_inject_finalization_nudges(tools, dr, "t", _trace(), "the value is 42", msgs, lambda *_: None)
+    text = msgs[-1]["content"]
+    assert "`FINAL ANSWER: <answer>`" in text and "the response above has none" in text
+    assert "If you are done" not in text and "keep working" not in text

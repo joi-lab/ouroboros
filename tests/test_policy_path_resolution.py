@@ -58,10 +58,15 @@ def test_hot_code_paths_resolve(candidate_paths: set[str]):
     assert not unresolved, f"hot-code paths bypass merge classification: {unresolved}"
 
 
-def test_size_ratchet_manifest_is_protected_runtime_and_merge_authority():
+def test_size_manifest_and_checklist_archive_are_editable_records():
+    """The size manifest and the checklist archive are records Advanced may
+    rewrite: the checklist the archive extends stays a frozen contract, and the
+    manifest keeps its presentation-only hot-code merge label."""
+    for record in ("ouroboros/size_ratchet_manifest.py", "docs/CHECKLISTS_ARCHIVE.md"):
+        assert (REPO_ROOT / record).is_file(), record
+        assert record not in PROTECTED_RUNTIME_PATHS, record
+        assert not is_protected_runtime_path(record), record
+    assert is_protected_runtime_path("docs/CHECKLISTS.md")
     path = "ouroboros/size_ratchet_manifest.py"
-
-    assert path in PROTECTED_RUNTIME_PATHS
-    assert is_protected_runtime_path(path)
     assert path in update_merge_policy.HOT_CODE_PATHS
     assert update_merge_policy.is_hot_code(path)

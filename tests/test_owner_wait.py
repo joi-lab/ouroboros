@@ -14,6 +14,7 @@ from ouroboros.owner_wait import (
     set_owner_wait, wait_after_tools, worker_owner_wait,
 )
 from ouroboros.task_results import write_task_result
+from tests._store_shared import result_signature, seed_result, unreadable_result
 
 
 def context(tmp_path):
@@ -51,14 +52,16 @@ def test_optional_question_never_enters_wait(tmp_path):
     wait_after_tools(ctx, [], {}, {}, 1, [], set())
 
 
-def test_wait_projection_does_not_overwrite_a_torn_result(tmp_path):
-    from ouroboros.task_results import task_result_path
+def test_wait_projection_does_not_overwrite_an_unreadable_result(tmp_path, monkeypatch):
+    from ouroboros.store import StoreError
 
-    path = task_result_path(tmp_path, "root-1")
-    path.write_text('{"status":')
-    with pytest.raises(ValueError):
+    seed_result(tmp_path, "root-1", {"task_id": "root-1", "status": "running"})
+    before = result_signature(tmp_path, "root-1")
+    unreadable = unreadable_result(monkeypatch, "root-1")
+    with pytest.raises(StoreError):
         set_owner_wait(tmp_path, "root-1", {"wait_id": "w1", "state": "waiting"})
-    assert path.read_text() == '{"status":'
+    unreadable["on"] = False
+    assert result_signature(tmp_path, "root-1") == before
 
 
 def test_failed_checkpoint_does_not_release_capacity(tmp_path, monkeypatch):

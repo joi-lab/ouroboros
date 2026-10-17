@@ -87,48 +87,6 @@ def is_terminal(detail: Dict[str, Any], terminal_states: frozenset[str]) -> bool
     return str(summary_of(detail).get("state") or "") in terminal_states
 
 
-def complete_custody_rows(path, marker: str, *, started_type: str = ""):
-    """Every custody row, or ``None`` when the log's view is INCOMPLETE.
-
-    The lenient reader skips unreadable lines to keep liveness surfaces
-    working; an authority decision (removing a shared project) must instead
-    fail closed: a marker-bearing line that cannot decode as strict UTF-8 or
-    parse as a row, or a STARTED row missing its run identity, means a
-    sibling's state may be invisible - no complete view exists. Streamed
-    line-by-line (event logs grow to hundreds of MB). Chain-aware (CPL4-C1):
-    reads the rotated ``archive/events_*.jsonl`` segments before the live
-    file — live-first open + inode dedup keeps a racing rotation from hiding
-    rows — and anything in the chain that exists but cannot be READ (segment,
-    live file, or the archive directory itself) is an incomplete view, not an
-    empty one: the STRICT chain reader turns each of those into a typed
-    ``JsonlChainUnreadable`` this authority answers with ``None``."""
-    import json
-
-    from ouroboros.utils import JsonlChainUnreadable, jsonl_chain_handles
-
-    try:
-        with jsonl_chain_handles(path, strict=True) as handles:
-            rows = []
-            for _, handle in handles:
-                for raw in handle:
-                    if marker.encode("ascii") not in raw:
-                        continue
-                    try:
-                        row = json.loads(raw.decode("utf-8", errors="strict"))
-                    except (ValueError, UnicodeDecodeError):
-                        return None
-                    if not isinstance(row, dict):
-                        return None
-                    if not str(row.get("type") or "").startswith(marker):
-                        continue  # a valid row of another event family
-                    if started_type and row.get("type") == started_type and not str(row.get("run_id") or ""):
-                        return None
-                    rows.append(row)
-            return rows
-    except (JsonlChainUnreadable, OSError):
-        return None
-
-
 # ---- reviewer usage observation (one llm_usage row per physical send) ----
 
 _EMITTED_SESSION_USAGE: Dict[str, float] = {}  # delegated run id -> first llm_usage emission
@@ -163,9 +121,8 @@ def observe_review_usage(observer: Any, usage: Optional[Dict[str, Any]]) -> None
 
 def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     """Rows for every physically dispatched attempt behind a failed reviewer send."""
-    from ouroboros.usage_accounting import (
-        POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, read_usage_records, current_usage_scope,
-    )
+    from ouroboros import usage_store
+    from ouroboros.usage_accounting import POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, current_usage_scope
 
     capture = getattr(exc, "physical_attempt_capture", None)
     attempt_ids = [str(value) for value in (getattr(exc, "ledger_attempt_ids", None) or []) if value]
@@ -176,8 +133,9 @@ def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     try:
         scope = current_usage_scope()
         root = _drive_root(getattr(scope, "drive_root", None))
-        finals = {str(row["attempt_id"]): row for row in read_usage_records(root, final_only=True)}
-        rows = {attempt_id: finals[attempt_id] for attempt_id in attempt_ids if attempt_id in finals}
+        with usage_store.read(root) as txn:  # one PK lookup per attempt id
+            found = {attempt_id: txn.attempt(attempt_id) for attempt_id in attempt_ids}
+        rows = {attempt_id: row for attempt_id, row in found.items() if row is not None}
     except Exception:
         log.debug("failed to resolve review attempt states", exc_info=True)
     capture_state = str(getattr(capture, "state", "") or "")

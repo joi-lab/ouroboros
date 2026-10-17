@@ -34,7 +34,6 @@ def sample(tmp_path, monkeypatch):
         "cost_final": True, "attempt_counts": {"settled": 51}, "integrity_degraded": False,
         "by_provider": {"openrouter": {"settled_usd": 40.0}}, "_ledger_high_water_seq": [0, 51],
     }
-    monkeypatch.setattr(accounting, "ensure_legacy_imported", lambda *_a, **_k: None)
     monkeypatch.setattr(accounting, "usage_writer_snapshot", lambda *_a, **_k: dict(ledger))
     monkeypatch.setattr(accounting, "usage_breakdown", lambda *_a, **_k: dict(ledger))
     # Even a missing test double cannot reach a real provider.

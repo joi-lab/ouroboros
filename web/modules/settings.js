@@ -1,17 +1,18 @@
 import { refreshModelCatalog, watchAccountModelCatalog } from './settings_catalog.js';
 export { accountCatalogRefreshKey } from './settings_catalog.js';
 import { getNotifier } from './notifications.js';
+import { mountDesktopShell } from './desktop_shell.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { bindAutostartControl } from './settings_autostart.js';
-import { applyMcpSettings, collectMcpSettings, initMcpSettings, validateMcpSettings } from './mcp_settings.js';
-import { adoptSubagentRoster, collectReviewerSlots, initReviewerSlots, reloadReviewerSlots, validateReviewerSlots, noteReviewerSlotsSaveAttempt, discardReviewerSlotsDraft, setReviewerProcessingPreference, setReviewerSourceContext } from './reviewer_slots.js';
+import { applyMcpSettings, collectMcpSettings, initMcpSettings, mcpDraftSnapshot, validateMcpSettings } from './mcp_settings.js';
 import {
     applySubagentsSettings,
     availableSubagentsPreviewPayload,
     collectSubagentsSettings,
     initSubagentsSection,
     noteSubagentsSaveAttempt,
+    reloadReviewPool,
     reloadSubagentsSection,
     subagentSettingsFingerprint,
     validateSubagentsDraft,
@@ -26,12 +27,13 @@ import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 import { claudexorStatus } from './claudexor_status_store.js';
-import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
-import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
+import { createModelRolesEditor } from './model_roles.js';
+import { PROCESSING_PREFERENCE_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
 import { bindLanguageSettings } from './settings_language.js';
 import { resetSecretReveals } from './settings_secrets.js';
+import { syncPolicyState } from './settings_policy.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -44,15 +46,11 @@ const INPUT_FIELDS = [
     ['s-minimax-region', 'MINIMAX_REGION'],
     ['s-zai-plan', 'ZAI_PLAN'],
     ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
-    // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
-    // longer authored here — the Review lanes section composes the ONE
-    // structured setting; the comma keys stay a backend-derived projection.
-    // R7: OUROBOROS_MODEL_DEEP_SELF_REVIEW is not authored here either — the
-    // deep self-review row lives in Review lanes; the key is the backend's
-    // invisible migration source for that row.
+    // No review route is authored here: the review pool is the Reviewer mark
+    // on the Available subagents rows.
     ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
     ['s-extra-ca-bundle', 'OUROBOROS_EXTRA_CA_BUNDLE'],
-    ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
+    ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-source', 'OUROBOROS_WEBSEARCH_BACKEND', 'auto'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
     ['s-evo-budget', 'OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD', '0'],
@@ -62,10 +60,7 @@ const INPUT_FIELDS = [
     ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
 ];
 const VALUE_FIELDS = [
-    // 6.3: Review / Scope Review efforts are per-slot rows in Agents → Review
-    // lanes now; their global keys remain backend defaults, no longer UI-authored.
-    ['s-effort-task', 'OUROBOROS_EFFORT_TASK', 'medium'], ['s-effort-evolution', 'OUROBOROS_EFFORT_EVOLUTION', 'high'],
-    ['s-effort-consciousness', 'OUROBOROS_EFFORT_CONSCIOUSNESS', ''], ['s-effort-deep-self-review', 'OUROBOROS_EFFORT_DEEP_SELF_REVIEW', 'high'],
+    // Effort is not a Settings draft: the range is edited in the chat composer alone, and Settings has no effort section.
     ['s-consciousness-autonomy', 'OUROBOROS_CONSCIOUSNESS_AUTONOMY', 'act'],
     ['s-review-enforcement', 'OUROBOROS_REVIEW_ENFORCEMENT', 'advisory'], ['s-task-review-mode', 'OUROBOROS_TASK_REVIEW_MODE', 'auto'], ['s-runtime-mode', 'OUROBOROS_RUNTIME_MODE', 'advanced'],
     // Shared paid-review-cycle cap (plan review / task acceptance / commit gate);
@@ -98,6 +93,26 @@ function byId(id) {
 // of ANY tab wrote the fallback back. Only a missing value takes the fallback.
 export function storedOrFallback(value, fallback) {
     return fallback && (value === undefined || value === null || value === '') ? fallback : value;
+}
+
+// What the core serves at its own address right now (`served_ui` on /api/state),
+// beside the saved choice that applies at the next restart; a refused choice
+// carries the core's own sentence naming it and why. A core older than the choice
+// reports nothing, and nothing is shown.
+export function servedUiStatus(servedUi) {
+    const label = { builtin: 'the built-in interface', directory: 'the interface directory', none: 'no main page' }[servedUi?.source];
+    if (!label) return null;
+    return servedUi.error
+        ? { text: `Serving now: ${label}. ${servedUi.error}`, tone: 'warn' }
+        : { text: `Serving now: ${label}.`, tone: 'muted' };
+}
+
+// The interface choice travels only when edited: an untouched field must not turn
+// an environment choice or the default into a saved one, and a cleared field saves
+// the blank that selects built-in over the environment.
+export function uiDirChange(edited, loaded) {
+    const value = String(edited ?? '').trim();
+    return value === String(loaded ?? '').trim() ? {} : { OUROBOROS_UI_DIR: value };
 }
 
 function applyInputValue(id, value) {
@@ -135,32 +150,6 @@ function setButtonBusy(button, busy) {
     button.disabled = busy;
     if (busy) button.setAttribute('aria-busy', 'true');
     else button.removeAttribute('aria-busy');
-}
-
-function policyValueLabel(value) {
-    const labels = {
-        light: 'Light', advanced: 'Advanced', pro: 'Pro', cyber_pro: 'Cyber Pro',
-        full: 'Full', off: 'Off', advisory: 'Advisory', blocking: 'Blocking',
-    };
-    return labels[String(value || '').trim().toLowerCase()] || String(value || 'Unknown');
-}
-
-function syncPolicyState(root, meta) {
-    const state = meta?.policy_state;
-    if (!state) return;
-    const render = (key, text) => {
-        const node = root?.querySelector(`[data-policy-state="${key}"]`);
-        if (node) node.textContent = text;
-    };
-    const access = state.access || {};
-    render('access', access.restart_required
-        ? `Saved: ${policyValueLabel(access.configured)} · Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)} · Restart required`
-        : `Current process: ${policyValueLabel(access.current_process || access.effective)} · After restart: ${policyValueLabel(access.configured)}`);
-    const suffix = (item) => item.active_task_snapshot
-        ? `Saved: ${policyValueLabel(item.configured)} · Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)} · Current task keeps its start snapshot`
-        : `Current process: ${policyValueLabel(item.current_process || item.effective)} · Next task: ${policyValueLabel(item.next_task || item.configured)}`;
-    render('supervisor', suffix(state.supervisor || {}));
-    render('review', suffix(state.review || {}));
 }
 
 function readInt(id, fallback) {
@@ -445,6 +434,25 @@ export function providerTestResultIsCurrent({
     return sentGeneration === currentGeneration && sentFingerprint === currentFingerprint;
 }
 
+// The save's effect, from the gateway's honest buckets (#285). A running task keeps
+// its start snapshot, while a skill reads the keys it is granted on its next read
+// (#1122): the next-task bucket states both once, whichever keys the save carried.
+const SKILL_KEYS_READ = 'skills pick up granted keys on their next read';
+
+export function settingsSaveEffectText(data = {}) {
+    if (data.no_changes) return 'No changes detected';
+    if (data.restart_required) return 'Settings saved. Some changes require a restart to take effect';
+    if (data.restart_state?.summary || data.restart_state?.local_model?.summary) return 'Settings saved';
+    if (data.immediate_changed && data.next_task_changed) {
+        return `Settings saved. Some changes took effect immediately, others apply on the next task; ${SKILL_KEYS_READ}`;
+    }
+    if (data.immediate_changed) return 'Settings saved. Changes took effect immediately';
+    if (data.next_task_changed) return `Settings saved. Changes take effect on the next task; ${SKILL_KEYS_READ}`;
+    // Reachable when the only changed keys are retired no-ops:
+    // the warning below carries the honest story.
+    return 'Settings saved';
+}
+
 // Decision 16=A (#285): the settings "Restart now" action reuses the existing
 // owner command contract — the same WS `/restart` the chat header sends, through
 // the ONE shared confirmation both Restart buttons use (owner quiz 285597). The
@@ -472,6 +480,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // Notification preferences are client-local for the same reason; the module
     // owns delegated handlers, so mounting only paints current state.
     getNotifier().mountSettings(page);
+    // The desktop app's own facts (storage, system notifications): the app is not updated with the core.
+    const disposeShell = mountDesktopShell(page, (shell) => getNotifier().configure({ shell }));
     // The interface language is an install-wide setting with its own endpoint; the block
     // saves on change and never marks the Settings draft dirty.
     const disposeLanguage = bindLanguageSettings(page);
@@ -487,6 +497,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         })
         .catch(() => { /* about version is best-effort */ });
     let currentSettings = {};
+    let searchSelectionEdited = false;
     let extensionRefreshPending = false;
     let settingsLoaded = false;
     let settingsBaseline = '';
@@ -494,6 +505,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let draftRevision = 0;
     let loadSequence = 0;
     let restartReadSequence = 0;
+    let servedUiReadSequence = 0;
     let restartState = { restart_required: false };
     let settingsSaving = false;
     let saveOutcomeUnknown = false;
@@ -504,9 +516,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         onChange: (settings) => { syncProcessingPreference(settings); onSettingsEdited(); } });
     modelRoles.mount();
     initMcpSettings({ onChange: onSettingsEdited });
-    initReviewerSlots({ onChange: () => onSettingsEdited() });
     initSubagentsSection({
-        onChange: (setting) => { adoptSubagentRoster({ OUROBOROS_SUBAGENTS: setting }); onSettingsEdited(); },
+        hasPageDirtyIndicator: true,
+        onChange: () => onSettingsEdited(),
         // A judged roster may clear only the validation footer it authored.
         // A cadence or other field error keeps its typed subject and survives.
         onJudged: (clean) => {
@@ -526,7 +538,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     function syncProcessingPreference(settings) {
         setSubagentsProcessingPreference(settings[PROCESSING_PREFERENCE_KEY]);
-        setReviewerProcessingPreference(settings[PROCESSING_PREFERENCE_KEY], modelRoleMap(settings[MODEL_PROCESSING_PREFERENCES_KEY]));
     }
 
     function syncRestartState(value) {
@@ -538,6 +549,18 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         const target = byId('settings-restart-status');
         target.hidden = !text;
         setInlineStatus(target, text, restartAvailable || value.local_model?.pending_keys?.length ? 'warn' : 'muted');
+    }
+
+    async function refreshServedUi() {
+        const sequence = ++servedUiReadSequence;
+        let shown;
+        try {
+            shown = servedUiStatus((await apiClient.state())?.served_ui);
+        } catch { return; /* An unavailable read keeps the last known fact. */ }
+        const target = byId('s-ui-dir-applied');
+        if (sequence !== servedUiReadSequence || !target) return;
+        target.hidden = !shown;
+        setInlineStatus(target, shown?.text || '', shown?.tone || 'muted');
     }
 
     async function refreshRestartState() {
@@ -596,6 +619,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             controls: Array.from(page.querySelectorAll('input[id^="s-"], select[id^="s-"], textarea[id^="s-"], [data-secret-setting], [data-model-role-context]'),
                 (input) => [input.id, input.value, input.checked, input.validity?.badInput || false, input.dataset.forceClear || '']),
             customSecrets: readCustomSecretDraft(page),
+            // MCP header rows, including exact duplicates the saved map would collapse.
+            mcpHeaderRows: mcpDraftSnapshot(),
         });
     }
 
@@ -649,7 +674,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     function discardUnsavedSettingsDraft() {
         applySettings(currentSettings || {});
-        discardReviewerSlotsDraft();
         renderCustomSecrets(page, currentSettings || {});
         validationAttempted = false;
         paintSettingsFieldErrors(page, []);
@@ -680,6 +704,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
         INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, storedOrFallback(s[key], fallback)));
+        applyInputValue('s-ui-dir', s.OUROBOROS_UI_DIR);
+        searchSelectionEdited = false;
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
         modelRoles.load(s, { ...setupContract, modelSlots: setupModelSlots().map((slot) => ({
             ...slot, inputId: slot.settingsInputId,
@@ -703,14 +729,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // The actor list lives next to it in Agents → Available subagents.
         applySubagentsSettings(s);
         syncProcessingPreference(s);
-        // The Review-lanes «Configured subagent» selects reference the SAME
-        // roster; adopt it from the same loaded document.
-        adoptSubagentRoster(s);
-        // …and both editors offer the API providers THIS document has a
-        // credential for, named by the setup contract. Derived from the loaded
-        // settings, so a key added under Accounts shows up on the next load
-        // rather than being typed as a prefix (docs/DESIGN.md §7).
-        setReviewerSourceContext({ settings: s, providerProfiles: setupContract.providerProfiles });
+        // The editor offers the API providers THIS document has a credential
+        // for, named by the setup contract. Derived from the loaded settings,
+        // so a key added under Accounts shows up on the next load rather than
+        // being typed as a prefix (docs/DESIGN.md §7).
         setSubagentsSourceContext(s, setupContract.providerProfiles);
         // Post-task evolution: one owner-facing selector maps to enable + cadence.
         const evoEnabled =
@@ -749,7 +771,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         syncRuntimeModeBridgeState();
         syncPolicyState(page, s?._meta);
         syncPostTaskEvolutionUi();
-        refreshSafetySkipCounter();  // fire-and-forget; fills the 24h audited-skip note
+        refreshSafetySkipCounter();  // fire-and-forget; labels matches in the inspected event window
+        void refreshSearchPreview();  // fire-and-forget; describes the applied search Source/Model
     }
 
     function syncMoreProvidersDisclosure() {
@@ -829,6 +852,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         setSettingsCleanBaseline();
         armCleanBaselineOnStatusSettle(revision);
         _renderNetworkHint(data._meta);
+        void refreshServedUi();
         syncSettingsLoadState();
         // The skill-requested rows and the extension settings forms (which read
         // their stored values before rendering) are optional enrichment: it must
@@ -836,7 +860,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // it was pending, so it lands only on an unchanged draft.
         const isCurrent = () => sequence === loadSequence && revision === draftRevision;
         const enriched = (async () => {
-            const enrichment = [reloadReviewerSlots({ isCurrent }), reloadSubagentsSection()];
+            const enrichment = [reloadReviewPool({ isCurrent }), reloadSubagentsSection()];
             const extData = await extensionsRead;
             if (extData && isCurrent()) {
                 renderRequestedSkillSecrets(page, extData.skills || [], data);
@@ -913,6 +937,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         }
     }
 
+    function collectSearchSelection() {
+        const backend = byId('s-websearch-source').value;
+        let model = byId('s-websearch-model').value.trim();
+        // Preserve untouched legacy settings. An edited native Anthropic id uses
+        // the existing routed spelling so dispatch can recognize the new intent.
+        if (searchSelectionEdited && backend === 'anthropic' && model
+                && !model.includes('::') && !model.startsWith('anthropic/')) model = `anthropic::${model}`;
+        return { backend, model };
+    }
+
     function collectBody() {
         const fieldValue = (id) => byId(id)?.value || '';
         const mutativeInput = byId('s-allow-mutative-subagents');
@@ -924,12 +958,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 ? ({ on: 'true', off: 'false' }[mutativeInput?.value] ?? '')
                 : (rawMutative ? ({ true: 'true', false: 'false' }[rawMutative] ?? rawMutative) : ''),
             ...collectMcpSettings(),
-            // 6.1: the ONE structured reviewer-slot setting; {} until the rows
-            // view has loaded, so an unrelated save cannot blank it.
-            ...collectReviewerSlots(),
             // Saved config and live availability are independent: a loaded
-            // actor list is collected even when status is down; only an
-            // unloaded/unparseable editor omits the key on an unrelated save.
+            // actor list is collected even when status is down; an unloaded,
+            // unparseable or untouched generated draft omits the key.
             ...collectSubagentsSettings(),
         };
         Object.assign(body, modelRoles.collect());
@@ -937,6 +968,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const value = fieldValue(id).trim();
             body[key] = key === 'OUROBOROS_SERVER_HOST' ? value || fallback : value || '';
         });
+        Object.assign(body, uiDirChange(fieldValue('s-ui-dir'), currentSettings?.OUROBOROS_UI_DIR));
+        body.OUROBOROS_WEBSEARCH_MODEL = collectSearchSelection().model;
         VALUE_FIELDS
             // Owner-only keys travel through their audited owner endpoints, never
             // the generic settings POST (safety_mode joined runtime/context, r4).
@@ -999,7 +1032,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             ['fields', fields.map(({ message }) => message)],
             ['models', modelRoles.validateAll()],
             ['subagents', validateSubagentsDraft().map((error) => `Available subagents: ${error}`)],
-            ['reviewers', validateReviewerSlots()],
         ];
         const messages = groups.flatMap(([, rows]) => rows).filter(Boolean);
         const subject = groups.find(([, rows]) => rows.some(Boolean))?.[0] || '';
@@ -1095,8 +1127,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     }
 
     async function refreshSafetySkipCounter() {
-        // 24h count of durable safety_mode_skip audit events, so the owner sees how much
-        // the reduced coverage actually waved through.
+        // Count the last-24h matches inside the returned tail, not all of that day.
         const el = byId('s-safety-skip-counter');
         if (!el) return;
         try {
@@ -1107,11 +1138,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 const t = Date.parse(String(e?.ts || ''));
                 return Number.isFinite(t) && t >= cutoff;
             }).length;
-            // Honest window note: the count scans the recent events tail (2000), so a
-            // very busy day can undercount — say "recent", never overclaim exactness.
+            // The tail may cover less than a day, including when it has no matches.
             el.textContent = n > 0
-                ? `${n} safety check(s) waved through in the last 24h (audited; recent events window).`
-                : 'No safety checks waved through in the last 24h (recent events window).';
+                ? `${n} safety check(s) waved through among inspected recent events dated within 24h.`
+                : 'No waved-through safety checks found among inspected recent events dated within 24h.';
         } catch {
             el.textContent = '';
         }
@@ -1154,15 +1184,34 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // ask the owner to discard "unsaved settings" that do not exist.
     const onServerSettingEdited = (event) => {
         if (event?.target?.closest?.('[data-notify-settings], [data-autostart-settings]')) return;
+        if (event?.target?.closest?.('[data-response-limit]')) return;   // a maximum is an evidence acknowledgement, not a setting
         if (event?.target?.closest?.('[data-i18n-settings]')) return;   // the interface language saves through its own endpoint
         onSettingsEdited();
     };
+    let searchPreviewSequence = 0;
+    async function refreshSearchPreview() {
+        const sequence = ++searchPreviewSequence;
+        const target = byId('s-websearch-preview');
+        if (!target?.isConnected) return;
+        try {
+            const data = await apiClient.webSearchPreview(searchSelectionEdited ? collectSearchSelection() : {});
+            if (sequence !== searchPreviewSequence || !target.isConnected) return;
+            // The help text already says skills, MCP and browser tools stay independent.
+            const legacy = data.ignored_legacy_model ? ` Anthropic does not apply the saved model ${data.ignored_legacy_model}; edit Source or Model to change it.`
+                : data.unapplied_model ? ` No built-in search serves the saved model ${data.unapplied_model}; Auto uses provider defaults.` : '';
+            target.textContent = data.error || `Eligible routes: ${(data.legs || []).map((leg) => `${leg.source}${leg.model ? ` · ${leg.model}` : ''}`).join(' → ') || 'none'}. Uses saved account credentials.${legacy}`;
+        } catch (_) { if (sequence === searchPreviewSequence && target.isConnected) target.textContent = 'Search routes could not be checked. Your choices are kept.'; }
+    }
+    const onSearchSelectionEdited = () => { searchSelectionEdited = true; void refreshSearchPreview(); };
+    byId('s-websearch-source')?.addEventListener('change', onSearchSelectionEdited);
+    byId('s-websearch-model')?.addEventListener('input', onSearchSelectionEdited);
     page.addEventListener('input', onServerSettingEdited);
     page.addEventListener('change', onServerSettingEdited);
     page.addEventListener('click', (event) => {
         if (event.target.closest('[data-effort-value], .secret-clear, [data-row-secret-clear], [data-custom-secret-remove]')) {
             queueMicrotask(() => {
                 syncPostTaskEvolutionUi();
+                syncPolicyState(page, currentSettings?._meta);
                 onSettingsEdited();
             });
         }
@@ -1202,6 +1251,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const accountModelCatalog = watchAccountModelCatalog();
     const disposeRestartReconnect = ws?.on?.('open', () => {
         refreshRestartState();
+        void refreshServedUi();
         if (settingsLoaded) void refreshModelCatalog();
     });
 
@@ -1225,6 +1275,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
         disposeLanguage();
+        disposeShell();
         disposeRestartReconnect?.();
         accountModelCatalog.dispose();
         restartReadSequence += 1;
@@ -1321,7 +1372,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         // whichever validation aborts it below — so from here the roster shows
         // its own errors beside the rows they name, not only in this status.
         noteSubagentsSaveAttempt();
-        noteReviewerSlotsSaveAttempt();
         modelRoles.noteSaveAttempt();
         page.querySelectorAll('[data-custom-secret-row]').forEach((row) => { row.dataset.judged = '1'; });
         validationAttempted = true;
@@ -1397,32 +1447,14 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             const ownerError = runtimeModeError || autoGrantError || contextModeError || safetyModeError;
             const draftKept = ownerError || sentRevision !== draftRevision || !(await loadSettings({ awaitEnrichment: false }));
             syncAutoGrantBridgeState();
-            let statusMsg;
-            let statusType = 'ok';
-            if (data.no_changes) {
-                statusMsg = 'No changes detected';
-            } else if (data.restart_required) {
-                statusMsg = 'Settings saved. Some changes require a restart to take effect';
-                statusType = 'warn';
-            } else if (data.restart_state?.summary || data.restart_state?.local_model?.summary) {
-                statusMsg = 'Settings saved';
-            } else if (data.immediate_changed && data.next_task_changed) {
-                statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task';
-            } else if (data.immediate_changed) {
-                statusMsg = 'Settings saved. Changes took effect immediately';
-            } else if (data.next_task_changed) {
-                statusMsg = 'Settings saved. Changes take effect on the next task';
-            } else {
-                // Reachable when the only changed keys are retired no-ops:
-                // the warning below carries the honest story.
-                statusMsg = 'Settings saved';
-            }
+            let statusMsg = settingsSaveEffectText(data);
+            let statusType = data.restart_required && !data.no_changes ? 'warn' : 'ok';
             if (subagentsChanged && data.agent_task_running) {
                 statusMsg += '. Available subagents take effect for new child tasks; '
                     + 'the current task keeps its existing routes';
             }
             if (data.warnings && data.warnings.length) {
-                statusMsg += ' ⚠️ ' + data.warnings.join(' | ');
+                statusMsg += '. Warnings: ' + data.warnings.join(' | ');
                 statusType = 'warn';
             }
             if (runtimeModeResult?.restart_required) {

@@ -28,14 +28,14 @@ from tests.test_tree_cost_ceiling import _ctx, _patch_execute_candidate
 
 _IDENTITY = ("model", "provider", "candidate_raw_sha256", "candidate_raw_size_bytes")
 _MESSAGES = [{"role": "system", "content": "policy"}, {"role": "user", "content": "wrap up"}]
-# The Main context builder's shape: a 3-block system declaring ONE byte-stable block
-# (context_fit.ContextFitProjection.system_message).
+# Main Max with a handbook: every stable item precedes the changing evidence.
 _DECLARED_MESSAGES = [
     {"role": "system", "content": [
         {"type": "text", "text": "policy", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "handbook", "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "memory", "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "evidence"},
-    ], STABLE_PREFIX_BLOCKS_KEY: 1},
+    ], STABLE_PREFIX_BLOCKS_KEY: 3},
     {"role": "user", "content": "wrap up"},
 ]
 _TOOLS = [{"type": "function", "function": {
@@ -97,7 +97,7 @@ def test_declared_system_prefix_split_is_projected_once_inside_the_candidate_bui
     """The prospective wrap-up candidate and the real send agree on the SPLIT copy, and
     the split happens INSIDE ``_build_remote_kwargs`` (llm_openai_compatible.py, the
     ``openai_family_route`` block before the direct/OpenRouter branch split): the spy sees
-    the canonical declared 3-block system ENTER the builder and the split copy LEAVE it,
+    the canonical declared system ENTER the builder and the split copy LEAVE it,
     on the priced build and on the sent build alike. A split that ran earlier (in the
     canonical transcript or ``chat()``) would show an already-split system entering; one
     that ran later (``_finalized_physical_candidate``) would show a whole system leaving;
@@ -142,23 +142,16 @@ def test_declared_system_prefix_split_is_projected_once_inside_the_candidate_bui
         key: getattr(prospective, key) for key in _IDENTITY}
     assert len(builds) == 2, "exactly one priced build and one sent build"
     for entering, wire, layout in builds:
-        assert entering[0][STABLE_PREFIX_BLOCKS_KEY] == 1 and len(entering[0]["content"]) == 3, \
-            "the canonical declared system enters the builder: nothing split it earlier"
-        if model.startswith("openai/"):
-            # OpenRouter keeps markers for this family: the marked memory block stays
-            # its own system item and only the unmarked evidence moves.
-            marked = {"cache_control": {"type": "ephemeral"}}
-            assert wire[:2] == [{"role": "system", "content": [{"type": "text", "text": "policy", **marked}]},
-                                {"role": "system", "content": [{"type": "text", "text": "memory", **marked}]}]
-            moved, wire = ("evidence", 1), [wire[0], *wire[2:]]
-        else:
-            assert wire[0] == {"role": "system", "content": [{"type": "text", "text": "policy"}]}
-            moved = ("memory\n\nevidence", 2)
-        assert wire[1]["role"] == "user"
-        assert wire[1]["content"] == "[SYSTEM NOTICE]\n" + HOST_CONTEXT_NOTICE_BEFORE_TASK + "\n\n" + moved[0]
-        assert wire[2] == {"role": "user", "content": "wrap up"}
+        assert entering == canonical, "the canonical declaration enters the builder unsplit"
+        stable = entering[0]["content"][:-1]
+        assert entering[0][STABLE_PREFIX_BLOCKS_KEY] == len(stable)
+        assert [message["role"] for message in wire] == ["system"] * len(stable) + ["user", "user"]
+        assert [message["content"][0]["text"] for message in wire[:len(stable)]] == [block["text"] for block in stable]
+        assert all(("cache_control" in message["content"][0]) == model.startswith("openai/") for message in wire[:len(stable)])
+        assert wire[-2]["content"] == "[SYSTEM NOTICE]\n" + HOST_CONTEXT_NOTICE_BEFORE_TASK + "\n\nevidence"
+        assert wire[-1] == {"role": "user", "content": "wrap up"}
         assert all(STABLE_PREFIX_BLOCKS_KEY not in message for message in wire)
-        assert layout == {"system_prefix_split": True, "moved_blocks": moved[1]}
+        assert layout == {"system_prefix_split": True, "moved_blocks": 1}
     assert builds[0][1] == builds[1][1], "the priced copy and the sent copy are one wire"
 
 
@@ -179,7 +172,7 @@ def _completion(text):
 def _last_fit_rail(monkeypatch, tmp_path, execute):
     """Drive the whole rail: last-fit decision -> admitted candidate -> the real send."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "unused")
-    monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0})
+    monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"settled_usd": 20.0, "accounted_usd": 20.0})
     # proxy, exact probe, prepared: one fits, two do not; then the FRESH send's own admission fits.
     answers = iter((True, False, True, False, True, False, True))
     monkeypatch.setattr(task_pacing, "wrapup_reservation_fits", lambda **_kwargs: next(answers))
@@ -188,7 +181,7 @@ def _last_fit_rail(monkeypatch, tmp_path, execute):
     logs.mkdir()
     ctx = _ctx(drive_logs=logs, llm=LLMClient(api_key="unused"), active_model="openai/gpt-test")
     ctx.messages = [dict(message) for message in _MESSAGES]
-    ceiling = task_pacing.resolve_cost_ceiling(None, normalize_budget_profile(None), root_cap_usd=50.0)
+    ceiling = task_pacing.resolve_cost_ceiling(None, normalize_budget_profile({"cost_hard_stop_pct": 50}), root_cap_usd=50.0)
     with usage_accounting.usage_scope(usage_accounting.UsageScope(
         drive_root=tmp_path, task_id="task1", root_task_id="task1",
     )):
@@ -322,9 +315,11 @@ def test_the_budget_probe_prices_the_reply_the_window_leaves(monkeypatch, tmp_pa
     from tests.test_context_fit_v664 import _plan
 
     monkeypatch.setenv("OPENROUTER_API_KEY", "unused")
-    monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0})
+    monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"settled_usd": 20.0, "accounted_usd": 20.0})
     plan = replace(_plan(preferred=mode, window=128_000, known=True), initial_mode=mode)
-    owner_ctx = SimpleNamespace(context_fit_plan=plan, active_context_mode=mode, task_metadata={}, model_turn_state=None)
+    # The last-fit probe is an explicit profile's authored rail: the task carries that profile.
+    owner_ctx = SimpleNamespace(context_fit_plan=plan, active_context_mode=mode, task_metadata={}, model_turn_state=None,
+                                task_contract={"budget_profile": {"cost_hard_stop_pct": 50}})
     priced = []
 
     def fits(**kwargs):
@@ -339,7 +334,7 @@ def test_the_budget_probe_prices_the_reply_the_window_leaves(monkeypatch, tmp_pa
     messages = [{"role": "system", "content": "policy " * 2_000}, {"role": "user", "content": "wrap up " * 40_000}]
     ctx = _ctx(drive_logs=logs, llm=LLMClient(api_key="unused"), active_model=plan.model, task_type="task",
                tools=SimpleNamespace(_ctx=owner_ctx), messages=[dict(message) for message in messages], tool_schemas=_TOOLS)
-    ceiling = task_pacing.resolve_cost_ceiling(None, normalize_budget_profile(None), root_cap_usd=50.0)
+    ceiling = task_pacing.resolve_cost_ceiling(None, normalize_budget_profile({"cost_hard_stop_pct": 50}), root_cap_usd=50.0)
     with usage_accounting.usage_scope(usage_accounting.UsageScope(
         drive_root=tmp_path, task_id="task1", root_task_id="task1",
     )), pytest.raises(_Captured):

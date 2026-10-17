@@ -270,8 +270,10 @@ def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(mo
     monkeypatch.setattr(workers, "PENDING", [])
     monkeypatch.setattr(workers, "RUNNING", {})
     (tmp_path / "state").mkdir()
-    (tmp_path / "state" / "queue_snapshot.json").write_text(
-        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}', encoding="utf-8")
+    from tests._shared import write_queue_document
+
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json",
+                         {"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []})
     append_jsonl(tmp_path / "logs" / "events.jsonl", {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
     orphan_row = {"status": "running", "ts": "2026-05-28T00:00:00+00:00"}
     registry = get_direct_activity_registry()
@@ -283,11 +285,13 @@ def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(mo
         _accepting_owner_messages=True, _current_task_metadata={}, _current_task_text="owner text",
         _task_started_ts=1.0, _current_chat_id=1)
     armed, seen = [], {}
+    routing_ctx = SimpleNamespace(DRIVE_ROOT=tmp_path)  # the roster now reads each root's room-reader fact
 
     def observe(task_id):
         return {
             "orphan": _is_stale_orphan_running_task(tmp_path, task_id, orphan_row),
-            "drain": workers.drain_repo_writers(timeout=0), "roots": [row["task_id"] for row in _active_direct_roots(None)],
+            "drain": workers.drain_repo_writers(timeout=0),
+            "roots": [row["task_id"] for row in _active_direct_roots(routing_ctx)],
             "turns": [turn["id"] for turn in workers.direct_chat_turns()],
             "state": [row["activity_id"] for row in _direct_turns_snapshot_safe()],
             "busy": (_has_running_agent_tasks(), _has_started_agent_tasks()), "wakes": mind.live_turns(),
@@ -438,6 +442,19 @@ def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
         ["Schedule: Mon 10:00"], "Final: 10:00", "partly confirmed")
     assert 'delivery partly confirmed): "Schedule: Mon 10:00" / "Final: 10:00".' in build_presence_context_section(
         tmp_path, captured[-1]["metadata"]["presence"])
+    # A lost projection is rebuilt from the same receipt/speech rule without rerunning either author.
+    from ouroboros.presence_runner import _previous_turn_path
+
+    pointer = _previous_turn_path(tmp_path, _event().conversation_key)
+    for event_id, state, message in (("e1", "confirmed", ""), ("e5", "partly confirmed", "Final: 10:00")):
+        pointer.unlink()
+        invoked = []
+        replay = _pointer_turn(tmp_path, event_id, {"outcome": "message", "text": "Must not run"},
+                               version=1, captured=invoked)
+        restored = json.loads(pointer.read_text())
+        assert invoked == [] and restored["task_id"] == replay.task_id
+        assert (restored["transport_sends"], restored["delivery"], restored["message"]) == (
+            ["Schedule: Mon 10:00"], state, message)
 
 
 def test_deferred_handoff_keeps_internal_finish_note_out_of_prior_speech(tmp_path):

@@ -26,6 +26,7 @@ from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
 from tests.test_llm_claudexor import ROUTE, result
 from tests.test_llm_claudexor import setup as gateway_fixture
 from tests.test_transport_death_retry import _events, _ledger
+from tests._usage_store_testing import dispatched_attempts
 
 setup = gateway_fixture
 PRIMARY = "primary/model"
@@ -120,8 +121,9 @@ def test_unknown_outcome_tries_the_configured_route_first_with_a_new_identity(da
     assert text == "answer from fb/one"
     assert [model for model, _messages in llm.sent] == [PRIMARY, "fb/one"]
     rows = _ledger(data_root)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved", "reserved", "dispatched", "settled"]
-    old, new = rows[0]["attempt_id"], rows[3]["attempt_id"]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4), ("settled", 3)]
+    assert rows[0]["physical_failure"]
+    old, new = rows[0]["attempt_id"], rows[1]["attempt_id"]
     assert old != new
     assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
     notices = _notices(llm.sent[-1][1])
@@ -138,7 +140,7 @@ def test_repeated_unknowns_move_on_through_the_configured_routes(data_root, tmp_
 
     assert text == "answer from fb/two"
     assert [model for model, _messages in llm.sent] == [PRIMARY, "fb/one", "fb/two"]
-    first, second, _third = (row["attempt_id"] for row in _ledger(data_root) if row["state"] == "dispatched")
+    first, second, _third = (row["attempt_id"] for row in dispatched_attempts(data_root))
     notices = _notices(llm.sent[-1][1])
     assert len(notices) == 2 and first in notices[0] and second in notices[1]
 
@@ -239,7 +241,8 @@ def test_direct_stop_during_the_unknown_wait_sends_nothing_further(data_root, tm
     _text, usage, _trace, _registry = _run(tmp_path, llm, direct=True)
 
     assert [model for model, _messages in llm.sent] == [PRIMARY]
-    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "unresolved"]
+    assert [(row["state"], row["revision"]) for row in _ledger(data_root)] == [("unresolved", 4)]
+    assert _ledger(data_root)[0]["physical_failure"]
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
 
 

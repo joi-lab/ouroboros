@@ -10,6 +10,7 @@ from ouroboros import delegate_custody as custody
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.registry import ToolContext, ToolRegistry
 from ouroboros.utils import utc_now_iso
+from tests._shared import write_queue_document
 
 
 pytestmark = pytest.mark.serial
@@ -26,7 +27,8 @@ def isolated_retry_state(monkeypatch):
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
 
 
-def retry_context(tmp_path, monkeypatch, *, chain=("retry-a", "retry-b"), split=False):
+def retry_context(tmp_path, monkeypatch, *, chain=("retry-a", "retry-b"), split=False,
+                  fixed_ownership_clock=False):
     """Durable host retry mirrors and the supervisor's current execution census."""
     data, repo, target = (tmp_path / name for name in ("data", "repo", "target"))
     for path in (data, repo, target):
@@ -49,6 +51,16 @@ def retry_context(tmp_path, monkeypatch, *, chain=("retry-a", "retry-b"), split=
     ctx.budget_drive_root = data
     ctx.task_metadata = {"root_task_id": chain[0], "parent_task_id": "", "delegation_role": "root"}
     queue_snapshot(ctx, [chain[-1]])
+    if fixed_ownership_clock:
+        from types import SimpleNamespace
+        from ouroboros import task_status
+
+        # No supervisor refreshes this synthetic queue during capture or EOF
+        # reads. Only these consumers opt in; stale-authority tests stay real.
+        clock = task_status.time
+        now = clock.time()
+        monkeypatch.setattr(task_status, "time", SimpleNamespace(
+            time=lambda: now, monotonic=clock.monotonic, sleep=clock.sleep))
     return ctx
 
 
@@ -59,8 +71,8 @@ def queue_snapshot(ctx, active, *, ts=None):
     }} for task_id in active]
     path = data / "state" / "queue_snapshot.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"schema_version": 1, "ts": ts or utc_now_iso(),
-                                "running": rows, "pending": []}), encoding="utf-8")
+    write_queue_document(path, {"schema_version": 1, "ts": ts or utc_now_iso(),
+                                "running": rows, "pending": []})
     return path
 
 

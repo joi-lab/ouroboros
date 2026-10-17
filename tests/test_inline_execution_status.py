@@ -18,6 +18,7 @@ from ouroboros.task_status import (
     task_execution_observation,
 )
 from ouroboros.utils import append_jsonl
+from tests._shared import write_queue_document
 
 
 def _stamp(epoch):
@@ -32,8 +33,7 @@ def _seed(root, tid, kind=None, **fields):
     if kind:
         fields["execution_owner"] = execution_owner_record(root, task, kind)
     row = write_task_result(root, tid, "running", task_attempt=1, ts=_stamp(now - 200), **fields)
-    (root / "state" / "queue_snapshot.json").write_text(
-        json.dumps({"ts": _stamp(now), "pending": [], "running": []}), encoding="utf-8")
+    write_queue_document(root / "state" / "queue_snapshot.json", {"ts": _stamp(now), "pending": [], "running": []})
     append_jsonl(root / "logs" / "events.jsonl", {"ts": _stamp(now - 100), "type": "worker_boot"})
     return row
 
@@ -87,9 +87,9 @@ def test_direct_fragment_is_only_positive_evidence(tmp_path, evidence):
     if evidence == "unreadable":
         path.write_text("{", encoding="utf-8")
     elif evidence != "missing":
-        path.write_text(json.dumps({"ts": _stamp(time.time() - (20 if evidence == "stale" else 0)),
+        write_queue_document(path, {"ts": _stamp(time.time() - (20 if evidence == "stale" else 0)),
                                   "incomplete": evidence == "incomplete",
-                                  "roots": [] if evidence == "incomplete" else [{"task_id": "direct"}]}), encoding="utf-8")
+                                  "roots": [] if evidence == "incomplete" else [{"task_id": "direct"}]})
     row = load_effective_task_result(tmp_path, "direct", materialize_artifacts=False)
     assert row["status"] == "running"
     assert row["execution_observation"]["state"] == ("active" if evidence == "fresh" else "unknown")
@@ -290,8 +290,7 @@ def test_real_presence_completion_survives_foreign_orphan_sweep(tmp_path):
             # and a later foreign worker boot as the death of this real live callback.
             now = time.time()
             write_task_result(tmp_path, tid, "running", ts=_stamp(now - 200))
-            (tmp_path / "state" / "queue_snapshot.json").write_text(
-                json.dumps({"ts": _stamp(now), "running": [], "pending": []}), encoding="utf-8")
+            write_queue_document(tmp_path / "state" / "queue_snapshot.json", {"ts": _stamp(now), "running": [], "pending": []})
             append_jsonl(tmp_path / "logs" / "events.jsonl", {"ts": _stamp(now - 100), "type": "worker_boot"})
             captured.update(_fresh_reader(tmp_path, tid, reconcile=True))
             write_task_result(tmp_path, tid, "completed", metadata=task["metadata"], result="Actual reply")

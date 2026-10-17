@@ -146,7 +146,7 @@ _POLICY_DENIAL_STATUSES = frozenset({
     # SUBSTRATE's answer, not the agent's mistake. It stays is_error=True and
     # blocking (the counters and anti-loop scan need it), but it must not degrade
     # execution health. `argument_error` deliberately stays OUT: a malformed call
-    # is the agent's own defect and feeds reflection.
+    # is the agent's own defect.
     "unavailable",
     "user_files_path_blocked",
     "workspace_blocked",

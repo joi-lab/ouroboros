@@ -44,18 +44,6 @@ def test_author_response_keeps_only_explicit_local_cap(monkeypatch):
         ) == (False, "improvement_passes_exhausted")
 
 
-def test_system_prompt_describes_one_whole_result_acceptance_operation():
-    import pathlib
-    system = (pathlib.Path(__file__).resolve().parents[1] / "prompts/SYSTEM.md").read_text(encoding="utf-8")
-    normalized = " ".join(system.split())
-    assert "`task_acceptance_review` can nominate my complete task result for review" in normalized
-    assert "After the whole tool-result block, the host advances the same operation as final delivery" in normalized
-    assert "checking an intermediate artifact is not whole-task acceptance" in normalized
-    assert "acknowledge my human's messages" in normalized
-    assert "A status reply need not replace the retained result or buy another panel" in normalized
-    assert "Use `task_acceptance_review` for expensive independent critique" not in system
-
-
 def test_review_capacity_is_unavailable_when_task_review_is_off(tmp_path, monkeypatch):
     from ouroboros import config
     from ouroboros.task_pacing import project_task_acceptance_review_capacity

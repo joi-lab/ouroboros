@@ -21,6 +21,7 @@ import uuid
 from typing import Dict, List  # noqa: F401
 
 from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tool_capabilities import RESULT_VIEW_PARAMS
 from ouroboros.tools.tool_result import launch_refusal_result, _publish_tool_result
 from ouroboros.artifacts import copy_directory_to_task_artifacts, copy_file_to_task_artifacts, record_task_scratch  # noqa: F401
 from ouroboros.platform_layer import bootstrap_process_path, kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs  # noqa: F401
@@ -530,7 +531,7 @@ def _run_shell(
         result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
         return _disclose_output_audit_failure(ctx, result, audit_error)
     except OwnerPauseRefused as exc:
-        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
+        return _publish_tool_result(ctx, launch_refusal_result(exc))
     except subprocess.TimeoutExpired:
         _publish_unfinished_process_facts(ctx, _command_start_ts, timed_out=True)
         # Timeout-created scratch still needs its exclusion fingerprint.
@@ -606,6 +607,9 @@ def _run_script(
     executor_active = _executor_can_run_cwd(ctx, resolved_workdir)
     active_workspace_script = binding.root == "active_workspace"
     if active_workspace_script:
+        # Workspace scripts stage in an owned per-run dir under <cwd>/.ouroboros/tmp_scripts: the run's
+        # own .gitignore keeps it out of raw Git status, and workspace_patch_rules._TOP_LEVEL_EXCLUDE_DIRS
+        # keeps ".ouroboros" out of patches. Task-drive runs stage under <task_drive>/tmp_scripts.
         root = resolved_workdir / ".ouroboros" / "tmp_scripts"
     else:
         try:
@@ -693,11 +697,12 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("run_command", {
             "name": "run_command",
             "description": (
-                "Run a bounded foreground command in an allowed cwd; returns stdout+stderr and the resolved cwd. "
-                "cmd MUST be an array of strings, never one shell string. A builtin as cmd[0] (cd, export, ...) "
-                "is refused: use cwd= or [\"sh\", \"-c\", \"cd x && a | b\"] (also for pipes/chaining). "
+                "Run a bounded foreground command in an allowed cwd; returns stdout+stderr and resolved cwd. "
+                "cmd MUST be a string array, not one shell string. A builtin as cmd[0] (cd, export, ...) "
+                "is refused: use cwd= or [\"sh\", \"-c\", \"cd x && a | b\"] (also pipes/chaining). "
                 "A background child (&, nohup) is no service: holding stdout/stderr it stalls the call until "
-                "timeout_sec, and once the call returns nothing tracks it (use start_service). "
+                "timeout_sec; it ends with this task (local POSIX runs only; start_service keep_alive=true "
+                "outlives the task). "
                 "Prefer read_file, search_code/query_code, write_file/edit_text to cat/head/sed, grep/find, redirects."
             ),
             "parameters": {"type": "object", "properties": {
@@ -711,7 +716,7 @@ def get_tools() -> List[ToolEntry]:
                         "stringified array like '[\"git\", \"log\"]'."
                     ),
                 },
-	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. task_drive, artifact_store, user_files and authorized absolute cwd forms are also accepted."},
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. task_drive, artifact_store, user_files and authorized absolute cwd forms are accepted, including Docker backend aliases inside active_workspace."},
 	                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Explicit environment variable → saved setting key mapping. Uses existing Settings-selection authority; secret values are masked in diagnostics."},
 	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
 	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
@@ -742,6 +747,7 @@ def get_tools() -> List[ToolEntry]:
 	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
 	                    ),
 	                },
+	                **RESULT_VIEW_PARAMS,
 	            }, "required": ["cmd"]},
         }, _run_shell, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
         ToolEntry("run_script", {
@@ -755,7 +761,7 @@ def get_tools() -> List[ToolEntry]:
                 "script": {"type": "string"},
 	                "interpreter": {"type": "string", "default": "python3", "description": "Installed executable name or path that accepts a script filename, such as python3, node, perl, zsh or lua. Receives the temporary script path followed by args. Use run_command for compiler or launcher subcommands."},
 	                "args": {"type": "array", "items": {"type": "string"}, "default": []},
-	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."},
+	                "cwd": {"type": "string", "default": "", "description": "Omit for active_workspace; use system_repo[/subdir] for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. Docker backend aliases inside active_workspace are accepted."},
 	                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Explicit environment variable → saved setting key mapping. Uses existing Settings-selection authority; secret values are masked in diagnostics."},
 	                "bucket": {"type": "string", "enum": ["external", "clawhub", "ouroboroshub", "user_repo"], "description": "Physical skill location for cwd=skill_payload[/subdir]."},
 	                "skill_name": {"type": "string", "description": "Exact skill identity for cwd=skill_payload[/subdir]."},
@@ -786,6 +792,7 @@ def get_tools() -> List[ToolEntry]:
 	                        "Clamped to the remaining task-deadline budget. Omit for the default (deadline-capped)."
 	                    ),
 	                },
+	                **RESULT_VIEW_PARAMS,
 	            }, "required": ["script"]},
         }, _run_script, is_code_tool=True, timeout_sec=_RUN_SHELL_DEFAULT_TIMEOUT_SEC, mutates_worktree=True),
     ]

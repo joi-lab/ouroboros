@@ -56,7 +56,7 @@ def test_pause_during_local_call_waits_for_host_return_then_requires_resume(tmp_
         assert request_owner_pause("root", request_id="during-call")["ok"]
         refresh_owner_pause_tree("root")
         assert owner_pause.read_fence(tmp_path, "root")["state"] == "requested"
-        assert load_task_result(tmp_path, "root")["launch_handoffs"]
+        assert load_task_result(tmp_path, "root").get("launch_handoffs", {})
         refused = registry.execute_result(name, {})
         assert refused.code == "OWNER_PAUSE_NOT_STARTED"
     finally:
@@ -70,7 +70,7 @@ def test_pause_during_local_call_waits_for_host_return_then_requires_resume(tmp_
     if warning:
         assert warning in result.text and warning not in result.producer_text
         assert result.meta["safety_warning"]
-    assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+    assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
     _park(tmp_path, monkeypatch, queue, workers)
     refresh_owner_pause_tree("root")
     assert owner_pause.read_fence(tmp_path, "root")["state"] == "paused"
@@ -79,8 +79,8 @@ def test_pause_during_local_call_waits_for_host_return_then_requires_resume(tmp_
 
 
 @pytest.mark.parametrize("late_runner", [False, True])
-def test_timed_out_async_call_never_settles_on_a_late_return(tmp_path, monkeypatch, late_runner):
-    release, cancelled = threading.Event(), threading.Event()
+def test_async_timeout_result_stays_while_custody_tracks_actual_unwind(tmp_path, monkeypatch, late_runner):
+    release, cancelled, unwound = threading.Event(), threading.Event(), threading.Event()
     async def handler(_ctx):
         try:
             await asyncio.Event().wait()
@@ -91,33 +91,42 @@ def test_timed_out_async_call_never_settles_on_a_late_return(tmp_path, monkeypat
                     await asyncio.sleep(.005)
                 return '{"operation_outcome":"completed", "local_extension_returned":true}'
             raise
+        finally:
+            unwound.set()
     registry, queue, workers, name = _local(tmp_path, monkeypatch, handler)
     try:
         result = registry.execute_result(name, {})
         assert result.code == "EXTENSION_TIMEOUT" and cancelled.is_set()
         runners = [t for t in threading.enumerate() if t.name == f"ext-tool-{name}-async"]
         assert bool(runners) is late_runner
-        claims = load_task_result(tmp_path, "root")["launch_handoffs"]
-        assert claims
-        _consumers(tmp_path, registry, queue, workers, held=True)
+        returned = (result.status, result.code, result.text, dict(result.meta))
+        claims = load_task_result(tmp_path, "root").get("launch_handoffs", {})
+        assert bool(claims) is late_runner and unwound.is_set() is not late_runner
+        _consumers(tmp_path, registry, queue, workers, held=late_runner)
     finally:
         release.set()
         for runner in threading.enumerate():
             if runner.name == f"ext-tool-{name}-async":
                 runner.join(5)
                 assert not runner.is_alive()
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == claims
+    assert unwound.is_set() and not load_task_result(tmp_path, "root").get("launch_handoffs", {})
+    assert (result.status, result.code, result.text, result.meta) == returned
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_handler_exception_retains_invocation(tmp_path, monkeypatch, asynchronous):
+def test_joined_handler_exception_keeps_error_but_releases_local_invocation(tmp_path, monkeypatch, asynchronous):
+    entered = []
     def sync(_ctx):
+        entered.append(True)
         raise RuntimeError("result unknown")
     async def async_handler(_ctx):
+        entered.append(True)
         raise asyncio.CancelledError("no completed await")
     registry, queue, workers, name = _local(tmp_path, monkeypatch, async_handler if asynchronous else sync)
-    assert registry.execute_result(name, {}).code == "EXTENSION_ERROR"
-    _consumers(tmp_path, registry, queue, workers, held=True)
+    result = registry.execute_result(name, {})
+    assert (result.status, result.code) == ("error", "EXTENSION_ERROR")
+    assert entered == [True] and result.meta["physical_dispatch"]
+    _consumers(tmp_path, registry, queue, workers, held=False)
 
 
 @pytest.mark.parametrize("body", ['{"ok":false}', ToolResult(status="ok", code="OK", text="payload",
@@ -142,7 +151,8 @@ def test_opaque_mcp_cannot_spoof_local_completion_metadata(tmp_path, monkeypatch
     _consumers(tmp_path, registry, queue, workers, held=True)
 
 
-def test_local_extension_leaves_its_spawned_process_and_money_obligations(tmp_path, monkeypatch):
+@pytest.mark.parametrize("fails", [False, True])
+def test_local_extension_leaves_its_spawned_process_and_money_obligations(tmp_path, monkeypatch, fails):
     from ouroboros import process_custody, usage_accounting as ua
     from ouroboros.model_sleep import cold_blockers
     from supervisor.owner_pause_control import refresh_owner_pause_tree
@@ -157,13 +167,15 @@ def test_local_extension_leaves_its_spawned_process_and_money_obligations(tmp_pa
             reservation = ua.reserve_attempt(ua.AttemptRequest(model="m", provider="p", reservation_usd=.1))
             ua.mark_dispatched(reservation)
             ua.mark_unresolved(reservation, "external_answer_unknown")
+        if fails:
+            raise RuntimeError("local handler failed after starting independent work")
         return "local handler returned"
     registry, queue, workers, name = _local(tmp_path, monkeypatch, handler)
     try:
         result = registry.execute_result(name, {})
-        assert result.status == "ok", result
+        assert result.code == ("EXTENSION_ERROR" if fails else "OK"), result
         assert children and children[0].poll() is None
-        assert not load_task_result(tmp_path, "root")["launch_handoffs"]
+        assert not load_task_result(tmp_path, "root").get("launch_handoffs", {})
         assert cold_blockers(registry._ctx)
         _park(tmp_path, monkeypatch, queue, workers)
         refresh_owner_pause_tree("root")
@@ -177,13 +189,18 @@ def test_local_extension_leaves_its_spawned_process_and_money_obligations(tmp_pa
 
 
 @pytest.mark.parametrize("kind", ["delegate", "model", "merge"])
-def test_local_return_cannot_retire_independent_custody(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize("fails", [False, True])
+def test_local_return_cannot_retire_independent_custody(tmp_path, monkeypatch, kind, fails):
     from ouroboros import delegate_custody as dc, model_wait, usage_accounting as ua
     from ouroboros.model_sleep import cold_blockers
     from supervisor.continuation_admission import conflicting_writers
     from supervisor.owner_pause_control import refresh_owner_pause_tree
 
-    registry, queue, workers, name = _local(tmp_path, monkeypatch, lambda _ctx: "completed local call")
+    def local(_ctx):
+        if fails:
+            raise RuntimeError("business failure after actual local unwind")
+        return "completed local call"
+    registry, queue, workers, name = _local(tmp_path, monkeypatch, local)
     owner = None
     if kind == "delegate":
         assert dc.record_start_requested(tmp_path, run_id="", task_id="root", root_task_id="root",
@@ -210,7 +227,8 @@ def test_local_return_cannot_retire_independent_custody(tmp_path, monkeypatch, k
     money = ua.read_usage_records(tmp_path)
     pending = dc.pending_invocations(tmp_path)
     try:
-        assert registry.execute_result(name, {}).status == "ok"
+        result = registry.execute_result(name, {})
+        assert result.code == ("EXTENSION_ERROR" if fails else "OK")
         after = load_task_result(tmp_path, "root")
         assert after.get("launch_handoffs", {}) == before.get("launch_handoffs", {})
         assert after.get("merge_receipts") == before.get("merge_receipts")
@@ -246,7 +264,6 @@ def test_process_proxy_requires_host_exit_and_valid_protocol(tmp_path, monkeypat
     monkeypatch.setattr(runner, "_skill_for_dispatch", lambda *_a: skill)
     monkeypatch.setattr(runner, "_base_env_for_skill", lambda *_a: {})
     monkeypatch.setattr(runner, "_extension_has_model_credentials", lambda *_a: False)
-    monkeypatch.setattr(runner, "_task_settings_for_skill", lambda *_a: {})
     drain_release, drains = threading.Event(), []
     if not drained:
         real_drain = runner._drain

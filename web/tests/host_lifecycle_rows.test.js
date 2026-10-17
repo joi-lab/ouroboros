@@ -31,6 +31,7 @@ test('#931 every typed checkpoint kind names itself; only a kindless one is peri
         ['budget_scope_paused', 'Budget scope paused'],
         ['services_stopped', 'Background services stopped'],
         ['services_kept', 'Background services kept'],
+        ['service_finalization_error', 'Background service cleanup unconfirmed'],
         ['forced_candidate_drift', 'Forced candidate drifted'],
     ]) {
         assert.equal(taskCheckpointLabel({ checkpoint_kind: kind, round: 30 }), label);
@@ -102,39 +103,162 @@ test('#1073 the worker readiness frames render their own fields in Logs', () => 
 });
 
 
-test('accounting wait phases remain distinct visible host checkpoints in chat and Logs', () => {
-    const frame = { type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', round: 3 };
-    const entered = { ...frame, phase: 'entered' };
-    const ended = { ...frame, phase: 'ended' };
-    const first = summarizeChatLiveEvent(entered);
-    const last = summarizeChatLiveEvent(ended);
-    assert.equal(first.headline, 'Waiting for accounting access');
-    assert.equal(last.headline, 'Accounting wait ended');
-    assert.notEqual(first.dedupeKey, last.dedupeKey);
-    for (const [event, view] of [[entered, first], [ended, last]]) {
-        assert.equal(view.visible, true);
-        assert.equal(view.promote, false);
-        assert.equal(view.terminal, false);
-        assert.equal(summarizeLogEvent(event).headline, view.headline);
+for (const [kind, labels] of [
+    ['usage_lock_wait', ['Waiting for accounting access', 'Accounting wait ended']],
+    ['control_store_wait', ['Waiting for control storage', 'Control storage wait ended']],
+]) {
+    test(`${kind} phases stay distinct visible host checkpoints in chat and Logs`, () => {
+        const frame = { type: 'task_checkpoint', task_id: 't1', checkpoint_kind: kind, round: 3 };
+        const events = ['entered', 'ended'].map(phase => ({ ...frame, phase }));
+        const views = events.map(summarizeChatLiveEvent);
+        assert.deepEqual(views.map(view => view.headline), labels);
+        assert.notEqual(views[0].dedupeKey, views[1].dedupeKey);
+        for (const [index, view] of views.entries()) {
+            assert.equal(view.visible, true);
+            assert.equal(view.promote, false);
+            assert.equal(view.terminal, false);
+            assert.equal(summarizeLogEvent(events[index]).headline, view.headline);
+        }
+    });
+
+    test(`${kind} episodes survive live delivery, redelivery, history and reconnect`, () => {
+        const events = ['first', 'second'].flatMap(episode_id => ['entered', 'ended'].map(phase => ({
+            type: 'task_checkpoint', task_id: 't1', checkpoint_kind: kind, episode_id, phase,
+        }))).map((event, index) => ({ ...event, ts: `2026-09-27T01:00:0${index}Z` }));
+        const live = { items: [] }, replay = { items: [] };
+        const deliver = event => {
+            const summary = summarizeChatLiveEvent(event);
+            updateLiveTimelineItem(live, summary, { ts: event.ts, rawTs: event.ts,
+                syntheticKey: summary.dedupeKey, headline: summary.headline, inPlaceByKey: false });
+        };
+        events.forEach(deliver);
+        assert.deepEqual(live.items.map(row => row.headline), [...labels, ...labels]);
+        events.forEach(deliver);
+        assert.equal(live.items.length, 4, 'redelivery adds no rows');
+        events.forEach((event, index) => {
+            const summary = summarizeChatLiveEvent(event);
+            const row = { ...event, history_id: `progress:${index}`,
+                history_position: { source: 'progress', offset: index } };
+            mergeHistoricalTimelineItem(replay, summary, row, event.ts);
+            mergeHistoricalTimelineItem(live, summary, row, event.ts);
+        });
+        assert.deepEqual(replay.items.map(row => row.headline), [...labels, ...labels]);
+        assert.deepEqual(live.items.map(row => row.headline), replay.items.map(row => row.headline));
+    });
+}
+
+test('unconfirmed service cleanup is visible without claiming stopped', () => {
+    const pending = { type: 'task_checkpoint', task_id: 'task', round: 1,
+        checkpoint_kind: 'service_finalization_error',
+        services: [{ service_id: 'task:svc', lifecycle: 'cleanup_pending', stop_failed: true }] };
+    const live = summarizeChatLiveEvent(pending);
+    assert.equal(live.visible, true);
+    assert.equal(live.headline, 'Background service cleanup unconfirmed');
+    assert.equal(live.phase, 'warn');
+    assert.equal(summarizeLogEvent(pending).phase, 'warn');
+    const stopped = { ...pending, checkpoint_kind: 'services_stopped' };
+    assert.equal(summarizeChatLiveEvent(stopped).phase, 'thinking');
+    assert.equal(summarizeLogEvent(stopped).phase, 'thinking');
+    assert.equal(live.terminal, false);
+    assert.equal(live.promote, false);
+    assert.notEqual(live.dedupeKey, summarizeChatLiveEvent({ ...pending,
+        checkpoint_kind: 'services_stopped' }).dedupeKey);
+});
+
+// ---------------------------------------------------------------------------
+// Threshold crossings (#1748/#1129): one row per crossing, each stating its own fact.
+// The payloads are the shapes `task_pacing` emits; its checkpoint carries no round.
+// ---------------------------------------------------------------------------
+
+const crossing = (checkpoint_kind, ts, fields) => ({ type: 'task_checkpoint', task_id: 't1', ts, checkpoint_kind, ...fields });
+const tree = (axis, spend, basis = 'tree_known') => ({
+    budget_axis: axis, deciding_spend_usd: spend, task_cost_usd: spend, base_usd: 10, hard_stop: true, spend_basis: basis });
+const wallet = (remaining) => ({
+    budget_axis: 'shared_wallet', wallet_remaining_known_usd: remaining, wallet_baseline_usd: 40, wallet_limit_usd: 100,
+    observed_at: '2026-10-13T01:00:00Z', hard_stop: true, task_cost_usd: 0.5 });
+const CROSSINGS = [
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:01Z', { milestone: '50%', ...tree('in_task_cost_ceiling', 5.1) }),
+        'Cost ceiling: 50% remaining'],
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:02Z', { milestone: '25%', ...tree('in_task_cost_ceiling', 7.6) }),
+        'Cost ceiling: 25% remaining'],
+    [crossing('cost_budget_wrapup', '2026-10-13T01:00:03Z', tree('in_task_cost_ceiling', 8.1)),
+        'Cost ceiling: 81% spent'],
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:04Z', { milestone: '10%', ...tree('hard_tree_cap', 9.1) }),
+        'Task tree cost cap: 10% remaining'],
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:05Z', { milestone: '50%', ...tree('whole_work_allowance', 5.5) }),
+        'Whole-work cost allowance: 50% remaining'],
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:06Z', { milestone: '50%', ...wallet(19.5) }),
+        'Shared wallet: 50% of starting headroom remaining'],
+    [crossing('cost_budget_milestone', '2026-10-13T01:00:07Z', { milestone: '25%', ...wallet(9) }),
+        'Shared wallet: 25% of starting headroom remaining'],
+    [crossing('cost_budget_wrapup', '2026-10-13T01:00:08Z', wallet(7.5)),
+        'Shared wallet: 81% of starting headroom spent'],
+    [crossing('time_budget_milestone', '2026-10-13T01:00:09Z', { milestone: '50%', elapsed_sec: 30, remaining_sec: 30, deadline_at: '2026-10-13T01:01:00Z' }),
+        'Time budget: 50% remaining'],
+    [crossing('time_budget_milestone', '2026-10-13T01:00:10Z', { milestone: '25%', elapsed_sec: 45, remaining_sec: 15, deadline_at: '2026-10-13T01:01:00Z' }),
+        'Time budget: 25% remaining'],
+];
+
+test('a crossing row states the bound and the share, from the typed payload', () => {
+    for (const [event, label] of CROSSINGS) {
+        assert.equal(taskCheckpointLabel(event), label);
+        assert.equal(summarizeLogEvent(event).headline, label, 'Logs reads the same words');
+        assert.equal(summarizeChatLiveEvent(event).headline, label);
+        // The notice is a fact, not advice: no row keeps the retired "wrap-up" framing.
+        assert.doesNotMatch(label, /wrap-up|milestone/i);
+    }
+    // An own-calls-only reading is a lower bound against the tree, as the notice says.
+    assert.equal(taskCheckpointLabel(crossing('cost_budget_wrapup', '', tree('hard_tree_cap', 9, 'own_fallback_tree_unknown'))),
+        'Task tree cost cap: at least 90% spent');
+    // Missing or null numbers are never read as zero spend.
+    for (const fields of [{ budget_axis: 'in_task_cost_ceiling' },
+        { budget_axis: 'in_task_cost_ceiling', deciding_spend_usd: null, base_usd: 10 },
+        { budget_axis: 'shared_wallet', wallet_baseline_usd: 40, wallet_remaining_known_usd: null }]) {
+        assert.match(taskCheckpointLabel(crossing('cost_budget_wrapup', '', fields)), /: spend threshold crossed$/);
     }
 });
 
-test('two wait episodes retain all phases through the actual live and history reducers', () => {
-    const events = ['first', 'second'].flatMap((episode_id) => ['entered', 'ended'].map((phase) => ({
-        type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', episode_id, phase,
-    }))).map((event, index) => ({ ...event, ts: `2026-09-27T01:00:0${index}Z` }));
+test('historical rows without the typed bound keep their old label', () => {
+    // The old producer's wrap-up was advice and carried no bound; its milestone carried none either.
+    for (const [event, label] of [
+        [crossing('cost_budget_wrapup', '', { deciding_spend_usd: 8.1, base_usd: 10 }), 'Cost budget wrap-up'],
+        [crossing('cost_budget_milestone', '', { milestone: '50%', deciding_spend_usd: 5.1, base_usd: 10 }), 'Cost budget milestone'],
+        [crossing('cost_budget_milestone', '', { milestone: '50%', budget_axis: 'a_future_axis' }), 'Cost budget milestone'],
+        [crossing('cost_budget_milestone', '', { budget_axis: 'in_task_cost_ceiling' }), 'Cost budget milestone'],
+        [crossing('time_budget_milestone', '', {}), 'Time budget milestone'],
+    ]) assert.equal(taskCheckpointLabel(event), label);
+});
+
+test('every distinct crossing is its own row, and one event delivered twice is one row', () => {
     const live = { items: [] }, replay = { items: [] };
-    events.forEach((event, index) => {
+    const feed = (record, event, index, route) => {
         const summary = summarizeChatLiveEvent(event);
-        updateLiveTimelineItem(live, summary, { ts: event.ts, rawTs: event.ts,
-            syntheticKey: summary.dedupeKey, headline: summary.headline });
-        const row = { ...event, history_id: `progress:${index}`, history_position: { source: 'progress', offset: index } };
-        mergeHistoricalTimelineItem(replay, summary, row, event.ts);
-        assert.equal(live.items.at(-1).headline, summary.headline);
-        assert.equal(live.items.length, index + 1);
-        // Reconnect enriches each existing live row without adding a twin.
-        mergeHistoricalTimelineItem(live, summary, row, event.ts);
-        assert.equal(live.items.length, index + 1);
-    });
-    assert.deepEqual(live.items.map(row => row.headline), replay.items.map(row => row.headline));
+        if (route === 'live') {
+            updateLiveTimelineItem(record, summary, { ts: event.ts, rawTs: event.ts,
+                syntheticKey: summary.dedupeKey, headline: summary.headline });
+        } else {
+            mergeHistoricalTimelineItem(record, summary, { ...event, history_id: `progress:${index}`,
+                history_position: { source: 'progress', offset: index } }, event.ts);
+        }
+    };
+    CROSSINGS.forEach(([event], index) => feed(live, event, index, 'live'));
+    // Time, the ceiling and the wallet each cross 50% in the same task: three rows, not one.
+    const keys = CROSSINGS.map(([event]) => summarizeChatLiveEvent(event).dedupeKey);
+    assert.equal(new Set(keys).size, CROSSINGS.length, `every crossing has its own identity: ${keys}`);
+    assert.deepEqual(live.items.map((row) => row.headline), CROSSINGS.map(([, label]) => label));
+    // The same events again — a re-delivered live frame — add nothing.
+    CROSSINGS.forEach(([event], index) => feed(live, event, index, 'live'));
+    assert.equal(live.items.length, CROSSINGS.length);
+    // History replays the same facts into a fresh card, then reconnect enriches the live one in place.
+    CROSSINGS.forEach(([event], index) => feed(replay, event, index, 'replay'));
+    assert.deepEqual(replay.items.map((row) => row.headline), live.items.map((row) => row.headline));
+    CROSSINGS.forEach(([event], index) => feed(live, event, index, 'replay'));
+    assert.equal(live.items.length, CROSSINGS.length, 'reconnect adopts the live rows; it does not twin them');
+});
+
+test('other checkpoint kinds keep the round identity they had', () => {
+    const keyOf = (patch) => summarizeChatLiveEvent({ type: 'task_checkpoint', task_id: 't1', ...patch }).dedupeKey;
+    assert.notEqual(keyOf({ checkpoint_kind: 'context_view', round: 3 }), keyOf({ checkpoint_kind: 'context_view', round: 4 }));
+    assert.equal(keyOf({ checkpoint_kind: 'context_view', round: 3 }), keyOf({ checkpoint_kind: 'context_view', round: 3 }));
+    assert.equal(keyOf({ checkpoint_number: 7 }), 'task_checkpoint:t1::7');
 });

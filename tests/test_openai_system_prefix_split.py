@@ -30,8 +30,8 @@ Production seams under test — each docstring names the line a guard would catc
   ``tests/test_handover_native_reset.py``: a declared string system is not split, so the
   key survives to the pop there.)
 * ``context_fit.ContextFitProjection.system_message`` — the declaration every projected
-  system message carries: two stable blocks (governance and books, identity and my story)
-  when block 1 has text, else one; an empty block is never declared.
+  system message carries: all nonempty stable blocks before the changing tail, including
+  the optional handbook; an empty block is never declared.
 
 Every guard asserts both directions: the projection applies where it must and is
 absent where it must not, and the canonical transcript is never mutated.
@@ -96,7 +96,7 @@ def _system_blocks(stable: str = STABLE, memory: str = MEMORY, evidence: str = E
 
 
 def _declared(*, task: str = TASK, declared: int = 1, **blocks):
-    """The Main context builder's shape: a 3-block system declaring ONE stable block."""
+    """A partial declaration: marked following blocks extend it only on supporting routes."""
     return [
         {"role": "system", "content": _system_blocks(**blocks), STABLE_PREFIX_BLOCKS_KEY: declared},
         {"role": "user", "content": task},
@@ -741,70 +741,39 @@ def _plan(blocks):
     )
 
 
-def test_context_fit_declares_two_stable_blocks_on_every_projected_system_message(monkeypatch):
-    """Pins ``ContextFitProjection.system_message`` (context_fit.py: ``STABLE_PREFIX_BLOCKS_KEY``
-    2 when block 1 has text): the plan's first-round messages, the Low projection and
-    ``reproject_transcript`` all carry the declaration with the canonical 3-block content
-    intact — and the declaration is what makes the OpenAI-family builder split. The Codex
-    backend reads a cache only inside the leading system group, by prefix (measured
-    2026-10-03): identity and my story stay there as their own item, the changing block is
-    the one notice. Removing the stamp keeps every transcript whole on the wire."""
-    blocks = _system_blocks()
+@pytest.mark.parametrize("book", [False, True])
+@pytest.mark.parametrize("marked", [False, True])
+@pytest.mark.parametrize("memory", [MEMORY, "  \n"])
+def test_context_fit_declares_all_nonempty_stable_items_before_the_tail(monkeypatch, book, marked, memory):
+    """The declaration survives reprojection and keeps B out of the notice without markers."""
+    blocks = _system_blocks(memory=memory)
+    if book:
+        blocks.insert(1, {"type": "text", "text": "handbook", "cache_control": {"type": "ephemeral"}})
+    if not marked:
+        for block in blocks:
+            block.pop("cache_control", None)
     plan = _plan(blocks)
-
+    stable = [block for block in blocks[:-1] if block["text"].strip()]
     system = plan.max_projection.system_message()
-    assert system == {"role": "system", "content": blocks, STABLE_PREFIX_BLOCKS_KEY: 2}
+    assert system == {"role": "system", "content": stable + blocks[-1:], STABLE_PREFIX_BLOCKS_KEY: len(stable)}
     assert plan.messages_for("max") == [system, {"role": "user", "content": TASK}]
-    low = plan.messages_for("low")[0]  # two blocks: the second is the changing one, never declared
-    assert low[STABLE_PREFIX_BLOCKS_KEY] == 1 and low["content"] == blocks[:2]
-
-    history = [{"role": "system", "content": "stale captured view"},
-               {"role": "user", "content": TASK},
+    history = [{"role": "system", "content": "old"}, {"role": "user", "content": TASK},
                {"role": "assistant", "content": "working"}]
     rebuilt = plan.reproject_transcript(copy.deepcopy(history), "max")
-    assert rebuilt[0] == system and rebuilt[1:] == history[1:]
-    inserted = plan.reproject_transcript([{"role": "user", "content": TASK}], "low")
-    assert inserted[0][STABLE_PREFIX_BLOCKS_KEY] == 1 and inserted[1] == {"role": "user", "content": TASK}
-
-    # End to end: the declaration reaches the OpenAI-family wire builder, direct and OpenRouter alike.
+    assert rebuilt == [system, *history[1:]]
+    assert plan.reproject_transcript(history[1:], "max") == rebuilt
+    low = plan.messages_for("low")[0]
+    assert low[STABLE_PREFIX_BLOCKS_KEY] == len(low["content"]) - 1
     client = LLMClient(api_key="unused")
-    target = _target(monkeypatch, client, "openai/gpt-6-sol", _OPENROUTER)
-    wire = _build(client, target, rebuilt)["messages"]
-    assert wire[0] == {"role": "system", "content": [{"type": "text", "text": STABLE, "cache_control": {"type": "ephemeral"}}]}
-    assert wire[1] == {"role": "system", "content": [
-        {"type": "text", "text": MEMORY, "cache_control": {"type": "ephemeral"}}]}
-    assert wire[2] == {"role": "user", "content": _notice(HOST_CONTEXT_NOTICE_BEFORE_TASK, EVIDENCE)}
-    assert wire[3:] == history[1:]
-    assert target["wire_layout"] == {"system_prefix_split": True, "moved_blocks": 1}
-    direct = _target(monkeypatch, client, "openai::gpt-6-sol", {"OPENAI_API_KEY": "unused"})
-    wire = _build(client, direct, rebuilt)["messages"]
-    assert wire[0] == {"role": "system", "content": [{"type": "text", "text": STABLE}]}
-    assert wire[1] == {"role": "system", "content": [{"type": "text", "text": MEMORY}]}
-    assert wire[2] == {"role": "user", "content": _notice(HOST_CONTEXT_NOTICE_BEFORE_TASK, EVIDENCE)}
-    assert direct["wire_layout"] == {"system_prefix_split": True, "moved_blocks": 1}
-    assert rebuilt[0] == system, "the canonical projected transcript is untouched"
-
-
-def test_an_empty_block_one_is_never_declared_or_sent_as_a_system_item(monkeypatch):
-    """Both directions of the emptiness rule: an empty block 1 declares one block, so the
-    wire is system(A) + one notice(C) and no empty system item; a non-empty one declares two."""
-    empty = _system_blocks(memory="  \n")
-    plan = _plan(empty)
-    system = plan.max_projection.system_message()
-    assert system[STABLE_PREFIX_BLOCKS_KEY] == 1
-    client = LLMClient(api_key="unused")
-    direct = _target(monkeypatch, client, "openai::gpt-6-sol", {"OPENAI_API_KEY": "unused"})
-    wire = _build(client, direct, plan.messages_for("max"))["messages"]
-    assert [message["role"] for message in wire] == ["system", "user", "user"]
-    assert wire[0] == {"role": "system", "content": [{"type": "text", "text": STABLE}]}
-    assert wire[1] == {"role": "user", "content": _notice(HOST_CONTEXT_NOTICE_BEFORE_TASK, EVIDENCE)}
-    # Regression: OpenRouter keeps marked blocks as their own items
-    # (keep_marked), and an empty marked block 1 is still never one of them.
-    routed = _target(monkeypatch, client, "openai/gpt-6-sol", _OPENROUTER)
-    wire = _build(client, routed, plan.messages_for("max"))["messages"]
-    assert [message["role"] for message in wire] == ["system", "user", "user"]
-    assert wire[0]["content"][0]["text"] == STABLE and routed["wire_layout"]["moved_blocks"] == 1
-    assert _plan(_system_blocks()).max_projection.system_message()[STABLE_PREFIX_BLOCKS_KEY] == 2
+    for model, env in (("openai/gpt-6-sol", _OPENROUTER), ("openai::gpt-6-sol", {"OPENAI_API_KEY": "unused"})):
+        target = _target(monkeypatch, client, model, env)
+        wire = _build(client, target, rebuilt)["messages"]
+        assert [message["role"] for message in wire] == ["system"] * len(stable) + ["user", "user", "assistant"]
+        assert [message["content"][0]["text"] for message in wire[:len(stable)]] == [block["text"] for block in stable]
+        assert wire[len(stable)] == {"role": "user", "content": _notice(HOST_CONTEXT_NOTICE_BEFORE_TASK, EVIDENCE)}
+        assert wire[len(stable) + 1:] == history[1:]
+        assert target["wire_layout"] == {"system_prefix_split": True, "moved_blocks": 1}
+    assert rebuilt[0] == system
 
 
 def test_a_late_demoted_system_notice_keeps_its_place_after_the_projected_host_notice(monkeypatch):

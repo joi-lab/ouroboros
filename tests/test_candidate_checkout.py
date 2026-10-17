@@ -85,6 +85,29 @@ def source(tmp_path):
     return repo
 
 
+def test_git_input_is_file_backed_with_identical_bytes_and_failure_semantics(source, monkeypatch):
+    """Keep the real batched protocol without a parent-to-child writer pipe."""
+    blob = git(source, "rev-parse", "HEAD:edited").strip()
+    empty = git(source, "hash-object", "--stdin", input=b"").strip()
+    absent = b"f" * len(blob)
+    real_run, seen = subprocess.run, []
+
+    def run(argv, **kwargs):
+        stdin = kwargs.get("stdin")
+        regular = stdin is not None and stat.S_ISREG(os.fstat(stdin.fileno()).st_mode)
+        seen.append((kwargs.get("input"), regular, kwargs.get("timeout")))
+        return real_run(argv, **kwargs)
+
+    monkeypatch.setattr(candidate.subprocess, "run", run)
+    rows = [blob, absent] * 2000
+    assert candidate._git(source, "cat-file", "--batch-check", data=b"\n".join(rows) + b"\n") == (
+        blob + b" blob 5\n" + absent + b" missing\n") * 2000
+    assert candidate._git(source, "hash-object", "--stdin", data=b"").strip() == empty
+    with pytest.raises(candidate.CandidateError, match=r"CANDIDATE_GIT_FAILED cat-file: \S"):
+        candidate._git(source, "cat-file", "--batch-check", "--no-such-option", data=b"x\n")
+    assert seen == [(None, True, 120)] * 3
+
+
 def test_unproven_process_or_inner_marker_retains_the_copy_in_place(source, tmp_path):
     """Deletion needs a proven-gone holder; retention is marked for enclosing layers."""
     from ouroboros.test_environment import RETENTION_MARKER, retain_tree

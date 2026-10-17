@@ -68,7 +68,7 @@ test('clearStickyCardState resets the recycled record activity + cost (reusable 
     const record = {
         collapsedActivity: 'Old cycle activity',
         costMeta: { meta: ['$1.00'], ts: 1, final: true },
-        executorChip: { harness: 'codex', icon: '◇', label: 'codex · no run yet' },
+        executorChip: { harness: 'codex', label: 'Codex · no run yet', hasEvidence: true },
         // Models the real element closely enough for attribute handling.
         activityEl: {
             textContent: 'Old cycle activity',

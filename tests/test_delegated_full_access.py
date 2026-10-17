@@ -20,16 +20,22 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.mark.parametrize('selected,expected', [(None, 'workspace_write'), ('workspace_write', 'workspace_write'), ('full', 'full')])
-def test_selected_access_applies_only_to_mutating_assignments(selected, expected):
+def test_selected_access_drives_the_shape_and_write_authority_its_purpose(selected, expected):
+    """#1609: technical access decides the shape; write authority decides only whether
+    the private copy can ever be integrated (acting) or is evidence (investigation)."""
     kwargs = {} if selected is None else {'access': selected}
     assert subagents.delegated_run_shape(True, **kwargs) == subagents.DelegatedRunShape(expected, 'agent', 'live', True)
-    assert subagents.delegated_run_shape(False, **kwargs) == subagents.DelegatedRunShape('readonly', 'ask')
+    assert subagents.delegated_run_shape(False, **kwargs) == subagents.DelegatedRunShape(
+        expected, 'agent', 'live', True, investigation=True)
 
 
-def test_invalid_access_is_not_silently_widened():
+def test_explicit_readonly_stays_readonly_and_invalid_access_is_refused():
     with pytest.raises(ValueError, match='workspace_write or full'):
         subagents.delegated_run_shape(True, 'inherit_native')
-    assert subagents.delegated_run_shape(False, 'full').access == 'readonly'
+    with pytest.raises(ValueError, match='workspace_write or full'):
+        subagents.delegated_run_shape(False, 'inherit_native')
+    for acting in (True, False):
+        assert subagents.delegated_run_shape(acting, 'readonly') == subagents.DelegatedRunShape('readonly', 'ask')
 
 
 @pytest.fixture
@@ -301,7 +307,8 @@ def test_owner_http_save_projects_full_choice_into_task_start_snapshot(monkeypat
         'recommended_use': 'Implementation on this installation.', 'access': 'full',
     }]}
     with TestClient(app) as client:
-        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config})
+        # A worker row, not a reviewer: the owner confirms the empty review pool.
+        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config, 'allow_empty_review_pool': True})
         assert response.status_code == 200, response.text
         assert json.loads(json.loads(isolated_settings.read_text(encoding='utf-8'))[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
         start = apply_task_start_settings()
@@ -309,7 +316,7 @@ def test_owner_http_save_projects_full_choice_into_task_start_snapshot(monkeypat
         assert selected['access'] == 'full'
         assert json.loads(start.environ[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
         config['items'][0]['access'] = 'workspace_write'
-        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config})
+        response = client.post('/api/settings', json={SUBAGENTS_SETTING: config, 'allow_empty_review_pool': True})
         assert response.status_code == 200
         assert selected['access'] == 'full'
         assert json.loads(start.environ[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
@@ -337,3 +344,28 @@ def test_retry_preserves_recorded_binding_evidence(full_run, monkeypatch, histor
     assert facts["requests"] == [original_request, original_request]
     assert custody.invocation_record(drive, invocation)["execution_binding_fingerprint"] == fingerprint
     assert custody.replay(drive)["full-run"].execution_binding_fingerprint == fingerprint
+
+
+def test_research_retry_keeps_investigation_purpose_and_exact_copy(full_run):
+    from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.tools.delegate_integration import _resolve_retry_invocation
+    from ouroboros.delegate_registration_policy import candidate_apply_possible
+
+    ctx, target, facts = full_run
+    # Keep the same readable workspace, but the task has no candidate-write grant.
+    ctx.task_constraint = TaskConstraint(mode='local_readonly_subagent')
+    facts['lost_start'] = True
+    first = delegate_payload(delegate._delegate_start(ctx, 'Investigate the fixture.'))
+    token = first['pending_invocation_id']
+    body = facts['requests'][0]
+    binding, refusal = _resolve_retry_invocation(ctx, custody.custody_root(ctx), token, 'Investigate the fixture.')
+    assert refusal is None and binding.authority.investigation
+    assert binding.authority_source == 'investigation'
+    facts['lost_start'] = False
+    resumed = delegate_payload(delegate._delegate_start(ctx, 'Investigate the fixture.', retry_of=token))
+    assert resumed['status'] == 'started', resumed
+    assert facts['requests'] == [body, body]
+    assert 'evidence-only investigation' in resumed['note']
+    entry = custody.replay(custody.custody_root(ctx))['full-run']
+    assert entry.authority_source == 'investigation' and not candidate_apply_possible(entry)
+    assert entry.execution_root == body[0]['execution']['workspaceRoot']

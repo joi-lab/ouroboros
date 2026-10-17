@@ -11,6 +11,7 @@ import pytest
 from ouroboros import task_status
 from ouroboros.context_runtime_facts import _queue_context_fact
 from ouroboros.tools.control_scheduling import _subagent_slot_note
+from tests._shared import write_queue_document
 
 
 def _snapshot(age=0):
@@ -24,7 +25,7 @@ def _snapshot(age=0):
 def _write(root, snapshot):
     path = root / "state" / "queue_snapshot.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    write_queue_document(path, snapshot)
     return path
 
 
@@ -36,6 +37,9 @@ def fixed_clock(monkeypatch):
 @pytest.mark.parametrize("age,fresh", [(0, True), (10, True), (10.001, False), (900, False)])
 def test_context_freshness_shares_ownership_boundary(age, fresh):
     snapshot = _snapshot(age)
+    snapshot.update(generation="fixture-generation", _queue_alive={
+        "generation": "fixture-generation", "ts": snapshot["ts"],
+    })
     fact = task_status.queue_snapshot_observation(snapshot)
     assert fact["fresh"] is fresh
     assert task_status._snapshot_is_stale(snapshot) is not fresh

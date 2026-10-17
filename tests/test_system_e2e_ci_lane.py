@@ -32,13 +32,10 @@ def _workflow() -> dict:
     return yaml.safe_load(CI_PATH.read_text(encoding="utf-8"))
 
 
-def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
-    """The PR lane is no longer the narrow Publish proof: it is the whole marker lane.
+def test_manual_and_release_callers_share_one_full_browser_lane():
+    """Both entries call the complete marker lane, never a narrow Publish proof.
 
-    `ci.yml` matches pull requests, manual runs and tags and delegates to the
-    reusable lane; every `ouroboros` push reaches the SAME job through its own
-    path-filter-free workflow. Nothing here may pull the costly system-e2e
-    scenarios into a pull request.
+    Dormant PR job predicates do not restore the removed workflow trigger.
     """
     shared_path = REPO_ROOT / ".github" / "workflows" / "ui-browser.yml"
     push_path = REPO_ROOT / ".github" / "workflows" / "ui-browser-push.yml"
@@ -51,8 +48,7 @@ def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
     assert "steps" not in caller, "the browser steps belong to the shared lane"
 
     push = yaml.safe_load(push_path.read_text(encoding="utf-8"))
-    assert set(_triggers(push)) == {"push", "workflow_dispatch"}
-    assert _triggers(push)["push"] == {"branches": ["ouroboros"]}
+    assert set(_triggers(push)) == {"workflow_dispatch"}
     assert _triggers(push)["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == ["full", "viewport", "inflight"]
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
 
@@ -124,6 +120,7 @@ def test_the_lane_runs_the_keyless_suite_on_a_throwaway_root():
     assert [step.get("uses") for step in steps][:2] == [
         "actions/checkout@v4", "./.github/actions/setup-python-env",
     ]
+    assert steps[1]["with"]["install-project"] == "false"
     run_steps = [step for step in steps if "run" in step]
     assert len(run_steps) == 2
     expected = [("tests/system_e2e/", "OUROBOROS_E2E_DEEP"),
@@ -190,8 +187,9 @@ def test_the_lane_asks_for_no_secret():
 def test_a_schedule_would_not_wake_the_paid_provider_lane():
     """A scheduled run would report the default branch in github.ref. The leading
     event guard keeps any schedule off the paid lane whatever ref conditions
-    follow it; the push workflow that serves branch pushes has no schedule."""
-    condition = " ".join(str(_workflow()["jobs"]["integration-test"]["if"]).split())
-    assert condition.startswith("github.event_name != 'schedule'"), condition
+    follow it; the standalone manual wrapper has no schedule."""
+    for name in ("integration-test", "integration-optional"):
+        condition = " ".join(str(_workflow()["jobs"][name]["if"]).split())
+        assert condition.startswith("github.event_name != 'schedule'"), condition
     push = yaml.safe_load((CI_PATH.parent / "provider-canary-push.yml").read_text(encoding="utf-8"))
-    assert list(push.get("on", push.get(True))) == ["push"]
+    assert list(push.get("on", push.get(True))) == ["workflow_dispatch"]

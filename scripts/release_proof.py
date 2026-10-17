@@ -47,16 +47,30 @@ DOWNLOAD_LABELS = {
     "android-arm64": "Experimental Android ARM64 USB setup (.tar.gz)",
     "android-apk": "Android publisher-signed reference APK (see setup guide)",
 }
+# The release job's needs apart from the optional Android build. The proof
+# records each job's actual GitHub conclusion; a missing one is an error,
+# never a pass.
 RELEASE_GATES = (
     "full-test",
+    "integration-test",
+    "system-e2e-mock",
+    "release-preflight",
+    "build",
+    "windows-proof",
     "marker-guards",
     "ui-smoke",
     "docker-ui-smoke",
     "docker-portable-test",
     "skill-smoke",
-    "packaged-artifact-smoke",
-    "android-build",
 )
+JOB_RESULTS = ("success", "failure", "cancelled", "skipped")
+# Owner decision of 2026-10-17: the official v7.7.0 tag alone may ship after
+# these test lanes concluded red (failed or timed out), disclosed in its proof
+# and notes, with follow-up patches. Every other gate and every other tag keeps
+# the strict bar, and ci.yml holds that tag at a verified draft.
+OWNER_EXCEPTION_REPOSITORY = "razzant/ouroboros"
+OWNER_EXCEPTION_TAG = "v7.7.0"
+OWNER_WAIVABLE_GATES = ("full-test", "system-e2e-mock", "ui-smoke")
 COMMON_SMOKE_CHECKS = frozenset(
     {
         "embedded_repo_bundle",
@@ -107,6 +121,13 @@ REQUIRED_SMOKE_CHECKS = {
     }),
     "android-apk": frozenset({"apk_signature", "apk_package_version"}),
 }
+# Windows signing is selected by configuration: without a signer thumbprint the
+# ZIP ships explicitly unsigned; with one, the receipt must name that verified
+# signer and carry these checks, or the whole release stops.
+AUTHENTICODE_PROOF_ID = "windows-x64"
+AUTHENTICODE_SMOKE_CHECKS = frozenset(
+    {"authenticode_signer", "timestamp", "signed_payload_archive_match"}
+)
 
 
 def sha256_file(path: Path) -> str:
@@ -158,6 +179,13 @@ def command_locate(args: argparse.Namespace) -> None:
         "name": artifact.name,
         "sha256": sha256_file(artifact),
     }
+    # A handed-over archive is checked against its producer job's output
+    # before anything extracts or executes it.
+    if args.expect_sha256 is not None and values["sha256"] != args.expect_sha256:
+        raise ValueError(
+            f"{artifact.name} has SHA-256 {values['sha256']}, not the "
+            f"{args.expect_sha256 or '(missing)'} digest its producer job recorded"
+        )
     if args.github_output:
         _append_github_output(args.github_output, values)
     print(json.dumps(values, sort_keys=True))
@@ -181,6 +209,14 @@ def command_record_smoke(args: argparse.Namespace) -> None:
         "releaseTag": args.tag,
         "checks": sorted(set(args.check)),
     }
+    if args.proof_id == AUTHENTICODE_PROOF_ID:
+        receipt["authenticode"] = {"status": "unsigned"}
+        if args.authenticode_thumbprint:
+            receipt["authenticode"] = {
+                "status": "signed",
+                "signerThumbprint": args.authenticode_thumbprint.upper(),
+                "publisher": args.authenticode_publisher,
+            }
     _write_json(args.output, receipt)
 
 
@@ -197,11 +233,59 @@ def _read_release_description(readme: Path, version: str) -> tuple[str, str]:
     raise ValueError(f"README Version History has no exact row for {version}")
 
 
+def _gate_results(pairs: list[str], *, owner_exception: bool) -> tuple[dict[str, str], dict[str, str]]:
+    """Return every gate's actual conclusion and the gates the owner exception waived."""
+    results: dict[str, str] = {}
+    for pair in pairs:
+        name, _, result = pair.partition("=")
+        if name not in RELEASE_GATES or name in results or result not in JOB_RESULTS:
+            raise ValueError(f"invalid release gate result: {pair!r}")
+        results[name] = result
+    missing = [name for name in RELEASE_GATES if name not in results]
+    if missing:
+        raise ValueError(f"missing release gate results: {missing}")
+    ordered = {name: results[name] for name in RELEASE_GATES}
+    waived = {name: result for name, result in ordered.items() if result != "success"}
+    for name, result in waived.items():
+        # A skipped lane produced no result at all; only a concluded red one is disclosed.
+        if not (owner_exception and name in OWNER_WAIVABLE_GATES and result in ("failure", "cancelled")):
+            raise ValueError(f"release gate {name} concluded {result}, not success")
+    return ordered, waived
+
+
 def _load_json(path: Path) -> dict:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
         raise ValueError(f"expected a JSON object in {path}")
     return value
+
+
+def _authenticode_state(smoke: dict, checks: list, signer_thumbprint: str) -> dict:
+    state = smoke.get("authenticode")
+    claimed = AUTHENTICODE_SMOKE_CHECKS & set(checks)
+    if not signer_thumbprint:
+        if state != {"status": "unsigned"} or claimed:
+            raise ValueError(
+                "Windows signing is not configured, but the windows-x64 receipt "
+                "does not record an unsigned archive"
+            )
+        return state
+    expected = signer_thumbprint.upper()
+    state = state if isinstance(state, dict) else {}
+    publisher = state.get("publisher")
+    if (
+        state.get("status") != "signed"
+        or state.get("signerThumbprint") != expected
+        or not isinstance(publisher, str)
+        or not publisher.strip()
+    ):
+        raise ValueError(
+            f"windows-x64 receipt does not record a signature by the configured certificate {expected}"
+        )
+    missing = AUTHENTICODE_SMOKE_CHECKS - claimed
+    if missing:
+        raise ValueError(f"windows-x64 receipt is missing signing checks: {sorted(missing)}")
+    return {"status": "signed", "signerThumbprint": expected, "publisher": publisher}
 
 
 def _proof_files(
@@ -212,6 +296,7 @@ def _proof_files(
     tag: str,
     android_build_result: str,
     android_attestation_result: str,
+    windows_signer_thumbprint: str,
 ) -> tuple[list[dict], dict]:
     archives = {
         path.name: path for path in _release_assets(directory, RELEASE_ASSET_SUFFIXES)
@@ -278,16 +363,19 @@ def _proof_files(
                 or not isinstance(sbom.get("serialNumber"), str)
             ):
                 raise ValueError(f"SBOM is not CycloneDX JSON: {sbom_path}")
-            records.append(
-                {
-                    "proofId": proof_id,
-                    "name": artifact.name,
-                    "size": artifact.stat().st_size,
-                    "sha256": digest,
-                    "smokeReceipt": smoke_path.name,
-                    "sbom": sbom_path.name,
-                }
-            )
+            record = {
+                "proofId": proof_id,
+                "name": artifact.name,
+                "size": artifact.stat().st_size,
+                "sha256": digest,
+                "smokeReceipt": smoke_path.name,
+                "sbom": sbom_path.name,
+            }
+            if proof_id == AUTHENTICODE_PROOF_ID:
+                record["authenticode"] = _authenticode_state(
+                    smoke, checks, windows_signer_thumbprint
+                )
+            records.append(record)
         except (OSError, ValueError) as exc:
             if proof_id not in ANDROID_DOWNLOAD_IDS:
                 raise
@@ -321,6 +409,7 @@ def _release_notes(
     records: Iterable[dict],
     android: dict,
     run_url: str,
+    waived: dict[str, str],
 ) -> str:
     short_commit = commit[:12]
     verify_base = (
@@ -359,6 +448,23 @@ def _release_notes(
             repository=repository,
         )
         lines.append(f"- **{label}:** [{name}]({url})")
+    authenticode = records_by_id[AUTHENTICODE_PROOF_ID]["authenticode"]
+    if authenticode["status"] == "signed":
+        lines.extend([
+            "",
+            "Windows: `Ouroboros.exe` in the ZIP carries a timestamped Authenticode signature "
+            f"from **{authenticode['publisher']}** (certificate SHA-1 "
+            f"`{authenticode['signerThumbprint']}`). The other files in the ZIP are not "
+            "signed individually, and SmartScreen may still warn while the publisher's "
+            "reputation builds.",
+        ])
+    else:
+        lines.extend([
+            "",
+            "Windows: this ZIP is unsigned. The release was built without a configured "
+            "code-signing certificate, so Windows reports an unknown publisher; check the "
+            "download against `SHA256SUMS` and its attestations below.",
+        ])
     if android["status"] != "verified":
         lines.extend([
             "",
@@ -382,11 +488,24 @@ def _release_notes(
         "",
         "## Release proof",
         "",
-        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}).",
-        "The release workflow passed the full test matrix, UI and Docker smoke tests, skill smoke tests, and packaged artifact smoke tests before publication.",
+        f"This release was built from [`{short_commit}`](https://github.com/{repository}/commit/{commit}) "
+        f"by [this workflow run]({run_url}).",
+        # Actual job conclusions, never a fixed claim; the owner exception is stated separately.
+        (
+            "Not every test job passed: "
+            + ", ".join(f"`{name}` {result}" for name, result in waived.items())
+            + f". The project owner approved releasing {tag} alone from this commit and run with "
+            "these results disclosed; follow-up patches will address them. Every other required release job "
+            "succeeded, including required provider integration, marker guards, Docker and skill "
+            "smoke tests, the build, Windows proof and packaged artifact smoke tests."
+            if waived else
+            "The release workflow passed the full test matrix, required provider integration, "
+            "system E2E, UI and Docker smoke tests, skill smoke tests, and packaged artifact "
+            "smoke tests before publication."
+        ),
         "",
         "- `SHA256SUMS` covers every installable platform artifact, its SBOM, and its smoke receipt.",
-        "- `release-evidence.json` binds the tag, commit, workflow run, artifact hashes, SBOMs, and smoke receipts.",
+        "- `release-evidence.json` binds the tag, commit, workflow run, each release job's actual conclusion, artifact hashes, SBOMs, and smoke receipts.",
         "- Each installable platform artifact has GitHub build provenance and a CycloneDX SBOM attestation.",
         f"- Verify build provenance with `{verify_base}`.",
         f"- Verify the CycloneDX attestation with `{verify_base} --predicate-type https://cyclonedx.org/bom`.",
@@ -409,6 +528,13 @@ def command_assemble(args: argparse.Namespace) -> None:
     release_date, description = _read_release_description(args.readme, version)
     if not re.fullmatch(r"[0-9a-f]{40}", args.commit):
         raise ValueError("commit must be a full lowercase Git SHA")
+    # Set but malformed is a broken configuration, never an unsigned release.
+    if args.windows_signer_thumbprint and not re.fullmatch(
+        r"[0-9A-Fa-f]{40}", args.windows_signer_thumbprint
+    ):
+        raise ValueError("ESIGNER_CERT_SHA1 is set but is not a 40-hex SHA-1 thumbprint")
+    eligible = (args.repository, args.tag) == (OWNER_EXCEPTION_REPOSITORY, OWNER_EXCEPTION_TAG)
+    gates, waived = _gate_results(args.gate_result, owner_exception=eligible)
     records, android = _proof_files(
         args.directory,
         version,
@@ -416,6 +542,7 @@ def command_assemble(args: argparse.Namespace) -> None:
         tag=args.tag,
         android_build_result=args.android_build_result,
         android_attestation_result=args.android_attestation_result,
+        windows_signer_thumbprint=args.windows_signer_thumbprint,
     )
     checksum_targets = _checksum_targets(args.directory, records)
     checksums = "".join(
@@ -425,7 +552,8 @@ def command_assemble(args: argparse.Namespace) -> None:
 
     generated_at = args.generated_at or dt.datetime.now(dt.timezone.utc).isoformat()
     evidence = {
-        "schemaVersion": 1,
+        # 2: gates carry actual job conclusions and ownerException is recorded.
+        "schemaVersion": 2,
         "kind": "build_time_release_proof",
         "product": "Ouroboros",
         "version": version,
@@ -437,8 +565,23 @@ def command_assemble(args: argparse.Namespace) -> None:
         },
         "workflow": {
             "runUrl": args.run_url,
-            "gates": [{"name": name, "status": args.android_build_result
-                       if name == "android-build" else "passed"} for name in RELEASE_GATES],
+            "gates": [
+                *({"name": name, "status": status} for name, status in gates.items()),
+                # Verified above from every selected asset's bound receipt.
+                {"name": "packaged-artifact-smoke", "status": "passed"},
+                {"name": "android-build", "status": args.android_build_result},
+            ],
+            # Eligibility is the exact official tag; waivedGates lists what it was used for.
+            "ownerException": {
+                "decision": "Owner decision of 2026-10-17: release v7.7.0 with any residual red "
+                            "test lanes disclosed; follow-up patches will address them.",
+                "repository": args.repository,
+                "tag": args.tag,
+                "commit": args.commit,
+                "runUrl": args.run_url,
+                "publication": "held at a verified draft for an explicit owner publish",
+                "waivedGates": [{"name": name, "status": status} for name, status in waived.items()],
+            } if eligible else None,
         },
         "experimentalAndroid": android,
         "generatedAt": generated_at,
@@ -472,6 +615,7 @@ def command_assemble(args: argparse.Namespace) -> None:
             records=records,
             android=android,
             run_url=args.run_url,
+            waived=waived,
         ),
         encoding="utf-8",
     )
@@ -520,6 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
     locate = commands.add_parser("locate", help="locate and hash one built archive")
     locate.add_argument("--directory", type=Path, default=Path("dist"))
     locate.add_argument("--github-output", type=Path)
+    locate.add_argument("--expect-sha256", help="fail unless the archive has this digest")
     locate.set_defaults(func=command_locate)
 
     smoke = commands.add_parser("record-smoke", help="write a passed smoke receipt")
@@ -529,6 +674,8 @@ def build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--commit", required=True)
     smoke.add_argument("--tag", required=True)
     smoke.add_argument("--check", action="append", default=[])
+    smoke.add_argument("--authenticode-thumbprint", default="")
+    smoke.add_argument("--authenticode-publisher", default="")
     smoke.set_defaults(func=command_record_smoke)
 
     assemble = commands.add_parser("assemble", help="assemble the release proof capsule")
@@ -544,6 +691,10 @@ def build_parser() -> argparse.ArgumentParser:
     assemble.add_argument("--notes-output", type=Path, required=True)
     assemble.add_argument("--android-build-result", choices=("success", "failure", "cancelled", "skipped", "not_run"), default="not_run")
     assemble.add_argument("--android-attestation-result", choices=("success", "failure", "not_run"), default="not_run")
+    # Required, possibly empty: the release states which Windows mode it expects.
+    assemble.add_argument("--windows-signer-thumbprint", required=True)
+    # One per RELEASE_GATES job, its actual result: ``--gate-result full-test=failure``.
+    assemble.add_argument("--gate-result", action="append", default=[], metavar="JOB=RESULT")
     assemble.add_argument("--github-output", type=Path)
     assemble.set_defaults(func=command_assemble)
 

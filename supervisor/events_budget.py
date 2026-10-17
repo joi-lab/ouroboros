@@ -15,6 +15,12 @@ import pathlib
 import time
 import uuid
 from typing import Any, Dict, Optional
+from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
+from ouroboros.contracts.record_contract import RECORD_CONTRACT_VERSION
+from ouroboros.event_usage import event_token_counts
+# The hold carrier and the row's selection against a latch live with the pause owner,
+# so reservation reads the very predicate assignment does; re-exported here.
+from ouroboros.budget_pause import BUDGET_HOLD_KEY, budget_fence_selected, budget_hold_fact  # noqa: F401
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
@@ -42,10 +48,12 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
         if isinstance(_m, dict):
             _m["last_progress_at"] = time.time()
             # Task-tree attribution: the durable llm_usage row declares
-            # root/parent/delegation/lane fields, but worker-side emitters do
-            # not know the queue lineage. The supervisor DOES — fill the gaps
-            # from the authoritative RUNNING record so per-tree cost rollups
-            # over events.jsonl become possible (emitter-supplied values win).
+            # root/parent/delegation/lane fields. The worker's per-task endpoint
+            # (``log_addressing.task_event_queue``) stamps them by value at the
+            # producer, so a usage row handled after its task left RUNNING (the
+            # telemetry lane is served after control) keeps its attribution;
+            # the RUNNING record only fills a gap an older or partial emitter
+            # left (emitter-supplied values win).
             _task = _m.get("task") if isinstance(_m.get("task"), dict) else {}
             for _field in (
                 "root_task_id", "parent_task_id", "delegation_role",
@@ -54,35 +62,12 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
                 if not evt.get(_field) and _task.get(_field):
                     evt[_field] = str(_task.get(_field))
 
-    # Normalize usage across loop.py, web_search, and delegated-run producers.
-    # Tolerant coercion: one malformed token field must not raise and drop the
-    # whole round from the budget ledger and events.jsonl (the exception would
-    # be swallowed by dispatch_event and the cost silently lost).
-    def _tolerant_int(*candidates: Any) -> int:
-        for value in candidates:
-            if value in (None, ""):
-                continue
-            try:
-                return int(float(value))
-            except (TypeError, ValueError):
-                log.warning("llm_usage: non-numeric token field %r ignored", value)
-        return 0
-
-    prompt_tokens = _tolerant_int(
-        usage.get("prompt_tokens"), usage.get("input_tokens"), evt.get("prompt_tokens")
-    )
-    completion_tokens = _tolerant_int(
-        usage.get("completion_tokens"), usage.get("output_tokens"), evt.get("completion_tokens")
-    )
-    cached_tokens = _tolerant_int(usage.get("cached_tokens"), evt.get("cached_tokens"))
-    cache_write_tokens = _tolerant_int(
-        usage.get("cache_write_tokens"), evt.get("cache_write_tokens")
-    )
-    prompt_cache_ttl = str(
-        usage.get("prompt_cache_ttl")
-        or evt.get("prompt_cache_ttl")
-        or ""
-    )
+    # Normalize usage across loop.py, web_search, review and delegated-run producers.
+    # Each counter keeps its own knowledge state (#1578): a missing or malformed field
+    # neither drops the event (dispatch_event would swallow it, losing the round) nor
+    # claims the provider measured zero tokens.
+    token_counts = event_token_counts(usage, evt)
+    prompt_cache_ttl = str(usage.get("prompt_cache_ttl") or evt.get("prompt_cache_ttl") or "")
     ledger_attempt_ids = [
         str(value)
         for value in (usage.get("ledger_attempt_ids") or evt.get("ledger_attempt_ids") or [])
@@ -123,6 +108,7 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     usage_event = {
         "ts": evt.get("ts", utc_now_iso()),
         "type": "llm_usage",
+        "record_contract_version": RECORD_CONTRACT_VERSION,
         "task_id": evt.get("task_id", ""),
         "root_task_id": evt.get("root_task_id", ""),
         "parent_task_id": evt.get("parent_task_id", ""),
@@ -134,16 +120,15 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
         "model": evt.get("model", ""),
         "api_key_type": evt.get("api_key_type", ""),
         "model_category": evt.get("model_category", "other"),
-        "provider": evt.get("provider", ""),
+        "provider": evt.get("provider") or usage.get("provider", ""),
         "source": evt.get("source", ""),
-        **{key: evt[key] for key in ("llm_call_id", "execution_id", "round_id", "round") if key in evt},
+        **{key: evt[key] for key in ("llm_call_id", "execution_id", "round_id", "round", "session_id") if key in evt},
+        **({"session_id": usage["session_id"]} if "session_id" not in evt and usage.get("session_id") else {}),
+        **{key: str(evt[key]) for key in REVIEW_ATTRIBUTION_KEYS if evt.get(key)},  # #807: the review wave/slot
         "cost_estimated": bool(evt.get("cost_estimated", False)),
         "cost": resolved_cost,
         "cost_known": cost_known,
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "cached_tokens": cached_tokens,
-        "cache_write_tokens": cache_write_tokens,
+        **token_counts,
         "prompt_cache_ttl": prompt_cache_ttl,
         "accounting_authority": "physical_attempt_ledger",
         "projection_update_status": projection_update_status,
@@ -167,15 +152,21 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
         log.debug("Failed to forward llm_usage to live logs", exc_info=True)
 
 
-def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any]) -> Dict[str, Any]:
-    """Install the sole root-budget admission marker; caller holds queue lock."""
+def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any], *,
+                                  prior_root: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Install the sole root-budget latch under the queue lock.
+
+    Restore supplies the root row BEFORE parking changed its carriers; live
+    callers still read the queue. Its selection must match the CURRENT latch.
+    """
     from supervisor import queue as queue_mod
 
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id:
         raise ValueError("root budget pause requires root_task_id")
     existing = queue_mod.BUDGET_ROOT_FENCES.get(root_task_id)
-    root_rows = list(queue_mod.PENDING) + [m.get("task", {}) for m in queue_mod.RUNNING.values()]
+    root_rows = ([prior_root] if prior_root is not None else
+                 list(queue_mod.PENDING) + [m.get("task", {}) for m in queue_mod.RUNNING.values()])
     resumed = any(str(t.get("id") or "") == root_task_id and budget_fence_selected(t, existing)
                   for t in root_rows)
     row = {
@@ -216,6 +207,66 @@ def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any]) -> D
     return row
 
 
+def finish_resume_clock(meta: dict, paused_sec: float) -> None:
+    """Apply a confirmed total to the matched interval, preserving Resume selection."""
+    task = meta["task"]
+    resume = task.get("_budget_pause_resume") or {}
+    meta["budget_paused_sec"] = paused_sec
+    meta.pop("sleep_parked_at", None)
+    if resume.get("authority") == "explicit_resume":
+        task["_budget_pause_resume"] = {key: value for key, value in resume.items()
+                                       if key != "sleep_exclusion_since"}
+    else:
+        task.pop("_budget_pause_resume", None)
+
+
+def _resume_observation(meta: dict, drive_root: Any) -> dict:
+    from ouroboros.budget_pause import budget_pause_row
+
+    task = meta["task"]
+    if not (task.get("_budget_pause_resume") or {}).get("sleep_exclusion_since"):
+        return {}  # No pending clock observation: ordinary recovery needs no storage read.
+    return budget_pause_row(pathlib.Path(task.get("budget_drive_root") or drive_root), task["id"])
+
+
+def _apply_consumed_resume(meta: Any, row: dict, evt: Optional[Dict[str, Any]] = None) -> bool:
+    """Project the matching consumption; lineage permission belongs to Resume admission."""
+    from ouroboros.budget_pause import STATE_RESUMED
+
+    task = meta.get("task") if isinstance(meta, dict) else None
+    resume = (task.get("_budget_pause_resume") if isinstance(task, dict) else None) or {}
+    evt = evt or {"task_attempt": meta.get("attempt") if isinstance(meta, dict) else None,
+                  **{key: resume.get(key) for key in ("pause_id", "grant_id")}}
+    if (not isinstance(task, dict) or meta.get("attempt") != evt.get("task_attempt")
+            or resume.get("pause_id") != evt.get("pause_id")
+            or resume.get("grant_id") != evt.get("grant_id")
+            or not resume.get("sleep_exclusion_since")
+            or meta.get("sleep_parked_at") != resume["sleep_exclusion_since"]):
+        return False
+    grant = row.get("grant") or {}
+    if (row.get("state") != STATE_RESUMED
+            or row.get("pause_id") != evt.get("pause_id")
+            or grant.get("grant_id") != evt.get("grant_id") or not grant.get("consumed_at")
+            or grant.get("revoked_at")
+            or row.get("source_ref") != resume.get("source_ref")
+            or row.get("pause_generation") != resume.get("pause_generation")
+            or grant.get("generation") != resume.get("grant_generation")
+            or grant.get("granted_at_ts") != resume["sleep_exclusion_since"]
+            or row.get("task_attempt") != evt.get("task_attempt")):
+        return False
+    finish_resume_clock(meta, float(row["paused_duration_sec"]))
+    return True
+
+
+def fold_consumed_resume(meta: Any, drive_root: Any, evt: Optional[Dict[str, Any]] = None) -> bool:
+    """Recover a captured clock from storage; an unavailable observation changes nothing."""
+    try:
+        row = _resume_observation(meta, drive_root)
+    except Exception:
+        return False
+    return _apply_consumed_resume(meta, row, evt)
+
+
 def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
     """Move a paused task back to the same durable queue generation.
 
@@ -225,31 +276,28 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
     THAT row, never against the event's prose.
     """
     if evt.get("phase") == "consumed":
-        from ouroboros.budget_pause import budget_pause_row, STATE_RESUMED
+        from ouroboros.store import acquisition_budget, StoreBusy
         from supervisor.queue import _queue_lock
 
+        task_id = str(evt.get("task_id") or "")
         with _queue_lock:
-            meta = ctx.RUNNING.get(str(evt.get("task_id") or ""))
-            if not isinstance(meta, dict) or meta.get("attempt") != evt.get("task_attempt"):
+            meta = ctx.RUNNING.get(task_id)
+            if not isinstance(meta, dict):
                 return
-            task = meta.get("task") or {}
-            resume = task.get("_budget_pause_resume") or {}
-            if (resume.get("pause_id") != evt.get("pause_id")
-                    or resume.get("grant_id") != evt.get("grant_id")
-                    or not resume.get("sleep_exclusion_since")
-                    or meta.get("sleep_parked_at") != resume["sleep_exclusion_since"]):
-                return
-            row = budget_pause_row(pathlib.Path(task.get("budget_drive_root") or ctx.DRIVE_ROOT), task["id"])
-            grant = row.get("grant") or {}
-            if (row.get("state") != STATE_RESUMED or row.get("reason") != "sleep"
-                    or row.get("pause_id") != evt.get("pause_id")
-                    or grant.get("grant_id") != evt.get("grant_id") or not grant.get("consumed_at")
-                    or grant.get("granted_at_ts") != resume["sleep_exclusion_since"]
-                    or row.get("task_attempt") != evt.get("task_attempt")):
-                return
-            meta["budget_paused_sec"] = float(row["paused_duration_sec"])
-            meta.pop("sleep_parked_at", None)
-            task.pop("_budget_pause_resume", None)
+            captured = {"task": dict(meta.get("task") or {})}
+        try:
+            with acquisition_budget(0):
+                observed = _resume_observation(captured, ctx.DRIVE_ROOT)
+        except StoreBusy as exc:
+            if exc.reason != "contention":
+                log.warning("Resume clock store unavailable for %s: %s", task_id, exc)
+            return  # The existing assignment tick reobserves the same consumption.
+        except Exception:
+            log.warning("Resume clock observation unavailable for %s", task_id, exc_info=True)
+            return
+        with _queue_lock:
+            if ctx.RUNNING.get(task_id) is meta:
+                _apply_consumed_resume(meta, observed, evt)
         return
     task_id = str(evt.get("task_id") or "")
     pause = evt.get("resource_limit") if isinstance(evt.get("resource_limit"), dict) else {}
@@ -304,8 +352,6 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
             resource_limit=pause,
             result="Task paused before its first model dispatch; explicit resume or cancel required.",
         )
-        from ouroboros.pause_notices import track
-        track(ctx.DRIVE_ROOT, task_id)
     except Exception:
         log.warning("Failed to persist budget pause for %s", task_id, exc_info=True)
     event = {
@@ -326,9 +372,37 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Failed to forward budget pause to Activity", exc_info=True)
 
 
+def _owner_park_fence_id(result_root: pathlib.Path, root_task_id: str) -> Optional[str]:
+    """The fence an owner Pause's parked root latch projects (#1730), or ``None``. Queue lock held.
+
+    Its root's CURRENT closed durable fence: the one ``request_owner_pause`` latched,
+    every Resume binds and lifts the latch on, and restore raises
+    (``queue_snapshot._raise_parked_root_fences``). The fence a row parked under is
+    history once a newer Pause supersedes it, possibly with its own latch still
+    ``latch_pending``, so it is never projected. Released authority projects nothing
+    (``""``: the generation rule). ``None``: the read failed (Q-held reads never wait),
+    so the current fence is unknown and ``install_exact_budget_pause`` publishes none.
+    """
+    from ouroboros.owner_pause import fence_closed, read_fence
+    from ouroboros.store import acquisition_budget
+
+    try:
+        with acquisition_budget(0):
+            current = read_fence(result_root, root_task_id)
+    except Exception:
+        log.warning("Owner fence of %s is unreadable at its park", root_task_id, exc_info=True)
+        return None
+    return str(current.get("fence_id") or "") if fence_closed(current) else ""
+
+
+class OwnerFenceUnknown(RuntimeError):
+    """A deferring park met an unreadable current owner fence; nothing was changed."""
+
+
 def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any], *,
                                evt: Dict[str, Any] | None = None,
-                               source: str = "worker_event") -> Dict[str, Any]:
+                               source: str = "worker_event",
+                               defer_unknown_owner_fence: bool = False) -> Dict[str, Any]:
     """Park the SAME task id under its exact continuation: RUNNING -> PENDING.
 
     Order: durable row must already say ``pausing`` for this pause_id/attempt
@@ -346,6 +420,12 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
     carries the turn's own task record (``task`` beside ``_is_direct_chat``),
     and THAT record is what the SAME task id is parked under (#1196). The row
     check above still decides; the record only supplies the queue row.
+
+    An owner Pause's root latch names its current durable fence (``_owner_park_fence_id``).
+    When that read fails, the death recoveries (``defer_unknown_owner_fence``) raise
+    ``OwnerFenceUnknown`` before any change and replay from their retained reaper job; a
+    live or direct park, which nothing replays, keeps the standing latch and mints none:
+    the durable fence still refuses every launch, as for an accepted ``latch_pending``.
     """
     from ouroboros.budget_pause import (
         STATE_PAUSED, STATE_PAUSING, budget_pause_row, exact_pause_marker, set_budget_pause,
@@ -381,9 +461,35 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
         if (row.get("pause_id") != pause_id or row.get("state") not in {STATE_PAUSING, STATE_PAUSED}
                 or int(row.get("task_attempt") or 0) != attempt or not row.get("source_ref")):
             raise ValueError(f"exact budget pause {pause_id} has no live durable row for attempt {attempt}")
+        if row.get("external_custody"):
+            from ouroboros.sleep_custody import accepted_receipt
+            if not accepted_receipt(task_id, row):
+                raise ValueError("cold external custody has no exact body acceptance")
         marker = exact_pause_marker(row, default_root=str(task.get("root_task_id") or task_id))
-        if marker["scope"] == "root":
-            fence = _set_root_budget_pause_locked(marker["root_task_id"], marker)
+        owner_fence = (_owner_park_fence_id(result_root, marker["root_task_id"])
+                       if marker["scope"] == "root" and row.get("reason") == "owner" else "")
+        if owner_fence is None and defer_unknown_owner_fence:
+            raise OwnerFenceUnknown(f"current owner fence of {marker['root_task_id']} is unreadable")
+        # Bind this exact park to its physical owner's fence: the parking pooled attempt/PID, or
+        # the direct turn's own in-process fence (no pooled owner). On the in-memory fence it survives
+        # marker reconstruction on revocation; a boot restores no fence row. No token enters cognition.
+        fence = queue_mod.ACCEPTANCE_FENCES.get(marker["root_task_id"]) or {}
+        worker = ctx.WORKERS.get(meta.get("worker_id"))
+        owner = fence.get("pooled_owner")
+        parked = {"direct_owner": {"task_attempt": attempt}} if direct_turn and "pooled_owner" not in fence else None
+        if (not direct_turn and worker is not None and isinstance(owner, dict) and worker.busy_task_id == task_id
+                and type(owner.get("pid")) is int and owner["pid"] == worker.proc.pid
+                and type(owner.get("task_attempt")) is int and owner["task_attempt"] == attempt):
+            parked = {"pooled_owner": dict(owner)}
+        if parked and fence.get("status") == "active" and fence.get("task_id") == task_id:
+            fence["paused_continuation"] = {**parked,
+                **{key: row[key] for key in ("pause_id", "pause_generation", "source_ref")}}
+        if marker["scope"] == "root" and owner_fence is None:
+            standing = queue_mod.BUDGET_ROOT_FENCES.get(marker["root_task_id"])
+            marker = {**marker, **({"fence_id": standing["fence_id"]} if standing else {})}
+        elif marker["scope"] == "root":
+            fence = _set_root_budget_pause_locked(
+                marker["root_task_id"], {**marker, **({"fence_id": owner_fence} if owner_fence else {})})
             marker = {**marker, "fence_id": fence["fence_id"]}
         ctx.RUNNING.pop(task_id, None)
         paused_task = dict(task)
@@ -463,12 +569,13 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
             try:
                 from supervisor.state import reconstruct_task_cost
 
-                owner = str(row.get("reason") or "") == "owner"
+                reason = str(row.get("reason") or "")
+                cause = {"owner": "owner Pause", "authority": str(row.get("rail") or "").replace("_", " ")}.get(reason, "budget")
                 cost_fields = reconstruct_task_cost(task_id, fields=True, drive_root=result_root)
                 write_task_result(
-                    result_root, task_id, STATUS_SCHEDULED,
-                    reason_code="owner_paused" if owner else "budget_paused", resource_limit=marker,
-                    result=(f"Task paused exactly at a completed boundary ({'owner Pause' if owner else 'budget'})"
+                    result_root, task_id, STATUS_SCHEDULED, resource_limit=marker,
+                    reason_code={"owner": "owner_paused", "authority": "authority_paused"}.get(reason, "budget_paused"),
+                    result=(f"Task paused exactly at a completed boundary ({cause})"
                             + ("; delegated work it had already sent is still running" if unsettled else "")
                             + ". Cumulative spend, rounds and execution time are retained; an explicit owner "
                             "Resume continues the same task."),
@@ -488,7 +595,7 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
             "toast_once": f"{task_id}:budget-paused:{pause_id}",
             "pause_source": source,
             "park_state": STATE_PAUSED if confirmed else STATE_PAUSING,
-            **({"pause_reason": "owner"} if str(row.get("reason") or "") == "owner" else {}),
+            **({"pause_reason": str(row["reason"])} if row.get("reason") in {"owner", "authority"} else {}),
             **{key: value for key, value in marker.items() if key != "checkpoint"},
             "pause_id": pause_id,
             "external_runs": [
@@ -521,7 +628,8 @@ def _handle_budget_resume_child(evt: Dict[str, Any], ctx: Any) -> None:
     """Owner Q9: a resumed root's model SELECTS one budget-paused child to continue.
 
     The requester must be the live parent/root of the target (its tree, not any
-    tree); the grant itself goes through the ONE resume seam, so every typed
+    tree): a root selects any stored descendant, an intermediate parent only its
+    direct children. The grant itself goes through the ONE resume seam, so every typed
     refusal (money, cancel intent, deadline, lifetime, root still paused) is the
     same the owner would receive. The outcome is recorded as an event the
     requesting task can read back; nothing is auto-fanned-out.
@@ -598,8 +706,6 @@ def _handle_budget_root_fence(evt: Dict[str, Any], ctx: Any) -> None:
 # whose spent grant could not be revoked, so an un-dispatchable row is always a
 # typed, visible fact instead of a dropped or silently runnable task.
 
-BUDGET_HOLD_KEY = "_budget_pause_hold"
-
 # The typed hold reasons (one vocabulary for the queue row, the task result and
 # the events log). A hold beside a retained ``_budget_pause`` marker is released
 # by a successful exact grant (the grant re-validates the durable authority);
@@ -633,54 +739,47 @@ HOLD_CONTINUATION_WRITER = "continuation_writer_unsettled"
 # explicit Resume after the owner's next launch does (a Restart holds it the
 # same way under ``owner_restart_hold``).
 HOLD_PANIC = "panic_hold"
+# Quit, crash, Panic or an unacknowledged restart: explicit same-ID Resume (restart_retention).
+HOLD_SAVED_WORK = "saved_work_hold"
+# An owner Pause seed whose attempt the idle reaper killed with no usable saved state: pause
+# intent, never an exact pause; the same id waits for explicit Resume (worker_health, #1729).
+HOLD_UNSAVED_PAUSE = "unsaved_pause_intent"
 SELECTABLE_HOLD_REASONS = frozenset({
     HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION, HOLD_OWNER_RESTART, HOLD_CONTINUATION_WRITER,
-    HOLD_PANIC})
+    HOLD_PANIC, HOLD_SAVED_WORK, HOLD_UNSAVED_PAUSE})
+# The holds an owner's own root Resume of its Pause releases with the Pause (queue_transitions).
+OWNER_ROOT_RESUME_HOLDS = frozenset({
+    HOLD_OWNER_RESTART, HOLD_SAVED_WORK, HOLD_UNSAVED_PAUSE, HOLD_CONTINUATION_WRITER})
 # Malformed acceptance-fence evidence in the snapshot fails the restore closed
 # for ordinary rows; a saved exact pause is retained under this hold instead.
 HOLD_INVALID_ACCEPTANCE_FENCE_SNAPSHOT = HOLD_RESTORE_REFUSED_PREFIX + "invalid_acceptance_fence_snapshot"
 HOLD_INVALID_BUDGET_FENCE_SNAPSHOT = HOLD_RESTORE_REFUSED_PREFIX + "invalid_budget_fence_snapshot"
 
 
-def budget_hold_fact(task) -> Optional[Dict[str, Any]]:
-    """The durable NON-dispatch hold on one queued row (#1196), or ``None``.
+def native_read_gap_hold(task: Dict[str, Any], hold: Dict[str, Any]) -> bool:
+    """A technical obstruction to the governing native wait, never a monetary selection."""
+    from ouroboros.budget_pause import RESTORE_REFUSAL_RECORD_UNREADABLE
+    from supervisor.task_admission import governing_continuation
 
-    Three shapes share it and none invents a checkpoint identity (no pause_id,
-    no ``exact_continuation``): a zero-dispatch sibling whose paused root's
-    admission fence was lifted by that root's Resume — lifting the fence must
-    not make it assignable, the model selects it explicitly (owner Q9) — a row
-    whose exact continuation could not be restored, and a row whose spent
-    grant could not be revoked. ``selected`` is the only release.
-    """
-    if isinstance(task, dict) and task.get("_continuation_prepared"):
-        return {"reason": "continuation_publication_unconfirmed", "selected": False, "dispatchable": False}
-    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task, dict) else None
-    return hold if isinstance(hold, dict) and not hold.get("selected") else None
+    return (hold.get("reason") in {HOLD_RESTORE_REFUSED_PREFIX + "owner_wait_source_unavailable",
+                                    HOLD_RESTORE_REFUSED_PREFIX + RESTORE_REFUSAL_RECORD_UNREADABLE}
+            and governing_continuation(task) == "owner_wait" and isinstance(task.get("_owner_wait_resume"), dict))
 
 
-def budget_fence_selected(task: Any, fence: Any) -> bool:
-    """Whether THIS row carries an explicit selection recorded against THIS fence.
-
-    A root's admission latch keeps a whole tree out of the queue. The owner (or,
-    under the root's live grant, the model) may select ONE member of that tree
-    without lifting the latch for its siblings: the selection rides the row's own
-    hold and names the fence generation it was granted against, so a later fence
-    — a root that paused again — is never pre-released by an older selection
-    (#1196, owner Q9).
-    """
-    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task, dict) else None
-    fence_id = str((fence or {}).get("fence_id") or "") if isinstance(fence, dict) else ""
-    return bool(isinstance(hold, dict) and hold.get("selected") and fence_id
-                and str(hold.get("fence_id") or "") == fence_id)
+def hold_selectable(task: Dict[str, Any], hold: Dict[str, Any]) -> bool:
+    """Whether this hold has an explicit selection path; selection still revalidates authority."""
+    return hold.get("reason") in SELECTABLE_HOLD_REASONS or native_read_gap_hold(task, hold)
 
 
-def budget_resume_dispatch_allowed(q: Any, task: Dict[str, Any]) -> bool:
+def budget_resume_dispatch_allowed(q: Any, task: Dict[str, Any]) -> Optional[bool]:
     """A child selection belongs to the CURRENT root grant and fence only.
 
     Both carriers are revalidated at dispatch: an exact grant handoff and a
     zero-dispatch hold selection alike name the root grant they were selected
     under, so a root that is pausing or paused again (with or without a new
     fence) admits neither on its old selection (#1196, owner Q9).
+    ``None`` holds this dispatch on unreadable retry/root-grant authority;
+    ``False`` retains stale-selection handling. Resolve the physical root once.
     """
     handoff = task.get("_budget_pause_resume")
     hold = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else None
@@ -717,20 +816,72 @@ def budget_resume_dispatch_allowed(q: Any, task: Dict[str, Any]) -> bool:
         return False
     if root_id == str(task.get("id") or ""):
         return True
-    root_grant = live_root_resume_grant(q, root_id, pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT))
-    return bool(carrier.get("selected_by") == "owner" and not carrier.get("root_grant_id") and not root_grant
-                or root_grant and carrier.get("root_grant_id") == root_grant["grant_id"]
-                and int(carrier.get("root_resume_generation") or 0) == int(root_grant["generation"]))
+    from ouroboros.cancel_intents import _validated_single_cancel_target
+
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    try:
+        actor_id = _validated_single_cancel_target(result_root, root_id)
+        owner_unbound = carrier.get('selected_by') == 'owner' and not carrier.get('root_grant_id')
+        if owner_unbound and actor_id == str(task.get('id') or ''):
+            return True
+        state = _root_resume_state(q, root_id, result_root, actor_id=actor_id)
+        live, durable = _root_resume_grants(state)
+    except Exception:
+        log.debug('Resume dispatch authority unreadable for %s', root_id, exc_info=True)
+        return None
+
+    def matches(grant):
+        return bool(grant and carrier.get('root_grant_id') == grant['grant_id']
+                    and int(carrier.get('root_resume_generation') or 0) == int(grant['generation']))
+
+    from ouroboros.budget_pause import STATE_PAUSED, STATE_PAUSING
+    from ouroboros.owner_pause import fence_closed
+
+    owner_unbound = (
+        carrier.get("selected_by") == "owner"
+        and not carrier.get("root_grant_id")
+    )
+    current_root = state["task"]
+    if not owner_unbound and (
+        isinstance(current_root.get("_budget_pause"), dict)
+        or budget_hold_fact(current_root) is not None
+        or current_root.get("_owner_hold")
+        or state["pause"].get("state") in {STATE_PAUSED, STATE_PAUSING}
+        or fence_closed(state["owner_fence"])
+    ):
+        return False
+
+    if 'root_resume_basis' in carrier:
+        basis = carrier['root_resume_basis']
+        if owner_unbound and fence_id and isinstance(basis, dict):
+            # This owner choice borrowed no root grant. The root parking on
+            # the same monetary latch does not supersede it; actor and owner
+            # fence identities (and the latch check above) still bind it.
+            basis = {**basis, 'budget': state['basis']['budget']}
+        if basis != state['basis']:
+            return False
+        # A current queue selection still supersedes an older choice. With no
+        # lender, unchanged durable identities preserve the choice already made.
+        return not live or matches(live)
+
+    # Legacy rows: accept matching evidence and the no-history case. Conflicting
+    # history takes the existing selectable-hold path, never a timestamp guess.
+    if live:
+        return matches(live)
+    if durable:
+        return matches(durable)
+    if owner_unbound:
+        return True
+    return not state['pause'] and not state['owner_fence'] and budget_hold_fact(state['task']) is None
 
 
 def hold_budget_row(task: Dict[str, Any], *, reason: str, detail: str = "",
                     extra: Optional[Dict[str, Any]] = None,
-                    result_root: Optional[pathlib.Path] = None) -> Dict[str, Any]:
+                    result_root: Optional[pathlib.Path] = None, existing_result_only: bool = False) -> Dict[str, Any]:
     """Hold one queued row: typed, visible, never dropped and never cancelled.
 
-    The row stays PENDING with its own identity; any spent resume handoff is
-    removed so no stale grant can dispatch, and the typed reason is projected
-    onto the task result so the owner and the model read the same fact.
+    Keep the PENDING identity, remove stale resume grants and project the same
+    reason to the result. Restore can require valid existing result authority.
     """
     hold = {"reason": str(reason), "detail": str(detail or "")[:300], "held_at": utc_now_iso(),
             "selected": False, "dispatchable": False, **(extra or {})}
@@ -740,11 +891,15 @@ def hold_budget_row(task: Dict[str, Any], *, reason: str, detail: str = "",
         try:
             write_task_result(
                 result_root, str(task.get("id") or ""), STATUS_SCHEDULED,
-                reason_code=(HOLD_OWNER_RESTART if reason == HOLD_OWNER_RESTART else
+                reason_code=(reason if reason in {HOLD_OWNER_RESTART, HOLD_SAVED_WORK} else
                              "owner_paused" if hold.get("cause") == "owner_pause" else "budget_paused"),
-                resource_limit={"status": "budget_hold", "auto_resume": False,
-                                "exact_continuation": False,
+                resource_limit={"status": "budget_hold", "auto_resume": False, "exact_continuation": False,
                                 "resume_policy": "explicit_selection_same_seam", **hold},
+                # Restoring accepted work must not manufacture a scheduled
+                # receipt over missing/corrupt authority. Keep the queue hold.
+                _field_projector=(lambda current, incoming: incoming if current else None)
+                    if existing_result_only else None,
+                strict_existing_dict=existing_result_only,
             )
         except Exception:
             log.debug("Budget hold projection failed for %s", task.get("id"), exc_info=True)
@@ -774,7 +929,7 @@ def hold_restored_budget_pause(task: Dict[str, Any], drive_root: Any, *, reason:
     return task
 
 
-def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict) -> tuple:
+def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict, *, actor_id: str = "") -> tuple:
     """Replace lifted-fence eligibility with per-child holds; retain exact pauses.
 
     A fence-derived marker is not a checkpoint: convert it to a selection hold
@@ -784,14 +939,16 @@ def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict)
     re-bound to the live grant in the same pass, so it stays selectable instead
     of refused forever as stale. Return ``(held, markers, rebound)``: the hold and
     marker changes and the prior re-bound holds, for the Resume transaction's
-    snapshot rollback; revocations stay safe.
+    snapshot rollback; revocations stay safe. ``actor_id``: the retry attempt
+    resuming as the root (``owner_pause.root_actor``) is that root, never a member.
     """
     from supervisor.budget_resume import revoke_exact_budget_resume
 
     held, markers, rebound = [], {}, {}
     for member in q.PENDING:
         member_id = str(member.get("id") or "")
-        if not member_id or member_id == root_id or str(member.get("root_task_id") or "") != root_id:
+        if (not member_id or member_id in {root_id, actor_id}
+                or str(member.get("root_task_id") or "") != root_id):
             continue
         if isinstance(member.get("_budget_pause_resume"), dict):
             revoke_exact_budget_resume(member, "root_resume_generation_changed")
@@ -807,6 +964,10 @@ def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict)
                                        "root_resume_generation": int(grant["generation"]),
                                        "cause": str(fence.get("cause") or ""),
                                        "rebound_at": utc_now_iso()}
+            # The latch was lifted; carrying its old id would make the newly
+            # selected child fail the dispatch fence comparison. Rollback above
+            # retains the original hold, including that id.
+            member[BUDGET_HOLD_KEY].pop("fence_id", None)
         if (pause is not None and not fence_derived) or hold is not None:
             continue
         if fence_derived:
@@ -828,22 +989,28 @@ def _held_selection_authority(q: Any, task: Dict[str, Any]) -> Dict[str, Any]:
     """Local selection identity under the queue lock; no transport or ledger I/O."""
     from types import SimpleNamespace
     from ouroboros.cancel_intents import cancel_pending
-    from ouroboros.owner_pause import member_fence
+    from ouroboros.owner_pause import consumed_member_resume, member_fence, root_actor
 
     task_id = str(task.get("id") or "")
     root_id = str(task.get("root_task_id") or task_id)
     result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
     predecessor = str(((task.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") or "")
     roots = {root_id, predecessor} - {""}
+    actor = root_actor(result_root, root_id, task_id, strict=True)
+    root_state = _root_resume_state(q, root_id, result_root,
+                                    actor_id=task_id if actor else None)
     return copy.deepcopy({
-        "task": task,
+        "task": task, "root_actor": actor,
         "fences": {root: q.BUDGET_ROOT_FENCES.get(root) for root in roots},
         "pending": [row for row in q.PENDING if str(row.get("root_task_id") or row.get("id") or "") in roots],
         "running": {tid: meta.get("task") for tid, meta in q.RUNNING.items()
                     if str((meta.get("task") or {}).get("root_task_id") or tid) in roots},
-        "root_grant": live_root_resume_grant(q, root_id, result_root) if root_id != task_id else {},
+        'root_grant': _root_resume_grants(root_state)[0] if not actor else {},
+        'root_resume_basis': root_state['basis'],
         "owner_fence": member_fence(SimpleNamespace(task_id=task_id, root_task_id=root_id,
                                                      drive_root=result_root)),
+        "consumed_resume": consumed_member_resume(result_root, root_id, task_id, attempt=int(
+            task["_working_recovery"].get("from_attempt") or 0)) if task.get("_working_recovery") else {},
         "cancel_pending": any(cancel_pending(result_root, tid, strict=True) for tid in {task_id, root_id}),
         "stop_flags": [name for name in ("owner_restart_no_resume.flag", "panic_stop.flag")
                        if (pathlib.Path(q.DRIVE_ROOT) / "state" / name).exists()],
@@ -858,7 +1025,7 @@ def observe_held_budget_selection(q: Any, task_id: str) -> Dict[str, Any]:
     invalidates this observation rather than inheriting its permission.
     """
     from supervisor.queue_transitions import pending_member_replay_safe
-    from supervisor.continuation_admission import conflicting_writers
+    from supervisor.continuation_admission import CONTINUE_PURPOSE, action_writers
 
     try:
         with q._queue_lock:
@@ -868,8 +1035,17 @@ def observe_held_budget_selection(q: Any, task_id: str) -> Dict[str, Any]:
             authority = _held_selection_authority(q, task)
         candidate = authority["task"]
         predecessor = str(((candidate.get("metadata") or {}).get("continuation") or {}).get("predecessor_task_id") or "")
-        blockers = conflicting_writers(q, predecessor) if predecessor else []
-        safe, error = pending_member_replay_safe(q, candidate)
+        blockers = action_writers(q, predecessor, purpose=CONTINUE_PURPOSE) if predecessor else []
+        if native_read_gap_hold(candidate, budget_hold_fact(candidate) or {}):
+            from ouroboros.owner_wait import restore_owner_wait_allowed
+
+            safe, error = False, "owner_held"
+            if not candidate.get("_owner_hold"):
+                root = pathlib.Path(candidate.get("budget_drive_root") or q.DRIVE_ROOT)
+                safe = restore_owner_wait_allowed(root, candidate, strict=True)
+                error = "" if safe else "dispatch_outcome_unknown"
+        else:
+            safe, error = pending_member_replay_safe(q, candidate)
         return {"candidate": task, "authority": authority, "blockers": blockers,
                 "safe": safe, "unsafe_error": error}
     except Exception:
@@ -881,15 +1057,15 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
                            *, selected_by: str, observation: Dict[str, Any]) -> Dict[str, Any]:
     """Record an explicit selection on a held row (queue lock held).
 
-    The hold is released ONLY here, and only for a row that still proves it
-    never dispatched. A model-issued selection additionally needs the live
+    Release requires current saved-continuation or never-dispatched evidence.
+    A model-issued selection additionally needs the live
     owner-derived Resume grant of its root: lifting a fence granted eligibility,
     never continuation.
     """
     task_id = str(task.get("id") or "")
     result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
     root_task_id = str(hold.get("root_task_id") or task.get("root_task_id") or task_id)
-    if hold.get("reason") not in SELECTABLE_HOLD_REASONS:
+    if not hold_selectable(task, hold):
         return {"ok": False, "error": str(hold.get("reason") or "budget_hold_unresolved")}
     if observation.get("error"):
         return {"ok": False, "error": observation["error"]}
@@ -901,7 +1077,10 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
             or current != observation.get("authority")
             or budget_hold_fact(task) != hold):
         return {"ok": False, "error": "selection_authority_changed"}
-    if current["cancel_pending"] or current["owner_fence"] or current["stop_flags"]:
+    native_read_gap = native_read_gap_hold(task, hold)
+    # This native repair cannot complete a shadow working carrier's root Resume.
+    completing = {} if selected_by or native_read_gap else current["consumed_resume"]
+    if current["cancel_pending"] or current["owner_fence"] and not completing or current["stop_flags"]:
         return {"ok": False, "error": "selection_owner_held"}
     continuation = ((task.get("metadata") or {}).get("continuation") or {}) if isinstance(
         task.get("metadata"), dict) else {}
@@ -910,10 +1089,14 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
         # whichever hold (its own, or a later Restart's) is being released.
         blockers = observation["blockers"]
         if blockers:
-            return {"ok": False, "error": "predecessor_writers_unsettled", "blockers": blockers[:20],
-                    "action": "wait_or_stop_the_previous_work"}
-    root_grant = live_root_resume_grant(q, root_task_id, result_root) if task_id != root_task_id else {}
-    if selected_by and task_id != root_task_id:
+            from supervisor.continuation_admission import writers_unsettled_refusal
+
+            return writers_unsettled_refusal(blockers)
+    # Use the identity already revalidated with this selection's snapshot.
+    # A reciprocal retry is the root actor even though its physical id differs.
+    actor = current["root_actor"]
+    root_grant = current["root_grant"]
+    if selected_by and not actor:
         if not root_grant:
             return {"ok": False, "error": "root_resume_grant_missing",
                     "root_task_id": root_task_id, "action": "resume_root_first"}
@@ -921,24 +1104,116 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
             return {"ok": False, "error": "root_resume_generation_stale",
                     "root_task_id": root_task_id, "action": "resume_root_first"}
     safe, unsafe_error = observation["safe"], observation["unsafe_error"]
+    if not safe and hold.get("reason") == HOLD_UNSAVED_PAUSE and "_working_recovery" not in task:
+        # Its attempt saved nothing: the fact is a missing continuation, not an unknown dispatch (#1729).
+        from ouroboros.budget_pause import RESTORE_REFUSAL_SOURCE_MISSING
+
+        return {"ok": False, "error": RESTORE_REFUSAL_SOURCE_MISSING, "action": "cancel_or_new_run",
+                "detail": "stopped while pausing, before anything was saved: there is nothing to continue"}
     if not safe:
         return {"ok": False, "error": unsafe_error, "action": "cancel_or_new_run"}
-    selection = {**hold, "selected": True, "selected_at": utc_now_iso(),
+    from ouroboros.control_actor import control_actor, mind_resume_refusal
+    if refusal := mind_resume_refusal(result_root, task):
+        return refusal
+    selection = {**hold, **control_actor(), "selected": True, "selected_at": utc_now_iso(),
                  "selected_by": str(selected_by or "owner")}
-    if task_id == root_task_id:
-        selection.update(root_grant_id=uuid.uuid4().hex, root_resume_generation=1)
-    elif root_grant:
-        # The selection names the root grant it was made under, so dispatch can
-        # recheck it exactly like an exact grant handoff (budget_resume_dispatch_allowed).
-        selection.update(root_grant_id=root_grant["grant_id"],
-                         root_resume_generation=int(root_grant["generation"]))
+    if not native_read_gap:
+        selection['root_resume_basis'] = current['root_resume_basis']
+        # A new owner choice does not inherit an obsolete upstream grant.
+        selection.pop('root_grant_id', None)
+        selection.pop('root_resume_generation', None)
+        latch = q.BUDGET_ROOT_FENCES.get(root_task_id) if not actor else None
+        if isinstance(latch, dict) and latch.get("cause") == "owner_pause" and not hold.get("fence_id"):
+            selection["fence_id"] = latch["fence_id"]  # it passed the owner fence: the selection names that latch
+        if actor:
+            selection.update(root_grant_id=uuid.uuid4().hex, root_resume_generation=1)
+        elif root_grant:
+            selection.update(root_grant_id=root_grant["grant_id"],
+                             root_resume_generation=int(root_grant["generation"]))
     prior_pause = task.pop("_budget_pause", None)
-    task[BUDGET_HOLD_KEY] = selection
-    if not q.persist_queue_snapshot(reason="budget_hold_selected"):
+
+    rebound, invalidated, exact_rebound = [], [], []
+    if not native_read_gap and actor and not q.BUDGET_ROOT_FENCES.get(root_task_id):
+        from supervisor.budget_resume import revoke_exact_budget_resume
+
+        for member in q.PENDING:
+            if (member is task or member.get('id') == root_task_id
+                    or member.get('root_task_id') != root_task_id):
+                continue
+            handoff = member.get('_budget_pause_resume')
+            if isinstance(handoff, dict):
+                if (handoff.get('authority') == 'explicit_resume'
+                        and handoff.get('selected_by') == 'owner'
+                        and not handoff.get('root_grant_id')
+                        and not handoff.get('root_fence_id')
+                        and not member.get('_budget_pause')
+                        and budget_hold_fact(member) is None
+                        and ('root_resume_basis' not in handoff
+                             or handoff['root_resume_basis'] == current['root_resume_basis'])):
+                    # Preserve the owner's existing choice, as for an unbound
+                    # selected hold below. Only its queue dispatch binding
+                    # changes; the exact single-use grant is not reissued.
+                    exact_rebound.append((member, handoff))
+                    continue
+                # As at fenced root Resume, revocation remains safe even if
+                # publication fails: an unused continuation is never replayed.
+                revoke_exact_budget_resume(member, 'root_resume_generation_changed')
+            prior = member.get(BUDGET_HOLD_KEY)
+            if not isinstance(prior, dict) or member.get('_budget_pause_resume'):
+                continue
+            stale_lifted = (not prior.get('selected')
+                            and prior.get('reason') == HOLD_ROOT_FENCE_LIFTED
+                            and prior.get('root_grant_id'))
+            unbound_owner = (prior.get('selected') and prior.get('selected_by') == 'owner'
+                             and not prior.get('root_grant_id') and not prior.get('fence_id'))
+            if stale_lifted or unbound_owner:
+                rebound.append((member, prior))
+            elif prior.get('selected'):
+                invalidated.append((member, prior))
+
+    def withdraw(persist: bool = True) -> None:
         task[BUDGET_HOLD_KEY] = dict(hold)
+        for member, prior in rebound + invalidated:
+            member[BUDGET_HOLD_KEY] = prior
+        for member, prior in exact_rebound:
+            member['_budget_pause_resume'] = prior
         if prior_pause is not None:
-            task["_budget_pause"] = prior_pause
-        return {"ok": False, "error": "snapshot_not_persisted"}
+            task['_budget_pause'] = prior_pause
+        if persist:
+            q.persist_queue_snapshot(reason='budget_hold_selection_withdrawn')
+
+    def publish() -> bool:
+        if native_read_gap:
+            task.pop(BUDGET_HOLD_KEY, None)  # Rejoin the same wait; no money or child grant is created.
+        else:
+            task[BUDGET_HOLD_KEY] = selection
+        for member, prior in exact_rebound:
+            member['_budget_pause_resume'] = {
+                **prior, 'root_grant_id': selection['root_grant_id'],
+                'root_resume_generation': selection['root_resume_generation'],
+                'root_resume_basis': current['root_resume_basis'],
+            }
+        for member, prior in rebound:
+            member[BUDGET_HOLD_KEY] = {
+                **prior, 'root_grant_id': selection['root_grant_id'],
+                'root_resume_generation': selection['root_resume_generation'],
+                'root_resume_basis': current['root_resume_basis'],
+            }
+            member[BUDGET_HOLD_KEY].pop('fence_id', None)
+        for member, prior in invalidated:
+            hold_budget_row(
+                member, reason=str(prior.get('reason') or HOLD_ROOT_FENCE_LIFTED),
+                detail='root_resume_generation_changed',
+                extra={'root_task_id': root_task_id})
+        return bool(q.persist_queue_snapshot(reason='budget_hold_selected'))
+
+    from ouroboros.owner_pause import complete_consumed_member_resume
+    refused = (complete_consumed_member_resume(result_root, root_task_id, task_id, completing, publish, withdraw)
+               if completing else "" if publish() else "snapshot_not_persisted")
+    if refused:
+        withdraw(persist=False)
+        return {"ok": False, "error": "snapshot_not_persisted" if refused == "snapshot_not_persisted"
+                else "selection_owner_held", **({"detail": refused} if completing else {})}
     try:
         write_task_result(result_root, task_id, STATUS_SCHEDULED, reason_code="",
                           resource_limit={"status": "resumed", "auto_resume": False,
@@ -955,46 +1230,242 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
             "selection": "budget_hold_released", "same_generation": True}
 
 
-def live_root_resume_grant(q: Any, root_task_id: str, result_root: pathlib.Path) -> Dict[str, Any]:
-    """The root's CURRENT owner-derived Resume grant, or ``{}`` (owner Q9).
+def continue_consumed_resume_selection(task: Dict[str, Any], pause_row: Dict[str, Any]) -> bool:
+    """Retain a consumed selection while retiring its execution handoff.
 
-    A descendant continues only under a root Resume that is still live: the
-    root's durable pause row must carry a granted-or-consumed, unrevoked grant.
-    A root that paused again after that grant opens a NEW generation, so a late
-    selection carrying the old one finds nothing live and is refused.
+    Preserve the own grant and its upstream binding separately. This does not
+    classify the row as a root: live readers revalidate that role. A matching
+    consumed handoff supersedes an older selected carrier, never a real hold.
+    A member of another root's tree never lends a root grant; its spent handoff
+    retires without creating a new dispatch carrier. Classify only the row's
+    own lineage here, so a transient retry-chain read cannot lose root evidence.
     """
-    from ouroboros.budget_pause import STATE_RESUME_GRANTED, STATE_RESUMED, budget_pause_row
+    from ouroboros.budget_pause import STATE_RESUMED
+    from ouroboros.task_results import resolve_task_lineage
 
-    root_task_id = str(root_task_id or "").strip()
+    lineage = resolve_task_lineage(task.get("id"), **{key: task.get(key) for key in (
+        "metadata", "root_task_id", "parent_task_id", "delegation_role", "original_task_id",
+        "timeout_retry_from")})
+    handoff = task.get("_budget_pause_resume") if isinstance(task.get("_budget_pause_resume"), dict) else {}
+    grant = pause_row.get("grant") if isinstance(pause_row.get("grant"), dict) else {}
+    prior = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else {}
+    if not (handoff.get("authority") == "explicit_resume"
+            and grant.get("authority") == "explicit_resume"
+            and pause_row.get("state") == STATE_RESUMED and grant.get("consumed_at")
+            and not grant.get("revoked_at") and grant.get("grant_id")
+            and handoff.get("grant_id") == grant["grant_id"]
+            and handoff.get("pause_id") == pause_row.get("pause_id")
+            and handoff.get("source_ref") == pause_row.get("source_ref")
+            and handoff.get("grant_generation") == grant.get("generation")
+            and (not prior or prior.get("selected"))):
+        return False
+    if lineage["parent_task_id"] and lineage["root_task_id"] != lineage["task_id"]:
+        # The matching consumed handoff superseded this selected carrier.
+        # Its caller retires the handoff; do not expose an older selection
+        # underneath it, or manufacture a new member dispatch carrier.
+        task.pop(BUDGET_HOLD_KEY, None)
+        return False
+    kept = {key: value for key, value in prior.items() if key != "fence_id"}
+    task[BUDGET_HOLD_KEY] = {
+        **kept,
+        "reason": kept["reason"] if kept.get("reason") in SELECTABLE_HOLD_REASONS else HOLD_SAVED_WORK,
+        "selected": True, "selected_by": str(grant.get("selected_by") or "owner"),
+        "selected_at": str(grant.get("granted_at") or ""),
+        "root_task_id": str(task.get("root_task_id") or task.get("id") or ""),
+        "grant_id": grant["grant_id"], "grant_generation": int(grant["generation"]),
+        "root_grant_id": str(grant.get("root_grant_id") or ""),
+        "root_resume_generation": int(grant.get("root_resume_generation") or 0),
+        **({"fence_id": str(grant["root_fence_id"])} if grant.get("root_fence_id") else {}),
+    }
+    return True
+
+
+def _root_resume_state(q: Any, root_task_id: str, result_root: pathlib.Path, *,
+                       actor_id: Optional[str] = None) -> Dict[str, Any]:
+    """Read the current physical actor and the two existing durable authorities.
+
+    The basis contains control identities, not lifecycle progress or clocks.
+    Read failures propagate; callers must not turn unknown into absent authority.
+    """
+    from ouroboros.budget_pause import budget_pause_row
+    from ouroboros.cancel_intents import _validated_single_cancel_target
+    from ouroboros.owner_pause import read_fence
+
+    actor = (actor_id if actor_id is not None else
+             _validated_single_cancel_target(result_root, root_task_id))
+    rows = [meta['task'] for meta in q.RUNNING.values()
+            if isinstance(meta, dict) and isinstance(meta.get('task'), dict)
+            and str(meta['task'].get('id') or '') == actor]
+    rows += [row for row in q.PENDING
+             if isinstance(row, dict) and str(row.get('id') or '') == actor]
+    from supervisor.workers import direct_chat_turn
+
+    direct = direct_chat_turn(actor) if not rows else None
+    current = next(iter(rows), direct or {})
+    root_drive = next((row.get('budget_drive_root') for row in rows
+                       if row.get('budget_drive_root')), result_root)
+    pause = budget_pause_row(pathlib.Path(root_drive), actor)
+    owner = read_fence(pathlib.Path(root_drive), root_task_id)
+    grant = pause.get('grant') or {}
+    warm = owner.get('resume_grant') or {}
+    basis = {
+        'actor_id': actor,
+        'budget': {
+            'pause_id': str(pause.get('pause_id') or ''),
+            'pause_generation': int(pause.get('pause_generation') or 0),
+            'resume_generation': int(pause.get('resume_generation') or 0),
+            'grant_id': str(grant.get('grant_id') or ''),
+            'grant_generation': int(grant.get('generation') or 0),
+            'revoked': bool(grant.get('revoked_at')),
+        },
+        'owner': {
+            'fence_id': str(owner.get('fence_id') or ''),
+            'generation': int(owner.get('generation') or 0),
+            'grant_id': str(warm.get('grant_id') or ''),
+            'grant_generation': int(warm.get('generation') or 0),
+            'revoked': bool(warm.get('revoked_at')),
+        },
+    }
+    return {'task': current, 'pause': pause, 'owner_fence': owner,
+            'latch': q.BUDGET_ROOT_FENCES.get(root_task_id), 'basis': basis}
+
+
+def _root_resume_grants(state: Dict[str, Any]) -> tuple:
+    """Return (lendable grant, comparable durable grant).
+
+    Consumed history can validate a prior selection, not lend on its own.
+    Current direct or pooled actors retain warm lending; unconsumed exact
+    grants are durable issuance authority. Cross-authority observations
+    resolve exact/warm order without wall clocks.
+    """
+    from ouroboros.budget_pause import (
+        STATE_PAUSED, STATE_PAUSING, STATE_RESUME_GRANTED, STATE_RESUMED,
+    )
+    from ouroboros.owner_pause import fence_closed
+
+    current, row = state['task'], state['pause']
+    owner, basis = state['owner_fence'], state['basis']
+    hold = current.get(BUDGET_HOLD_KEY) or {}
+    grant = row.get('grant') or {}
+    warm = owner.get('resume_grant') or {}
+    if (budget_hold_fact(current) is not None or current.get('_owner_hold')
+            or fence_closed(owner) or row.get('state') in {STATE_PAUSED, STATE_PAUSING}):
+        return {}, {}
+    latch = state['latch']
+    if latch:
+        if budget_fence_selected(current, latch) and hold.get('root_grant_id'):
+            return {'grant_id': str(hold['root_grant_id']),
+                    'generation': int(hold['root_resume_generation']), 'pause_id': ''}, {}
+        return {}, {}
+    if any(current.get(key) for key in (
+            '_budget_pause', '_budget_pause_consumed', '_continuation_prepared')):
+        return {}, {}
+
+    exact_basis = grant.get('root_resume_basis') or {}
+    warm_basis = warm.get('root_resume_basis') or {}
+    exact_ordered = bool(
+        not owner
+        or exact_basis.get('actor_id') == basis['actor_id']
+        and exact_basis.get('owner') == basis['owner']
+        or grant.get('owner_pause_fence_id')
+        and grant.get('owner_pause_fence_id') == owner.get('fence_id')
+        and not warm)
+    warm_ordered = bool(
+        not row
+        or warm_basis.get('actor_id') == basis['actor_id']
+        and warm_basis.get('budget') == basis['budget'])
+    exact = ({'grant_id': str(grant['grant_id']),
+              'generation': int(row.get('resume_generation') or 0),
+              'pause_id': str(row['pause_id'])}
+             if row.get('state') in {STATE_RESUME_GRANTED, STATE_RESUMED}
+             and row.get('pause_id') and grant.get('grant_id')
+             and not grant.get('revoked_at') and exact_ordered else {})
+    warmed = ({'grant_id': str(warm['grant_id']),
+               'generation': int(warm.get('generation') or 0), 'pause_id': ''}
+              if warm.get('grant_id') and not warm.get('revoked_at')
+              and warm_ordered else {})
+    durable = {} if exact and warmed else exact or warmed
+    handoff = current.get('_budget_pause_resume') or {}
+    if exact and handoff.get('grant_id') == exact['grant_id']:
+        return exact, durable
+    if (hold.get('selected') and hold.get('reason') in SELECTABLE_HOLD_REASONS
+            and hold.get('selected_by') == 'owner' and not hold.get('fence_id')
+            and not handoff):
+        if hold.get('grant_id'):
+            if (exact and row.get('state') == STATE_RESUMED and grant.get('consumed_at')
+                    and grant.get('authority') == 'explicit_resume'
+                    and hold['grant_id'] == grant.get('grant_id')
+                    and hold.get('grant_generation') == grant.get('generation')):
+                return exact, durable
+        elif (hold.get('root_grant_id') and int(hold.get('root_resume_generation') or 0) > 0
+              and (hold.get('root_resume_basis') == basis
+                   or 'root_resume_basis' not in hold and not row and not owner)):
+            return {'grant_id': str(hold['root_grant_id']),
+                    'generation': int(hold['root_resume_generation']), 'pause_id': ''}, durable
+
+    if current and warmed:
+        # A current selection above supersedes historical warm authority. A
+        # direct actor or its acknowledged pooled return can otherwise lend
+        # that warm grant without reconstructing a retired queue carrier.
+        return warmed, durable
+    if exact and row.get('state') == STATE_RESUME_GRANTED and not grant.get('consumed_at'):
+        return exact, durable
+    return {}, durable
+
+
+def live_root_resume_grant(q: Any, root_task_id: str, result_root: pathlib.Path, *,
+                           actor_id: Optional[str] = None, strict: bool = False) -> Dict[str, Any]:
+    """Current root authority for a NEW selection, not a carrier-survival test."""
+    root_task_id = str(root_task_id or '').strip()
     if not root_task_id:
         return {}
-    rows = [row for row in q.PENDING
-            if isinstance(row, dict) and str(row.get("id") or "") == root_task_id]
-    rows += [meta.get("task") for meta in q.RUNNING.values()
-             if isinstance(meta, dict) and isinstance(meta.get("task"), dict)
-             and str(meta["task"].get("id") or "") == root_task_id]
-    fence = q.BUDGET_ROOT_FENCES.get(root_task_id)
-    if fence:
-        # Legacy zero-dispatch root Resume selects only the root. Its selection
-        # grants child eligibility while the fence continues holding siblings.
-        for task in rows:
-            hold = task.get(BUDGET_HOLD_KEY) or {}
-            if budget_fence_selected(task, fence) and hold.get("root_grant_id"):
-                return {"grant_id": hold["root_grant_id"],
-                        "generation": hold["root_resume_generation"], "pause_id": ""}
-        return {}
-    root_drive = next((str(row.get("budget_drive_root")) for row in rows
-                       if isinstance(row, dict) and row.get("budget_drive_root")), "")
     try:
-        row = budget_pause_row(pathlib.Path(root_drive or result_root), root_task_id)
+        state = _root_resume_state(q, root_task_id, result_root, actor_id=actor_id)
+        return _root_resume_grants(state)[0]
     except Exception:
-        log.debug("Root resume grant unreadable for %s", root_task_id, exc_info=True)
+        if strict:
+            raise
+        log.debug('Root resume grant unreadable for %s', root_task_id, exc_info=True)
         return {}
-    grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
-    if (row.get("state") not in {STATE_RESUME_GRANTED, STATE_RESUMED}
-            or not str(row.get("pause_id") or "").strip()
-            or not str(grant.get("grant_id") or "").strip() or grant.get("revoked_at")):
-        return {}
-    return {"grant_id": str(grant["grant_id"]),
-            "generation": int(row.get("resume_generation") or 0),
-            "pause_id": str(row.get("pause_id") or "")}
+
+
+def explicit_resume_required(q: Any, task: Dict[str, Any], *, owner_paused: bool) -> bool:
+    """Whether this parked queued row continues only through the owner's explicit Resume.
+
+    Read from the release rules, never from a hold's name. The owner's own Pause
+    over the tree, or the member row it saved, comes first: its Resume releases
+    whatever lies beneath (``resume_budget_paused_task`` reads the same overlay). An
+    exact checkpoint is granted by an explicit Resume (``grant_exact_budget_resume``),
+    except an unheld cold sleep, which its own readiness wakes (``sleep_wake``).
+    An unselected hold is released only by an explicit selection
+    (``select_held_budget_row``), except the writer hold its reconciliation
+    releases (``release_settled_continuations``). A member whose root is itself
+    parked, or holds a live Resume grant (its model selects it, owner Q9), needs
+    no separate owner action. A current retry acts for its logical root, as in
+    the Resume door; unreadable identity propagates to the incomplete census.
+    ``q`` may be a snapshot of the queue registries.
+    """
+    from ouroboros.owner_pause import root_actor
+    from supervisor.queue_transitions import budget_pause_fact
+
+    fences = q.BUDGET_ROOT_FENCES
+    pause = task.get("_budget_pause") if isinstance(task.get("_budget_pause"), dict) else {}
+    if owner_paused or pause.get("reason") == "owner" or budget_pause_fact(task, fences) is None:
+        return False
+    hold = budget_hold_fact(task)
+    if pause.get("exact_continuation"):
+        if hold is None and pause.get("reason") == "sleep":
+            return False
+    elif hold is not None and (hold.get("reason") == HOLD_CONTINUATION_WRITER
+                               or not hold_selectable(task, hold)):
+        return False
+    task_id = str(task.get("id") or "")
+    root_id = str(task.get("root_task_id") or task_id)
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    if root_actor(result_root, root_id, task_id, strict=True):
+        return True
+    fence = fences.get(root_id)
+    root_parked = (isinstance(fence, dict) and str(fence.get("status") or "") in {"active", "paused"}) or any(
+        isinstance(row, dict) and str(row.get("id") or "") == root_id and budget_pause_fact(row, fences) is not None
+        for row in q.PENDING)
+    return not root_parked and not live_root_resume_grant(q, root_id, result_root)

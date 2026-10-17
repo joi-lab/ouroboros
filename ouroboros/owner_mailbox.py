@@ -63,6 +63,8 @@ KIND_HURRY = "hurry"
 # chosen option label (plus an optional owner comment) — delivered inside a
 # structural frame, never as forged free-form owner dialogue.
 KIND_QUIZ_ANSWER = "quiz_answer"
+# Explicit owner closure carries no answer, selected option, or approval.
+KIND_QUIZ_CLOSED = "quiz_closed"
 # The owner's Pause of a whole tree (``owner_pause.py``): a WAKE signal, never
 # dialogue and never the authority — the root's durable fence decides. It wakes
 # a warm owner wait so the member reaches its safe boundary without buying a
@@ -144,7 +146,7 @@ def acknowledged_task_message_ids(
                     continue
                 if (
                     isinstance(entry, dict)
-                    and str(entry.get("kind") or KIND_OWNER_TEXT) == KIND_OWNER_TEXT
+                    and str(entry.get("kind") or KIND_OWNER_TEXT) in {KIND_OWNER_TEXT, "relay_entry"}
                     and str(entry.get("msg_id") or "")
                 ):
                     legacy_owner_ids.add(str(entry["msg_id"]))
@@ -224,7 +226,7 @@ def acknowledge_transcript_entry(
     *,
     wake_id: str = "loop_delivery",
     attempt_key: Any = None,
-) -> None:
+) -> bool:
     """Durably acknowledge one mailbox entry after transcript injection."""
     if attempt_key is None:
         attempt_key = entry.get("_owner_attempt_key")
@@ -233,6 +235,14 @@ def acknowledge_transcript_entry(
         drive_root, task_id, [msg_id], wake_id=wake_id, attempt_key=attempt_key,
     ):
         log.warning("Mailbox delivery acknowledgement failed for %s", msg_id)
+        return False
+    if entry.get("quiz_delivery"):
+        from ouroboros.question_answers import acknowledge_answer
+        acknowledge_answer(drive_root, task_id, entry)
+    if entry.get("relay"):
+        from ouroboros.owner_relay import acknowledge_relay
+        acknowledge_relay(entry.get("relay_canonical_root") or drive_root, task_id, entry)
+    return True
 
 
 def write_owner_message(
@@ -245,6 +255,7 @@ def write_owner_message(
     attachment_manifest: Optional[List[Dict[str, Any]]] = None,
     client_message_id: str = "",
     late_answer: Optional[Dict[str, Any]] = None,
+    quiz_delivery: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Write an owner message or typed control entry to a task's mailbox.
 
@@ -270,6 +281,8 @@ def write_owner_message(
         entry["client_message_id"] = str(client_message_id)
     from ouroboros.owner_quiz import late_answer_ref
 
+    if quiz_delivery:
+        entry["quiz_delivery"] = dict(quiz_delivery)
     late_ref = late_answer_ref(late_answer)
     if late_ref is not None:
         entry["late_answer"] = late_ref
@@ -701,7 +714,7 @@ def drain_owner_entries(
             if kind == KIND_CONTROL_REVOKED or (mid and mid in revoked):
                 continue
             text = entry.get("text", "")
-            if text:
+            if text or kind == "relay_entry":
                 # ``ts`` is ADDITIVE (2026-08-15 Fable pin): typed controls such
                 # as ``hurry`` carry their request time into the drained entry so
                 # the attempt latch can preserve when the owner actually asked.
@@ -721,6 +734,9 @@ def drain_owner_entries(
                     drained["client_message_id"] = str(entry["client_message_id"])
                 # Same for a late quiz answer's typed provenance: the drain
                 # rebuilds the card frame for the model from it.
+                for relay_field in ("relay", "owner_rows", "source_task_id", "source_row", "quiz_delivery", "relay_canonical_root", "sender_origin"):
+                    if relay_field in entry:
+                        drained[relay_field] = entry[relay_field]
                 if isinstance(entry.get("late_answer"), dict):
                     drained["late_answer"] = dict(entry["late_answer"])
                 if isinstance(entry.get("attachment_manifest"), list):
@@ -730,7 +746,7 @@ def drain_owner_entries(
                     ]
                 if entry.get("attachment_manifest_ref"):
                     drained["attachment_manifest_ref"] = dict(entry["attachment_manifest_ref"])
-                if attempt_key is not None and kind == KIND_OWNER_TEXT:
+                if attempt_key is not None and kind in {KIND_OWNER_TEXT, "relay_entry"}:
                     drained["_owner_attempt_key"] = attempt_key
                 if kind == KIND_TASK_MESSAGE:
                     drained["provenance"] = str(entry.get("provenance") or "ancestor_task")
@@ -860,6 +876,21 @@ def mail_write_receipt(recipient_status: str, *, drain_ended: bool = False) -> D
              else MAIL_QUEUED if str(recipient_status or "") in {"requested", "scheduled"} else MAIL_DELIVERED)
     return {"receipt": state, "read": False,
             "read_evidence": "the recipient's task_message_acknowledged row (mail_read_state)"}
+
+
+def mailbox_holds(drive_root: pathlib.Path, task_id: str, msg_id: str) -> bool:
+    """True while TASK_ID's mailbox still carries MSG_ID: written and not yet drained away."""
+    try:
+        content = _mailbox_path(drive_root, task_id).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return False
+    for line in mailbox_lines(content):
+        try:
+            if json.loads(line).get("msg_id") == msg_id:
+                return True
+        except (ValueError, AttributeError):
+            continue
+    return False
 
 
 def mail_read_state(drive_root: pathlib.Path, task_id: str, msg_id: str) -> Optional[bool]:

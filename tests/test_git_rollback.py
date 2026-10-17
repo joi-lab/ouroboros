@@ -1,8 +1,8 @@
-"""Tests for ouroboros/tools/git_rollback.py — rollback_to_target tool."""
+"""Tests for ouroboros/tools/git_rollback.py: the preview, and the confirmed call as a
+``rollback_request`` the supervisor answers through the UI Rollback door (P4-S)."""
 
+import queue
 import subprocess
-import types
-from unittest import mock
 
 import pytest
 
@@ -49,31 +49,36 @@ def test_rollback_preview_invalid_target(ctx):
     assert "Cannot resolve" in result
 
 
-def test_rollback_confirm_calls_git_ops(ctx):
+def test_rollback_confirm_emits_the_request_and_answers_requested(ctx):
+    """A confirmed call resets nothing in the worker: one ``rollback_request`` event, bound to
+    the resolved SHA, reaches the supervisor; the answer says the request was taken."""
     from ouroboros.tools.git_rollback import _rollback_to_target
-    with mock.patch(
-        "ouroboros.tools.git_rollback.rollback_to_version",
-        create=True,
-    ) as mock_rb:
-        # Simulate successful rollback via git_ops import inside function
-        mock_rb.return_value = (True, "Rolled back to abc123 (abc12345)")
-        # We need to patch the import inside the function
-        fake_git_ops = types.ModuleType("supervisor.git_ops")
-        fake_git_ops.rollback_to_version = mock_rb
-        with mock.patch.dict("sys.modules", {"supervisor.git_ops": fake_git_ops}):
-            result = _rollback_to_target(ctx, target="HEAD", confirm=True)
-    assert "abc12345" in result or "Rolled back" in result
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir, capture_output=True, text=True).stdout.strip()
+    ctx.event_queue = queue.Queue()
+    ctx.task_id = "task-1"
+    result = _rollback_to_target(ctx, target="HEAD", confirm=True)
+    assert "requested" in result and sha[:8] in result and "ROLLBACK_ERROR" not in result
+    event = ctx.event_queue.get_nowait()
+    assert event["type"] == "rollback_request" and event["target"] == "HEAD" and event["target_sha"] == sha
+    assert event["reason"] == "agent_rollback_tool" and event["task_id"] == "task-1" and event["ts"]
+    assert ctx.event_queue.empty() and getattr(ctx, "pending_restart_reason", None) is None
+    assert subprocess.run(["git", "status", "--porcelain"], cwd=ctx.repo_dir, capture_output=True, text=True).stdout == ""
 
 
 def test_rollback_confirm_failure(ctx):
     from ouroboros.tools.git_rollback import _rollback_to_target
-    fake_git_ops = types.ModuleType("supervisor.git_ops")
-    fake_git_ops.rollback_to_version = mock.Mock(
-        return_value=(False, "Cannot resolve badref")
-    )
-    with mock.patch.dict("sys.modules", {"supervisor.git_ops": fake_git_ops}):
-        result = _rollback_to_target(ctx, target="badref", confirm=True)
-    assert "ROLLBACK_ERROR" in result
+    ctx.event_queue = queue.Queue()
+    result = _rollback_to_target(ctx, target="badref", confirm=True)
+    assert "ROLLBACK_ERROR" in result and "Cannot resolve" in result
+    assert ctx.event_queue.empty()
+
+
+def test_rollback_confirm_without_a_supervisor_is_an_error(ctx):
+    """No event queue (no supervisor): the tool refuses instead of resetting on its own."""
+    from ouroboros.tools.git_rollback import _rollback_to_target
+    ctx.event_queue = None
+    result = _rollback_to_target(ctx, target="HEAD", confirm=True)
+    assert "ROLLBACK_ERROR" in result and "UI Rollback" in result
 
 
 def test_get_tools_exports():
@@ -101,17 +106,3 @@ def test_rollback_in_initial_tool_schemas():
         schemas = initial_tool_schemas(reg)
         names = {s["function"]["name"] for s in schemas}
         assert "vcs_rollback" in names
-
-
-def test_rollback_requests_restart_on_success(ctx):
-    """After successful rollback, ctx.pending_restart_reason is set."""
-    from ouroboros.tools.git_rollback import _rollback_to_target
-    import types
-    fake_git_ops = types.ModuleType("supervisor.git_ops")
-    fake_git_ops.rollback_to_version = mock.Mock(
-        return_value=(True, "Rolled back to abc123")
-    )
-    with mock.patch.dict("sys.modules", {"supervisor.git_ops": fake_git_ops}):
-        result = _rollback_to_target(ctx, target="HEAD", confirm=True)
-    assert "restart has been requested" in result
-    assert ctx.pending_restart_reason == "rollback_to_target completed"

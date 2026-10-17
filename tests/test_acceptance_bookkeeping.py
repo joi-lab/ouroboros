@@ -21,6 +21,7 @@ from ouroboros.task_status import load_effective_task_result
 from supervisor.events_worker_reports import _handle_log_event
 from supervisor.worker_process import WORKER_LOG_SINK_SUPPRESSED_TYPES
 from tests.test_acceptance_publication import _run
+from tests._room_shared import RoomsFromBindings
 
 pytestmark = pytest.mark.serial
 
@@ -106,14 +107,14 @@ def test_terminal_pipeline_routes_review_and_downloads_without_bookkeeping_deliv
     chats = {project_chat} if project_bound else set()
     main_rows, _ = _collect_progress_rows(
         tmp_path / "logs" / "progress.jsonl", tmp_path / "logs" / "archive", 20,
-        _make_thread_filter(1, chats, [], bindings),
+        _make_thread_filter(1, chats, [], RoomsFromBindings(bindings)),
     )
     main_references = [row for row in main_rows if row.get("system_type") == "review_reference"]
     assert bool(main_references) is (chat_id == 1 and not project_bound)
     if project_bound:
         project_rows, _ = _collect_progress_rows(
             tmp_path / "logs" / "progress.jsonl", tmp_path / "logs" / "archive", 20,
-            _make_thread_filter(project_chat, chats, [], bindings),
+            _make_thread_filter(project_chat, chats, [], RoomsFromBindings(bindings)),
         )
         assert any(row.get("system_type") == "review_reference" for row in project_rows)
 

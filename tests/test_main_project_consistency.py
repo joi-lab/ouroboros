@@ -11,8 +11,9 @@ import pytest
 from ouroboros import projects_registry as registry
 from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import queue, workers
-from tests.test_project_hold_recovery import worker
+from tests.test_project_hold_recovery import resume_after_app_stop, worker
 from tests.test_swarm_host_admission import host  # noqa: F401
+from tests._store_shared import unreadable_result
 
 pytestmark = pytest.mark.serial
 
@@ -55,6 +56,7 @@ def test_known_none_recovers_same_id_after_bindings_outage(host, monkeypatch, pr
     queue.restore_pending_from_snapshot()
     path.write_text('{"bindings": {}}', encoding="utf-8")
     registry._registry_path(host.root).write_text("{still torn", encoding="utf-8")
+    resume_after_app_stop(host, original["id"])
     workers.assign_tasks()
     workers.assign_tasks()
     assert [row["id"] for row in sent] == [original["id"]]
@@ -75,7 +77,12 @@ def test_unscoped_producers_preserve_absence_and_stale_restore_policy(host, prod
     queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap), encoding="utf-8")
     host.pending.clear()
     queue.restore_pending_from_snapshot()
-    assert not host.pending
+    # Owner 2026-10-08 (#1563): accepted work never expires with snapshot age; the
+    # stale row waits for an explicit Resume and keeps its unscoped absence.
+    from supervisor.events_budget import HOLD_SAVED_WORK, budget_hold_fact
+
+    [held] = host.pending
+    assert budget_hold_fact(held)["reason"] == HOLD_SAVED_WORK and "_project_admission" not in held
 
 
 @pytest.mark.parametrize("veto", ["legacy", "null", "malformed", "dispatch", "stopped", "binding", "origin", "folder"])
@@ -102,8 +109,9 @@ def test_no_scope_recovery_requires_original_positive_authority(host, monkeypatc
                 "text_sha256": hashlib.sha256(b"Owner work").hexdigest()}, "text": "Owner work"})
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
-    assert not sent and not host.attempts
-    assert not any(r.get("project_id") == "new-room" for r in host.pending)
+    assert ([r["id"] for r in sent] == ["main"] if veto == "origin" else not sent)
+    assert not host.attempts
+    assert not any(r.get("project_id") == "new-room" for r in [*host.pending, *sent])
 
 
 def test_restore_never_retargets_unscoped_row_to_a_later_origin_binding(host, monkeypatch):  # noqa: F811
@@ -119,8 +127,10 @@ def test_restore_never_retargets_unscoped_row_to_a_later_origin_binding(host, mo
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
     assert not sent and not any(r.get("project_id") == "new-room" for r in host.pending)
-    stored = load_task_result(host.root, "main")  # a semantic change, visibly terminal, never rerouted
-    assert stored["status"] == "failed" and stored["reason_code"] == "project_routing_fence_changed"
+    assert load_task_result(host.root, "main")["status"] == "scheduled"
+    resume_after_app_stop(host, "main")
+    workers.assign_tasks()
+    assert [r["id"] for r in sent] == ["main"] and not sent[0].get("project_id")
 
 
 def test_old_main_snapshot_cannot_replay_after_handoff(host, monkeypatch):  # noqa: F811
@@ -170,8 +180,8 @@ def test_corrupt_registry_keeps_main_dialogue_available(tmp_path, monkeypatch, p
 
 @pytest.mark.parametrize("project_room", [False, True])
 def test_main_steers_healthy_foreign_task_despite_corrupt_registry(host, monkeypatch, project_room):  # noqa: F811
-    from ouroboros.owner_mailbox import drain_owner_messages
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.tools.control import _tell_task
     from tests.test_steer_relay import _live_tool_ctx, _supervisor_ctx
 
     project = registry.create_project(host.root, "target")
@@ -183,8 +193,8 @@ def test_main_steers_healthy_foreign_task_despite_corrupt_registry(host, monkeyp
         issuer.current_chat_id = project["chat_id"]
         issuer.task_metadata["origin_message_ref"]["chat_id"] = project["chat_id"]
     registry._registry_path(host.root).write_text("{torn", encoding="utf-8")
-    _steer_task(issuer, "t-target", "Continue original task")
-    assert drain_owner_messages(host.root, "t-target") == ([] if project_room else ["Continue original task"])
+    _tell_task(issuer, "t-target", "Continue original task")
+    assert [e["text"] for e in drain_owner_entries(host.root, "t-target")] == ["Continue original task"]
 
 
 @pytest.mark.parametrize("producer", ["promotion", "api"])
@@ -302,6 +312,8 @@ def test_never_dispatched_main_restores_once_and_live_retry_still_assigns(host, 
     queue.restore_pending_from_snapshot()
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
+    assert not sent, "fresh accepted work after an application stop requires Resume"
+    resume_after_app_stop(host, "main")
     workers.assign_tasks()
     assert [row["id"] for row in sent] == ["main"]
     queue.RUNNING.clear()
@@ -349,13 +361,15 @@ def test_host_producer_row_recovers_once_after_bindings_fault(host, monkeypatch,
     assert not sent and host.pending[0]["_project_admission_restore_hold"]
     assert host.pending[0]["_queue_seq"] > 0 and host.pending[0]["queued_at"]  # order survives the hold
     if veto == "unreadable":
-        (host.root / "task_results" / f"{tid}.json").write_text("{torn", encoding="utf-8")
+        unreadable_result(monkeypatch, tid)
     elif veto == "possible":
         write_task_result(host.root, tid, "scheduled", admitted_dispatch="possible")
     elif veto == "legacy":
         for key in ("_project_scope_none", "admitted_dispatch"):
             host.pending[0].pop(key)
     path.write_text('{"bindings": {}}', encoding="utf-8")
+    if not veto:
+        resume_after_app_stop(host, tid)
     workers.assign_tasks()
     workers.assign_tasks()
     assert [task["id"] for task in sent] == ([] if veto else [tid]) and not host.attempts
@@ -456,8 +470,8 @@ def test_external_owner_main_dialogue_survives_registry_fault(tmp_path, monkeypa
 @pytest.mark.parametrize("fault", ["torn", "missing", "fresh"])
 @pytest.mark.parametrize("sender", ["external_owner", "unbound_external", "project_room"])
 def test_external_owner_steers_despite_registry_fault(host, monkeypatch, sender, fault):  # noqa: F811
-    from ouroboros.owner_mailbox import drain_owner_messages
-    from ouroboros.tools.control import _steer_task
+    from ouroboros.owner_mailbox import drain_owner_entries
+    from ouroboros.tools.control import _tell_task
     from tests.test_steer_relay import _live_tool_ctx, _supervisor_ctx
 
     chat_id = _sender_chat(sender, _committed_room(host.root, fault))
@@ -469,7 +483,6 @@ def test_external_owner_steers_despite_registry_fault(host, monkeypatch, sender,
     issuer.current_chat_id = chat_id
     issuer.task_metadata["origin_message_ref"]["chat_id"] = chat_id
     _registry_fault(host.root, fault)
-    _steer_task(issuer, "t-target", "Continue original task")
-    delivered = drain_owner_messages(host.root, "t-target")
-    allowed = sender == "external_owner" or fault == "fresh"
-    assert delivered == (["Continue original task"] if allowed else [])
+    _tell_task(issuer, "t-target", "Continue original task")
+    delivered = [e["text"] for e in drain_owner_entries(host.root, "t-target")]
+    assert delivered == ["Continue original task"]

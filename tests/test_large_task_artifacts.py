@@ -9,6 +9,7 @@ import zipfile
 import pytest
 
 from ouroboros import artifacts
+from tests._store_shared import read_result, result_signature
 
 
 def _large_file(path):
@@ -755,7 +756,7 @@ def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_p
     genuine late fact still lands, survives the next retry, and a restored source converges."""
     from ouroboros.headless import prepare_task_drive, copy_child_task_result
     from ouroboros.observability import retry_pending_child_ref_promotions
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
 
     parent = tmp_path / "canonical"
     child = prepare_task_drive(parent, "stale", "empty")
@@ -771,17 +772,17 @@ def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_p
     # Adoption only owes history; the first archive attempt establishes its
     # inventory and failed-copy facts. Unchanged retries after that do not write.
     assert retry_pending_child_ref_promotions(parent)["pending"] == ["stale"]
-    row = task_result_path(parent, "stale")
-    before, stamp = row.read_bytes(), row.stat().st_mtime_ns
+    before = result_signature(parent, "stale")
     report = retry_pending_child_ref_promotions(parent)
     assert report["unchanged"] == report["pending"] == ["stale"]
     assert not report["retried"] and not report["errors"]
-    assert row.read_bytes() == before and row.stat().st_mtime_ns == stamp
+    assert result_signature(parent, "stale") == before
     write_task_result(parent, "stale", "failed", accounted_upper_bound_usd=4.25)
-    late = row.read_bytes()
+    late = result_signature(parent, "stale")
     report = retry_pending_child_ref_promotions(parent)
     assert report["retried"] == report["pending"] == ["stale"] and not report["unchanged"]
-    assert row.read_bytes() == late and json.loads(late)["accounted_upper_bound_usd"] == 4.25
+    assert result_signature(parent, "stale") == late
+    assert read_result(parent, "stale")["accounted_upper_bound_usd"] == 4.25
     Path(record["path"]).write_bytes(b"report")
     attempts = []
     def transient_copy(*args, **kwargs):
@@ -794,7 +795,7 @@ def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_p
             assert report["retried"] == report["pending"] == ["stale"] and not report["unchanged"]
             assert len(attempts) == expected_attempts
     assert retry_pending_child_ref_promotions(parent)["completed"] == ["stale"]
-    settled = json.loads(row.read_bytes())
+    settled = read_result(parent, "stale")
     assert settled["status"] == "failed" and settled["accounted_upper_bound_usd"] == 4.25
     assert settled["child_ref_promotion"]["status"] == "complete"
 

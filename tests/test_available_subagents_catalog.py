@@ -76,12 +76,12 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
     assert list(catalog["rows"][0])[-1] == "recommended_use"
     assert catalog["rows"][0]["route_class"] == "API model"
     assert catalog["rows"][0]["requested_model"] == "google/gemini-3.7-flash"
-    assert catalog["rows"][0]["requested_effort"] == "low"
+    assert catalog["rows"][0]["effort"] == "low" and "effort_source" not in catalog["rows"][0]
     assert catalog["rows"][1]["route_class"] == "Agent session"
     assert catalog["rows"][1]["requested_target"] == "claude=claude-fable-5"
     assert catalog["rows"][1]["mutating_access"] == "full"
     assert "credential_profile_id" not in catalog["rows"][1]
-    assert catalog["rows"][2]["requested_effort"] == "(not explicitly set)"
+    assert catalog["rows"][2]["effort"] == "high" and catalog["rows"][2]["effort_source"] == "model_name"
     assert catalog["rows"][2]["credential_profile_id"] == "cursor-owner"
     assert not any("account_policy" in row for row in catalog["rows"])
 
@@ -94,13 +94,51 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
             **_settings(enabled=False),
             "OUROBOROS_SUBAGENT_HARNESS": "codex=gpt-5.6-sol:high",
         },
-        _settings(),
+        _settings(),  # no rows and no reachable Main: nothing to offer
     ],
 )
 def test_catalog_omits_unsaved_invalid_disabled_and_empty(settings):
     from ouroboros.subagent_runtime import model_visible_subagent_catalog
 
     assert model_visible_subagent_catalog(settings) == {}
+
+
+_MAIN = {"OUROBOROS_MODEL": "openai/gpt-5.6-sol", "OPENROUTER_API_KEY": "sk-or-present"}
+
+
+def test_a_switched_on_catalog_with_no_rows_offers_the_main_model_as_the_base_agent():
+    """With no agent configured the default model is the base agent: the catalog shows ONE
+    row, Main's model as a catalog row runs it (an API model, Auto effort), and scheduling
+    resolves it by its handle and by its stored id ``main`` into an ordinary api snapshot."""
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog, select_subagent_snapshot
+
+    settings = {**_settings(), **_MAIN}
+    (row,) = model_visible_subagent_catalog(settings)["rows"]
+    assert (row["route_class"], row["effort"], row["review_eligible"]) == ("API model", "auto", False)
+    for selector in (row["subagent_id"], "main"):
+        snapshot, legacy = select_subagent_snapshot(settings, subagent_id=selector)
+        assert (snapshot["selected_subagent_id"], snapshot["route"], legacy) == (
+            "main", {"kind": "api_model", "target_id": "openai/gpt-5.6-sol"}, False)
+
+
+@pytest.mark.parametrize(("settings", "code"), [
+    ({**_settings(), "OUROBOROS_MODEL": "openai/gpt-5.6-sol"}, "no_available_subagents"),  # Main without access
+    ({**_settings(enabled=False), **_MAIN}, "subagents_disabled"),  # the owner switched delegation off
+    ({**_settings(_row("scout", kind="api_model", target="openai/gpt-5.6-luna", recommendation="Scouts.")), **_MAIN},
+     "unknown_subagent_id"),  # saved rows are the whole choice set
+])
+def test_the_base_agent_is_offered_only_for_a_switched_on_catalog_without_rows(settings, code):
+    from ouroboros.subagent_runtime import (
+        SubagentSelectionError,
+        model_visible_subagent_catalog,
+        select_subagent_snapshot,
+    )
+
+    rows = model_visible_subagent_catalog(settings).get("rows", [])
+    assert all(row["subagent_id"] != "openai/gpt-5.6-sol" for row in rows), rows
+    with pytest.raises(SubagentSelectionError) as refused:
+        select_subagent_snapshot(settings, subagent_id="main")
+    assert refused.value.code == code
 
 
 def test_catalog_omits_a_real_undecided_candidate_rejected_by_new_id_dispatch():
@@ -192,14 +230,14 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
     catalog_text = core.semi_stable_text.split("## Available subagents\n\n", 1)[1]
     catalog, _end = json.JSONDecoder().raw_decode(catalog_text)
 
-    assert blocks[1]["text"] == core.semi_stable_text
-    assert blocks[1]["cache_control"] == {"type": "ephemeral"}
-    assert blocks[2]["text"] == core.dynamic_head_text + "\n\n" + core.dynamic_text  # knowledge leads block 2
-    assert "cache_control" not in blocks[2]
-    # A projection's story closes block 1 after the catalog; its rooms open block 2 after the knowledge.
+    assert blocks[-2]["text"] == core.semi_stable_text
+    assert blocks[-2]["cache_control"] == {"type": "ephemeral"}
+    assert blocks[-1]["text"] == core.dynamic_head_text + "\n\n" + core.dynamic_text  # knowledge leads the changing block
+    assert "cache_control" not in blocks[-1]
+    # A projection's story closes the story block after the catalog; its rooms open the changing block after the knowledge.
     viewed = _render_context_system_content(env, core, mode="max", story="## My story\n\nS", room="## This room (R)")
-    assert viewed[1]["text"] == core.semi_stable_text + "\n\n## My story\n\nS"
-    assert viewed[2]["text"] == core.dynamic_head_text + "\n\n## This room (R)\n\n" + core.dynamic_text
+    assert viewed[-2]["text"] == core.semi_stable_text + "\n\n## My story\n\nS"
+    assert viewed[-1]["text"] == core.dynamic_head_text + "\n\n## This room (R)\n\n" + core.dynamic_text
     assert catalog["rows"][0]["recommended_use"] == owner_text
     assert '"subagent_id": "codex=gpt-5.6-sol/high"' in core.semi_stable_text
     assert "builder" not in core.semi_stable_text, "the stored key is not model-facing"

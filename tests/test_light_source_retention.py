@@ -1,16 +1,17 @@
 """Light memory operations keep their sources whole.
 
-A reflection whose prompt cannot fit is retained first and read completely in
-ranges; an answer given before the retained source was read authorizes nothing;
-a scratchpad pass never drops blocks written while its Light call ran. (These
-tests outlived the measured-pressure batch they used to sit beside.)
+A scratchpad pass whose prompt cannot fit is retained first and read completely in
+ranges; an answer given before the retained source was read replaces nothing; a
+scratchpad pass never drops blocks written while its Light call ran. (These tests
+outlived the measured-pressure batch they used to sit beside, and the post-task
+reflection they were first written for.)
 """
 import hashlib
 import json
 
 import pytest
 
-from ouroboros import consolidator as c, reflection
+from ouroboros import consolidator as c
 from ouroboros.context_fit import estimate_context_prompt_tokens
 from ouroboros.memory import Memory
 from ouroboros.tools.registry import ToolContext
@@ -53,8 +54,14 @@ class SourceReader:
             assert kwargs["model_turn_state"] is self.operation_turns[-1]
             if self.stage == "read":
                 result = kwargs["messages"][-1]["content"]
-                body = result.split("\n[Tool result source view]\n", 1)[0].split("\n", 1)[1]
                 source = (self.root / self.ref["read"]["arguments"]["path"]).read_text(encoding="utf-8")
+                from ouroboros.tools.core_file_tools import _render_line_slice, delivered_source_prefix
+
+                view = {}
+                _render_line_slice("source", source, start_char=self.position, extent=view)
+                view["body_start"] = result.find("\n") + 1
+                visible = result.split("\n[Tool result source view]\n", 1)[0]
+                body = delivered_source_prefix(view, visible, len(visible))
                 assert body == source[self.position:self.position + len(body)]
                 assert body
                 self.position += len(body)
@@ -80,36 +87,50 @@ def setup_memory(root):
     return memory, ToolContext(repo_dir=root, drive_root=root, task_id="source-task")
 
 
-def test_two_megabyte_reflection_retained_before_first_fit_and_read_completely(tmp_path, fit):
+def _oversized_scratchpad(memory):
+    text = "BEGINNING original event.\n" + "Decision and counterexample matter. " * 30000
+    blocks = [{"ts": "2026-09-12T10:00:00Z", "source": "task", "content": text},
+              {"ts": "2026-09-12T10:01:00Z", "source": "task", "content": text + "\nDECISIVE FINAL EVENT."},
+              {"ts": "2026-09-12T10:02:00Z", "source": "task", "content": "A later episode."}]
+    memory.mutate_scratchpad_blocks(lambda _: blocks)
+    return blocks
+
+
+def test_two_megabyte_scratchpad_source_retained_before_first_fit_and_read_completely(tmp_path, fit):
     fit.window = 50000
-    text = "BEGINNING original event.\n" + "Decision and counterexample matter. " * 60000 + "\nDECISIVE FINAL EVENT."
-    assert len(text.encode()) > 2_000_000
-    actor = SourceReader(tmp_path, fit.window, "I retain the original beginning and DECISIVE FINAL EVENT.\nMEMORY_ACTIONS_JSON: []")
-    entry = reflection.generate_reflection({"id": "big-reflection", "text": text, "drive_root": str(tmp_path)},
-                                           {}, "trace", actor, {"rounds": 20, "cost": 1})
-    assert not entry.get("memory_operation_errors"), (entry.get("memory_operation_errors"), len(actor.calls), actor.position, actor.stage)
-    assert "DECISIVE FINAL EVENT" in entry["reflection"]
-    ref = entry["source_ref"]
+    memory, ctx = setup_memory(tmp_path)
+    blocks = _oversized_scratchpad(memory)
+    assert len("".join(block["content"] for block in blocks[:2]).encode()) > 2_000_000
+    actor = SourceReader(tmp_path, fit.window, json.dumps(
+        {"compressed_block": "I retain the original beginning and DECISIVE FINAL EVENT."}))
+    usage = c.consolidate_scratchpad(memory, actor, knowledge_context=ctx)
+    assert not usage.get("_consolidation_errors"), (usage.get("_consolidation_errors"), len(actor.calls), actor.position)
+    [ref] = actor.sources
     stored = (tmp_path / ref["read"]["arguments"]["path"]).read_bytes()
     assert ref["sha256"] == hashlib.sha256(stored).hexdigest()
-    assert text in stored.decode()
+    assert blocks[0]["content"] in stored.decode() and blocks[1]["content"] in stored.decode()
     assert actor.received == [stored.decode()]
     assert len(actor.calls) > 5
     assert len(actor.calls[0]["messages"][0]["content"]) < 3000
     assert all(ca["model_role"] == "light" for ca in actor.calls)
+    saved = memory.load_scratchpad_blocks()
+    assert "DECISIVE FINAL EVENT" in saved[0]["content"] and saved[1:] == blocks[2:]
 
 
-def test_unread_initial_source_cannot_authorize_a_reflection_action(tmp_path, fit):
+def test_unread_initial_source_cannot_replace_scratchpad_blocks(tmp_path, fit):
     fit.window = 24000
+    memory, ctx = setup_memory(tmp_path)
+    blocks = _oversized_scratchpad(memory)
+
     class Unread:
         def chat(self, **_kwargs):
-            return {"content": 'Reflection.\nMEMORY_ACTIONS_JSON: [{"type":"knowledge_write","topic":"new","content":"Unread claim"}]'}, {"cost": 0.03}
-    entry = reflection.generate_reflection({"id": "unread", "text": "large " * 100000, "drive_root": str(tmp_path)},
-                                           {}, "trace", Unread(), {"rounds": 20})
-    assert entry["memory_actions"] == []
-    assert entry["memory_operation_errors"][0]["kind"] == "source_incomplete"
-    assert entry["memory_operation_errors"][0]["response_ref"]
-    assert (tmp_path / entry["source_ref"]["read"]["arguments"]["path"]).exists()
+            return {"content": '{"compressed_block": "Unread claim"}'}, {"cost": 0.03}
+
+    usage = c.consolidate_scratchpad(memory, Unread(), knowledge_context=ctx)
+    [error] = usage["_consolidation_errors"]
+    assert error["kind"] == "source_incomplete" and error["response_ref"]
+    assert (tmp_path / error["source_ref"]["read"]["arguments"]["path"]).exists()
+    assert memory.load_scratchpad_blocks() == blocks
 
 
 @pytest.mark.parametrize("change_same_source", [False, True])
@@ -122,7 +143,7 @@ def test_scratchpad_pressure_cas_preserves_concurrent_sources(tmp_path, fit, cha
     class Concurrent:
         def chat(self, **_kwargs):
             memory.mutate_scratchpad_blocks(lambda rows: [newer] if change_same_source else rows + [appended])
-            return {"content": '{"knowledge_entries":[],"compressed_block":"Short retained understanding."}'}, {"cost": 0.01}
-    c.consolidate_scratchpad(memory, tmp_path / "memory/knowledge", Concurrent(), pressure=True, knowledge_context=ctx)
+            return {"content": '{"compressed_block":"Short retained understanding."}'}, {"cost": 0.01}
+    c.consolidate_scratchpad(memory, Concurrent(), pressure=True, knowledge_context=ctx)
     saved = memory.load_scratchpad_blocks()
     assert saved == [newer] if change_same_source else saved[1:] == [appended]

@@ -9,6 +9,7 @@ import pytest
 
 from ouroboros import projects_registry as registry
 from ouroboros.task_results import load_task_result, write_task_result
+from tests._store_shared import unreadable_result
 from tests.test_project_semantic_admission import room, task  # noqa: F401
 from tests.test_schedule_occurrence import q  # noqa: F401
 from tests.test_swarm_host_admission import host  # noqa: F401
@@ -89,9 +90,7 @@ def test_api_preparation_cleanup_keeps_ownership_until_resources_settle(room, mo
     elif occupant == "foreign_result":
         write_task_result(room.root, tid, "scheduled", result="foreign")
     elif occupant == "unreadable":
-        path = room.root / "task_results" / f"{tid}.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("{torn", encoding="utf-8")
+        unreadable_result(monkeypatch, tid)  # the store cannot say whose the id is: cleanup keeps ownership
     elif occupant == "pending":
         room.pending.append(task(tid))
     original = headless.remove_subagent_task_drive

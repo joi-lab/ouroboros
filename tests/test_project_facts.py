@@ -230,25 +230,6 @@ def test_context_project_scope_adds_to_global_knowledge_index(tmp_path, monkeypa
     assert "Project knowledge" not in blob2
 
 
-def test_apply_memory_actions_project_scoped_redirects_and_skips(tmp_path, monkeypatch):
-    monkeypatch.setattr(cfg, "DATA_DIR", tmp_path / "data")
-    from ouroboros.reflection import apply_memory_actions
-
-    drive = tmp_path / "drive"
-    env = types.SimpleNamespace(drive_root=drive, repo_dir=tmp_path / "repo")
-    applied = apply_memory_actions(env, [
-        {"type": "knowledge_write", "topic": "pfacts", "content": "project knowledge X"},
-        {"type": "scratchpad_append", "content": "should be skipped"},
-        {"type": "identity_update_candidate", "content": "should be skipped"},
-    ], project_id="proj_z")
-    assert applied == 1  # only knowledge_write applied for a project task
-    proj = project_knowledge_dir("proj_z") / "pfacts.md"
-    assert proj.exists() and "project knowledge X" in proj.read_text(encoding="utf-8")
-    # never canonical: no global knowledge, no scratchpad
-    assert not (drive / "memory" / "knowledge" / "pfacts.md").exists()
-    assert not (drive / "memory" / "scratchpad_blocks.json").exists()
-
-
 def test_forked_project_child_skips_global_knowledge_seed(tmp_path):
     from ouroboros.headless import prepare_task_drive
 
@@ -354,18 +335,6 @@ def test_maybe_promote_skips_project_scoped_task(tmp_path, monkeypatch):
     env = types.SimpleNamespace(drive_root=tmp_path)
     # explicit project_id -> project-scoped -> never promote global evolution
     assert pte.maybe_promote(env, {"type": "task", "id": "t1", "project_id": "proj_p"}, {"reflection": "x"}) is None
-
-
-def test_apply_memory_actions_canonical_when_unscoped(tmp_path):
-    from ouroboros.reflection import apply_memory_actions
-
-    drive = tmp_path / "drive"
-    env = types.SimpleNamespace(drive_root=drive, repo_dir=tmp_path / "repo")
-    applied = apply_memory_actions(env, [
-        {"type": "knowledge_write", "topic": "gfacts", "content": "global knowledge"},
-    ])
-    assert applied == 1
-    assert (drive / "memory" / "knowledge" / "gfacts.md").exists()
 
 
 # --- origin-keyed project lookup (one owner message, one Project) -------------

@@ -1,12 +1,15 @@
 """Reviewable skill payload: what a reviewer may see, and how much of it.
 
-Owns the assembly of the skill file pack the reviewer reads: the pack-level
+Owns the assembly of the skill file pack a packet reviewer reads: the pack-level
 token budget derived from the review stack's prompt-budget SSOT, the text read
 that refuses unreadable or non-UTF-8 runtime payloads, the binary extensions
 named early on the refusal path, and the split of an over-budget skill into
-budget-sized packs reviewed in separate passes. The three typed refusals live
-here with the reads that raise them, so a caller can distinguish a
-shrink-the-file case from an opaque-payload case without parsing a message.
+budget-sized packs reviewed in separate passes. A retrieving reviewer is not
+bound by that budget: it gets the whole payload when its first send holds it,
+otherwise the per-file index of the frozen copy it reads (``frozen_payload_files``).
+The three typed refusals live here with the reads that raise them, so a caller
+can distinguish a shrink-the-file case from an opaque-payload case without
+parsing a message.
 """
 
 from __future__ import annotations
@@ -118,6 +121,7 @@ def _build_skill_file_packs(
     manifest_entry: str = "",
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     expected_content_hash: str = "",
+    split: bool = True,
 ) -> List[str]:
     """Return the fenced-code review pack(s) mirroring the skill content-hash surface.
 
@@ -125,7 +129,9 @@ def _build_skill_file_packs(
     the files are split into multiple budget-sized packs (greedy by file) so each is
     reviewed in a SEPARATE pass and EVERY byte is still reviewed — never silently
     truncated. A single file that alone exceeds the budget cannot be split without
-    truncating it, so it raises ``_SkillFileOverBudget`` (honest-pending).
+    truncating it, so it raises ``_SkillFileOverBudget`` (honest-pending). The
+    budget is the packet seat's: ``split=False`` (a panel without packet seats)
+    returns the whole payload as one pack and refuses no file for its size.
 
     The bound is ONE pack-level token budget, not per-file BYTE caps. Loadable
     executables (content magic bytes) / unreadable files are still refused by
@@ -158,7 +164,7 @@ def _build_skill_file_packs(
             block = f"### {rel_head}\n\n```json\n{body}\n```"
         else:
             block = f"### {rel}\n\n```\n{body}\n```"
-        block_tokens = estimate_tokens(block)
+        block_tokens = estimate_tokens(block) if split else 0
         if block_tokens > budget:
             # One file too large to review in a single pass without truncating it.
             raise _SkillFileOverBudget(rel, block_tokens, budget)
@@ -172,3 +178,33 @@ def _build_skill_file_packs(
     if expected_content_hash and reduce_skill_content_hash(file_digests) != expected_content_hash:
         raise _SkillFileUnreadable("(payload snapshot)", RuntimeError("skill payload changed after hashing"))
     return packs
+
+
+def frozen_payload_files(
+    view: pathlib.Path,
+    *,
+    manifest_entry: str = "",
+    manifest_scripts: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Per-file facts of the frozen payload copy a retrieving reviewer reads.
+
+    The same file set and reads as the packs (``_iter_payload_files``,
+    ``_read_skill_file``): a text file carries the identity a ``read_file``
+    receipt stamps (``source_text_identity``), a binary file stays its
+    descriptor — a descriptor never claims its bytes were inspected.
+    """
+    from ouroboros.skill_loader import _iter_payload_files  # pylint: disable=W0212
+    from ouroboros.tools.scope_required_sources import source_text_identity
+
+    view = pathlib.Path(view).resolve()
+    entries: List[Dict[str, Any]] = []
+    for file_path in _iter_payload_files(view, manifest_entry=manifest_entry, manifest_scripts=manifest_scripts):
+        rel = file_path.relative_to(view).as_posix()
+        text, digest, descriptor = _read_skill_file(file_path, relpath=rel)
+        if descriptor is not None:
+            entries.append({"path": rel, "binary": descriptor})
+            continue
+        raw = text.encode("utf-8")
+        entries.append({"path": rel, "size": len(raw), "sha256": digest.hex(), "text": text,
+                        **source_text_identity(raw)})
+    return entries

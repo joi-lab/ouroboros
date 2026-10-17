@@ -577,24 +577,10 @@ def write_blob_stream(drive_root: pathlib.Path, chunks: Any, *, kind: str = "bin
 
 
 def read_blob_bytes(drive_root: pathlib.Path, ref: Dict[str, Any], *, expected_kind: str = "bin") -> bytes:
-    """Read and verify one content-addressed BYTES blob below this drive root."""
-    from ouroboros.observability import _blob_ref_path
+    """Read and verify one content-addressed BYTES blob below this drive root (loose, else its pack)."""
+    from ouroboros.evidence_packs import blob_bytes
 
-    if not isinstance(ref, dict):
-        raise ValueError("observability blob ref must be an object")
-    if str(ref.get("kind") or "") != expected_kind or ref.get("encoding") != "gzip":
-        raise ValueError("observability blob ref has an unexpected kind or encoding")
-    expected_sha = str(ref.get("sha256") or "")
-    try:
-        expected_size = int(ref["size"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("observability blob ref has no valid size") from exc
-    path = _blob_ref_path(drive_root, ref)
-    with gzip.open(path, "rb") as handle:
-        raw = handle.read()
-    if len(raw) != expected_size or hashlib.sha256(raw).hexdigest() != expected_sha:
-        raise ValueError("observability blob ref failed size or sha256 verification")
-    return raw
+    return blob_bytes(drive_root, ref, expected_kind=expected_kind)
 
 
 def retain_private_capture(drive_root: Any, capture: RepoDiffCapture) -> Dict[str, Any]:

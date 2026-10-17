@@ -56,13 +56,19 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
         "text_preview": str(evt.get("text_preview") or "")[:200],
     }
     try:
+        # #1578: address BEFORE the durable append, so the row and its live copy
+        # carry the same lineage and audience (read-only over RUNNING).
+        from supervisor.log_addressing import address_ctx_event
+
+        payload = address_ctx_event(ctx, payload)
+    except Exception:
+        log.debug("Failed to address task_message_injected", exc_info=True)
+    try:
         ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
     except Exception:
         log.warning("Failed to log task_message_injected event", exc_info=True)
     try:
-        from supervisor.log_addressing import address_ctx_event
-
-        ctx.bridge.push_log(address_ctx_event(ctx, dict(payload)))
+        ctx.bridge.push_log(dict(payload))
     except Exception:
         log.debug("Failed to forward task_message_injected to live logs", exc_info=True)
 
@@ -72,13 +78,10 @@ def _handle_task_message_injected(evt: Dict[str, Any], ctx: Any) -> None:
 # fix registered one branch of review_helpers' if/else and missed the other.
 TELEMETRY_EVENT_HANDLERS = {
     "review_density_probe": _handle_typed_telemetry,
-    "review_scope_delivery_migrated": _handle_typed_telemetry,
-    "review_scope_lead_unobserved": _handle_typed_telemetry,
     "review_wave_admission_unavailable": _handle_typed_telemetry,
     "review_wave_budget_insufficient": _handle_typed_telemetry,
+    "review_wave_billing_authority_unavailable": _handle_typed_telemetry,
     "review_wave_budget_partial_unknown": _handle_typed_telemetry,
-    "advisory_suspect_result": _handle_typed_telemetry,
-    "advisory_contract_warning": _handle_typed_telemetry,
     "plan_task_deadline_skip": _handle_typed_telemetry,
     "task_message_injected": _handle_task_message_injected,
     # #Q-2b: the owner's quiz answer landed in a worker round — same

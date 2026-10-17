@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
 from copy import deepcopy
 import gzip
 import hashlib
@@ -19,6 +20,7 @@ from ouroboros.gateways.claudexor import ClaudexorGateway, ClaudexorUnavailable
 from ouroboros.llm import LLMClient
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
 from ouroboros.transport_custody import is_pre_dispatch_transport_failure, is_retryable_transport_death
+from tests._usage_store_testing import ledger_rows
 
 
 MODEL = "claudexor::codex=exact-model"
@@ -142,7 +144,7 @@ class Gateway:
         self.catalog_reads = 0
         self.capture_requests = []
 
-    def operations(self):
+    def operations(self, **_kwargs):
         self.catalog_reads += 1
         return deepcopy(self.operation_catalog)
 
@@ -214,8 +216,7 @@ def setup(tmp_path, monkeypatch):
 
 
 def ledger(root):
-    path = root / ua.LEDGER_REL
-    return [json.loads(row) for row in path.read_text().splitlines()] if path.exists() else []
+    return ledger_rows(root)
 
 
 def retained(root, suffix="response", *, raw=False):
@@ -260,7 +261,7 @@ def test_sync_preserves_system_images_tool_cycle_and_native_custody(setup, monke
     client.chat(followup, MODEL, tools)
     assert gateway.uploads[-1][0]["messages"] == followup
     assert gateway.uploads[-1][0]["account"] == {"mode": "auto", "preferredProfileId": "account-a"}
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"] * 2
+    assert [row["state"] for row in ledger(root)] == ["settled"] * 2
     assert len(usage["ledger_attempt_ids"]) == 1
 
 
@@ -317,7 +318,7 @@ def test_lost_create_reply_rejoins_without_second_physical_attempt(setup):
     assert answer["content"] == "Ответ 🐍"
     assert len(gateway.creates) == 2 and gateway.creates[0] == gateway.creates[1]
     assert len(gateway.accepted_operations) == 1 and len(usage["ledger_attempt_ids"]) == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in ledger(root)] == ["settled"]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -494,7 +495,7 @@ def test_field_refusal_retains_then_acknowledges_once_with_display(setup, asynch
     assert error.physical_attempt_capture.state == "settled"
     assert error.usage["claudexor"]["result_custody"]["state"] == "acknowledged"
     assert len(gateway.accepted_operations) == len(gateway.creates) == len(gateway.acks) == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in ledger(root)] == ["settled"]
 
 
 @pytest.mark.parametrize("code,vendor", [("unsupported_parameter", ""),
@@ -511,7 +512,7 @@ def test_proven_not_started_releases_and_never_fabricates_provider_usage(setup, 
     assert raised.value.physical_attempt_capture.provider_code == code
     assert raised.value.physical_attempt_capture.provider_error_type == (vendor or "ClaudexorModelNotDispatched")
     assert gateway.uploads[0][0]["options"]["temperature"] == 0.2
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"]
+    assert [row["state"] for row in ledger(root)] == ["released"]
     assert len(gateway.accepted_operations) == 1
 
 
@@ -541,7 +542,40 @@ def test_upload_proof_refines_terminal_without_resending_or_inventing_usage(setu
     assert ledger(root)[-1]["state"] == ("released" if proven else "unresolved")
     classified = classify_llm_exception(error)
     assert classified.retry_same_request is proven
+    # The kind decides the free wait (12.10: a proven non-delivery read as provider_error).
+    assert classified.kind == ("transport_unavailable" if proven else "provider_outcome_unknown")
+    assert error.physical_attempt_capture.route_is_loopback is False  # the daemon is no model server
     assert len(gateway.accepted_operations) == len(gateway.creates) == 1
+
+
+@pytest.mark.parametrize("code, basis, cause, kind", [
+    ("transport_not_delivered", "incomplete_upload", "EPIPE", "transport_unavailable"),
+    ("transport_not_delivered", "connect_failure", "UND_ERR_CONNECT_TIMEOUT", "transport_unavailable"),
+    ("auth_unavailable", "", "", "auth_error"),
+    ("model_source_unavailable", "", "", "bad_request"),
+])
+def test_engine_not_started_receipt_is_classified_by_its_typed_code(setup, code, basis, cause, kind):
+    """The 12.10 receipt verbatim waits as a free outage; a typed engine precondition
+    refusal before dispatch never waits as one (it would hold the task for hours)."""
+    from ouroboros.loop_llm_call import classify_llm_exception
+
+    root, gateway, client = setup
+    context = ({"errorCode": cause, "stage": "fetch", "generationStarted": False,
+                "requestDelivery": {"basis": basis, "state": "not_delivered", "bodyBytes": 4_910_776,
+                                    "handedOffBytes": 3_997_696, "responseReceived": False}} if basis else {})
+    message = ("The complete Codex request was not delivered; generation did not start." if basis
+               else "Controlled engine refusal")
+    value = result(outcome="failed", problem={"code": code, "message": message, "retryable": bool(basis),
+                                              "context": context})
+    gateway.results = [value]
+    gateway.dispatch = ["not_started"]
+    with pytest.raises(transport.ClaudexorModelNotDispatched) as raised:
+        client.chat([{"role": "user", "content": "hi"}], MODEL)
+    assert raised.value.physical_attempt_capture.state == "released"
+    assert [row["state"] for row in ledger(root)] == ["released"]
+    classified = classify_llm_exception(raised.value)
+    assert classified.kind == kind
+    assert classified.retry_same_request is (kind == "transport_unavailable")
 
 
 def test_typed_subject_refusal_suppresses_next_auto_preference(setup):
@@ -587,7 +621,7 @@ def test_native_reset_keeps_canonical_tools_and_only_claims_a_real_account_chang
     resent = gateway.uploads[1][0]["messages"]
     assert "nativeContinuation" not in resent[0]
     assert resent[0]["tool_calls"] == original[0]["tool_calls"] and resent[1:] == original[1:]
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    assert [row["state"] for row in ledger(root)] == ["released", "settled"]
     event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
     assert event["type"] == "native_continuation_reset" and "payload" not in json.dumps(event)
     assert event["routes"] == [{"old_route": ROUTE, "new_route": changed if rerouted else {}}]
@@ -632,8 +666,7 @@ def test_native_reset_clears_both_surfaces_and_adopts_the_new_turn(
     resets = [event for event in events if event["type"] == "native_continuation_reset"]
     assert len(resets) == 1 and resets[0]["surface"] == "top_level_turn_slot"
     assert len(resets[0]["routes"]) == (2 if with_message_token else 1)
-    assert [row["state"] for row in ledger(root)] == [
-        "reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    assert [row["state"] for row in ledger(root)] == ["released", "settled"]
     send()
     assert gateway.uploads[2][0]["nativeContinuation"] == TURN
     assert slot.envelope is None
@@ -654,7 +687,7 @@ def test_dual_continuation_repair_is_bounded_to_one_retry(setup, turn_engine, as
             client.chat(messages, MODEL, model_turn_state=slot)
     assert len(gateway.accepted_operations) == 2 and slot.envelope is None
     assert messages == original
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"] * 2
+    assert [row["state"] for row in ledger(root)] == ["released"] * 2
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -768,14 +801,24 @@ def test_gigachat_async_tools_still_refuse_before_provider_io(setup, monkeypatch
 @pytest.mark.parametrize("profile", [None, "account-b"])
 @pytest.mark.parametrize("fails", [False, True])
 @pytest.mark.parametrize("requested_model", [None, "exact-model"])
-def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypatch, profile, fails, requested_model):
+@pytest.mark.parametrize("admission_supported", [False, True])
+def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypatch, profile, fails,
+                                                               requested_model, admission_supported):
+    from ouroboros import llm_capability_policy
+
     root, gateway, client = setup
-    monkeypatch.setattr(transport, "read_owned_gateway", lambda: gateway)
+    monkeypatch.setattr(llm_capability_policy, "read_owned_gateway", lambda: gateway)
     catalog = {"source": "opaque-source", "route": {"credentialProfileId": profile}, "models": []}
+    if admission_supported:
+        gateway.operation_catalog = [{"method": "GET", "path": "/v2/model-sources/:id/models",
+            "parameters": [{"name": "includeAdmission", "location": "query", "enum": ["true", "false"]}]}]
 
     def read(source, credential_profile_id, **kwargs):
         assert source == "opaque-source" and credential_profile_id == profile
-        assert kwargs == ({"requested_model": requested_model} if requested_model else {})
+        expected = {"requested_model": requested_model} if requested_model else {}
+        if requested_model and admission_supported:
+            expected["include_admission"] = True
+        assert kwargs == expected
         if fails:
             raise ClaudexorUnavailable("catalog_unavailable", "No catalog evidence")
         return catalog
@@ -787,6 +830,7 @@ def test_catalog_metadata_uses_exact_optional_profile_and_closes(setup, monkeypa
     else:
         assert client.claudexor_model_catalog("opaque-source", profile, requested_model=requested_model) is catalog
     assert gateway.closed == 1 and not gateway.creates and not ledger(root)
+    assert gateway.catalog_reads == int(requested_model is not None)
 
 
 def test_cold_actual_model_call_still_ensures_engine_after_unknown_metadata(setup, monkeypatch):
@@ -820,7 +864,7 @@ def test_cold_actual_model_call_still_ensures_engine_after_unknown_metadata(setu
     assert answer == result()["message"]
     assert startup == ["ensure_running", "handshake", "reconcile"]
     assert len(gateway.creates) == 1 and len(usage["ledger_attempt_ids"]) == 1
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "settled"]
+    assert [row["state"] for row in ledger(root)] == ["settled"]
     assert gateway.closed == 1
 
 
@@ -835,12 +879,14 @@ def test_operation_observer_has_recovery_identity_without_provider_content(setup
         call = getattr(client, method)([], **kwargs)
         if method == "chat_async":
             asyncio.run(call)
-    assert [value["operation_id"] for value in events] == ["", "op-0"]
+    assert [value["operation_id"] for value in events] == ["", "op-0", "op-0"]
+    assert [value["model_activity"]["phase"] for value in events] == ["preparing", "response_ready", "response_received"]
     assert events[0]["invocation_id"] == events[1]["invocation_id"]
     assert events[1]["request_ref"] == REF
     assert events[1]["request_manifest_ref"]["path"]
     assert events[1]["request_manifest_ref"]["sha256"]
-    assert set(events[1]) == {"operation_id", "invocation_id", "request_ref", "request_manifest_ref"}
+    assert set(events[1]) == {"operation_id", "invocation_id", "request_ref", "request_manifest_ref", "model_activity"}
+    assert set(events[1]["model_activity"]) == {"operation_id", "invocation_id", "phase"}
     assert "model_operation_observer" not in gateway.uploads[0][0]
     assert retained(root, "request") == gateway.uploads[0][0]
 
@@ -939,7 +985,7 @@ def test_continuation_repair_is_bounded_to_one_unstarted_operation(setup):
     with pytest.raises(transport.ClaudexorModelNotDispatched):
         client.chat([result()["message"]], MODEL)
     assert len(gateway.accepted_operations) == 2
-    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"] * 2
+    assert [row["state"] for row in ledger(root)] == ["released"] * 2
 
 
 def test_unreleased_attempt_cannot_authorize_continuation_repair(setup, monkeypatch):
@@ -1054,44 +1100,46 @@ def test_caller_control_before_create_proves_no_dispatch(setup):
         client.chat([], MODEL, model_poll_control=lambda: "owner_cancelled")
     assert not gateway.uploads and not gateway.creates
     assert raised.value.physical_attempt_capture.state == "released"
-    assert [row["state"] for row in ledger(root)] == ["reserved", "released"]
+    assert [row["state"] for row in ledger(root)] == ["released"]
 
 
 @pytest.mark.parametrize("phase", ["upload", "ack"])
 def test_async_cancellation_preserves_io_ownership_outside_polling(setup, phase):
     root, gateway, client = setup
-    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    entered, release, closed = Future(), threading.Event(), Future()
     name = "upload_model_request" if phase == "upload" else "acknowledge_model_result"
     original = getattr(gateway, name)
     original_close = gateway.close
 
     def blocked(*args, **kwargs):
-        entered.set()
-        assert release.wait(2)
-        assert not closed.is_set()
+        entered.set_result(None)
+        release.wait()
+        assert not closed.done()
         return original(*args, **kwargs)
 
     def close():
         original_close()
-        closed.set()
+        closed.set_result(None)
 
     setattr(gateway, name, blocked)
     gateway.close = close
 
     async def run():
         task = asyncio.create_task(client.chat_async([], MODEL))
-        assert await asyncio.to_thread(entered.wait, 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert not closed.is_set()
-        release.set()
-        assert await asyncio.to_thread(closed.wait, 2)
+        try:
+            # Witness the I/O owner directly, without another executor waiter or
+            # a two-second performance requirement on request preparation.
+            await asyncio.wrap_future(entered)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not closed.done()
+        finally:
+            task.cancel()
+            release.set()  # also unblock the owner if the scenario fails
+        await asyncio.wrap_future(closed)
 
-    try:
-        asyncio.run(run())
-    finally:
-        release.set()
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
     assert gateway.closed == 1
     if phase == "upload":
         assert not gateway.creates and ledger(root)[-1]["state"] == "released"
@@ -1102,36 +1150,36 @@ def test_async_cancellation_preserves_io_ownership_outside_polling(setup, phase)
 
 def test_async_cancellation_leaves_io_owner_to_cancel_and_close(setup):
     root, gateway, client = setup
-    entered, release, closed = threading.Event(), threading.Event(), threading.Event()
+    entered, release, closed = Future(), threading.Event(), Future()
     gateway.pending = True
     original = gateway.get_model_operation
     original_close = gateway.close
 
     def read(*args, **kwargs):
-        entered.set()
-        assert release.wait(2)
+        entered.set_result(None)
+        release.wait()
         return original(*args, **kwargs)
 
     def close():
         original_close()
-        closed.set()
+        closed.set_result(None)
 
     gateway.get_model_operation, gateway.close = read, close
 
     async def run():
         task = asyncio.create_task(client.chat_async([{"role": "user", "content": "hi"}], MODEL))
-        assert await asyncio.to_thread(entered.wait, 2)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert not closed.is_set()
-        release.set()
-        assert await asyncio.to_thread(closed.wait, 2)
+        try:
+            await asyncio.wrap_future(entered)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not closed.done()
+        finally:
+            task.cancel()
+            release.set()
+        await asyncio.wrap_future(closed)
 
-    try:
-        asyncio.run(run())
-    finally:
-        release.set()
+    asyncio.run(asyncio.wait_for(run(), timeout=30))
     assert gateway.cancels == [("op-0", "host_cancelled")]
     assert ledger(root)[-1]["state"] == "unresolved" and not gateway.acks
 

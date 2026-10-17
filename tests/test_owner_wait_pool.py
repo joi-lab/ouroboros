@@ -11,6 +11,7 @@ import pytest
 from ouroboros.artifacts import store_actor_source_bytes
 from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import queue, worker_owner_wait, worker_pool_lifecycle, workers
+from tests.worker_pool_support import affirm_ready
 
 
 class Process:
@@ -52,7 +53,7 @@ def pool(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr(workers, "repo_writer_task_allowed", lambda task: True)
     monkeypatch.setattr(workers, "load_state", lambda: {})
-    monkeypatch.setattr(worker_pool_lifecycle, "_record_worker_pids", lambda: None)
+    monkeypatch.setattr(worker_pool_lifecycle, "_record_worker_processes", lambda: None)
     monkeypatch.setattr(worker_pool_lifecycle.threading, "Thread",
                         lambda **kw: SimpleNamespace(start=lambda: None))
     monkeypatch.setattr(workers, "get_event_q", InputQueue)
@@ -71,9 +72,12 @@ def pool(tmp_path, monkeypatch):
                 worker.proc.alive = False
                 worker.proc.exitcode = 0
 
-    monkeypatch.setattr(worker_owner_wait, "kill_worker_tree", kill)
+    monkeypatch.setattr(worker_pool_lifecycle, "kill_worker_tree", kill)
+    monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(workers, "repo_writer_admission_closed", lambda: "")
     root_task = {"id": "owner", "type": "task", "chat_id": 1, "_attempt": 3, "text": "work"}
     original = workers.Worker(0, Process(42), InputQueue(), busy_task_id="owner")
+    affirm_ready(original)
     slots[0] = original
     started = time.time() - 4000
     running["owner"] = {"task": root_task, "worker_id": 0, "attempt": 3,
@@ -81,12 +85,29 @@ def pool(tmp_path, monkeypatch):
     write_task_result(tmp_path, "owner", "running", result="prepared", total_rounds=7)
     source = store_actor_source_bytes(tmp_path, "owner", category="context_checkpoints",
                                      source_id="wait", data=b'{"effects":"done"}', extension="json")
-    wait = {"wait_id": "wait", "task_attempt": 3, "quiz_id": "quiz", "source_ref": source,
+    wait = {"wait_id": "wait", "task_attempt": 3, "reason": "owner", "quiz_id": "quiz", "source_ref": source,
             "execution_drive_root": str(tmp_path), "started_at": started}
     event = {"type": "owner_wait", "task_id": "owner", "worker_id": 0, "pid": 42,
              "task_attempt": 3, "wait_id": "wait", "phase": "park", "checkpoint": wait}
     return SimpleNamespace(root=tmp_path, original=original, meta=running["owner"],
                            event=event, wait=wait, created=created)
+
+
+def maintain_capacity():
+    worker_owner_wait.maintain_owner_wait_capacity()
+    worker_pool_lifecycle.reconcile_worker_capacity(lambda: 0)
+
+
+def quiesce_and_reap(worker):
+    command = worker.in_q.get_nowait()
+    assert command["type"] == "worker_quiescence"
+    worker_pool_lifecycle.handle_worker_quiescent({
+        "worker_id": worker.wid, "pid": worker.proc.pid,
+        "process_birth": worker.process_birth, "token": command["token"]}, workers)
+    worker_owner_wait.maintain_owner_wait_capacity()
+    assert worker.retiring and worker.active_capacity
+    worker_pool_lifecycle.reap_idle_worker(queue._reap_queue.get_nowait())
+    worker_owner_wait.maintain_owner_wait_capacity()
 
 
 def park(pool):
@@ -116,17 +137,20 @@ def test_snapshot_failure_never_lends_capacity_or_confirms_park(pool, monkeypatc
 
 def test_replacement_readiness_and_same_stack_resume(pool):
     park(pool)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     replacement = workers.WORKERS[1]
     assert replacement.reaping and replacement.active_capacity
     assert pool.original is workers.WORKERS[0] and len(pool.created) == 1
     replacement.reaping = False
+    affirm_ready(replacement)
     replacement.busy_task_id = "independent"
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert pool.original.in_q.empty() and not pool.original.active_capacity
     replacement.busy_task_id = None
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
+    assert replacement.proc.is_alive() and not pool.original.active_capacity
+    quiesce_and_reap(replacement)
     assert set(workers.WORKERS) == {0} and not replacement.proc.is_alive()
     grant = pool.original.in_q.get_nowait()
     assert grant == {"type": "owner_wait", "task_id": "owner", "task_attempt": 3,
@@ -149,7 +173,7 @@ def test_foreign_or_stale_event_does_not_park(pool, field, value):
 
 def test_dead_parked_worker_is_removed_without_respawn(pool):
     park(pool)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     replacement = workers.WORKERS[1]
     pool.original.proc.alive = False
     assert workers.respawn_worker(0)
@@ -180,20 +204,20 @@ def test_resume_snapshot_failure_keeps_original_parked(pool, monkeypatch):
     park(pool)
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **kw: False)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert not pool.original.active_capacity and pool.original.in_q.empty()
     assert load_task_result(pool.root, "owner")["owner_wait"]["state"] == "waiting"
 
 
 def test_ordinary_pool_does_not_grow_to_configured_max(pool, monkeypatch):
     monkeypatch.setattr(workers, "MAX_WORKERS", 10)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert set(workers.WORKERS) == {0} and not pool.created
 
 
 def exhausted_replacement(pool):
     park(pool)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     replacement = workers.WORKERS[1]
     replacement.proc.alive = False
     replacement.readiness_exhausted = True
@@ -202,11 +226,11 @@ def exhausted_replacement(pool):
 
 def test_same_stack_reclaims_exhausted_replacement_without_new_spawn(pool):
     replacement = exhausted_replacement(pool)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert workers.worker_pool_admission_state()["available"]
     assert len(pool.created) == 1 and replacement.active_capacity
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert workers.WORKERS == {0: pool.original}
     assert pool.original.active_capacity and len(pool.created) == 1
     assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
@@ -235,7 +259,7 @@ def test_exhausted_reservation_and_original_rollback_together(pool, monkeypatch,
         def fail_command(*a, **k):
             raise OSError("command unavailable")
         monkeypatch.setattr(worker_owner_wait, "_command", fail_command)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert not pool.original.active_capacity and replacement.active_capacity
     assert len(pool.created) == 1 and workers.WORKERS[1] is replacement
     assert pool.original.in_q.empty() and pool.meta["owner_wait"]["state"] == "waiting"
@@ -253,6 +277,7 @@ def test_wait_lends_capacity_to_real_assignment(pool, monkeypatch):
     assert "independent" not in workers.RUNNING  # New slot still awaits readiness.
     replacement = workers.WORKERS[1]
     replacement.reaping = False
+    affirm_ready(replacement)
     workers.assign_tasks()
     assert replacement.in_q.get_nowait()["id"] == "independent"
     assert workers.RUNNING["independent"]["worker_id"] == 1
@@ -265,13 +290,16 @@ def test_stop_policy_keeps_its_authority_at_resume(pool, monkeypatch, policy, gr
     from ouroboros import cancel_intents
 
     park(pool)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     replacement = workers.WORKERS[1]
     replacement.reaping = False
+    affirm_ready(replacement)
     monkeypatch.setattr(cancel_intents, "active_intents",
                         lambda *a, **k: {"owner": {"stop_policy": policy}})
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
+    if granted:
+        quiesce_and_reap(replacement)
     assert pool.original.active_capacity is granted
     assert pool.original.in_q.empty() is not granted
     if not granted:
@@ -310,10 +338,12 @@ def test_stale_snapshot_keeps_only_verified_planned_owner_handoff(pool, monkeypa
                 "_attempt": 3, "_owner_wait_resume": {**pool.wait, "restart_transaction_id": "tx"}}
     workers.PENDING.extend([selected, {"id": "old", "chat_id": 1, "type": "task", "text": "old"}])
     assert queue.persist_queue_snapshot()
-    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
     assert snap["pending"][0]["task"]["_owner_wait_resume"] == selected["_owner_wait_resume"]
-    snap["ts"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
-    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    stamp_path = queue.QUEUE_SNAPSHOT_PATH.with_name("queue.alive")
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    stamp["ts"] = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).isoformat()
+    stamp_path.write_text(json.dumps(stamp), encoding="utf-8")
     workers.PENDING.clear()
     monkeypatch.setattr(owner_wait, "restore_owner_wait_allowed", lambda root, task: task["id"] == "resume")
     monkeypatch.setattr(queue, "enqueue_task", lambda task, **kwargs: workers.PENDING.append(task))
@@ -344,16 +374,17 @@ def test_cold_assignment_restores_old_clock_without_budget_replay_classification
 def test_stopped_last_sleeper_preserves_enabled_capacity_only(pool, monkeypatch, replacement_exists, disabled):
     park(pool)
     if replacement_exists:
-        worker_owner_wait.maintain_owner_wait_capacity()
+        maintain_capacity()
     if disabled:
         monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "worker_crash_storm")
     workers.RUNNING.pop("owner")
     pool.original.busy_task_id = None
     pool.original.proc.alive = False  # The Stop/reaper owner already proved death.
-    assert workers.respawn_worker(0)
+    assert workers.respawn_worker(0) is not disabled
     active = [w for w in workers.WORKERS.values() if w.active_capacity]
     assert len(active) == int(replacement_exists or not disabled)
-    assert pool.original not in workers.WORKERS.values()
+    # A fence's stop owner tears down the membership it captured, this dead slot included.
+    assert (pool.original in workers.WORKERS.values()) is disabled
     assert all(w.reaping for w in active)  # A replacement still owes readiness.
 
 
@@ -436,7 +467,7 @@ def test_native_continuation_crash_never_replays_original_work(pool, monkeypatch
     else:
         park(pool)
         worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-        worker_owner_wait.maintain_owner_wait_capacity()
+        maintain_capacity()
         assert pool.original.active_capacity
         if stage == "grant_consumed":
             assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
@@ -456,7 +487,7 @@ def test_grant_consumes_old_cold_marker_before_publishing_snapshot(pool):
     pool.meta["task"]["_owner_wait_resume"] = {**pool.wait, "restart_transaction_id": "tx"}
     park(pool)
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
     assert "_owner_wait_resume" not in pool.meta["task"]
     row = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())["running"][0]
@@ -476,7 +507,7 @@ def test_failed_grant_rolls_back_marker_and_wait_together(pool, monkeypatch, fai
         def fail_command(*args, **kwargs):
             raise OSError("input queue unavailable")
         monkeypatch.setattr(worker_owner_wait, "_command", fail_command)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     assert not pool.original.active_capacity and pool.original.in_q.empty()
     assert pool.meta["task"]["_owner_wait_resume"] == marker
     assert pool.meta["owner_wait"]["state"] == "waiting"
@@ -499,7 +530,7 @@ def test_idle_timeout_never_clones_a_checkpointed_attempt(pool, monkeypatch, sta
     elif stage != "ordinary":
         park(pool)
         worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-        worker_owner_wait.maintain_owner_wait_capacity()
+        maintain_capacity()
         assert pool.original.in_q.get_nowait()["phase"] == "resume_granted"
         if stage == "other_attempt":
             pool.meta["owner_wait"]["task_attempt"] = 2
@@ -542,6 +573,6 @@ def test_the_wait_stamp_rides_park_grant_and_restart_handoff_beside_the_task_sta
     assert selected == {"owner"}
     assert pool.meta["task"]["_owner_wait_resume"]["parked_at"] == "2026-09-26T11:30:00+00:00"
     worker_owner_wait.handle_owner_wait({**pool.event, "phase": "resume"}, workers)
-    worker_owner_wait.maintain_owner_wait_capacity()
+    maintain_capacity()
     resumed = load_task_result(pool.root, "owner")["owner_wait"]
     assert resumed["state"] == "resumed" and resumed["parked_at"] == "2026-09-26T11:30:00+00:00"

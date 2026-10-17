@@ -18,6 +18,7 @@ from ouroboros.tools import (
     control,
     control_events,
     control_routing,
+    control_relay,
     control_runtime,
     control_scheduling,
     control_subagent_spec,
@@ -30,6 +31,7 @@ REPO = pathlib.Path(__file__).parents[1]
 _LEAVES = (
     control_events,
     control_routing,
+    control_relay,
     control_runtime,
     control_scheduling,
     control_subagent_spec,
@@ -50,14 +52,10 @@ _MOVED_OWNERS = {
     "_attach_origin_from_metadata": control_routing,
     "_finish_swarm_handoff": control_routing,
     "_list_projects": control_routing,
-    "_promote_chat_to_task": control_routing,
-    "_route_to_project": control_routing,
-    "_steer_task": control_routing,
+    "_start_task": control_routing,
+    "_tell_task": control_relay,
     # unrowed post-cutoff upstream family riding with its only readers
     # (promote/route): the predecessor-authority selector and its two helpers.
-    "_MISSING_PREDECESSOR_SELECTOR": control_routing,
-    "_predecessor_selector_error": control_routing,
-    "_attach_predecessor_authority_from_metadata": control_routing,
     "_chat_history": control_runtime,
     "_evolution_restart_block_reason": control_runtime,
     "_promote_to_stable": control_runtime,
@@ -76,7 +74,7 @@ _MOVED_OWNERS = {
     "schedule_subagent_param_names": control_subagent_spec,
     "_INTERNAL_SCHEDULE_OPTIONS": control_subagent_spec,
     "_validated_schedule_fields": control_subagent_spec,
-    "RETIRED_SCHEDULE_PARAMS": control_subagent_spec,
+    "requested_child_effort": control_subagent_spec,
     "_record_scheduled_subagent": control_scheduling,
     "_emit_swarm_fanout": control_scheduling,
     "_subagent_slot_note": control_scheduling,
@@ -138,10 +136,9 @@ def test_control_leaves_are_non_catalog_owners_without_control_backedges():
 def test_control_catalog_handler_owners_point_at_the_carried_leaves():
     entries = {entry.name: entry for entry in control.get_tools()}
     owned = {
-        "promote_chat_to_task": (control_routing, "_promote_chat_to_task"),
+        "start_task": (control_routing, "_start_task"),
         "list_projects": (control_routing, "_list_projects"),
-        "route_to_project": (control_routing, "_route_to_project"),
-        "steer_task": (control_routing, "_steer_task"),
+        "tell_task": (control_relay, "_tell_task"),
         "set_tool_timeout": (control_runtime, "_set_tool_timeout"),
         "request_restart": (control_runtime, "_request_restart"),
         "promote_to_stable": (control_runtime, "_promote_to_stable"),

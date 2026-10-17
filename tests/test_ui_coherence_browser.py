@@ -122,33 +122,6 @@ def test_scroll_fade_tracks_edges_late_content_and_stops_after_disposal(subscrip
     page.evaluate("shellFade.el.remove()")
 
 
-def test_matrix_respects_reduced_motion_changes_and_page_cleanup(subscription_ui):
-    page = subscription_ui["page"]
-    page.emulate_media(reduced_motion="reduce")
-    open_app(subscription_ui)
-    page.wait_for_selector("#matrix-rain", state="attached")
-    sample = "document.querySelector('#matrix-rain').toDataURL()"
-    first = page.evaluate(sample)
-    page.wait_for_timeout(200)
-    assert page.evaluate(sample) == first
-    setup_browser.capture(page, "shell-rain-reduced")
-    page.emulate_media(reduced_motion="no-preference")
-    page.wait_for_function("before => document.querySelector('#matrix-rain').toDataURL() !== before", arg=first)
-    page.emulate_media(reduced_motion="reduce")
-    page.wait_for_timeout(100)
-    frozen = page.evaluate(sample)
-    page.wait_for_timeout(200)
-    assert page.evaluate(sample) == frozen
-    page.evaluate("""() => {window.shellRain=document.querySelector('#matrix-rain');
-        window.dispatchEvent(new PageTransitionEvent('pagehide',{persisted:false}));}""")
-    assert page.locator("#matrix-rain").count() == 0
-    before = page.evaluate("[shellRain.width,shellRain.height,shellRain.toDataURL()]")
-    page.set_viewport_size({"width": 700, "height": 400})
-    page.emulate_media(reduced_motion="no-preference")
-    page.wait_for_timeout(200)
-    assert page.evaluate("[shellRain.width,shellRain.height,shellRain.toDataURL()]") == before
-
-
 @pytest.mark.parametrize("height", [260, 600])
 def test_photo_menu_escapes_gallery_crop_downloads_and_cleans_up(subscription_ui, height):
     page = subscription_ui["page"]
@@ -261,7 +234,8 @@ def test_short_sidebar_bounds_projects_list_and_cost_cards_keep_local_table_over
         "supervisor_ready": True, "active_chat_activities": [], "projects": projects,
         "project_chat_ids": [p["chat_id"] for p in projects]})))
     data = {"total_cost": 27.4, "total_calls": 42, "accounting": {"available": True,
-            "accounted_usd": 27.4, "confirmed_usd": 25, "reserved_usd": 2,
+            "accounted_usd": 27.4, "settled_usd": 25, "confirmed_usd": 25,
+            "estimated_usd": 0, "reserved_usd": 2,
             "unresolved_upper_bound_usd": 0.4, "unknown_unmetered": 1,
             "limit_usd": 200, "cost_final": False},
             "by_model": {"provider/a-long-model-name-for-real-table-overflow": {"calls": 42, "cost": 27.4}}}
@@ -354,6 +328,28 @@ CARD_FORM_JS = """card => { const out = []; const walk = (el) => {
     [...el.children].forEach(walk); }; walk(card); return out; }"""
 
 
+# Where Main's waiting pill landed a card: its bubble's top under the floating chat header (by the
+# pill's 12px margin unless the feed cannot scroll that far), inside the reading area above the
+# composer row, and whether the question text took focus. Read once the scroll is quiet for two frames.
+PILL_LANDING_JS = """async qid => {
+    const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+    const feed = document.querySelector('#chat-messages');
+    let last = null;
+    for (let quiet = 0; quiet < 2;) { await frame(); quiet = feed.scrollTop === last ? quiet + 1 : 0; last = feed.scrollTop; }
+    const page = document.querySelector('#page-chat');
+    const header = page.querySelector('.chat-page-header').getBoundingClientRect();
+    const toolbar = page.querySelector('.chat-toolbar-row').getBoundingClientRect();
+    const card = feed.querySelector(`.chat-quiz-card[data-quiz-id="${qid}"]`);
+    const box = card.closest('.chat-bubble').getBoundingClientRect();
+    const top = Math.max(feed.getBoundingClientRect().top, header.bottom);
+    return {below_header: Math.round(box.top - top), above_composer: Math.round(toolbar.top - box.top),
+            scroll_top: feed.scrollTop, focused: document.activeElement === card.querySelector('.chat-quiz-question')};
+}"""
+
+
+def pill_landing(page, quiz_id):
+    return page.evaluate(PILL_LANDING_JS, quiz_id)
+
 @pytest.mark.parametrize('width,height', [(1100, 722), (390, 844)])
 def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, height):
     """Real SPA readers and WebSocket handlers; disposable source data, no owner writes.
@@ -426,7 +422,15 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     page.route('**/api/projects', lambda r: r.fulfill(json={'projects': [project]}))
     # A stable served SHA: a reconnect re-reads history in place instead of reloading the window.
     page.route('**/api/state', lambda r: r.fulfill(json={'sha': 'browser-fixture', 'supervisor_ready': True,
-        'active_chat_activities': activities, 'projects': [project], 'project_chat_ids': [42]}))
+        'active_chat_activities': activities, 'projects': [project], 'project_chat_ids': [42],
+        # These deliberately synthetic canonical fields exercise the real SPA
+        # projection. The stale-reconnect branch withholds settled sources so
+        # the existing canonical task-detail recovery assertions still apply.
+        'current_questions': [pointer(qid, block) for qid, block in blocks.items()
+                           if not mode['stale'] or qid in ('second', 'replaced')]
+                          + ([a['required_question'] for a in activities
+                              if a['activity_id'] == 'late-task'] if not mode['stale'] else []),
+        'current_questions_complete': not mode['stale'], 'main_attention': [], 'main_attention_complete': True}))
 
     def detail(route):
         # The canonical record (GET /api/tasks/{id}) the Project form and a revalidating Main read.
@@ -434,6 +438,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         detail_reads.append(task_id)
         quizzes = blocks if task_id == 'proof-task' else {'late-form': late}
         route.fulfill(json={'task_id': task_id, 'project_id': project['id'],
+            # Exact-quiz room proof, as returned by the real detail consumer tests.
+            'question_rooms': {qid: {'state': 'known', 'chat_id': 42, 'project_id': project['id']}
+                               for qid in quizzes},
             'owner_quiz': {qid: {'quiz_id': qid, **block} for qid, block in quizzes.items()},
             'owner_wait': wait if task_id == 'proof-task' else {'quiz_id': 'late-form', 'state': 'resumed'}})
     page.route('**/api/tasks/proof-task', detail)
@@ -500,7 +507,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert by_id['waiting']['details'] == ['Readers follow one extra link.', 'Publication slips by about a week.']
     assert by_id['waiting']['recommended'] == 0 and by_id['passed']['recommended'] == 1
     assert by_id['passed']['details'] == ['Lossless, larger', 'Smaller at quality 82'] and by_id['passed']['own']
-    assert by_id['finished']['status'].startswith('Unanswered · the task finished') and by_id['finished']['own']
+    assert by_id['finished']['status'] == 'Unanswered · task finished' and by_id['finished']['own']
     assert by_id['replaced']['status'] == 'Replaced by a newer question'
     assert by_id['replaced']['disabled'] and not by_id['replaced']['own'], 'a replaced question is a read-only record'
     assert card('waiting').locator('.chat-quiz-question strong').inner_text() == 'licence'
@@ -597,7 +604,17 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     page.locator('#project-panel-close').click()
 
     # The Project form answers another question while the owner reads further down: the copy
-    # above the reader settles and leaves without moving the reading position.
+    # above the reader settles and leaves without moving the reading position. Closing the
+    # Project returns Main to its newest message a frame or more later (showLatest), and
+    # reading on supersedes that return (DESIGN "A room always opens at its newest message"),
+    # so the owner turns back with the wheel before reading further down.
+    page.evaluate("""() => document.querySelector('#chat-messages').addEventListener(
+        'wheel', () => { window.__turnedBack = true; }, {once: true, passive: true})""")
+    feed = page.locator('#chat-messages').bounding_box()
+    page.mouse.move(feed['x'] + feed['width'] / 2, feed['y'] + min(feed['height'], height) / 2)
+    page.mouse.wheel(0, -120)
+    page.wait_for_function('() => window.__turnedBack')
+    page.evaluate("() => new Promise(r => requestAnimationFrame(()=>requestAnimationFrame(r)))")
     card('finished').evaluate("el => el.scrollIntoView({block: 'start'})")
     anchor = card('finished').evaluate('el => el.getBoundingClientRect().top')
     frame = {'type': 'quiz_state', 'task_id': 'proof-task', 'quiz_id': 'passed', 'state': 'answered', 'answered_index': 0,
@@ -710,6 +727,131 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     card('second').scroll_into_view_if_needed()
     setup_browser.capture(page, f'question-mirrors-reloaded-{width}')
     assert len(decisions) == 2, 'a reload and a navigation never answer anything'
+
+
+@pytest.mark.parametrize('width,height', [(1100, 722), (390, 844)])
+def test_main_waiting_pill_reaches_each_target_and_one_tap_close(subscription_ui, width, height):
+    """Real SPA readers, WebSocket and decision handlers; synthetic API data, no owner writes.
+
+    Main keeps no section of its own for what waits on the owner: a Project question scrolled out
+    of the reading area and a task that needs the owner (one System message at the live edge). The
+    amber pill among the composer's pills counts both, points at the next one and reaches them
+    oldest first, cycling; a question's card lands just under the chat header with its question
+    text focused. The card's quiet Close waits while an answer is typed and closes in one tap; the
+    copy reads its closure for five seconds, then only the Main copy goes and the pill counts on."""
+    from urllib.parse import parse_qs
+    from playwright.sync_api import expect
+
+    ui = subscription_ui
+    page = ui['page']
+    page.set_viewport_size({'width': width, 'height': height})
+    project = {'id': 'pill-proof', 'name': 'Chart review', 'chat_id': 42, 'lifecycle': 'active', 'visible_revision': 0}
+    question = {'role': 'system', 'system_type': 'project_question_pointer', 'task_id': 'pill-task', 'quiz_id': 'scale',
+                'quiz_state': 'open', 'project_id': project['id'], 'project_name': project['name'],
+                'project_chat_id': 42, 'chat_id': 1, 'ts': '2026-09-16T00:30:00Z',
+                'question': 'Which scale should the appendix chart use?', 'options': ['Linear', 'Logarithmic'],
+                'option_details': ['Readers compare sizes directly.', 'The small series stays visible.']}
+    action = {'task_id': 'paused-task', 'task_name': 'Paused build', 'project_id': project['id'],
+              'project_name': project['name'], 'phase': 'budget_paused', 'can_resume': True,
+              'attention_reason': 'budget', 'pause_cause': 'budget'}
+    canonical, decisions = {'questions': [question]}, []
+    page.route('**/api/projects', lambda r: r.fulfill(json={'projects': [project]}))
+    page.route('**/api/state', lambda r: r.fulfill(json={'sha': 'browser-fixture', 'supervisor_ready': True,
+        'active_chat_activities': [], 'projects': [project], 'project_chat_ids': [42],
+        'current_questions': canonical['questions'], 'current_questions_complete': True,
+        'main_attention': [action], 'main_attention_complete': True}))
+
+    def history(route):
+        main = parse_qs(urlparse(route.request.url).query).get('chat_id', ['1'])[0] == '1'
+        rows = [{'role': 'assistant', 'text': f'Earlier Main note {i}.', 'ts': f'2026-09-16T00:{i:02d}:00Z'}
+                for i in range(8)] + [question] + [
+                {'role': 'assistant', 'text': f'Later Main note {i}. ' + 'Reading continues below the question. ' * 6,
+                 'ts': f'2026-09-16T01:{i:02d}:00Z'} for i in range(14)]
+        route.fulfill(json={'messages': rows if main else [], 'progress': []})
+    page.route('**/api/chat/history*', history)
+
+    def decide(route):
+        sent = route.request.post_data_json
+        decisions.append(sent)
+        canonical['questions'] = []
+        route.fulfill(json={'ok': True, 'decision_id': sent['decision_id'], 'state': 'closed', 'duplicate': False,
+            'closed_reason': 'Closed by the owner without an answer.', 'closed_actor': 'owner',
+            'closed_at': '2026-09-16T02:00:00Z', 'closed_request_id': sent['request_id'],
+            'question_delivery': {'kind': 'closure', 'state': 'delivered'}})
+    page.route('**/api/decisions', decide)
+    open_app(ui)
+    pill = page.locator('#page-chat .chat-toolbar-row > button.chat-question-nav')
+    card = page.locator('#chat-messages .project-question-card[data-quiz-id="scale"]')
+    message = page.locator('#chat-messages .chat-bubble.owner-action[data-owner-action="paused-task"]')
+    arrow_down = "document.querySelector('#page-chat .chat-question-nav-arrow').classList.contains('down')"
+    # The System message's top stands in the reading area, between the chat header and the composer row.
+    action_on_screen = """() => {
+        const page = document.querySelector('#page-chat');
+        const top = page.querySelector('.chat-bubble.owner-action').getBoundingClientRect().top;
+        return top >= page.querySelector('.chat-page-header').getBoundingClientRect().bottom - 1
+            && top < page.querySelector('.chat-toolbar-row').getBoundingClientRect().top;
+    }"""
+    message.get_by_role('button', name='Resume', exact=True).wait_for()
+    card.wait_for(state='attached')
+    expect(message.locator('.sender')).to_have_text('System')
+    expect(message.locator('.owner-action-reason')).to_have_text(
+        'Paused at the spending limit. Change the limit if needed, then Resume.')
+    # Main opens at its newest message: the action stands at the live edge, the question above it.
+    expect(pill).to_be_visible()
+    expect(pill).to_have_text('2 waiting')
+    expect(pill).to_have_attribute('aria-label', '2 waiting for you: show the next one')
+    assert not page.evaluate(f'() => {arrow_down}'), 'the next target, the question, is above the reading area'
+    word = pill.locator('.chat-question-nav-word')
+    if width > 460:
+        expect(word).to_be_visible()
+    else:
+        expect(word).to_be_hidden()  # a narrow composer row keeps the glyph and the number
+    assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    setup_browser.capture(page, f'main-waiting-pill-{width}')
+
+    def land_on_question():
+        pill.click()
+        landed = pill_landing(page, 'scale')
+        assert landed['focused'] and abs(landed['below_header'] - 12) <= 3 and landed['above_composer'] > 0, landed
+
+    # Oldest first: the question, then the action left below it, then around again.
+    land_on_question()
+    page.wait_for_function(f'() => {arrow_down}')
+    expect(pill).to_have_text('2 waiting')
+    setup_browser.capture(page, f'main-waiting-pill-landed-{width}')
+    pill.click()
+    page.wait_for_function(action_on_screen)
+    page.wait_for_function(f'() => !{arrow_down}')
+    land_on_question()
+
+    # One quiet x closes the question; it waits while an answer is typed.
+    close = card.locator('.chat-quiz-head .chat-quiz-head-end').get_by_role(
+        'button', name='Close question without answering', exact=True)
+    expect(close).to_be_enabled()
+    card.locator('.chat-quiz-comment').fill('Logarithmic, with a note on the axis')
+    expect(close).to_be_disabled()
+    card.locator('.chat-quiz-comment').fill('   ')
+    expect(close).to_be_enabled()
+    card.locator('.chat-quiz-comment').fill('')
+    close.click()
+    expect(card).to_have_attribute('data-state', 'closed')
+    shown = page.evaluate('performance.now()')
+    expect(card.locator('.chat-quiz-status-text')).to_have_text('Question closed')
+    expect(card.locator('.chat-quiz-closed-reason')).to_have_text('Closed by the owner without an answer.')
+    expect(card.locator('.chat-quiz-close, .chat-quiz-comment, .chat-quiz-option:enabled')).to_have_count(0)
+    assert decisions == [{'request_id': decisions[0]['request_id'], 'decision_id': 'quiz:pill-task:scale',
+                          'action': 'close', 'reason': ''}], decisions
+    setup_browser.capture(page, f'main-waiting-closed-{width}')
+    page.wait_for_function("() => !document.querySelector('#chat-messages [data-quiz-id=\"scale\"]')", timeout=10000)
+    elapsed = page.evaluate('performance.now()') - shown
+    assert 4500 <= elapsed <= 6500, elapsed
+    # What is left waiting is the owner action below the reader.
+    expect(pill).to_have_text('1 action', timeout=10000)
+    expect(pill).to_have_attribute('aria-label', '1 waiting for you: show the next one')
+    pill.click()
+    expect(pill).to_be_hidden()
+    assert page.evaluate(action_on_screen)
+    assert len(decisions) == 1, 'navigation never answers or closes anything'
 
 
 @pytest.mark.parametrize('width', [1100, 375])

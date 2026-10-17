@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from ouroboros.config import (
     SETTINGS_DEFAULTS, defaults_for_settings_document, normalize_settings_raw, serialize_settings,
 )
+from ouroboros.settings_scales import EFFORT_FORMAT_KEY, normalize_effort_document
 from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
 from ouroboros.utils import atomic_write_json, write_text_atomic
 
@@ -115,6 +116,12 @@ def masked_secret_status(settings: Dict[str, Any]) -> Dict[str, bool]:
     return {key: bool(str(settings.get(key, "") or "").strip()) for key in _SECRET_KEYS}
 
 
+_COLAB_MODEL_OVERRIDE_KEYS = frozenset({
+    "OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION",
+    "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS",
+})
+
+
 def build_colab_settings(
     secrets: Dict[str, str],
     *,
@@ -140,22 +147,25 @@ def build_colab_settings(
     """
     present = bool(existing) if drive_document_present is None else bool(drive_document_present)
     settings = defaults_for_settings_document(present)
-    if existing:
-        # The Drive document is an install's settings document, so it is read the way
-        # every reader reads one: the raw-stage normalization (coercion, retention fold,
-        # review-cycle seed, retired purge, slot rename, secret repair) runs BEFORE the
-        # defaults are merged — after the merge the renamed key is already present as its
-        # default and the customization under the former key is lost, then written back
-        # to Drive as the owner's choice. Private sentinel keys stay out of the document.
-        settings.update({
-            k: v for k, v in normalize_settings_raw(existing).items() if not str(k).startswith("_")
-        })
+    document: Dict[str, Any] = dict(existing or {})
     for key, value in secrets.items():
         # Only overwrite when the freshly collected secret is non-empty, so a
         # re-run that omits an optional provider/GitHub key (collect_colab_secrets
         # returns "") does NOT wipe a credential already persisted on Drive.
-        if (key in settings or key == "TELEGRAM_BOT_TOKEN") and str(value or "").strip():
-            settings[key] = str(value)
+        if (key in SETTINGS_DEFAULTS or key == "TELEGRAM_BOT_TOKEN") and str(value or "").strip():
+            document[key] = str(value)
+    for key, value in (models or {}).items():
+        if key in _COLAB_MODEL_OVERRIDE_KEYS and value:
+            document[key] = str(value)
+    # The Drive document is an install's settings document, so it is read the way
+    # every reader reads one: the raw-stage normalization (coercion, retention fold,
+    # review-cycle seed, retired purge, slot rename, secret repair, the historical
+    # review-lane migration) runs BEFORE the defaults are merged — after the merge the
+    # renamed key is already present as its default and the customization under the
+    # former key is lost, then written back to Drive as the owner's choice. Private
+    # sentinel keys stay out of the document.
+    loaded = {k: v for k, v in normalize_settings_raw(document).items() if not str(k).startswith("_") or k == EFFORT_FORMAT_KEY} if document else {}
+    settings.update(normalize_effort_document(loaded))
     if github_repo:
         settings["GITHUB_REPO"] = github_repo
     settings["TOTAL_BUDGET"] = float(total_budget)
@@ -167,15 +177,18 @@ def build_colab_settings(
     )
     if network_password:
         settings["OUROBOROS_NETWORK_PASSWORD"] = network_password
-    for key, value in (models or {}).items():
-        if key in {"OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_VISION", "OUROBOROS_MODEL_CONSCIOUSNESS", "OUROBOROS_MODEL_FALLBACKS"} and value:
-            settings[key] = str(value)
-    # Route model slots to the configured provider (same SSOT the desktop
-    # onboarding wizard uses): an OpenAI-only / Anthropic-only / Cloud.ru-only
-    # Colab config gets correct provider model defaults instead of OpenRouter-style
-    # ones. Explicitly supplied model overrides above are preserved.
-    from ouroboros.server_runtime import apply_runtime_provider_defaults
+    # Slots the document does not author take the configured provider's proposals (the
+    # loader's rule): an OpenAI-only Colab gets OpenAI's ids, while saved values and the
+    # explicit model overrides above stay. The freshly collected secrets are in the
+    # document, so a first launch's factory catalog (never-configured cell) is minted from
+    # the provider it holds credentials for and pinned on Drive by this very write.
+    from ouroboros.review_pool_migration import apply_at_read_seam
+    from ouroboros.server_runtime import (
+        apply_runtime_provider_defaults, authored_model_slots, propose_unauthored_model_slots,
+    )
+    propose_unauthored_model_slots(settings, authored_model_slots(loaded))
     settings, _changed, _changed_keys = apply_runtime_provider_defaults(settings)
+    apply_at_read_seam(settings, merged=True)
     return settings
 
 
@@ -186,9 +199,15 @@ def write_colab_settings(data_dir: pathlib.Path, settings: Dict[str, Any]) -> pa
     ratchets against THIS process's ``config.SETTINGS_PATH``, and the Drive root is another
     path (the quickstart exports the Colab paths only after this write). The bytes are
     still ``serialize_settings`` bytes, so the next reader of the Drive file meets the
-    spelling every other writer produces."""
+    spelling every other writer produces. The one prologue duty it shares: a review-pool
+    migration ``build_colab_settings`` computed for the Drive document gets its durable
+    receipts under the Drive root (``review_pool_receipts.persist_write_receipts``) BEFORE this
+    write replaces the pre-image — the kernel is a different process from the server that later tells the owner."""
+    from ouroboros.review_pool_receipts import persist_write_receipts
+
     path = pathlib.Path(data_dir) / "settings.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    persist_write_receipts(data_dir, settings, path)
     write_text_atomic(path, serialize_settings(dict(settings)))
     return path
 

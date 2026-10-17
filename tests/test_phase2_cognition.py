@@ -70,9 +70,6 @@ def test_root_checkpoint_prevents_a_second_facts_row_and_buys_no_summary(tmp_pat
     monkeypatch.setattr(llm_mod, "LLMClient", lambda: llm)
     monkeypatch.setattr(memory_mod, "Memory", lambda **_kwargs: object())
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *_a, **_k: None)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *_a, **_k: None)
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda *_a, **_k: 0)
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *_a, **_k: 0)
     monkeypatch.setattr(evolution, "maybe_promote", lambda *_a, **_k: None)
     env = SimpleNamespace(
         repo_dir=tmp_path / "repo", drive_root=tmp_path,
@@ -87,7 +84,7 @@ def test_root_checkpoint_prevents_a_second_facts_row_and_buys_no_summary(tmp_pat
     )
     args = (
         env, task, {"rounds": 2, "cost": 0},
-        {"tool_calls": [{"tool": "read_file"}]}, {}, tmp_path / "logs",
+        {"tool_calls": [{"tool": "read_file"}]}, tmp_path / "logs",
     )
     pipeline._run_post_task_processing_async(*args, blocking=True)
     # Raw dialogue may rotate/compact after the checkpoint settles. Its absence
@@ -437,9 +434,8 @@ def test_duplicate_task_done_after_child_copyback_appends_one_canonical_projecti
     assert len(rows) == 1
     assert rows[0]["result_ref"]["reader"] == "get_task_result"
     assert load_task_result(tmp_path, "child-copy")["canonical_terminal_projection"]["summary_id"] == "task-terminal:child-copy"
-    assert not child_drive.joinpath("task_results", "child-copy.json").samefile(
-        tmp_path / "task_results" / "child-copy.json"
-    )
+    # the child drive's own row is a separate document: the copy-back projected, it did not alias
+    assert "canonical_terminal_projection" not in (load_task_result(child_drive, "child-copy") or {})
 
 
 def test_child_projection_enters_main_cognition_and_project_lineage_not_main_ui(tmp_path):

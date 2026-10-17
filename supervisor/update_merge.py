@@ -6,6 +6,13 @@ helpers — referenced via the ``git_ops`` module object (``_g.X``) so a test th
 monkeypatches ``git_ops.REPO_DIR`` / ``_managed_update_target`` / ``_git_dir`` /
 ``DRIVE_ROOT`` is followed by these primitives. Control plane: ``ouroboros.gateway.control``
 orchestrates lock → kill workers → re-plan → rescue → tx marker → apply → smoke → restart.
+
+Transaction marker fields: ``m0_tree`` is the mechanical-merge tree, the baseline an assisted
+resolution is reviewed against; it is pinned when the merge is materialized and backfilled on
+resume only while absent, else ``m0_missing_reason`` records the gap, and the commit gate checks
+only that one of the two is present. ``tests_evidence`` is resolver-writable forensics that
+survives phase writes. ``stash_sha`` / ``local_work_carrier`` name the stash holding the owner's
+local work until it is restored; ``failed_update_ref`` is the branch that keeps a rolled-back attempt.
 """
 
 from __future__ import annotations
@@ -177,9 +184,9 @@ def release_assisted_writer_gate_after_task(
     try:
         if active_update_tx():
             return False
-        from supervisor.workers import open_repo_writer_admission
+        from supervisor.workers import open_repo_writer_admission_after_update_abort
 
-        return open_repo_writer_admission(expected_reason=reason)
+        return open_repo_writer_admission_after_update_abort(expected_reason=reason)
     finally:
         release_update_lock(lock_fh)
 
@@ -421,10 +428,10 @@ def rollback_managed_update(
     """Roll a failed managed update back to the pre-update SHA in the tx marker. Preserves
     the failed candidate — an uncommitted resolution included — on the deterministic
     branch ``failed-update-<target12>`` for inspection and retry, hard-resets the branch
-    to pre_update_sha, cleans, and logs. Boot recovery retains a clear-only transaction
-    until the restored process starts, protecting returned work from bootstrap reset.
-    Other callers clear it immediately. Does NOT push (unlike
-    rollback_to_version, which can push origin — wrong for an internal recovery).
+    to pre_update_sha and cleans unless that verified target already holds, and logs. Boot
+    recovery retains a clear-only transaction until the restored process starts, protecting
+    returned work from bootstrap reset; other callers clear it immediately. Does NOT push
+    (unlike rollback_to_version, which can push origin — wrong for an internal recovery).
 
     Marker admission is STRICT (F14): a FUTURE-schema marker was recorded by a newer
     release — this code cannot interpret its semantics, so the rollback refuses typed
@@ -490,47 +497,49 @@ def rollback_managed_update(
     if failed_ref:
         tx["failed_update_ref"] = failed_ref
         write_update_tx(tx)
-    rc0, _o0, e0 = _g.git_capture(["git", "reset", "--hard", "HEAD"])
-    if rc0 != 0:
-        return _fail(f"rollback reset failed before checkout: {e0}")
-    rc_clean0, _co0, ce0 = _g.git_capture(["git", "clean", "-fd"])
-    if rc_clean0 != 0:
-        return _fail(f"rollback clean failed before checkout: {ce0}")
-    rc1, _o1, e1 = _g.git_capture(["git", "checkout", "-B", branch, pre])
-    if rc1 != 0:
-        return _fail(f"rollback checkout -B {branch} {pre[:12]} failed: {e1}")
-    rc2, _o2, e2 = _g.git_capture(["git", "reset", "--hard", pre])
-    if rc2 != 0:
-        return _fail(f"rollback reset --hard {pre[:12]} failed: {e2}")
-    rc_clean, _co, clean_error = _g.git_capture(["git", "clean", "-fd"])
-    if rc_clean != 0:
-        return _fail(f"rollback clean failed: {clean_error}")
-    rc_h2, restored_head, head_error = _g.git_capture(["git", "rev-parse", "--verify", "HEAD"])
-    rc_b2, restored_branch, branch_error = _g.git_capture(
-        ["git", "rev-parse", "--abbrev-ref", "HEAD"]
-    )
-    rc_s2, restored_status, status_error = _g.git_capture(["git", "status", "--porcelain"])
-    if (
-        rc_h2 != 0
-        or restored_head != pre
-        or rc_b2 != 0
-        or restored_branch != branch
-        or rc_s2 != 0
-        or bool(restored_status.strip())
-        or bool(_merge_head_sha())
-        or not managed_update_constitution_present("HEAD")
-    ):
-        detail = head_error or branch_error or status_error or "rollback verification mismatch"
-        return _fail(f"rollback could not be verified: {detail}")
+    # These commands only reach the verified target below. A checkout that already IS it
+    # (read directly, never inferred from a refused first step) is left alone, so an index
+    # lock Git cannot take stops only a rollback that still has tree work to do. A clean index
+    # can still belong to an unfinished operation (an empty cherry-pick or revert): its marker
+    # denies only the skip, since reset ends those but leaves a stopped sequence or rebase.
+    in_place = not _rollback_target_unmet(pre, branch) and not any(
+        (_g._git_dir() / name).exists()
+        for name in ("CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer", "rebase-merge", "rebase-apply"))
+    if not in_place:
+        for cmd, failure in (
+                (["git", "reset", "--hard", "HEAD"], "rollback reset failed before checkout"),
+                (["git", "clean", "-fd"], "rollback clean failed before checkout"),
+                (["git", "checkout", "-B", branch, pre], f"rollback checkout -B {branch} {pre[:12]} failed"),
+                (["git", "reset", "--hard", pre], f"rollback reset --hard {pre[:12]} failed"),
+                (["git", "clean", "-fd"], "rollback clean failed")):
+            rc, _out, error = _g.git_capture(cmd)
+            if rc != 0:
+                return _fail(f"{failure}: {error}")
+        detail = _rollback_target_unmet(pre, branch)
+        if detail:
+            return _fail(f"rollback could not be verified: {detail}")
     result = restore_stash_with_marker(tx, "rollback")
-    return _finish_rollback(tx, pre, branch, reason, result, reopen_writer_admission)
+    return _finish_rollback(tx, pre, branch, reason, result, reopen_writer_admission, in_place=in_place)
+
+
+def _rollback_target_unmet(pre: str, branch: str) -> str:
+    """Why the checkout is not the rollback target (``""`` when it is: HEAD at ``pre`` on ``branch``, clean
+    tree and index, no merge in progress, constitution present)."""
+    rc_h, head, head_error = _g.git_capture(["git", "rev-parse", "--verify", "HEAD"])
+    rc_b, current, branch_error = _g.git_capture(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    rc_s, status, status_error = _g.git_capture(["git", "status", "--porcelain"])
+    if (rc_h != 0 or head != pre or rc_b != 0 or current != branch or rc_s != 0 or status.strip()
+            or _merge_head_sha() or not managed_update_constitution_present("HEAD")):
+        return head_error or branch_error or status_error or "rollback verification mismatch"
+    return ""
 
 
 def _finish_rollback(
     tx: Dict[str, Any], pre: str, branch: str, reason: str,
-    result: StashRestoreResult, reopen_writer_admission: bool,
+    result: StashRestoreResult, reopen_writer_admission: bool, *, in_place: bool = False,
 ) -> Tuple[bool, str]:
-    """Finish the effect, retaining boot custody until the restored process starts."""
+    """Finish the effect, retaining boot custody until the restored process starts.
+    ``in_place``: the checkout was verified already at ``pre``; no rollback command rewrote it."""
     if not result.complete:
         return False, result.note
     from supervisor.git_ops_reset import _record_checkout_facts
@@ -539,7 +548,10 @@ def _finish_rollback(
     # Publish the verified checkout through the same owner as ordinary reset.
     _record_checkout_facts({"current_branch": branch, "current_sha": pre})
     stash_note = result.note
-    gate_reason = "managed_update:rollback"
+    # Keep the resolver's immutable release identity if a same-process handoff
+    # fails after clearing the tx; its task_done hook can then retry that gate.
+    gate_reason = (assisted_writer_gate_reason(tx) if reopen_writer_admission and tx.get("task_id")
+                   else "managed_update:rollback")
     try:
         from supervisor.workers import close_repo_writer_admission
 
@@ -549,7 +561,7 @@ def _finish_rollback(
     rescue = tx.get("rollback_rescue") if isinstance(tx.get("rollback_rescue"), dict) else {}
     if not _log_supervisor(
         {"type": "managed_update_rolled_back", "reason": reason,
-         "pre_update_sha": pre, "branch": branch,
+         "pre_update_sha": pre, "branch": branch, **({"checkout_already_restored": True} if in_place else {}),
          "stash_note": stash_note, "stash_restore_status": result.status,
          **({"failed_update_ref": tx["failed_update_ref"]} if tx.get("failed_update_ref") else {}),
          **{f"rescue_{key}": rescue[key] for key in ("path", "ref", "ts") if rescue.get(key)},
@@ -572,12 +584,15 @@ def _finish_rollback(
         return False, "rollback restored the repository but could not clear update transaction; " + stash_note
     if reopen_writer_admission:
         try:
-            from supervisor.workers import open_repo_writer_admission
+            from supervisor.workers import open_repo_writer_admission_after_update_abort
 
-            open_repo_writer_admission(expected_reason=gate_reason)
+            if not open_repo_writer_admission_after_update_abort(expected_reason=gate_reason):
+                return False, "rollback restored the repository; saved-work handoff remains held; " + stash_note
         except Exception:
             _g.log.warning("rollback restored the repository but could not reopen writer admission", exc_info=True)
-    message = f"rolled back to {pre[:12]}"
+            return False, "rollback restored the repository but could not reopen writer admission; " + stash_note
+    message = f"rolled back to {pre[:12]}" + (
+        "; the checkout already matched it and needed no reset/checkout" if in_place else "")
     if tx.get("failed_update_ref"):
         message += f"; the attempt is preserved on branch {tx['failed_update_ref']}"
     if stash_note:
@@ -859,6 +874,25 @@ def _complete_stash_recovery(
     return {**result, **disclosure}
 
 
+def _boot_smoke_rollback(tx: Dict[str, Any], reason: str) -> Tuple[bool, str]:
+    """The boot-smoke door: a pre-update tree WITHOUT the store is reached through the authority
+    switch (intent now, export and reset at the restart exit the caller requests); one with it
+    through today's restore. A second intent before the restart is a refusal, not a reset."""
+    from ouroboros.store_switch import switch_or_reset
+
+    pre = str(tx.get("pre_update_sha") or "")
+    if not pre:
+        return rollback_managed_update(reason, reopen_writer_admission=False)  # its own typed refusal
+    try:
+        ok, msg, _deferred = switch_or_reset(
+            _g.DRIVE_ROOT, _g.REPO_DIR, target_sha=pre, target_ref=str(tx.get("pre_update_branch") or pre),
+            reason=reason, door="boot_smoke_rollback",
+            reset=lambda: rollback_managed_update(reason, reopen_writer_admission=False))
+    except RuntimeError as exc:
+        return False, str(exc)
+    return ok, msg
+
+
 def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> Dict[str, Any]:
     """Health-check a committed-and-restarted update (auto_merge OR a committed assisted
     merge). Pre-restart smoke already ran inline; this is the post-boot backstop + boot-loop
@@ -869,7 +903,8 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
     head_resolved = rc_h == 0 and bool(merge_commit)
     merge_in_head = head_resolved and (
         head == merge_commit
-        or _g.git_capture(["git", "merge-base", "--is-ancestor", merge_commit, "HEAD"])[0] == 0
+        or (tx.get("strategy") != "replace"  # a replace lands exactly; an older target is often HEAD's ancestor
+            and _g.git_capture(["git", "merge-base", "--is-ancestor", merge_commit, "HEAD"])[0] == 0)
     )
     if (
         bool(supervisor_ready)
@@ -878,9 +913,7 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
     ):
         smoke = update_restart_smoke()
         if not smoke.get("ok"):
-            ok, msg = rollback_managed_update(
-                "recovered_pre_restart_smoke_failed", reopen_writer_admission=False
-            )
+            ok, msg = _boot_smoke_rollback(tx, "recovered_pre_restart_smoke_failed")
             _log_supervisor({
                 "type": "managed_update_recovered_smoke_failed",
                 "ok": ok,
@@ -893,9 +926,7 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
     if bool(supervisor_ready) and merge_in_head:
         native_smoke = external_host_restart_smoke()
         if not native_smoke.get("ok"):
-            ok, msg = rollback_managed_update(
-                "external_host_post_boot_smoke_failed", reopen_writer_admission=False
-            )
+            ok, msg = _boot_smoke_rollback(tx, "external_host_post_boot_smoke_failed")
             _log_supervisor({"type": "managed_update_native_host_failed", "ok": ok,
                              "msg": msg, "smoke": native_smoke})
             return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg, "smoke": native_smoke}
@@ -906,9 +937,7 @@ def _finalize_pending_boot_smoke(tx: Dict[str, Any], supervisor_ready: bool) -> 
             tx, "boot_finalize", {"finalized": True}, {"type": "managed_update_finalized", "head": head},
         )
     if (bool(supervisor_ready) and head_resolved and not merge_in_head) or attempts >= 2:
-        ok, msg = rollback_managed_update(
-            "post_boot_smoke_failed", reopen_writer_admission=False
-        )
+        ok, msg = _boot_smoke_rollback(tx, "post_boot_smoke_failed")
         _log_supervisor({"type": "managed_update_rollback_after_failed_boot",
                          "ok": ok, "msg": msg, "boot_attempts": attempts})
         return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
@@ -933,6 +962,18 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
             _log_supervisor({"type": "managed_update_assisted_materialization_interrupted",
                              "ok": ok, "msg": msg})
             return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
+    if state == "committed" and tx.get("postcommit_resume"):
+        # An explicit Pause retained the exact commit and its unfinished gates.
+        # The resolver's normal Resume/rejoin rechecks SHA/binding and reruns the
+        # gates. Boot grants neither success nor rollback for this owner hold.
+        saved = tx["postcommit_resume"]
+        binding = ((saved.get("post_fingerprint") or {}).get("binding") or {}) if isinstance(saved, dict) else {}
+        sha = str(tx.get("merge_commit") or "")
+        tree_rc, tree, _error = _g.git_capture(["git", "rev-parse", f"{sha}^{{tree}}"])
+        unchanged = (sha and _rev_parse("HEAD") == sha and tree_rc == 0
+                     and tree == binding.get("tree_sha"))
+        return {"finalized": False, "reason": "assisted_postcommit_paused" if unchanged
+                else "assisted_postcommit_changed"}
     if state == "committed":
         # Only pending_boot_smoke proves that exact-binding verification, post-commit
         # tests, and the pre-restart smoke all passed. A commit found under an assisted
@@ -1002,7 +1043,8 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
         rescue_info: Dict[str, Any] = {}
         if not has_progress:
             # The server's owner-control path must be resident before the
-            # re-materialized conflict markers land in the live tree (#283).
+            # re-materialized conflict markers land in the live tree (#283); it imports
+            # the first-party ``ouroboros`` and ``supervisor`` packages.
             from supervisor.worker_chat_lane import preload_owner_control_path
 
             preload_owner_control_path()
@@ -1148,6 +1190,7 @@ def managed_assisted_postcommit(tx: Dict[str, Any], commit_sha: str) -> Tuple[bo
         "phase": "pending_boot_smoke",
         "merge_commit": commit_sha,
         "pre_restart_smoke": _PRE_RESTART_SMOKE_PENDING,
+        "postcommit_resume": {},
     })
     smoke = update_restart_smoke()
     if smoke.get("ok"):
@@ -1222,7 +1265,7 @@ def abort_orphaned_assisted_tx(
         try:
             from supervisor.workers import ensure_worker_pool_started
 
-            if not ensure_worker_pool_started(allow_disabled_restart=True):
+            if ok and not ensure_worker_pool_started(allow_disabled_restart=True):
                 _g.log.warning(
                     "abort_orphaned_assisted_tx: worker pool remains explicitly disabled"
                 )
@@ -1234,37 +1277,37 @@ def abort_orphaned_assisted_tx(
             release_update_lock(lock_fh)
 
 
+def abandon_unapplied_replace(head: str, **event: Any) -> Dict[str, Any]:
+    """Disarm a replace that never moved HEAD off ``pre_update_sha`` (intent, then tx); earlier rescue/keep refs stay."""
+    if not _g._clear_update_intent():
+        mark_update_tx_gate_blocked("replace_abandon_intent_cleanup_failed")
+        return {"finalized": False, "reason": "could not disarm replace replay"}
+    if not clear_update_tx():
+        mark_update_tx_gate_blocked("replace_abandon_tx_cleanup_failed", cleanup_only=True)
+        return {"finalized": False, "reason": "could not clear replace transaction"}
+    _log_supervisor({"type": "managed_update_replace_apply_abandoned", "head": head, **event})
+    return {"finalized": False, "abandoned": True, "reason": "replace_not_applied"}
+
+
 def _recover_replace_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dict[str, Any]:
     """Resume the narrow crash window between replace rescue and pending smoke."""
     pre = str(tx.get("pre_update_sha") or "")
     target = str(tx.get("target_sha") or "")
     rc_h, head, _head_error = _g.git_capture(["git", "rev-parse", "--verify", "HEAD"])
     rc_s, dirty, _status_error = _g.git_capture(["git", "status", "--porcelain"])
-    if rc_h != 0 or rc_s != 0 or not pre or not target:
-        ok, msg = rollback_managed_update(
-            "replace_apply_state_unreadable", reopen_writer_admission=False
-        )
-        return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
-    applied = head == target and not dirty.strip()
-    if applied:
-        tx["phase"] = "pending_boot_smoke"
-        write_update_tx(tx)
-        _log_supervisor({"type": "managed_update_replace_apply_recovered", "head": head})
-        return _finalize_pending_boot_smoke(tx, supervisor_ready)
-    if head == pre:
-        # No target checkout is visible. Disarm replay and leave the current tree alone;
-        # the rescue already exists, but a crash before reset must not erase dirty work.
-        if not _g._clear_update_intent():
-            mark_update_tx_gate_blocked("replace_abandon_intent_cleanup_failed")
-            return {"finalized": False, "reason": "could not disarm replace replay"}
-        if not clear_update_tx():
-            mark_update_tx_gate_blocked("replace_abandon_tx_cleanup_failed", cleanup_only=True)
-            return {"finalized": False, "reason": "could not clear replace transaction"}
-        _log_supervisor({"type": "managed_update_replace_apply_abandoned", "head": head})
-        return {"finalized": False, "abandoned": True, "reason": "replace_not_applied"}
-    ok, msg = rollback_managed_update(
-        "replace_apply_interrupted", reopen_writer_admission=False
-    )
+    reason = "replace_apply_state_unreadable"
+    if rc_h == rc_s == 0 and pre and target:
+        if head == target and not dirty.strip():
+            tx["phase"] = "pending_boot_smoke"
+            write_update_tx(tx)
+            _log_supervisor({"type": "managed_update_replace_apply_recovered", "head": head})
+            return _finalize_pending_boot_smoke(tx, supervisor_ready)
+        if head == pre:
+            # No target checkout is visible. Disarm replay and leave the current tree alone;
+            # the rescue already exists, but a crash before reset must not erase dirty work.
+            return abandon_unapplied_replace(head)
+        reason = "replace_apply_interrupted"
+    ok, msg = rollback_managed_update(reason, reopen_writer_admission=False)
     return {"finalized": False, "rolled_back": ok, "msg": msg, "stash_note": msg}
 
 

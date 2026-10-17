@@ -1,8 +1,4 @@
-"""Headless task helpers for CLI/workspace runs.
-
-The gateway owns task transport; this module owns the small amount of local
-filesystem state needed for isolated external runs and patch artifacts.
-"""
+"""Isolated drives and patch artifacts for CLI/workspace runs; the gateway owns transport."""
 
 from __future__ import annotations
 
@@ -15,7 +11,6 @@ import shutil
 import subprocess  # noqa: F401
 import tempfile  # noqa: F401
 import threading  # noqa: F401
-from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, BinaryIO, Dict, Iterable, List, Optional, Sequence, Tuple  # noqa: F401
 
@@ -26,6 +21,7 @@ from ouroboros.task_results import (
     cancellation_blocks_child_result, load_task_result, validate_task_id, write_task_result,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.retention import task_result_timestamp as _timestamp_from_result
 from ouroboros.headless_status import (  # noqa: F401
     ARTIFACT_STATUS_FAILED,
     ARTIFACT_STATUS_FINALIZING,
@@ -168,21 +164,6 @@ def _resolve_retention_days(retention_days: Optional[int]) -> int:
     return retention_days
 
 
-def _timestamp_from_result(result: Dict[str, Any], fallback: float) -> float:
-    for key in ("artifact_finalized_at", "completed_at", "finished_at", "ts"):
-        raw = str(result.get(key) or "").strip()
-        if not raw:
-            continue
-        try:
-            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return float(parsed.timestamp())
-        except ValueError:
-            continue
-    return fallback
-
-
 def _effective_task_result(parent: pathlib.Path, task_id: str) -> Dict[str, Any]:
     """Prune reads the projected result; a projection failure reads canonical."""
     try:
@@ -205,11 +186,31 @@ def _prompt_settlement(result: Dict[str, Any]) -> bool:
             and str(result.get("delegation_role") or "") == "subagent")
 
 
+def _drive_retention_rows(parent: pathlib.Path, names: List[str], stop: Any) -> Iterable[Tuple[str, Any]]:
+    """Select only this layout's names in bounded transactions; never hold one across a yield.
+
+    A selector/upgrade failure does not become absence: the existing strict reader
+    handles each name, preserving missing/quarantined/unreadable-result outcomes.
+    """
+    from ouroboros import store
+    from ouroboros.task_store import DRIVE_RETENTION_BATCH, drive_retention_facts
+
+    for start in range(0, len(names), DRIVE_RETENTION_BATCH):
+        batch = names[start:start + DRIVE_RETENTION_BATCH]
+        try:
+            facts = drive_retention_facts(parent, batch, stop=stop)
+        except (store.StoreError, ValueError, TypeError):
+            facts = {}
+        for task_id in batch:
+            yield task_id, facts.get(task_id)
+
+
 def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, not_terminal: str,
                   retention_days: Optional[int], now: Optional[float], live: Any, guard: Any, stop: Any,
                   budget: Optional[int], after: str, extra_checks: Any) -> Dict[str, Any]:
-    """The prune both drive layouts share: candidates from the DURABLE canonical row (a projection is not
-    custody), settled through ``task_custody.settle_child_drive`` in name order after ``after`` (wrapping), at
+    """The prune both layouts share: cheap per-name facts select possible work;
+    fresh strict canonical status/date and existing checks still decide eligibility.
+    Settlement through ``task_custody.settle_child_drive`` runs in name order after ``after`` (wrapping), at
     most ``budget`` attempts per call; ``cursor`` is the last attempted drive, ``deferred`` the unreached rest."""
     from ouroboros.retention import age_cutoff
     from ouroboros.task_custody import settle_child_drive
@@ -223,11 +224,27 @@ def _prune_drives(base: pathlib.Path, parent: pathlib.Path, *, drive_of: Any, no
     names = sorted(entry.name for entry in base.iterdir() if entry.is_dir())
     names = [name for name in names if name > after] + [name for name in names if name <= after]
     attempts = 0
-    for task_id in names:
+    for task_id, fact in _drive_retention_rows(parent, names, stop):
         task_dir = base / task_id
         report["scanned"] += 1
         try:
             validate_task_id(task_id)
+            if fact is not None and fact["body_present"] and fact["drive_retention_at"] is not None:
+                status = str(fact.get("status") or "").lower()
+                if status not in _FINAL_STATUSES:
+                    report["skipped"].append({"task_id": task_id, "reason": not_terminal, "status": status})
+                    continue
+                if not _prompt_settlement(fact):
+                    raw = fact["drive_retention_at"]
+                    timestamp = float(raw) if raw else task_dir.stat().st_mtime
+                    if timestamp > cutoff:
+                        report["skipped"].append({"task_id": task_id, "reason": "younger_than_retention"})
+                        continue
+            if stop is not None and stop():
+                report["deferred"].append(task_id)
+                continue
+            # A hint never authorizes removal. In particular a date changed after
+            # selection must be checked here; settlement rechecks custody, not age.
             result = load_task_result(parent, task_id, strict=True) or {}
             status = str(result.get("status") or "").lower()
             if status not in _FINAL_STATUSES:
@@ -544,10 +561,8 @@ def terminal_task_files_ready(canonical_root: pathlib.Path, task: Dict[str, Any]
 def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, Any]) -> Dict[str, Any]:
     """Finish one file-save attempt without turning an I/O failure into a worker crash.
 
-    The dispatcher re-reads CURRENT; returned result is diagnostic. Pending refs
-    keep existing custody. terminal_source_present is True after a strict terminal
-    read, False for absence/nonterminal, None for unknown; later write failure
-    preserves that observation and never manufactures a completed source.
+    The dispatcher re-reads CURRENT; pending refs keep custody. terminal_source_present is True after a strict terminal read,
+    False for absence/nonterminal, None for unknown; later write failure preserves that observation, never inventing a source.
     """
     task_id = str(task.get("id") or task.get("task_id") or "")
     report: Dict[str, Any] = {"task_id": task_id, "result": None, "error": "", "terminal_source_present": None}
@@ -572,6 +587,11 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
         if not task_is_readonly_subagent(task) and current.get("artifact_status") not in ARTIFACT_TERMINAL_STATUSES:
             finalize_task_artifacts(root, {**task, "id": task_id})
         report["result"] = load_task_result(root, task_id, strict=True)
+        from ouroboros.obligations import drive_finished
+        drive_finished(root, task, report["result"])
+        # Derived inventories need not outlive terminal file adoption.
+        if child is not None and child.resolve(strict=False) != root.resolve(strict=False):
+            shutil.rmtree(child / "state" / "code_intel", ignore_errors=True)
     except CustodyBusy as exc:
         # Another publisher (a settlement or copy-back) holds the store: the next attempt
         # completes the same work; nothing failed and no failure is stamped.
@@ -738,16 +758,17 @@ def _file_artifact(kind: str, path: pathlib.Path, **facts: Any) -> Dict[str, Any
             "size": path.stat().st_size if path.exists() else 0, **facts}
 
 
-def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Write patch/memory-export artifacts for a completed headless task under the task's custody lock, the
-    one lock every canonical-store publisher takes (copy-back, ref retry, settlement, mailbox cleanup), so no
-    two publishers place or list one task's files at once; a held lock is ``CustodyBusy`` (nothing failed)."""
+def finalize_task_artifacts(parent_drive_root: pathlib.Path, task: Dict[str, Any],
+                            *, lock_timeout_sec: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Publish under the custody lock shared by copy-back, ref retry, settlement and mailbox cleanup.
+    Publishers never place/list one task's files concurrently; an exhausted lock budget is ``CustodyBusy``."""
     from ouroboros.task_custody import CustodyBusy, task_custody_lock
 
     task_id = str(task.get("id") or "")
     if not task_id:
         return []
-    with task_custody_lock(parent_drive_root, task_id, timeout_sec=PUBLICATION_LOCK_SEC) as locked:
+    budget = PUBLICATION_LOCK_SEC if lock_timeout_sec is None else lock_timeout_sec
+    with task_custody_lock(parent_drive_root, task_id, timeout_sec=budget) as locked:
         if not locked:
             raise CustodyBusy(f"custody lock of {task_id} is held by another publisher")
         return _finalize_task_artifacts_locked(parent_drive_root, task, task_id)

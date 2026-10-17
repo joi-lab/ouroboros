@@ -23,7 +23,8 @@ from ouroboros.loop_messages import _append_or_merge_user_content, _record_owner
 
 @pytest.fixture
 def eligible(monkeypatch, tmp_path):
-    """Smallest non-direct root-task context that receives the selector."""
+    """Smallest non-direct root-task context that receives the selector: Required
+    reviews the write the host observed (#1731), not the queued task itself."""
     monkeypatch.setattr(loop, "get_task_review_mode", lambda: "required")
     ctx = SimpleNamespace(
         task_id="root", task_attempt=1, drive_root=tmp_path,
@@ -32,7 +33,8 @@ def eligible(monkeypatch, tmp_path):
     )
     _record_owner_directive(ctx, source="initial_user", content="Prepare the full report.", msg_id="first")
     messages = [{"role": "user", "content": "Prepare the full report."}]
-    trace = {"tool_calls": [{"tool": "read_file", "is_error": False, "status": "ok", "args": {}}],
+    trace = {"tool_calls": [{"tool": "write_file", "is_error": False, "status": "ok", "args": {"path": "report.md"}},
+                            {"tool": "read_file", "is_error": False, "status": "ok", "args": {}}],
              "reasoning_notes": []}
     schemas = [{"function": {"name": "task_acceptance_review"}}]
     return ctx, messages, trace, schemas

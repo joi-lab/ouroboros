@@ -295,6 +295,16 @@ def account_engine(monkeypatch):
     return gateway, accounts
 
 
+def test_account_catalog_matches_the_published_response_shape(account_engine):
+    from ouroboros.gateway.management_contracts import ModelCatalogResponse
+    from ouroboros.gateway.schema import validate_ingress
+
+    payload = json.loads(asyncio.run(model_catalog_api.api_model_catalog(None)).body)
+    assert any(row['default_reasoning_effort'] is None for row in payload['items'])
+    assert any(row['observed_at'] is None for row in payload['items'])
+    assert not validate_ingress(payload, ModelCatalogResponse)
+
+
 def test_auto_catalog_keeps_every_account_and_independent_capabilities(account_engine):
     gateway, accounts = account_engine
     payload = json.loads(asyncio.run(model_catalog_api.api_model_catalog(None)).body)

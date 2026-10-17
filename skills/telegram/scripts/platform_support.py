@@ -188,7 +188,8 @@ def require_isolated_process_group() -> None:
 
 
 def process_alive(pid: int) -> bool:
-    if pid <= 1:
+    # A bare container server is PID 1; only PID 0 and negatives are invalid.
+    if pid <= 0:
         return False
     if IS_WINDOWS:
         # On Windows CPython, os.kill(pid, 0) is destructive: signal 0 is

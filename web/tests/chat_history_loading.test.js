@@ -28,7 +28,7 @@ function fixture(t, options = {}) {
         }
         return new Promise((resolve, reject) => reads.push({
             ok: data => resolve({ ok: true, status: 200, json: async () => data }),
-            http: status => resolve({ ok: false, status, json: async () => ({ error: `HTTP ${status}` }) }),
+            http: (status, reason_code) => resolve({ ok: false, status, json: async () => ({ error: `HTTP ${status}`, reason_code }) }),
             drop: () => reject(new TypeError('Failed to fetch')),
         }));
     });
@@ -67,10 +67,44 @@ const assertLoading = (f, why) => {
     assert.ok(f.controls(), `${why}: the history control is mounted in the feed`);
     assert.equal(f.controls().hidden, false, why);
     assert.equal(f.controls().getAttribute('aria-busy'), 'true', why);
-    assert.equal(f.button().textContent, 'Loading…', why);
+    assert.equal(f.button().textContent, 'Loading saved history…', why);
     assert.equal(f.button().hidden, false, why);
     assert.equal(f.button().disabled, true, why);
 };
+
+test('migration shows a calm note and retries until history publishes without a click', async t => {
+    const f = fixture(t);
+    const paint = f.instance.refreshHistory({ revision: 1 });
+    await settle();
+    f.reads[0].http(503, 'migrating');
+    await paint;
+    assert.equal(f.note().textContent, 'Saved history is being upgraded…');
+    assert.equal(f.button().hidden, true);
+    assert.equal(f.logged.length, 0);
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(f.reads.length, 2, 'publication is polled without an owner action');
+    f.reads[1].http(503, 'migrating');
+    await settle();
+    assert.equal(f.note().textContent, 'Saved history is being upgraded…');
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(f.reads.length, 3);
+    f.reads[2].ok(page([row('chat:10', 'Published answer')]));
+    await settle();
+    assert.equal(f.bubbles().length, 1);
+    assert.equal(f.instance.hasPaintedHistory(), true);
+    assert.doesNotMatch(f.note().textContent, /upgraded|could not/);
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(f.reads.length, 3, 'success stops migration retries');
+});
+
+test('closing a migrating chat cancels its automatic retry', async t => {
+    const f = fixture(t);
+    const paint = f.instance.refreshHistory({ revision: 1 });
+    await settle(); f.reads[0].http(503, 'migrating'); await paint;
+    f.instance.destroy();
+    await new Promise(resolve => setTimeout(resolve, 750));
+    assert.equal(f.reads.length, 1);
+});
 
 test('an empty feed shows the loading state BEFORE the history request resolves', async (t) => {
     const f = fixture(t);
@@ -83,7 +117,7 @@ test('an empty feed shows the loading state BEFORE the history request resolves'
     f.reads[0].ok(page([row('chat:10', 'First saved answer')]));
     assert.equal((await paint).painted, true);
     assert.equal(f.controls().getAttribute('aria-busy'), '', 'the loading state is lifted on success');
-    assert.notEqual(f.button().textContent, 'Loading…');
+    assert.notEqual(f.button().textContent, 'Loading saved history…');
     assert.equal(f.bubbles().length, 1);
 });
 
@@ -101,7 +135,7 @@ test('an ordinary refresh over a painted transcript keeps every rendered message
     assert.equal(f.reads.length, 2, 'the refresh request is in flight and unanswered');
     assert.deepEqual(f.bubbles(), painted, 'the painted messages stay mounted while the refresh is in flight');
     assert.equal(f.controls().getAttribute('aria-busy'), '');
-    assert.notEqual(f.button().textContent, 'Loading…');
+    assert.notEqual(f.button().textContent, 'Loading saved history…');
 
     f.reads[1].ok(page([row('chat:10', 'Kept answer one'), row('chat:20', 'Kept answer two')]));
     assert.equal((await second).painted, true);
@@ -195,7 +229,7 @@ test('closing the panel while its first read is in flight leaves no late write a
     f.reads[0].ok(page([row('chat:10', 'Arrived after close')]));
     assert.deepEqual(await paint, { painted: false, revision: 1 });
     assert.equal(f.bubbles().length, 0, 'a closed room consumes no late response');
-    assert.equal(controls.querySelector('.chat-load-older-btn').textContent, 'Loading…',
+    assert.equal(controls.querySelector('.chat-load-older-btn').textContent, 'Loading saved history…',
         'destroy() makes late continuations no-ops instead of repainting a removed control');
 });
 
@@ -210,9 +244,14 @@ test('delayed latest cannot certify newer retained recent rows until the physica
     });
     const first = f.instance.refreshHistory({ revision: 1 });
     await settle(); f.reads[0].ok(covered(0, 80, 80, 70)); await first;
+    // The reader turned back into history: the shifted read below re-anchors nothing.
+    f.messages.scrollTop = 400;
+    for (const handler of f.messages.listeners.get('wheel')) handler({ type: 'wheel', deltaY: -1, target: f.messages, timeStamp: 0 });
     const second = f.instance.refreshHistory({ revision: 2 });
     await settle(); f.reads[1].ok(covered(90, 100, 100, 95)); await second;
-    await settle(); assert.equal(f.reads.length, 3, 'latest rebase is held');
+    await settle(); assert.equal(f.reads.length, 2, 'a shifted window re-anchors at the read in hand, never by a second read');
+    globalThis.document.byId.get('chat-scroll-bottom').click();
+    await settle(); assert.equal(f.reads.length, 3, '↓ across the gap: its latest rebase is held');
     const third = f.instance.refreshHistory({ revision: 3 });
     await settle(); f.reads[3].ok(covered(180, 200, 200, 190)); await third;
     f.reads[2].ok(covered(0, 100, 100, 95, 'fill-gap'));

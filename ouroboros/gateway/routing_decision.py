@@ -177,6 +177,13 @@ def handle_routing_decision(
         if isinstance(receipt.get("attachment_manifest"), list) else []
     )
     dispatch_token, derived_task_id = _derived_identity(client_message_id, token, option_index)
+    from ouroboros.settings_scales import EFFORT_SCALE
+
+    # #1539: the routing turn's explicit start for a NEW task picked here, kept on
+    # every card row; a hand-edited unknown tier stays the default. A steer starts
+    # no root, so it carries none and nothing below claims one applied.
+    card_effort = str(receipt.get("reasoning_effort") or "")
+    card_effort = card_effort if card_effort in EFFORT_SCALE else ""
     # Origin provenance BY VALUE from the canonical row itself (the same rail
     # the LLM promote path rides): identity ref + full text + surface fact.
     from ouroboros.project_dialogue import build_owner_message_ref
@@ -191,11 +198,16 @@ def handle_routing_decision(
     if isinstance(origin.get("client_surface"), dict) and origin.get("client_surface"):
         provenance["client_surface"] = dict(origin["client_surface"])
     if action == "steer_task":
+        from ouroboros.owner_relay import owner_quote
+
         evt: Dict[str, Any] = {
             "type": "steer_task",
             "routing_token": dispatch_token,
             "target_task_id": str(chosen.get("task_id") or ""),
-            "message": origin_text,
+            # His click names this live work for his own retained message: the words
+            # travel as a verified quote with his force (D7); the note is only his comment.
+            "message": f"[Owner picker comment] {comment}" if comment else "",
+            "quotes": [owner_quote(drive_root, origin)],
             "chat_id": chat_id,
             "client_message_id": client_message_id,
             # The owner clicked: an owner turn by construction. The option list
@@ -223,6 +235,7 @@ def handle_routing_decision(
             "host_initiated": True,
             "client_message_id": client_message_id,
             "attachment_uploads": attachment_uploads,
+            **({"reasoning_effort": card_effort} if card_effort else {}),
             **provenance,
             "ts": utc_now_iso(),
         }
@@ -239,6 +252,7 @@ def handle_routing_decision(
                 status="needs_manual_target", routing_token=token,
                 options=options,
                 attachment_manifest=receipt.get("attachment_manifest"),
+                reasoning_effort=card_effort,
                 require_latest_token={token, dispatch_token},
             )
         except Exception:
@@ -256,6 +270,7 @@ def handle_routing_decision(
             detail=f"request:{request_id}", options=options,
             reason=f"claimed_option:{int(option_index)}",
             attachment_manifest=receipt.get("attachment_manifest"),
+            reasoning_effort=card_effort,
             require_latest_status={"needs_manual_target"},
             require_latest_token={token},
         )
@@ -270,6 +285,10 @@ def handle_routing_decision(
         ForkingPickler.dumps(dict(evt))
         from supervisor.workers import get_event_q
 
+        if action == "new_task_in_project":
+            from ouroboros.promotion_intent import prepare_promotion_intent
+
+            prepare_promotion_intent(drive_root, evt)
         get_event_q().put_nowait(dict(evt))
     except Exception as exc:
         log.warning("routing decision dispatch failed", exc_info=True)
@@ -293,6 +312,16 @@ def handle_routing_decision(
     outcome_status = str(outcome.get("status") or "unconfirmed")
     expected = _DISPATCH_STATUS_BY_ACTION[action]
     if outcome_status == expected:
+        # What the admitted root's own row says it starts on, never the card's echo;
+        # an unreadable row reports nothing rather than the request.
+        admitted_effort = ""
+        if action != "steer_task" and card_effort:
+            from ouroboros.task_results import load_task_result
+
+            try:
+                admitted_effort = str((load_task_result(drive_root, derived_task_id) or {}).get("reasoning_effort") or "")
+            except Exception:
+                log.debug("admitted effort read failed for %s", derived_task_id, exc_info=True)
         try:
             # The closing row IS the presentation receipt after hydration, so
             # it wears the real routing action + label ("Steered task · X"),
@@ -306,6 +335,7 @@ def handle_routing_decision(
                 status=expected, routing_token=token,
                 detail=f"request:{request_id}",
                 reason=f"answered_option:{int(option_index)}",
+                reasoning_effort=admitted_effort,
             )
         except Exception:
             log.debug("closing annotation append failed", exc_info=True)
@@ -314,6 +344,8 @@ def handle_routing_decision(
                                    "answered_index": int(option_index)}
         if action != "steer_task":
             payload["task_id"] = derived_task_id
+        if admitted_effort:
+            payload["reasoning_effort"] = admitted_effort
         return 200, payload
     if outcome_status in {"rejected", "needs_manual_target"}:
         # The handler's rejection receipt (under the DISPATCH token) is now

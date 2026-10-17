@@ -28,7 +28,7 @@ from ouroboros.task_status import (
     wait_for_effective_tasks,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.utils import truncate_review_artifact, utc_now_iso
+from ouroboros.utils import truncate_review_artifact
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 
@@ -48,6 +48,21 @@ def disclosable_capability_delta(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     delta = data.get("capability_delta") if isinstance(data.get("capability_delta"), dict) else {}
     return delta if (delta.get("reduced") or delta.get("legacy_note")) else {}
+
+
+def disclosable_effort_fact(data: Dict[str, Any]) -> Dict[str, str]:
+    """The child's effort decision when it has something to SAY — the parent's request was
+    moved into the range or set aside by a pin or a model name (``effort_fact_says``) —
+    else ``{}``. The same predicate on both parent surfaces (``[SUBTASK_OUTCOME]`` and the
+    compact batch projection); a request that simply applied, or the plain default, is noise."""
+    from ouroboros.settings_scales import effort_fact_says
+
+    fact = {"requested": data.get("effort_requested"), "applied": data.get("effort_level"),
+            "source": data.get("effort_source")}
+    if not effort_fact_says(fact):
+        return {}
+    return {"level": str(fact["applied"] or ""), "requested": str(fact["requested"] or ""),
+            "source": str(fact["source"] or "")}
 
 
 def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None) -> str:
@@ -70,7 +85,12 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
     )
     envelope = data.get("delegate_terminal_reconciliation")
     envelope = envelope if isinstance(envelope, dict) else {}
-    if unreconciled or envelope:
+    # #1573: an effective retry view keeps each physical predecessor's retained outputs
+    # on its lineage hop; their source_read names the task that publishes them.
+    hops = [hop for hop in (data.get("retry_lineage") or []) if isinstance(hop, dict)]
+    predecessor_runs = [{k: v for k, v in row.items() if k != "selected_subagent_id"}
+                        for hop in hops for row in (hop.get("terminal_runs") or []) if isinstance(row, dict)]
+    if unreconciled or envelope or predecessor_runs:
         custody: Dict[str, Any] = {"unreconciled": unreconciled[:10]}
         omitted_any = False
         if len(unreconciled) > 10:
@@ -89,6 +109,11 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
                 if len(values) > 10:
                     custody[field + "_omitted"] = len(values) - 10
                     omitted_any = True
+        if predecessor_runs:
+            custody["predecessor_terminal_runs"] = predecessor_runs[:10]
+            if len(predecessor_runs) > 10:
+                custody["predecessor_terminal_runs_omitted"] = len(predecessor_runs) - 10
+                omitted_any = True
         if omitted_any:
             # A bound must name a source the actor can resolve (BIBLE P1).
             # Retry lineage unions the ORIGINAL row's disclosure into this
@@ -98,18 +123,19 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
             origin = str(
                 data.get("original_task_id") or data.get("timeout_retry_from") or ""
             )
-            paths = [f"task_results/{tid}.json"]
-            if origin and origin != tid:
-                paths.append(f"task_results/{origin}.json")
-            custody["full_source"] = [
-                f"read_file(root='runtime_data', path='{p}')" for p in paths
-            ]
+            ids = [tid]
+            for other in (origin, *(str(hop.get("task_id") or "") for hop in hops)):
+                if other and other not in ids:
+                    ids.append(other)
+            custody["full_source"] = [f"get_task_result(task_id='{task_id}', include_authority=True)" for task_id in ids]
         summary["delegated_custody"] = custody
     if isinstance(data.get("task_contract"), dict):
         summary["task_contract"] = data.get("task_contract")
     _delta = disclosable_capability_delta(data)
     if _delta:
         summary["capability_delta"] = _delta
+    if _effort := disclosable_effort_fact(data):
+        summary["effort"] = _effort
     if isinstance(data.get("artifact_bundle"), dict):
         summary["artifact_bundle"] = data.get("artifact_bundle")
     if ledger:
@@ -186,6 +212,33 @@ def _unchanged_result_reference(task_id: str, current_hash: str, known_hash: Any
     }
 
 
+def get_task_result_entry() -> ToolEntry:
+    """The result/source reader schema lives beside its scoped handler."""
+    return ToolEntry("get_task_result", {
+        "name": "get_task_result",
+        "description": "Read the effective result or exact authority of a task, including one bounded canonical work-order source range when requested.",
+        "parameters": {"type": "object", "required": ["task_id"], "properties": {
+            "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
+            "known_result_sha256": {"type": "string", "description": "Optional child_result_sha256 from a previous read. An exact match omits only unchanged result/trace text, retaining current facts and a full-read reference. Omit for full text; explicit authority/source requests always return their requested view."},
+            "include_authority": {"type": "boolean", "default": False, "description": "Return the exact selected result, task contract, origin, artifact references, and current plan-review authority."},
+            "include_work_order_source": {"type": "boolean", "default": False, "description": "Return the canonical work-order source projection; provide both source_start_char and source_end_char for the exact bounded range."},
+            "include_completion_source": {"type": "boolean", "default": False,
+                                          "description": "Read the full stored completion observations for this task, including returns omitted from the summary. Omit bounds for source length/hash, then request explicit character ranges."},
+            "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
+            "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
+            "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
+            "delegated_output_sha256": {"type": "string", "default": "", "description": "Read a retained full delegated output that this PHYSICAL task_id's own receipts publish, pinned even after a retry: call exactly the source_read of a staged_output or other_staged_outputs ref (unordered; each says complete) named in public summary delegated_custody.terminal_runs or predecessor_terminal_runs (it names the publishing task; the ref's task_id is only the staging store). Works across forked/empty drives and after drive cleanup. Omit ranges for complete_chars/hash, then use source_start_char/source_end_char. Never marks the run's result as read; does not include authority."},
+            "presence_reentry_sha256": {"type": "string", "default": "", "description": "Read the exact Presence reentry observation checkpoint named in a resumed-conversation note. Includes full observed messages and transport facts plus coverage gaps. Uses the existing task scope; omit ranges for complete_chars/hash, then page with source_start_char/source_end_char."},
+            "presence_reentry_offset": {"type": "integer", "description": "With presence_reentry_sha256: scan the frozen canonical interval of that checkpoint's own conversation, including rows beyond its initial scan budget. Start at history_start and follow next_offset until interval_exhausted. Small pages return complete rows and explicit gaps. Oversized pages return complete_chars/hash; use source_start_char/source_end_char with the same offset to reconstruct that page's exact JSON before advancing."},
+            "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
+            "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical source range. A range outside the source returns no text: the answer names complete_chars and the range received, and is an argument error."},
+            "presence_scope": {"type": "string", "enum": ["own_binding"], "description": "Presence tasks only: read just independent work started from this Presence binding (any of its conversations) or this task's own tree."},
+            "view_head_chars": {"type": "integer", "minimum": 0, "description": "Chars of this answer's head to show in this turn when the complete answer cannot be delivered whole (pair with view_tail_chars). The complete answer is kept as an exact, readable source either way; this only shapes the first view and never changes source_start_char/source_end_char selection."},
+            "view_tail_chars": {"type": "integer", "minimum": 0, "description": "Chars of this answer's tail to show in this turn (see view_head_chars)."},
+        }},
+    }, _get_task_result)
+
+
 @completed_local_read
 def _get_task_result(
     ctx: ToolContext, task_id: str, include_authority: bool = False,
@@ -193,8 +246,15 @@ def _get_task_result(
     source_end_char: Any = None, include_completion_source: bool = False,
     known_result_sha256: str = "", include_focus_source: bool = False, focus_source_sha256: str = "",
     presence_scope: str = "", review_source_sha256: str = "",
+    presence_reentry_sha256: str = "", presence_reentry_offset: Any = None,
+    view_head_chars: Any = None, view_tail_chars: Any = None, delegated_output_sha256: str = "",
 ) -> str:
-    """Read a task result, or a bounded canonical work-order/completion source range."""
+    """Read a task result, or a bounded canonical work-order/completion source range.
+
+    ``view_head_chars``/``view_tail_chars`` are accepted here so the declared
+    parameters bind; the loop's delivery honors them when it shapes the first
+    view of this answer. They select nothing in the source arithmetic below.
+    """
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     scoped = bool(str(presence_scope or "").strip())
@@ -240,26 +300,34 @@ def _get_task_result(
             status="unavailable", code="LEGACY_UNAVAILABLE",
             text=f"Task {task_id}: unknown or not yet registered",
         ))
-    from ouroboros.project_sources import CLONE_TIMEOUT_SEC
-    from ouroboros.routing_wait import is_emitted_admission_stub
+    from ouroboros.promotion_intent import promotion_intent_notice
 
-    if is_emitted_admission_stub(data):
-        # #1160: a promote whose admission the supervisor has not confirmed yet is
-        # PENDING, not unknown. Answering "unknown or not yet registered" read as
-        # "your promote never happened" and invited the second promote that mints a
-        # duplicate root; the id stays reserved and this read is the reconciliation.
-        since = str((data.get("promotion_admission") or {}).get("emitted_at") or "")
-        return _publish_tool_result(ctx, ToolResult(
-            status="unavailable", code="LEGACY_UNAVAILABLE",
-            text=(
-                f"Task {task_id}: admission pending since {since} (now {utc_now_iso()}) - the promote "
-                "was emitted and this row carries no supervisor receipt yet, neither scheduled nor "
-                f"refused. Read get_task_result({task_id}) again before promoting the same work: a "
-                f"promote that prepares a source can stay pending for up to {CLONE_TIMEOUT_SEC // 60} "
-                "minutes. A new promote is a NEW task id; this row does not forbid one, and whether "
-                "this one is lost is yours to judge from the two times above."
-            ),
-        ))
+    notice = promotion_intent_notice(task_id, data)
+    if notice:
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=notice))
+    if presence_reentry_sha256:
+        from ouroboros.presence_continuation import reentry_source_projection
+
+        source = reentry_source_projection(status_drive_root, str(task_id), presence_reentry_sha256,
+                                            source_start_char, source_end_char, presence_reentry_offset)
+        text = json.dumps({"presence_reentry_source": source}, ensure_ascii=False, sort_keys=True)
+        if source.get("reason") == "source_range_invalid":
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))
+        return text
+    if delegated_output_sha256:
+        from ouroboros.delegate_output import delegated_output_source_projection
+        from ouroboros.task_results import load_task_result
+
+        # Only a source this PHYSICAL task's own receipts publish (#1573): the
+        # staging task and path come from that ref, never from the caller.
+        physical = load_task_result(status_drive_root, str(task_id))
+        source = delegated_output_source_projection(
+            status_drive_root, physical if isinstance(physical, dict) else {},
+            delegated_output_sha256, source_start_char, source_end_char)
+        text = json.dumps({"delegated_output_source": source}, ensure_ascii=False, sort_keys=True)
+        if source.get("reason") == "source_range_invalid":
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))
+        return text
     if review_source_sha256:
         from ouroboros.task_finalization import review_source_projection
 
@@ -738,6 +806,10 @@ def _wait_window(
     the tool's entry timeout, which each caller keeps at ``clamp + margin`` or
     more. Inside the finalization reserve the executor's 1 s floor stays the
     bounded exit.
+
+    The task waits pass minimum 0 and ``NESTED_SETTLEMENT_MARGIN_SEC``, so they end
+    that far inside the executor's emission; ``await_messages`` passes minimum 1 and
+    margin 1, and its last poll sleep is clipped to the remaining window.
     """
     from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
     from ouroboros.task_pacing import effective_finalization_reserve_sec
@@ -757,7 +829,8 @@ def _wait_window(
 
 
 def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot", senders: Any = None,
-                    tasks: Any = None, runs: Any = None, wake_at: Any = None, wake_after_sec: Any = None) -> str:
+                    tasks: Any = None, runs: Any = None, wake_at: Any = None, wake_after_sec: Any = None,
+                    services: Any = None) -> str:
     """Hold this task's worker slot until an unread mailbox entry exists or the
     window elapses. Delivers nothing: the round-top drain owns delivery and
     acknowledgement, exactly as after a wait_task early return. An owner Stop
@@ -782,8 +855,8 @@ def _await_messages(ctx: ToolContext, timeout_sec: int = 0, mode: str = "in_slot
     from ouroboros.loop_transport import _owner_signal_pending
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
-    if mode != "in_slot" or senders or tasks or runs or wake_at or wake_after_sec:
-        return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs,
+    if mode != "in_slot" or senders or tasks or runs or services or wake_at or wake_after_sec:
+        return _await_as_sleep(ctx, mode, senders=senders, tasks=tasks, runs=runs, services=services,
                                wake_at=wake_at, wake_after_sec=wake_after_sec)
     try:
         requested = int(timeout_sec)
@@ -838,7 +911,7 @@ def _await_as_sleep(ctx: ToolContext, mode: str, **chosen: Any) -> str:
 
     try:
         if mode not in (model_sleep.MODE_WARM, model_sleep.MODE_COLD):
-            raise ValueError("senders/tasks/runs/wake_at/wake_after_sec select a sleep: give mode warm or cold")
+            raise ValueError("senders/tasks/runs/services/wake_at/wake_after_sec select a sleep: give mode warm or cold")
         if not callable(getattr(ctx, "owner_wait_callback", None)):
             raise ValueError("this task has no continuation owner to sleep under")
         outcome = model_sleep.request_sleep(ctx, model_sleep.selectors(ctx, **chosen), mode)
@@ -846,7 +919,8 @@ def _await_as_sleep(ctx: ToolContext, mode: str, **chosen: Any) -> str:
         return _publish_tool_result(ctx, ToolResult(
             status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR (await_messages): {exc}",
             meta={"operation_outcome": "completed_no_effect"}))
-    return json.dumps(outcome, ensure_ascii=False)
+    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK",
+        text=json.dumps(outcome, ensure_ascii=False), meta={"sleep_question_notice": bool(outcome.get("questions"))}))
 
 
 def await_messages_entry() -> ToolEntry:
@@ -871,9 +945,15 @@ def await_messages_entry() -> ToolEntry:
             "result says when the applied prompt-cache horizon elapsed since the last model response. "
             "mode=warm or mode=cold instead SLEEPS without holding your model slot, until what you select: "
             "mail from `senders`, the terminal of `tasks` you can read, the terminal of delegated `runs` you "
-            "own, and/or `wake_at`/`wake_after_sec`; with nothing selected any addressed mail wakes you. The "
-            "owner's messages and controls always wake you; unselected mail waits unread. Warm keeps your "
-            "process and browser (a pooled slot is lent meanwhile); you choose which fits. A source that is "
+            "own, the exit of your own `services` (warm only: the start each has now; a replaced, stopped "
+            "or lost one wakes you as unknown, never as success), and/or `wake_at`/`wake_after_sec`; with "
+            "nothing selected any addressed mail wakes you. The "
+            "owner's messages, controls and typed descendant escalations always wake you; other unselected mail waits unread. Warm keeps your "
+            "process and browser (a pooled slot is lent meanwhile). Cold saves your continuation and releases "
+            "the process only after the body accepts custody of your bound external runs; local services "
+            "still need warm sleep. A new question from any ordinary run you own also wakes you, even "
+            "if not selected; reviewer runs stay with their panel. Question sources are delivered, not answered. "
+            "Retaining an external writer retains its project lane. A source that is "
             "already ready answers at once. Sleep does not count as execution time; an explicit deadline "
             "still applies. A settled task is not a successful one: read its result when you wake."
         ),
@@ -884,11 +964,13 @@ def await_messages_entry() -> ToolEntry:
             "mode": {"type": "string", "enum": ["in_slot", "warm", "cold"],
                      "description": "in_slot (default) holds your slot for timeout_sec; warm/cold is a sleep."},
             "senders": {"type": "array", "items": {"type": "string"},
-                        "description": "Sleep: task ids whose mail wakes you (others' mail stays unread)."},
+                        "description": "Sleep: task ids whose ordinary mail wakes you; owner input and descendant escalations bypass this filter."},
             "tasks": {"type": "array", "items": {"type": "string"},
                       "description": "Sleep: task ids whose terminal (any settled status) wakes you."},
             "runs": {"type": "array", "items": {"type": "string"},
                      "description": "Sleep: your delegated run ids whose terminal wakes you."},
+            "services": {"type": "array", "items": {"type": "string"},
+                         "description": "Warm sleep: names of your own running services whose exit wakes you."},
             "wake_at": {"type": "string", "description": "Sleep: an absolute ISO-8601 wake time (with timezone)."},
             "wake_after_sec": {"type": "integer", "description": "Sleep: wake after this many seconds."},
         }},
@@ -1058,6 +1140,8 @@ def _compact_child_projection(tid: str, data: Dict[str, Any], known_hash: Any) -
     _delta = disclosable_capability_delta(data)
     if _delta:
         projected["capability_delta"] = _delta
+    if _effort := disclosable_effort_fact(data):
+        projected["effort"] = _effort
     # Delegation honesty (Q1A, 2026-08-10 amendments): whether a
     # harness-dispatched child ACTUALLY delegated is a handoff fact the
     # fan-out parent absorbs here — the e9108a09 incident hid nine
@@ -1221,7 +1305,7 @@ def _wait_for_tasks(
         # envelope duplicated forensics (trace_refs, loop_outcome internals,
         # verification_ledger) into the parent context on every batch absorb.
         # The parent decision needs the semantic handoff only; the full envelope
-        # stays on disk in task_results/<id>.json, addressable by
+        # stays in the current task store, addressable by
         # child_result_sha256 (the join-ledger SSOT hash), and is fetched with
         # get_task_result — a DISCLOSED omission (BIBLE P1), not silent
         # truncation. get_task_result and a SETTLED wait_task stay full; an
@@ -1251,8 +1335,8 @@ def _wait_for_tasks(
         waited["tasks"] = public_tasks
         waited["tasks_note"] = (
             "Compact per-child projection. The full result envelope (trace_refs, "
-            "loop_outcome, verification_ledger) remains on disk in task_results/"
-            "<task_id>.json, addressable by child_result_sha256; get_task_result "
+            "loop_outcome, verification_ledger) remains in the task store, "
+            "addressable by child_result_sha256; get_task_result "
             "returns the full result text plus trace/outcome summaries."
         )
         if unknown_ids:

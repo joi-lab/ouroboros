@@ -125,7 +125,7 @@ def test_a_parent_reading_the_childs_work_order_sees_the_childs_words(tmp_path):
 
 
 def test_a_direct_start_appends_the_words_after_the_host_contract(tmp_path):
-    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    marker = "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
     root = _root(tmp_path)
     text = assignment_instructions(root)
     contract_json, words = text[len(marker):].split("\n\n", 1)
@@ -145,7 +145,7 @@ def test_a_direct_start_appends_the_words_after_the_host_contract(tmp_path):
 
 def test_a_declared_work_order_holds_no_words_and_its_receipt_names_them(tmp_path):
     """A declared child keeps its parent's selection; the words ride its task, unread."""
-    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    marker = "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
     root = _root(tmp_path)
     _event, _stored, declared = _schedule(root, input_sources="declared")
     assert declared["metadata"][ow.FIELD]  # the words ride with every child

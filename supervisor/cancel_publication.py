@@ -339,6 +339,12 @@ def _register_owed_terminal_delivery(
         if not deliver or str((task or {}).get("delegation_role") or "") == "subagent":
             return True
         stored_status = str((stored or {}).get("status") or "")
+        if stored_status and stored_status != STATUS_CANCELLED:
+            # The worker's own terminal row won over the Stop: the provisional
+            # salvage owed before the terminal write is not this task's answer.
+            from supervisor.terminal_delivery import withdraw_stop_episode
+
+            withdraw_stop_episode(pathlib.Path(q.DRIVE_ROOT), task_id)
         event: Optional[Dict[str, Any]] = None
         if stored_status == STATUS_CANCELLED:
             event = build_unreviewed_salvage_event(
@@ -584,11 +590,14 @@ def _audit_delegated_runs_on_kill(
     from supervisor.terminal_delivery import RUN_STATE_UNKNOWN_PREFIX
 
     try:
+        from ouroboros.delegate_custody_reconcile import attach_only_gateway
         from ouroboros.delegate_terminal import terminal_reconcile_task
 
+        # A kill boundary attaches and settles; it never starts a daemon or
+        # replays a pending invocation (the admitted sweep recovers those).
         audit = terminal_reconcile_task(
             pathlib.Path(q.DRIVE_ROOT), task_id, trigger=trigger,
-            deliberate_terminal=deliberate_terminal,
+            deliberate_terminal=deliberate_terminal, gateway_factory=attach_only_gateway,
         )
     except Exception:
         log.warning(
@@ -664,7 +673,7 @@ def _finish_captured_chat_turn(
     arms the cooperative stop and waits its short bound
     (``worker_chat_lane.stop_direct_chat_turn``); custody settles the intent
     against what the turn published, or releases the claim so the sweep
-    retries — the HTTP caller then sees "still live", never a fabricated
+    retries — the HTTP caller then sees 202 pending, never a fabricated
     ``cancelled`` row over a turn that is still running. A turn that ENDED
     without publishing a terminal (the lane's error path writes none) takes
     the same miss finalizer a pooled task does — ``cancelled`` with the
@@ -737,19 +746,31 @@ def stop_paused_late_phase_custody(q: Any, task_id: str, *, intent: Optional[Dic
     return True
 
 
+def live_presence_row(row: Any) -> bool:
+    """An unsettled row a live Presence turn owns: its runner settles it, not cancel custody."""
+    from supervisor.queue_transitions import settled_status_of
+
+    owner = row.get("execution_owner") if isinstance(row, dict) else None
+    return isinstance(owner, dict) and owner.get("kind") == "presence" and not settled_status_of(row)
+
+
 def _finalize_cancel_intent_on_miss(
     q: Any, task_id: str, *, intent: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Neither queued nor running: settle an open cancel intent (or a legacy
     ``cancel_requested`` latch file) as cancelled with reconstructed cost.
 
-    Two things this lane must NOT do. It must not invent a task: an intent for an
-    id that has no durable result at all names a task that never existed, and
+    Three things this lane must NOT do. It must not invent a task: an intent for
+    an id that has no durable result at all names a task that never existed, and
     fabricating a ``cancelled`` row with $0 for it would put a phantom task in the
-    ledger — it settles as ``not_found`` instead. And it must not bury a child
+    ledger — it settles as ``not_found`` instead. It must not take a row whose
+    execution owner is a live Presence turn (no supervisor map knows it): that
+    settles ``not_found`` too, the row untouched. And it must not bury a child
     that finished: when the row names a child drive, the child's own result is
     copied back BEFORE the cancelled write, so a crash of the split-drive
-    copy-back window cannot cost a completed answer.
+    copy-back window cannot cost a completed answer. Nor does a direct restore fence
+    bury an answer the host already owes or delivered under cancel text and a
+    "no salvageable output" notice: that attempt is finalized from the answer.
     """
     from supervisor.queue_transitions import _settled_status
     from supervisor.task_lifecycle import (
@@ -779,6 +800,14 @@ def _finalize_cancel_intent_on_miss(
             # the intent honestly rather than minting a cancelled task.
             _settle_intent(q, task_id, outcome="not_found",
                            detail="no durable task result for this id", intent=intent)
+            return CANCEL_NOT_FOUND
+        if live_presence_row(existing):
+            # A live Presence turn runs on its own thread outside every supervisor
+            # map: nothing here can capture it, and a cancelled write would only
+            # strand a turn that keeps spending. The row stays its runner's and
+            # the Stop answers "not active", as it did before intent-first minting.
+            _settle_intent(q, task_id, outcome="not_found",
+                           detail="execution owned by a live Presence turn", intent=intent)
             return CANCEL_NOT_FOUND
         # A concurrent custody attempt may have captured this task between our
         # own capture miss and here (the pending double-settle probe). If the
@@ -843,17 +872,57 @@ def _finalize_cancel_intent_on_miss(
             return CANCEL_ALREADY_SETTLED
         existing = load_task_result(q.DRIVE_ROOT, task_id) or existing
         cost_fields = _reconstructed_cost_fields(q, task_id, existing)
-        stored = write_task_result(
-            q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
-            **_cancel_result_fields(
-                existing, existing=existing, **cost_fields,
-                **_intent_outcome_fields(active),
-                # R2/R4: the audited list AND its envelope ride this single
-                # cancelled write — a clean audit clears a stale stored list.
-                **_custody_disclosure_fields(audit),
-                result=_miss_lane_cancel_text(active),
-            ),
-        )
+        from ouroboros.store import StoreBusy, acquisition_budget
+        from ouroboros.working_checkpoint import adopt_registered_answer, registered_answer
+        from supervisor.task_reaper import _deferred_reap_jobs
+        registry_root = pathlib.Path(existing.get("budget_drive_root") or q.DRIVE_ROOT)
+        # A direct restore fence keeps a positively held answer, like dead-worker recovery.
+        # Other cancel paths (including pooled restore) keep their existing outcome.
+        owner = existing.get("execution_owner")
+        adopt = (isinstance(owner, dict) and owner.get("kind") == "direct"
+                 and bool(shutdown_cancel_text(active))
+                 and registered_answer(registry_root, task_id).get("basis") in {"owed", "exhausted", "delivered"})
+        adopted: Optional[Dict[str, Any]] = None
+        # Under Q the health tick hands a retained reap back to its reaper wholly before or after
+        # this write: an idle one replays over it; one out for its replay keeps the slot and the write.
+        try:
+            with acquisition_budget(0), q._queue_lock:
+                retained = [job for job in _deferred_reap_jobs if str(job.get("task_id") or "") == task_id]
+                replaying = any(job.get("_replaying") for job in retained)
+                if not replaying and adopt:
+                    adopted = adopt_registered_answer(q.DRIVE_ROOT, existing, task_id, cause="app_stop",
+                                                      attempt=int(existing.get("task_attempt") or 0),
+                                                      registry_root=registry_root)
+                if not replaying and not adopted:
+                    stored = write_task_result(
+                        q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+                        **_cancel_result_fields(
+                            existing, existing=existing, **cost_fields,
+                            **_intent_outcome_fields(active),
+                            # R2/R4: the audited list AND its envelope ride this single
+                            # cancelled write — a clean audit clears a stale stored list.
+                            **_custody_disclosure_fields(audit),
+                            result=_miss_lane_cancel_text(active),
+                        ),
+                    )
+        except StoreBusy:  # Q never waits on the store: the open intent returns to the watchdog
+            _release_intent_claim(q, task_id, error="result store contended under the queue lock", intent=intent)
+            return CANCEL_FAILED
+        if replaying:  # the open intent returns to the watchdog, as for any reaper-owned slot
+            _release_intent_claim(q, task_id, error="slot owned by the reaper's replay", intent=intent)
+            return CANCEL_FAILED
+        if adopted:  # published like dead-worker recovery's adoption: no cancel text, no "no output" notice
+            if not retained:
+                from supervisor import workers
+                from supervisor.task_reaper import _finish_self_finalized_task
+                from supervisor.worker_health import terminal_task_metadata
+
+                _finish_self_finalized_task(q, workers, existing, task_id, str(existing.get("type") or "task"),
+                                            str(adopted.get("status") or ""), adopted,
+                                            terminal_task_metadata(existing.get("metadata")), unreconciled)
+            _settle_intent(q, task_id, outcome=SETTLED_ALREADY, detail="registered_answer_finalized", intent=intent)
+            q.persist_queue_snapshot(reason="cancel_finalize")
+            return CANCEL_ALREADY_SETTLED
         stored_status = str((stored or {}).get("status") or "")
         if stored_status != STATUS_CANCELLED:
             # The monotonic guard refused: something settled it while we worked.
@@ -871,7 +940,9 @@ def _finalize_cancel_intent_on_miss(
                                    unreconciled_runs=unreconciled)
         _settle_or_reopen_intent(q, task_id, owed_ok=owed_ok, intent=intent,
                                  outcome="cancelled", detail="finalized on miss")
-        q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
+        # A reap the reaper retains (its slot, its replay) publishes this terminal once, on that replay.
+        if not retained:
+            q._emit_cancel_task_done(existing, task_id, cost_fields=cost_fields)
         q.persist_queue_snapshot(reason="cancel_finalize")
         return CANCEL_CANCELLED
     except Exception:

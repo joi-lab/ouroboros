@@ -1,5 +1,5 @@
-// Shared by chat_decision.test.js and question_mirrors.test.js: a small DOM stub (descendant lookup
-// by class), the chat-decision fixture and one quiz frame.
+// Shared by chat_decision.test.js, question_mirrors.test.js and chat_attachment_values.test.js: a small
+// DOM stub (descendant lookup by class), the chat-decision fixture and one quiz frame.
 import { createChatDecision } from '../modules/chat_decision.js';
 
 class Classes {
@@ -62,7 +62,10 @@ export class NodeStub {
     matches(selector) {
         return selector === ':focus-visible' && globalThis.document.activeElement === this && !globalThis.document.pointerModality;
     }
-    addEventListener(type, handler) { this.listeners.set(type, handler); }
+    addEventListener(type, handler) {
+        const previous = this.listeners.get(type);
+        this.listeners.set(type, previous ? event => { previous(event); handler(event); } : handler);
+    }
     click(event = {}) {
         const handler = this.listeners.get('click');
         if (handler) handler({ target: this, detail: 0, stopPropagation() {}, preventDefault() {}, ...event });
@@ -99,11 +102,15 @@ export function countPropertyWrites(target, key) {
 }
 
 export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite, fetchDetail, isMain = false,
-    frameNode = (_msg, node) => node, insertMessageNode = null, removeMessageNode = null, focusAfterRemoval = null } = {}) {
-    const prior = { document: globalThis.document, crypto: globalThis.crypto, window: globalThis.window };
+    frameNode = (_msg, node) => node, insertMessageNode = null, removeMessageNode = null, focusAfterRemoval = null,
+    onQuestionsChanged, rawDetail = false, storage = null, events = null, projectId = '', chatId = 1 } = {}) {
+    const prior = { document: globalThis.document, crypto: globalThis.crypto, window: globalThis.window, localStorage: globalThis.localStorage };
+    const saved = new Map();
+    globalThis.localStorage = storage || { getItem: key => saved.get(key) || null,
+        setItem: (key, value) => saved.set(key, value), removeItem: key => saved.delete(key) };
     globalThis.document = { createElement: (tag) => new NodeStub(tag) };
     const opened = [];
-    globalThis.window = { dispatchEvent: (event) => opened.push(event.detail) };
+    globalThis.window = events || { dispatchEvent: (event) => opened.push(event.detail) };
     if (!globalThis.crypto?.randomUUID) Object.defineProperty(globalThis, 'crypto', {
         configurable: true, value: { randomUUID: () => 'fixed-request-id' },
     });
@@ -123,13 +130,25 @@ export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite
         enhanceMarkdown: enhanceMarkdown || (renderMarkdown ? () => {} : null),
         showToast: (text, tone) => toasts.push({ text, tone }),
         onDomWrite,
-        fetchDetail,
-        isMain,
+        // Legacy unit mocks declare their room with project_id/chat_id. Emit the additive wire
+        // projection for them; real producer and absent-proof tests opt out with rawDetail.
+        fetchDetail: !fetchDetail || rawDetail ? fetchDetail : async (...args) => {
+            const detail = await fetchDetail(...args);
+            if (!detail || Object.hasOwn(detail, 'question_rooms')) return detail;
+            const room = detail.project_id ? { state: 'known', project_id: detail.project_id, chat_id: 23 }
+                : Number.isInteger(detail.chat_id) ? { state: 'known', project_id: '', chat_id: detail.chat_id }
+                    : { state: 'unknown' };
+            return { ...detail, question_rooms: Object.fromEntries(Object.keys(detail.owner_quiz || {}).map(id => [id, room])) };
+        },
+        isMain, projectId, chatId,
         insertMessageNode,
         removeMessageNode,
         focusAfterRemoval,
+        onQuestionsChanged,
     });
     return { decision, toasts, calls, opened, restore: () => {
+        decision.destroy();
+        globalThis.localStorage = prior.localStorage;
         globalThis.document = prior.document;
         globalThis.window = prior.window;
         Object.defineProperty(globalThis, 'crypto', { configurable: true, value: prior.crypto });

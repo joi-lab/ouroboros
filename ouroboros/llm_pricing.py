@@ -2,16 +2,14 @@
 
 Prices are never hand-maintained here: each catalog is read from the provider
 that will bill the call, and a missing price stays unknown rather than
-inheriting a synthetic coefficient. The generation-cost fetch is the same fact
-arriving late — the authoritative settlement for a call whose response carried
-no cost.
+inheriting a synthetic coefficient. Explicit late generation-price receipts
+belong to ``openrouter_cost`` and the accounting writer, never normalization.
 """
 
 
 from __future__ import annotations
 
 import logging
-import time
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.provider_models import normalize_model_identity
@@ -24,9 +22,14 @@ log = logging.getLogger("ouroboros.llm")
 
 
 def add_usage(total: Dict[str, Any], usage: Dict[str, Any]) -> None:
-    """Accumulate usage from one LLM call into a running total."""
+    """Accumulate usage from one LLM call into a running total.
+
+    The numeric fold below is the billing shape; events read the separate cumulative
+    ``reported_tokens`` fact, unknown per counter once any summed call was (#1578)."""
+    from ouroboros.event_usage import REPORTED_TOKENS_KEY, cumulative_reported_tokens
     from ouroboros.request_wire_recovery import merge_request_wire_usage
 
+    total[REPORTED_TOKENS_KEY] = cumulative_reported_tokens(total, usage)  # reads the pre-fold seed
     for k in ("prompt_tokens", "completion_tokens", "total_tokens", "cached_tokens", "cache_write_tokens"):
         total[k] = int(total.get(k) or 0) + int(usage.get(k) or 0)
     if usage.get("cost") is not None:
@@ -296,40 +299,3 @@ def fetch_cloudru_pricing(*, timeout_sec: float = 5.0) -> Dict[str, Tuple[Option
     except (requests.RequestException, ValueError, KeyError) as e:
         log.warning(f"Failed to fetch cloud.ru pricing: {e}")
         return {}
-
-
-class _GenerationCostMixin:
-    """Late cost settlement for a route that reports it out of band."""
-
-    def _fetch_generation_cost(
-        self,
-        generation_id: str,
-        target: Optional[Dict[str, Any]] = None,
-    ) -> Optional[float]:
-        """Fetch cost from OpenRouter Generation API when usage lacks it."""
-        active_target = target or self._resolve_remote_target("openrouter::")
-        if not active_target.get("supports_generation_cost"):
-            return None
-        try:
-            import requests
-            base_url = str(active_target.get("base_url") or "").rstrip("/")
-            api_key = str(active_target.get("api_key") or "")
-            url = f"{base_url}/generation?id={generation_id}"
-            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5, **requests_verify_kwargs())
-            if resp.status_code == 200:
-                data = resp.json().get("data") or {}
-                cost = data.get("total_cost") or data.get("usage", {}).get("cost")
-                if cost is not None:
-                    return float(cost)
-            # Generation cost can lag the chat response; retry once.
-            time.sleep(0.5)
-            resp = requests.get(url, headers={"Authorization": f"Bearer {api_key}"}, timeout=5, **requests_verify_kwargs())
-            if resp.status_code == 200:
-                data = resp.json().get("data") or {}
-                cost = data.get("total_cost") or data.get("usage", {}).get("cost")
-                if cost is not None:
-                    return float(cost)
-        except Exception:
-            log.debug("Failed to fetch generation cost from OpenRouter", exc_info=True)
-            pass
-        return None

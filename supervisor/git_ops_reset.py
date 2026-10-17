@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -103,11 +104,42 @@ def _preserve_branch_for_official_reset(
     return True, branch_or_error
 
 
+class IndexLockRefusal(subprocess.CalledProcessError):
+    """Every attempt of a ``git reset``/``git checkout`` died taking this checkout's ``index.lock``.
+
+    Both take that lock before writing the index, the tree or a ref, so the command
+    itself changed nothing. ``before_tree_effects`` is its raiser's fact that no earlier
+    tree step of the same call ran (``checkout_and_reset``; Restore's single reset).
+    """
+    before_tree_effects = False
+
+
+_LOCK_REFUSAL = re.compile(r"fatal: Unable to create '(.+)': File exists\.")
+
+
+def _index_lock_refused(cmd, result) -> bool:
+    """This attempt died acquiring this checkout's index lock (C-locale Git, first stderr line)."""
+    if result.returncode != 128 or [str(part) for part in cmd[:2]] not in (["git", "reset"], ["git", "checkout"]):
+        return False
+    stderr = result.stderr.decode("utf-8", "replace") if isinstance(result.stderr, bytes) else str(result.stderr or "")
+    match = _LOCK_REFUSAL.fullmatch((stderr.splitlines() or [""])[0].strip())
+    try:
+        return bool(match) and pathlib.Path(match.group(1)).resolve() == (_go()._git_dir() / "index.lock").resolve()
+    except OSError:
+        return False
+
+
 def _run_git_resilient(cmd, **kwargs):
-    """Run a destructive-checkout git command with index-repair retries."""
+    """Run a destructive-checkout git command with index-repair retries.
+
+    The raise is an ``IndexLockRefusal`` only when every attempt died acquiring the
+    index lock and no repair ran between them; anything else is a plain refusal.
+    """
     import time
     check = bool(kwargs.pop("check", False))
+    kwargs.setdefault("env", {**os.environ, "LC_ALL": "C", "LANG": "C"})  # stderr is parsed below
     _go()._guard_live_repo_destructive_git(list(cmd))
+    lock_refused = True
     for attempt in range(5):
         run_kwargs = dict(kwargs)
         run_kwargs.setdefault("capture_output", True)
@@ -115,17 +147,28 @@ def _run_git_resilient(cmd, **kwargs):
         result = subprocess.run(cmd, **run_kwargs)
         if result.returncode == 0:
             return result
+        lock_refused = lock_refused and _index_lock_refused(cmd, result)
         if _go()._maybe_repair_git_index(result.stderr):
+            lock_refused = False
             time.sleep(0.2)
             continue
         if not check:
             return result
         if attempt == 4:
-            raise subprocess.CalledProcessError(
-                result.returncode, cmd, output=result.stdout, stderr=result.stderr,
-            )
+            refusal = IndexLockRefusal if lock_refused else subprocess.CalledProcessError
+            raise refusal(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
         time.sleep(1)
     return subprocess.run(cmd, check=check, **kwargs)
+
+
+def _tree_step(done: List[str], cmd: List[str]) -> None:
+    """One tree-mutating ``checkout_and_reset`` command; ``done`` lists those already applied."""
+    try:
+        _go()._run_git_resilient(cmd, cwd=str(_go().REPO_DIR), check=True)
+    except IndexLockRefusal as exc:
+        exc.before_tree_effects = not done
+        raise
+    done.append(" ".join(cmd))
 
 
 def _admission_gate_for_unsynced_tree(
@@ -306,8 +349,16 @@ def _admission_gate_for_unsynced_tree(
     return None
 
 
+def _target_lacks_store(sha: str) -> bool:
+    """Whether ``sha`` is a tree the store switch must reach (``store_switch.switch_needs``)."""
+    from ouroboros.store_switch import switch_needs
+
+    return switch_needs(_go().REPO_DIR, sha)["facts"]
+
+
 def checkout_and_reset(branch: str, reason: str = "unspecified",
                        unsynced_policy: str = "ignore") -> Tuple[bool, str]:
+    before_head = _go().git_capture(["git", "rev-parse", "HEAD"])[1].strip()
     managed_meta = _go()._read_managed_repo_meta()
     fetch_remote = ""
     target_ref = ""
@@ -343,9 +394,12 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
                 )
             )
             if constitution_ok:
-                update_intent_target = intent_sha
-                target_ref = intent_sha
-                intent_keep_branch = str(update_intent.get("keep_branch") or "").strip()
+                # Only the authority switch's own door checkout reaches a store-less target, after its
+                # export; a bootstrap or restart replay leaves the armed intent to the boot finalizer.
+                if str(reason or "") == "ui_update_apply" or not _target_lacks_store(intent_sha):
+                    update_intent_target = intent_sha
+                    target_ref = intent_sha
+                    intent_keep_branch = str(update_intent.get("keep_branch") or "").strip()
             else:
                 cleared = _go()._clear_update_intent()
                 _go().append_jsonl(
@@ -403,6 +457,7 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
             capture_output=True,
         ).returncode == 0
 
+    done: List[str] = []  # tree-mutating commands completed by this call (`_tree_step`)
     if remote_ref_exists:
         if update_intent_target:
             preserve_ok, preserve_msg = _go()._preserve_branch_for_official_reset(
@@ -422,12 +477,12 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
                         "keep_branch": preserve_msg,
                     },
                 )
-            _go()._run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(_go().REPO_DIR), check=True)
-            _go()._run_git_resilient(["git", "clean", "-fd"], cwd=str(_go().REPO_DIR), check=True)
-        _go()._run_git_resilient(["git", "checkout", "-B", branch, target_ref], cwd=str(_go().REPO_DIR), check=True)
+            _tree_step(done, ["git", "reset", "--hard", "HEAD"])
+            _tree_step(done, ["git", "clean", "-fd"])
+        _tree_step(done, ["git", "checkout", "-B", branch, target_ref])
         if update_intent_target:
-            _go()._run_git_resilient(["git", "reset", "--hard", target_ref], cwd=str(_go().REPO_DIR), check=True)
-        _go()._run_git_resilient(["git", "clean", "-fd"], cwd=str(_go().REPO_DIR), check=True)
+            _tree_step(done, ["git", "reset", "--hard", target_ref])
+        _tree_step(done, ["git", "clean", "-fd"])
     else:
         rc_local = subprocess.run(
             ["git", "rev-parse", "--verify", branch],
@@ -435,28 +490,28 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
         ).returncode
 
         if rc_local != 0:
-            _go()._run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(_go().REPO_DIR), check=True)
-            _go()._run_git_resilient(["git", "clean", "-fd"], cwd=str(_go().REPO_DIR), check=True)
+            _tree_step(done, ["git", "reset", "--hard", "HEAD"])
+            _tree_step(done, ["git", "clean", "-fd"])
             # §6 (same detached-HEAD class as BUG1): `-b` with check=False silently swallowed a
             # "branch already exists" error and proceeded with HEAD possibly detached/wrong;
             # `-B` force-creates the branch at HEAD and check=True raises a real failure.
-            _go()._run_git_resilient(["git", "checkout", "-B", branch], cwd=str(_go().REPO_DIR), check=True)
+            _tree_step(done, ["git", "checkout", "-B", branch])
         else:
             if policy == "rescue_and_reset":
-                _go()._run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(_go().REPO_DIR), check=True)
-                _go()._run_git_resilient(["git", "clean", "-fd"], cwd=str(_go().REPO_DIR), check=True)
-            _go()._run_git_resilient(["git", "checkout", branch], cwd=str(_go().REPO_DIR), check=True)
-            _go()._run_git_resilient(["git", "reset", "--hard", "HEAD"], cwd=str(_go().REPO_DIR), check=True)
+                _tree_step(done, ["git", "reset", "--hard", "HEAD"])
+                _tree_step(done, ["git", "clean", "-fd"])
+            _tree_step(done, ["git", "checkout", branch])
+            _tree_step(done, ["git", "reset", "--hard", "HEAD"])
             if policy == "rescue_and_reset":
-                _go()._run_git_resilient(["git", "clean", "-fd"], cwd=str(_go().REPO_DIR), check=True)
+                _tree_step(done, ["git", "clean", "-fd"])
 
-    # Checkout may not update mtimes; remove stale bytecode.
-    for p in _go().REPO_DIR.rglob("__pycache__"):
-        shutil.rmtree(p, ignore_errors=True)
     st = {"current_branch": branch, "current_sha": subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(_go().REPO_DIR),
         capture_output=True, text=True, check=True,
     ).stdout.strip()}
+    if before_head and st["current_sha"] != before_head:
+        for p in _go().REPO_DIR.rglob("__pycache__"):
+            shutil.rmtree(p, ignore_errors=True)
     _record_checkout_facts(st)
     if update_intent_target and st["current_sha"] != update_intent_target:
         return False, f"Update intent checkout landed on {st['current_sha']} but expected {update_intent_target}"
@@ -465,6 +520,31 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     if update_intent_target and str(reason or "") != "ui_update_apply":
         _go()._clear_update_intent()
     return True, "ok"
+
+
+def _dependency_install_plan(repo_dir: pathlib.Path) -> Tuple[List[str], str, pathlib.Path]:
+    """``(command, source, lock path)`` of the one runtime-dependency install for ``repo_dir``."""
+    from ouroboros.platform_layer import pip_install_target_args
+
+    req_path = repo_dir / "requirements-runtime.lock"
+    if not req_path.exists():
+        # Preserve upgrades from managed repositories created before uv locks.
+        req_path = repo_dir / "requirements.txt"
+    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
+    # bundled interpreter, so an unflagged install wrote into the signed bundle.
+    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
+                      *pip_install_target_args(sys.executable)]
+    if req_path.exists():
+        return cmd + ["-r", str(req_path)], f"requirements:{req_path}", req_path
+    return cmd + ["openai>=1.0.0", "requests"], "fallback:minimal", req_path
+
+
+def runtime_dependency_command(repo_dir: pathlib.Path) -> Optional[List[str]]:
+    """The same install command for a body switch that runs with no launcher; ``None`` where
+    this chokepoint installs nothing (a frozen bundle, an active test boundary)."""
+    if getattr(sys, 'frozen', False) or os.environ.get("OUROBOROS_PYTEST_ACTIVE") == "1":
+        return None
+    return _dependency_install_plan(pathlib.Path(repo_dir))[0]
 
 
 def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
@@ -484,24 +564,16 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
         log.info("Skipping dependency sync under an active test boundary (%s).", reason)
         return True, "pytest:suppressed"
 
-    from ouroboros.platform_layer import pip_install_target_args
-
-    req_path = _go().REPO_DIR / "requirements-runtime.lock"
-    if not req_path.exists():
-        # Preserve upgrades from managed repositories created before uv locks.
-        req_path = _go().REPO_DIR / "requirements.txt"
-    # The sixth and last pip call site. On a packaged install `sys.executable` IS the
-    # bundled interpreter, so an unflagged install wrote into the signed bundle.
-    cmd: List[str] = [sys.executable, "-m", "pip", "install", "-q",
-                      *pip_install_target_args(sys.executable)]
-    source = ""
-    if req_path.exists():
-        cmd += ["-r", str(req_path)]
-        source = f"requirements:{req_path}"
-    else:
-        cmd += ["openai>=1.0.0", "requests"]
-        source = "fallback:minimal"
+    cmd, source, req_path = _dependency_install_plan(_go().REPO_DIR)
     try:
+        from ouroboros.startup_migrations import watermarks, stamp
+        fingerprint = _dependency_fingerprint(req_path, cmd)
+        try:
+            synced = watermarks(_go().DRIVE_ROOT).get("dependencies")
+        except ValueError:
+            synced = None  # an unreadable watermark file means "not known synced": sync
+        if synced == fingerprint:
+            return True, "unchanged:" + source
         from ouroboros.platform_layer import kill_process_tree, subprocess_new_group_kwargs
         from ouroboros.tools.shell import _active_subprocesses, _subprocess_lock
 
@@ -521,6 +593,10 @@ def sync_runtime_dependencies(reason: str) -> Tuple[bool, str]:
                 _active_subprocesses.discard(proc)
         if returncode != 0:
             raise subprocess.CalledProcessError(returncode, cmd)
+        try:
+            stamp(_go().DRIVE_ROOT, dependencies=fingerprint)
+        except Exception:
+            log.warning("Dependency fingerprint not recorded; the next sync runs pip again", exc_info=True)
         _go().append_jsonl(
             _go().DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {
@@ -551,8 +627,59 @@ def import_test() -> Dict[str, Any]:
         cwd=str(_go().REPO_DIR),
         capture_output=True, text=True,
     )
+    if r.returncode != 0:
+        _forget_dependency_fingerprint()  # a broken environment is re-synced next time, never skipped
     return {"ok": (r.returncode == 0), "stdout": r.stdout, "stderr": r.stderr,
             "returncode": r.returncode}
+
+
+def _forget_dependency_fingerprint() -> None:
+    try:
+        from ouroboros.startup_migrations import stamp
+        stamp(_go().DRIVE_ROOT, dependencies=None)
+    except Exception:
+        log.warning("Dependency fingerprint not cleared after a failed import test", exc_info=True)
+
+
+def _checkout_outcome(branch: str, reason: str, unsynced_policy: str) -> Tuple[bool, str]:
+    """``checkout_and_reset`` whose Git refusal is a failed outcome, never a raise.
+
+    Git explains the refusal (e.g. an ``index.lock`` another process holds or a
+    crash left); it is recorded once and returned in Git's own words (``refusal_text``).
+    """
+    try:
+        return _go().checkout_and_reset(branch, reason=reason, unsynced_policy=unsynced_policy)
+    except subprocess.CalledProcessError as exc:
+        cmd, detail = refusal_parts(exc)
+        _go().append_jsonl(
+            _go().current_drive_root() / "logs" / "supervisor.jsonl",
+            {"ts": _go().utc_now_iso(), "type": "checkout_step_failed", "reason": reason,
+             "target_branch": branch, "cmd": cmd, "returncode": exc.returncode, "stderr": detail},
+        )
+        return False, refusal_text(exc)
+
+
+def _git_said(exc: subprocess.CalledProcessError) -> str:
+    output = exc.stderr or exc.output or ""
+    return output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output)
+
+
+def refusal_parts(exc: subprocess.CalledProcessError) -> Tuple[str, str]:
+    """The refused command and Git's own stderr, each on one line."""
+    cmd = " ".join(map(str, exc.cmd)) if isinstance(exc.cmd, (list, tuple)) else str(exc.cmd)
+    return cmd, " ".join(_git_said(exc).split())
+
+
+def refusal_text(exc: BaseException) -> str:
+    """A checkout refusal: a headline line (the step, Git's own first line, what is known of the
+    tree), then Git's whole output on the next line. Owner notices show the headline only."""
+    if not isinstance(exc, subprocess.CalledProcessError):
+        return str(exc)
+    cmd, detail = refusal_parts(exc)
+    first = next((" ".join(line.split()) for line in _git_said(exc).splitlines() if line.strip()), "no output")
+    scope = ("no checkout step had changed the working tree" if getattr(exc, "before_tree_effects", False)
+             else "earlier checkout steps may already have changed the working tree")
+    return f"`{cmd}` failed (exit {exc.returncode}): {first}; {scope}.\nGit: {detail or 'no output'}"
 
 
 def safe_restart(
@@ -583,7 +710,7 @@ def safe_restart(
             return True, "OK: managed checkout disabled — staying on the current checkout"
         return False, f"Import test failed with managed checkout disabled (rc={t.get('returncode', -1)})"
 
-    ok, err = _go().checkout_and_reset(_go().BRANCH_DEV, reason=reason, unsynced_policy=unsynced_policy)
+    ok, err = _checkout_outcome(_go().BRANCH_DEV, reason, unsynced_policy)
     if not ok:
         return False, f"Failed checkout {_go().BRANCH_DEV}: {err}"
 
@@ -608,11 +735,7 @@ def safe_restart(
         },
     )
 
-    ok_s, err_s = _go().checkout_and_reset(
-        _go().BRANCH_STABLE,
-        reason=f"{reason}_fallback_stable",
-        unsynced_policy="rescue_and_reset",
-    )
+    ok_s, err_s = _checkout_outcome(_go().BRANCH_STABLE, f"{reason}_fallback_stable", "rescue_and_reset")
     if not ok_s:
         return False, f"Failed checkout {_go().BRANCH_STABLE}: {err_s}"
 
@@ -635,3 +758,25 @@ def _record_checkout_facts(facts: dict) -> None:
         _go().update_state(lambda live: live.update(facts))
     except StateUnavailable:
         log.warning("Checkout facts not recorded in state: runtime state unavailable", exc_info=True)
+        return
+    try:
+        from ouroboros.startup_migrations import stamp
+        stamp(_go().DRIVE_ROOT, observed_state_sha=facts.get("current_sha"))
+    except Exception:
+        # Bookkeeping never fails a checkout: without the stamp the next start re-imports.
+        log.warning("Observed checkout SHA not stamped; the next start re-imports the obligation sets", exc_info=True)
+
+
+def _dependency_fingerprint(req_path, cmd):
+    """Actual requirement bytes, install target/environment and interpreter."""
+    import hashlib
+    import json
+    import site
+    import sysconfig
+    source = req_path.read_bytes() if req_path.exists() else b"openai>=1.0.0\nrequests"
+    facts = {"requirements_sha256": hashlib.sha256(source).hexdigest(), "command": cmd,
+             "interpreter": [sys.executable, sys.version, sys.prefix, sys.base_prefix],
+             "target": [site.getuserbase(), sysconfig.get_path("purelib")],
+             "environment": {key: os.environ.get(key, "") for key in
+                             ("PYTHONUSERBASE", "PIP_TARGET", "PIP_PREFIX", "PIP_USER", "PIP_CONFIG_FILE", "VIRTUAL_ENV")}}
+    return hashlib.sha256(json.dumps(facts, sort_keys=True).encode("utf-8")).hexdigest()

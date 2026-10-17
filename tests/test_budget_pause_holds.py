@@ -19,6 +19,7 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from tests.worker_pool_support import affirm_ready
 
 from tests._budget_pause_exact_helpers import (  # noqa: F401 -- shared fixtures of the exact-pause suite
     _install_queue,
@@ -100,8 +101,8 @@ def test_unrestorable_source_holds_the_row_with_its_marker_and_a_later_grant_rel
     hold = budget_hold_fact(held)
     assert hold["reason"] == "restore_refused:pause_source_unreadable" and hold["dispatchable"] is False
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
     workers.assign_tasks()
     assert sent == []  # held, not assignable
     assert queue.resume_budget_paused_task("corrupt-1")["error"] == "pause_source_unreadable"
@@ -137,8 +138,8 @@ def test_orphaned_unwritten_revocation_is_written_by_the_next_resume_before_a_ne
     assert task["_budget_pause"]["exact_continuation"] is True and "_budget_pause_resume" not in task
     assert budget_pause.budget_pause_row(tmp_path, "orphan-1")["state"] == budget_pause.STATE_RESUME_GRANTED
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
     workers.assign_tasks()
     assert sent == []  # a stale grant never dispatches
     second = queue.resume_budget_paused_task("orphan-1")
@@ -169,8 +170,8 @@ def test_root_re_resume_rebinds_fence_lifted_sibling_holds_to_the_live_grant(tmp
     hold = budget_hold_fact(sibling)
     assert hold["reason"] == HOLD_ROOT_FENCE_LIFTED and hold["root_grant_id"] == first["grant_id"]
     sent = []
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
     workers.assign_tasks()
     assert [t["id"] for t in sent] == ["root-3"]  # the sibling waits for an explicit selection
     pause_a = sent[0]["_budget_pause_resume"]["pause_id"]
@@ -334,8 +335,8 @@ def _fenced_member(workers, task_id, root_task_id):
 
 
 def _idle_worker(workers, sent):
-    workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
-                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    workers.WORKERS[0] = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                                         in_q=SimpleNamespace(put=lambda t: sent.append(dict(t)))))
 
 
 def test_selecting_one_member_of_a_fenced_root_never_lifts_the_latch(tmp_path, monkeypatch):
@@ -374,7 +375,8 @@ def test_selecting_one_member_of_a_fenced_root_never_lifts_the_latch(tmp_path, m
     assert [t["id"] for t in sent] == ["m1-f2"]  # no fan-out of the fenced tree
 
 
-def test_a_selection_bound_to_an_older_fence_does_not_pre_release_a_new_one(tmp_path, monkeypatch):
+@pytest.mark.parametrize("worker_busy", [False, True])
+def test_a_selection_bound_to_an_older_fence_does_not_pre_release_a_new_one(tmp_path, monkeypatch, worker_busy):
     """The selection names the fence generation it was granted against: a root that
     paused AGAIN raises a new latch, and the earlier selection is not a key to it."""
     from supervisor.events_budget import _set_root_budget_pause_locked
@@ -393,8 +395,11 @@ def test_a_selection_bound_to_an_older_fence_does_not_pre_release_a_new_one(tmp_
     assert budget_pause_fact(member)["fence_id"] == "fence-2"
     sent = []
     _idle_worker(workers, sent)
+    if worker_busy:
+        workers.WORKERS[0].busy_task_id = "other"
     workers.assign_tasks()
     assert sent == []
+    assert not member.get("_budget_pause_hold", {}).get("selected")
 
 
 def test_root_resume_holds_a_fence_bound_child_marker_instead_of_stranding_it(tmp_path, monkeypatch):

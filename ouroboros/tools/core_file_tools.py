@@ -7,7 +7,8 @@ import hashlib
 import json
 import logging
 import pathlib
-from typing import Any, Callable, Dict, List, Optional
+import re
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ouroboros.contracts.skill_payload_policy import (
     SKILL_OWNER_STATE_FILENAMES,
@@ -17,6 +18,7 @@ from ouroboros.contracts.task_constraint import normalize_task_constraint, resol
 from ouroboros.project_facts import filter_out_project_store as _filter_out_project_store
 from ouroboros.project_facts import project_store_access_block as _project_store_access_block
 from ouroboros.protected_artifacts import block_reason_for_path
+from ouroboros import store
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
     UserFilesPathBlockedError,
@@ -101,20 +103,22 @@ def _direct_resource_binding(
 
 
 def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_line: int = 1,
-                       start_char: int = 0, extent: Optional[Dict[str, Any]] = None) -> str:
+                       start_char: int = 0, extent: Optional[Dict[str, Any]] = None,
+                       max_chars: Optional[int] = None) -> str:
     """Return a line-ranged file view with the shared read-tool header.
 
     ``extent`` (when a dict is passed) receives the DELIVERED window as FACTS,
     stamped AFTER the ``start_char`` cut: ``first_line`` (the first COMPLETE line
     in the body — a cursor that skips whole lines advances it, and a cursor that
     lands mid-line makes that line partial, so it is not counted), ``end_line``,
-    ``total_lines``, ``body_start`` (where the body begins in the returned text,
-    right after the one header line), ``body_chars``, ``partial_head`` (the body
-    opens with a partial line), ``line_ends`` (the end offsets, within the body,
-    of its COMPLETE lines — the partial head excluded — on the very line
+    ``total_lines``, ``body_start`` (where the numbered display begins),
+    ``body_chars`` (source characters), ``partial_head`` (the body opens with
+    a partial line), ``line_ends`` (display offsets of COMPLETE lines — partial
+    head and tail rows excluded — on the very line
     definition the renderer cut by, so a consumer that cuts the body further
-    counts complete lines from them and never recounts newlines), plus the
-    requested ``start_line``/``start_char``.
+    counts complete lines from them and never recounts newlines), ``display_map``
+    (the compact descriptor ``display_source_segments`` rebuilds the numbered
+    rows from), plus the requested ``start_line``/``start_char``.
     An empty delivery (cursor at or past the window's end, or a start past EOF)
     is an EMPTY range (``end_line < first_line``), never an inverted claim. A
     consumer that must know what a read delivered (the native review episode's
@@ -122,10 +126,16 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     header text back.
 
     ``start_char`` is a SUB-LINE cursor: it skips that many characters of the selected
-    window's body before rendering. It exists because delivery is char-bounded (the
-    outer tool-result truncator cuts at ``tool_result_limit``): a single line longer
-    than the budget can never be delivered whole by any line window, so the reader
-    advances WITHIN it by re-reading the same window with a growing ``start_char``.
+    window's body before rendering. Delivery is char-bounded (the loop shows a
+    result the measured frame cannot hold as head+tail with its exact source), so
+    a single line longer than the room can never be delivered whole by any line
+    window: the reader advances WITHIN it by re-reading the same window with a
+    growing ``start_char``. ``max_chars`` bounds THIS view's body (after the cursor)
+    to an exact character count, so the piece is chosen rather than cut from
+    outside; the header then names the next ``start_char``. Both cursors count
+    Unicode code points of the universal-newline source text, never display
+    numbers. ``end_line`` is the last
+    COMPLETE line delivered and ``partial_tail`` says the body ends mid-line.
     Disclosed in the header, so the view never silently masquerades as the whole line.
     """
     start_raw, max_raw = _coerce_line_window(start_line, max_lines)
@@ -146,29 +156,139 @@ def _render_line_slice(path: str, content: str, max_lines: int = 2000, start_lin
     for line in window_lines:
         ends.append((ends[-1] if ends else 0) + len(line))
     offset = _coerce_start_char(start_char)
-    if offset:
-        body = window[offset:]
-        header = f"# {path} — lines {start}\u2013{end} of {total} (from char {offset} of this window)\n"
-        whole = bisect.bisect_right(ends, offset)  # lines ending at or before the cursor: skipped whole
-        partial_head = bool(body) and not (whole and ends[whole - 1] == offset)  # landed mid-line: that line is partial
-        first_line = start + whole + (1 if partial_head else 0)
-        line_ends = tuple(e - offset for e in ends[whole + (1 if partial_head else 0):])
+    budget = _coerce_max_chars(max_chars)
+    body = window[offset:] if offset else window
+    cut = budget is not None and len(body) > budget
+    if cut:
+        body = body[:budget]
+    delivered_end = offset + len(body)  # window offset right after the body
+    span = f"# {path} — lines {start}\u2013{end} of {total}"
+    if cut:
+        header = f"{span} (from char {offset} of this window, {len(body)} chars; next start_char={delivered_end})\n"
+    elif offset:
+        header = f"{span} (from char {offset} of this window)\n"
     else:
-        body, header, partial_head, first_line = window, f"# {path} — lines {start}\u2013{end} of {total}\n", False, start
-        line_ends = tuple(ends)
+        header = f"{span}\n"
+    whole = bisect.bisect_right(ends, offset)  # lines ending at or before the cursor: skipped whole
+    partial_head = bool(body) and bool(offset) and not (whole and ends[whole - 1] == offset)  # landed mid-line
+    first_line = start + whole + (1 if partial_head else 0)
+    complete_through = bisect.bisect_right(ends, delivered_end)  # lines whose end the body reaches
+    partial_tail = bool(body) and delivered_end < len(window) and not (complete_through and ends[complete_through - 1] == delivered_end)
+    end_line = start + complete_through - 1 if cut else end  # a cut view ends at its last COMPLETE line
     if not body:
-        first_line, line_ends = end + 1, ()  # nothing complete was delivered: an EMPTY range, never an inverted one
+        first_line = end + 1  # nothing complete was delivered: an EMPTY range, never an inverted one
+    # Display offsets are deliberately separate from source offsets: a number
+    # prefix can be delivered without delivering any character of the file.
+    display_parts: List[str] = []
+    display_line_ends: List[int] = []
+    display_pos = 0
+    visible_line = start + whole  # a partial head row keeps its own source line number
+    rows = body.splitlines(keepends=True)
+    last_row = visible_line + len(rows) - 1
+    for number, line in enumerate(rows, visible_line):
+        prefix = _display_prefix(number)
+        display_parts.extend((prefix, line))
+        display_pos += len(prefix) + len(line)
+        if not (partial_head and number == visible_line) and not (partial_tail and number == last_row):
+            display_line_ends.append(display_pos)
+    displayed = "".join(display_parts)
     if extent is not None:
         source_start = sum(len(line) for line in lines[:start - 1]) + min(offset, len(window))
-        extent.update({"start_line": start, "end_line": end, "total_lines": total, "start_char": offset,
+        extent.update({"start_line": start, "end_line": end_line, "total_lines": total, "start_char": offset,
                        "first_line": first_line, "body_start": len(header), "body_chars": len(body),
-                       "partial_head": partial_head, "line_ends": line_ends,
+                       "partial_head": partial_head, "partial_tail": partial_tail,
+                       "line_ends": tuple(display_line_ends),
+                       "display_map": {"scheme": _DISPLAY_SCHEME, "first_number": visible_line, "rows": len(rows)},
                        "complete_chars": len(content),
                        "complete_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                        "source_start_char": source_start, "source_end_char": source_start + len(body),
                        "range_basis": "unicode_text_universal_newlines", "source_masked": False})
-    rendered = header + body
+    rendered = header + displayed
     return rendered
+
+
+# The numbered display is deterministic: row k is ``_display_prefix(first_number + k)``
+# followed by one source line on read_file's ``splitlines`` definition. A view
+# carries only this descriptor (a 2,000-line read stays a few bytes of facts);
+# consumers rebuild row coordinates from the rendered text and validate them.
+_DISPLAY_SCHEME = "numbered_rows_v1"
+_DISPLAY_BOUNDARY = re.compile("[\n\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _display_prefix(number: int) -> str:
+    return f"{number:>6}\t"
+
+
+def display_source_segments(view: Dict[str, Any], rendered: str) -> Optional[List[Tuple[int, int, int]]]:
+    """Rows of a numbered read as ``(display_begin, display_end, source_at)``.
+
+    Display offsets are absolute in ``rendered``; ``source_at`` counts source
+    characters from the window start. Rows are rebuilt from the deterministic
+    display and checked against the view's descriptor; a rendering cut short
+    yields the rows it still holds. ``None`` when the text is not this display.
+    """
+    body_start, chars, shape = view.get("body_start"), view.get("body_chars"), view.get("display_map")
+    if (type(body_start) is not int or type(chars) is not int or body_start < 0 or chars < 0
+            or not isinstance(shape, dict) or shape.get("scheme") != _DISPLAY_SCHEME
+            or type(shape.get("first_number")) is not int or type(shape.get("rows")) is not int):
+        return None
+    segments: List[Tuple[int, int, int]] = []
+    pos, source_at = body_start, 0
+    for number in range(shape["first_number"], shape["first_number"] + shape["rows"]):
+        prefix = _display_prefix(number)
+        visible = rendered[pos:pos + len(prefix)]
+        if visible != prefix:  # a cut inside or before this prefix ends the delivered rows
+            return segments if pos + len(visible) == len(rendered) and prefix.startswith(visible) else None
+        begin = pos + len(prefix)
+        cap = begin + chars - source_at
+        found = _DISPLAY_BOUNDARY.search(rendered, begin, cap)
+        stop = found.end() if found else min(cap, len(rendered))
+        if found and found.group() == "\r" and stop < cap and rendered.startswith("\n", stop):
+            stop += 1
+        segments.append((begin, stop, source_at))
+        source_at += stop - begin
+        pos = stop
+    return segments if source_at == chars or pos == len(rendered) else None
+
+
+def display_intervals_to_source(view: Dict[str, Any], rendered: str,
+                                shown: List[Tuple[int, int]]) -> Optional[List[Tuple[int, int]]]:
+    """File character intervals actually delivered by ``shown`` display intervals.
+
+    ``shown`` are half-open offsets in ``rendered`` that reached the reader (one
+    prefix, or a head and a tail around a hidden gap). Only source characters
+    inside them count: number prefixes and hidden spans credit nothing. Results
+    use the view's ``range_basis`` and start at its ``source_start_char``.
+    """
+    segments = display_source_segments(view, rendered)
+    base = view.get("source_start_char")
+    if segments is None or type(base) is not int:
+        return None
+    credited: List[Tuple[int, int]] = []
+    for low, high in sorted(shown):
+        for begin, stop, source_at in segments:
+            first, last = max(begin, low), min(stop, high)
+            if first >= last:
+                continue
+            interval = (base + source_at + first - begin, base + source_at + last - begin)
+            if credited and interval[0] <= credited[-1][1]:
+                credited[-1] = (credited[-1][0], max(credited[-1][1], interval[1]))
+            else:
+                credited.append(interval)
+    return credited
+
+
+def delivered_source_prefix(view: Dict[str, Any], rendered: str, shown: int) -> str:
+    """Source characters in a delivered read_file display prefix.
+
+    The renderer owns this mapping; consumers must not strip number prefixes
+    with independent parsers. Rows are rebuilt from the delivered prefix alone,
+    so a marker appended after the cut is never read as source; a cut within a
+    prefix contributes zero chars.
+    """
+    delivered = rendered[:max(0, shown)]
+    segments = display_source_segments(view, delivered) or []
+    return "".join(delivered[begin:stop] for begin, stop, _ in segments)
 
 
 def _read_source_text(target: pathlib.Path, extent: Optional[Dict[str, Any]]) -> str:
@@ -178,7 +298,13 @@ def _read_source_text(target: pathlib.Path, extent: Optional[Dict[str, Any]]) ->
     text; source_revision names the actual file bytes, including CRLF. Reopening
     only to hash could bind a delivered view to a different concurrent revision.
     """
-    raw = target.read_bytes()
+    try:
+        raw = store.read_file_bytes(target)
+    except FileNotFoundError:
+        from ouroboros.evidence_packs import materialize_path
+        if materialize_path(target) is None:  # a packed checkpoint handle is written back first
+            raise
+        raw = store.read_file_bytes(target)
     content = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
     if extent is not None:
         extent.update(source_revision=hashlib.sha256(raw).hexdigest(), source_bytes=len(raw))
@@ -190,6 +316,15 @@ def _coerce_start_char(start_char: Any = 0) -> int:
         return max(0, int(start_char))
     except (TypeError, ValueError):
         return 0
+
+
+def _coerce_max_chars(max_chars: Any = None) -> Optional[int]:
+    """A positive character budget for one view; anything else means unbounded."""
+    try:
+        value = int(max_chars) if max_chars is not None else None
+    except (TypeError, ValueError):
+        return None
+    return value if value is not None and value > 0 else None
 
 
 def _coerce_line_window(start_line: Any = 1, max_lines: Any = 2000) -> tuple[int, int]:
@@ -252,7 +387,11 @@ def _list_dir(root: pathlib.Path, rel: str, max_entries: int = 500) -> List[str]
     # A hard iterdir/permission/race failure PROPAGATES: _list_files renders it
     # as a first-class "⚠️ LIST_FILES_ERROR" tool error, never an ok-shaped JSON
     # listing carrying an error string inside (v6.54.3, review round 3).
-    for entry in sorted(target.iterdir()):
+    from ouroboros.evidence_packs import packed_handle_names_at
+    entries = list(target.iterdir())  # a task's packed checkpoint handles list beside the loose ones
+    present = {entry.name for entry in entries}
+    entries += [target / name for name in packed_handle_names_at(target) if name not in present]
+    for entry in sorted(entries):
         if len(items) >= max_entries:
             items.append(f"...(truncated at {max_entries})")
             break
@@ -313,6 +452,7 @@ def _repo_read(
     display_path: str | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
     extent: Optional[Dict[str, Any]] = None,
+    max_chars: Optional[int] = None,
 ) -> str:
     """Read a repo file; root-level memory names return a runtime_data read hint."""
     target = _resolved_binding.target_path if _resolved_binding is not None else ctx.repo_path(path)
@@ -341,7 +481,7 @@ def _repo_read(
             text=f"⚠️ NOT_FOUND: file does not exist: {target}",
         ))
     return _render_line_slice(display_path or path, content, max_lines=max_lines, start_line=start_line,
-                              start_char=start_char, extent=extent)
+                              start_char=start_char, extent=extent, max_chars=max_chars)
 
 
 def _repo_list(
@@ -382,6 +522,7 @@ def _data_read(
     display_path: str | None = None,
     _resolved_binding: ResolvedResourceBinding | None = None,
     extent: Optional[Dict[str, Any]] = None,
+    max_chars: Optional[int] = None,
 ) -> str:
     """Read a drive text file; duplicate drive_root prefixes are stripped."""
     task_constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
@@ -420,14 +561,15 @@ def _data_read(
         content = _read_source_text(target, extent)
         start_raw, max_raw = _coerce_line_window(start_line, max_lines)
         # The cognitive full-read shortcut only applies to a DEFAULT read: an explicit
-        # start_char is a sub-line cursor request and must be honored, not swallowed.
-        if _is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000 and not _coerce_start_char(start_char):
+        # start_char or max_chars is a bounded-view request and must be honored, not swallowed.
+        if (_is_cognitive_data_path(norm) and start_raw == 1 and max_raw == 2000
+                and not _coerce_start_char(start_char) and _coerce_max_chars(max_chars) is None):
             if display_path is None:
                 return content
             full_line_count = max(1, len(content.splitlines()))
             return _render_line_slice(display_path, content, max_lines=full_line_count, start_line=1, extent=extent)
         return _render_line_slice(display_path or norm, content, max_lines=max_raw, start_line=start_raw,
-                                  start_char=start_char, extent=extent)
+                                  start_char=start_char, extent=extent, max_chars=max_chars)
     except FileNotFoundError:
         if norm.replace("\\", "/").startswith("memory/"):
             explanation = (
@@ -533,7 +675,7 @@ def _root_display_path(root: str, path: str) -> str:
 
 
 def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: int, result: str,
-                     start_char: int = 0) -> str:
+                     start_char: int = 0, max_chars: Optional[int] = None) -> str:
     """Append an advisory hint when the SAME file slice is re-read unchanged.
 
     Per-task, key on (resolved path, slice); the change signal is (size, mtime).
@@ -547,7 +689,7 @@ def _annotate_reread(ctx: ToolContext, target: Any, start_line: int, max_lines: 
         return result
     if not isinstance(result, str) or result.startswith("⚠️"):
         return result
-    key = f"{resolved}|{int(start_line)}|{int(max_lines)}|{_coerce_start_char(start_char)}"
+    key = f"{resolved}|{int(start_line)}|{int(max_lines)}|{_coerce_start_char(start_char)}|{_coerce_max_chars(max_chars)}"
     sig = (st.st_size, st.st_mtime_ns)
     seen = getattr(ctx, "_read_file_seen", None)
     if not isinstance(seen, dict):
@@ -579,8 +721,23 @@ def _stamp_read_view(ctx: ToolContext, target: Any, opened: str, opened_root: st
     before every dispatch (these are the ONLY writers — a static test pins the
     writer set). Disclosure only — never gates or alters the read."""
     if "body_start" in extent:
-        ctx.last_read_view = {"target": str(target), "opened_path": str(opened),
-                              "opened_root": str(opened_root), **extent}
+        view = {"target": str(target), "opened_path": str(opened), "opened_root": str(opened_root), **extent}
+        ctx.last_read_view = view
+        from ouroboros.delegate_output import acknowledge_staged_output_read
+        from ouroboros.tools.tool_result import _published_tool_result, _replace_tool_result
+
+        # display_map (a few bytes) lets the delivery credit decode numbered rows;
+        # per-line facts such as line_ends stay off the bounded ToolResult meta.
+        compact = {key: view[key] for key in (
+            "target", "opened_root", "body_start", "body_chars", "source_start_char", "source_end_char",
+            "complete_chars", "complete_sha256", "source_revision", "range_basis", "source_masked",
+            "display_map") if key in view}
+        prior = _published_tool_result(ctx, None)
+        result = (_replace_tool_result(prior, meta_updates={"read_view": compact})
+                  if isinstance(prior, ToolResult) and prior.text == rendered else
+                  ToolResult(status="ok", code="OK", text=rendered, meta={"read_view": compact}))
+        rendered = _publish_tool_result(ctx, result)
+        acknowledge_staged_output_read(ctx, compact, rendered)
     return rendered
 
 
@@ -588,18 +745,23 @@ def _stamp_read_view(ctx: ToolContext, target: Any, opened: str, opened_root: st
 def _read_file(
     ctx: ToolContext,
     path: str,
-    root: str = "active_workspace",
+    root: str | None = None,
     max_lines: int = 2000,
     start_line: int = 1,
     start_char: int = 0,
     bucket: str = "",
     skill_name: str = "",
     _resolved_binding: ResolvedResourceBinding | None = None,
+    max_chars: Optional[int] = None,
 ) -> str:
     # Reset first: a blocked or missing read must never inherit the previous
     # read's extent (the renderer fills `extent` only when it rendered).
     ctx.last_read_view = None
     extent: Dict[str, Any] = {}
+    if not root:
+        from ouroboros.tools.tool_resolution import _root_containing_absolute_path
+
+        root = _root_containing_absolute_path(ctx, "read_file", path) or "active_workspace"
     normalized, block = _access_or_block(ctx, root, "read")
     if block:
         return block
@@ -646,7 +808,8 @@ def _read_file(
             display_path=display_path,
             _resolved_binding=binding,
             extent=extent,
-        ), start_char=start_char))
+            max_chars=max_chars,
+        ), start_char=start_char, max_chars=max_chars))
     if normalized == "runtime_data":
         return _stamp_read_view(ctx, target, opened, opened_root, extent, _annotate_reread(ctx, target, start_line, max_lines, _data_read(
             ctx,
@@ -657,26 +820,16 @@ def _read_file(
             display_path=_root_display_path(normalized, path),
             _resolved_binding=binding,
             extent=extent,
-        ), start_char=start_char))
+            max_chars=max_chars,
+        ), start_char=start_char, max_chars=max_chars))
     try:
         content = _read_source_text(target, extent)
         rendered = _render_line_slice(_root_display_path(normalized, path), content,
                                       max_lines=max_lines, start_line=start_line,
-                                      start_char=start_char, extent=extent)
-        if normalized == "task_drive":
-            # D7 coverage acknowledgement: what counts as read is what the DELIVERY
-            # layer will actually hand the model, so the hook receives the rendered
-            # view and applies the same char budget the outer truncator applies.
-            # Disclosure only — nothing on this path may ever block or fail the read.
-            try:
-                from ouroboros.tools.delegate import acknowledge_staged_output_read
-
-                acknowledge_staged_output_read(ctx, target, content, start_line, max_lines,
-                                               start_char=start_char, rendered=rendered)
-            except Exception:
-                log.warning("staged-output coverage acknowledgement hook failed", exc_info=True)
+                                      start_char=start_char, extent=extent, max_chars=max_chars)
         return _stamp_read_view(ctx, target, opened, opened_root, extent,
-                                _annotate_reread(ctx, target, start_line, max_lines, rendered, start_char=start_char))
+                                _annotate_reread(ctx, target, start_line, max_lines, rendered,
+                                                 start_char=start_char, max_chars=max_chars))
     except FileNotFoundError:
         return _publish_tool_result(ctx, ToolResult(
             status="ok",

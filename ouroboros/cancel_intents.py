@@ -102,12 +102,14 @@ def _intents_path(drive_root: Any) -> pathlib.Path:
 
 
 @contextmanager
-def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
+def cancellation_projection_lock(drive_root: Any, *, wait: bool = True) -> Iterator[None]:
     """Hold the same short lock used by cancel-intent mutators.
 
     Cross-store decisions such as a paid acceptance claim use this only while
     committing their own atomic row.  If cancellation linearizes first they see
     it; if this lock wins first, the claim linearizes before cancellation.
+    ``wait=False`` tries once (an automatic caller under Q); the refusal's
+    ``reason`` keeps the acquisition outcome, so contention stays distinct.
     """
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
@@ -116,9 +118,13 @@ def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
 
     path = _intents_path(drive_root)
     lock_path = path.with_name(path.name + ".lock")
-    lock_fd = acquire_exclusive_file_lock(lock_path, owner_aware_stale=True)
+    outcome: Dict[str, Any] = {}
+    lock_fd = acquire_exclusive_file_lock(lock_path, owner_aware_stale=True, outcome=outcome,
+                                          **({} if wait else {"timeout_sec": 0.0}))
     if lock_fd is None:
-        raise TimeoutError("cancel-intent projection lock unavailable")
+        error = TimeoutError("cancel-intent projection lock unavailable")
+        error.reason = outcome.get("reason", "unknown")
+        raise error
     try:
         yield
     finally:
@@ -867,7 +873,7 @@ def active_intent(
 
 
 def resolve_owner_stop_intent(
-    drive_root: Any, task_id: str,
+    drive_root: Any, task_id: str, *, propagate_busy: bool = False,
 ) -> Tuple[str, Dict[str, Any]]:
     """Return the durable owner-stop key/row for a physical retry task.
 
@@ -884,6 +890,9 @@ def resolve_owner_stop_intent(
     exact = active_intent(drive_root, tid)
     if isinstance(exact, dict) and stop_policy(exact) == STOP_POLICY_FINALIZE:
         return tid, exact
+    if exact is not None:
+        return tid, {}  # A known immediate intent needs no lineage read.
+    from ouroboros.store import StoreBusy
     try:
         from ouroboros.task_results import load_task_result
 
@@ -900,6 +909,10 @@ def resolve_owner_stop_intent(
         ):
             return tid, {}
         return logical_root, logical
+    except StoreBusy:
+        if propagate_busy:
+            raise
+        return tid, {}
     except Exception:
         log.debug(
             "owner-stop intent resolution failed for physical task %s",
@@ -1155,7 +1168,8 @@ def settle_intent(
             # Transfer before retiring the active intent, under this same cancel
             # lock. Natural completion keeps its status, answer, cost and custody.
             # A failed transfer leaves the intent active for watchdog recovery.
-            from ouroboros.task_results import task_result_path, require_writable_task_result_schema
+            from ouroboros.task_results import require_writable_task_result_schema
+            from ouroboros.task_store import patch_document
             def retain_stop(result):
                 if not result:
                     if outcome == SETTLED_NOT_FOUND:
@@ -1163,8 +1177,7 @@ def settle_intent(
                     raise ValueError("followup_stop_result_missing")
                 require_writable_task_result_schema(result)
                 return {**result, "followup_stop": copy.deepcopy(row["followup_stop"])}
-            update_json_locked(task_result_path(pathlib.Path(drive_root), tid), retain_stop,
-                               strict_existing_dict=True)
+            patch_document(pathlib.Path(drive_root), tid, retain_stop)
         intents.pop(tid, None)
         settled.update(row)
         return {"schema_version": _SCHEMA_VERSION, "intents": intents}
@@ -1274,7 +1287,7 @@ def claim_still_owned(drive_root: Any, task_id: str, claim: Dict[str, Any]) -> b
         return False
 
 
-def migrate_legacy_cancel_latches(drive_root: Any) -> List[str]:
+def migrate_legacy_cancel_latches(drive_root: Any, *, records=None) -> List[str]:
     """Boot migration: legacy ``cancel_requested`` status files → synthetic intents.
 
     Pre-redesign task results may still sit in the ``cancel_requested`` latch (the
@@ -1301,70 +1314,53 @@ def migrate_legacy_cancel_latches(drive_root: Any) -> List[str]:
     visibility owner decision 6.3=B gives the quarantine itself.
     """
     from ouroboros.task_result_schema import task_result_schema_refusal
-    from ouroboros.task_results import (
-        STATUS_CANCEL_REQUESTED, list_task_results, task_results_dir,
-        write_task_result,
-    )
-    from ouroboros.utils import read_json_dict
-
-    admitted: List[str] = []
-    for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
-        raw = read_json_dict(path)
-        if task_result_schema_refusal(raw) != "unstamped_pre_7_0":
+    from ouroboros.task_results import STATUS_CANCEL_REQUESTED, write_task_result
+    if records is None:
+        from ouroboros.task_store import list_documents
+        records = [(str(row.get("task_id") or ""), row, "") for row in list_documents(drive_root)]
+    admitted, migrated, failed = [], [], []
+    for tid, row, error in records:
+        if error or not isinstance(row, dict) or row.get("status") != STATUS_CANCEL_REQUESTED:
             continue
-        if (
-            str(raw.get("status") or "") != STATUS_CANCEL_REQUESTED
-            or str(raw.get("task_id") or "") != path.stem
-        ):
-            continue  # not a latch, or an identity this write would rewrite
+        refusal = task_result_schema_refusal(row)
+        if str(row.get("task_id") or "") != tid or refusal not in {"", "unstamped_pre_7_0"}:
+            failed.append(tid)
+            continue
         try:
-            write_task_result(drive_root, path.stem, STATUS_CANCEL_REQUESTED)
+            if refusal:
+                write_task_result(drive_root, tid, STATUS_CANCEL_REQUESTED)
+                admitted.append(tid)
+            intent = request_cancel(pathlib.Path(drive_root), tid,
+                reason="legacy cancel_requested latch migrated at boot", source="boot_migration")
+            if not intent.get("already_requested") and not intent.get("already_settled"):
+                migrated.append(tid)
         except Exception:
-            log.warning("cancel-latch schema admission failed for %s", path.name,
-                        exc_info=True)
-            continue
-        admitted.append(path.stem)
+            failed.append(tid)
+            log.warning("legacy cancel-latch migration failed for %s", tid, exc_info=True)
     if admitted:
-        try:
-            append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "task_result_cancel_latch_admitted",
-                "count": len(admitted),
-                "task_ids": admitted,
-                "reason": "unstamped_pre_7_0",
-            })
-        except Exception:
-            log.warning("failed to record the cancel-latch admission", exc_info=True)
-
-    migrated: List[str] = []
-    try:
-        latched = list_task_results(
-            pathlib.Path(drive_root), statuses=[STATUS_CANCEL_REQUESTED],
-        )
-    except Exception:
-        log.debug("legacy cancel-latch scan failed", exc_info=True)
-        return migrated
-    for row in latched:
-        tid = str(row.get("task_id") or row.get("id") or "")
-        if not tid:
-            continue
-        try:
-            intent = request_cancel(
-                pathlib.Path(drive_root), tid,
-                reason="legacy cancel_requested latch migrated at boot",
-                source="boot_migration",
-            )
-        except Exception:
-            log.debug("legacy cancel-latch migration failed for %s", tid, exc_info=True)
-            continue
-        if not intent.get("already_requested") and not intent.get("already_settled"):
-            migrated.append(tid)
+        append_jsonl(pathlib.Path(drive_root) / "logs/events.jsonl", {
+            "ts": utc_now_iso(), "type": "task_result_cancel_latch_admitted",
+            "count": len(admitted), "task_ids": admitted, "reason": "unstamped_pre_7_0"})
+    from ouroboros.obligations import add, members, remove
+    for tid in failed:
+        add(drive_root, "unknowns", f"task:{tid}",
+            {"task_id": tid, "reason": "cancel_latch_migration_failed"})
+    if migrated:  # a rerun (the explicit rebuild) that succeeds retires the gap it recorded
+        gaps = members(drive_root, "unknowns")
+        for tid in migrated:
+            if gaps.get(f"task:{tid}", {}).get("reason") == "cancel_latch_migration_failed":
+                remove(drive_root, "unknowns", f"task:{tid}")
     return migrated
 
 
-def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
-    """Typed public projection: ``{"cancel_state": "pending", ...}`` or ``{}``."""
-    intent = active_intent(drive_root, task_id)
+def cancel_state_fields(drive_root: Any, task_id: str, *, intents: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Typed public projection: ``{"cancel_state": "pending", ...}`` or ``{}``; ``intents`` is a
+    batch reader's one ``active_intents`` read (``task_reads``) instead of a read per task."""
+    if intents is None:
+        intent = active_intent(drive_root, task_id)
+    else:
+        row = intents.get(str(task_id))
+        intent = dict(row) if isinstance(row, dict) else None
     if intent is None:
         return {}
     fields: Dict[str, Any] = {"cancel_state": "pending"}
@@ -1378,7 +1374,7 @@ def cancel_state_fields(drive_root: Any, task_id: str) -> Dict[str, Any]:
     return fields
 
 
-def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bool:
+def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False, propagate_busy: bool = False) -> bool:
     """Both cancel-pending carriers in ONE predicate — fail-soft.
 
     The durable intent projection is the live authority; the legacy
@@ -1387,6 +1383,8 @@ def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bo
     both, or a task wedged in the old shape still accepts new owner messages
     while the supervisor is tearing it down.
     """
+    from ouroboros.store import StoreBusy
+
     try:
         if has_active_intent(drive_root, task_id, strict=strict):
             return True
@@ -1395,12 +1393,20 @@ def cancel_pending(drive_root: Any, task_id: str, *, strict: bool = False) -> bo
             raise
         log.debug("cancel-pending intent read failed for %s", task_id, exc_info=True)
     try:
-        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result
+        from ouroboros.task_results import STATUS_CANCEL_REQUESTED, load_task_result, validate_task_id
 
-        status = str(
-            (load_task_result(drive_root, task_id, strict=strict) or {}).get("status") or ""
-        )
+        if strict:
+            result = load_task_result(drive_root, task_id, strict=True) or {}
+        else:
+            from ouroboros.task_store import task_facts
+            tid = validate_task_id(task_id)
+            result = task_facts(drive_root, where="task_id=?", params=(tid,)).get(tid, {})
+        status = str(result.get("status") or "")
         return status == STATUS_CANCEL_REQUESTED
+    except StoreBusy:
+        if strict or propagate_busy:
+            raise
+        return False
     except Exception:
         if strict:
             raise

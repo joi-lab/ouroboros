@@ -387,8 +387,8 @@ _DONE = {"status": "completed", "conclusion": "success"}
 
 
 def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkeypatch):
-    """One push starts the code workflow, the browser lane and the provider
-    canaries. A finished canary run listed first is not "CI passed"."""
+    """A repository may run several push workflows, or none.
+    A finished canary run listed first is not "CI passed"."""
     note = _ci_note(monkeypatch, [
         {"name": "Provider canaries", **_DONE},
         {"name": "CI", "status": "in_progress", "conclusion": None},
@@ -402,7 +402,7 @@ def test_ci_note_names_every_push_workflow_and_none_stands_for_the_others(monkey
     note = _ci_note(monkeypatch, [{"name": "Provider canaries", **_DONE}, {"name": "CI", **_DONE}])
     assert note == ("\n\n✅ CI: registered push runs passed for this commit — "
                     "Provider canaries: success; CI: success.")
-    assert _ci_note(monkeypatch, []) == "\n\n⏳ CI: Run not yet registered — check GitHub Actions in ~30s."
+    assert _ci_note(monkeypatch, []) == "\n\nCI: No push workflow run is registered for this commit."
 
 
 def test_ci_note_attributes_a_failure_to_its_workflow(monkeypatch):

@@ -37,10 +37,7 @@ from ouroboros.subagent_runtime import (
     effective_runtime_subagent_settings,
     select_subagent_snapshot,
 )
-from ouroboros.subagents import (
-    LEGACY_SUBAGENT_FIELDS,
-    build_subagent_envelope,
-)
+from ouroboros.subagents import build_subagent_envelope
 from ouroboros.task_results import STATUS_REQUESTED, write_task_result
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE
 from ouroboros.tools.control_delegation import (
@@ -54,7 +51,6 @@ from ouroboros.tools.control_delegation import (
 )
 from ouroboros.tools.control_events import _SCHEDULE_EMIT_LOCK, _emit_control_event
 from ouroboros.tools.control_subagent_spec import (
-    RETIRED_SCHEDULE_PARAMS,
     _INTERNAL_SCHEDULE_OPTIONS,
     _validated_schedule_fields,
     schedule_subagent_param_names,
@@ -154,6 +150,8 @@ def _emit_swarm_fanout(
     }
     try:
         append_jsonl(ctx.drive_logs() / "events.jsonl", evt)
+        from ouroboros.swarm_rollup import load_swarm_rollup
+        load_swarm_rollup(ctx.drive_logs().parent, parent_task_id)
     except Exception:
         log.debug("Failed to emit swarm_fanout telemetry", exc_info=True)
 
@@ -331,7 +329,31 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
         f"Subagent request queued {task_ids[0]}: {objective} "
         f"(subagent_id={selected_name}, route={route_kind}, {commitment})"
         f"{worker_note}{slot_note}{profile_note}{coop_note}{legacy_note}{access_note}"
+        f"{_effort_request_note(configured, str(emission.get('requested_effort') or ''), getattr(ctx, 'task_metadata', None))}"
     )
+
+
+def _effort_request_note(configured: Dict[str, Any], requested: str, task_metadata: Any = None) -> str:
+    """What the parent can be told about its effort request BEFORE dispatch decides: the
+    request itself and, when the selected row is pinned or model-named, that outside Cyber
+    Pro the row's level stands (the dispatched level reaches the parent in the outcome)."""
+    if not requested:
+        return ""
+    from ouroboros.route_spec import RouteSpec, model_named_effort
+
+    route = configured.get("route") if isinstance(configured.get("route"), dict) else {}
+    named = model_named_effort(RouteSpec(str(route.get("kind") or "api_model"), str(route.get("target_id") or "")))
+    pin = str(configured.get("effort") or "")
+    if named:
+        return f"\neffort requested: {requested}; the row's model name carries {named}, which stands in every mode"
+    if not pin:
+        return f"\neffort requested: {requested} (decided at dispatch inside my human's range)"
+    from ouroboros.runtime_mode_policy import effort_range_binds
+
+    # The parent's effective mode (a consciousness-origin tree's cap included), as dispatch reads it.
+    if not effort_range_binds(task_metadata if isinstance(task_metadata, dict) else None):
+        return f"\neffort requested: {requested} (Cyber Pro: it outranks my human's pin {pin})"
+    return f"\neffort requested: {requested}; my human pinned the row at {pin}, which stands outside Cyber Pro"
 
 
 def _build_acting_constraint(
@@ -526,6 +548,8 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
     """Build a delegated child's task contract from a single spec mapping (extracted
     from _schedule_task to keep it under the method size gate; one dict param to stay
     within the parameter-count discipline; pure construction)."""
+    from ouroboros.main_context_authority import project_helper_predecessor_authority
+
     parent_contract = spec.get("parent_contract")
     input_source_fields = {}
     if isinstance(parent_contract, dict) and "input_sources" in parent_contract:
@@ -536,21 +560,12 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
             and input_source_fields.get("input_sources") != "declared"):
         raise ValueError("input_sources=shared cannot widen an inherited declared selection")
     if input_source_fields.get("input_sources") == "declared":
-        # Omit whole prior-case narrative carriers; keep the predecessor source
-        # that grants lineage reads. Input selection must not alter that access.
-        predecessor = (parent_contract or {}).get("predecessor_authority")
+        # Prior-case notes are not declared inputs; the predecessor is projected
+        # after the parent spread below, preserving its lineage read source.
         parent_contract = {
             key: value for key, value in (parent_contract or {}).items()
-            if key not in {"notes", "review_notes", "predecessor_authority"}
+            if key not in {"notes", "review_notes"}
         }
-        if isinstance(predecessor, dict) and predecessor:
-            reference_keys = {"source", "task_id", "authority_sha256", "authority_chars", "digest_semantics"}
-            reference = {key: value for key, value in predecessor.items() if key in reference_keys}
-            omitted = predecessor.get("omitted_fields")
-            reference["omitted_fields"] = sorted(set(
-                [str(key) for key in predecessor if key not in reference_keys | {"omitted_fields"}]
-                + (list(omitted) if isinstance(omitted, list) else [])))
-            parent_contract["predecessor_authority"] = reference
         input_source_fields["context"] = str(spec.get("context") or "")
     objective = spec.get("objective", "")
     expected_output = spec.get("expected_output", "")
@@ -603,6 +618,9 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # value silently wins back — which is exactly what used to happen to a
                 # requested child deadline whenever the parent carried one of its own.
                 "deadline_at": narrowed_deadline_at,
+                "predecessor_authority": project_helper_predecessor_authority(
+                    parent_contract.get("predecessor_authority"),
+                    declared=input_source_fields.get("input_sources") == "declared"),
                 "delegation_budget": delegation_budget,
                 "resource_policy": spec.get("resource_policy", parent_contract.get("resource_policy", {})),
                 "attachment_manifest": spec.get("attachment_manifest") or [],
@@ -658,6 +676,15 @@ def _child_workspace(ctx, metadata, params):
     """Bind the parent's observed source before selecting the child's start."""
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
+    from ouroboros import body_candidate
+    from ouroboros.workspace_copies import same_directory
+
+    own_body_copy = str(params.get("write_surface") or "").strip().lower() == "self_worktree"
+    if body_candidate.is_bound(ctx) and (not workspace_root or (own_body_copy and same_directory(
+            workspace_root, body_candidate.serving_repo_dir_for(ctx)))):
+        # The parent authors a body candidate: its child reads and copies THAT, and an
+        # acting child's patch therefore returns into it, never into the serving tree.
+        workspace_root, workspace_mode = str(body_candidate.descriptor(ctx)["path"]), "self_worktree"
     from ouroboros.tool_access_reads import admit_child_start_folder, capture_parent_workspace
     parent_workspace = capture_parent_workspace(ctx)
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
@@ -668,30 +695,55 @@ def _child_workspace(ctx, metadata, params):
             if not selected_path.is_absolute() and (not parent_workspace["root"]
                     or parent_workspace.get("availability") == "unavailable"):
                 raise ValueError("relative workspace_root needs an available parent folder; name an absolute readable folder")
-            workspace_root = admit_child_start_folder(ctx,
-                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path, params)
+            selected_path = selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path
+            if (own_body_copy and body_candidate.is_bound(ctx)
+                    and same_directory(selected_path, body_candidate.serving_repo_dir_for(ctx))):
+                selected_path = Path(body_candidate.descriptor(ctx)["path"])
+            workspace_root = admit_child_start_folder(ctx, selected_path, params)
             workspace_mode = "read_only"
         except (OSError, ValueError, RuntimeError) as exc:
             return workspace_root, workspace_mode, parent_workspace, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}"
     return workspace_root, workspace_mode, parent_workspace, ""
 
 
+def child_copies_serving_body(ctx, params) -> bool:
+    """Whether a self_worktree child scheduled now copies the serving checkout: this
+    selection names it, or names nothing and the supervisor copies the system repository.
+    The body-candidate seam asks before scheduling, so such a child copies the candidate.
+    A named selection is pinned to the checkout it resolved to here: binding moves the
+    parent folder a relative spelling (``../repo``) is read from, not the selected source."""
+    from ouroboros.body_candidate import serving_repo_dir_for
+    from ouroboros.workspace_copies import same_directory
+
+    metadata = getattr(ctx, "task_metadata", None)
+    source, _mode, _parent, error = _child_workspace(ctx, metadata if isinstance(metadata, dict) else {}, params)
+    copies = not error and (not source or same_directory(source, serving_repo_dir_for(ctx)))
+    if copies and str(params.get("workspace_root") or "").strip():
+        params["workspace_root"] = source
+    return copies
+
+
+_EXECUTION_SPENT = ("⚠️ TASK_LIFETIME_EXHAUSTED (schedule_subagent): this task's execution budget is spent; "
+                    "no child was scheduled. Finalize with what you have.")
+
+
+def _inherited_execution_allowance(ctx: ToolContext) -> Any:
+    """#939: a child of an explicitly bounded task gets the parent's remaining execution
+    allowance as its own budget (its queue wait excluded), never a fresh one."""
+    from ouroboros.model_wait import explicit_execution_window_remaining
+
+    return explicit_execution_window_remaining(ctx)
+
+
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
     allowed_params = schedule_subagent_param_names() | HIDDEN_LEGACY_SCHEDULE_PARAMS
-    retired = sorted(str(key) for key in params if key in RETIRED_SCHEDULE_PARAMS)
-    if retired:
-        return _publish_scheduling_refusal(
-            ctx, "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (schedule_subagent): " + " ".join(
-                f"{name} was withdrawn: {LEGACY_SUBAGENT_FIELDS[RETIRED_SCHEDULE_PARAMS[name]]}. "
-                "Drop it — the owner's configured effort applies, exactly as it did when "
-                f"{name} was omitted." for name in retired))
     unsupported = sorted(str(key) for key in params if key not in allowed_params)
     if unsupported:
         bad = ", ".join(unsupported)
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (schedule_subagent): unsupported argument(s): "
             f"{bad}. Use the strict schema: subagent_id, objective, expected_output, "
-            "optional role/context/constraints/memory_mode/workspace_root and (for mutative children) "
+            "optional role/context/constraints/memory_mode/workspace_root/effort and (for mutative children) "
             "write_surface/write_root/protected_paths_grant/external_tool_grants.")
     internal = dict(internal or {})
     if set(internal) - _INTERNAL_SCHEDULE_OPTIONS:
@@ -710,6 +762,9 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     memory_mode = fields["memory_mode"]
     may_mutate = fields["may_mutate"]
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    execution_left = _inherited_execution_allowance(ctx)
+    if execution_left is not None and execution_left <= 0:
+        return _publish_scheduling_refusal(ctx, "error", "TOOL_ERROR", _EXECUTION_SPENT, reason="task_lifetime_exhausted")
     try:
         configured_subagent, legacy_selection = select_subagent_snapshot(
             effective_runtime_subagent_settings(runtime_settings(settings_reader=_ctl().load_settings)),
@@ -741,17 +796,6 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         )
 
     current_task_id = str(getattr(ctx, "task_id", "") or "")
-    if getattr(ctx, 'is_direct_chat', False):
-        try:
-            append_jsonl(ctx.drive_logs() / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "schedule_task_from_direct_chat",
-                "task_id": current_task_id,
-                "description": objective[:200],
-                "warning": "schedule_subagent called from direct chat context — potential duplicate work",
-            })
-        except Exception:
-            pass
     parent_task_id = str(current_task_id or metadata.get("parent_task_id") or "").strip()
     root_task_id_seed = str(metadata.get("root_task_id") or current_task_id or "").strip()
     session_id = str(metadata.get("session_id") or "")
@@ -878,12 +922,16 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "requested_model_lane": requested_model_lane,
         "parent_model_lane": str(metadata.get("effective_model_lane") or ""),
         "requested_executor": requested_executor,
+        # The parent's effort REQUEST (``""`` = none); dispatch decides the level inside the
+        # owner's range and records the fact beside it (``SubagentDispatch.effort_fact``).
+        "requested_effort": fields["requested_effort"],
         "configured_subagent": configured_subagent,
         "parent_cognitive_route": parent_cognitive_route,
         **{key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields},
     }
     owner_origin = governing_words_for_schedule(ctx)  # the owner's words that caused this tree, by value
     child_facts = {
+        **({"execution_timeout_sec": execution_left} if execution_left is not None else {}),
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
@@ -944,7 +992,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     except Exception:
         log.warning("Failed to persist requested task status for %s", tid, exc_info=True)
         try:
-            (status_drive_root / "task_results" / f"{tid}.json").unlink(missing_ok=True)
+            from ouroboros.task_store import delete_document
+            delete_document(status_drive_root, tid)
         except Exception:
             pass
         if child_drive is not None:
@@ -964,6 +1013,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "configured_subagent": configured_subagent,
         "legacy_selection": legacy_selection,
         "requested_access": params.get("access"),
+        "requested_effort": fields["requested_effort"],
         # Host-minted shared coop tree only (a caller-supplied write_root is the
         # parent's own knowledge already).
         "coop_shared_tree": (

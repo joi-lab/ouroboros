@@ -1,19 +1,22 @@
-"""Which ports a panic stop sweeps, and in what order it hard-exits.
+"""Panic sweeps no port, and in what order it hard-exits.
 
-Characterization of the Emergency Stop contract that must survive any change to
-how ``server_control.execute_panic_stop`` learns the port the server bound: the
-sweep targets the ACTUALLY bound main port (a custom-port install must not
-panic-kill an unrelated listener on 8765), the host-service gets an independent
-sweep, and neither sweep's failure may prevent the hard exit.
+Characterization of the Emergency Stop contract: the main and Host Service
+listeners belong to the exiting server, so the hard exit closes them and no
+listener is killed by port — an unrelated process on a default or configured
+Ouroboros port survives. Owned work is requested first; persistence precedes
+the hard exit.
 
-Every destructive operation is neutralized here: no real process, port, daemon
-or interpreter teardown runs.
+Every destructive operation is neutralized here except the one under test: a
+real sentinel listener stands on the ports the old sweeps targeted.
 """
 
 from __future__ import annotations
 
-import copy
+import socket
+import subprocess
+import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -85,66 +88,39 @@ def _harness(monkeypatch, tmp_path, *, port_kill=None):
     monkeypatch.setattr(server_control.os, "_exit", exit_for_test)
     return events, lambda **kw: _record("kill_workers", kw)
 
-def _swept_ports(events: list) -> list:
-    return [value for name, value in (e for e in events if len(e) == 2) if name == "kill_process_on_port"]
+def _sentinel_listener():
+    """A foreign process listening on a free loopback port; the caller stops it."""
+    code = ("import socket, sys, time; s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(); "
+            "print(s.getsockname()[1], flush=True); time.sleep(120)")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+    return proc, int(proc.stdout.readline())
 
 
-def test_panic_through_the_server_sweeps_the_actually_bound_port(monkeypatch, tmp_path):
-    """A custom-port install must panic-kill ITS listener, never a stranger on 8765."""
+@pytest.mark.skipif(sys.platform == "win32", reason="the sentinel port probe uses POSIX lsof semantics")
+def test_panic_sweeps_no_port_and_a_foreign_listener_survives(monkeypatch, tmp_path):
+    """The removed sweeps targeted the bound main port and the Host Service port: a stranger
+    there survives Panic, and the real port primitive is never reached."""
     import server
+    from ouroboros import platform_layer
 
-    events, kill_workers = _harness(monkeypatch, tmp_path)
-    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
-
-    with pytest.raises(_ExitCalled) as exit_info:
-        server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
-
-    assert sorted(_swept_ports(events)) == [8767, 9123]
-    assert exit_info.value.args[0] == server.PANIC_EXIT_CODE
-
-
-def test_panic_with_no_known_bound_port_sweeps_the_default_install_port(monkeypatch, tmp_path):
-    """Nothing told this panic which port was bound, so the default install port
-    is the last resort — the panic never skips the sweep."""
-    from ouroboros import server_control
-
-    events, kill_workers = _harness(monkeypatch, tmp_path)
-
-    with pytest.raises(_ExitCalled):
-        server_control.execute_panic_stop(
-            consciousness=SimpleNamespace(stop=lambda: None),
-            kill_workers_fn=kill_workers,
-            data_dir=tmp_path,
-            panic_exit_code=120,
-            log=SimpleNamespace(critical=lambda *a, **k: None),
-        )
-
-    assert sorted(_swept_ports(events)) == [8765, 8767]
-
-
-def test_a_failing_main_port_sweep_is_disclosed_and_does_not_target_unrelated_default(
-    monkeypatch, tmp_path,
-):
-    """Failure retains the actual-port identity; host-service cleanup is independent."""
-    import server
-
-    def _boom(port):
-        if port == 9123:
-            raise OSError("port sweep failed")
-
-    events, kill_workers = _harness(monkeypatch, tmp_path, port_kill=_boom)
-    diagnostics = []
-    monkeypatch.setattr(server.log, "critical", lambda message, *args:
-                        diagnostics.append(copy.deepcopy(args)) if args and isinstance(args[0], dict) else None)
-    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
-
-    with pytest.raises(_ExitCalled):
-        server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
-
-    assert sorted(_swept_ports(events)) == [8767, 9123]
-    assert diagnostics[0][1]["main-port"] == {"requested": False, "error": "OSError: port sweep failed"}
+    sentinel, port = _sentinel_listener()
+    try:
+        # The recorder forwards to the REAL primitive: the old sweep would have killed the sentinel.
+        events, kill_workers = _harness(monkeypatch, tmp_path, port_kill=platform_layer.kill_process_on_port)
+        monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: port)
+        monkeypatch.setattr(server, "DEFAULT_PORT", port)
+        monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+        with pytest.raises(_ExitCalled) as exit_info:
+            server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
+        assert exit_info.value.args[0] == server.PANIC_EXIT_CODE
+        time.sleep(0.5)
+        assert sentinel.poll() is None, "Panic killed an unrelated listener by port"
+        with socket.create_connection(("127.0.0.1", port), timeout=2):
+            pass
+        assert not any(event[0] == "kill_process_on_port" for event in events)
+    finally:
+        sentinel.kill()
+        sentinel.wait(timeout=5)
 
 
 def test_requests_precede_settlement_and_persistence_before_hard_exit(monkeypatch, tmp_path):
@@ -154,7 +130,6 @@ def test_requests_precede_settlement_and_persistence_before_hard_exit(monkeypatc
 
     events, kill_workers = _harness(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
     child = SimpleNamespace(pid=12345, _ouroboros_stop_backstop=None)
     monkeypatch.setattr("multiprocessing.active_children", lambda: [child])
     monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
@@ -179,28 +154,6 @@ def test_requests_precede_settlement_and_persistence_before_hard_exit(monkeypatc
         "foreground_settlement", "services_settlement", "companions_settlement"}
     assert not any(name == "kill_workers" for name in names)
     assert (tmp_path / "state" / "panic_stop.flag").read_text(encoding="utf-8") == "panic"
-
-
-def test_the_server_passes_its_bound_port_instead_of_the_leaf_reaching_back(monkeypatch):
-    """Emergency Stop 2A: the composition root owns the bound-port fact and hands
-    it down as a keyword-only argument with a default, so the panic leaf never has
-    to reach back into the server module for it."""
-    import inspect
-
-    import server
-    from ouroboros import server_control
-
-    parameter = inspect.signature(server_control.execute_panic_stop).parameters["bound_port"]
-    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
-    assert parameter.default is None
-
-    captured: dict = {}
-    monkeypatch.setattr(server, "_execute_panic_stop_impl", lambda *a, **kw: captured.update(kw))
-    monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
-
-    server._execute_panic_stop(SimpleNamespace(stop=lambda: None), lambda **kw: None)
-
-    assert captured["bound_port"] == 9123
 
 
 def test_no_server_host_leaf_imports_the_composition_root():
@@ -242,11 +195,11 @@ def test_emergency_process_cleanup_stays_a_separate_path_from_panic(monkeypatch,
     monkeypatch.setattr("supervisor.workers.kill_workers", lambda **kw: worker_calls.append(kw))
     monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr("ouroboros.platform_layer.force_kill_pid", lambda *a, **k: None)
-    monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)
+    monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port",
+                        lambda _port: pytest.fail("the restart cleanup sweeps no port"))
     monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
-    monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: 8767)
 
     # Returns normally: no os._exit patch is needed, which is the whole point.
-    server._emergency_process_cleanup(port_sweep=False)
+    server._emergency_process_cleanup()
 
     assert worker_calls and worker_calls[0]["force"] is True

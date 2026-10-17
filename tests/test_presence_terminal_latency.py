@@ -1,5 +1,6 @@
 """Native Presence returns durable replies while existing synthesis retains custody."""
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -10,6 +11,7 @@ import pytest
 from ouroboros import agent as agent_module, agent_task_pipeline as pipeline, loop
 from ouroboros.model_wait import current_model_wait
 from ouroboros.presence_runner import PresenceTurnGate, run_presence_turn
+from ouroboros.settings_integrity import task_settings_snapshot
 from ouroboros.task_results import load_task_result
 from tests.test_presence_completion import _call
 from tests.test_presence_runner import _admission, _event
@@ -32,7 +34,8 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setattr(agent_module, "validate_task_authority_sources", lambda *_a: None)
     monkeypatch.setattr(agent_module.OuroborosAgent, "_start_task_heartbeat_loop", lambda *_a: None)
-    monkeypatch.setattr(agent_module.subagent_runtime, "apply_task_start_settings_or_disclose", lambda *_a: None)
+    monkeypatch.setattr(agent_module.subagent_runtime, "apply_task_start_settings_or_disclose",
+                        lambda *_a: task_settings_snapshot({}, os.environ))
     started, release = threading.Event(), threading.Event()
     stages, owners, agents = [], [], []
     threads_before = set(threading.enumerate())
@@ -40,14 +43,12 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
     def consolidate(*_a, **_kw):
         owners.append(current_model_wait())
         started.set()
-        assert release.wait(5), "test releases the existing synthesis worker"
+        assert release.wait(120), "test releases the existing synthesis worker"
         stages.append("consolidation")
 
     # The first paid late stage (scratchpad consolidation since the dialogue writer is retired).
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", consolidate)
     monkeypatch.setattr(pipeline, "_record_task_facts", lambda *_a, **_k: stages.append("facts"))
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *_a, **_k: stages.append("reflection"))
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *_a, **_k: stages.append("memory"))
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (_call(outcome, "Reply" if outcome == "message" else ""), 0.0))
 
     # Cold tool-catalog construction is setup, outside the completion-order barrier.
@@ -77,8 +78,11 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
     try:
         with ThreadPoolExecutor(max_workers=1) as requests:
             first_future = requests.submit(run_presence_turn, **kwargs)
-            assert started.wait(3)
-            first = first_future.result(timeout=2)
+            # Synthesis stays held until the test releases it: the first turn must answer
+            # within 10 s of synthesis starting, so a turn that waits on it fails; the other
+            # timeouts only bound a hung test (Windows needs over 3 s to reach `started`).
+            assert started.wait(30)
+            first = first_future.result(timeout=10)
             assert first.outcome == outcome
             assert first.text == ("Reply" if outcome == "message" else "")
             row = load_task_result(tmp_path, first.task_id)
@@ -93,14 +97,14 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
             # accept its next event even while prior memory work is in flight.
             second = requests.submit(run_presence_turn, **{**kwargs, "event": replace(
                 _event(), source_event_id="telegram:bot-1:43", text="Next",
-            )}).result(timeout=2)
+            )}).result(timeout=30)
             assert second.task_id != first.task_id and len(agents) == 2
             assert not release.is_set()
     finally:
         release.set()
         for thread in set(threading.enumerate()) - threads_before:
-            thread.join(timeout=5)
-    assert stages.count("facts") == stages.count("reflection") == 2
+            thread.join(timeout=30)
+    assert stages.count("facts") == stages.count("consolidation") == 2
     for task_id in (first.task_id, second.task_id):
         row = load_task_result(tmp_path, task_id)
         assert row["root_phase_checkpoint"]["post_task_synthesis"] == "completed"
@@ -119,7 +123,7 @@ def test_only_native_unsplit_presence_changes_post_task_wait(tmp_path, monkeypat
     task = {"id": "test", "type": "presence" if presence else "task", "_is_direct_chat": True,
             "_presence_turn": presence}
     env = SimpleNamespace(drive_root=tmp_path)
-    pipeline._dispatch_root_post_task(env, task, "Done", None, [], {}, {}, {}, tmp_path / "logs",
+    pipeline._dispatch_root_post_task(env, task, "Done", None, [], {}, {}, tmp_path / "logs",
         budget_drive_root="", split_drive=split, project_scoped=False, project_task=False,
         parent_env=env if split else None, parent_task=task if split else None)
     assert calls == [expected]

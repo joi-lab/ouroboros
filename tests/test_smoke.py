@@ -46,9 +46,11 @@ TOOL_MODULES = [
     "ouroboros.tools.control",
     "ouroboros.tools.browser",
     "ouroboros.tools.review",
-    "ouroboros.tools.claude_advisory_review",
+    "ouroboros.tools.preflight_review",
+    "ouroboros.tools.commit_gate",
+    "ouroboros.tools.review_change",
     "ouroboros.tools.recent_tasks",
-    "ouroboros.tools.scope_review",
+    "ouroboros.tools.review_brief_coupling",
     "ouroboros.tools.review_helpers",
     "ouroboros.tools.plan_review",
     "ouroboros.tools.git_rollback",
@@ -97,9 +99,11 @@ def test_tool_set_matches(registry):
 
 
 EXPECTED_TOOLS = [
+    "continue_in_background", "pause_task", "resume_task", "continue_task",
     "browse_page", "browser_action",
-    "preflight_review", "review_status",
-    "compact_context", "set_tool_timeout", "request_restart",
+    "preflight_review", "review_change", "review_status",
+    "compact_context", "set_tool_timeout", "request_restart", "prepare_self_change",
+    "inspect_harness", "maintain_harness",
     "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
     "configure_presence", "initiate_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
@@ -116,9 +120,9 @@ EXPECTED_TOOLS = [
     "delegate_message",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",
-    "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "escalate",
+    "send_photo", "send_video", "send_file", "send_links", "search_code", "query_code", "query_data", "escalate",
         "forward_to_worker",
-    "generate_evolution_stats",
+    "generate_image", "list_image_models", "recover_image", "generate_evolution_stats",
     "commit_reviewed", "vcs_commit_reviewed", "vcs_status", "vcs_diff",
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
@@ -129,8 +133,8 @@ EXPECTED_TOOLS = [
     "codebase_health", "knowledge_read", "knowledge_write", "knowledge_list",
     "chronicle_write", "memory_read", "memory_mark",
     "journal_read", "journal_write", "workpad_read", "workpad_write",
-    "promote_chat_to_task", "route_to_project", "list_projects", "steer_task",
-    "ensure_project_scope", "schedule_followup",
+    "start_task", "list_projects", "tell_task",
+    "move_to_project", "schedule_followup",
     "memory_map", "memory_update_registry",
     "plan_task", "recent_tasks", "live_roots", "update_focus",
     "task_acceptance_review", "finish_task", "verify_and_record", "web_search",
@@ -225,6 +229,7 @@ def test_frozen_registry_includes_packaged_tool_modules(monkeypatch):
         "memory_map",
         "memory_update_registry",
         "preflight_review",
+        "review_change",
         "review_status",
         "plan_task",
         "vcs_rollback",
@@ -339,7 +344,7 @@ def test_memory_persistence():
 
 def test_no_hardcoded_replies():
     """Principle 5 (LLM-First): no hardcoded reply strings in code.
-    
+
     Checks for suspicious patterns like:
     - reply = "Fixed string"
     - return "Sorry, I can't..."
@@ -501,7 +506,7 @@ def test_js_module_gate_buckets_and_grandfathering():
 
 def test_no_bare_except_pass():
     """No bare `except: pass` (not even except Exception: pass with just pass).
-    
+
     v4.9.0 hardened exceptions — but checks the STRICTEST form:
     bare except (no Exception class) followed by pass.
     """
@@ -633,8 +638,6 @@ class TestPrePushGate:
                 _os.environ.pop("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", None)
             else:
                 _os.environ["OUROBOROS_PREFLIGHT_TIMEOUT_SEC"] = prev
-
-
 
 
 def test_no_module_defines_the_same_top_level_name_twice():

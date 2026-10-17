@@ -34,7 +34,6 @@ from ouroboros.config import (
     REPO_DIR,
     RESTART_EXIT_CODE,
     SETTINGS_PATH,
-    SETTINGS_DEFAULTS,
     acquire_pid_lock,
     apply_settings_to_env as _apply_settings_to_env,
     load_settings,
@@ -47,19 +46,20 @@ from ouroboros.config import (
 from ouroboros.launcher_bootstrap import (
     BootstrapContext,
     bootstrap_repo as _bootstrap_repo,
-    check_git as _check_git,
+    check_git as _check_git, launcher_sources_changed, remember_loaded_checkout,
     install_deps as _install_deps_impl,
-    embedded_python_env,
-    update_external_host,
-    parse_launch_options,
+    embedded_python_env, update_external_host,
+    parse_launch_options, source_handoff_argv,
     automatic_launch_allowed,
     sync_existing_repo_from_bundle as _sync_existing_repo_from_bundle_impl,
 )
+from ouroboros.runtime_venv import PREPARATION_DEPS_TIMEOUT_SEC, RuntimeVenvRefused, mark_ready, prepare_runtime_venv
 from ouroboros.launcher_onboarding import (
     prepare_first_run_settings as _prepare_first_run_settings,
     present_first_run_onboarding as _present_first_run_onboarding,
+    setup_recovery_menu,
 )
-from ouroboros.launcher_background import (Background, activate_running_instance, background_env,
+from ouroboros.launcher_background import (Background, DesktopApi, activate_running_instance, background_env,
                                            request_tray_cleanup, stop_tray_before_exit)
 from ouroboros.launcher_server_reaper import (
     reap_same_install_strays as _reap_same_install_strays_impl,
@@ -87,7 +87,7 @@ from ouroboros.platform_layer import (
     kill_process_tree,
     merge_hidden_kwargs,
     open_path_external,
-    pid_is_alive,
+    pid_provably_gone,
     process_command,
     process_group_id,
     resume_process,
@@ -195,6 +195,7 @@ def _bootstrap_context() -> BootstrapContext:
         # Launcher is owner-process boundary; first-launch migration may set runtime mode.
         save_settings=lambda settings: save_settings(settings, allow_elevation=True),
         log=log,
+        **({"deps_timeout_sec": PREPARATION_DEPS_TIMEOUT_SEC} if _runtime_venv and not _runtime_venv.ready else {}),
     )
 
 
@@ -232,34 +233,41 @@ _external_host_update: Optional[pathlib.Path] = None
 _external_host_result: dict = {}
 _external_seed_bundle: Optional[pathlib.Path] = None
 _launch_argv: list[str] = []
+_launch_intent = "owner"
+_runtime_venv = None  # runtime_venv.RuntimeVenv selected by --runtime-venv
+_generation_port: Optional[int] = None  # the endpoint the current generation proved healthy
 
 
-def _server_process_identity_matches(record: dict) -> bool:
+def _recorded_server_identity(record: dict) -> str:
+    """``"ours"``, ``"foreign"`` (gone, reused, another process) or ``"unknown"`` (unmeasurable, so no
+    signal and no retirement). A measured fingerprint decides alone; older records keep their path/group/command proof."""
     try:
         pid = int(record.get("pid") or 0)
     except (TypeError, ValueError):
-        return False
-    if pid <= 0 or pid == os.getpid() or not pid_is_alive(pid):
-        return False
+        return "foreign"
+    if pid <= 0 or pid == os.getpid() or pid_provably_gone(pid):
+        return "foreign"
+    if isinstance(record.get("fingerprint"), dict):
+        from ouroboros.process_custody import process_fingerprint_matches
+
+        if process_fingerprint_matches(record, require_measured=True):
+            return "ours"
+        return "unknown" if process_fingerprint_matches(record) else "foreign"
     expected_server = str((REPO_DIR / "server.py").resolve())
     expected_repo = str(REPO_DIR.resolve())
-    record_server = str(record.get("server_path") or "")
-    record_repo = str(record.get("repo_dir") or "")
-    if record_server and record_server != expected_server:
-        return False
-    if record_repo and record_repo != expected_repo:
-        return False
-    live_pgid = process_group_id(pid)
+    if record.get("server_path") not in (None, "", expected_server) or record.get("repo_dir") not in (None, "", expected_repo):
+        return "foreign"
     try:
         recorded_pgid = int(record.get("pgid") or 0)
     except (TypeError, ValueError):
         recorded_pgid = 0
-    if not IS_WINDOWS and (recorded_pgid <= 0 or live_pgid <= 0 or recorded_pgid != live_pgid):
-        return False
+    live_pgid = process_group_id(pid)
+    if not IS_WINDOWS and (recorded_pgid <= 0 or live_pgid != recorded_pgid):
+        return "unknown" if recorded_pgid > 0 and live_pgid <= 0 else "foreign"
     command = process_command(pid)
     if not command:
-        return False
-    return expected_server in command or ("server.py" in command and expected_repo in command)
+        return "unknown"
+    return "ours" if expected_server in command or ("server.py" in command and expected_repo in command) else "foreign"
 
 
 def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py: pathlib.Path,
@@ -276,6 +284,9 @@ def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py
             "argv": [str(EMBEDDED_PYTHON), str(server_py.resolve())],
             "created_at": utc_now_iso(),
         }
+        from ouroboros.process_custody import process_fingerprint
+
+        record["fingerprint"] = process_fingerprint(proc.pid, record["argv"])  # the identity cleanup proves
         atomic_write_json(_server_process_record_path(), record, trailing_newline=True)
     except Exception:
         log.warning("Failed to write server process record", exc_info=True)
@@ -308,69 +319,93 @@ def _retained_shared_daemon_pids() -> set[int]:
     )
 
 
-def _cleanup_recorded_server_process(reason: str = "preflight") -> None:
+def _confirm_gone(pid: int, timeout: float = 5.0) -> bool:
+    from ouroboros.process_containment import pid_is_zombie
+
+    deadline = time.monotonic() + timeout
+    while not (pid_provably_gone(pid) or pid_is_zombie(pid)):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def _cleanup_recorded_server_process(reason: str = "preflight") -> list[int]:
+    """Stop the generation recorded in server_process.json; return the PIDs still unresolved.
+
+    Only a positively identified server is signalled, and its record retires only after
+    confirmed death or a refuted identity. An unmeasurable identity or an unconfirmed
+    stop keeps the record and is returned, so no next generation starts beside it."""
+    record_path = _server_process_record_path()
     try:
-        record_path = _server_process_record_path()
-        if not record_path.exists():
-            return
         record = json.loads(record_path.read_text(encoding="utf-8"))
-        if not isinstance(record, dict):
-            record_path.unlink(missing_ok=True)
-            return
-        if not _server_process_identity_matches(record):
-            log.info("Ignoring stale server process record with non-matching identity (%s)", reason)
-            record_path.unlink(missing_ok=True)
-            return
-        pid = int(record.get("pid") or 0)
-        pgid = int(record.get("pgid") or 0)
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError):
+        record = None
+    if not isinstance(record, dict):
+        record_path.unlink(missing_ok=True)  # no identity to act on or to keep
+        return []
+    identity, pid = _recorded_server_identity(record), int(record.get("pid") or 0)
+    if identity == "foreign":
+        log.info("Retiring the server process record pid=%d: gone or another process (%s)", pid, reason)
+        record_path.unlink(missing_ok=True)
+        return []
+    if identity == "unknown":
+        log.warning("Recorded server pid=%d cannot be verified (%s): no signal, record retained", pid, reason)
+        return [pid]
+    pgid = int(record.get("pgid") or 0)
+    log.info("Stopping recorded server process pid=%d pgid=%d (%s)", pid, pgid, reason)
+    try:
         retained = _retained_shared_daemon_pids()
-        log.info("Cleaning recorded server process pid=%d pgid=%d (%s)", pid, pgid, reason)
         if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
             terminate_process_group_id(pgid, exclude_pids=retained)
             time.sleep(0.5)
             kill_process_group_id(pgid, exclude_pids=retained)
-        if pid_is_alive(pid):
-            kill_pid_tree(pid, exclude_pids=retained)
-        record_path.unlink(missing_ok=True)
+        kill_pid_tree(pid, exclude_pids=retained)
     except Exception:
-        log.warning("Failed to clean recorded server process (%s)", reason, exc_info=True)
+        log.warning("Shared daemon custody unavailable; stopping only the recorded server (%s)", reason, exc_info=True)
+        force_kill_pid(pid)
+    if not _confirm_gone(pid):
+        log.error("Recorded server pid=%d survived its stop (%s); record retained", pid, reason)
+        return [pid]
+    record_path.unlink(missing_ok=True)
+    return []
 
 
-def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit") -> None:
+def _cleanup_recorded_server_group_for_pid(pid: int, reason: str = "agent_exit") -> bool:
+    """Retire the record of a captured child this launcher has already reaped (both callers wait first).
+
+    Nothing is signalled: once the root is reaped, its PID and group id are names a later process may
+    hold, so a group that still has members is reported, never killed. Workers end through their parent
+    lifeline, ledgered children through the next generation's custody sweep."""
     try:
         record_path = _server_process_record_path()
         if not record_path.exists():
-            return
+            return True
         record = json.loads(record_path.read_text(encoding="utf-8"))
         if not isinstance(record, dict) or int(record.get("pid") or 0) != int(pid):
-            return
+            return True
         pgid = int(record.get("pgid") or 0)
-        retained = _retained_shared_daemon_pids()
-        live_pgid = process_group_id(int(pid)) if pid_is_alive(int(pid)) else 0
-        if not IS_WINDOWS and live_pgid > 0 and pgid > 0 and pgid != live_pgid:
-            log.info(
-                "Ignoring mismatched recorded server pgid=%d for live pid=%d pgid=%d (%s)",
-                pgid,
-                pid,
-                live_pgid,
-                reason,
-            )
-            pgid = 0
-        if not IS_WINDOWS and pgid > 0 and pgid != current_process_group_id():
-            log.info("Cleaning server process group pgid=%d after pid=%d exit (%s)", pgid, pid, reason)
-            terminate_process_group_id(pgid, exclude_pids=retained)
-            time.sleep(0.2)
-            kill_process_group_id(pgid, exclude_pids=retained)
-        if pid_is_alive(int(pid)):
-            kill_pid_tree(int(pid), exclude_pids=retained)
+        if not IS_WINDOWS and pgid > 0:
+            from ouroboros.process_containment import process_group_has_live_members
+
+            if process_group_has_live_members(pgid):
+                log.warning("Server pid=%d exited while its former process group %d still has members; "
+                            "not signalled after the reap (%s)", pid, pgid, reason)
         record_path.unlink(missing_ok=True)
     except Exception:
-        log.warning("Failed to clean recorded server process group (%s)", reason, exc_info=True)
+        log.warning("Failed to retire the recorded server process (%s)", reason, exc_info=True)
+        return False
+    return True
 
 
 def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     """Start server.py as the managed agent subprocess."""
     global _agent_proc, _agent_job
+    # Stdlib-only, so it loads even when the server's own imports are broken; imported
+    # before the spawn, because an undrained pipe would block the server.
+    from ouroboros.process_logging import copy_capped_output
 
     settings = _load_settings()
     _apply_settings_to_env(settings)
@@ -392,6 +427,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
     env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
+    env["OUROBOROS_LAUNCH_INTENT"] = _launch_intent  # this launcher's parsed intent, never an inherited one
     # Launcher-owned presentation is re-stamped for every generation; other hosts default
     # to web. After a killed launcher it can remain stale until the next owned reap.
     # Env-only: a SETTINGS_DEFAULTS entry would pop an injected value when absent on disk.
@@ -412,15 +448,15 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     server_py = REPO_DIR / "server.py"
     log.info("Starting agent: %s %s (port=%d)", EMBEDDED_PYTHON, server_py, port)
 
+    env["OUROBOROS_LAUNCHER_STOP_STDIN"] = "1"  # every platform: quit stops, EOF (launcher gone) too
     popen_kwargs: dict = {
         "cwd": str(REPO_DIR),
         "env": env,
+        "stdin": subprocess.PIPE,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.STDOUT,
     }
     if IS_WINDOWS:
-        env["OUROBOROS_LAUNCHER_STOP_STDIN"] = "1"
-        popen_kwargs["stdin"] = subprocess.PIPE
         popen_kwargs["creationflags"] = (
             popen_kwargs.get("creationflags", 0)
             | _CREATE_NEW_PROCESS_GROUP
@@ -460,83 +496,42 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
         log.info("Agent pid %d assigned to Windows Job Object", proc.pid)
 
     _write_server_process_record(proc, port=port, server_py=server_py, server_host_source=host_source)
-
-    def _stream_output() -> None:
-        # Match server.log rotation; rotation failure leaves streaming alive.
-        max_bytes = 2 * 1024 * 1024
-        backups = 3
-
-        def _rotate(log_path: pathlib.Path) -> None:
-            try:
-                for index in range(backups - 1, 0, -1):
-                    older = log_path.with_name(f"{log_path.name}.{index}")
-                    if older.exists():
-                        os.replace(older, log_path.with_name(f"{log_path.name}.{index + 1}"))
-                if log_path.exists():
-                    os.replace(log_path, log_path.with_name(f"{log_path.name}.1"))
-            except OSError:
-                pass
-
-        log_path = DATA_DIR / "logs" / "agent_stdout.log"
-        try:
-            written = log_path.stat().st_size if log_path.exists() else 0
-        except OSError:
-            written = 0
-        handle = None
-        try:
-            handle = open(log_path, "a", encoding="utf-8")
-            for line in iter(proc.stdout.readline, b""):
-                decoded = line.decode("utf-8", errors="replace")
-                if written + len(decoded) > max_bytes:
-                    handle.close()
-                    handle = None
-                    _rotate(log_path)
-                    handle = open(log_path, "a", encoding="utf-8")
-                    written = 0
-                handle.write(decoded)
-                handle.flush()
-                written += len(decoded)
-        except Exception:
-            pass
-        finally:
-            if handle is not None:
-                try:
-                    handle.close()
-                except Exception:
-                    pass
-
-    threading.Thread(target=_stream_output, daemon=True).start()
+    # The server blocks once its output pipe fills, so the copy drains until the pipe ends.
+    threading.Thread(target=copy_capped_output, args=(proc.stdout, DATA_DIR / "logs" / "agent_stdout.log"),
+                     kwargs={"report": log}, name="agent-output-copy", daemon=True).start()
     return proc
 
 
-def stop_agent() -> None:
-    """Gracefully stop the agent process."""
+def stop_agent() -> bool:
+    """Ordinarily stop the captured server; True once its exit is confirmed. An unconfirmed stop keeps
+    the Popen, Job and record, so no next generation starts beside a server that may still be live."""
     global _agent_proc, _agent_job
     with _agent_lock:
-        if _agent_proc is None:
-            return
-        proc = _agent_proc
-        job = _agent_job
-        _agent_proc = None
-        _agent_job = None
+        proc, job = _agent_proc, _agent_job
+    if proc is None:
+        return True
 
     log.info("Stopping agent (pid=%s)...", proc.pid)
+    confirmed = False
     try:
-        # Windows terminate is forced: its owned stdin asks the server to drain first.
-        if IS_WINDOWS and proc.stdin is not None:
+        stdin = getattr(proc, "stdin", None)
+        if stdin is not None:  # the owned pipe asks the server to drain first; Windows terminate is forced
             try:
-                proc.stdin.write(b"quit\n")
-                proc.stdin.flush()
-            except (BrokenPipeError, OSError):
+                stdin.write(b"quit\n")
+                stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
                 log.warning("Launcher stop pipe unavailable; retaining the exit wait and fallback")
+                if not IS_WINDOWS:
+                    proc.terminate()
             finally:
                 try:
-                    proc.stdin.close()
-                except OSError:
+                    stdin.close()
+                except (OSError, ValueError):
                     pass  # A failed pipe must still reach the wait/forced cleanup.
         else:
             proc.terminate()
         proc.wait(timeout=LAUNCHER_STOP_GRACE_SEC)
+        confirmed = True
     except subprocess.TimeoutExpired:
         if IS_WINDOWS and job is not None:
             terminate_job(job)
@@ -548,70 +543,39 @@ def stop_agent() -> None:
                 proc.kill()
         try:
             proc.wait(timeout=5)
+            confirmed = True
         except subprocess.TimeoutExpired:
-            log.warning("Agent process did not exit after forced stop (pid=%s)", proc.pid)
+            pass
     except Exception:
-        pass
+        log.warning("Ordinary agent stop failed", exc_info=True)
+    if not (confirmed or (callable(getattr(proc, "poll", None)) and proc.poll() is not None)):
+        log.error("Agent pid=%s did not confirm its exit; its handle and record stay for the next stop", proc.pid)
+        return False
+    with _agent_lock:
+        if _agent_proc is proc:
+            _agent_proc = None
+        owned_job = job if job is not None and _agent_job is job else None
+        if owned_job is not None:
+            _agent_job = None
+    if IS_WINDOWS and owned_job is not None:
+        close_job(owned_job)
+    return _cleanup_recorded_server_group_for_pid(proc.pid, "stop_agent")
 
-    if IS_WINDOWS and job is not None:
-        close_job(job)
-    _cleanup_recorded_server_group_for_pid(proc.pid, "stop_agent")
 
-
-def _read_port_file() -> int:
+def _read_port_file(default: Optional[int] = AGENT_SERVER_PORT) -> Optional[int]:
     """Read the active server port from PORT_FILE."""
     try:
         if PORT_FILE.exists():
             return int(PORT_FILE.read_text(encoding="utf-8").strip())
     except (ValueError, OSError):
         pass
-    return AGENT_SERVER_PORT
+    return default
 
 
-def _kill_stale_on_port(port: int) -> None:
-    """Kill any process listening on a runtime port."""
-    if IS_WINDOWS:
-        kill_process_on_port(port)
-        return
-    try:
-        # -sTCP:LISTEN keeps this a listener sweep: a bare tcp:PORT selector
-        # also matches ESTABLISHED client sockets, and in browser mode the
-        # owner's own browser holds one — sweeping it violates the invariant
-        # documented on _open_browser_detached (the browser is the owner's
-        # application, outside custody). -nP avoids resolver stalls.
-        result = subprocess.run(
-            ["lsof", "-nP", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        pids = result.stdout.strip().split()
-        for pid_str in pids:
-            try:
-                pid = int(pid_str)
-                if pid != os.getpid():
-                    force_kill_pid(pid)
-            except (TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
-                pass
-    except Exception:
-        kill_process_on_port(port)
-
-
-def _host_service_port() -> int:
-    default_port = int(SETTINGS_DEFAULTS.get("OUROBOROS_HOST_SERVICE_PORT", 8767))
-    try:
-        raw_port = os.environ.get("OUROBOROS_HOST_SERVICE_PORT")
-        if not str(raw_port or "").strip():
-            raw_port = _load_settings().get("OUROBOROS_HOST_SERVICE_PORT", default_port)
-        return int(raw_port)
-    except (TypeError, ValueError, OSError):
-        return default_port
-
-
-def _kill_stale_runtime_ports(port: int) -> None:
-    """Clear core runtime listener ports before start/restart."""
-    _kill_stale_on_port(port)
-    _kill_stale_on_port(_host_service_port())
+def _requested_server_port() -> int:
+    """``OUROBOROS_SERVER_PORT`` as requested, else the historical default; the server keeps its fallback."""
+    raw = str(os.environ.get("OUROBOROS_SERVER_PORT") or "").strip()
+    return int(raw) if raw else AGENT_SERVER_PORT
 
 
 def _reap_same_install_strays(reason: str) -> list[int]:
@@ -632,29 +596,60 @@ def _reap_same_install_strays(reason: str) -> list[int]:
         return []
 
 
-def _pre_generation_cleanup(port: int) -> list[int]:
-    """Clear the previous generation before starting a new one; returns proven stray survivors.
+def _pre_generation_cleanup() -> list[int]:
+    """Resolve the previous generation before starting a new one; returns PIDs still unresolved.
 
     Per GENERATION, not once per launcher: exit-42 and crash restarts are where the observed
-    double-boot collisions began. Ordered recorded-cleanup -> stray sweep -> port sweep: the
-    recorded pid keeps its record-driven path with the record unlinked first, the tree kill runs
-    while PPID links are still live, and the port sweep stays the residual net."""
-    _cleanup_recorded_server_process("startup")
-    survivors = _reap_same_install_strays("startup")
-    _kill_stale_runtime_ports(port)
-    return survivors
+    double-boot collisions began. Recorded cleanup first, then the stray sweep while PPID links
+    are still live. No port sweep: a listener proves no ownership, and the data-root admission
+    lock refuses a second updated server whatever port it would take."""
+    unresolved = _cleanup_recorded_server_process("startup")
+    return unresolved + [pid for pid in _reap_same_install_strays("startup") if pid not in unresolved]
 
 
-def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool:
+def _clear_port_file() -> bool:
+    """Remove the previous generation's port publication; True only once it is confirmed gone."""
+    try:
+        PORT_FILE.unlink(missing_ok=True)
+    except OSError:
+        log.warning("Could not remove %s; only this generation's binding can prove readiness", PORT_FILE)
+    return not PORT_FILE.exists()
+
+
+def _await_generation_endpoint(proc, *, port_file_cleared: bool, timeout: float, abort_event=None) -> Optional[int]:
+    """The port THIS child published, or None when it exited, stopped or never published. The main
+    binding counts only with the child's PID and measured birth identity (a stale row of an earlier
+    server that held the same PID fails); the plain port file only after its pre-start removal was confirmed."""
+    from ouroboros.server_process import read_service_bindings, service_binding_is_live
+
+    deadline = time.time() + timeout
+    while time.time() < deadline and not (abort_event is not None and abort_event.is_set()):
+        if proc.poll() is not None:
+            return None
+        try:
+            binding = read_service_bindings(DATA_DIR).get("main")
+            if isinstance(binding, dict) and binding.get("pid") == proc.pid and service_binding_is_live(binding):
+                return int(binding["port"])
+        except (OSError, ValueError, TypeError):
+            pass  # an informational snapshot; the confirmed-fresh port file remains
+        if port_file_cleared and (published := _read_port_file(default=None)):
+            return published
+        time.sleep(0.25)
+    return None
+
+
+def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None, proc=None) -> bool:
     """Wait for the agent HTTP server to respond.
 
     ``abort_event`` (headless mode) lets a shutdown signal cut the wait short:
     the handlers only set the event, so without this check a SIGTERM during
-    startup would still sit out the full readiness timeout."""
+    startup would still sit out the full readiness timeout. ``proc``'s exit ends it too."""
     url = f"http://127.0.0.1:{port}/api/health"
     deadline = time.time() + timeout
     while time.time() < deadline:
         if abort_event is not None and abort_event.is_set():
+            return False
+        if proc is not None and proc.poll() is not None:
             return False
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
@@ -666,35 +661,17 @@ def _wait_for_server(port: int, timeout: float = 30.0, abort_event=None) -> bool
     return False
 
 
-def _poll_port_file(timeout: float = 30.0, abort_event=None) -> int:
-    """Poll until the port file is freshly written."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if abort_event is not None and abort_event.is_set():
-            break
-        try:
-            if PORT_FILE.exists():
-                age = time.time() - PORT_FILE.stat().st_mtime
-                if age < 10:
-                    return int(PORT_FILE.read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            pass
-        time.sleep(0.5)
-    return _read_port_file()
-
-
-def _kill_orphaned_children(port: int, reason: str = "window_close") -> None:
-    """Final safety net: kill processes still on runtime ports.
+def _kill_orphaned_children(reason: str = "window_close") -> None:
+    """Final safety net: the recorded server, companions and multiprocessing children.
 
     Module-level so both the window-close handler (_on_closing, main thread) and
     the panic-stop branch (agent_lifecycle_loop, supervisor thread) tear down the
     exact same way. ``reason`` names the actual trigger, journalled HERE because
-    stop_agent() usually consumed the recorded-process row already.
+    stop_agent() usually consumed the recorded-process row already. No port is swept: the main and
+    Host Service listeners end with their server; companion PIDs/ports stay the disclosed exception.
     """
     log.info("Tearing down runtime orphans (%s)", reason)
     _cleanup_recorded_server_process(reason)
-    _kill_stale_runtime_ports(port)
-    _kill_stale_on_port(8766)
     try:
         companions = json.loads((DATA_DIR / "state" / "extension_companions.json").read_text(encoding="utf-8"))
         if isinstance(companions, dict):
@@ -725,38 +702,44 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
     global _agent_proc, _agent_job, _external_host_result
     crash_times: list[float] = []
 
+    global _generation_port
     while not _shutdown_event.is_set():
-        survivors = _pre_generation_cleanup(port)
-        if survivors:
-            # Starting now would put a second generation on the same data directory — the exact
-            # collision this sweep exists to prevent. The next iteration re-sweeps.
-            log.error(
-                "Not starting the agent: same-install server process(es) %s are proven "
-                "launcher-managed strays but survived every kill pass. Retrying in 3s.",
-                survivors,
-            )
+        unresolved = _pre_generation_cleanup()
+        if unresolved:
+            # Starting now could put a second generation on the same data directory: a known
+            # predecessor is unconfirmed or unverifiable. The next iteration tries again.
+            log.error("Not starting the agent: previous server process(es) %s are not confirmed "
+                      "stopped. Retrying in 3s.", unresolved)
             time.sleep(3)
             continue
-
-        try:
-            PORT_FILE.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if not automatic_launch_allowed(_launch_intent, DATA_DIR, log):
+            # Panic landed after main()'s check (a long bootstrap, a restart): stay stopped.
+            _shutdown_event.set()
+            break
+        port_file_cleared = _clear_port_file()
 
         _external_host_result = update_external_host(_external_host_update, EMBEDDED_PYTHON, log, _shutdown_event)
         if _shutdown_event.is_set():
             break  # Native preparation has reaped its owned processes before returning.
+        remember_loaded_checkout(REPO_DIR)  # the commit this launcher's own modules came from
         proc = start_agent(port)
         if _shutdown_event.is_set():
             stop_agent()
             break
 
-        actual_port = _poll_port_file(timeout=30, abort_event=_shutdown_event)
-        _update_server_process_record_port(proc.pid, actual_port)
-        if not _wait_for_server(actual_port, timeout=45, abort_event=_shutdown_event):
-            log.warning("Agent server did not become responsive within 45s (port %d)", actual_port)
+        actual_port = _await_generation_endpoint(proc, port_file_cleared=port_file_cleared, timeout=45,
+                                                  abort_event=_shutdown_event)
+        if actual_port is None:
+            log.warning("Agent server published no endpoint of its own within 45s")
+        else:
+            _update_server_process_record_port(proc.pid, actual_port)
+            if _wait_for_server(actual_port, timeout=45, abort_event=_shutdown_event, proc=proc):
+                _generation_port = actual_port
+            else:
+                log.warning("Agent server did not become responsive within 45s (port %d)", actual_port)
 
         proc.wait()
+        _generation_port = None
         exit_code = proc.returncode
         log.info("Agent exited with code %d", exit_code)
         if exit_code == RESTART_EXIT_CODE:
@@ -789,7 +772,17 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             # supervisor thread cannot end the main-thread Cocoa webview loop on
             # macOS (it leaves a black frozen window), so exit with parity to the
             # window-close path: kill orphans, release the pid lock, os._exit(0).
-            _kill_orphaned_children(port, reason="panic_stop")
+            try:  # the server's census may not have finished before its hard exit: finish it by identity, bounded
+                from ouroboros.process_scope import complete_pending_panic_sweep
+
+                completion = threading.Thread(
+                    target=complete_pending_panic_sweep, args=(DATA_DIR,),
+                    kwargs={"exclude": {os.getpid(), os.getppid(), 1}, "installation": True}, name="panic-scope-completion", daemon=True)
+                completion.start()
+                completion.join(timeout=3.0)  # later starts retry saved identities only; the exit never waits longer
+            except Exception:
+                log.warning("Pending Panic scope sweep failed; later starts retry saved identities only", exc_info=True)
+            _kill_orphaned_children(reason="panic_stop")
             stop_tray_before_exit(release_pid_lock, wait=0)
             os._exit(0)
 
@@ -801,18 +794,13 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             # restart. No dependency sync — nothing about the checkout changed.
             _agent_restart_requested.clear()
             log.info("Restarting the agent to adopt the saved first-run configuration.")
-            # No port sweep here: _pre_generation_cleanup at the top of the
-            # next iteration runs it as its third phase.
             continue
 
         if exit_code == RESTART_EXIT_CODE:
             log.info("Agent requested restart (exit code 42). Restarting...")
             _sync_existing_repo_from_bundle()
             if not _install_deps():
-                # An evolved checkout may have added requirements its reviewed
-                # commit depends on. Pause visibly and retry once — pip failures
-                # are often transient (index/network) — instead of restarting as
-                # if nothing happened.
+                # Retry dependency sync once before letting imports fail under the crash fuse.
                 log.error(
                     "Dependency install failed after the restart request; "
                     "retrying once in %ds.", _DEPS_RETRY_DELAY_SEC,
@@ -826,10 +814,13 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
                         "import them — see the pip output above for the cause.",
                         MAX_CRASH_RESTARTS, CRASH_WINDOW_SEC,
                     )
-            if _external_seed_bundle is not None:
+            if _external_seed_bundle is not None or launcher_sources_changed(REPO_DIR, bundle_dir=_bundle_dir()):
+                # The interpreter (a --runtime-venv included) carries over; consumed options do not.
+                argv = source_handoff_argv(_launch_argv)
+                if getattr(sys, "frozen", False):
+                    argv += ["--seed-bundle", str(_bundle_dir())]
                 release_pid_lock()
-                os.execv(EMBEDDED_PYTHON, [EMBEDDED_PYTHON, str(REPO_DIR / "launcher.py"), *_launch_argv])
-            # No port sweep here: _pre_generation_cleanup owns it next iteration.
+                os.execv(EMBEDDED_PYTHON, [EMBEDDED_PYTHON, str(REPO_DIR / "launcher.py"), *argv])
             continue
 
         now = time.time()
@@ -840,7 +831,6 @@ def agent_lifecycle_loop(port: int = AGENT_SERVER_PORT) -> None:
             break
 
         log.info("Agent crashed. Restarting in 3s...")
-        # No port sweep here: _pre_generation_cleanup owns it next iteration.
         time.sleep(3)
 
 def _request_agent_restart() -> None:
@@ -848,6 +838,7 @@ def _request_agent_restart() -> None:
 
     The lifecycle loop owns the restart; this flags intent and stops the child.
     """
+    global _generation_port
     with _agent_lock:
         agent_alive = _agent_proc is not None
     if not agent_alive:
@@ -856,15 +847,15 @@ def _request_agent_restart() -> None:
         log.info("No managed agent to recycle; the next start reads the saved settings.")
         return
     _agent_restart_requested.set()
+    _generation_port = None  # the next generation proves its own endpoint
     stop_agent()
 
 
 def _await_server_ready(port: int, abort_event=None, lifecycle_thread=None) -> tuple[bool, int]:
-    """Wait for managed-server health; resolve the AUTHORITATIVE bound port.
+    """Wait until the lifecycle thread proves the current generation healthy; its port.
 
-    The server may rebind on conflict and publish the real port in
-    ``data/state/server_port``; every later consumer (UI URL, onboarding window,
-    teardown sweep) must use that value, not the requested one.
+    The server may rebind on conflict; every later consumer (UI URL, onboarding window)
+    uses the endpoint that generation published, never the requested port or a stale file.
     """
     if _external_host_update is not None and lifecycle_thread is not None:
         # Native preparation has its own bounded operation before server.py exists.
@@ -876,30 +867,33 @@ def _await_server_ready(port: int, abort_event=None, lifecycle_thread=None) -> t
                     break
             lifecycle_thread.join(timeout=0.1)
         else:
-            return False, _read_port_file()
-    ready = _wait_for_server(port, timeout=15, abort_event=abort_event)
-    actual_port = _read_port_file()
-    if actual_port != port:
-        ready = _wait_for_server(actual_port, timeout=45, abort_event=abort_event)
-    else:
-        ready = ready or _wait_for_server(port, timeout=45, abort_event=abort_event)
-    return ready, actual_port
+            return False, port
+    deadline = time.time() + 60
+    while time.time() < deadline and not (abort_event is not None and abort_event.is_set()):
+        if _generation_port:
+            return True, _generation_port
+        if lifecycle_thread is not None and not lifecycle_thread.is_alive():
+            break
+        time.sleep(0.1)
+    return False, _generation_port or port
 
 
 def _load_settings() -> dict:
     return load_settings()
 
 
-def _save_settings(settings: dict) -> None:
+def _save_settings(changes: dict) -> None:
     # The desktop launcher is the owner-controlled writer.  The generic
     # config.save_settings ratchet deliberately makes allow_elevation inert
     # after boot, which is correct for agent-reachable callers but also made a
     # confirmed Cyber Pro selection fall back to Advanced.  Reuse the existing
     # owner writer so the confirmation is honored while its document lock,
     # persistence normalization and other owner-only checks remain in force.
-    from ouroboros.gateway.owner_settings import _owner_write_settings
+    # Only ``changes`` land, on the document as it is under that lock: a merged
+    # read's defaults, environment values and proposals are no choice.
+    from ouroboros.gateway.owner_settings import _owner_update_settings, fields_on_saved_document
 
-    _owner_write_settings(settings)
+    _owner_update_settings(fields_on_saved_document(changes))
 
 
 def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
@@ -918,8 +912,7 @@ def _request_runtime_mode_change(mode: str, confirm_fn) -> dict:
     )
     if not confirm_fn("Confirm Runtime Mode Change", message):
         return {"ok": False, "error": "Runtime mode change cancelled."}
-    settings["OUROBOROS_RUNTIME_MODE"] = new_mode
-    _save_settings(settings)
+    _save_settings({"OUROBOROS_RUNTIME_MODE": new_mode})
     return {"ok": True, "runtime_mode": new_mode, "restart_required": restart_required}
 
 
@@ -941,8 +934,7 @@ def _request_auto_grant_reviewed_skills_change(enabled: bool, confirm_fn) -> dic
         message = "Disable auto-grant for reviewed skills?"
     if not confirm_fn("Confirm Reviewed Skill Auto-Grant", message):
         return {"ok": False, "error": "Auto-grant setting change cancelled."}
-    settings["OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS"] = "true" if new_enabled else "false"
-    _save_settings(settings)
+    _save_settings({"OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS": "true" if new_enabled else "false"})
     return {"ok": True, "enabled": new_enabled}
 
 
@@ -1152,7 +1144,7 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
     stop_agent()
     if _external_host_update is not None:
         lifecycle_thread.join()  # The hook observes shutdown and owns its bounded reap.
-    _kill_orphaned_children(port, reason="headless_shutdown" if requested_shutdown else "crash_fuse")
+    _kill_orphaned_children(reason="headless_shutdown" if requested_shutdown else "crash_fuse")
     # NO explicit release_pid_lock(): sys.exit runs the atexit-registered
     # release, and a second release would unconditionally unlink a lock a
     # NEWER launcher may own (explicit calls stay only on os._exit paths).
@@ -1160,9 +1152,10 @@ def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) 
 
 
 def main(argv=()):
-    global _headless, _external_ui, _external_host_update, _external_seed_bundle, _launch_argv
+    global _headless, _external_ui, _external_host_update, _external_seed_bundle, _launch_argv, _launch_intent, \
+        _runtime_venv, EMBEDDED_PYTHON
     options = parse_launch_options(argv)
-    _launch_argv = list(argv)
+    _launch_argv, _launch_intent = list(argv), options.launch_intent
     _external_ui = options.no_ui
     _external_host_update = options.host_update.resolve() if options.host_update is not None else None
     _external_seed_bundle = options.seed_bundle.resolve() if options.seed_bundle is not None else None
@@ -1317,6 +1310,15 @@ def main(argv=()):
         if not check_git():
             sys.exit(1)
 
+    if options.runtime_venv is not None:  # under the PID lock, before bootstrap and world generation
+        try:
+            _runtime_venv = prepare_runtime_venv(options.runtime_venv, run=_hidden_run, log=log)
+        except RuntimeVenvRefused as refusal:
+            log.error("%s", refusal)
+            print(f"Ouroboros did not start: {refusal}", file=sys.stderr, flush=True)
+            sys.exit(1)
+        EMBEDDED_PYTHON = _runtime_venv.python  # the body, its installs and the source handoff
+        os.environ["PATH"] = os.pathsep.join([str(_runtime_venv.bin_dir), os.environ.get("PATH", "")])
     if not bootstrap_repo():
         # Disclosed, not fatal: an already-provisioned install with satisfied
         # requirements still runs, and a genuinely broken checkout is stopped
@@ -1325,6 +1327,13 @@ def main(argv=()):
             "Continuing startup after a failed dependency install; the agent may "
             "be missing packages (see the pip output above)."
         )
+    elif _runtime_venv is not None and not _runtime_venv.ready and _install_deps():
+        try:
+            _runtime_venv = mark_ready(_runtime_venv)  # a failed install stays preparing and retries next start
+        except RuntimeVenvRefused as refusal:
+            log.error("%s", refusal)
+            print(f"Ouroboros did not start: {refusal}", file=sys.stderr, flush=True)
+            sys.exit(1)
 
     # D-8: decide here, PRESENT after the gateway is healthy. Everything above
     # (single-instance lock, Git, managed-repo bootstrap/seed validation) is a
@@ -1332,16 +1341,7 @@ def main(argv=()):
     onboarding_settings, onboarding_required = _prepare_first_run_settings()
 
     global _webview_window
-    port = AGENT_SERVER_PORT
-
-    # Clear any stale server process or ports before starting the new agent
-    _cleanup_recorded_server_process("preflight")
-    _reap_same_install_strays("preflight")
-    _kill_stale_runtime_ports(port)
-    try:
-        PORT_FILE.unlink(missing_ok=True)
-    except OSError:
-        pass
+    port = _requested_server_port()  # the lifecycle loop clears the previous generation first
 
     # Headless: handlers BEFORE the lifecycle thread spawns server.py — a
     # SIGTERM in the ~60s readiness window must reach our teardown.
@@ -1360,7 +1360,7 @@ def main(argv=()):
         # supervisor — the supported state that lets the wizard reach /api/*.
         onboarding = _present_first_run_onboarding(
             onboarding_settings, actual_port, headless=_headless,
-            open_external_url=_open_external_url,
+            open_external_url=_open_external_url, read_port=lambda: _generation_port,
         )
         if not onboarding["saved"]:
             log.info(
@@ -1374,12 +1374,12 @@ def main(argv=()):
             _request_agent_restart()
             server_ready, actual_port = _await_server_ready(port, _abort, lifecycle_thread)
 
-    if _headless and _shutdown_event.is_set():
+    if (_headless or options.launch_intent == "automatic") and _shutdown_event.is_set():
         # Shutdown during startup: same teardown the keep-alive loop performs
-        # (an aborted wait is a requested shutdown, not a startup failure).
-        log.info("Shutdown requested during headless startup; tearing down.")
+        # (an aborted wait, or an automatic start meeting Panic, is no startup failure).
+        log.info("Shutdown requested during startup; tearing down.")
         stop_agent()
-        _kill_orphaned_children(actual_port, reason="startup_abort")
+        _kill_orphaned_children(reason="startup_abort")
         # atexit owns release_pid_lock on sys.exit (a second release would
         # unlink a newer launcher's lock).
         sys.exit(0)
@@ -1390,7 +1390,7 @@ def main(argv=()):
         stop_agent()
         lifecycle_thread.join(timeout=5)
         if _headless:
-            _kill_orphaned_children(actual_port, reason="startup_failure")
+            _kill_orphaned_children(reason="startup_failure")
             print(
                 "Ouroboros failed to start: the local agent server did not "
                 "become ready.\n"
@@ -1451,7 +1451,8 @@ def main(argv=()):
         with urllib.request.urlopen(full_url, timeout=60) as resp, target.open("wb") as fh:  # noqa: S310 - localhost validated above
             shutil.copyfileobj(resp, fh)
 
-    class MainApi:
+    class MainApi(DesktopApi):  # alerts, shell facts and system notifications: launcher_background.DesktopApi
+        _background = background
         @staticmethod
         def _native_confirm(title: str, message: str) -> bool:
             return bool(_webview_window and _webview_window.create_confirmation_dialog(title, message))
@@ -1514,9 +1515,6 @@ def main(argv=()):
 
         def open_external_url(self, url: str) -> dict:
             return _open_external_url(url)
-        def request_attention(self, sound: bool = True, title: str = "", body: str = "", cue_when_visible: bool = True) -> dict:
-            return background.attention(bool(sound), str(title or ""), str(body or ""), bool(cue_when_visible))
-        notify_owner = request_attention  # newer pages send the alert text; older launchers lack this name
 
         def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
             try:
@@ -1562,7 +1560,7 @@ def main(argv=()):
         log.info("Window closing — graceful shutdown.")
         _shutdown_event.set()
         stop_agent()
-        _kill_orphaned_children(port)
+        _kill_orphaned_children()
         stop_tray_before_exit(release_pid_lock)
         os._exit(0)
 
@@ -1577,7 +1575,8 @@ def main(argv=()):
         text_select=True, hidden=background.start_hidden(options.launch_intent),
     )
     _webview_window = background.attach(window)  # Persist cookies and website data (ouroboros.theme); rebuild/limits: ARCHITECTURE §3.
-    webview.start(func=background.run, debug=False, private_mode=False)
+    webview.start(func=background.run, debug=False, private_mode=False,
+                  menu=setup_recovery_menu(window, lambda: _generation_port))
 
 
 if __name__ == "__main__":

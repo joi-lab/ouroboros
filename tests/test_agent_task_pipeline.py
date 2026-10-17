@@ -117,6 +117,9 @@ def test_emit_task_results_queues_restart_after_final_events(tmp_path, monkeypat
         "effective_model_lane": "",
         "model": "",
         "executor_route": "",
+        "effort_level": "",
+        "effort_requested": "",
+        "effort_source": "",
     }
     assert memory_calls == []
 
@@ -233,6 +236,7 @@ def test_task_result_and_task_done_mirror_authoritative_review_status(tmp_path, 
     assert stored["review_status"]["status"] == "pass"
     done = next(row for row in pending_events if row["type"] == "task_done")
     assert done["review_status"] == stored["review_status"]
+    assert done["root_task_id"] == "review-mirror"
 
 
 
@@ -411,10 +415,10 @@ def test_stopped_direct_turn_pays_no_post_task_synthesis(tmp_path, monkeypatch):
     end through the real post-task lane. The loop's hard stop records the
     existing ``_skip_post_task_synthesis`` marker on the tool context;
     ``emit_task_results`` copies it onto the task before the root predicate
-    runs, so the reflection worker is never dispatched and no open
+    runs, so the post-task worker is never dispatched and no open
     ``root_phase_checkpoint`` is seeded for the boot reconciler to re-pay. A
     positive control (the same turn, not stopped) proves the recording model
-    would have seen the paid reflection call. Neither turn buys a narrative:
+    would have seen the paid scratchpad upkeep call. Neither turn buys a narrative:
     both keep free host facts even when Stop prevents the worker from starting."""
     import ouroboros.llm as llm_mod
     from ouroboros.outcomes import REASON_OWNER_REQUESTED_FINALIZATION
@@ -456,7 +460,11 @@ def test_stopped_direct_turn_pays_no_post_task_synthesis(tmp_path, monkeypatch):
     (root / "memory").mkdir()
     (root / "repo").mkdir()
     env = SimpleNamespace(drive_root=root, repo_dir=root / "repo", drive_path=lambda rel: root / rel)
-    # Non-trivial and above the reflection threshold: both paid post-steps would fire.
+    # A scratchpad big enough for its upkeep: the unstopped turn's paid post-step would fire.
+    from ouroboros.memory import Memory
+
+    for index in range(4):
+        Memory(root).append_scratchpad_block(f"note-{index}-" + "x" * 8_000, source=f"task-{index}")
     llm_trace = {"reasoning_notes": [], "tool_calls": [
         {"tool": "list_files", "arguments": {}, "result": "ok", "is_error": False}]}
 
@@ -512,11 +520,11 @@ def test_stopped_direct_turn_pays_no_post_task_synthesis(tmp_path, monkeypatch):
 
 # --- "Stop now" while the paid synthesis is ALREADY in flight (audit point 4, G18) ---
 
-_STAGES = ("memory_fallback_draft", "scratchpad_consolidation", "reflection", "promotion")
+_STAGES = ("memory_fallback_draft", "scratchpad_consolidation", "promotion")
 
 
 def _stubbed_stages(monkeypatch, calls, *, on_first=None):
-    """Record the free facts row and the four paid stages in order; ``on_first`` runs
+    """Record the free facts row and the three paid stages in order; ``on_first`` runs
     INSIDE stage 1 (the Stop lands after the synthesis has begun, past the entry snapshot)."""
     import ouroboros.llm as llm_mod
     import ouroboros.post_task_evolution as pte
@@ -534,11 +542,7 @@ def _stubbed_stages(monkeypatch, calls, *, on_first=None):
     monkeypatch.setattr(pipeline, "_run_memory_fallback_draft", _stage("memory_fallback_draft"))
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", _stage("scratchpad_consolidation"))
     monkeypatch.setattr(pipeline, "_record_task_facts", _stage("facts"))
-    monkeypatch.setattr(pipeline, "_run_reflection", _stage(
-        "reflection", {"reflection": "x", "backlog_candidates": [], "memory_actions": []}))
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", _stage("promotion"))
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *a, **k: None)
-    monkeypatch.setattr(pte, "maybe_promote", lambda *a, **k: None)
+    monkeypatch.setattr(pte, "maybe_promote", _stage("promotion"))
 
 
 def _synthesis_root(tmp_path):
@@ -558,7 +562,7 @@ def test_stop_now_during_inflight_synthesis_skips_the_remaining_paid_stages(tmp_
     """The Stop lands AFTER stage 1 began (the loop has returned, the entry
     snapshot saw no marker): the durable immediate cancel intent every stop
     ingress mints — or the live task marker re-read — trips the per-stage gate,
-    so stages 2..4 never run, the checkpoint settles ``degraded`` and the typed
+    so stages 2..3 never run, the checkpoint settles ``degraded`` and the typed
     ``post_task_stop_reason`` NAMES the skipped stages, riding the result row
     and the ``task_cost_finalized`` event alike. The in-flight key is gone."""
     from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, request_cancel
@@ -578,13 +582,13 @@ def test_stop_now_during_inflight_synthesis_skips_the_remaining_paid_stages(tmp_
 
     _stubbed_stages(monkeypatch, calls, on_first=_deliver_stop)
     pipeline._run_post_task_processing_async(
-        env, task, {"rounds": 20, "cost": 0.02}, {"tool_calls": [], "reasoning_notes": []}, {}, root / "logs", blocking=True)
+        env, task, {"rounds": 20, "cost": 0.02}, {"tool_calls": [], "reasoning_notes": []}, root / "logs", blocking=True)
 
     assert calls == ["facts", "memory_fallback_draft"], calls
     checkpoint = (pipeline.load_task_result(root, task_id) or {}).get("root_phase_checkpoint") or {}
     assert checkpoint.get("post_task_synthesis") == "degraded", checkpoint
     assert checkpoint.get("post_task_stop_reason") == (
-        "owner_stopped:skipped=scratchpad_consolidation,reflection,promotion"), checkpoint
+        "owner_stopped:skipped=scratchpad_consolidation,promotion"), checkpoint
     finalized = _finalized_events(root, task_id)
     assert len(finalized) == 1 and finalized[0]["post_task_status"] == "degraded", finalized
     assert finalized[0]["post_task_stop_reason"] == checkpoint["post_task_stop_reason"], finalized
@@ -593,7 +597,7 @@ def test_stop_now_during_inflight_synthesis_skips_the_remaining_paid_stages(tmp_
 
 def test_no_stop_runs_every_paid_stage_and_finalizes_without_a_stop_reason(tmp_path, monkeypatch):
     """Positive control for the gate: an un-stopped synthesis records its free
-    facts row, then runs all four paid stages in order, and the checkpoint is
+    facts row, then runs all three paid stages in order, and the checkpoint is
     byte-identical to before (``completed``, no ``post_task_stop_reason`` anywhere)."""
     root, env = _synthesis_root(tmp_path)
     task_id = "unstopped1"
@@ -602,7 +606,7 @@ def test_no_stop_runs_every_paid_stage_and_finalizes_without_a_stop_reason(tmp_p
     calls = []
     _stubbed_stages(monkeypatch, calls)
     pipeline._run_post_task_processing_async(
-        env, task, {"rounds": 20, "cost": 0.02}, {"tool_calls": [], "reasoning_notes": []}, {}, root / "logs", blocking=True)
+        env, task, {"rounds": 20, "cost": 0.02}, {"tool_calls": [], "reasoning_notes": []}, root / "logs", blocking=True)
 
     assert calls == ["facts", *_STAGES], calls
     checkpoint = (pipeline.load_task_result(root, task_id) or {}).get("root_phase_checkpoint") or {}
@@ -625,7 +629,7 @@ def test_entry_marker_still_skips_every_paid_stage_and_seeds_no_checkpoint(tmp_p
     calls = []
     _stubbed_stages(monkeypatch, calls)
     pipeline._run_post_task_processing_async(
-        env, task, {"rounds": 2, "cost": 0.01}, {"tool_calls": [], "reasoning_notes": []}, {}, root / "logs", blocking=True)
+        env, task, {"rounds": 2, "cost": 0.01}, {"tool_calls": [], "reasoning_notes": []}, root / "logs", blocking=True)
 
     assert calls == ["facts"], calls
     stored = pipeline.load_task_result(root, task_id) or {}

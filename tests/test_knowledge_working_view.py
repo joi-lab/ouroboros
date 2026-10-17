@@ -65,17 +65,13 @@ def test_tool_result_projection_never_credits_undelivered_body_or_header(tmp_pat
     assert not reads.reads
 
 
-def test_light_reads_large_note_in_multiple_windows_then_publishes_its_revision(tmp_path, fit):
+def test_light_reads_large_note_in_multiple_windows_across_authored_views(tmp_path, fit):
     fit.window = 50000
     ctx, original, reads = _setup(tmp_path, "Original account of events. " * 7000 + "DECISIVE LAST EVENT.")
     chunk = 40000
     total = len(original.text)
     assert estimate_context_prompt_tokens([{"role": "user", "content": original.text}], reads.tools) + 16384 > fit.window
     episode = "ORIGINAL EPISODE: reconsider the complete account."
-    revised = "A coherent revised account preserving the decisive last event."
-    nomination = [{"topic": "large", "scope": "global", "edits": [{
-        "old_text": "DECISIVE LAST EVENT.", "new_text": revised,
-        "basis": "The complete source and new episode correct the final event."}]}]
     answer = "I read the full account and retained what changed."
 
     class Reader:
@@ -109,12 +105,9 @@ def test_light_reads_large_note_in_multiple_windows_then_publishes_its_revision(
 
     llm = Reader()
     content, usage = c._call_consolidation_llm(llm, episode, "multiwindow", knowledge=reads)
-    bound = reads.bind_entries(nomination)
-    assert content, usage
+    assert content == answer, usage
     assert len(llm.revisions) > 2
-    assert bound[0]["expected_revision"] == original.revision
-    assert c._write_knowledge_entries(original.address.shelf, bound, context=ctx)[0]["ok"]
-    assert k.read_knowledge_note(original.address).text.endswith("decisive last event.")
+    assert k.read_knowledge_note(original.address).raw == original.raw  # a read writes nothing
     assert list((tmp_path / "task_results" / "artifacts" / "memory-view" / "source_handles").rglob("*.json"))
 
 
@@ -177,3 +170,35 @@ def test_full_pressure_read_can_compact_directly_from_its_causal_send(tmp_path, 
     assert not reads.reads
     assert k.read_knowledge_note(original.address).raw == original.raw
     assert read_actor_source_bytes(tmp_path, "memory-view", llm.source).decode().endswith(original.text)
+
+
+def test_staged_output_read_waits_for_the_consolidators_accepted_projection(tmp_path):
+    from types import SimpleNamespace
+    from ouroboros import delegate_output as output
+    from tests.test_delegated_result_delivery import _staged_for_main
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="memory-view")
+    target, entry = _staged_for_main(SimpleNamespace(ctx=ctx), ("Ж🙂" * 6000 + "\r\n").encode())
+    reads = c.KnowledgeReadContext(ctx)
+    values = {"messages": [{"role": "user", "content": "Read the complete staged result."}], "tools": reads.tools}
+    message = {"role": "assistant", "content": "", "tool_calls": [_call("read_file", {
+        "root": "task_drive", "path": entry.output_artifact})]}
+    delivered = reads.next_messages(values, message, fit_candidate=lambda messages, tools: {
+        "accepted": sum(len(row.get("content") or "") for row in messages if row.get("role") == "tool") <= 4000,
+    }, facts={}, round_id="first")
+    assert not entry.output_consumed and not output._READ_COVERAGE
+    pending = reads.pending_delivery[0]
+    # One numbered row: its display number is shown but is never source.
+    end = (pending["result_source_view"]["delivered_range"][1] - pending["tool_result"].meta["read_view"]["body_start"]
+           - len(f"{1:>6}\t"))
+    content = target.read_text(encoding="utf-8")
+    assert 0 < end < len(content) and content[:end] in delivered[-1]["content"]
+    reads.accept_delivery()
+    assert output._READ_COVERAGE[f"{target.resolve()}|{entry.output_sha}"] == [[0, end]]
+    assert not entry.output_consumed
+    final = reads.read_call(_call("read_file", {"root": "task_drive", "path": entry.output_artifact,
+                                              "start_char": end}, "remaining"))
+    assert not entry.output_consumed
+    reads.pending_delivery = [final]
+    reads.accept_delivery()
+    assert entry.output_consumed

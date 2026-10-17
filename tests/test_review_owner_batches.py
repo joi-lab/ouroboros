@@ -65,19 +65,26 @@ def test_active_owner_batch_reuses_one_history_snapshot(tmp_path, monkeypatch):
         tmp_path, invocation_id="inv-started", operation_id="wrong-operation",
         surface="multi_model_review", request={"prompt": "duplicate"},
     )
-    from ouroboros import delegate_custody_memo
+    from contextlib import contextmanager
+
+    from ouroboros import store
 
     scans = []
-    original = delegate_custody_memo._refresh
+    real_open = store.open_store
 
-    def counted(drive_root, *args, **kwargs):
-        # One custody refresh per reconcile: the batch shares that snapshot
-        # across replay, pending and invocation projections (a `replay()` that
-        # dropped `rows=` would refresh a second time and show here).
-        scans.append(drive_root)
-        return original(drive_root, *args, **kwargs)
+    @contextmanager
+    def counted(root, **kwargs):
+        # One custody store read per reconcile: the batch shares that snapshot
+        # across the held runs, the pending invocations and each run's minting
+        # request; the retained chain is never folded here.
+        with real_open(root, **kwargs) as txn:
+            if not kwargs.get("write"):
+                scans.append(root)
+            yield txn
 
-    monkeypatch.setattr(delegate_custody_memo, "_refresh", counted)
+    monkeypatch.setattr(store, "open_store", counted)
+    monkeypatch.setattr(delegate_custody, "_iter_rows",
+                        lambda *a, **kw: pytest.fail("chain fold on owner-death reconcile"))
     result = review_owner_custody.reconcile_review_custody_after_confirmed_process_deaths(
         tmp_path, {101, 202},
     )

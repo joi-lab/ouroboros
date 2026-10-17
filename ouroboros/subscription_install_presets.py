@@ -1,11 +1,13 @@
-"""Pure sibling compilers for Available subagents and reviewer presets.
+"""Pure sibling compilers for Available subagents and the review pool.
 
 The caller supplies already-normalized settings and, only when subscriptions
 were declared, one verified live discovery snapshot. Task actors consume every
-supported harness plus truthful Main/Light API or local routes. Reviewer slots
-consume only the independently ratified Claude/Codex/Cursor subset, so Agy-only
-is a successful task preset with no structured reviewer override and a mixed
-Agy install produces byte-identical reviewer JSON to its core-only projection.
+supported harness plus truthful Main/Light API or local routes. Review seats
+consume only the independently ratified Claude/Codex/Cursor subset and land as
+MARKED catalog rows (``review_eligible``) — the review pool — so Agy-only is a
+successful task preset with no review rows and a mixed Agy install marks the
+same rows its core-only projection does. ``factory_review_rows`` mints the
+shipped API default panel into catalog rows for the migration and the wizard.
 
 No settings or transport are read here. Exact discovery misses are typed
 refusals with no partial output. Rows are unpinned by default so Claudexor owns
@@ -16,12 +18,13 @@ model slug and the explicit row field.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from ouroboros.configured_subagents import (
     ALTERNATIVE_RECOMMENDATION,
     MAX_CONFIGURED_SUBAGENTS,
+    MINTED_FROM_FACTORY_DEFAULT,
     INDEPENDENT_RECOMMENDATION,
     PRIMARY_RECOMMENDATION,
     SCOUT_RECOMMENDATION,
@@ -36,6 +39,7 @@ from ouroboros.configured_subagents import (
     serialize_configured_subagents,
 )
 from ouroboros.provider_models import (
+    image_input_from_modalities,
     model_has_credentials_in_settings,
 )
 from ouroboros.route_spec import ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL, RouteSpec
@@ -43,10 +47,8 @@ from ouroboros.route_spec import ROUTE_KIND_AGENT_SESSION, ROUTE_KIND_API_MODEL,
 # The marker written beside the applied preset. Its ABSENCE is not authority to
 # apply anything (every pre-preset install lacks it too); the server-side
 # fresh-install latch is. Bumping this string marks a NEW preset generation.
-SUBSCRIPTION_PRESET_VERSION = "3"
+SUBSCRIPTION_PRESET_VERSION = "4"
 PRESET_MARKER_KEY = "OUROBOROS_SUBSCRIPTION_PRESET_VERSION"
-
-REVIEWER_SLOTS_KEY = "OUROBOROS_REVIEWER_SLOTS"
 
 HARNESS_CLAUDE = "claude"
 HARNESS_CODEX = "codex"
@@ -59,7 +61,6 @@ PRESET_HARNESSES: Tuple[str, ...] = (
 )
 
 SURFACE_SUBAGENT = "subagent"
-SURFACE_ADVISORY = "advisory"
 SURFACE_TRIAD = "triad"
 SURFACE_SCOPE = "scope"
 
@@ -73,12 +74,10 @@ _EFFORT_IN_MODEL_ID = frozenset({HARNESS_CURSOR, HARNESS_AGY})
 # different model or to the harness default.
 _MODEL_ALIASES: Dict[str, Dict[str, Tuple[str, ...]]] = {
     HARNESS_CLAUDE: {
-        "opus-5": ("claude-opus-5",),
-        "sonnet-5": ("claude-sonnet-5",),
+        "opus-5.5": ("claude-opus-5-5",),
     },
     HARNESS_CODEX: {
         "gpt-5.6-sol": ("gpt-5.6-sol",),
-        "gpt-5.6-terra": ("gpt-5.6-terra",),
     },
     HARNESS_CURSOR: {
         "grok-4.6": ("cursor-grok-4.6-{effort}", "grok-4.6-{effort}"),
@@ -143,7 +142,6 @@ class SubscriptionInstallPreset:
     """The compiled preset, or a typed refusal. Never both, never partial."""
 
     connected: Tuple[str, ...] = ()
-    reviewer_slots: str = ""
     available_subagents: str = ""
     source: str = SOURCE_ONBOARDING_DEFAULT
     diagnostics: Tuple[Dict[str, Any], ...] = ()
@@ -155,11 +153,10 @@ class SubscriptionInstallPreset:
     def ok(self) -> bool:
         return self.refusal is None and bool(self.available_subagents)
 
-    def settings_keys(
-        self, *, include_reviewer: bool = True, include_marker: bool = True,
-    ) -> Dict[str, str]:
-        """The EXACT settings keys an install-time save adds. Empty on refusal —
-        a half-applied preset is worse than none."""
+    def settings_keys(self, *, include_marker: bool = True) -> Dict[str, str]:
+        """The EXACT settings keys an install-time save adds (the catalog — the
+        review pool rides inside it — its receipt, and the preset marker). Empty
+        on refusal — a half-applied preset is worse than none."""
         if not self.ok:
             return {}
         values = {
@@ -168,8 +165,6 @@ class SubscriptionInstallPreset:
         }
         if include_marker:
             values[PRESET_MARKER_KEY] = SUBSCRIPTION_PRESET_VERSION
-        if include_reviewer and self.reviewer_slots:
-            values[REVIEWER_SLOTS_KEY] = self.reviewer_slots
         return values
 
 
@@ -186,9 +181,9 @@ class SurfacePolicy:
 
 @dataclass(frozen=True)
 class ReviewerHarnessPolicy:
-    """Review-only model choices; task actors have an independent catalog."""
+    """Review-only model choices; task actors have an independent catalog. Only the
+    surfaces that mark rows are resolved: a model no row runs never refuses a preset."""
 
-    advisory: SurfacePolicy
     triad: SurfacePolicy
     scope: SurfacePolicy
 
@@ -199,24 +194,21 @@ def _surface(preference: str, effort: str) -> SurfacePolicy:
 
 _REVIEWER_POLICIES: Dict[str, ReviewerHarnessPolicy] = {
     HARNESS_CLAUDE: ReviewerHarnessPolicy(
-        advisory=_surface("sonnet-5", "low"),
-        triad=_surface("opus-5", "medium"),
-        scope=_surface("opus-5", "medium"),
+        triad=_surface("opus-5.5", "medium"),
+        scope=_surface("opus-5.5", "medium"),
     ),
     HARNESS_CODEX: ReviewerHarnessPolicy(
-        advisory=_surface("gpt-5.6-terra", "medium"),
         triad=_surface("gpt-5.6-sol", "medium"),
         scope=_surface("gpt-5.6-sol", "medium"),
     ),
     HARNESS_CURSOR: ReviewerHarnessPolicy(
-        advisory=_surface("grok-4.6", "medium"),
         triad=_surface("grok-4.6", "medium"),
         scope=_surface("grok-4.6", "high"),
     ),
 }
 
 _TASK_POLICIES: Dict[str, SurfacePolicy] = {
-    HARNESS_CLAUDE: _surface("opus-5", "medium"),
+    HARNESS_CLAUDE: _surface("opus-5.5", "medium"),
     HARNESS_CODEX: _surface("gpt-5.6-sol", "medium"),
     HARNESS_CURSOR: _surface("grok-4.6", "high"),
     HARNESS_AGY: _surface("gemini-3.8-flash", "high"),
@@ -224,7 +216,6 @@ _TASK_POLICIES: Dict[str, SurfacePolicy] = {
 
 _POLICY_HARNESSES = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
 REVIEWER_PRESET_HARNESSES = _POLICY_HARNESSES
-_ADVISORY_ORDER = _POLICY_HARNESSES
 _TRIAD_ORDER = (HARNESS_CLAUDE, HARNESS_CODEX, HARNESS_CURSOR)
 _SCOPE_ORDER = (HARNESS_CODEX, HARNESS_CLAUDE, HARNESS_CURSOR)
 
@@ -239,17 +230,17 @@ def _policy_seat(surface: str, position: int, harness: str) -> PresetSeat:
 
 
 def _compile_policy_seats(connected: Sequence[str]) -> Dict[str, Tuple[PresetSeat, ...]]:
-    """Apply linear priority rules; no powerset row grows when a harness is added."""
+    """Apply linear priority rules; no powerset row grows when a harness is added.
+
+    One triad seat per connected reviewer harness: a sole harness reviews once (owner
+    Q5=A), never as three copies of one model that pay three runs for no second opinion.
+    """
     present = set(connected)
-    advisory = _first_connected(_ADVISORY_ORDER, present)
     scope = _first_connected(_SCOPE_ORDER, present)
 
     triad_harnesses = [harness for harness in _TRIAD_ORDER if harness in present]
-    if len(triad_harnesses) == 1:
-        triad_harnesses *= 3
 
     return {
-        SURFACE_ADVISORY: (_policy_seat(SURFACE_ADVISORY, 1, advisory),),
         SURFACE_TRIAD: tuple(
             _policy_seat(SURFACE_TRIAD, position, harness)
             for position, harness in enumerate(triad_harnesses, start=1)
@@ -314,19 +305,6 @@ def _resolved_row(seat: PresetSeat, model_id: str) -> Dict[str, Any]:
     }
 
 
-def _slot_id(surface: str, position: int) -> str:
-    """Row identity from the ONE mint (``review_substrate.slot_id_for_row``) so a
-    preset row's receipts line up with a hand-authored row's."""
-    from ouroboros.review_substrate import (
-        SCOPE_SLOT_ID_PREFIX,
-        SLOT_ID_PREFIX,
-        slot_id_for_row,
-    )
-
-    prefix = SCOPE_SLOT_ID_PREFIX if surface == SURFACE_SCOPE else SLOT_ID_PREFIX
-    return slot_id_for_row(position, prefix=prefix)
-
-
 def _resolve_surface(seats: Sequence[PresetSeat],
                      discovery: Mapping[str, HarnessDiscovery],
                      ) -> Tuple[List[Dict[str, Any]], Optional[PresetRefusal]]:
@@ -339,137 +317,240 @@ def _resolve_surface(seats: Sequence[PresetSeat],
     return rows, None
 
 
-def _inline_reviewer_slots_json(triad: Sequence[Mapping[str, Any]],
-                                scope: Sequence[Mapping[str, Any]],
-                                advisory: Mapping[str, Any]) -> str:
-    """Inline reviewer routes for the owner-configured path.
-
-    An owner draft is validate-only: the preset never extends or edits the
-    owner's roster, so its reviewer seats cannot mint reference rows — they
-    stay self-contained inline routes (4=A references belong to the roster
-    the preset itself ships)."""
-    def _rows(resolved: Sequence[Mapping[str, Any]], surface: str) -> List[Dict[str, Any]]:
-        return [
-            {
-                "slot_id": _slot_id(surface, int(row["position"])),
-                "route": {"kind": "agent_session", "target_id": str(row["target_id"])},
-                "effort": str(row["effort"]),
-            }
-            for row in resolved
-        ]
-
-    payload = {
-        "triad": _rows(triad, SURFACE_TRIAD),
-        "scope": _rows(scope, SURFACE_SCOPE),
-        "advisory": {
-            "enabled": True,
-            "route": {"kind": "agent_session", "target_id": str(advisory["target_id"])},
-            "effort": str(advisory["effort"]),
-        },
-    }
-    if scope:
-        payload["deep_review"] = {"route": {"kind": "agent_session", "target_id": str(scope[0]["target_id"])}, "effort": str(scope[0]["effort"])}
-    return json.dumps(payload, ensure_ascii=False, sort_keys=False)
-
-
 _REVIEW_SEAT_RECOMMENDATION = (
     "Review-lane seat minted at onboarding; also selectable for delegated "
     "child work when its strengths fit."
 )
 
 
-def _reference_reviewer_rows(
+def _free_review_id(used: set[str], base: str) -> str:
+    """``<base>``, else the first free ``<base>-<n>`` (n from 2); a numeric base
+    (``review-``) counts naturals from 1 — the migration's own minting order."""
+    if base.endswith("-"):
+        n = 1
+        while f"{base}{n}" in used:
+            n += 1
+        return f"{base}{n}"
+    row_id, suffix = base, 2
+    while row_id in used:
+        row_id, suffix = f"{base}-{suffix}", suffix + 1
+    return row_id
+
+
+def _mark_review_rows(
     available: ConfiguredSubagents,
     triad: Sequence[Mapping[str, Any]],
-    scope: Sequence[Mapping[str, Any]],
-    advisory: Mapping[str, Any],
-) -> tuple[ConfiguredSubagents, str, List[Dict[str, Any]]]:
-    """Compile reviewer slots as ``subagent_id`` REFERENCES into the roster.
+    scope: Sequence[Mapping[str, Any]] = (),
+) -> tuple[ConfiguredSubagents, List[Dict[str, Any]]]:
+    """The subscription wizard's review pool: MARK catalog rows for its seats.
 
-    One SSOT from the first boot (owner decision 4=A): a seat whose session
-    route already exists as a roster row references it; otherwise a roster
-    row is minted for it (no ``name`` — the field is retired) and referenced.
-    A per-slot ``effort`` override rides the slot only when it differs from
-    the referenced row's own effort. If the 10-row roster cap leaves no room,
-    the seat falls back to an inline route and says so in diagnostics —
-    honest fallback, never a silent drop.
+    One SSOT from the first boot (owner decision 4=A, now literally one list):
+    a seat whose session route already exists as an unmarked roster row with
+    the seat's effort marks that row (``review_eligible``); otherwise a
+    ``review-<harness>`` row is minted for it, marked, with
+    ``minted_from: factory_default``. Each triad seat takes one row (the
+    compiler names each harness once; identical seats would each mint their
+    own twin, ``review-<harness>-2`` and on). A scope seat whose effective
+    identity a marked row already has MERGES into it (every pool row judges
+    both parts of the brief), else takes a row like a triad seat. If the
+    catalog ceiling leaves no room, the seat is omitted and said so in
+    diagnostics — honest disclosure, never a silent drop.
+
+    Idempotent: a row already marked with a seat's identity COUNTS as that seat
+    (each marked row satisfies one triad seat), so feeding the wizard's own
+    output back — the catalog a preview showed, re-saved — changes nothing and
+    mints no further twins.
     """
     items = list(available.items)
     diagnostics: List[Dict[str, Any]] = []
+    taken: set[int] = set()  # row indices already standing for a seat of this run
 
-    def _row_for(target_id: str, effort: str) -> tuple[str, str] | None:
-        identity = (ROUTE_KIND_AGENT_SESSION, target_id, "")
-        for row in items:
-            if (row.route.kind, row.route.target_id,
-                    row.route.credential_profile_id) == identity:
-                return row.subagent_id, row.effort
-        if len(items) >= MAX_CONFIGURED_SUBAGENTS:
-            return None
-        used = {row.subagent_id for row in items}
-        harness = target_id.partition("=")[0] or "session"
-        base = f"review-{harness}"
-        row_id, suffix = base, 2
-        while row_id in used:
-            row_id, suffix = f"{base}-{suffix}", suffix + 1
-        items.append(ConfiguredSubagent(
-            subagent_id=row_id,
-            recommended_use=_REVIEW_SEAT_RECOMMENDATION,
-            route=RouteSpec(ROUTE_KIND_AGENT_SESSION, target_id),
-            effort=effort,
-        ))
-        return row_id, effort
+    def _same(row: ConfiguredSubagent, target: str, effort: str) -> bool:
+        return (row.route.kind == ROUTE_KIND_AGENT_SESSION and row.route.target_id == target
+                and not row.route.credential_profile_id and row.effort == effort)
 
-    def _slot(surface: str, row: Mapping[str, Any]) -> Dict[str, Any]:
-        target, effort = str(row["target_id"]), str(row["effort"])
-        ref = _row_for(target, effort)
-        slot: Dict[str, Any] = {"slot_id": _slot_id(surface, int(row["position"]))}
-        if ref is None:
-            diagnostics.append({
-                "code": "reviewer_seat_inline_roster_full",
-                "surface": surface, "target_id": target,
-            })
-            slot["route"] = {"kind": "agent_session", "target_id": target}
-            slot["effort"] = effort
-            return slot
-        row_id, row_effort = ref
-        slot["subagent_id"] = row_id
-        if effort and effort != row_effort:
-            slot["effort"] = effort
-        return slot
+    def _first(target: str, effort: str, *, marked: bool) -> Optional[int]:
+        return next((index for index, row in enumerate(items)
+                     if index not in taken and row.review_eligible is marked and _same(row, target, effort)), None)
 
-    payload: Dict[str, Any] = {
-        "triad": [_slot(SURFACE_TRIAD, row) for row in triad],
-        "scope": [_slot(SURFACE_SCOPE, row) for row in scope],
-    }
-    adv = _slot(SURFACE_ADVISORY, dict(advisory) | {"position": 1})
-    adv.pop("slot_id", None)
-    payload["advisory"] = {"enabled": True, **adv}
-    if scope:
-        deep = _slot(SURFACE_SCOPE, scope[0])
-        deep.pop("slot_id", None)
-        payload["deep_review"] = deep
-    extended = make_configured_subagents(items, enabled=available.enabled)
-    return extended, json.dumps(payload, ensure_ascii=False, sort_keys=False), diagnostics
+    for seat in [*({**s, "_merge": False} for s in triad), *({**s, "_merge": True} for s in scope)]:
+        target, effort = str(seat["target_id"]), str(seat["effort"])
+        if seat["_merge"] and any(row.review_eligible and _same(row, target, effort) for row in items):
+            continue
+        standing = _first(target, effort, marked=True)
+        if standing is not None:
+            taken.add(standing)
+            continue
+        unmarked = _first(target, effort, marked=False)
+        if unmarked is not None:
+            items[unmarked] = replace(items[unmarked], review_eligible=True)
+            taken.add(unmarked)
+        else:
+            if len(items) >= MAX_CONFIGURED_SUBAGENTS:
+                diagnostics.append({
+                    "code": "reviewer_seat_omitted_roster_full",
+                    "surface": str(seat.get("surface") or ""), "target_id": target,
+                })
+                continue
+            harness = target.partition("=")[0] or "session"
+            items.append(ConfiguredSubagent(
+                subagent_id=_free_review_id({row.subagent_id for row in items}, f"review-{harness}"),
+                recommended_use=_REVIEW_SEAT_RECOMMENDATION,
+                route=RouteSpec(ROUTE_KIND_AGENT_SESSION, target),
+                effort=effort,
+                review_eligible=True,
+                minted_from=MINTED_FROM_FACTORY_DEFAULT,
+            ))
+            taken.add(len(items) - 1)
+    return make_configured_subagents(items, enabled=available.enabled), diagnostics
 
 
-def _validate_against_parser(raw: str, subagents_raw: str = "") -> Optional[PresetRefusal]:
-    """Feed our own output through the reviewer-slot SSOT parser.
-
-    The compiler does not maintain a second schema: if the ONE strict parser
-    every consumer uses refuses this value, the preset is not applied.
-    ``subagents_raw`` threads the roster THIS preset ships, so actor
-    references validate against it (context-local override; the process env
-    does not carry the not-yet-applied roster)."""
-    from ouroboros.reviewer_slot_config import reviewer_slot_save_check
+def _validate_pool(serialized: str) -> Optional[PresetRefusal]:
+    """Feed the compiled catalog through the ONE strict parser every consumer
+    uses, then the pool's save judge: a preset whose pool the save path would
+    refuse is not applied."""
+    from ouroboros.configured_subagents import parse_configured_subagents
+    from ouroboros.reviewer_slot_config import review_pool_save_error
 
     try:
-        reviewer_slot_save_check(raw, subagents_raw=subagents_raw or None)
+        parse_configured_subagents(serialized)
+        error = review_pool_save_error(serialized, allow_empty=False)
     except ValueError as exc:
+        error = str(exc)
+    if error:
         return PresetRefusal(
-            code="preset_failed_slot_validation", seat=None, candidates=(),
-            message=f"The compiled reviewer-slot value did not validate: {exc}",
+            code="preset_failed_pool_validation", seat=None, candidates=(),
+            message=f"The compiled review pool did not validate: {error}",
         )
     return None
+
+
+def _document_catalog_ids(doc: Mapping[str, Any]) -> set[str]:
+    """Row ids a settings document's catalog already holds (lenient: a
+    malformed catalog contributes none — the migration refuses it elsewhere)."""
+    raw = doc.get(SUBAGENTS_SETTING)
+    try:
+        payload = json.loads(raw) if isinstance(raw, str) else raw
+        return {str(row.get("subagent_id") or "") for row in (payload or {}).get("items") or []
+                if isinstance(row, dict)}
+    except (TypeError, ValueError, AttributeError):
+        return set()
+
+
+def _factory_settings(doc: Mapping[str, Any]) -> Dict[str, Any]:
+    """The configuration a factory row is derived from: ``doc`` over the shipped defaults, its
+    unauthored model slots on their provider proposals and saved ids respelled onto the one
+    exclusive provider — exactly what the runtime makes of the same document. A saved blank Main
+    runs as the runtime reads it (``model_slots._main_model``: the shipped Main)."""
+    from ouroboros.server_runtime import (
+        apply_runtime_provider_defaults, authored_model_slots, propose_unauthored_model_slots,
+    )
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    settings = propose_unauthored_model_slots({**SETTINGS_DEFAULTS, **doc}, authored_model_slots(doc))
+    settings = apply_runtime_provider_defaults(settings)[0]
+    settings["OUROBOROS_MODEL"] = _runtime_main(settings)
+    return settings
+
+
+def _runtime_main(settings: Mapping[str, Any]) -> str:
+    """Main as the runtime runs it: a saved blank Main is ``model_slots._main_model``'s shipped Main
+    (a mapping without the key names no Main; every merged view carries the slot)."""
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    main = settings.get("OUROBOROS_MODEL")
+    return "" if main is None else str(main).strip() or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL"])
+
+
+def role_route_binding(settings: Mapping[str, Any], role: str = "main") -> Dict[str, Any]:
+    """Main's (or Light's) model as a catalog row runs it — the reachable route in full identity
+    (the ``(local)`` label), a managed source's account pin and that role's processing — or ``{}``
+    without access."""
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, resolve_processing_preference
+    from ouroboros.provider_models import provider_for_model
+
+    model = dict(zip(("main", "light"), _effective_api_models(settings))).get(role, "")
+    if not model:
+        return {}
+    route: Dict[str, Any] = {"kind": ROUTE_KIND_API_MODEL, "target_id": model}
+    try:  # a malformed role map is the settings validator's refusal, never a read-seam crash
+        pin = str(model_role_option(MODEL_ACCOUNTS_KEY, role, settings=dict(settings)) or "")
+        processing = resolve_processing_preference(role, settings=dict(settings))
+    except ValueError:
+        pin = processing = ""
+    if pin and provider_for_model(model) == "claudexor":
+        route["credential_profile_id"] = pin
+    return {"route": route, **({"processing_preference": processing} if processing else {})}
+
+
+def factory_review_rows(doc: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The factory review pool for THIS settings document, as catalog rows (pure).
+
+    The panel follows the Main the document runs (owner 4A), whatever other access sits beside
+    it: a reachable OpenRouter Main → OpenRouter's three ``OPENROUTER_REVIEW_DEFAULTS``; a
+    reachable direct Main → its provider's ``DIRECT_PROVIDER_REVIEW_ROLES`` panel (one Main row;
+    MiniMax's Main, Light, Light), each seat in its ROLE's whole binding (a Light seat runs Light's,
+    never Main's by a shared model name; a blank or another provider's Light leaves the provider's
+    shipped Light standing in, plain); any other reachable Main (compatible, local, managed) → ONE
+    row of it, in its whole binding
+    (``role_route_binding``: ``(local)`` label, account pin, processing): copies of one model would
+    multiply every review's cost without a second opinion, so its one answer decides (quorum 1 of
+    1, recorded as ``single_reviewer_no_diversity``). With no configured access at all the shipped
+    OpenRouter Main keeps its panel (the defaults before any provider is chosen). A Main the
+    configured access cannot run — several direct keys and none chosen, or an explicit route
+    without access — mints nothing rather than a panel derived from another default; the read
+    seam names the setting. Every row is marked (``review_eligible``), ``minted_from:
+    factory_default``, reads natively (the catalog's default delivery), and carries a non-empty
+    effort: the document's ``OUROBOROS_EFFORT_REVIEW`` when it is on the scale, else ``high``
+    (Astra F7). Ids are the first free ``review-<n>`` against the document's own catalog. Nothing
+    is read from the process environment; task actors are ``factory_actor_rows``, never a
+    reviewer template.
+    """
+    from ouroboros.config import EFFORT_SCALE
+    from ouroboros.provider_models import compute_direct_review_seats, provider_for_model
+    from ouroboros.server_runtime import has_startup_ready_provider
+    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
+
+    settings = _factory_settings(doc)
+    main, light = settings["OUROBOROS_MODEL"], str(settings.get("OUROBOROS_MODEL_LIGHT") or "")
+    router_panel = list(OPENROUTER_REVIEW_DEFAULTS["triad"])
+    bindings = {role: role_route_binding(settings, role) for role in ("main", "light")}
+    main = bindings["main"]["route"]["target_id"] if bindings["main"] else main
+    router_main = provider_for_model(main) == "openrouter"
+    if bindings["main"] and not router_main:
+        seats = compute_direct_review_seats(provider_for_model(main), main, light) or [("main", main)]
+    else:  # a router Main reviews on the diverse router panel, never as twins of itself
+        reachable = router_main and (bindings["main"] or not has_startup_ready_provider(settings))
+        seats = [("", model) for model in router_panel] if reachable else []
+    effort = str(settings.get("OUROBOROS_EFFORT_REVIEW") or "").strip().lower()
+    if effort not in EFFORT_SCALE:
+        effort = "high"
+    used = _document_catalog_ids(settings)
+    rows: List[Dict[str, Any]] = []
+    for role, model in seats:
+        row_id = _free_review_id(used, "review-")
+        used.add(row_id)
+        binding = bindings.get(role) or {}
+        rows.append({
+            "subagent_id": row_id,
+            "recommended_use": _REVIEW_SEAT_RECOMMENDATION,
+            "route": dict(binding["route"]) if binding else {"kind": ROUTE_KIND_API_MODEL, "target_id": model},
+            "effort": effort,
+            **({"processing_preference": binding["processing_preference"]}
+               if "processing_preference" in binding else {}),
+            "review_eligible": True,
+            "minted_from": MINTED_FROM_FACTORY_DEFAULT,
+        })
+    return rows
+
+
+def factory_actor_rows(doc: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """The wizard's API/local task actors for a never-configured install (pure): one Auto
+    generalist on the reachable Main and a scout only for a reachable Light that differs in its
+    whole binding — exactly ``compile_available_subagents`` without sessions, as the wizard runs it,
+    so none without a reachable Main."""
+    available, _diagnostics = compile_available_subagents((), _factory_settings(doc))
+    return configured_subagents_dict(available)["items"] if available is not None else []
 
 
 def connected_preset_harnesses(discoveries: Sequence[HarnessDiscovery]) -> Tuple[str, ...]:
@@ -488,7 +569,7 @@ def _local_model(settings: Mapping[str, Any], slot: str, model: str) -> str:
 
 
 def _effective_api_models(settings: Mapping[str, Any]) -> Tuple[str, str]:
-    main = str(settings.get("OUROBOROS_MODEL") or "").strip()
+    main = _runtime_main(settings)
     light_raw = str(settings.get("OUROBOROS_MODEL_LIGHT") or "").strip()
     light = light_raw or main
     main = _local_model(settings, "MAIN", main) if main else ""
@@ -501,7 +582,7 @@ def _effective_api_models(settings: Mapping[str, Any]) -> Tuple[str, str]:
 
 
 def _actor(
-    row_id: str, recommendation: str, route: RouteSpec, effort: str,
+    row_id: str, recommendation: str, route: RouteSpec, effort: str, processing: str = "",
 ) -> ConfiguredSubagent:
     # `name` is retired (owner decision 1=A): identity is the neutral id plus
     # derived route facts; recommended_use is the one semantic field.
@@ -510,14 +591,8 @@ def _actor(
         recommended_use=recommendation,
         route=route,
         effort=effort,
+        processing_preference=processing,
     )
-
-
-def _task_effort(settings: Mapping[str, Any]) -> str:
-    effort = str(settings.get("OUROBOROS_EFFORT_TASK") or "medium").strip().lower()
-    from ouroboros.config import EFFORT_SCALE
-
-    return effort if effort in EFFORT_SCALE else "medium"
 
 
 def compile_available_subagents(
@@ -529,11 +604,19 @@ def compile_available_subagents(
     Install discovery leaves ``credential_profile_id`` absent so Claudexor can
     rotate accounts.  The bounded singleton migration may supply the same
     resolved row with its historical pin; both paths deliberately share this
-    one composition policy.
+    one composition policy. A minted ACTOR row carries no ``effort`` — Auto, so
+    the owner's effort range decides — unless its model id spells the level
+    (``_EFFORT_IN_MODEL_ID``); reviewer seats keep their explicit levels. An
+    API/local row runs its role's whole binding (``role_route_binding``), and a
+    row's identity is that whole binding: rows alike in every setting are one,
+    a Light on Main's model with its own account pin or processing is a second.
+    Main is read as the runtime runs it (a saved blank is the shipped Main); a
+    Light row only joins a session or that Main, so an API-only setup whose Main
+    has no access gets the typed ``main_without_access``, never a Light primary.
     """
     actors: list[ConfiguredSubagent] = []
     diagnostics: list[Dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()  # route kind, target, account pin, processing
 
     for index, row in enumerate(session_rows):
         harness = str(row["harness"])
@@ -542,7 +625,7 @@ def compile_available_subagents(
             str(row["target_id"]),
             str(row.get("credential_profile_id") or "").strip(),
         )
-        identity = (route.kind, route.target_id, route.credential_profile_id)
+        identity = (route.kind, route.target_id, route.credential_profile_id, "")
         if identity in seen:
             continue
         if index == 0:
@@ -553,35 +636,28 @@ def compile_available_subagents(
             row_id, recommendation = (
                 f"alternative-builder-{harness}", ALTERNATIVE_RECOMMENDATION,
             )
-        actors.append(_actor(row_id, recommendation, route, str(row["effort"])))
+        actors.append(_actor(row_id, recommendation, route,
+                             str(row["effort"]) if row.get("effort_in_model_id") else ""))
         seen.add(identity)
 
+    def api_actor(row_id: str, recommendation: str, role: str) -> bool:
+        binding = role_route_binding(settings, role)
+        route = RouteSpec(ROUTE_KIND_API_MODEL, binding["route"]["target_id"],
+                          binding["route"].get("credential_profile_id", ""))
+        processing = binding.get("processing_preference", "")
+        identity = (route.kind, route.target_id, route.credential_profile_id, processing)
+        if identity in seen:
+            return False
+        actors.append(_actor(row_id, recommendation, route, "", processing))
+        seen.add(identity)
+        return True
+
     main, light = _effective_api_models(settings)
-    main_effort = _task_effort(settings)
-    if not actors and (main or light):
-        primary_api = main or light
-        route = RouteSpec(ROUTE_KIND_API_MODEL, primary_api)
-        actors.append(_actor(
-            "primary-builder", PRIMARY_RECOMMENDATION, route,
-            main_effort if main else "low",
-        ))
-        seen.add((route.kind, route.target_id, ""))
-
-    if light:
-        route = RouteSpec(ROUTE_KIND_API_MODEL, light)
-        identity = (route.kind, route.target_id, "")
-        if identity not in seen:
-            actors.append(_actor("fast-scout", SCOUT_RECOMMENDATION, route, "low"))
-            seen.add(identity)
-
+    if not actors and main:
+        api_actor("primary-builder", PRIMARY_RECOMMENDATION, "main")
+    scout = bool(actors and light) and api_actor("fast-scout", SCOUT_RECOMMENDATION, "light")
     if len(session_rows) == 1 and main:
-        route = RouteSpec(ROUTE_KIND_API_MODEL, main)
-        identity = (route.kind, route.target_id, "")
-        if identity not in seen:
-            actors.append(_actor(
-                "independent-perspective", INDEPENDENT_RECOMMENDATION, route, main_effort,
-            ))
-            seen.add(identity)
+        api_actor("independent-perspective", INDEPENDENT_RECOMMENDATION, "main")
 
     if len(session_rows) == 1 and not (main or light):
         diagnostics.append({
@@ -591,7 +667,7 @@ def compile_available_subagents(
                 "Light API/local route to add another real actor."
             ),
         })
-    elif not session_rows and main and light and main == light:
+    elif not session_rows and main and light and not scout:
         diagnostics.append({
             "code": "duplicate_api_routes_omitted",
             "message": "Main and Light resolve to the same route, so no duplicate actor was created.",
@@ -599,17 +675,21 @@ def compile_available_subagents(
 
     if not actors:
         return None, ({
+            "code": "main_without_access",
+            "message": ("Main (OUROBOROS_MODEL) has no access in this setup, and the Light model does not "
+                        "stand in for it: choose a Main model with access or connect an agent subscription."),
+        } if light else {
             "code": "no_available_subagents",
             "message": "No connected session or credentialed API/local model is available.",
         },)
-    if len(actors) > 10:
-        omitted = actors[10:]
+    if len(actors) > MAX_CONFIGURED_SUBAGENTS:
+        omitted = actors[MAX_CONFIGURED_SUBAGENTS:]
         diagnostics.append({
             "code": "available_subagents_omitted",
             "count": len(omitted),
             "subagent_ids": [row.subagent_id for row in omitted],
         })
-        actors = actors[:10]
+        actors = actors[:MAX_CONFIGURED_SUBAGENTS]
     return make_configured_subagents(actors), tuple(diagnostics)
 
 
@@ -618,10 +698,12 @@ def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
     """Suggest a complete zero-key setup from exact raw-route catalog evidence.
 
     Existing usable/custom choices win. The model's backend default supplies
-    the proposal, not an invented model family or a CLI alias table.
+    the proposal, not an invented model family or a CLI alias table. Vision is
+    a row whose input modalities state image input, else blank: Auto, which
+    still tries an unknown route when an image needs one (``vision_routing``).
     """
     from ouroboros.model_slots import MODEL_ROLE_SETTINGS
-    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+    from ouroboros.settings_defaults import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS
 
     main = str(settings.get("OUROBOROS_MODEL") or "")
     if main and (model_has_credentials_in_settings(main, dict(settings))
@@ -630,116 +712,19 @@ def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
     default = next((row for row in model_catalog if row.get("is_default") and row.get("value")), None)
     if default is None:
         return {}
-    vision = next((row for row in model_catalog if "image" in (row.get("input_modalities") or [])
-                   and row.get("value")), default)
+    vision = next((str(row["value"]) for row in model_catalog if row.get("value")
+                   and image_input_from_modalities(row.get("input_modalities")) is True), "")
     proposed = {}
     for role, key in MODEL_ROLE_SETTINGS.items():
         if role == "websearch":
             continue  # Provider-owned web-search tools are a separate capability.
+        if key in RETIRED_SETTING_KEYS:
+            continue  # Never honored: the next load drops it with a retired-key notice to the owner.
         current = str(settings.get(key) or "")
         if current and current != str(SETTINGS_DEFAULTS.get(key) or ""):
             continue
-        proposed[key] = "" if role == "fallback" else str((vision if role == "vision" else default)["value"])
+        proposed[key] = {"fallback": "", "vision": vision}.get(role, str(default["value"]))
     return proposed
-
-
-def preview_api_reviewer_slots(settings: Mapping[str, Any]) -> str:
-    """Project ordinary API/local defaults for an unsaved wizard without mutating env.
-
-    The existing provider-normalization helpers own model policy. This is only
-    the structured editor representation of the same defaults, not a new panel.
-    """
-    from ouroboros.model_slots import get_deep_self_review_model
-    from ouroboros.provider_models import compatible_only_main_model
-    from ouroboros.server_runtime import (
-        _exclusive_direct_remote_provider,
-        _normalize_direct_review_models,
-        _normalize_direct_scope_review_models,
-        has_remote_provider,
-    )
-    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
-
-    authored = str(settings.get(REVIEWER_SLOTS_KEY) or "")
-    if authored:
-        return authored
-    provider = _exclusive_direct_remote_provider(dict(settings))
-    triad = list(OPENROUTER_REVIEW_DEFAULTS["triad"])
-    scope = list(OPENROUTER_REVIEW_DEFAULTS["scope"])
-    advisory_target = ""
-    if provider:
-        triad = _normalize_direct_review_models(dict(settings), provider).split(",")
-        scope = _normalize_direct_scope_review_models(dict(settings), provider).split(",")
-    elif compatible := compatible_only_main_model(settings):  # #1116: the one reachable route
-        triad, scope, advisory_target = [compatible] * len(triad), [compatible] * len(scope), compatible
-    if not has_remote_provider(dict(settings)) and str(settings.get("USE_LOCAL_MAIN")).lower() in {"true", "1"}:
-        triad = [str(settings.get("OUROBOROS_MODEL") or "")] * len(triad)
-        scope = [str(settings.get("OUROBOROS_MODEL") or "")] * len(scope)
-    def rows(models, surface):
-        # #1334: fresh triad rows read the work themselves; scope rows always read.
-        delivery = {"delivery": "native"} if surface == SURFACE_TRIAD else {}
-        return [{"slot_id": _slot_id(surface, i + 1),
-                 "route": {"kind": "api_chat", "target_id": model}, "effort": "", **delivery}
-                for i, model in enumerate(models) if model]
-    return json.dumps({
-        "triad": rows(triad, SURFACE_TRIAD), "scope": rows(scope, SURFACE_SCOPE),
-        "advisory": {"enabled": True, "route": {"kind": "api_chat", "target_id": advisory_target}, "effort": "low"},
-        "deep_review": {"route": {"kind": "api_chat", "target_id": get_deep_self_review_model(dict(settings))}, "effort": ""},
-    }, ensure_ascii=False)
-
-
-def preview_main_reviewer_slots(settings: Mapping[str, Any]) -> Tuple[str, str]:
-    """Rebind a visible review draft to Main, preserving effort and inspection.
-
-    Original task actors stay unchanged. A retrieving triad row becomes a direct
-    Main API row saved with ``delivery: native`` (#1334) — it keeps reading the
-    work itself with no roster actor minted for it; its effective effort stays
-    an independent row override. Other review surfaces already retrieve by
-    their surface contract. The returned reviewer and actor drafts are shown
-    together before the completion write.
-    """
-    from ouroboros.configured_subagents import normalize_configured_subagents
-    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, resolve_processing_preference
-    from ouroboros.provider_models import provider_for_model
-    from ouroboros.reviewer_slot_config import DELIVERY_NATIVE, parse_reviewer_slots, roster_env_override
-    from ouroboros.route_spec import compound_session_effort
-
-    main, _light = _effective_api_models(settings)
-    if not main:
-        raise ValueError("Choose a Main model with access in this setup before using it for reviews.")
-    profile = str(model_role_option(MODEL_ACCOUNTS_KEY, "main", settings=dict(settings)))
-    if profile and provider_for_model(main) != "claudexor":
-        raise ValueError("A Main account pin requires a managed model source.")
-    processing = resolve_processing_preference("main", settings=dict(settings))
-    roster, roster_raw = normalize_configured_subagents(settings[SUBAGENTS_SETTING])
-    raw = preview_api_reviewer_slots(settings)
-    with roster_env_override(roster_raw, environ=dict(settings)):
-        resolved = parse_reviewer_slots(raw)
-    payload = json.loads(raw)
-    payload["advisory"] = payload.get("advisory") or {"enabled": True}
-    payload["deep_review"] = payload.get("deep_review") or {}
-    pairs = [*((row, slot, slot.retrieves) for row, slot in zip(payload["triad"], resolved.triad)),
-             *((row, slot, False) for row, slot in zip(payload["scope"], resolved.scope)),
-             (payload["advisory"], resolved.advisory, False),
-             (payload["deep_review"], resolved.deep_review, False)]
-    for row, original, retrieving in pairs:
-        effort = original.effort if original else ""
-        if original and not effort and original.kind == "agent_session":
-            effort = compound_session_effort(RouteSpec(ROUTE_KIND_AGENT_SESSION, original.target_id))
-        for key in ("subagent_id", "route", "processing_preference", "delivery"):
-            row.pop(key, None)
-        row["effort"] = effort
-        row["route"] = {"kind": "api_chat", "target_id": main}
-        if profile:
-            row["route"]["profile_id"] = profile
-        if processing:
-            row["processing_preference"] = processing
-        if retrieving:
-            row["delivery"] = DELIVERY_NATIVE
-    raw, roster_raw = json.dumps(payload, ensure_ascii=False), serialize_configured_subagents(roster)
-    refusal = _validate_against_parser(raw, roster_raw)
-    if refusal:
-        raise ValueError(refusal.message)
-    return raw, roster_raw
 
 
 def compile_install_preset(
@@ -802,27 +787,23 @@ def compile_install_preset(
             )
 
     reviewer_connected = tuple(h for h in _POLICY_HARNESSES if h in connected)
-    reviewer_slots = ""
     resolved: Dict[str, List[Dict[str, Any]]] = {}
     if reviewer_connected:
         seats = _compile_policy_seats(reviewer_connected)
-        for surface in (SURFACE_ADVISORY, SURFACE_TRIAD, SURFACE_SCOPE):
+        for surface in (SURFACE_TRIAD, SURFACE_SCOPE):
             rows, refusal = _resolve_surface(seats[surface], discovery)
             if refusal is not None:
                 return SubscriptionInstallPreset(connected=connected, refusal=refusal)
             resolved[surface] = rows
-        if configured_subagents is None:
-            available, reviewer_slots, ref_diagnostics = _reference_reviewer_rows(
-                available, resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
-                resolved[SURFACE_ADVISORY][0])
-            if ref_diagnostics:
-                diagnostics = tuple(diagnostics) + tuple(ref_diagnostics)
-        else:
-            reviewer_slots = _inline_reviewer_slots_json(
-                resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE],
-                resolved[SURFACE_ADVISORY][0])
-        invalid = _validate_against_parser(
-            reviewer_slots, serialize_configured_subagents(available))
+        # The review pool IS catalog rows, so an owner draft is extended too
+        # (its marked rows are shown with it before the completion write); the
+        # former inline lane had no catalog to live in. No advisory seat exists:
+        # the preflight reviewer is a row the author names.
+        available, ref_diagnostics = _mark_review_rows(
+            available, resolved[SURFACE_TRIAD], resolved[SURFACE_SCOPE])
+        if ref_diagnostics:
+            diagnostics = tuple(diagnostics) + tuple(ref_diagnostics)
+        invalid = _validate_pool(serialize_configured_subagents(available))
         if invalid is not None:
             return SubscriptionInstallPreset(connected=connected, refusal=invalid)
 
@@ -836,12 +817,10 @@ def compile_install_preset(
         "diagnostics": list(diagnostics),
         "surfaces": {
             SURFACE_SUBAGENT: task_rows,
-            SURFACE_ADVISORY: (
-                resolved[SURFACE_ADVISORY][0] if resolved.get(SURFACE_ADVISORY) else None
-            ),
             SURFACE_TRIAD: resolved.get(SURFACE_TRIAD, []),
             SURFACE_SCOPE: resolved.get(SURFACE_SCOPE, []),
         },
+        "review_pool": [row.subagent_id for row in available.items if row.review_eligible],
         "discovery_counts": {h: len(discovery[h].model_ids) for h in connected},
         # Generated rows are deliberately unpinned so the daemon can rotate
         # accounts.  An exact owner draft may still carry a pin, and the
@@ -855,7 +834,7 @@ def compile_install_preset(
         receipt["capability"] = dict(capability)
     return SubscriptionInstallPreset(
         connected=connected,
-        reviewer_slots=reviewer_slots,
+        # The structured lane is retired: the pool rides inside the catalog.
         available_subagents=serialized_available,
         source=source,
         diagnostics=diagnostics,
@@ -871,10 +850,8 @@ __all__ = [
     "HARNESS_CURSOR",
     "PRESET_HARNESSES",
     "PRESET_MARKER_KEY",
-    "REVIEWER_SLOTS_KEY",
     "REVIEWER_PRESET_HARNESSES",
     "SUBSCRIPTION_PRESET_VERSION",
-    "SURFACE_ADVISORY",
     "SURFACE_SCOPE",
     "SURFACE_SUBAGENT",
     "SURFACE_TRIAD",
@@ -885,4 +862,7 @@ __all__ = [
     "compile_available_subagents",
     "compile_install_preset",
     "connected_preset_harnesses",
+    "factory_actor_rows",
+    "factory_review_rows",
+    "role_route_binding",
 ]

@@ -646,6 +646,20 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
         log.debug("delegated progress emit failed", exc_info=True)
 
 
+def emit_retained(ctx: Any, run_id: str) -> None:
+    """Retry local activity delivery without delaying a ready result on transport."""
+    fn = getattr(ctx, "emit_progress_fn", None)
+    if not callable(fn):
+        return
+    from ouroboros import delegate_activity
+    try:
+        for activity, commit in delegate_activity.retained_observations(ctx, run_id):
+            fn(delegate_activity.progress_text(activity), delegated_activity=activity)
+            commit()
+    except Exception:
+        log.debug("retained delegated progress emit failed", exc_info=True)
+
+
 def paused_note(pending_interactions: Optional[List[Dict[str, Any]]]) -> str:
     """The note of a run PAUSED on its own question(s): never "stuck" (owner 7=A /
     F13). Shared by the per-window payload and the supervising wake, which keeps it

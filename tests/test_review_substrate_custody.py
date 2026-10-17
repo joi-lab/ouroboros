@@ -159,6 +159,21 @@ def test_actor_projection_carries_bounded_disclosed_finding_rows():
     }]
     assert actors["triad-shape"]["findings_omitted"] == 0
 
+def test_actor_binding_is_attempt_identity():
+    """A changed actor reference mints a new custody attempt key (#285 class):
+    the pool row's ``subagent_id`` is part of the seat's identity."""
+    from ouroboros.review_custody import _attempt_key
+    from ouroboros.review_execution import ReviewRouteKind
+
+    request = SimpleNamespace(retry_key="", slot_messages={}, surface="multi_model_review",
+                              task_id="t", call_type="multi_model_review")
+    base = dict(slot_id="t1", model="openai/gpt-5.6-terra", effort="medium",
+                route=ReviewRouteKind.API_CHAT)
+    a = ReviewSlot(subagent_id="api-critic", **base)
+    b = ReviewSlot(subagent_id="", **base)
+    assert _attempt_key(request, a) != _attempt_key(request, b)
+
+
 def test_spent_owner_deadline_does_not_dispatch_a_review_worker(tmp_path):
     calls = []
     paid = []
@@ -692,7 +707,9 @@ def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
     # run then JOINED the still-active attempt instead of retrying (same drain
     # as test_late_agent_session_preflight_failure_can_retry).
     key = _attempt_key(request, slot)
-    deadline = time.monotonic() + 5.0
+    # Bounded preparation and publication may outlive the short result window; the slot
+    # deadlines below still exercise timeout and same-operation collection.
+    deadline = time.monotonic() + 30.0
     active = True
     while time.monotonic() < deadline:
         with _ACTIVE_LOCK:
@@ -701,15 +718,34 @@ def test_late_error_is_not_cached_as_a_permanent_review_verdict(tmp_path):
             break
         time.sleep(0.01)
     assert not active
+    retry_slot = ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.5)
     second = run_review_request(
-        request,
-        slots=[ReviewSlot(slot_id="slot_a", model="same/model", timeout_sec=0.5)],
-        drive_root=tmp_path,
-        llm=ErrorThenSuccess(),
-        usage_ctx=ctx,
-    )
-    assert len(calls) >= 2
-    assert second.actors[0]["status"] == "ok"
+        request, slots=[retry_slot], drive_root=tmp_path, llm=ErrorThenSuccess(), usage_ctx=ctx,
+    ).actors[0]
+    # The settled error was not replayed: the retry is a new physical operation.
+    assert second["operation_id"] != first.actors[0]["operation_id"]
+    if second["operation_state"] == "in_flight":
+        # Its 0.5s window is not this contract. Collect THAT operation from the
+        # same-context custody written before _ACTIVE retires it.
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            with _ACTIVE_LOCK:
+                settled = key in getattr(ctx, "_review_settled_attempts", {})
+                active = key in _ACTIVE
+            if settled and not active:
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("the retried review did not settle into same-context custody")
+        request.reconcile_only = True  # collect only; never dispatch a replacement
+        collected = run_review_request(
+            request, slots=[retry_slot], drive_root=tmp_path, llm=ErrorThenSuccess(), usage_ctx=ctx,
+        ).actors[0]
+        assert collected["operation_id"] == second["operation_id"]
+        assert collected["operation_state"] == "late_settled"
+        second = collected
+    assert second["status"] == "ok"
+    assert len(calls) == 2
 
 def test_late_agent_session_failure_is_replayed_without_a_second_run(tmp_path, monkeypatch):
     import threading

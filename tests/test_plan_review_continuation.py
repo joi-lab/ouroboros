@@ -1,55 +1,15 @@
-"""Every paid predecessor is CONTINUED per reviewer: a packet slot re-sends its exact
-recorded transcript plus the new packet when both fit its window, otherwise it goes out
-fresh with the cause disclosed on THAT row alone; a session slot resumes its sticky thread
-and the host never states a guess about its continuity. The first cycle discloses nothing."""
+"""Every participant is CONTINUED on its own: a packet seat re-sends its exact retained
+transcript plus the new turn when both fit its window, otherwise it goes out fresh with the
+cause disclosed for THAT seat alone; a session seat resumes its own recorded thread; a seat
+whose earlier delivery cannot be read goes out fresh while the others continue; the first
+ask continues nobody."""
 from __future__ import annotations
 
-import json
+from ouroboros.tools.plan_packet import PLAN_REPLY_CONTRACT
+from tests.test_plan_task_tool import CLEAN, _call, _record, _slots, _write
+from tests.test_plan_task_tool import harness as _plan_task_harness
 
-from tests.test_plan_review_engine import (  # noqa: F401
-    CLEAN, DECK_SPEC, _call, _control, _finding, _slots, _state, _user_text, harness,
-)
-
-_CONTINUATION = "continuation of prior transcript"
-
-
-def _deltas(actor: dict) -> list:
-    return [d for d in actor.get("capability_delta") or [] if d.get("requested") == _CONTINUATION]
-
-
-def _first_wave(h, answers=None):
-    sub = h.install(answers or {"s1": json.dumps([_finding("f1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
-    ctx = h.make_ctx()
-    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
-    return ctx, sub
-
-
-def test_first_cycle_carries_no_continuation_delta(harness):  # noqa: F811
-    _first_wave(harness)
-    assert all(not _deltas(a) for a in _state(harness)["waves"][-1]["actors"])
-
-
-def test_second_cycle_continues_the_api_transcript_without_a_requested_locator(harness, monkeypatch):  # noqa: F811
-    """The prior finding asked for no document, yet cycle 2 continues each packet slot's exact
-    recorded transcript: the second send begins with the cycle-1 request, then the reviewer's
-    own cycle-1 answer, then the new packet — and no row carries a restart delta."""
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    ctx, sub = _first_wave(harness)
-    from ouroboros.tools.plan_review_artifacts import authority_wave
-
-    exact = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
-    recorded = {r["slot_id"]: r for r in exact["reviewer_outputs"]}
-    assert recorded["s1"]["request_messages"], "cycle 1 recorded its packet"
-    sub2 = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    second = _call(ctx, {**DECK_SPEC, "acceptance_claims": ["the corrected claim"]})
-    assert _control(second) == {"outcome": "GREEN", "closed": True}
-    sent = sub2.calls[0]["request"].slot_messages
-    for sid in ("s1", "s2", "s3"):
-        prior = recorded[sid]["request_messages"]
-        assert sent[sid][:len(prior)] == prior, f"{sid} continues its exact recorded request"
-        assert sent[sid][len(prior)] == {"role": "assistant", "content": recorded[sid]["text"]}
-        assert sent[sid][-1]["role"] == "user" and "the corrected claim" in json.dumps(sent[sid][-1]["content"])
-    assert all(not _deltas(a) for a in _state(harness)["waves"][-1]["actors"])
+harness = _plan_task_harness  # the plan_task fixture, under the name its tests take
 
 
 def test_over_window_continuation_restarts_only_that_slot(monkeypatch):
@@ -65,43 +25,57 @@ def test_over_window_continuation_restarts_only_that_slot(monkeypatch):
     prior = [{"role": "system", "content": "sys"}, {"role": "user", "content": "x" * 2000},  # > 400 tokens * 4 chars
              {"role": "assistant", "content": "[]"}, {"role": "user", "content": "the new packet"}]
     out = dialogue_slot_inputs(slots, system_prompt="sys", user_content="the new packet", session_task="",
-                               manifest={}, slot_messages={"small": prior, "large": prior}, native_mandatory_chars=0)
+                               manifest={}, slot_messages={"small": prior, "large": prior}, native_mandatory_chars=0,
+                               output_contract=PLAN_REPLY_CONTRACT)
     assert out["continuation_restarted"] == {"small": "prior_transcript_exceeds_slot_window"}
     assert out["slot_messages"]["large"][:3] == prior[:3] and len(out["slot_messages"]["large"]) == 4
     assert len(out["slot_messages"]["small"]) == 2 and out["slot_messages"]["small"][0]["role"] == "system"
     assert out["slot_prompt_chars"]["small"] <= 400 * 4, "the fresh packet fits the small window"
 
 
-def test_resumed_session_rows_carry_no_fresh_session_delta(harness, monkeypatch):  # noqa: F811
-    """The live shape: cycle-1 session slot B recorded no thread id; in cycle 2 the API rows
-    continue their transcripts and the session row resumes its sticky thread — no row, and
-    never a session row, carries a "fresh session" delta."""
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    harness.state["slots"] = _slots(("s1", "m/a"), ("s2", "m/b", "session"), ("s3", "m/c"))
-    ctx, _sub = _first_wave(harness)
-    harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    second = _call(ctx, {**DECK_SPEC, "acceptance_claims": ["the corrected claim"]})
-    assert _control(second) == {"outcome": "GREEN", "closed": True}
-    actors = {a["slot_id"]: a for a in _state(harness)["waves"][-1]["actors"]}
-    assert actors["s2"]["route"] == "agent_session" and not _deltas(actors["s2"])
-    assert not _deltas(actors["s1"]) and not _deltas(actors["s3"])
+def _answer_with_thread(thread_id: str) -> dict:
+    return {"raw_text": CLEAN, "usage": {"prompt_tokens": 10, "completion_tokens": 5, "physical_attempt_state": "settled",
+                                         "cost": 0.0, "review_thread_id": thread_id}}
 
 
-def test_a_per_slot_miss_restarts_only_that_slot(harness, monkeypatch):  # noqa: F811
-    """A wave-level miss touches every packet slot; a per-slot miss touches one: with s2's
-    recorded transcript invalid, s2 goes out fresh with its cause and s1/s3 continue."""
-    from ouroboros.tools.plan_review_artifacts import continuation_inputs, persist_wave, slot_row
+def _continued(h, ask_index: int) -> dict:
+    return {p["seat_id"]: p["continued"] for p in _record(h)["asks"][ask_index]["participants"]}
 
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    slots = harness.state["slots"]
-    exact = {"schema_version": 2, "cycle_index": 1, "request_fingerprint": "f" * 64,
-             "slots": [slot_row(s) for s in slots],
-             "reviewer_outputs": [
-                 {"slot_id": "s1", "request_messages": [{"role": "user", "content": "p1"}], "text": "[]"},
-                 {"slot_id": "s2", "request_messages": [{}], "text": "[]"},
-                 {"slot_id": "s3", "request_messages": [{"role": "user", "content": "p3"}], "text": "[]"}]}
-    ref = persist_wave(harness.drive, "task-1", exact)
-    _slots_out, messages, _threads, causes = continuation_inputs(
-        harness.drive, "task-1", {"wave_artifact": ref}, slots, user_content="next")
-    assert causes == {"s2": "prior_api_transcript_invalid:s2"}
-    assert set(messages) == {"s1", "s3"} and messages["s1"][0] == {"role": "user", "content": "p1"}
+
+def test_a_session_participant_resumes_its_own_recorded_thread_and_nobody_continues_the_first_ask(harness):
+    """The first ask continues nobody. On a later ask the packet seat continues its own
+    transcript, the session seat whose answer recorded a thread resumes exactly that thread,
+    and a session seat whose answer recorded none starts a new one (no thread is invented)."""
+    harness.state["slots"] = _slots(("s1", "m/a"), ("s2", "cursor=grok", "session"), ("s3", "cursor=fable", "session"))
+    substrate = harness.install({"s1": CLEAN, "s2": _answer_with_thread("thread-7"), "s3": CLEAN})
+    ctx = harness.make_ctx()
+    _write(ctx, ask="council")
+    assert substrate.calls[0]["request"].session_threads == {}
+    assert _continued(harness, 0) == {"s1": False, "s2": False, "s3": False}
+    assert _record(harness)["asks"][0]["participants"][1]["review_thread_id"] == "thread-7"
+    substrate = harness.install({})
+    _call(ctx, ask="council", message="I revised nothing; what do you make of each other's answers?")
+    request = substrate.calls[0]["request"]
+    assert request.session_threads == {"s2": "thread-7"}
+    assert [m["role"] for m in request.slot_messages["s1"]] == ["system", "user", "assistant", "user"]
+    assert _continued(harness, 1) == {"s1": True, "s2": True, "s3": False}
+
+
+def test_a_seat_whose_retained_delivery_cannot_be_read_goes_out_fresh_alone(harness):
+    """A packet seat continues from the transcript its earlier ask retained. When that source
+    cannot be read the seat is sent fresh (no continuation claimed) and its peers still continue."""
+    from ouroboros.artifacts import task_artifact_dir_path
+
+    substrate = harness.install({})
+    ctx = harness.make_ctx()
+    _write(ctx, ask="council")
+    seat = next(p for p in _record(harness)["asks"][0]["participants"] if p["seat_id"] == "s2")
+    retained = task_artifact_dir_path(harness.drive, seat["delivery_ref"]["task_id"]) / seat["delivery_ref"]["ref"]["path"]
+    assert retained.is_file()
+    retained.unlink()
+    substrate = harness.install({})
+    _call(ctx, ask="council", message="again")
+    sent = substrate.calls[0]["request"].slot_messages
+    assert [m["role"] for m in sent["s2"]] == ["system", "user"]
+    assert [m["role"] for m in sent["s1"]] == [m["role"] for m in sent["s3"]] == ["system", "user", "assistant", "user"]
+    assert _continued(harness, 1) == {"s1": True, "s2": False, "s3": True}

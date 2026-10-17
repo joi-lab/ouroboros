@@ -256,3 +256,262 @@ def test_ui_project_completion_mirror_folds_after_mounting_on_a_hidden_page(dire
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+@pytest.mark.parametrize("width", [1280, 390])
+def test_ui_project_completion_mirror_has_one_project_door(direct_server_with_data, engine, width):  # noqa: F811
+    """The accepted replacement for Main's in-place expansion: a folded preview,
+    Copy, factual caveat/time and one keyboard-operable Project reference."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    import os
+    import re
+    from pathlib import Path
+    from playwright.sync_api import expect, sync_playwright
+    from ouroboros.projects_registry import create_project
+    from ouroboros.utils import append_jsonl
+
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR") or direct_server_with_data["data_dir"] / "evidence") / f"mirror-{engine}-{width}"
+    evidence.mkdir(parents=True, exist_ok=True)
+    root = direct_server_with_data["data_dir"]
+    project = create_project(root, f"mirror-door-{engine}-{width}", name="Long report")
+    answer = _LONG_ANSWER + "\n\nThe [deep link](https://example.com/deep) and `TAIL_MARKER` end it."
+    append_jsonl(root / "logs" / "chat.jsonl", {
+        "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
+        "project_id": project["id"], "project_name": project["name"], "status": "completed",
+        "ts": "2026-08-22T12:00:00+00:00", "task_id": "mirror-door",
+        "text": "Long report · Done with warnings\nOpen the Project for details.",
+        "completion_answer": answer, "completion_reason": "Windows verification was not performed.",
+        "terminal_time": {"v": 1, "source": "executor_terminal", "occurred_at": "2026-08-22T11:59:00Z"}})
+    tab = "Alt+Tab" if engine == "webkit" else "Tab"
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch(headless=True)
+        page = browser.new_page(viewport={"width": width, "height": 900})
+        page.add_init_script("""window.__copied = []; Object.defineProperty(navigator, 'clipboard', {configurable: true,
+            value: {writeText: async text => { window.__copied.push(text); }}});""")
+        try:
+            page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+            _wait_status(page, "Online", timeout=30_000)
+            row = page.locator('#chat-messages .chat-bubble.project-answer[data-task-id="mirror-door"]')
+            for stage in ("history", "reload"):
+                expect(row).to_have_class(re.compile(r'\bis-folded\b'))
+                row.scroll_into_view_if_needed()
+                message = row.locator('.message')
+                assert message.evaluate('n => n.scrollHeight > n.clientHeight && n.clientHeight > 0')
+                assert 'TAIL_MARKER' in message.text_content()
+                assert row.locator('[data-answer-fold], .project-answer-files').count() == 0
+                assert row.get_by_role('button', name='Files', exact=True).count() == 0
+                assert message.locator('[data-fold-stop]').count() == 1
+                assert message.locator('a').evaluate_all('ns => ns.every(n => n.tabIndex === -1)')
+                expect(row.locator('.project-answer-limitation')).to_have_text('Windows verification was not performed.')
+                assert row.locator(':scope > .msg-provenance').count() == 2
+                assert row.locator('.msg-time').inner_text()
+                assert row.locator('.system-message-actions').locator('button').count() == 1
+                row.screenshot(path=str(evidence / f'{stage}.png'))
+                if stage == 'history':
+                    row.locator('.chat-message-copy').click()
+                    page.wait_for_function('() => window.__copied.length === 1')
+                    assert page.evaluate('() => window.__copied[0]') == answer
+                    page.reload(wait_until='domcontentloaded')
+                    _wait_status(page, 'Online', timeout=30_000)
+            # The hidden tail cannot receive Tab; the existing Project reference can.
+            row.locator('.sender').click()
+            project_ref = row.locator('[data-intent="open-project"]')
+            for _ in range(8):
+                page.keyboard.press(tab)
+                assert not message.evaluate('n => n.contains(document.activeElement)'), 'focus reached clipped text'
+                if project_ref.evaluate('n => n === document.activeElement'):
+                    break
+            expect(project_ref).to_be_focused()
+            page.keyboard.press('Enter')
+            expect(page.locator('#project-panel-title')).to_have_text(project['name'])
+        finally:
+            browser.close()
+
+
+@pytest.mark.ui_browser
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_ui_folded_completion_excludes_late_table_focus(direct_server_with_data, engine):  # noqa: F811
+    """Table enhancement/resize must not create a keyboard door into clipped Main text.
+    The identical ordinary Project table remains a named, keyboard-scrollable region.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    import json
+    import os
+    import re
+    from pathlib import Path
+    from playwright.sync_api import expect, sync_playwright
+    from ouroboros.projects_registry import create_project
+    from ouroboros.utils import append_jsonl
+
+    root = direct_server_with_data["data_dir"]
+    project = create_project(root, f"table-focus-{engine}", name="Table report")
+    table = ("| " + " | ".join(f"Column {i}" for i in range(8)) + " |\n"
+             + "| " + " | ".join("---" for _ in range(8)) + " |\n"
+             + "\n".join("| " + " | ".join("wide-cell-" + "X" * 70 for _ in range(8)) + " |" for _ in range(4)))
+    answer = _LONG_ANSWER + "\n\n" + table + "\n\nTABLE_FOCUS_TAIL"
+    append_jsonl(root / "logs" / "chat.jsonl", {
+        "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
+        "project_id": project["id"], "project_name": project["name"], "status": "completed",
+        "ts": "2026-08-22T12:00:00+00:00", "task_id": "table-focus",
+        "text": "Table report · Done", "completion_answer": answer})
+    append_jsonl(root / "logs" / "chat.jsonl", {
+        "direction": "out", "chat_id": int(project["chat_id"]), "user_id": 1,
+        "ts": "2026-08-22T11:59:00+00:00", "task_id": "table-focus", "text": answer})
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR") or root / "evidence") / f"table-focus-{engine}"
+    evidence.mkdir(parents=True, exist_ok=True)
+    observations = []
+    tab = "Alt+Tab" if engine == "webkit" else "Tab"
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch(headless=True)
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        page.add_init_script("""window.__copied = []; Object.defineProperty(navigator, 'clipboard', {configurable: true,
+            value: {writeText: async text => { window.__copied.push(text); }}});""")
+        try:
+            page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+            _wait_status(page, "Online", timeout=30_000)
+            row = page.locator('#chat-messages .project-answer[data-task-id="table-focus"]')
+            expect(row).to_have_class(re.compile(r'\bis-folded\b'))
+            message, tables = row.locator('.message'), row.locator('.md-table-wrap')
+            # Wait for the real late ResizeObserver callback, not merely rendered Markdown.
+            expect(tables.first).to_have_attribute('role', 'region')
+            row.scroll_into_view_if_needed()
+            for stage, width in (("initial", 1280), ("late-write", 1280), ("resize", 390)):
+                if stage == "late-write":
+                    # A renderer can append a table after the preview was measured. Exercise
+                    # the production binding's existing mutation/resize path, not a mock.
+                    message.evaluate('''n => {
+                        const table = n.querySelector('.md-table-wrap').cloneNode(true);
+                        for (const name of ['tabindex', 'role', 'aria-label', 'data-fold-stop', 'data-scroll-start', 'data-scroll-end']) table.removeAttribute(name);
+                        n.appendChild(table);
+                    }''')
+                wrap = tables.last
+                expect(wrap).to_have_attribute('role', 'region')
+                page.set_viewport_size({"width": width, "height": 900})
+                # Two frames settle both fold measurement and the table's own resize callback.
+                page.evaluate('() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
+                expect(row).to_have_class(re.compile(r'\bis-folded\b'))
+                row.locator('.sender').click()
+                project_ref = row.locator('[data-intent="open-project"]')
+                hidden_focus = False
+                for _ in range(12):
+                    page.keyboard.press(tab)
+                    state = message.evaluate('n => ({scroll: n.scrollTop, hiddenFocus: n.contains(document.activeElement), active: document.activeElement?.outerHTML})')
+                    observations.append({"stage": stage, "width": width, "table_tabindex": wrap.get_attribute('tabindex'), **state})
+                    hidden_focus |= state['hiddenFocus']
+                    if project_ref.evaluate('n => n === document.activeElement'):
+                        break
+                row.screenshot(path=str(evidence / f'main-{stage}-{width}.png'))
+                assert not hidden_focus, observations
+                assert message.evaluate('n => n.scrollTop') == 0, observations
+                assert wrap.get_attribute('tabindex') == '-1'
+                expect(project_ref).to_be_focused()
+            assert row.locator('[data-answer-fold], .project-answer-files').count() == 0
+            row.locator('.chat-message-copy').click()
+            page.wait_for_function('() => window.__copied.length === 1')
+            assert page.evaluate('() => window.__copied[0]') == answer
+            project_ref.click()
+            panel = page.locator(f'#panel-pchat-{project["id"]}')
+            expect(panel).to_be_visible()
+            full_table = panel.locator('.chat-bubble.assistant .md-table-wrap')
+            expect(full_table).to_have_attribute('tabindex', '0')
+            expect(full_table).to_have_attribute('role', 'region')
+            assert full_table.get_attribute('aria-label')
+            # Enter by the real sequential-key path, not programmatic focus.
+            panel.locator('.chat-bubble.assistant .sender').click()
+            for _ in range(12):
+                page.keyboard.press(tab)
+                if full_table.evaluate('n => n === document.activeElement'):
+                    break
+            expect(full_table).to_be_focused()
+            before = full_table.evaluate('n => n.scrollLeft')
+            # WebKit scrolls focused regions while held, not on a zero-duration tap
+            # (the same consumer contract as test_markdown_reading_browser.py).
+            page.keyboard.press('ArrowRight', delay=300)
+            page.wait_for_function('(n) => n.scrollLeft > 0', arg=full_table.element_handle())
+            assert full_table.evaluate('n => n.scrollLeft') > before
+            panel.screenshot(path=str(evidence / 'project-table.png'))
+            page.locator('#project-panel-close').click()
+            expect(panel).not_to_be_visible()
+            # Change only the fixture's fold height: table width/height stay fixed.
+            # This isolates syncFold -> MutationObserver restoration from table resize.
+            # Pin the fixture table width: WebKit's page scrollbar otherwise
+            # changes its width by six pixels when the message becomes taller.
+            tables.first.evaluate('n => { n.style.minWidth = `${n.clientWidth}px`; n.style.maxWidth = "none"; }')
+            page.evaluate('() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)))')
+            dimensions = tables.first.evaluate('n => [n.clientWidth, n.clientHeight]')
+            message.evaluate("n => n.style.maxHeight = 'none'")
+            page.evaluate("window.dispatchEvent(new Event('resize'))")
+            expect(row).not_to_have_class(re.compile(r'\bis-folded\b'))
+            expect(tables.first).to_have_attribute('tabindex', '0')
+            assert tables.first.evaluate('n => [n.clientWidth, n.clientHeight]') == dimensions
+            observations.append({'stage': 'unfold-without-table-resize', 'table_tabindex': tables.first.get_attribute('tabindex')})
+        finally:
+            (evidence / 'focus.json').write_text(json.dumps(observations, indent=2), encoding='utf-8')
+            browser.close()
+
+
+@pytest.mark.ui_browser
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_ui_folded_completion_excludes_delayed_diagram_fallback(direct_server_with_data, engine):  # noqa: F811
+    """A late real Mermaid load failure cannot add a hidden keyboard stop."""
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    import re
+    from playwright.sync_api import expect, sync_playwright
+    from ouroboros.projects_registry import create_project
+    from ouroboros.utils import append_jsonl
+
+    root = direct_server_with_data["data_dir"]
+    project = create_project(root, f"late-diagram-{engine}", name="Diagram report")
+    # The fallback is also an implicitly keyboard-focusable overflowing code box.
+    diagram_source = 'graph TD; A-->B\n%% ' + 'X' * 250
+    answer = _LONG_ANSWER + '\n\n```mermaid\n' + diagram_source + '\n```'
+    append_jsonl(root / "logs" / "chat.jsonl", {
+        "direction": "system", "chat_id": 1, "user_id": 1, "type": "project_completion_summary",
+        "project_id": project["id"], "project_name": project["name"], "status": "completed",
+        "ts": "2026-08-22T12:00:00+00:00", "task_id": "late-diagram",
+        "text": "Diagram report · Done", "completion_answer": answer})
+    append_jsonl(root / "logs" / "chat.jsonl", {
+        "direction": "out", "chat_id": int(project["chat_id"]), "user_id": 1,
+        "ts": "2026-08-22T11:59:00+00:00", "task_id": "late-diagram", "text": answer})
+    tab = "Alt+Tab" if engine == "webkit" else "Tab"
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch(headless=True)
+        page = browser.new_page(viewport={"width": 1146, "height": 792})
+        page.add_init_script("""window.__copied = []; Object.defineProperty(navigator, 'clipboard', {configurable: true,
+            value: {writeText: async text => { window.__copied.push(text); }}});""")
+        pending = []
+        page.route("**/mermaid.min.js", lambda route: pending.append(route))
+        try:
+            with page.expect_request("**/mermaid.min.js"):
+                page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+            row = page.locator('#chat-messages .project-answer[data-task-id="late-diagram"]')
+            expect(row).to_have_class(re.compile(r'\bis-folded\b'))
+            assert row.locator('[data-code-copy]').count() == 0
+            pending.pop().abort()
+            button = row.locator('[data-code-copy]')
+            expect(button).to_have_attribute('tabindex', '-1')
+            row.locator('.sender').click()
+            reference = row.locator('[data-intent="open-project"]')
+            for _ in range(12):
+                page.keyboard.press(tab)
+                assert not row.locator('.message').evaluate('n => n.contains(document.activeElement)')
+                if reference.evaluate('n => n === document.activeElement'):
+                    break
+            expect(reference).to_be_focused()
+            assert row.locator('.message').evaluate('n => n.scrollTop') == 0
+            page.unroute("**/mermaid.min.js")
+            page.route("**/mermaid.min.js", lambda route: route.abort())
+            reference.click()
+            panel = page.locator(f'#panel-pchat-{project["id"]}')
+            ordinary = panel.locator('[data-code-copy]')
+            expect(ordinary).to_be_visible()
+            assert ordinary.evaluate('n => n.tabIndex') == 0
+            ordinary.click()
+            expect(ordinary).to_have_text('Copied')
+            copied = page.evaluate('() => window.__copied.at(-1)')
+            assert copied == panel.locator('.md-code-block pre > code').inner_text()
+            assert copied.strip() == diagram_source
+        finally:
+            browser.close()

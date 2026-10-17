@@ -3,7 +3,7 @@
 ``logs/chat.jsonl`` rotates verbatim into ``archive/chat_<ts>.jsonl``; the
 ordered archives plus the live file are the whole conversation. These readers
 are shared by ``chat_history``, the generation-aware chat reader in ``memory``,
-the owner-message source lens in ``project_dialogue``, reflection, the
+the owner-message source lens in ``project_dialogue``, the
 consciousness wake and the one-time legacy import in ``chronicle_import``. Callers
 use ``chat_chain.retain_memory_source`` as a module attribute, so one
 substitution reaches every caller.
@@ -406,12 +406,12 @@ def iter_room_rows(root: Any, room_id: Any, *, from_addr: Any = None, to_addr: A
     own address: a redelivered message is not folded into its first copy.
     """
     from ouroboros.project_dialogue import room_membership, source_refs_for_project
-    from ouroboros.projects_registry import all_task_bindings, list_reserved_projects
+    from ouroboros.projects_registry import list_reserved_projects, RoomResolver
 
     root, chat = pathlib.Path(root), int(room_id)
     projects = {int(project["chat_id"]) for project in list_reserved_projects(root)}
     refs = source_refs_for_project(root, chat) if chat in projects else []
-    member = room_membership(chat, projects, refs, all_task_bindings(root))
+    member = room_membership(chat, projects, refs, RoomResolver(root))
     tasks = None if task_ids is None else {str(task) for task in task_ids}
     lower, upper = _period_bounds(period)
 

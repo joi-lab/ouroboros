@@ -27,17 +27,6 @@ body {
     position: relative;
 }
 
-#matrix-rain {
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    opacity: 0.12;
-    pointer-events: none;
-    z-index: 0;
-}
-
 /* App navigation shell: desktop persistent sidebar, mobile drawer below. */
 .mobile-nav-toggle {
     display: none;
@@ -59,6 +48,48 @@ body {
     border-right: 1px solid var(--divider);
     z-index: 10;
     position: relative;  /* positioning context for the resize handle */
+}
+
+/* macOS desktop window (launcher_window_chrome.py): while its transparent title bar covers the page,
+   the shell writes the band's height and the traffic lights' far edge here, measured, in CSS px.
+   The sidebar starts below the band; content reaching the left edge (drawer layout, a project panel
+   as wide as the window) starts past the lights. Without the shell's attribute nothing moves. */
+:root[data-window-chrome="integrated"] {
+    --window-chrome-top: 0px;
+    --window-chrome-start: 0px;
+    --window-chrome-clearance: calc(var(--window-chrome-start) + var(--space-3));
+}
+:root[data-window-chrome="integrated"] #primary-sidebar {
+    padding-top: calc(var(--space-4) + var(--window-chrome-top));
+}
+:root[data-window-chrome="integrated"] .onboarding-overlay {
+    box-sizing: border-box;
+    padding-top: var(--window-chrome-top);
+}
+/* Main's header floats over its transcript and lets a press between its groups through to the row beneath, a
+   link or button the owner cannot see: inside the band this strip takes such a press for the title bar. The
+   header's groups stay above it; the feed keeps its scrollbar (the global 6px ::-webkit-scrollbar). */
+:root[data-window-chrome="integrated"] .chat-page-header::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 6px;
+    height: var(--window-chrome-top);
+    z-index: -1;
+    pointer-events: auto;
+}
+:root[data-window-chrome="integrated"] .project-panel-bar {
+    padding-left: max(14px, calc(var(--window-chrome-clearance) + var(--project-panel-width) - 100vw));
+}
+@media (max-width: 900px) {
+    :root[data-window-chrome="integrated"] .project-panel-bar { padding-left: max(14px, var(--window-chrome-clearance)); }
+}
+@media (max-width: 640px) {
+    :root[data-window-chrome="integrated"] #primary-sidebar {
+        padding-top: max(64px, calc(var(--space-4) + var(--window-chrome-top)));
+    }
+    :root[data-window-chrome="integrated"] .app-page-header { padding-left: max(12px, var(--window-chrome-clearance)); }
 }
 
 /* Resizable side-section drag handles (v6.33.0). Thin edge strips that set
@@ -274,9 +305,18 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-actions {
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: flex-end;
     gap: var(--space-2);
-    padding: 0 14px var(--space-2);
+    padding: 0 var(--space-4) var(--space-3);
+}
+
+/* In the card's foot the controls are the action row's right end: [Reply] [Resume] [Stop…]. */
+.chat-live-foot-end > .chat-live-actions {
+    flex: 0 1 auto;
+    margin-inline-start: auto;
+    padding: 0;
 }
 
 /* S3 (Q2/HQ1): the three-action task stop/hurry dropdown (Chat + Activity). */
@@ -291,7 +331,8 @@ body.resizing-panels { user-select: none; }
     padding: var(--space-2);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-md);
-    background: rgba(var(--shell-rgb), 0.94);
+    /* An opaque modal surface: a menu over a card's footer must not let its text read through. */
+    background: rgb(var(--modal-rgb));
     backdrop-filter: blur(18px);
     -webkit-backdrop-filter: blur(18px);
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
@@ -304,9 +345,11 @@ body.resizing-panels { user-select: none; }
     border: none;
     border-radius: var(--radius-sm);
     background: transparent;
-    color: var(--text-secondary);
+    /* Each item is an action the owner can take: legible at rest, on the body size. */
+    color: var(--text-primary);
     font: inherit;
-    font-size: 13px;
+    font-size: var(--type-body);
+    line-height: var(--line-body);
     text-align: left;
     padding: var(--space-2) var(--space-3);
     cursor: pointer;
@@ -324,11 +367,6 @@ body.resizing-panels { user-select: none; }
 .task-control-item:disabled {
     opacity: 0.6;
     cursor: default;
-}
-
-/* HQ1 compact card status: hurry applied — a phase chip, never a chat bubble. */
-.chat-live-card[data-owner-hurry] [data-live-phase]::after {
-    content: ' ⏩';
 }
 
 /* Layout-only composition for the row under a question, a Project lifecycle row or a
@@ -351,7 +389,8 @@ body.resizing-panels { user-select: none; }
 .chat-quiz-project.chat-live-project-card-btn {
     flex: 0 1 auto; width: auto; min-width: 0; max-width: min(100%, 32ch);
     margin-inline-end: auto;
-    padding: 1px 8px;
+    /* A reference is a control: at least a 24px target (it measured 20px). */
+    padding: var(--space-1) var(--space-3);
     gap: var(--space-1);
     border: 1px solid var(--project-18);
     border-radius: var(--pill-radius);
@@ -369,7 +408,7 @@ body.resizing-panels { user-select: none; }
 /* A Project root's final answer in Main is an ordinary Ouroboros message (docs/DESIGN.md
    "Project completion mirror"): folded when it is long, with the Project chip under it. The
    clamp is unconditional CSS over the complete text (never a cut, the text stays selectable);
-   `is-folded` adds the fade only when the fold really hides something. */
+   `is-folded` adds the fade only when the fold hides text. The Project opens the complete answer. */
 .chat-bubble.project-answer {
     --project-answer-fold: calc(var(--type-section) * var(--line-body) * 7);
 }
@@ -379,7 +418,66 @@ body.resizing-panels { user-select: none; }
     mask-image: linear-gradient(180deg, black 60%, transparent 100%);
 }
 .chat-bubble.project-answer > .message > :first-child { margin-top: 0; }
-.chat-bubble.project-answer > .system-message-actions { align-items: center; padding-block: var(--space-2) var(--space-1); }
+.chat-bubble.project-answer > .system-message-actions,
+.chat-bubble.assistant > .system-message-actions { align-items: center; padding-block: var(--space-2) var(--space-1); }
+.chat-bubble.assistant > .system-message-actions .chat-quiz-project { min-height: var(--space-5); max-width: min(100%, 64ch); }
+.project-answer-limitation { color: var(--text-meta); white-space: normal; overflow-wrap: anywhere; }
+/* Main's questions and owner actions (docs/DESIGN.md "Project question mirror"). The waiting
+   pill is one of the composer's pills (Swarm / Context / Effort): their row, height and type, at
+   the row's end, amber for "waits for you"; a narrow row keeps the glyph and the number. */
+.chat-question-nav {
+    order: 9;
+    margin-inline-start: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: var(--composer-control-height);
+    padding: 0 12px;
+    border: 1px solid var(--status-warn-border);
+    border-radius: 999px;
+    background: var(--status-warn-bg);
+    color: var(--status-warn-fg);
+    box-shadow: var(--composer-control-shadow);
+    font: inherit;
+    font-size: var(--composer-control-font-size);
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.chat-question-nav[hidden] { display: none; }
+.chat-question-nav:hover { border-color: var(--status-warn-fg); }
+.chat-question-nav:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+.chat-question-nav-arrow.down { transform: rotate(180deg); }
+.chat-toolbar-row[data-owner-solo] .chat-question-nav { display: none; }
+@container composer (max-width: 460px) {
+    .chat-question-nav { padding: 0 10px; gap: 4px; }
+    .chat-question-nav-word, .chat-question-nav-arrow { display: none; }
+}
+/* A quiz card's head ends with its status and, while it takes an answer, one quiet × that closes it. */
+.chat-quiz-head-end { margin-inline-start: auto; display: inline-flex; align-items: center; gap: var(--space-3); min-width: 0; }
+.chat-quiz-close {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--ui-card-border);
+    border-radius: 50%;
+    background: var(--ui-card-bg-soft);
+    color: var(--text-meta);
+    cursor: pointer;
+}
+.chat-quiz-close:hover:not(:disabled) { color: var(--text-primary); border-color: var(--focus-accent-border); }
+.chat-quiz-close:disabled { color: var(--text-disabled); cursor: default; }
+.chat-quiz-close:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+@media (pointer: coarse) { .chat-quiz-close::after { content: ''; position: absolute; inset: -10px; } }
+/* An owner-required action is a System message: the task, one sentence, the task's own controls. */
+.owner-action-body { display: flex; flex-direction: column; gap: var(--space-2); }
+.owner-action-reason { font-size: var(--type-meta); color: var(--text-meta); }
+.chat-quiz-materials { display: flex; flex-wrap: wrap; gap: var(--space-2); margin-block: var(--space-2); }
 /* Under any message the reference has the row to itself, so its name may run longer than in a quiz head. */
 .system-message-actions .chat-quiz-project { margin-inline-end: 0; max-width: min(100%, 44ch); }
 /* === design-system:migrated-end === */
@@ -396,15 +494,6 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-actions:empty {
     display: none;
-}
-
-/* P3 — a converted card becomes a calm "project identity" chip. The whole card
-   recolors from the red task accent to the project fuchsia over ~250ms; the live
-   timeline is gone (the project panel owns it now), so the main chat is freed. */
-.chat-live-card.is-project {
-    border-color: var(--project-18);
-    background: var(--project-08);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(240, 171, 252, 0.05);
 }
 
 .chat-live-project-card-btn {
@@ -460,47 +549,75 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-meta);
 }
 
-/* F4 — a bound (project-chat) card keeps its live timeline above and gets the
-   project pointer as a calm fuchsia footer, so a divider sets it apart. */
+/* A Project door that is a row or a capsule carries the glyph on a light tile of
+   the Project tint, the glyph in project ink: a mark, never a second button
+   (docs/DESIGN.md "Visual intent"); the question head keeps its compact pill. */
+.chat-live-bound-pointer .chat-live-project-icon,
+.system-message-actions .chat-quiz-project .chat-live-project-icon,
+.msg-routing-annotation .chat-quiz-project .chat-live-project-icon {
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: var(--space-5);
+    height: var(--space-5);
+    border-radius: var(--radius-sm);
+    background: var(--project-18);
+    color: var(--project);
+    font-size: var(--type-body);
+}
+
+/* Under a message the reference is a capsule with the reading size and a full target; the one-line receipt
+   that names a room (`Passed on to the work in`) carries the same capsule after its words. */
+.system-message-actions .chat-quiz-project.chat-live-project-card-btn,
+.msg-routing-annotation .chat-quiz-project.chat-live-project-card-btn {
+    min-height: var(--touch-target-min);
+    padding: var(--space-1) var(--space-3) var(--space-1) var(--space-1);
+    gap: var(--space-2);
+    font-size: var(--type-body);
+}
+.system-message-actions .chat-quiz-project :is(.chat-live-project-name, .chat-live-project-status),
+.msg-routing-annotation .chat-quiz-project :is(.chat-live-project-name, .chat-live-project-status) {
+    font-size: var(--type-body);
+}
+
+/* The card of a work that lives in a Project ends with that Project's reference (A's bound footer): a wide
+   fuchsia strip across the card's full width with the Project mark, the name in the Project hue and the arrow
+   on a round mark at the row's end. The task title stays the one primary thing in text ink. Same insets as the
+   card body, so the mark lines up with the chip and the title. */
 .chat-live-bound-pointer {
+    /* The card's footer, not a pill inside it: square corners (the card clips its own bottom corners) and a
+       hairline that runs edge to edge. */
+    border-radius: 0;
+    gap: var(--space-2);
+    min-height: var(--touch-target-min);
+    padding: var(--space-2) var(--space-4);
     border-top: 1px solid var(--project-18);
     background: var(--project-08);
-}
-
-/* On a task card the task title stays the one primary thing; the pointer's
-   project name steps down to meta ink. */
-.chat-live-bound-pointer .chat-live-project-name {
-    font-weight: 500;
-    color: var(--text-meta);
-}
-
-.project-handoff-heading {
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    gap: var(--space-2);
-    padding: var(--space-3);
-}
-
-.project-handoff-title {
-    min-width: 0;
-    overflow-wrap: anywhere;
     font-size: var(--type-body);
-    color: var(--text-primary);
+    line-height: var(--line-body);
 }
 
-.chat-bubble.system.project-handoff {
-    border-color: var(--project-18);
-    background: var(--project-08);
+.chat-live-bound-pointer .chat-live-project-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    font-weight: 500;
+    color: var(--project);
 }
 
-/* A converted card whose Main history receipt is not durable: the binding
-   holds, the anchor does not survive a reload — say so with the border. */
-.chat-bubble.system.project-handoff--unsaved,
-.project-handoff--unsaved { border-style: dashed; }
+.chat-live-bound-pointer .chat-live-project-status {
+    display: inline-grid;
+    place-items: center;
+    width: var(--space-5);
+    height: var(--space-5);
+    border: 1px solid var(--project-18);
+    border-radius: var(--pill-radius);
+    font-size: var(--type-body);
+}
 
-.project-handoff > .sender { display: none; }
-.project-handoff .message { padding: 0; }
 
 .nav-section {
     display: flex;
@@ -1014,13 +1131,21 @@ body.resizing-panels { user-select: none; }
 
 /* === design-system:migrated-begin (chat: page header, budget pill, load-older) === */
 
+/* Main's header is one bar like a Project's: the title with the room's status right after it, then the agent's
+   commands. The title block's flex basis, never a word, decides whether the commands share its row: below that
+   width they wrap onto their own row, still at the trailing edge, so no status word can wrap, stretch or move
+   anything (the title and the word ellipsize inside the block instead). */
 .chat-page-header {
     position: absolute;
     top: 0;
     left: 0;
     right: 0;
     z-index: 5;
-    row-gap: 10px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: var(--space-3);
+    row-gap: calc(var(--space-2) + var(--chrome-inset));
     pointer-events: none;
     background: transparent;
     backdrop-filter: none;
@@ -1029,19 +1154,24 @@ body.resizing-panels { user-select: none; }
     mask-image: none;
     overflow: visible;
 }
+.chat-page-header > .app-page-leading { flex: 0 0 auto; }
+.chat-page-header > .app-page-title-block { flex: 999 1 min(15rem, calc(100% - 44px - var(--space-3))); min-width: 0; }
+.chat-page-header > .app-page-actions { flex: 1 1 auto; gap: 6px; justify-content: flex-end; }
 
-/* Blur is decoration, so fade its own layer without masking header actions. */
+/* The header's reading backing (DESIGN §5): page ink under everything readable (title, every wrapped line
+   of controls, the history note) that fades only in the band below it, so moving messages never show
+   through header text, closed or open. The mask stays on this layer, never on the actions. */
 .chat-page-header::before {
     content: "";
     position: absolute;
-    inset: 0;
+    inset: 0 0 calc(-1 * var(--space-4));
     z-index: -1;
     pointer-events: none;
-    background: linear-gradient(180deg, var(--bg-primary), transparent);
+    background: var(--bg-primary);
     backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
-    -webkit-mask-image: linear-gradient(180deg, black 45%, transparent 100%);
-    mask-image: linear-gradient(180deg, black 45%, transparent 100%);
+    -webkit-mask-image: linear-gradient(180deg, black calc(100% - var(--space-4)), transparent);
+    mask-image: linear-gradient(180deg, black calc(100% - var(--space-4)), transparent);
 }
 
 .chat-page-header > * {
@@ -1061,12 +1191,8 @@ body.resizing-panels { user-select: none; }
 .chat-header-btn {
     border: 1px solid rgba(var(--neutral-rgb), 0.12);
     background: rgba(var(--shell-rgb), 0.55);
-    backdrop-filter: blur(8px);
     color: var(--text-secondary);
-    border-radius: 999px;
-    padding: 7px 14px;
     font-size: var(--type-meta);
-    line-height: 1.2;
     font-weight: 600;
     cursor: pointer;
     white-space: nowrap;
@@ -1177,11 +1303,8 @@ body.resizing-panels { user-select: none; }
     flex-direction: column;
     align-items: center;
     gap: 3px;
-    padding: 4px 12px;
-    border-radius: 999px;
     border: 1px solid rgba(245, 158, 11, 0.18);
     background: rgba(var(--shell-rgb), 0.55);
-    backdrop-filter: blur(8px);
     cursor: pointer;
     min-width: 100px;
     font: inherit;
@@ -1234,6 +1357,11 @@ body.resizing-panels { user-select: none; }
 .status-badge.starting { color: var(--status-warn-fg); }
 .status-badge.error { color: var(--status-error-fg); }
 .status-badge.offline { color: var(--text-muted); }
+.chat-page-header .status-badge,
+.chat-panel-statusbar .status-badge {
+    max-width: 100%;
+    white-space: normal;
+}
 .status-badge.thinking {
     color: var(--accent);
     animation: thinking-pulse 1.5s ease-in-out infinite;
@@ -1304,9 +1432,7 @@ body.resizing-panels { user-select: none; }
     max-width: none;
     text-align: left;
     overflow-wrap: anywhere;
-    background: var(--bg-primary);
 }
-
 .typing-bubble { opacity: 0.7; }
 .typing-dots {
     display: inline-flex;
@@ -1346,13 +1472,28 @@ body.resizing-panels { user-select: none; }
     backdrop-filter: blur(10px);
 }
 
-.onboarding-frame {
+.onboarding-surface {
     position: relative;
     z-index: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
     width: 100%;
-    height: 100%;
+}
+
+.onboarding-frame {
+    flex: 1;
+    min-height: 0;
+    width: 100%;
     border: 0;
     background: transparent;
+}
+
+.onboarding-recovery {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px;
+    background: var(--bg-primary);
 }
 
 .onboarding-restart-card {
@@ -1489,7 +1630,9 @@ body.resizing-panels { user-select: none; }
 .chat-scroll-activity-dot[hidden] { display: none; }
 
 .chat-bubble {
-    padding: 10px 14px;
+    /* The same inset as a task card's body (--space-4 at the sides), so a bubble's words and the card
+       under it start on one edge. */
+    padding: var(--space-3) var(--space-4);
     border-radius: var(--radius-lg);
     max-width: 80%;
     word-wrap: break-word;
@@ -1614,26 +1757,26 @@ body.resizing-panels { user-select: none; }
 .ui-rich-content p:first-child { margin-block-start: 0; }
 .ui-rich-content p:last-child { margin-block-end: 0; }
 
-.chat-bubble.system[data-system-type="skill_review"] {
+.chat-bubble.system.chat-skill-review {
     padding: 0;
     overflow: hidden;
 }
 
-.chat-bubble.system[data-system-type="skill_review"] .sender,
-.chat-bubble.system[data-system-type="skill_review"] .msg-time {
+.chat-bubble.system.chat-skill-review .sender,
+.chat-bubble.system.chat-skill-review .msg-time {
     margin-left: 14px;
     margin-right: 14px;
 }
 
-.chat-bubble.system[data-system-type="skill_review"] .sender {
+.chat-bubble.system.chat-skill-review .sender {
     margin-top: 10px;
 }
 
-.chat-bubble.system[data-system-type="skill_review"] .msg-time {
+.chat-bubble.system.chat-skill-review .msg-time {
     margin-bottom: 10px;
 }
 
-.chat-bubble.system[data-system-type="skill_review"] .message {
+.chat-bubble.system.chat-skill-review .message {
     white-space: normal;
 }
 
@@ -1720,10 +1863,22 @@ body.resizing-panels { user-select: none; }
     border-style: dashed;
 }
 
+/* The delivery sentence under an owner message. When it carries actions (Send again, Discard, Send as a new
+   message) the sentence and its actions are ONE flex row: the same gap everywhere, wrapping on a phone, never a
+   stack of full-width buttons (docs/DESIGN.md "Chat attachments"). */
 .msg-pending {
-    margin-top: 6px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+    margin-top: var(--space-2);
     font-size: var(--type-meta);
+    line-height: var(--line-meta);
     color: var(--text-muted);
+}
+/* A doubt the owner may act on is a load-bearing caveat: meta ink, not the disabled step (docs/DESIGN.md section 3). */
+.msg-pending:is([data-ingress-unconfirmed], [data-ingress-saved="unconfirmed"], [data-ingress-saved="undispatched"]) {
+    color: var(--text-meta);
 }
 
 .msg-routing-annotation {
@@ -1735,6 +1890,17 @@ body.resizing-panels { user-select: none; }
     text-overflow: ellipsis;
     white-space: nowrap;
 }
+/* The receipt that names a room carries the Project reference on its own line, not in a second padded row. */
+.msg-routing-annotation.has-reference {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    margin-top: var(--space-2);
+    overflow: visible;
+    white-space: normal;
+}
+.msg-routing-annotation .chat-quiz-project { margin-inline-end: 0; max-width: min(100%, 64ch); min-height: var(--space-5); }
 
 .msg-routing-annotation[data-annotation-status="pending"] {
     color: var(--text-disabled);
@@ -1743,6 +1909,15 @@ body.resizing-panels { user-select: none; }
 .msg-routing-annotation[data-annotation-status="needs_manual_target"],
 .msg-routing-annotation[data-annotation-status="project_unavailable"] {
     color: var(--status-error-fg);
+}
+
+/* A file the host could not attach to the task: wraps (names must stay readable on a phone). */
+.msg-attachment-outcome {
+    margin-top: 6px;
+    color: var(--status-warn-fg);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
 }
 
 .msg-time {
@@ -1803,14 +1978,14 @@ body.resizing-panels { user-select: none; }
     max-width: max(80%, min(100%, 620px));
     padding: 0;
     border-radius: var(--radius-lg);
-    border: 1px solid var(--accent-dim);
+    border: 1px solid var(--accent-12);
     background: var(--accent-04);
     backdrop-filter: blur(12px);
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18), inset 0 1px 0 rgba(var(--neutral-rgb), 0.03);
+    box-shadow: var(--live-card-shadow);
     overflow: hidden;
     container-type: inline-size;
     container-name: livecard;
-    /* So the convert-to-project recolor (.is-project) fades in calmly (P3). */
+    /* Conversion to the shared Project entry fades in calmly (P3). */
     transition: border-color 250ms ease, background-color 250ms ease, box-shadow 250ms ease;
 }
 
@@ -1823,17 +1998,51 @@ body.resizing-panels { user-select: none; }
     display: none;
 }
 
+/* The portal (work_portal.js): the same card in Main, collapsed for good, while its work lives in a
+   Project room. Chip + quiet fact, title, one narration line (two at most), the foot (meta + its
+   controls) and the Project reference footer. The room holds the timeline, reviews and children,
+   so they never render here, and the summary is reading content, not a disclosure. */
+.chat-live-card[data-portal="1"] > .chat-live-timeline,
+.chat-live-card[data-portal="1"] > [data-live-reviews-host],
+.chat-live-card[data-portal="1"] > .chat-subagents,
+.chat-live-card[data-portal="1"] > .chat-live-summary-button .chat-live-summary-side,
+.chat-live-card[data-portal="1"] > .chat-live-foot > .chat-live-foot-end > .chat-live-review-summary {
+    display: none;
+}
+
+.chat-live-card[data-portal="1"] > .chat-live-summary-button {
+    cursor: auto;
+    -webkit-user-select: text;
+    user-select: text;
+}
+
+.chat-live-card[data-portal="1"] > .chat-live-summary-button:hover {
+    background: transparent;
+}
+
+.chat-live-card[data-portal="1"]:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-activity {
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+}
+
+/* A binding whose Main receipt is not durable keeps its visible gap mark. */
+.chat-live-card[data-receipt] {
+    border-style: dashed;
+}
+
 .chat-live-summary-button {
+    box-sizing: border-box;
     width: 100%;
     border: 0;
     background: transparent;
     color: inherit;
     font: inherit;
     cursor: pointer;
-    padding: 11px 14px;
+    /* The card's inset: --space-4 at the sides, --space-3 on top; the foot below closes it. */
+    padding: var(--space-3) var(--space-4) 0;
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    flex-direction: column;
+    gap: var(--space-2);
     user-select: none;
     text-align: left;
 }
@@ -1849,8 +2058,9 @@ body.resizing-panels { user-select: none; }
    is a div[role=button] (keyboard-activated in chat.js) because WebKit never
    lets text inside a real <button> be selected. */
 .chat-live-summary-button .chat-live-title,
+.chat-live-summary-button .chat-live-episodes,
 .chat-live-summary-button .chat-live-activity,
-.chat-live-summary-button .chat-live-meta {
+.chat-live-foot .chat-live-meta {
     -webkit-user-select: text;
     user-select: text;
 }
@@ -1867,8 +2077,33 @@ body.resizing-panels { user-select: none; }
        controls past the card edge. */
     min-width: 0;
     justify-content: space-between;
-    gap: 10px;
+    gap: var(--space-3);
+}
+
+/* A root card reads top to bottom: status (chip + quiet fact) with its disclosure on the right,
+   then the work's name on a line of its own, at the card-title size and title weight 500. */
+.chat-live-card:not(.subagent) > .chat-live-summary-button > .chat-live-summary {
+    flex-wrap: wrap;
+    align-items: center;
+    row-gap: var(--space-2);
+}
+
+/* The status box spans its row and centres its own chip, so an empty status (a terminal projection) starts at
+   the row's top with the disclosure instead of floating to the row's middle. */
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-summary-main {
+    align-self: stretch;
+}
+
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-title {
+    order: 3;
     flex: 1 1 100%;
+    font-size: var(--type-section);
+    line-height: var(--line-title);
+}
+
+.chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-summary-side {
+    order: 2;
+    margin-inline-start: auto;
 }
 
 /* Chip + typing dots only; the title is their sibling so a narrow container can
@@ -1876,14 +2111,17 @@ body.resizing-panels { user-select: none; }
 .chat-live-summary-main {
     display: flex;
     align-items: center;
-    gap: 8px;
-    flex: 0 0 auto;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-2);
+    flex: 0 1 auto;
+    max-width: 100%;
+    min-width: 0;
 }
 
 .chat-live-summary-side {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: var(--space-2);
     flex-shrink: 0;
     /* One title line (title type size, not the inherited body size). */
     min-height: calc(1.45 * var(--type-body));
@@ -1903,6 +2141,26 @@ body.resizing-panels { user-select: none; }
     text-transform: none;
 }
 
+/* The task status chip (DESIGN "Status and chips"): a semi-transparent pill, dot + the chip's words,
+   in its explicit pair. The dot carries the state at a glance; while the work is computing it
+   breathes (the one motion; the card draws no second typing indicator). */
+.chat-live-phase {
+    gap: calc(var(--space-1) * 1.5);
+    padding: calc(var(--space-1) / 2) var(--space-3) calc(var(--space-1) / 2) var(--space-2);
+    line-height: var(--line-meta);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.chat-live-phase::before {
+    content: "";
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
 .chat-live-phase:is(.start, .calling, .context, .progress, .working, .thought, .thinking, .boot),
 .chat-live-line-phase:is(.start, .calling, .context, .progress, .working, .thought, .thinking, .boot) {
     color: var(--accent-light);
@@ -1910,8 +2168,23 @@ body.resizing-panels { user-select: none; }
     background: var(--accent-10);
 }
 
-.chat-live-card:not([data-finished="1"]) .chat-live-phase:is(.working, .thinking, .progress, .calling, .context) {
+/* Motion: the chip's dot breathes while the work computes (the chip itself stays still and readable);
+   a moving fact beside an outcome chip (a running finalization) keeps today's gentle pulse. */
+.chat-live-phase[data-motion="1"]::before {
+    animation: live-dot-breathe 1.4s ease-in-out infinite;
+}
+
+.chat-live-phase-secondary[data-motion="1"] {
     animation: thinking-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes live-dot-breathe {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.35; transform: scale(0.7); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .chat-live-phase[data-motion="1"]::before, .chat-live-phase-secondary[data-motion="1"] { animation: none; }
 }
 
 /* Phase pills are status chips with class-named tones; the triple is the
@@ -1965,6 +2238,11 @@ body.resizing-panels { user-select: none; }
 .chat-live-typing span:nth-child(3) { animation-delay: 0.4s; }
 
 .chat-live-card[data-finished="1"] > .chat-live-summary-button .chat-live-typing {
+    display: none;
+}
+
+/* A card's chip dot is its activity indicator; the three dots stay for the sidebar and typing rows. */
+.chat-live-card .chat-live-typing {
     display: none;
 }
 
@@ -2047,7 +2325,8 @@ body.resizing-panels { user-select: none; }
 .chat-live-meta {
     display: flex;
     flex-wrap: wrap;
-    gap: 6px;
+    /* One space's width after a separator (the space before it is real text inside the part). */
+    gap: 0 var(--space-1);
     flex: 1 1 auto;
     min-width: 0;
     color: var(--text-disabled);
@@ -2055,18 +2334,132 @@ body.resizing-panels { user-select: none; }
     line-height: var(--line-meta);
 }
 
-.chat-live-card:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta {
+.chat-live-card:not([data-expanded="1"]) > .chat-live-foot > .chat-live-meta {
     min-height: 1.35em;
 }
+
+/* The card's foot: the meta line (tool calls · cost · updated) at full width, then ONE action row. Controls
+   never sit on the meta/timestamp band. The row leads with the quiet Reviews count (under the metadata, DESIGN
+   "Reviews inside task cards") and ends right-aligned with the controls: [Reply] [Resume] [Stop…]. Same
+   structure at every width; the Project reference footer stays below. */
+.chat-live-foot {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-4) var(--space-3);
+}
+
+.chat-live-foot-end {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--space-2) var(--space-3);
+    min-width: 0;
+}
+
+.chat-live-foot-end > .chat-live-review-summary {
+    margin-inline-end: auto;
+}
+
+/* A root card's action row always holds Reply, so it keeps the controls' height whether the work runs or
+   has settled: running and settled cards breathe alike. */
+.chat-live-card:not(.subagent) > .chat-live-foot > .chat-live-foot-end {
+    min-height: calc(var(--space-5) + var(--space-1));
+}
+
+.chat-live-foot-end:not(:has(> :not([hidden]):not(:empty))) {
+    display: none;
+}
+
+/* A settled card (Done, Done with warnings, Failed, Cancelled) whose only action is Reply has no action row:
+   Reply stands at the right end of the meta line (its last line when the meta wraps), the same small neutral
+   button, vertically centred on that line. A card with a lifecycle control keeps its row [Reply] [Resume] [Stop…],
+   and a Reviews count keeps its row with Reply. */
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) {
+    flex-direction: row;
+    align-items: center;
+    align-items: last baseline;
+    gap: var(--space-3);
+}
+
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) > .chat-live-meta {
+    flex: 1 1 0;
+    min-width: 0;
+}
+
+.chat-live-card[data-finished="1"]:not(.subagent) > .chat-live-foot:has(> .chat-live-foot-end > .chat-live-actions > [data-card-reply]:only-child):not(:has(> .chat-live-foot-end > .chat-live-review-summary:not([hidden]))) > .chat-live-foot-end {
+    flex: none;
+    min-height: 0;
+}
+
+/* Episodes of one work (Continue): one meta line each under the title, never a chip column. */
+.chat-live-episodes {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--space-1) / 2);
+    min-width: 0;
+}
+
+.chat-live-episodes[hidden] {
+    display: none;
+}
+
+.chat-live-episode {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
+}
+
+.chat-live-episode-label {
+    font-weight: 500;
+}
+
+.chat-live-episode-outcome {
+    font-weight: 500;
+}
+
+.chat-live-episode-outcome[data-tone="ok"] { color: var(--status-ok-fg); }
+.chat-live-episode-outcome[data-tone="warn"] { color: var(--status-warn-fg); }
+.chat-live-episode-outcome[data-tone="error"] { color: var(--status-error-fg); }
+.chat-live-episode-outcome[data-tone="neutral"] { color: var(--status-neutral-fg); }
+
+/* Why a chip word or an amount reads as it does: part of the expanded card, which the
+   summary button opens by pointer, touch and keyboard (never a hover-only title); selectable. */
+.chat-live-details {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
+}
+.chat-live-details > div { padding: 0 14px var(--space-1); }
+.chat-live-card:not([data-expanded="1"]) > .chat-live-details { display: none; }
 
 /* The secondary status fact beside the outcome chip (a running finalization).
    Neutral by rule: the outcome owns the status colour, this only says the task
    has not let go yet, so it stays a quiet sentence rather than a second chip. */
 .chat-live-phase-secondary {
+    min-width: 0;
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
-    white-space: nowrap;
+}
+
+.chat-live-phase-secondary[hidden] {
+    display: none;
+}
+
+/* HQ1: an applied owner hurry, never a chat bubble — the house fast-forward vector
+   beside the chip, named by its aria-label (task_phase_chip.markOwnerHurry). */
+.chat-live-hurry {
+    display: inline-flex;
+    align-items: center;
+    color: var(--text-meta);
 }
 
 .chat-live-meta-text {
@@ -2076,13 +2469,23 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-meta);
 }
 
+.chat-live-meta-part {
+    min-width: 0;
+}
+
+/* The ` · ` separator rides inside the fact before it (chat_activity.metaLineHtml). A plain-text fact is an
+   inline block: it moves to the next line whole, and when it is longer than a line its separator follows its last
+   word in the text flow (an inline-flex box would park the dot at the far right of the wrapped fact). */
+.chat-live-meta-part > .chat-live-meta-text:not(.chat-live-effort) {
+    display: inline-block;
+}
+
+
 .chat-live-review-summary {
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: var(--line-meta);
     flex: 0 0 auto;
-    margin-inline-start: auto;
-    align-self: baseline;
     white-space: nowrap;
 }
 
@@ -2099,7 +2502,7 @@ body.resizing-panels { user-select: none; }
 
 .chat-live-card[data-expanded="1"] > [data-live-reviews-host] > .chat-live-reviews {
     display: block;
-    margin: 0 14px 12px;
+    margin: 0 var(--space-4) var(--space-3);
     border-top: 1px solid var(--divider);
 }
 
@@ -2250,10 +2653,10 @@ body.resizing-panels { user-select: none; }
 }
 
 .chat-live-timeline {
-    padding: 0 14px 12px;
+    padding: var(--space-3) var(--space-4);
     display: none;
     flex-direction: column;
-    gap: 8px;
+    gap: var(--space-2);
 }
 
 .chat-live-card[data-expanded="1"] > .chat-live-timeline {
@@ -2266,11 +2669,11 @@ body.resizing-panels { user-select: none; }
 .chat-subagents {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-block: 2px 12px;
-    margin-inline: 24px 14px;
-    padding-inline-start: 14px;
-    border-inline-start: 1px solid var(--accent-25);
+    gap: var(--space-2);
+    margin-block: 0 var(--space-3);
+    margin-inline: var(--space-5) var(--space-4);
+    padding-inline-start: var(--space-3);
+    border-inline-start: 1px solid var(--accent-18);
 }
 
 .chat-subagents:empty {
@@ -2298,6 +2701,12 @@ body.resizing-panels { user-select: none; }
     .chat-live-card {
         width: 100%;
         max-width: 100%;
+    }
+
+    /* The question card takes the narrow column's full width like every other bubble, so a column of
+       bubbles shares one right edge (DESIGN §5). Two classes: the base 560px rule comes later in the file. */
+    .chat-bubble > .chat-quiz-card {
+        max-width: none;
     }
 }
 
@@ -2331,6 +2740,12 @@ body.resizing-panels { user-select: none; }
         justify-content: flex-end;
     }
 
+    /* A narrow card keeps its counts and chevron beside the chip (the chevron already says it opens);
+       the words would push them onto a row of their own. */
+    .chat-live-card:not(.subagent) > .chat-live-summary-button .chat-live-toggle {
+        display: none;
+    }
+
     .chat-live-line-toggle {
         flex-wrap: wrap;
     }
@@ -2358,27 +2773,39 @@ body.resizing-panels { user-select: none; }
         margin-inline-start: 0;
     }
 
+    /* Equal inline inset on both sides, paid once: a child sits --space-1 inside the thread line on the left
+       and inside its root card's border on the right, so no child border meets the root's border. Deeper
+       levels keep only their rail and frame; any wider per-level inset collapses a depth-10 child on a phone. */
     .chat-subagents {
         margin-inline: 0;
-        padding-inline-start: 8px;
+        padding-inline: var(--space-1);
     }
 
     .chat-subagents .chat-subagents {
-        padding-inline-start: 0;
+        padding-inline: 0;
     }
 
     /* A COLLAPSED nested child keeps its one-line identity row — status chip ·
        role · `N notes` · chevron — over its model/executor metadata (DESIGN.md
        §5) instead of dropping the title to a third band once its own inline
-       width crosses this threshold (#623). The title is already nowrap/ellipsis
-       here; it keeps the same 160px demand the mobile readability floor uses,
-       and only when even that cannot share the row do the side controls wrap
-       under it. Higher specificity than the .chat-live-title rule above, so the
-       cascade decides, not source order. */
+       width crosses this threshold (#623). The row never wraps: the side
+       controls keep their size and the role (nowrap/ellipsis, below) takes the
+       rest, so a long role ellipsizes before its `N notes` count would drop to
+       a row of its own. Higher specificity than the .chat-live-title rule
+       above, so the cascade decides, not source order. */
+    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button > .chat-live-summary {
+        flex-wrap: nowrap;
+    }
+
     .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-title {
         order: 0;
-        flex: 1 1 160px;
+        flex: 1 1 0;
         min-width: 0;
+    }
+
+    .chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-summary-side {
+        flex: none;
+        flex-wrap: nowrap;
     }
 }
 
@@ -2393,7 +2820,20 @@ body.resizing-panels { user-select: none; }
 /* An opaque secondary surface prevents translucent tints accumulating at depth.
    Nested frames and parent-child rails remain the hierarchy cue. */
 .chat-live-card.subagent .chat-live-summary-button {
-    padding: 9px 12px;
+    padding: var(--space-2) var(--space-3) 0;
+}
+
+.chat-live-card.subagent > .chat-live-foot {
+    padding: var(--space-1) var(--space-3) var(--space-2);
+}
+
+/* A child with nothing for its foot (no meta, no count, no control) closes on its summary. */
+.chat-live-card.subagent > .chat-live-foot:not(:has(> .chat-live-meta:not(:empty), > .chat-live-foot-end > .chat-live-review-summary:not([hidden]), > .chat-live-foot-end > .chat-live-actions:not(:empty))) {
+    display: none;
+}
+
+.chat-live-card.subagent:not(:has(> .chat-live-foot > .chat-live-meta:not(:empty), > .chat-live-foot > .chat-live-foot-end > .chat-live-review-summary:not([hidden]), > .chat-live-foot > .chat-live-foot-end > .chat-live-actions:not(:empty))) > .chat-live-summary-button {
+    padding-bottom: var(--space-2);
 }
 
 /* A nested child is subordinate to its root: quieter ink, and collapsed it is
@@ -2401,8 +2841,8 @@ body.resizing-panels { user-select: none; }
    label is the root's) over its metadata row (model, harness chip with the run count,
    cost, last update, docked Reviews count). Only its narration line waits for
    expansion. The title stays on one line and stays IN the identity row at every
-   width (the narrow-regime rule above gives it a 160px demand and lets the side
-   controls wrap under it instead). Activity now stays visible beneath it. */
+   width (in the narrow regime above it ellipsizes before the side controls
+   would leave the row). Activity now stays visible beneath it. */
 .chat-live-card.subagent .chat-live-title {
     font-weight: 400;
     color: var(--text-secondary);
@@ -2429,7 +2869,7 @@ body.resizing-panels { user-select: none; }
     display: none;
 }
 
-.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-summary-button .chat-live-meta {
+.chat-live-card.subagent:not([data-expanded="1"]) > .chat-live-foot > .chat-live-meta {
     min-height: 0;
 }
 
@@ -2813,19 +3253,25 @@ body.resizing-panels { user-select: none; }
    it opens: `#` = `##`, `###` one step down, deeper levels at the reading
    size; all in the bubble's own ink, with clearly more space above than below.
    `:where` keeps the rich scope weightless, so these rules win over the
-   compact ones above by order and the first/last-child rules below still apply. */
-.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2, .md-h3) {
+   compact ones above by order and the first/last-child rules below still apply.
+   A delivered document in the reader reads on the same ladder (DESIGN
+   "Document reading"). */
+.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2, .md-h3),
+.document-reader-markdown :is(.md-h1, .md-h2, .md-h3) {
     color: inherit;
     font-weight: 600;
     line-height: var(--line-title);
     text-wrap: balance;
     margin-block: var(--space-5) var(--space-2);
 }
-.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2) { font-size: var(--md-heading-major); }
-.chat-bubble .message:where(.ui-rich-content) .md-h3 { font-size: var(--md-heading-minor); }
+.chat-bubble .message:where(.ui-rich-content) :is(.md-h1, .md-h2),
+.document-reader-markdown :is(.md-h1, .md-h2) { font-size: var(--md-heading-major); }
+.chat-bubble .message:where(.ui-rich-content) .md-h3,
+.document-reader-markdown .md-h3 { font-size: var(--md-heading-minor); }
 /* h4-h6 carry .md-h3 (the compact demotion); `:where` keeps this rule no
    stronger than the class rule it follows. */
-.chat-bubble .message:where(.ui-rich-content) :where(h4, h5, h6).md-h3 {
+.chat-bubble .message:where(.ui-rich-content) :where(h4, h5, h6).md-h3,
+.document-reader-markdown :where(h4, h5, h6).md-h3 {
     font-size: inherit;
     margin-block: var(--space-4) var(--space-1);
 }
@@ -3086,16 +3532,17 @@ body.resizing-panels { user-select: none; }
         width: min(86vw, 320px);
         max-width: 320px;
         transform: translateX(-105%);
-        transition: transform 0.18s ease;
-        box-shadow: 24px 0 60px rgba(0, 0, 0, 0.36);
+        transition: transform 0.18s ease, box-shadow 0.18s ease;
         padding-top: calc(64px + env(safe-area-inset-top, 0px));
         background:
             linear-gradient(180deg, rgba(var(--shell-rgb), 0.94), rgba(var(--shell-rgb), 0.86)),
             radial-gradient(circle at 8% 0%, var(--accent-10), transparent 260px);
     }
 
+    /* The shadow belongs to the open drawer: on the closed one it leaked a grey band onto the phone's left edge. */
     #primary-sidebar.open {
         transform: translateX(0);
+        box-shadow: 24px 0 60px rgba(0, 0, 0, 0.36);
     }
 
     .unread-badge {
@@ -3115,19 +3562,6 @@ body.resizing-panels { user-select: none; }
         padding-bottom: env(safe-area-inset-bottom, 0px);
     }
 
-    .chat-page-header {
-        /* Keep the desktop overlay header (position:absolute + fade-to-transparent
-           gradient + blur): the transcript scrolls under it. Only restack the grid
-           for narrow widths — never switch to position:static / a flat background,
-           which is what removed the gradient and made mobile look heavy. */
-        row-gap: 6px;
-        grid-template-columns: auto minmax(0, 1fr);
-        grid-template-areas:
-            "leading title"
-            "toolbar toolbar"
-            "tabs tabs";
-    }
-
     body.project-panel-open .mobile-nav-toggle {
         display: none;
     }
@@ -3141,23 +3575,9 @@ body.resizing-panels { user-select: none; }
         flex-wrap: wrap;
     }
 
-    .chat-page-header .app-page-actions {
-        width: 100%;
-        margin-left: 0;
-        justify-content: flex-start;
-        align-items: center;
-        flex-wrap: wrap;
-        gap: 6px;
-    }
-
     .chat-page-header .chat-budget-pill,
     .chat-page-header .status-badge {
         order: 0;
-    }
-
-    .chat-budget-pill {
-        min-width: 0;
-        padding: 3px 10px;
     }
 
     .page-header,
@@ -3258,6 +3678,9 @@ body.resizing-panels { user-select: none; }
     gap: var(--space-2);
     min-width: 0;
     padding: 0 var(--space-2);
+    /* Size containment: the row's width never depends on what it holds, so the open effort
+       strip's measured fit (composer_owner_controls.js) cannot feed back into it. */
+    container: composer / inline-size;
 }
 
 #chat-input-area.drag-active .chat-input-wrap,
@@ -3366,14 +3789,23 @@ textarea.chat-input {
     font-family: inherit;
     outline: none;
     resize: none;
+    /* Grows with its text or placeholder to this one cap, then scrolls;
+       chat_input_sizing.js picks content sizing, else writes the measured height. */
+    height: var(--chat-input-height, auto);
     min-height: 32px;
     max-height: 140px;
     line-height: 1.45;
 }
+#chat-input[data-sizing="content"],
+textarea.chat-input[data-sizing="content"] { field-sizing: content; }
+/* A measured box below the cap holds its whole text: a rounded scrollHeight must not
+   leave a sub-pixel scrollbar. */
+#chat-input[data-sizing="fit"],
+textarea.chat-input[data-sizing="fit"] { overflow-y: hidden; }
 #chat-input::placeholder,
 textarea.chat-input::placeholder { color: var(--text-muted); }
 
-/* Composer pills (Swarm + Low|Max), left of the absolute send button. */
+/* Composer pills (Swarm), left of the owner capsules. */
 .chat-composer-pills {
     display: flex;
     align-items: center;
@@ -3410,57 +3842,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     border-color: var(--accent-45);
     background: var(--accent-dim);
     box-shadow: inset 0 1px 0 rgba(var(--neutral-rgb), 0.06), 0 0 0 3px var(--accent-10);
-}
-
-/* Low|Max segmented control: both options visible, the active one highlighted. */
-.chat-context-mode {
-    display: inline-flex;
-    align-items: center;
-    height: var(--composer-control-height);
-    border: 1px solid rgba(var(--neutral-rgb), 0.12);
-    border-radius: 999px;
-    overflow: hidden;
-    background: rgba(var(--composer-rgb), 0.38);
-    backdrop-filter: blur(18px);
-    -webkit-backdrop-filter: blur(18px);
-    box-shadow: var(--composer-control-shadow);
-    font-size: var(--composer-control-font-size);
-    font-weight: 700;
-    letter-spacing: 0;
-}
-.chat-context-mode[data-disabled="true"] {
-    opacity: 0.5;
-    pointer-events: none;
-}
-.chat-context-mode .chat-seg {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    text-align: center;
-    height: var(--composer-control-height);
-    padding: 0 12px;
-    border: none;
-    background: transparent;
-    color: var(--text-secondary);
-    font: inherit;
-    cursor: pointer;
-    transition: color 0.15s, background 0.15s;
-}
-.chat-context-mode .chat-seg:hover {
-    color: var(--text-primary);
-}
-/* Active segment: Max glows accent (full context); Low glows amber (reduced). */
-.chat-context-mode[data-context-mode="max"] .chat-seg[data-mode="max"] {
-    background: var(--accent-dim);
-    color: var(--accent);
-}
-.chat-context-mode[data-context-mode="low"] .chat-seg[data-mode="low"] {
-    background: rgba(245, 158, 11, 0.16);
-    color: var(--status-warn-fg);
-}
-.chat-context-mode[data-context-mode="nano"] .chat-seg[data-mode="nano"] {
-    background: var(--project-18);
-    color: var(--project);
 }
 
 .chat-send-group {
@@ -3504,6 +3885,431 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .chat-send-inline:active {
     background: var(--accent-18);
     opacity: 1;
+}
+
+/* Owner capsules (DESIGN "Composer owner controls"): Context and Effort, each a glass capsule of
+   the pills' height (ring glyph · name · value) that opens inline into its strip. Siblings of the
+   pills; the same vocabulary as Swarm. The open strip never takes a second line: beside the other
+   controls when it fits, alone while they step aside, scrolling inside itself only when nothing
+   else fits (composer_owner_controls.js sets data-fit, data-tight, data-label and
+   --capsule-seg-pad from measurement, and holds --capsule-value-width and --capsule-body-width
+   while a capsule opens or closes). */
+.chat-capsule {
+    --capsule-band-inset: var(--space-1);
+    --capsule-seg-pad: var(--space-2);
+    /* The strip's end gutter: a pill-shaped mark is concentric with the rounded end, so the band
+       inset is its clearance on every side (Effort's square bracket needs more, below). */
+    --capsule-end-gutter: var(--capsule-band-inset);
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    flex: 0 0 auto;
+    box-sizing: border-box;
+    height: var(--composer-control-height);
+    max-width: 100%;
+    min-width: 0;
+    border: 1px solid rgba(var(--neutral-rgb), 0.12);
+    border-radius: 999px;
+    background: rgba(var(--composer-rgb), 0.38);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
+    box-shadow: var(--composer-control-shadow);
+    color: var(--text-secondary);
+    font-size: var(--composer-control-font-size);
+    font-weight: 700;
+    letter-spacing: 0;
+    white-space: nowrap;
+    transition: border-color 0.18s, background 0.18s, box-shadow 0.18s;
+}
+.chat-capsule[data-open="true"] {
+    border-color: var(--accent-35);
+}
+.chat-capsule:is([data-saving="true"], [data-disabled="true"]) {
+    box-shadow: var(--composer-control-shadow), 0 0 0 3px var(--accent-10);
+}
+/* The head: ring, name, value. Closed it is the whole capsule; open, the value gives way to the
+   strip and the name stays unless the strip needs its room. */
+.chat-capsule-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    align-self: stretch;
+    padding: 0;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: background 0.18s;
+}
+.chat-capsule-head:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: -2px;
+}
+@media (hover: hover) {
+    .chat-capsule-head:hover {
+        background: var(--accent-10);
+    }
+}
+.chat-capsule-glyph {
+    flex: 0 0 auto;
+    display: grid;
+    place-items: center;
+    width: calc(var(--composer-control-height) - 2px);
+    height: 100%;
+}
+.chat-capsule-glyph svg {
+    display: block;
+    width: 22px;
+    height: 22px;
+    overflow: visible;
+}
+.chat-capsule-name {
+    margin: 0;
+    margin-inline: -2px var(--space-2);
+}
+.chat-capsule-value {
+    max-width: var(--capsule-value-width, none);
+    margin: 0;
+    margin-inline: -2px var(--space-3);
+    overflow: hidden;
+    color: var(--accent-light);
+    /* The strip's curve and duration: the value gives way exactly as the strip grows, so the
+       capsule never stands wider than closed or open (the fit measures only those). */
+    transition: max-width 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), margin 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.2s;
+}
+.chat-capsule[data-open="true"] .chat-capsule-value {
+    max-width: 0;
+    margin: 0;
+    opacity: 0;
+}
+.chat-capsule[data-open="true"][data-label="false"] .chat-capsule-name {
+    display: none;
+}
+.chat-effort-glyph-rail,
+.chat-context-arc {
+    stroke: rgba(var(--neutral-rgb), 0.28);
+}
+.chat-effort-glyph-band {
+    stroke: var(--accent-55);
+}
+.chat-effort-glyph-dot {
+    fill: var(--accent);
+}
+.chat-capsule-body {
+    display: flex;
+    align-items: center;
+    align-self: stretch;
+    max-width: 0;
+    overflow: hidden;
+    opacity: 0;
+    transition: max-width 0.4s cubic-bezier(0.2, 0.8, 0.2, 1), opacity 0.22s;
+}
+/* The divider between the name and the levels; without the name the ring delimits them. */
+.chat-capsule-body::before {
+    content: "";
+    flex: 0 0 auto;
+    width: 1px;
+    height: 16px;
+    margin-inline-end: var(--capsule-band-inset);
+    background: rgba(var(--neutral-rgb), 0.16);
+}
+.chat-capsule[data-label="false"] .chat-capsule-body::before {
+    display: none;
+}
+.chat-capsule[data-open="true"] .chat-capsule-body {
+    max-width: var(--capsule-body-width, none);
+    opacity: 1;
+}
+/* Alone, the strip appears and disappears at once, together with the controls it replaces; a
+   capsule the other one closes collapses at once too (data-snap). */
+.chat-capsule:is([data-fit="solo"], [data-fit="overflow"], [data-snap="true"]) :is(.chat-capsule-body, .chat-capsule-value) {
+    transition: none;
+}
+.chat-toolbar-row[data-owner-solo] .chat-composer-pills,
+.chat-toolbar-row[data-owner-solo="effort"] .chat-context-mode,
+.chat-toolbar-row[data-owner-solo="context"] .chat-effort-range {
+    display: none;
+}
+/* A line too narrow for every name (a 360 px phone, a longer translation) keeps the closed
+   capsules' rings and values; composer_owner_controls.js measures it on the settled row, and
+   where that still wraps it cuts the longest values to one measured width. */
+.chat-toolbar-row[data-owner-compact] .chat-capsule:not([data-open="true"]) .chat-capsule-name {
+    display: none;
+}
+.chat-toolbar-row[data-owner-compact="values"] .chat-capsule:not([data-open="true"]) .chat-capsule-value {
+    max-width: var(--capsule-value-cap);
+    text-overflow: ellipsis;
+}
+/* While a drag runs, and when the layout itself changes (opening, a resize, a new padding),
+   the marks land with the words at once, so a pill never trails behind the word it names. */
+.chat-capsule:is([data-dragging="true"], [data-settling="true"]) :is(.chat-effort-band, .chat-effort-handle, .chat-effort-seg, .chat-context-thumb) {
+    transition: none;
+}
+/* At var(--space-1) of padding and below, a full capsule would cut the corners of the word's box. */
+.chat-capsule[data-tight="true"] :is(.chat-effort-rec, .chat-context-thumb) {
+    border-radius: calc(var(--capsule-seg-pad) + var(--space-1));
+}
+
+/* Context: exactly three modes, the chosen one under a glass thumb, in its mode's colour (Max the
+   accent, full context; Low amber, reduced; Nano the project fuchsia). */
+.chat-context-mode {
+    --context-ink: var(--accent-light);
+    --context-fill: var(--accent-dim);
+}
+.chat-context-mode[data-context-mode="low"] {
+    --context-ink: var(--status-warn-fg);
+    --context-fill: var(--status-warn-bg);
+}
+.chat-context-mode[data-context-mode="nano"] {
+    --context-ink: var(--project);
+    --context-fill: var(--project-18);
+}
+.chat-context-mode .chat-capsule-value,
+.chat-context-mode .chat-seg[aria-checked="true"] {
+    color: var(--context-ink);
+}
+.chat-context-mode[data-context-mode="nano"] .chat-context-arc[data-arc="nano"],
+.chat-context-mode[data-context-mode="low"] .chat-context-arc[data-arc="low"],
+.chat-context-mode[data-context-mode="max"] .chat-context-arc[data-arc="max"] {
+    stroke: var(--context-ink);
+}
+.chat-context-strip {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-self: stretch;
+    margin-inline-end: var(--capsule-end-gutter);
+}
+.chat-context-mode[data-disabled="true"] .chat-context-strip {
+    opacity: 0.5;
+    pointer-events: none;
+}
+.chat-context-thumb {
+    position: absolute;
+    top: var(--capsule-band-inset);
+    bottom: var(--capsule-band-inset);
+    left: 0;
+    width: 0;
+    border-radius: 999px;
+    background: var(--context-fill);
+    box-shadow: inset 0 1px 0 rgba(var(--neutral-rgb), 0.06);
+    pointer-events: none;
+    transition: left 0.2s cubic-bezier(0.2, 0.8, 0.2, 1), width 0.2s, background 0.2s;
+}
+.chat-context-mode .chat-seg {
+    position: relative;
+    display: flex;
+    align-items: center;
+    padding: 0 var(--capsule-seg-pad);
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-secondary);
+    font: inherit;
+    letter-spacing: inherit;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    transition: color 0.15s;
+}
+.chat-seg-text {
+    display: block;
+}
+.chat-context-mode .chat-seg:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: -2px;
+}
+@media (hover: hover) {
+    .chat-context-mode .chat-seg[aria-checked="false"]:hover {
+        color: var(--text-primary);
+    }
+}
+
+/* Effort: one segment per level, as wide as its word plus the padding; the band and the three
+   handles sit over it and share one vertical inset, so their edges meet exactly. The max bracket
+   is square: at the last level its corners would graze the rounded end, so the end gutter adds
+   what the curve takes back at the bracket's height (about a sixth of the control's height) and
+   the bracket keeps the band inset from the shell, as the concentric pill does. */
+.chat-effort-range {
+    --effort-cap-width: var(--space-2);
+    --capsule-end-gutter: calc(var(--capsule-band-inset) + var(--composer-control-height) / 6);
+}
+.chat-effort-strip {
+    position: relative;
+    flex: 0 0 auto;
+    display: flex;
+    align-self: stretch;
+    margin-inline-end: var(--capsule-end-gutter);
+    touch-action: none;
+    cursor: pointer;
+}
+.chat-effort-band {
+    position: absolute;
+    top: var(--capsule-band-inset);
+    bottom: var(--capsule-band-inset);
+    border-radius: 4px;
+    background: var(--accent-10);
+    pointer-events: none;
+    transition: left 0.15s, width 0.15s;
+}
+.chat-effort-seg {
+    position: relative;
+    z-index: 2;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 var(--capsule-seg-pad);
+    color: var(--text-secondary);
+    pointer-events: none;
+    transition: color 0.15s;
+}
+.chat-effort-seg[data-in="true"] {
+    color: var(--text-primary);
+}
+.chat-effort-seg[data-rec="true"] {
+    color: var(--accent-light);
+}
+.chat-effort-seg-text {
+    display: block;
+}
+/* Handles: the pill is the recommended level, the brackets are min and max. A tap or a key
+   moves every handle with the same short transition, so a pushed bracket keeps pace. */
+.chat-effort-handle {
+    position: absolute;
+    top: var(--capsule-band-inset);
+    bottom: var(--capsule-band-inset);
+    box-sizing: border-box;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: grab;
+    touch-action: none;
+    -webkit-tap-highlight-color: transparent;
+    z-index: 3;
+    transition: left 0.15s, width 0.15s, box-shadow 0.15s;
+}
+.chat-effort-handle::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+}
+.chat-effort-handle:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
+}
+.chat-effort-handle[data-dragging="true"] {
+    cursor: grabbing;
+    z-index: 4;
+}
+/* The pill covers its whole segment; the word sits centred inside it. */
+.chat-effort-rec {
+    z-index: 1;
+    border: 1px solid var(--accent-55);
+    border-radius: 999px;
+    background: var(--accent-22);
+}
+.chat-effort-rec[data-dragging="true"] {
+    box-shadow: 0 0 0 4px var(--accent-18);
+}
+.chat-effort-cap {
+    width: var(--effort-cap-width);
+    border: 2px solid var(--accent);
+    background: transparent;
+}
+/* A finger-sized hit area that grows outward, never over the pill or the head. */
+.chat-effort-min {
+    border-right: 0;
+    border-radius: 4px 0 0 4px;
+}
+.chat-effort-min::before {
+    inset: -10px 0 -10px -12px;
+}
+.chat-effort-max {
+    border-left: 0;
+    border-radius: 0 4px 4px 0;
+    transform: translateX(-100%);
+}
+.chat-effort-max::before {
+    inset: -10px -12px -10px 0;
+}
+/* Right to left the scale runs leftwards: each bracket faces the range from the other side. */
+.chat-effort-strip:dir(rtl) .chat-effort-min {
+    border: 2px solid var(--accent);
+    border-left: 0;
+    border-radius: 0 4px 4px 0;
+    transform: translateX(-100%);
+}
+.chat-effort-strip:dir(rtl) .chat-effort-min::before {
+    inset: -10px -12px -10px 0;
+}
+.chat-effort-strip:dir(rtl) .chat-effort-max {
+    border: 2px solid var(--accent);
+    border-right: 0;
+    border-radius: 4px 0 0 4px;
+    transform: none;
+}
+.chat-effort-strip:dir(rtl) .chat-effort-max::before {
+    inset: -10px 0 -10px -12px;
+}
+.chat-effort-cap[data-dragging="true"] {
+    box-shadow: 0 0 0 4px var(--accent-22);
+}
+@media (hover: hover) {
+    .chat-effort-rec:hover {
+        box-shadow: 0 0 0 4px var(--accent-18);
+    }
+    .chat-effort-cap:hover {
+        box-shadow: 0 0 0 3px var(--accent-18);
+    }
+}
+/* Nothing fits even at the tightest padding (a 320 px phone, a pane dragged very narrow):
+   the strip scrolls inside the capsule and fades on the side that hides levels. A swipe on
+   a word scrolls, a handle still drags, the ring stays put. */
+.chat-capsule[data-fit="overflow"] {
+    flex: 1 1 auto;
+}
+.chat-capsule[data-fit="overflow"][data-open="true"] .chat-capsule-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: none;
+}
+.chat-capsule[data-fit="overflow"] :is(.chat-effort-strip, .chat-context-strip) {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    touch-action: pan-x;
+    --capsule-fade-to: right;  /* toward the strip's end */
+}
+.chat-capsule[data-fit="overflow"] :is(.chat-effort-strip, .chat-context-strip):dir(rtl) {
+    --capsule-fade-to: left;
+}
+.chat-capsule[data-fit="overflow"] :is(.chat-effort-strip, .chat-context-strip)::-webkit-scrollbar {
+    display: none;
+}
+.chat-capsule[data-fit="overflow"] [data-scroll="start"] {
+    -webkit-mask-image: linear-gradient(to var(--capsule-fade-to), black calc(100% - var(--space-3)), transparent);
+    mask-image: linear-gradient(to var(--capsule-fade-to), black calc(100% - var(--space-3)), transparent);
+}
+.chat-capsule[data-fit="overflow"] [data-scroll="middle"] {
+    -webkit-mask-image: linear-gradient(to var(--capsule-fade-to), transparent, black var(--space-3), black calc(100% - var(--space-3)), transparent);
+    mask-image: linear-gradient(to var(--capsule-fade-to), transparent, black var(--space-3), black calc(100% - var(--space-3)), transparent);
+}
+.chat-capsule[data-fit="overflow"] [data-scroll="end"] {
+    -webkit-mask-image: linear-gradient(to var(--capsule-fade-to), transparent, black var(--space-3));
+    mask-image: linear-gradient(to var(--capsule-fade-to), transparent, black var(--space-3));
+}
+@media (prefers-reduced-motion: reduce) {
+    .chat-toolbar-row .chat-capsule,
+    .chat-toolbar-row .chat-capsule * {
+        transition: none;
+    }
 }
 
 /* === design-system:migrated-end === */
@@ -4100,6 +4906,104 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
 .cost-bar::-moz-progress-bar { background: var(--accent); }
 .cost-empty-cell { color: var(--text-muted); text-align: center; }
 
+/* === design-system:migrated-begin (Dashboard Storage tab) === */
+/* Dashboard Storage (the passive, owner-triggered measurement view): shared card, type,
+   spacing and tone tokens; only the bar's measured share arrives at runtime (--storage-share). */
+.storage-root { min-height: 0; display: flex; flex-direction: column; gap: var(--space-3); }
+.storage-summary, .storage-panel { padding: var(--space-4); }
+.storage-summary-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-4); }
+.storage-summary-text { min-width: 0; }
+.storage-total {
+    color: var(--text-primary);
+    font-size: var(--type-page);
+    line-height: var(--line-title);
+    font-weight: 650;
+    overflow-wrap: anywhere;
+}
+.storage-total.is-unknown,
+.storage-row-size.is-unknown,
+.storage-group-size.is-unknown { color: var(--text-meta); }
+.storage-kicker,
+.storage-meta,
+.storage-coverage,
+.storage-footnote,
+.storage-group-why,
+.storage-group-note,
+.storage-row-why { color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta); }
+.storage-meta { margin-top: var(--space-1); }
+.storage-notes { margin-top: var(--space-3); }
+.storage-notes:empty { display: none; }
+.storage-coverage { display: flex; align-items: flex-start; gap: var(--space-2); margin: 0; }
+.storage-status { margin: 0; }
+.storage-icon { display: inline-flex; flex: 0 0 auto; margin-top: 1px; }
+.storage-body { min-height: 0; }
+.storage-panel > .storage-meta { margin: 0 0 var(--space-2); }
+.storage-bar {
+    display: flex;
+    width: 100%;
+    min-height: 14px;
+    overflow: hidden;
+    border-radius: var(--radius-sm);
+    background: var(--surface-control);
+    border: 1px solid var(--surface-border);
+}
+/* Counted segments shrink in proportion so the fixed unknown marker is never clipped. */
+.storage-bar-seg {
+    flex: 0 1 calc(var(--storage-share, 0) * 1%);
+    min-width: 2px;
+    background: var(--accent);
+    border-inline-end: 1px solid var(--ui-card-bg);
+}
+.storage-bar-seg.is-unmeasured {
+    flex: 0 0 12px;
+    min-width: 12px;
+    background: repeating-linear-gradient(135deg, transparent 0 4px, var(--text-disabled) 4px 6px);
+    border-inline: 1px dashed var(--text-meta);
+}
+.storage-key { flex: 0 0 auto; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); }
+.storage-key.is-unmeasured { border: 1px dashed var(--text-meta); border-radius: 1px; background: transparent; }
+:is(.storage-bar-seg, .storage-key)[data-group="exact"] { background: var(--project); }
+:is(.storage-bar-seg, .storage-key)[data-group="kept"] { background: var(--accent-light); }
+:is(.storage-bar-seg, .storage-key)[data-group="temporary"] { background: var(--status-warn-fg); }
+:is(.storage-bar-seg, .storage-key)[data-group="other"] { background: var(--text-secondary); }
+.storage-groups { display: grid; gap: var(--space-4); margin-top: var(--space-4); }
+.storage-group { min-width: 0; }
+.storage-group-head { display: flex; align-items: baseline; gap: var(--space-2); min-width: 0; }
+.storage-group-title {
+    min-width: 0;
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    font-weight: 650;
+}
+.storage-group-size { margin-inline-start: auto; color: var(--text-meta); font-size: var(--type-body); white-space: nowrap; }
+.storage-group-count { margin-inline-start: var(--space-2); color: var(--text-meta); font-size: var(--type-meta); font-weight: 400; }
+.storage-group-why { margin: var(--space-1) 0 var(--space-2); }
+.storage-group-note { margin: var(--space-2) 0 0; }
+.storage-list { display: grid; gap: var(--space-1); margin: 0; padding: 0 0 0 var(--space-4); list-style: none; }
+.storage-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) auto;
+    align-items: baseline;
+    gap: var(--space-2);
+    padding-block: var(--space-1);
+    border-top: 1px solid var(--surface-border-soft);
+}
+.storage-row-label { min-width: 0; color: var(--text-meta); font-size: var(--type-body); line-height: var(--line-body); overflow-wrap: anywhere; }
+.storage-row-why { min-width: 0; }
+.storage-row-size { color: var(--text-primary); font-size: var(--type-body); line-height: var(--line-body); text-align: end; white-space: nowrap; }
+.storage-footnote { margin: 0; padding-inline: var(--space-1); }
+
+@media (max-width: 640px) {
+    .storage-summary-head { align-items: stretch; flex-direction: column; }
+    .storage-refresh { align-self: flex-start; }
+    .storage-row { grid-template-columns: minmax(0, 1fr) auto; }
+    .storage-row-why { grid-column: 1 / -1; grid-row: 2; }
+    .storage-row-size { grid-column: 2; grid-row: 1; }
+}
+/* === design-system:migrated-end === */
+
 #page-dashboard {
     min-height: 0;
 }
@@ -4199,6 +5103,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     text-overflow: ellipsis;
 }
 
+/* A known outcome's shared chip and its quieter second fact lead the meta line. */
+.activity-phase {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-1);
+    vertical-align: middle;
+}
+
 .activity-row-actions {
     display: flex;
     align-items: center;
@@ -4214,7 +5126,10 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     flex: 1 1 240px;
 }
 
-.activity-schedule .activity-sub {
+/* A held Continue's cause (#1721) is bounded owner text the owner must read to
+   act, so on a phone it wraps like a schedule's state instead of losing the cause. */
+.activity-schedule .activity-sub,
+.activity-held .activity-sub {
     white-space: normal;
     overflow: visible;
     overflow-wrap: anywhere;
@@ -4520,12 +5435,6 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     outline-offset: 2px;
 }
 
-.skills-lock-hint::before {
-    content: '\1F512';
-    font-family: 'Apple Color Emoji', 'Segoe UI Emoji', 'Noto Color Emoji', sans-serif;
-    font-size: 11px;
-}
-
 .skills-review-progress {
     display: inline-flex;
     align-items: center;
@@ -4813,6 +5722,14 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     color: var(--status-error-fg);
     font-size: 12px;
     margin-bottom: 8px;
+}
+
+/* A failed review run's recorded reason: meta under its outcome line. */
+.skills-review-reason {
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
 }
 
 .skills-badge {
@@ -5973,22 +6890,11 @@ textarea.chat-input {
         bottom: auto;
         z-index: auto;
         justify-content: flex-start;
-        gap: 8px;
+        gap: 6px;
         padding: 0 6px;
     }
 
-    .chat-composer-pills {
-        flex: 1;
-        overflow-x: auto;
-        scrollbar-width: none;
-    }
-
-    .chat-composer-pills::-webkit-scrollbar {
-        display: none;
-    }
-
-    .chat-swarm,
-    .chat-context-mode .chat-seg {
+    .chat-swarm {
         padding-left: 10px;
         padding-right: 10px;
     }
@@ -6452,11 +7358,11 @@ textarea.chat-input {
     width: var(--project-panel-width);
     z-index: 58;
     border-left: 1px solid var(--divider);
+    /* A reading surface keeps its own backing even where native backdrop blur is not composited.
+       Project tint supplies the light material; underlying Main text must never show through it. */
     background:
-        linear-gradient(180deg, rgba(var(--shell-rgb), 0.74), rgba(var(--shell-rgb), 0.64)),
-        radial-gradient(circle at 15% 0%, var(--project-12), transparent 300px);
-    backdrop-filter: blur(22px) saturate(130%);
-    -webkit-backdrop-filter: blur(22px) saturate(130%);
+        radial-gradient(circle at 15% 0%, var(--project-12), transparent 300px),
+        rgb(var(--shell-rgb));
     box-shadow: -24px 0 64px rgba(0, 0, 0, 0.34);
     transform: translateX(18px);
     opacity: 0;
@@ -6503,8 +7409,9 @@ textarea.chat-input {
     background: var(--accent-04);
     color: var(--text-secondary);
     border-radius: var(--radius-md, 8px);
-    width: 28px;
-    height: 28px;
+    /* The bar's floating-chrome height (ui.css): close and status control share one line box. */
+    width: var(--chrome-control-h);
+    height: var(--chrome-control-h);
     font-size: 16px;
     line-height: 1;
     cursor: pointer;
@@ -6513,6 +7420,13 @@ textarea.chat-input {
 .project-panel-close:hover {
     color: var(--text-primary);
     border-color: var(--accent);
+}
+
+/* The bars' icon controls wear the one focus ring (DESIGN §3 Focus), like every other control. */
+.project-panel-close:focus-visible,
+.mobile-nav-toggle:focus-visible {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: 2px;
 }
 
 .project-panel-body {
@@ -6637,11 +7551,11 @@ textarea.chat-input {
     }
 }
 
-/* Review lanes (6.2) + agent accounts (D30).
+/* Agent accounts (D30).
    Borders read the theme's --divider like every other panel surface. They used
    to name --border, which this dark-only :root never declares, so all three
    rules silently took their literal grey fallback instead of the token. */
-/* === design-system:migrated-begin (harness accounts + reviewer slots + Dashboard Updates tab) ===
+/* === design-system:migrated-begin (harness accounts + Dashboard Updates tab) ===
    Down to the matching end marker: docs/DESIGN.md tokens only, guarded by
    tests/test_web_typography_static.py. The rest of this file is a later pass. */
 /* Subsection rhythm: a group is its head (heading + that group's own Add
@@ -6719,6 +7633,36 @@ textarea.chat-input {
     line-height: var(--line-meta);
 }
 .agent-family-rows { display: flex; flex-direction: column; gap: 8px; }
+.harness-maintenance-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-1) var(--space-2);
+    min-width: 0;
+}
+.harness-maintenance-line {
+    flex: 1 1 auto;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    overflow-wrap: anywhere;
+}
+.harness-maintenance-actions { display: flex; flex-wrap: wrap; gap: var(--space-1); }
+.harness-maintenance-notice,
+.harness-maintenance-details {
+    flex-basis: 100%;
+    min-width: 0;
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    color: var(--text-meta);
+    overflow-wrap: anywhere;
+}
+.harness-maintenance-notice[data-tone="warn"] { color: var(--status-warn-fg); }
+.harness-maintenance-details summary { color: var(--text-primary); cursor: pointer; }
+.harness-maintenance-details dl { margin: var(--space-2) 0; }
+.harness-maintenance-details dt { color: var(--text-meta); }
+.harness-maintenance-details dd { margin: 0 0 var(--space-1); color: var(--text-primary); }
+.harness-maintenance-details pre { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Account rows are purpose-built (identity left, actions right), not the
    settings key/value grid — .settings-custom-secret-row's 0.65fr/1.35fr
    columns inverted the proportions and its align-items:end sank the text.
@@ -6946,7 +7890,7 @@ textarea.chat-input {
 /* Local chip/dot primitives on purpose: the shared .ui-chip alias group
    carries page palettes (skills/marketplace) and .ui-status recolors the
    sentence itself — neither covers a label:value fact chip with a dot-status
-   sibling (checklist item 30 one-line statement). DESIGN section 2: label at
+   sibling (checklist item 26 one-line statement). DESIGN section 2: label at
    meta ink, the value is the primary thing. */
 .updates-chip {
     font-size: var(--type-meta);
@@ -7145,6 +8089,19 @@ textarea.chat-input {
 /* === design-system:migrated-end === */
 
 /* === design-system:migrated-begin (chat: executor chip, structured delivery, quiz card) === */
+/* The child card's effort chip: one text part of the meta line; a pinned level wears the pin glyph. */
+.chat-live-effort {
+    display: inline-flex;
+    align-items: center;
+}
+/* The pin keeps its own space (a margin, not a flex gap), so the meta separator that rides inside this fact
+   sits as close as after any other fact. */
+.chat-live-effort-pin {
+    flex: 0 0 auto;
+    width: 11px;
+    height: 11px;
+    margin-inline-end: calc(var(--space-1) * 0.75);
+}
 
 /* Phase 6: per-bubble/subagent executor chip (owner directive: a small chip
    like Claudexor's, never a promotional badge). Reuses .harness-chip, sized on
@@ -7158,6 +8115,10 @@ textarea.chat-input {
     vertical-align: middle;
     opacity: 0.85;
 }
+/* The chip's detail sentence is card text only while the card is expanded;
+   `contents` makes its separator and text ordinary parts of the meta line. */
+.chat-live-executor-detail { display: none; }
+.chat-live-card[data-expanded="1"] > :is(.chat-live-summary-button, .chat-live-foot) .chat-live-executor-detail { display: contents; }
 
 /* Structured chat delivery surfaces. All controls inherit the dark application
    palette so media stays legible in both Main and Project chat instances. */
@@ -7204,12 +8165,111 @@ textarea.chat-input {
     background: var(--ui-card-bg);
 }
 
+/* Whole images on both sides (owner choice): a tile letterboxes, never crops. */
 .chat-gallery-item .chat-photo {
     display: block;
     width: 100%;
     aspect-ratio: 4 / 3;
-    object-fit: cover;
+    object-fit: contain;
     border-radius: 0;
+}
+
+/* One photo alone keeps its own ratio up to the token height, whoever sent it:
+   an Ouroboros single-photo bubble or an owner bubble with one image. */
+.chat-bubble:not(.is-multiple) .chat-gallery-grid:not(.is-multiple) .chat-gallery-item {
+    justify-self: start;
+    width: fit-content;
+    max-width: 100%;
+}
+
+.chat-bubble:not(.is-multiple) .chat-gallery-grid:not(.is-multiple) .chat-photo {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    max-height: var(--chat-photo-max-height);
+    /* A tiny, very narrow or very short photo still gets a box its always-present
+       actions fit in (the figure clips what overflows it); scale-down shows the
+       photo whole at its own size and ratio inside that box, never enlarged. */
+    min-width: var(--chat-photo-min-box);
+    min-height: var(--chat-photo-min-box);
+    aspect-ratio: auto;
+    object-fit: scale-down;
+}
+
+/* Owner attachments: one block above the caption inside the owner's bubble
+   (DESIGN "Chat attachments"); the photo grid, players and file cards are the
+   shared delivery atoms above, composed — not restyled. */
+.chat-bubble.has-attachments {
+    max-width: min(80%, var(--chat-media-bubble-max));
+}
+
+.chat-bubble.has-attachments.has-wide-media {
+    width: min(80%, var(--chat-media-bubble-max));
+}
+
+.chat-attachments {
+    display: grid;
+    /* One column the bubble's width: no child's min-content (a player's control
+       row, a long nowrap title) may widen it past the bubble's edge. */
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-2);
+    min-width: 0;
+    white-space: normal;
+}
+
+.chat-attachments + .message { margin-top: var(--space-2); }
+
+.chat-attachments .chat-gallery-grid.is-multiple {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.chat-attachments .chat-file-card { min-width: 0; }
+
+/* A long name wraps to two lines instead of widening the bubble; the dialog a
+   tap opens shows it whole (touch has no hover title). */
+.chat-attachments .chat-file-name {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    white-space: normal;
+    overflow-wrap: anywhere;
+}
+
+.chat-file-item.is-unavailable .chat-file-name { color: var(--text-meta); }
+.chat-file-card:disabled .chat-file-more { visibility: hidden; }
+
+.chat-attachment-player .chat-media-player { min-width: 0; }
+
+/* The shared player keeps its controls inside the bubble: they wrap, and a video's
+   progress bar takes its own row (the player's narrow layout below). */
+.chat-attachment-player .chat-media-controls { flex-wrap: wrap; }
+.chat-attachment-player .chat-media-player:not(.is-audio) .chat-media-progress { order: 2; flex-basis: 100%; }
+
+.attach-badge .attach-thumb {
+    flex: 0 0 auto;
+    width: var(--chat-attach-thumb-size);
+    height: var(--chat-attach-thumb-size);
+    border-radius: var(--radius-xs);
+    object-fit: cover;
+}
+
+/* Touch: actions are always visible (no hover), and big enough for a finger. */
+@media (pointer: coarse) {
+    .chat-photo-actions summary,
+    .attach-remove {
+        min-width: var(--touch-target-min);
+        min-height: var(--touch-target-min);
+    }
+}
+
+@container chatcol (max-width: 620px) {
+    .chat-bubble.has-attachments,
+    .chat-bubble.has-attachments.has-wide-media {
+        width: auto;
+        max-width: 100%;
+    }
+
+    .chat-attachments .chat-gallery-grid.is-multiple { grid-template-columns: minmax(0, 1fr); }
 }
 
 .chat-gallery-item figcaption,
@@ -7306,8 +8366,10 @@ textarea.chat-input {
 
 .chat-file-more { color: var(--text-meta); }
 
-.chat-file-dialog {
-    width: min(420px, calc(100vw - 32px));
+/* The file dialog and the document reader (below) are one modal surface; the
+   buttons of both are `.btn.btn-default`. */
+.chat-file-dialog,
+.document-reader {
     padding: 0;
     border: 1px solid var(--ui-card-border);
     border-radius: var(--radius-lg);
@@ -7316,7 +8378,10 @@ textarea.chat-input {
     box-shadow: 0 18px 44px rgba(0, 0, 0, 0.34);
 }
 
-.chat-file-dialog::backdrop { background: rgba(0, 0, 0, 0.64); }
+.chat-file-dialog { width: min(420px, calc(100vw - 32px)); }
+
+.chat-file-dialog::backdrop,
+.document-reader::backdrop { background: rgba(0, 0, 0, 0.64); }
 
 .chat-file-dialog-panel { padding: 18px; }
 
@@ -7332,7 +8397,6 @@ textarea.chat-input {
     gap: 8px;
 }
 
-.chat-file-dialog-actions button,
 .chat-media-controls button,
 .chat-media-rate-menu {
     min-height: 32px;
@@ -7343,8 +8407,181 @@ textarea.chat-input {
     cursor: pointer;
 }
 
-.chat-file-dialog-actions button { padding: 6px 12px; }
-.chat-file-dialog-actions button:disabled { cursor: default; opacity: 0.45; }
+/* Delivered-document reader (document_reader.js, DESIGN "Document reading"):
+   a modal reading surface over the conversation, a full sheet on a phone. Its
+   chrome is the file dialog's above; its buttons are `.btn.btn-default`. */
+.chat-file-more.is-read {
+    color: var(--accent-light);
+    font-size: var(--type-meta);
+    font-weight: 600;
+}
+
+.document-reader {
+    width: min(var(--document-reader-size), calc(100vw - 2 * var(--space-5)));
+    max-width: none;
+    /* `vh` first for an engine without `dvh`. */
+    height: min(var(--document-reader-size), calc(100vh - 2 * var(--space-5)));
+    height: min(var(--document-reader-size), calc(100dvh - 2 * var(--space-5)));
+    max-height: none;
+    overflow: hidden;
+    /* Opaque: the conversation must not show through the text being read. */
+    background: var(--bg-primary);
+}
+
+.document-reader-panel {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+}
+
+.document-reader-head {
+    display: grid;
+    grid-template-areas: "identity actions close";
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-3) var(--space-4) var(--space-3) var(--space-5);
+    border-bottom: 1px solid var(--surface-border);
+}
+
+/* Name, type and size are selectable text like the document: declared, so the macOS window's
+   title bar band (launcher_window_chrome.py) leaves a press on them to selection. */
+.document-reader-identity { grid-area: identity; min-width: 0; cursor: text; }
+.document-reader-actions { grid-area: actions; }
+.document-reader-close { grid-area: close; }
+
+.document-reader-title {
+    margin: 0;
+    overflow: hidden;
+    color: var(--text-primary);
+    font-size: var(--type-section);
+    font-weight: 600;
+    line-height: var(--line-title);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.document-reader-meta {
+    margin-top: var(--space-1);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+
+.document-reader-actions,
+.document-reader-views {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+/* The chosen view, in the theme choice's selected paint (ui.css). */
+.document-reader-views .btn[aria-pressed="true"] {
+    color: var(--text-primary);
+    border-color: var(--focus-accent-border);
+    background: var(--accent-12);
+}
+
+/* Opened by a pointer, the focused reading region shows its ring from the first
+   key; until then no ring at all, the engine's own included. */
+.document-reader-body:focus { outline: none; }
+
+.document-reader-body:focus-visible:not(.is-quiet-focus) {
+    outline: 2px solid var(--focus-accent-border);
+    outline-offset: -2px;
+}
+
+.document-reader-notice {
+    padding: var(--space-2) var(--space-5);
+    border-bottom: 1px solid var(--status-warn-border);
+    background: var(--status-warn-bg);
+    color: var(--status-warn-fg);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+}
+
+.document-reader-notice p { margin: 0; }
+
+.document-reader-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: var(--space-5);
+    overflow: auto;
+    overscroll-behavior: contain;
+}
+
+/* One reading measure, centred; code and tables scroll inside their own wrappers. */
+.document-reader-markdown,
+.document-reader-source,
+.document-reader-status {
+    max-width: var(--document-reader-measure);
+    margin: 0 auto;
+}
+
+.document-reader-markdown {
+    color: var(--text-primary);
+    font-size: var(--type-section);
+    line-height: var(--line-body);
+}
+
+.document-reader-markdown p { margin-block: var(--space-3); }
+/* Headings take the chat reading ladder (with the rich-answer rules above). */
+.document-reader-markdown > :first-child { margin-block-start: 0; }
+
+/* A relative or refused link has no destination here: it reads as its words. */
+.document-reader-markdown a.md-link:not([href]) {
+    color: inherit;
+    text-decoration: none;
+}
+
+.document-reader-source {
+    margin-block: 0;
+    color: var(--text-primary);
+    font-family: 'SF Mono', 'Fira Code', Consolas, monospace;
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    tab-size: 4;
+}
+
+.document-reader-status {
+    display: grid;
+    justify-items: start;
+    gap: var(--space-3);
+    color: var(--text-meta);
+    font-size: var(--type-body);
+    line-height: var(--line-body);
+}
+
+.document-reader-status p { margin: 0; }
+.document-reader-status.is-error { color: var(--text-primary); }
+
+/* A phone reads the document on a full sheet; Close returns to the same place in the chat. */
+@media (max-width: 620px) {
+    .document-reader {
+        width: 100vw;
+        height: 100vh;
+        height: 100dvh;
+        margin: 0;
+        border: 0;
+        border-radius: 0;
+    }
+
+    .document-reader-head {
+        grid-template-areas: "identity close" "actions actions";
+        grid-template-columns: minmax(0, 1fr) auto;
+        padding: calc(var(--space-2) + env(safe-area-inset-top, 0px)) var(--space-3) var(--space-2);
+    }
+
+    .document-reader-notice { padding-inline: var(--space-3); }
+
+    .document-reader-body {
+        padding: var(--space-4) var(--space-3) calc(var(--space-5) + env(safe-area-inset-bottom, 0px));
+    }
+}
 
 .chat-media-player {
     overflow: hidden;
@@ -7388,6 +8625,11 @@ textarea.chat-input {
     flex: 0 0 auto;
     min-width: 32px;
     padding: 4px 7px;
+}
+
+.chat-media-controls button > svg {
+    display: block;
+    margin: 0 auto;
 }
 
 .chat-media-progress {
@@ -7437,13 +8679,15 @@ textarea.chat-input {
 .chat-link-button:hover { background: var(--accent-18); }
 
 /* The bubble owns the width floor against the definite transcript column:
-   260px card plus its 28px bubble padding and 2px border. A child percentage
+   260px card plus its 36px bubble padding and 2px border. A child percentage
    alone would lose that floor in a shrink-to-fit bubble, even on desktop. */
 .chat-bubble:has(> .chat-quiz-card) {
-    min-width: min(290px, 100%);
+    min-width: min(298px, 100%);
     margin-inline: 0;
 }
-/* Owner quiz card (design system: born on tokens; DESIGN.md "Quiz card"). */
+/* Owner quiz card (design system: born on tokens; DESIGN.md "Quiz card"). Inside a bubble the bubble is the object, so
+   the card adds no box of its own. */
+.chat-bubble > .chat-quiz-card { padding: 0; border-color: transparent; background: transparent; gap: var(--space-3); }
 .chat-quiz-card {
     display: flex;
     flex-direction: column;
@@ -7463,7 +8707,9 @@ textarea.chat-input {
     gap: var(--space-2, 8px);
 }
 .chat-quiz-chip {
+    flex: 0 0 auto;
     padding: 1px 8px;
+    white-space: nowrap;
     border-radius: var(--pill-radius);
     font-size: var(--type-meta);
     color: var(--status-neutral-fg);
@@ -7508,41 +8754,68 @@ textarea.chat-input {
     min-inline-size: 0;
     overflow-wrap: anywhere;
 }
+/* An offered answer is an elevated card (owner 16.10: Material's elevated card, a choice and never a field): the
+   capsule surface on the rest shadow like every pressable thing, the object radius because an answer can be a
+   paragraph; hover and press change its colour. Once the question settles the cards lie flat and the chosen one
+   takes the green tone. */
 .chat-quiz-options {
     display: flex;
     flex-direction: column;
-    gap: var(--space-1, 4px);
+    gap: 10px;
 }
 .chat-quiz-option {
     display: flex;
     flex-direction: column;
     align-items: flex-start;
-    gap: var(--space-1, 4px);
-    padding: var(--space-2, 8px) var(--space-3, 12px);
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius-sm);
-    background: var(--ui-card-bg-soft);
+    gap: 3px;
+    padding: 14px 18px;
+    border: 0;
+    border-radius: var(--radius-object);
+    background: var(--surface-capsule);
+    box-shadow: var(--elev-rest);
     color: var(--text-primary);
     font-size: var(--type-body);
+    font-weight: 600;
     text-align: left;
     cursor: pointer;
+    transition: var(--motion-tone);
 }
-.chat-quiz-option:hover:not(:disabled) {
-    border-color: var(--focus-accent-border);
+.chat-quiz-option:hover:not(:disabled) { background: var(--surface-capsule-hover); }
+.chat-quiz-option:active:not(:disabled) { filter: var(--press); }
+.chat-quiz-option:disabled { color: var(--text-disabled); cursor: default; background: var(--surface-tray); box-shadow: none; }
+.chat-quiz-option.chosen { color: var(--status-ok-fg); background: var(--tone-green); }
+.chat-quiz-option.pending-choice {
+    transition: none;
+    box-shadow: var(--elev-rest), inset 0 0 0 1px var(--focus-accent-border);
     background: var(--accent-08);
+    color: var(--text-primary);
 }
-.chat-quiz-option:disabled { color: var(--text-disabled); cursor: default; }
-.chat-quiz-option.chosen {
-    border-color: var(--status-ok-fg);
-    color: var(--status-ok-fg);
-    background: var(--status-ok-bg);
+.chat-quiz-card [aria-disabled="true"] { cursor: default; }
+.chat-quiz-card [aria-disabled="true"]:not(.pending-choice) { opacity: .75; }
+.chat-quiz-card [aria-disabled="true"]:hover:not(.pending-choice) {
+    background: var(--surface-tray);
+}
+.chat-quiz-card[data-submission="sending"] .chat-quiz-dot,
+.chat-quiz-card[data-submission="unknown"] .chat-quiz-dot,
+.chat-quiz-card[data-submission="checking"] .chat-quiz-dot { background: var(--text-meta); }
+.chat-quiz-feedback {
+    display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2);
+    color: var(--text-meta); font-size: var(--type-meta); line-height: var(--line-meta);
+}
+.chat-quiz-feedback[hidden], .chat-quiz-feedback [hidden] { display: none; }
+.chat-quiz-submission-note, .chat-quiz-storage-note { flex-basis: 100%; white-space: pre-wrap; }
+.chat-quiz-storage-note { color: var(--status-warn-fg); }
+.chat-quiz-feedback button:focus-visible {
+    outline: 2px solid var(--focus-accent-border); outline-offset: 2px;
 }
 .chat-quiz-option-detail {
+    font-weight: 400;
     font-size: var(--type-meta);
     line-height: var(--line-meta, 1.35);
     color: var(--text-meta);
 }
 .chat-quiz-option:disabled .chat-quiz-option-detail { color: var(--text-disabled); }
+.chat-quiz-option.chosen .chat-quiz-option-detail { color: var(--text-meta); }
 .chat-quiz-option-recommended {
     margin-left: var(--space-2, 8px);
     font-size: var(--type-meta);
@@ -7560,7 +8833,7 @@ textarea.chat-input {
     box-sizing: border-box;
     padding: var(--space-2, 8px);
     border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius-sm);
+    border-radius: var(--radius-inner);
     background: var(--ui-card-bg-soft);
     color: var(--text-primary);
     font-family: inherit;
@@ -7569,21 +8842,25 @@ textarea.chat-input {
     resize: vertical;
 }
 .chat-quiz-comment::placeholder { color: var(--text-meta); }
+/* Main's removal of an unknown late answer: a secondary action at its natural width. */
+.chat-quiz-card > .chat-quiz-dismiss { align-self: flex-start; }
+/* Send is the primary action's crimson capsule; until there is something to send it lies flat. */
 .chat-quiz-send {
     align-self: flex-start;
-    padding: var(--space-1, 4px) var(--space-3, 12px);
-    border: 1px solid var(--ui-card-border);
-    border-radius: var(--radius-sm);
-    background: var(--ui-card-bg-soft);
-    color: var(--text-primary);
+    padding: 6px 16px;
+    border: 0;
+    border-radius: var(--pill-radius);
+    background: var(--tone-crimson);
+    color: var(--tone-crimson-ink);
     font-size: var(--type-meta);
+    font-weight: 600;
+    box-shadow: var(--elev-rest);
     cursor: pointer;
+    transition: var(--motion-tone);
 }
-.chat-quiz-send:hover:not(:disabled) {
-    border-color: var(--focus-accent-border);
-    background: var(--accent-08);
-}
-.chat-quiz-send:disabled { color: var(--text-disabled); cursor: default; }
+.chat-quiz-send:hover:not(:disabled) { background: var(--tone-crimson-hover); }
+.chat-quiz-send:active:not(:disabled) { filter: var(--press); }
+.chat-quiz-send:disabled { color: var(--text-disabled); background: var(--surface-tray); box-shadow: none; cursor: default; }
 .chat-quiz-option:focus-visible,
 .chat-quiz-comment:focus-visible,
 .chat-quiz-send:focus-visible,
@@ -7608,46 +8885,245 @@ textarea.chat-input {
     cursor: pointer;
 }
 .chat-quiz-assumption {
-    padding-top: var(--space-1, 4px);
-    border-top: 1px solid var(--ui-card-border);
     font-size: var(--type-meta);
     line-height: var(--line-meta, 1.35);
     color: var(--text-meta);
 }
 
-/* D12: always-visible compact copy icon in the bubble's bottom-right corner. */
-.chat-message-copy {
-    position: absolute;
-    right: 8px;
-    bottom: 6px;
+/* D12: always-visible compact copy icon in the bubble's bottom-right corner. The Reply control joins it in
+   one control row (docs/DESIGN.md "Replies"): the same 24px square, ink and rhythm, one --space-2 gap. */
+.chat-message-copy,
+.chat-message-reply {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 22px;
-    height: 22px;
+    width: var(--space-5);
+    height: var(--space-5);
     padding: 0;
     border: 1px solid transparent;
-    border-radius: var(--radius-xs);
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--text-meta);
     font-size: var(--type-meta);
     line-height: 1;
     cursor: pointer;
-    opacity: 0.45;
+    opacity: 0.7;
     transition: opacity 0.15s ease, background 0.15s ease;
 }
+/* On the time's line: the bubble's bottom inset is --space-3, the 24px controls stand --space-2 above its edge. */
+.chat-message-copy { position: absolute; right: var(--space-2); bottom: var(--space-2); }
+.chat-message-actions {
+    position: absolute;
+    right: var(--space-2);
+    bottom: var(--space-2);
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+.chat-message-actions > .chat-message-copy { position: static; }
 
 .chat-message-copy:hover,
-.chat-message-copy:focus-visible { opacity: 1; }
-.chat-message-copy:hover { background: var(--surface-control); }
-.chat-message-copy:focus-visible {
+.chat-message-copy:focus-visible,
+.chat-message-reply:hover,
+.chat-message-reply:focus-visible { opacity: 1; }
+.chat-message-copy:hover,
+.chat-message-reply:hover { background: var(--surface-control); }
+.chat-message-copy:focus-visible,
+.chat-message-reply:focus-visible {
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
 
-/* Reserve a gutter so the timestamp never sits under the always-visible icon
-   (the button spans ~30px from the bubble's right edge). */
-.chat-bubble.has-copy .msg-time { margin-right: 28px; }
+/* Reserve a gutter so the timestamp never sits under the always-visible controls (Copy ends 32px from the
+   bubble's edge, Reply and Copy 64px; the bubble's own inset is --space-4, the gap to the time --space-2). */
+.chat-bubble.has-copy .msg-time { margin-right: var(--space-5); }
+.chat-bubble.has-reply .msg-time { margin-right: calc(var(--space-5) * 2 + var(--space-2)); }
+
+/* The message a quote points at: a calm ring for a moment, a keyboard ring while it holds focus. */
+@keyframes chat-quote-target {
+    from { box-shadow: 0 0 0 3px var(--accent-25); }
+    to { box-shadow: 0 0 0 3px transparent; }
+}
+:is(.chat-bubble, .chat-live-card).is-quote-target { animation: chat-quote-target 1.4s ease-out; }
+/* A row that takes focus only to be returned to (a quote's target, a closed row menu) shows the one keyboard ring. */
+:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus { outline: none; }
+:is(.chat-bubble, .chat-live-card)[tabindex="-1"]:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+    :is(.chat-bubble, .chat-live-card).is-quote-target { animation: none; box-shadow: 0 0 0 3px var(--accent-25); }
+}
+
+/* === The quote panel (docs/DESIGN.md "Replies"): one component (chat_reply_quote.js) inside a bubble and
+   above the composer. The bar and the author name wear the QUOTED author's ink, the panel one tint of that same
+   ink on the quote glass; no literal colours. A reply shows one ellipsized line and is a button that jumps to
+   the quoted message; a relay shows the owner's complete words, clamped to six lines, `Show all` in its head. */
+.chat-quote {
+    --quote-ink: var(--text-meta);
+    --quote-tint: var(--ui-card-bg-soft);
+    position: relative;
+    display: block;
+    margin: 0 0 var(--space-2);
+    border-radius: var(--radius-sm);
+    background: linear-gradient(var(--quote-tint), var(--quote-tint)), var(--quote-glass);
+    overflow: hidden;
+}
+.chat-quote[data-author="user"] { --quote-ink: var(--user-sender); --quote-tint: var(--user-bubble-from); }
+.chat-quote[data-author="assistant"] { --quote-ink: var(--assistant-sender); --quote-tint: var(--accent-10); }
+.chat-quote[data-author="system"] { --quote-ink: var(--system-sender); --quote-tint: var(--system-bubble-bg); }
+.chat-quote::before {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    inset-inline-start: 0;
+    inline-size: 2px;
+    background: var(--quote-ink);
+}
+.chat-quote-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    box-sizing: border-box;
+    width: 100%;
+    min-width: 0;
+    margin: 0;
+    padding: var(--space-2) var(--space-3);
+    border: 0;
+    background: transparent;
+    color: var(--text-meta);
+    font: inherit;
+    text-align: start;
+    cursor: pointer;
+}
+.chat-quote-main:hover { background: var(--menu-item-hover); }
+/* A quoted photo leads the panel with its thumbnail (the head and the line stand to its right). */
+.chat-quote-main.has-thumb {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    column-gap: var(--space-2);
+    align-items: center;
+}
+.chat-quote-main.has-thumb > .chat-quote-thumb { grid-row: 1 / span 2; }
+.chat-quote-thumb {
+    display: block;
+    width: var(--chat-attach-thumb-size);
+    height: var(--chat-attach-thumb-size);
+    border-radius: var(--radius-xs);
+    object-fit: cover;
+    background: var(--surface-control);
+}
+.chat-quote-main:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+.chat-quote-head {
+    display: flex;
+    align-items: baseline;
+    gap: var(--space-1);
+    min-width: 0;
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    white-space: nowrap;
+}
+.chat-quote-lead,
+.chat-quote-when { flex: none; color: var(--text-meta); }
+.chat-quote-author {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--quote-ink);
+    font-weight: 600;
+    text-overflow: ellipsis;
+}
+.chat-quote-text {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-meta);
+    font-size: var(--type-body);
+    line-height: var(--line-meta);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A relay: the owner's words are the instruction, so they read in primary ink, wrapped, up to six lines. */
+.chat-quote[data-mode="relay"] { padding: var(--space-2) var(--space-3); }
+.chat-quote[data-mode="relay"] > .chat-quote-head { align-items: center; min-height: var(--space-5); }
+.chat-quote[data-mode="relay"] > .chat-quote-text {
+    margin-top: var(--space-1);
+    color: var(--text-primary);
+    line-height: var(--line-body);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    text-overflow: clip;
+}
+
+/* The clamp of a long quotation (a relay panel's text); its toggle lives in the panel's head, a row that already
+   exists, so no control floats on a row of its own. */
+.chat-clamp {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 6;
+    line-clamp: 6;
+    overflow: hidden;
+}
+.chat-clamp[data-expanded="1"] { display: block; -webkit-line-clamp: unset; line-clamp: unset; overflow: visible; }
+.chat-clamp-toggle { flex: none; margin-inline-start: auto; min-height: var(--space-5); padding-block: 0; }
+/* The files that came with the owner's relayed words: named, not served again. */
+.chat-quote-files {
+    margin-top: var(--space-1);
+    color: var(--text-meta);
+    font-size: var(--type-meta);
+    line-height: var(--line-meta);
+    overflow-wrap: anywhere;
+}
+.chat-clamp-toggle[hidden] { display: none; }
+
+/* Above the composer: the same panel on the glass of the field below it, with its cancel control. */
+.chat-input-wrap > .chat-quote--composer {
+    order: 1;
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin: 0;
+    padding-inline-end: var(--space-2);
+    border: 1px solid var(--surface-border);
+    border-radius: var(--radius-lg);
+    background: linear-gradient(var(--quote-tint), var(--quote-tint)), var(--quote-glass);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    animation: chat-quote-in 0.16s ease-out;
+}
+.chat-quote--composer .chat-quote-main { flex: 1 1 auto; width: auto; padding-block: var(--space-2); padding-inline-start: var(--space-5); }
+/* In the rounded strip the author bar stands inside the curve, straight from end to end (the bubble quote's
+   bar meets square-ish corners; here the pill would bend it into a crescent). */
+.chat-quote--composer::before {
+    inset-block: var(--space-2);
+    inset-inline-start: var(--space-3);
+    border-radius: var(--radius-xs);
+}
+.chat-quote-cancel {
+    flex: none;
+    display: grid;
+    place-items: center;
+    width: var(--composer-control-height, 32px);
+    height: var(--composer-control-height, 32px);
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-meta);
+    cursor: pointer;
+}
+.chat-quote-cancel:hover { background: var(--menu-item-hover); color: var(--text-primary); }
+.chat-quote-cancel:focus-visible { outline: 2px solid var(--focus-accent-border); outline-offset: -2px; }
+@keyframes chat-quote-in {
+    from { opacity: 0; transform: translateY(var(--space-1)); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .chat-input-wrap > .chat-quote--composer { animation: none; }
+}
+/* A finger needs the shared touch target on the controls these blocks add (the clamp toggle, the doubt's actions);
+   the time under the doubt's actions then keeps clear of the Reply / Copy targets that sit on its line. */
+@media (pointer: coarse) {
+    .chat-clamp-toggle, .msg-pending .btn { min-height: var(--touch-target-min); }
+    .chat-bubble:is(.has-reply, .has-copy) > .msg-pending:has(.btn) + .msg-time { margin-top: var(--space-3); }
+}
 
 .chat-copy-fallback {
     position: fixed;
@@ -7667,28 +9143,6 @@ textarea.chat-input {
 
 /* === design-system:migrated-end === */
 
-/* One line, never a paragraph: the pointer names the card and ellipsizes, so
-   the status bar cannot grow into the reading area (a 400-character plan_task
-   verdict used to wrap it to twelve lines). The 180px basis is the bar's
-   original row policy: a default desktop panel keeps one row while the
-   status pill is short; a longer pill, a narrower panel or a phone wraps the
-   bar to a second row, never a third. The auto margin keeps the pointer left
-   of the status pill. */
-.project-work-pointer {
-    flex: 1 1 180px;
-    min-width: 0;
-    max-width: 40ch;
-    margin-right: auto;
-    justify-content: flex-start;
-    text-align: left;
-    overflow: hidden;
-}
-.project-work-pointer-label {
-    min-width: 0;
-    overflow: hidden;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-}
 /* Compact horizontal spacing leaves room for wider native system-font metrics. */
 .chat-panel-statusbar { flex-wrap: wrap; gap: var(--space-2) var(--space-1); }
 .chat-live-executor-chip { max-width: 100%; white-space: normal; }
@@ -7746,6 +9200,9 @@ textarea.chat-input {
     background: var(--menu-item-hover);
     color: var(--text-primary);
 }
+.skills-card-menu-dialog .skills-menu-item.skills-attest-warn {
+    color: var(--status-warn-fg);
+}
 
 
 .chat-photo-menu:not(.ui-popup) {
@@ -7780,8 +9237,7 @@ textarea.chat-input {
 
 
 
-.form-field input:not(.ui-control):not(.ui-checkbox), .form-field select:not(.ui-control):not(.ui-checkbox),
-.reviewer-slot-controls input:not(.ui-control):not(.ui-checkbox), .reviewer-slot-controls select:not(.ui-control):not(.ui-checkbox) {
+.form-field input:not(.ui-control):not(.ui-checkbox), .form-field select:not(.ui-control):not(.ui-checkbox) {
     padding: 8px 12px;
     border-radius: var(--radius-sm);
     border: 1px solid var(--divider);
@@ -7851,7 +9307,6 @@ textarea.chat-input {
 /* track-migration:end */
 
 /* Light surfaces keep geometry and domain state semantics unchanged. */
-:root[data-theme="light"] #matrix-rain { display: none; }
 :root[data-theme="light"] .chat-page-header { background: var(--bg-primary); }
 :root[data-theme="light"] .chat-bubble.assistant { background: var(--accent-05); }
 :root[data-theme="light"] .chat-bubble.user { background: var(--user-bubble-to); }
@@ -7884,3 +9339,210 @@ textarea.chat-input {
 :root[data-theme="light"] .status-badge.online { color: var(--status-ok-fg); }
 :root[data-theme="light"] .status-badge.starting { color: var(--status-warn-fg); }
 :root[data-theme="light"] .status-badge.error { color: var(--status-error-fg); }
+
+/* ---- Airy dopamine (DESIGN.md design bible) -----------------------------------------------------------------------
+   One set of recipes for both themes; ui.css's seed gives each its values and materials (glass in the dark one). The
+   room is plain; objects rest on the rest shadow without outlines; what floats over moving content takes the float
+   shadow; each voice tints its own objects; every control is one of ui.css's capsule tones, and a state changes its
+   colour, never its height. */
+
+/* The room: plain, the sidebar one step off it, no wash, glow or texture behind the page. */
+:root[data-theme] #primary-sidebar { background: var(--surface-side); border-right-color: rgba(var(--neutral-rgb), 0.05); }
+@media (max-width: 980px) {
+    :root[data-theme] #primary-sidebar { background: var(--surface-side); }
+    :root[data-theme] #primary-sidebar.open { box-shadow: var(--elev-float); }
+}
+:root[data-theme] .chat-page-header { background: var(--bg-primary); }
+/* A scrollbar is the room's furniture: neutral, never the accent. */
+:root[data-theme] ::-webkit-scrollbar-thumb { background: rgba(var(--neutral-rgb), 0.16); }
+:root[data-theme] ::-webkit-scrollbar-thumb:hover { background: rgba(var(--neutral-rgb), 0.28); }
+:root[data-theme] .app-page-glass { background: none; }
+:root[data-theme] .files-preview { background: rgba(var(--neutral-rgb), 0.015); }
+/* A reading surface is one flat material; the project's colour lives in its small marks. */
+:root[data-theme] .project-panel { background: rgb(var(--shell-rgb)); }
+/* Air is spacing, never paleness: a timestamp keeps its meta ink. */
+:root[data-theme] .msg-time { opacity: 1; }
+
+/* Voices: the owner blue, Ouroboros blush (a task card a quieter blush), each a resting object. */
+:root[data-theme] :is(#chat-messages, .chat-messages) { gap: 14px; }
+:root[data-theme] .chat-bubble { padding: 12px 18px 10px; border-radius: var(--radius-object); }
+:root[data-theme] .chat-bubble.user {
+    background: var(--voice-owner); border-color: transparent; box-shadow: var(--elev-rest);
+}
+:root[data-theme] .chat-bubble.assistant {
+    background: var(--voice-ouroboros); border-color: transparent; box-shadow: var(--elev-rest);
+}
+:root[data-theme] :is(.chat-live-card, .chat-live-card[data-finished="1"]) {
+    border-color: transparent;
+    background: var(--voice-ouroboros-card);
+    border-radius: var(--radius-object);
+    box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+}
+:root[data-theme] .chat-live-summary-button { padding: 16px 20px 12px; }
+:root[data-theme] .chat-live-actions { padding: 0 20px 16px; gap: var(--space-2); }
+/* The work card's foot (meta line, its one action row) and its Project footer share the card's insets. */
+:root[data-theme] :is(.chat-live-foot, .chat-live-bound-pointer) { padding-inline: 20px; }
+:root[data-theme] .chat-live-foot-end > .chat-live-actions { padding: 0; }
+:root[data-theme] :is(.chat-live-phase, .chat-live-line-phase) { border-color: transparent; }
+/* A Project entry is the Project's voice: its tint, one resting object in every shell it replaces (a task card, a
+   history row); an unsaved entry keeps its dashed edge, which is a state, not an outline. */
+:root[data-theme] :is(.chat-live-card, .chat-bubble).project-handoff {
+    padding: var(--space-3) var(--space-4);
+    border-color: transparent;
+    background: var(--project-08);
+    border-radius: var(--radius-object);
+    box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+}
+:root[data-theme] .project-handoff.project-handoff--unsaved { border-color: var(--project-18); }
+
+/* Objects and trays. A card on the room is an object: the object surface on the rest shadow with the object radius.
+   Inside an object a group or row is a tray: the soft neutral fill with the inner radius and no shadow; a tray inside
+   a tray drops its fill, so fills never stack and its rows part by space alone. A status sentence stays a dot and a
+   word, never a box. */
+:root[data-theme] :is(.ui-card, .settings-shell .form-section, .settings-card, .settings-provider-card, .skills-card,
+    .marketplace-card, .widgets-card, .updates-card, .costs-budget-card, .stat-card, .log-task-card, .evo-runtime-card,
+    .evo-chart-wrap) {
+    border-color: transparent;
+    background: var(--surface-object);
+    border-radius: var(--radius-object);
+    box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+}
+:root[data-theme] :is(.agent-family-card, .harness-account-row, .harness-login-card, .settings-effort-card,
+    .settings-model-card, .settings-custom-secret-row, .settings-extension-section, .mcp-server-card) {
+    border-color: transparent; background: var(--surface-tray); border-radius: var(--radius-inner); box-shadow: none;
+}
+:root[data-theme] :is(.agent-family-card, .harness-login-card, .settings-effort-card, .settings-model-card,
+    .settings-extension-section, .mcp-server-card) :is(.harness-account-row, .harness-login-card, .settings-effort-card,
+    .settings-model-card, .settings-custom-secret-row) {
+    background: transparent;
+}
+:root[data-theme] .agents-service-banner { border-color: transparent; background: transparent; padding-inline: 0; }
+/* A state on an object is mapped here too, or the object and tray rules above would erase it: a spent account is
+   the amber tone, the Danger Zone the red one, a widget being dropped on or resized wears the focus ring. */
+:root[data-theme] :is(.harness-account-row, .agent-family-card .harness-account-row).harness-exhausted { background: var(--tone-amber); }
+:root[data-theme] .settings-shell .form-section.danger { background: var(--tone-red); }
+:root[data-theme] :is(.widgets-card.drag-over, .widgets-card.resizing) {
+    box-shadow: var(--elev-float), 0 0 0 2px var(--focus-accent-border);
+}
+:root[data-theme] .settings-more-providers > summary {
+    border-color: transparent; border-radius: var(--radius-object); background: var(--surface-object); box-shadow: var(--elev-rest);
+}
+:root[data-theme] .settings-footer { background: var(--surface-object); }
+
+/* Sheets: what floats over moving content (menus, the composer's field) takes the float surface and shadow; the
+   shared menu and model list take it in ui.css, so setup has it too. */
+:root[data-theme] :is(.chat-header-menu, .task-control-menu, .marketplace-modal) {
+    border-color: transparent; border-radius: var(--radius-object); background: var(--surface-float); box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+:root[data-theme] .chat-text-row {
+    border-color: transparent; background: var(--surface-float); box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+:root[data-theme] .chat-text-row:focus-within {
+    border-color: var(--focus-accent-border); background: var(--surface-float); box-shadow: var(--elev-float), 0 0 0 3px var(--focus-accent-ring);
+}
+
+/* Controls: ui.css's tones mapped onto the page's own controls. Every one with a body stands on the rest shadow in
+   every state; hover deepens its fill, a press deepens it again, a chosen or switched-on one takes its tone. The bars'
+   controls (the Project bar's close and the phone's menu button among them) are neutral capsules; Panic is danger,
+   the budget amber (it is the owner's money). The room's status beside the title is not a control: it stays a bare
+   sentence (room_work.css). */
+:root[data-theme] :is(.chat-header-btn.ui-chrome-control, .project-panel-close, .mobile-nav-toggle) {
+    border-color: transparent; background: var(--surface-capsule); color: var(--text-primary); box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+    transition: var(--motion-tone);
+}
+:root[data-theme] :is(.chat-header-btn.ui-chrome-control, .project-panel-close, .mobile-nav-toggle):hover {
+    border-color: transparent; background: var(--surface-capsule-hover); box-shadow: var(--elev-rest);
+}
+:root[data-theme] :is(.project-panel-close, .mobile-nav-toggle) { border-radius: var(--pill-radius); }
+:root[data-theme] .chat-header-btn.danger.ui-chrome-control { background: var(--tone-red); color: var(--status-error-fg); }
+:root[data-theme] .chat-header-btn.danger.ui-chrome-control:hover { background: var(--tone-red-hover); }
+:root[data-theme] .chat-budget-pill.ui-chrome-control {
+    border-color: transparent; background: var(--tone-amber); box-shadow: var(--elev-rest); transition: var(--motion-tone);
+}
+:root[data-theme] .chat-budget-pill.ui-chrome-control:hover { border-color: transparent; background: var(--tone-amber-hover); }
+:root[data-theme] .chat-budget-pill.ui-chrome-control:is(:hover, :active) { transform: none; }
+/* The composer: Swarm, Context and Effort are neutral capsules. A setting's name takes the secondary ink at 500 and
+   its value the meta ink at 600 (owner 16.10: never the darkest ink); the only colour is a ring's lit arc. Send is the
+   primary action's crimson tone. */
+:root[data-theme] .chat-input-wrap { --composer-control-shadow: var(--elev-rest); }
+:root[data-theme] :is(.chat-swarm, .chat-capsule) {
+    border-color: transparent; background: var(--surface-capsule); color: var(--text-secondary); font-weight: 600;
+    box-shadow: var(--elev-rest); -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+:root[data-theme] .chat-swarm:hover { border-color: transparent; background: var(--surface-capsule-hover); color: var(--text-primary); }
+:root[data-theme] .chat-swarm[data-armed="true"] {
+    border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); box-shadow: var(--elev-rest);
+}
+:root[data-theme] .chat-capsule[data-open="true"] { border-color: transparent; }
+:root[data-theme] .chat-capsule .chat-capsule-name { font-weight: 500; }
+@media (hover: hover) {
+    :root[data-theme] .chat-capsule-head:hover { background: var(--surface-capsule-hover); }
+}
+:root[data-theme] .chat-capsule .chat-capsule-value { color: var(--text-meta); }
+:root[data-theme] .chat-capsule[data-known="false"] .chat-capsule-value { color: var(--text-secondary); }
+:root[data-theme] .chat-capsule[data-known="false"] :is(.chat-effort-glyph-band, .chat-effort-glyph-dot) { visibility: hidden; }
+:root[data-theme] :is(.chat-effort-glyph-rail, .chat-context-arc) { stroke: rgba(var(--neutral-rgb), 0.16); }
+:root[data-theme] .chat-send-inline {
+    border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); opacity: 1; box-shadow: var(--elev-rest);
+    -webkit-backdrop-filter: none; backdrop-filter: none;
+}
+:root[data-theme] .chat-send-inline:not(:disabled):hover { border-color: transparent; background: var(--tone-crimson-hover); }
+/* Main's waiting pill is one of these capsules: the owner's turn in the amber tone, standing like the others. */
+:root[data-theme] .chat-question-nav {
+    border-color: transparent; background: var(--tone-amber); color: var(--status-warn-fg); box-shadow: var(--elev-rest);
+    font-weight: 600; -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass); transition: var(--motion-tone);
+}
+:root[data-theme] .chat-question-nav:hover { border-color: transparent; background: var(--tone-amber-hover); }
+/* A question's × is a quiet control: no body until hover. */
+:root[data-theme] .chat-quiz-close { border-color: transparent; background: transparent; }
+:root[data-theme] .chat-quiz-close:hover:not(:disabled) { border-color: transparent; background: var(--tone-quiet-hover); }
+:root[data-theme] :is(.chat-attach-btn, .rw-more) { border-radius: var(--pill-radius); }
+/* Navigation over the transcript: Load older rests in the reading flow; ↓ latest and Back to reading fly over it. */
+:root[data-theme] .chat-load-older-btn { border-color: transparent; background: var(--surface-capsule); box-shadow: var(--elev-rest); }
+:root[data-theme] :is(.chat-scroll-bottom-btn, .rw-back) {
+    border-color: transparent; background: var(--surface-capsule); box-shadow: var(--elev-float);
+    -webkit-backdrop-filter: var(--glass); backdrop-filter: var(--glass);
+}
+:root[data-theme] :is(.chat-load-older-btn, .chat-scroll-bottom-btn, .rw-back):not(:disabled):hover { border-color: transparent; background: var(--surface-capsule-hover); }
+/* Tabs and segmented choices: neutral capsules with the secondary ink; the chosen one takes the crimson tone and stays
+   standing. Their strip scrolls sideways, so it lends the capsules' shadow room inside its own box instead of clipping
+   it. Filters are quiet controls: no body, so no shadow; a chosen filter takes the crimson tone. */
+:root[data-theme] .app-tab-strip { padding: 6px 16px 24px; margin: 0 -16px -16px; }
+:root[data-theme] .app-tab {
+    border-color: transparent; border-radius: var(--pill-radius); background: var(--surface-capsule); box-shadow: var(--elev-rest);
+}
+:root[data-theme] .app-tab:hover { border-color: transparent; background: var(--surface-capsule-hover); box-shadow: var(--elev-rest); color: var(--text-primary); }
+:root[data-theme] :is(.app-tab.active, .app-tab.is-active) {
+    border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); box-shadow: var(--elev-rest);
+}
+:root[data-theme] .filter-chip { border-color: transparent; border-radius: var(--pill-radius); background: transparent; box-shadow: none; }
+:root[data-theme] .filter-chip:hover { background: var(--tone-quiet-hover); }
+:root[data-theme] .filter-chip.active { border-color: transparent; background: var(--tone-crimson); color: var(--tone-crimson-ink); }
+/* A press deepens a capsule's colour; nothing changes height. */
+:root[data-theme] :is(.chat-header-btn, .chat-budget-pill, .project-panel-close, .mobile-nav-toggle, .chat-swarm, .chat-send-inline,
+    .app-tab, .filter-chip, .chat-load-older-btn, .chat-scroll-bottom-btn, .rw-back, .chat-question-nav):not(:disabled):active,
+:root[data-theme] .chat-capsule:not([data-open="true"]):active {
+    filter: var(--press);
+}
+/* What cannot be pressed now has no body. */
+:root[data-theme] :is(.chat-header-btn, .chat-budget-pill, .project-panel-close, .mobile-nav-toggle, .chat-swarm, .chat-send-inline,
+    .app-tab, .chat-load-older-btn, .chat-scroll-bottom-btn, .rw-back, .rw-row .rw-pill):disabled {
+    box-shadow: none;
+}
+:root[data-theme] :is(.chat-capsule, .chat-swarm, .chat-send-inline, .app-tab, .filter-chip, .chat-load-older-btn) {
+    transition: var(--motion-tone);
+}
+
+/* The sidebar's places are rows of one list: quiet rows with the inner radius; the chosen place takes the crimson
+   tone's own ink, so it keeps reading contrast on its tint. A Project row keeps its own fuchsia. */
+:root[data-theme] :is(.nav-row, .nav-section-toggle) { border-radius: var(--radius-inner); }
+:root[data-theme] :is(.nav-row, .nav-section-toggle).active:not(.nav-project-row) { color: var(--tone-crimson-ink); }

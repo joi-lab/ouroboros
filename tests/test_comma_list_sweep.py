@@ -1,19 +1,9 @@
-"""ABI 7.0 (ABI-10, owner 5.4=A): the comma-list remnant sweep — the phase CI gate.
-
-Grep-level checker pinning that the legacy reviewer comma-list migration read
-stays gone: no migration-read branches, the settings vocabulary carries the
-comma keys only as RETIRED, and no bench settings template configures
-reviewers through them. The comma ENV spellings legitimately survive as the
-derived runtime projection (``project_reviewer_slots_into_env`` + the
-API-pinned getters) — the sweep therefore pins SETTINGS-plane and
-migration-branch absence, not env-name absence.
-"""
+"""Current review-pool states and compatibility with retired comma-list settings."""
 
 from __future__ import annotations
 
 import json
 import pathlib
-import re
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -29,30 +19,14 @@ _PHASE5_ROUTE_KEYS = (
 )
 
 
-def _python_files() -> list[pathlib.Path]:
-    files: list[pathlib.Path] = []
-    for base in ("ouroboros", "supervisor"):
-        files.extend((_ROOT / base).rglob("*.py"))
-    return files
+def test_review_pool_state_vocabulary_is_structured_empty_error():
+    """The pool's state vocabulary is structured|empty|error — never ``legacy``."""
+    from ouroboros.reviewer_slot_config import review_pool_state
+    from tests.review_pool_rosters import pool_roster, pool_seat
 
-
-def test_no_migration_read_branches_remain():
-    """The reviewer_slot_config legacy block and its helpers stay deleted."""
-    retired_symbols = ("_legacy_rows", "_legacy_config", "_shared_session_route_spec")
-    hits: list[str] = []
-    for path in _python_files():
-        text = path.read_text(encoding="utf-8", errors="replace")
-        for symbol in retired_symbols:
-            if re.search(rf"\b{symbol}\b", text):
-                hits.append(f"{path.relative_to(_ROOT)}: {symbol}")
-    assert not hits, f"migration-read remnants: {hits}"
-
-
-def test_reviewer_config_source_is_never_legacy():
-    """`ReviewerSlotConfig.source` vocabulary is structured|default now."""
-    text = (_ROOT / "ouroboros" / "reviewer_slot_config.py").read_text(encoding="utf-8")
-    assert 'source="legacy"' not in text
-    assert 'source="default"' in text and 'source="structured"' in text
+    assert review_pool_state(None)["state"] == "empty"
+    assert review_pool_state(pool_roster(pool_seat("a", "m/one")))["state"] == "structured"
+    assert review_pool_state("{not json")["state"] == "error"
 
 
 def test_settings_vocabulary_retired_the_comma_keys():
@@ -96,19 +70,3 @@ def test_no_bench_settings_template_configures_reviewers_via_comma_keys():
             if key in data:
                 hits.append(f"{path.relative_to(_ROOT)}: {key}")
     assert not hits, f"bench templates still carry retired comma keys: {hits}"
-
-
-def test_prose_no_longer_promises_a_comma_list_migration():
-    """The rewritten prose markers stay rewritten (review.py:965 class)."""
-    for rel in ("ouroboros/tools/review.py", "ouroboros/reviewer_slot_config.py",
-                "ouroboros/review_model_routes.py"):
-        text = (_ROOT / rel).read_text(encoding="utf-8")
-        assert "migrated comma-lists" not in text, rel
-        assert "старый читается" not in text, rel
-
-
-def test_derived_projection_survives():
-    """5.4=A removes the migration READ; the derived projection STAYS."""
-    from ouroboros.reviewer_slot_config import project_reviewer_slots_into_env
-
-    assert callable(project_reviewer_slots_into_env)

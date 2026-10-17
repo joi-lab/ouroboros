@@ -19,7 +19,20 @@ Light writer's, or a delegated child's or nanny's signed with its focus) is
 a draft that acts at once; the mind's ``decision`` accepts or rejects it, and a
 rejected draft stops acting, so its rows are open and its members unfolded
 again; a draft already folded into a part is not rejected while that part acts
-(``already_folded``). Only the mind corrects, beside the original.
+(``already_folded``). Only the mind corrects, and a correction stands under the
+original wherever the record is shown, signed and dated (``_interpret``); it never
+replaces the record's words.
+
+An ``account`` is the mind's own text connecting experience of several rooms. It names
+the exact versions of the records it is based on (``sources``: id, the revision the mind
+read, the body's sha256, and a draft's status then); that relation is provenance, never
+ownership: it seals no row, folds nothing, moves no room head, and the same source may
+inform several accounts and still be folded locally. Whether an account stands in the
+common view, and which named records it tells in their place, is a separate ``selection``
+by the mind (the latest per account acts; ``shown`` false withdraws it). Both are
+corrected like any record; neither is rewritten. What changed in a source since the
+account was written is read at interpretation time (``_source_state``), never written
+back into the account.
 
 Every precondition is checked inside the same publication lock, and a refusal
 is a typed ``PublishResult`` (not an exception) carrying the current revision
@@ -38,21 +51,23 @@ import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterable, List, NamedTuple, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, NamedTuple, Optional, Tuple
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.utils import append_jsonl, assert_test_data_path, utc_now_iso
 
 SCHEMA_VERSION = 1
 KINDS = frozenset({"page", "part", "note", "correction", "decision", "mark", "mark_view", "mark_release",
-                   "legacy", "gap", "activation"})
+                   "legacy", "gap", "activation", "account", "selection"})
 AUTHOR_KINDS = frozenset({"mind", "helper", "host", "legacy_helper"})
 SPEAKERS = frozenset({"human", "ouroboros", "child", "host", "helper", "unattributed"})
-STORY_KINDS = ("page", "part", "note", "legacy", "gap")
+STORY_KINDS = ("page", "part", "note", "legacy", "gap", "account")
+# An account or its selection changes the common view, not what one room's story says: neither moves a room head.
 HEAD_KINDS = ("page", "part", "note", "correction", "decision", "legacy", "gap")
-_CORRECTABLE = frozenset({"page", "part", "note", "legacy", "gap"})
+_CORRECTABLE = frozenset({"page", "part", "note", "legacy", "gap", "account"})
 _FOLDABLE = frozenset({"page", "part", "legacy"})
-_TEXT_KINDS = frozenset({"page", "part", "note", "correction", "mark"})
+_TEXT_KINDS = frozenset({"page", "part", "note", "correction", "mark", "account"})
+_SOURCE_FIELDS = ("id", "kind", "room_id", "revision", "sha256")  # what an account freezes of each source
 _NO_BLOCK = float("inf")
 _CHUNK = 500
 
@@ -86,7 +101,7 @@ class PublishResult(NamedTuple):
     """Outcome of one publication; ``reason`` is ``saved``, ``unchanged`` or a typed refusal.
 
     Refusals: ``revision_required``, ``revision_conflict``, ``already_sealed``,
-    ``already_folded``, ``quote_mismatch``, ``target_missing``, ``invalid``. A
+    ``already_folded``, ``quote_mismatch``, ``target_missing``, ``not_integrator``, ``invalid``. A
     refusal names ids (``conflict_ids``), the current revision or room head, and
     a short ``detail``; it never carries record text.
     """
@@ -107,8 +122,18 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _nonblank(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def body_sha256(record: Mapping[str, Any]) -> str:
+    """The sha256 of a record's canonical body (``_json`` of the journal record, without its sequence)."""
+    body = {key: value for key, value in record.items() if key != "sequence"}
+    return hashlib.sha256(_json(body).encode("utf-8")).hexdigest()
 
 
 def source_time_span(timestamps: Iterable[Any], *, incomplete: bool = False) -> Dict[str, Any]:
@@ -120,6 +145,18 @@ def source_time_span(timestamps: Iterable[Any], *, incomplete: bool = False) -> 
     return {"start": min(known).isoformat() if known else None,
             "end": max(known).isoformat() if known else None,
             "incomplete": bool(incomplete or not known or len(known) != len(parsed))}
+
+
+# A host-signed mark that keeps late reviewer feedback in view in its room (``late_review_marks``). The
+# feedback waits for the integrating mind: a delegated child or nanny is a helper, so only another
+# focus releases it, with a reason (``_rule_mark_release``); a first show, a page seal or a read never does.
+LATE_REVIEW_OPERATION = "late_review"
+DELEGATED_FOCUS_ROLES = frozenset({"child", "nanny"})
+
+
+def is_late_review_mark(mark: Any) -> bool:
+    author = mark.get("author") if isinstance(mark, Mapping) else None
+    return isinstance(author, Mapping) and author.get("kind") == "host" and author.get("operation") == LATE_REVIEW_OPERATION
 
 
 def _author_problem(author: Any) -> str:
@@ -151,6 +188,15 @@ def draft_signer(author: Any) -> str:
         return "Light"
     task = str(author.get("task_id") or focus.get("task_id") or "").strip()
     return f"{role}, task {task}" if task else role
+
+
+def correction_line(fix: Mapping[str, Any]) -> str:
+    """The signature a correction stands under, beside its original: ``[correction <id> by mind (<focus>), <date>]``.
+
+    Only the mind corrects, so the focus (``draft_signer``'s words) and the publication date
+    say who and when; the same line wherever the record is shown.
+    """
+    return f"[correction {fix.get('id')} by mind ({draft_signer(fix.get('author'))}), {str(fix.get('ts') or '')[:10] or 'date not recorded'}]"
 
 
 # A markdown emphasis marker: a run of up to three ``*``/``_`` that opens before a word (nothing
@@ -411,6 +457,38 @@ class ChronicleStore:
         return self.publish([{"kind": "note", "room_id": str(room_id), "task_id": task_id, "text": text,
                               "author": author}])
 
+    def publish_account(self, *, room_id: Any, text: str, sources: Iterable[Any], author: Dict[str, Any],
+                        metadata: Optional[Dict[str, Any]] = None, record_id: Optional[str] = None) -> PublishResult:
+        """The mind's account over exact source versions; each source is ``{id, revision?}`` or an id.
+
+        The revision named is the one the mind read (the record itself or one of its corrections);
+        unnamed, the current one is frozen. A source that is not in this chronicle is
+        ``target_missing``; a revision that is not that record's is ``revision_conflict``.
+        """
+        with self._index() as db:
+            refs = []
+            for given in sources if isinstance(sources, (list, tuple)) else ():
+                frozen, refusal = self._source_version(db, given)
+                if refusal is not None:
+                    return refusal
+                refs.append(frozen)
+            record = {"kind": "account", "room_id": str(room_id), "text": text, "author": author, "sources": refs,
+                      "metadata": metadata or {}}
+            if record_id:
+                record["id"] = str(record_id)
+            return self._commit(db, [record])
+
+    def select_account(self, account_id: str, *, replaces: Iterable[Any], author: Dict[str, Any], reason: str,
+                       shown: bool = True) -> PublishResult:
+        """The mind's choice of the common view: show the account (or withdraw it) in place of the named records."""
+        with self._index() as db:
+            target = self._get(db, account_id)
+            if target is None:
+                return _refuse("target_missing", conflict_ids=(str(account_id),))
+            return self._commit(db, [{"kind": "selection", "room_id": target["room_id"], "target_id": target["id"],
+                                      "replaces": [str(r) for r in (replaces or ())], "shown": shown, "reason": reason,
+                                      "author": author}])
+
     def correct(self, target_id: str, text: str, author: Dict[str, Any], *,
                 expected_revision: Optional[str] = None, expected_sequence: Optional[int] = None) -> PublishResult:
         """The mind's correction beside the original; it acts at once and moves the target room's head."""
@@ -633,6 +711,58 @@ class ChronicleStore:
                            "is a helper's draft, or correct this draft beside its original", conflict_ids=(holder[0],))
         return None
 
+    def _source_version(self, db, given) -> Tuple[Optional[Dict[str, Any]], Optional[PublishResult]]:
+        """The frozen form of one source reference (``{id, revision?}`` or an id), or a typed refusal.
+
+        The revision is the one named (the record's own id or one of its corrections'; unnamed, the
+        current one); the body's sha256 and a draft's status are the record's as they are now.
+        """
+        ref = _mapping(given) if isinstance(given, Mapping) else {"id": given}
+        found = self._get(db, ref.get("id", ""))
+        if found is None:
+            return None, _refuse("target_missing", "a source is a record of this chronicle", conflict_ids=(str(ref.get("id")),))
+        revisions = self._revisions(db, found["id"])
+        cited = ref.get("revision") or revisions[-1]
+        if cited not in revisions:
+            return None, _refuse("revision_conflict", f"{cited} is not a revision of {found['id']}",
+                                 current_revision=revisions[-1], conflict_ids=(found["id"],))
+        frozen = {"id": found["id"], "kind": found["kind"], "room_id": found["room_id"], "revision": cited,
+                  "sha256": body_sha256(found)}
+        status = self._status(db, found)
+        return ({**frozen, "status": status} if status else frozen), None
+
+    def _rule_account(self, db, record):
+        if record["author"]["kind"] != "mind":
+            return _refuse("invalid", "an account is the mind's own text")
+        refs = record.get("sources")
+        if not isinstance(refs, list) or not refs or len({str(_mapping(r).get("id")) for r in refs}) != len(refs):
+            return _refuse("invalid", "sources is a non-empty list of distinct source versions (publish_account fills them)")
+        for ref in refs:
+            frozen, refusal = self._source_version(db, ref)
+            if refusal is not None:
+                return refusal
+            if {key: _mapping(ref).get(key) for key in frozen} != frozen:  # a hand-made reference is checked, never trusted
+                return _refuse("invalid", f"source {frozen['id']}: kind, room, sha256 and status are the record's own")
+        return None
+
+    def _rule_selection(self, db, record):
+        if record["author"]["kind"] != "mind" or not _nonblank(record.get("reason")):
+            return _refuse("invalid", "a selection is the mind's, with a reason")
+        if not isinstance(record.get("shown"), bool):
+            return _refuse("invalid", "shown is true or false")
+        target = self._get(db, record.get("target_id", ""))
+        if target is None:
+            return _refuse("target_missing", conflict_ids=(str(record.get("target_id", "")),))
+        if target["kind"] != "account":
+            return _refuse("invalid", "a selection chooses the common view of an account")
+        ids = record.get("replaces")
+        if not isinstance(ids, list) or len(set(map(str, ids))) != len(ids) or target["id"] in map(str, ids):
+            return _refuse("invalid", "replaces is a list of distinct record ids other than the account itself")
+        missing = tuple(str(i) for i in ids if self._get(db, i) is None)
+        if missing:
+            return _refuse("target_missing", "replaces names records of this chronicle", conflict_ids=missing)
+        return None
+
     def _rule_mark(self, db, record):
         if record.get("scope", "room") not in ("room", "global"):
             return _refuse("invalid", "scope is room or global")
@@ -657,10 +787,17 @@ class ChronicleStore:
         return None
 
     def _rule_mark_release(self, db, record):
-        if db.execute("SELECT 1 FROM active_marks WHERE id=?", (record.get("target_id", ""),)).fetchone() is None:
+        active = db.execute("SELECT body FROM active_marks WHERE id=?", (record.get("target_id", ""),)).fetchone()
+        if active is None:
             return _refuse("target_missing", "no active mark has this id", conflict_ids=(str(record.get("target_id")),))
         if not _nonblank(record.get("reason")):
             return _refuse("invalid", "a mark release needs an explicit reason")
+        author = record["author"]
+        if is_late_review_mark(json.loads(active[0])) and (
+                author["kind"] != "mind" or author["focus"]["role"] in DELEGATED_FOCUS_ROLES):
+            return _refuse("not_integrator", "late review feedback the host keeps in view is released by the "
+                           "integrating mind with its reason; a delegated helper reports it instead",
+                           conflict_ids=(str(record["target_id"]),))
         return None
 
     def _head(self, db, room) -> int:
@@ -685,6 +822,11 @@ class ChronicleStore:
         row = db.execute("SELECT id FROM records WHERE target=? AND kind='correction' ORDER BY sequence DESC LIMIT 1",
                          (record_id,)).fetchone()
         return row[0] if row else record_id
+
+    def _revisions(self, db, record_id) -> List[str]:
+        """The record's own id, then each correction's, in publication order: every revision it ever had."""
+        return [str(record_id)] + [rid for (rid,) in db.execute(
+            "SELECT id FROM records WHERE target=? AND kind='correction' ORDER BY sequence", (str(record_id),))]
 
     # --- order, interpretation ---------------------------------------------------------------------
 
@@ -758,25 +900,125 @@ class ChronicleStore:
         return covers
 
     def _interpret(self, db, record) -> Dict[str, Any]:
+        """The record as it acts: its own words, then every correction of the mind under them, each signed.
+
+        ``current_text`` keeps the original and adds each correction in publication order under
+        ``correction_line``; the author stays the record's. ``revision`` is the last correction's id
+        (what ``expected_revision`` names) and ``corrections`` lists them all. A correction never
+        replaces a record's words: to say a record anew the mind folds it into a part over it.
+        """
         record = dict(record)
-        current = db.execute("SELECT body FROM records WHERE target=? AND kind='correction' ORDER BY sequence DESC "
-                             "LIMIT 1", (record["id"],)).fetchone()
-        correction = json.loads(current[0]) if current else None
-        record["current_text"] = correction["text"] if correction else record.get("text", "")
-        record["current_author"] = correction["author"] if correction else record.get("author", {})
-        record["revision"] = correction["id"] if correction else record["id"]
+        fixes = [json.loads(body) for (body,) in db.execute(
+            "SELECT body FROM records WHERE target=? AND kind='correction' ORDER BY sequence", (record["id"],))]
+        record["current_text"] = "\n\n".join([str(record.get("text", "")),
+                                              *(f"{correction_line(fix)}\n{fix.get('text', '')}" for fix in fixes)])
+        record["revision"] = fixes[-1]["id"] if fixes else record["id"]
+        record["corrections"] = [{"id": fix["id"], "author": fix.get("author"), "ts": fix.get("ts")} for fix in fixes]
         status = self._status(db, record)
         if status:
             record["status"] = status
         folded = db.execute("SELECT part_id FROM folded WHERE member_id=?", (record["id"],)).fetchone()
         record["folded_into"] = folded[0] if folded else None
+        if record.get("kind") == "account":
+            record["sources"] = [self._source_state(db, ref) for ref in record.get("sources") or ()]
+            record["selection"] = self._selection_of(db, record["id"])
         return record
+
+    def _source_state(self, db, ref) -> Dict[str, Any]:
+        """A frozen source reference plus what changed since: the account's basis stays what it was.
+
+        ``current_revision``, ``later_corrections`` (after the cited revision), ``status_now`` (a
+        draft's), ``folded_into`` now, and ``missing`` when the record is not in this chronicle;
+        ``revision_known`` is false when the cited revision is not one this journal holds.
+        """
+        state = {key: _mapping(ref).get(key) for key in (*_SOURCE_FIELDS, "status")}
+        found = self._get(db, state["id"] or "")
+        if found is None:
+            return {**state, "missing": True, "revision_known": False, "later_corrections": [], "current_revision": None,
+                    "status_now": None, "folded_into": None}
+        revisions = self._revisions(db, found["id"])
+        known = state["revision"] in revisions
+        later = revisions[revisions.index(state["revision"]) + 1:] if known else []
+        folded = db.execute("SELECT part_id FROM folded WHERE member_id=?", (found["id"],)).fetchone()
+        return {**state, "missing": False, "revision_known": known, "current_revision": revisions[-1],
+                "later_corrections": later, "status_now": self._status(db, found), "folded_into": folded[0] if folded else None,
+                "nested_changes": self._nested_source_changes(db, found)}
+
+    def _nested_source_changes(self, db, source) -> List[Dict[str, Any]]:
+        """Changes inside retained account/part sources, independent of current display or fold ownership.
+
+        Account edges retain exact cited revisions/statuses. Parts retain member IDs only, so their
+        members' corrections and decisions are reported without inventing a revision read by the part.
+        Visit only this source graph; a repeated node's immutable edges need expanding just once.
+        """
+        changes, todo, expanded = [], [(source, [])], set()
+        while todo:
+            parent, path = todo.pop()
+            if parent["id"] in expanded:
+                continue
+            expanded.add(parent["id"])
+            if parent["kind"] == "account":
+                refs = parent.get("sources") or ()
+            elif parent["kind"] == "part":
+                refs = [{"id": ident} for ident in (parent.get("covers") or {}).get("member_ids") or ()]
+            else:
+                continue
+            via = [*path, parent["id"]]
+            for ref in refs:
+                member = self._get(db, ref["id"])
+                if member is None:
+                    continue
+                revision = ref.get("revision")
+                revisions = self._revisions(db, member["id"])
+                later = (revisions[revisions.index(revision) + 1:] if revision in revisions else
+                         revisions[1:] if revision is None else [])
+                for (body,) in db.execute("SELECT body FROM records WHERE target=? AND kind IN ('correction','decision') "
+                                          "ORDER BY sequence", (member["id"],)):
+                    event = json.loads(body)
+                    if (event["kind"] == "correction" and event["id"] not in later
+                            or event["kind"] == "decision" and revision is not None
+                            and ref.get("status") == self._status(db, member)):
+                        continue
+                    changes.append({"source_id": member["id"], "kind": member["kind"], "room_id": member["room_id"],
+                                    "via": via, "revision": revision, "event": event})
+                todo.append((member, via))
+        return changes
+
+    def _selection_of(self, db, account_id) -> Optional[Dict[str, Any]]:
+        """The latest selection of an account (the one that acts), or None while it was never selected."""
+        row = db.execute("SELECT sequence,body FROM records WHERE target=? AND kind='selection' ORDER BY sequence DESC LIMIT 1",
+                         (str(account_id),)).fetchone()
+        if not row:
+            return None
+        chosen = json.loads(row[1])
+        return {"id": chosen["id"], "shown": bool(chosen.get("shown")), "replaces": [str(r) for r in chosen.get("replaces") or ()],
+                "reason": str(chosen.get("reason") or ""), "ts": chosen.get("ts"), "sequence": row[0]}
 
     # --- reads -------------------------------------------------------------------------------------
 
     def get(self, record_id: str) -> Optional[Dict[str, Any]]:
         with self._index() as db:
             return self._get(db, record_id)
+
+    def rejected_input(self, room_id: Any, unit_key: str, input_sha256: str,
+                       light_binding: Mapping[str, Any]) -> bool:
+        """A rejected helper attempt at this exact input/route, including old published drafts.
+
+        Read the addressed room's indexed draft metadata and latest decision;
+        never recreate a lost receipt or append published drafts to scan state.
+        """
+        with self._index() as db:
+            rows = db.execute(
+                "SELECT body FROM records WHERE room=? AND kind IN ('page','part') "
+                "AND json_extract(body, '$.metadata.unit.key')=? "
+                "AND json_extract(body, '$.metadata.input_sha256')=?",
+                (str(room_id), unit_key, input_sha256))
+            for (body,) in rows:
+                record = json.loads(body)
+                if ((record.get("metadata") or {}).get("light_binding") == dict(light_binding)
+                        and self._status(db, record) == "rejected"):
+                    return True
+        return False
 
     def records(self, room_id: Any = None, *, kinds: Optional[Iterable[str]] = None,
                 after_seq: int = 0) -> List[Dict[str, Any]]:
@@ -794,11 +1036,10 @@ class ChronicleStore:
                 "SELECT sequence,body FROM records WHERE " + " AND ".join(where) + " ORDER BY sequence", args)]
 
     def room_records(self, room_id: Any, *, after_seq: int = 0) -> List[Dict[str, Any]]:
-        """A room's pages, parts, notes, legacy sections and gaps, without rejected drafts.
+        """A room's pages, parts, accounts, notes, legacy sections and gaps, without rejected drafts.
 
-        Each carries ``current_text``/``current_author`` (the mind's latest
-        correction, else the original), ``revision`` (the id whose text acts),
-        ``status`` for pages and parts and ``folded_into``.
+        Each is interpreted (``_interpret``): ``current_text`` with the mind's corrections under
+        the original, ``revision``, ``corrections``, ``status`` for pages and parts and ``folded_into``.
         """
         with self._index() as db:
             rows = [{**json.loads(body), "sequence": seq} for seq, body in db.execute(
@@ -815,6 +1056,12 @@ class ChronicleStore:
             cache: Dict[str, Tuple[Any, ...]] = {}
             effective = [r for r in (self._interpret(db, row) for row in rows) if r.get("status") != "rejected"]
             return sorted(effective, key=lambda r: self._order_key(db, r, cache))
+
+    def accounts(self) -> List[Dict[str, Any]]:
+        """Every account, interpreted (sources with their later changes, the acting selection), in publication order."""
+        with self._index() as db:
+            return [self._interpret(db, {**json.loads(body), "sequence": seq}) for seq, body in db.execute(
+                "SELECT sequence,body FROM records WHERE kind='account' ORDER BY sequence")]
 
     def folded_members(self, part_id: Any) -> List[str]:
         """Every record under a part through nested parts: its own members first, then theirs."""

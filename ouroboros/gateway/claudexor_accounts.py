@@ -46,7 +46,9 @@ There is no PATH-CLI or in-app terminal surface, and none may be added.
 from __future__ import annotations
 
 import asyncio
+import copy
 import logging
+import threading
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, Tuple
 
@@ -245,7 +247,69 @@ def _account_row_visible(harness_id: str, row: Dict[str, Any], capable) -> bool:
     return harness_id in capable or bool(row.get("native_login_detected"))
 
 
-def _status_payload(include_models: bool) -> Dict[str, Any]:
+# One status read per variant (with or without per-harness models) at a time: concurrent
+# requests join the read in flight instead of fanning the daemon out again. Each facet
+# keeps its own last answered read per daemon home (the catalog per variant: its rows carry
+# models or not), so a failed or unasked facet serves that value again, stale, under its
+# own observation time and this read's error.
+_STATUS_LOCK = threading.Lock()
+_STATUS_IN_FLIGHT: Dict[bool, Future] = {}
+_FACET_MEMORY: Dict[Tuple[str, str, bool], Dict[str, Any]] = {}
+_FACET_FIELDS = {"catalog": ("harnesses",), "accounts": ("profiles",),
+                 "quota": ("quota", "quota_absences", "resources")}
+
+
+def _status_payload(include_models: bool, *, join: bool = True) -> Dict[str, Any]:
+    """The status answer: joins a read of the same variant already in flight (an owner
+    wake passes ``join=False`` and reads anew); every caller gets its own copy."""
+    with _STATUS_LOCK:
+        shared = _STATUS_IN_FLIGHT.get(include_models) if join else None
+        owner = shared is None
+        if owner:
+            shared = Future()
+            if join:
+                _STATUS_IN_FLIGHT[include_models] = shared
+    if owner:
+        try:
+            shared.set_result(_with_facet_memory(_read_status_payload(include_models), include_models))
+        except BaseException as exc:
+            shared.set_exception(exc)
+        finally:
+            with _STATUS_LOCK:
+                if _STATUS_IN_FLIGHT.get(include_models) is shared:
+                    del _STATUS_IN_FLIGHT[include_models]
+    return copy.deepcopy(shared.result())
+
+
+def _with_facet_memory(payload: Dict[str, Any], include_models: bool = False) -> Dict[str, Any]:
+    """Stamp ``facets`` and serve each unanswered facet's last answered value as stale.
+
+    An ``ok`` read replaces the facet's memory and observation time; a ``failed`` or
+    ``not_read`` facet keeps both (a stale value never refreshes its timestamp) and carries
+    this read's typed error. ``reads`` still states what THIS read established."""
+    from ouroboros.utils import utc_now_iso
+
+    now, home = utc_now_iso(), str(payload.get("config_dir") or "")
+    errors = payload.pop("_facet_errors", {})
+    facets: Dict[str, Dict[str, Any]] = {}
+    with _STATUS_LOCK:
+        for facet, fields in _FACET_FIELDS.items():
+            key = (home, facet, include_models and facet == "catalog")
+            if payload["reads"][facet] == READ_OK:
+                _FACET_MEMORY[key] = held = {
+                    "observed_at": now, "value": copy.deepcopy({name: payload[name] for name in fields if name in payload})}
+            else:
+                held = _FACET_MEMORY.get(key)
+                payload.update(copy.deepcopy(held["value"]) if held else {})
+            facets[facet] = {"observed_at": held["observed_at"] if held else None,
+                             "stale": bool(held) and payload["reads"][facet] != READ_OK,
+                             "error": errors.get(facet)}
+    payload["facets"] = facets
+    return payload
+
+
+def _read_status_payload(include_models: bool) -> Dict[str, Any]:
+    """One uncached status fan-out; a facet's refusal rides ``_facet_errors``, never the daemon state."""
     from ouroboros.claudexor_daemon import get_owned_daemon, owned_config_dir
     from ouroboros.gateways.claudexor import (
         ClaudexorGateway,
@@ -262,6 +326,8 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
         "profiles": {},
         "quota": [],
         "quota_absences": [],
+        # /v2/operations is distinct from agent_capabilities (reads.catalog).
+        "resource_capabilities_read": READ_NOT_READ,
         # PROVENANCE, per independent facet (BIBLE P1: missing data is a GAP,
         # never a value). `[]`/`{}` alone cannot say WHETHER the daemon was
         # asked: the owner's panel printed "no account connected" for three
@@ -302,8 +368,22 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             payload["daemon"]["engine_version"] = gateway.engine_version
 
             def _quota_state() -> Dict[str, Any]:
+                from ouroboros.gateways.claudexor import account_resource_capabilities
+
+                try:
+                    capabilities = account_resource_capabilities(operations_call.result())
+                    payload["resource_capabilities_read"] = READ_OK
+                except Exception:
+                    payload["resource_capabilities_read"] = READ_FAILED
+                    capabilities = account_resource_capabilities([])
+                payload["resource_capabilities"] = capabilities
                 reader = getattr(gateway, "quota_state", None)
                 if callable(reader):
+                    if capabilities["read"]:
+                        result = reader(view="resources")
+                        if not isinstance(result, dict) or not isinstance(result.get("resources"), list):
+                            raise ClaudexorUnavailable("malformed_response", "Account resources were not returned")
+                        return result
                     return reader()
                 # Compatibility for old embedded gateway doubles. The shipped
                 # gateway has quota_state, so the live status path always uses
@@ -315,10 +395,11 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
             # login state). Serialized, the panel waited for their SUM — ~23s on a
             # warm daemon with nothing on screen; fanned out it waits for the
             # slowest. Failure semantics are per-facet: each result is classified
-            # on its own (see `_facet_outcome`), a refusal surfaces as the typed
-            # unreachable state below WITHOUT downgrading the siblings that
+            # on its own (see `_facet_outcome`), a refusal surfaces as that facet's
+            # own typed error below WITHOUT downgrading the siblings that
             # landed, and a manifest refusal still fails OPEN.
             with ThreadPoolExecutor(max_workers=5) as pool:
+                operations_call = pool.submit(lambda: gateway.operations())
                 catalog_call = pool.submit(gateway.agent_capabilities)
                 manifests_call = pool.submit(gateway.harnesses)
                 profiles_call = pool.submit(gateway.credential_profiles)
@@ -326,7 +407,6 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 # Deferred lookup on purpose: the failure of THIS read (or a
                 # transport double that lacks the method) must land inside the
                 # future, where the absorbed fail-closed handling below owns it.
-                operations_call = pool.submit(lambda: gateway.operations())
             # Classify every submitted future INDEPENDENTLY, before consuming
             # any of them. Reading `.result()` in sequence would make a facet's
             # verdict depend on which sibling raised first — a catalog failure
@@ -345,11 +425,12 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 "accounts": profiles_outcome[0],
                 "quota": quota_outcome[0],
             }
-            first_error = next(
-                (outcome[2] for outcome in (catalog_outcome, profiles_outcome, quota_outcome)
-                 if outcome[2] is not None),
-                None,
-            )
+            # A refused facet keeps its own typed error; the daemon that answered the
+            # handshake and its other facets stay as read (no whole-payload `unreachable`).
+            payload["_facet_errors"] = {
+                facet: outcome[2].code if outcome[2] is not None else "malformed_response"
+                for facet, outcome in (("catalog", catalog_outcome), ("accounts", profiles_outcome),
+                                       ("quota", quota_outcome)) if outcome[0] == READ_FAILED}
             catalog = catalog_outcome[1] if catalog_outcome[0] == READ_OK else {}
             # Account surfaces show only harnesses with a login concept. On a
             # transient manifest-read failure — or a successful read with zero
@@ -453,18 +534,14 @@ def _status_payload(include_models: bool) -> Dict[str, Any]:
                 row for row in (raw_absences if isinstance(raw_absences, list) else [])
                 if isinstance(row, dict)
             ]
-            if first_error is not None:
-                # At least one facet refused while others landed. The daemon is
-                # disclosed as unreachable AND the surviving facets keep their
-                # own `ok` — the panel shows what was genuinely read instead of
-                # blanking, and never presents an unread facet as empty.
-                raise first_error
+            if isinstance(quota.get("resources"), list):
+                payload["resources"] = quota["resources"]
     except ClaudexorUnavailable as exc:
         payload["daemon"]["state"] = "unreachable"
         payload["daemon"]["last_error"] = f"{exc.code}: {exc}"
         # A failure BEFORE the fan-out (discovery, handshake) leaves every facet
-        # at its `not_read` default; those never asked stay not_read, and the
-        # ones that were asked and refused are already marked failed above.
+        # at its `not_read` default, each carrying the error that kept it unasked.
+        payload["_facet_errors"] = {facet: exc.code for facet in payload["reads"]}
     return payload
 
 
@@ -512,9 +589,14 @@ def _facet_outcome(
 
 async def api_claudexor_status(request: Request) -> JSONResponse:
     """GET /api/claudexor/status[?include=models] — owned-daemon state plus the
-    daemon's own account/quota/catalog truth. Read-only; never spawns."""
+    daemon's own account/quota/catalog truth. ``?view=quota`` reads only the
+    passive quota and account roster. Read-only; never spawns."""
     include_models = "models" in str(request.query_params.get("include") or "")
     try:
+        if request.query_params.get("view") == "quota":
+            from ouroboros.gateway.claudexor_passive import _quota_payload
+
+            return JSONResponse(await asyncio.to_thread(_quota_payload))
         return JSONResponse(await asyncio.to_thread(_status_payload, include_models))
     except Exception as exc:
         log.exception("api_claudexor_status failed")
@@ -544,7 +626,7 @@ async def api_claudexor_wake(request: Request) -> JSONResponse:
         get_owned_daemon().clear_start_failure_latch(cleared_by="owner_wake")
         gateway = ensure_owned_gateway()
         gateway.close()
-        return _status_payload(include_models=False)
+        return _status_payload(include_models=False, join=False)
 
     try:
         return JSONResponse(await asyncio.to_thread(_wake))

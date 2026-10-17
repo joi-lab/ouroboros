@@ -1,5 +1,4 @@
 import pathlib
-import re
 import shlex
 import sys
 
@@ -111,27 +110,6 @@ def test_list_files_schema_uses_path_not_dir(tmp_path):
     assert "path" in props
     assert "dir" not in props
     assert "TOOL_ARG_ERROR" in registry.execute("list_files", {"dir": "."})
-
-
-def test_runtime_prompts_do_not_advertise_legacy_public_tool_names():
-    root = pathlib.Path(__file__).resolve().parent.parent
-    prompt_text = "\n".join(
-        (root / path).read_text(encoding="utf-8")
-        for path in ("prompts/SYSTEM.md", "prompts/SAFETY.md", "prompts/CONSCIOUSNESS.md")
-    )
-    for name in LEGACY_PUBLIC_TOOL_NAMES:
-        assert re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", prompt_text) is None, name
-    for name in (
-        "read_file",
-        "run_command",
-        "commit_reviewed",
-        "preflight_review",
-        "schedule_subagent",
-        "task_acceptance_review",
-    ):
-        assert name in prompt_text
-    assert "`runtime_data` for explicit runtime state/memory work" in prompt_text
-    assert "`runtime_data` for read-only runtime state" not in prompt_text
 
 
 def test_frozen_registry_includes_service_tools(monkeypatch, tmp_path):

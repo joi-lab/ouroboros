@@ -206,8 +206,8 @@ def test_summary_revision_still_refuses_a_rerender_that_changes_a_recursive_fiel
     write_content = store._write_content
     # A re-render that loses the alias is a changed field, not a revised summary.
     monkeypatch.setattr(store, "_write_content", lambda *args: write_content(*args).replace(b"- *id001", b"- []"))
-    result = store.write_knowledge_note(target, "", mode="edit", summary="New view.", expected_revision=original.revision,
-                                        edits=[{"old_text": "Old.", "new_text": "New.", "basis": "This episode."}])
+    result = store.write_knowledge_note(target, "New.", mode="edit", old_str="Old.", summary="New view.",
+                                        expected_revision=original.revision)
     assert result.reason == "invalid_note: edit cannot change frontmatter"
     assert target.path.read_bytes() == original.raw
     assert not (target.shelf.parent / "knowledge_history.jsonl").exists()
@@ -262,14 +262,20 @@ def test_edit_delta_counts_real_markdown_headings_including_duplicates(tmp_path)
     assert noop.ok and noop.reason == "unchanged" and noop.delta["change_chars"] == 0
 
 
-def test_edit_is_an_opt_in_tool_mode_not_a_backlog_merge(tmp_path):
+def test_edit_is_an_opt_in_tool_mode_the_backlog_shares(tmp_path):
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     schema = next(entry.schema for entry in tools.get_tools() if entry.name == "knowledge_write")
     assert "edit" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "old_str" in schema["parameters"]["properties"]
-    assert "edit is not supported" in tools._knowledge_write(
+    backlog = address(tmp_path, "improvement-backlog")
+    assert "edit_source_missing" in tools._knowledge_write(
         ctx, "improvement-backlog", "new", mode="edit", old_str="old")
-    assert not (tmp_path / "memory" / "knowledge" / "improvement-backlog.md").exists()
+    assert not backlog.path.exists()
+    # Once written, the backlog takes the same revision-checked anchored edit as any note.
+    assert tools._knowledge_write(ctx, "improvement-backlog", "- old item\n").startswith("✅")
+    assert tools._knowledge_write(ctx, "improvement-backlog", "- new item", mode="edit", old_str="- old item",
+                                  expected_revision=store.read_knowledge_note(backlog).revision).startswith("✅")
+    assert store.read_knowledge_note(backlog).text.endswith("- new item\n")
     assert "old_str is used only" in tools._knowledge_write(
         ctx, "somewhere", "new", mode="append", old_str="old")
     assert "non-empty old_str" in tools._knowledge_write(ctx, "somewhere", "new", mode="edit", old_str="")

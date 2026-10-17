@@ -10,9 +10,15 @@ from ouroboros.platform_layer import (
     resolve_bundled_node,
 )
 
-def generate_world_profile(output_path: str):
-    """Generates a WORLD.md file containing the system profile and hardware details."""
-    
+def generate_world_profile(output_path: str, repo_dir: str = "", data_dir: str = ""):
+    """Generates a WORLD.md file containing the system profile and hardware details.
+
+    The file-system rules name the roots this installation actually uses; a caller
+    without them resolves the configured ones (``ouroboros.config``)."""
+    if not (repo_dir and data_dir):
+        from ouroboros.config import resolve_data_dir, resolve_repo_dir
+
+        repo_dir, data_dir = repo_dir or str(resolve_repo_dir()), data_dir or str(resolve_data_dir())
     os_name = platform.system()
     os_release = platform.release()
     arch = platform.machine()
@@ -77,9 +83,8 @@ The following binaries are available in my PATH:
 `{', '.join(tools)}`
 
 ## File System Rules
-I live inside `~/Ouroboros/`. 
-- `repo/` contains my codebase.
-- `data/` contains my memory, state, and logs.
+- `{repo_dir}` contains my codebase.
+- `{data_dir}` contains my memory, state, and logs.
 I should generally confine my writes to these directories, though I have read access to the rest of the filesystem if needed for exploration.
 
 *(Generated automatically on first boot)*

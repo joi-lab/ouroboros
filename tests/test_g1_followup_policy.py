@@ -5,6 +5,7 @@ import copy
 from types import SimpleNamespace
 
 import pytest
+from tests.worker_pool_support import affirm_ready
 
 from ouroboros.cancel_intents import request_cancel, settle_intent, active_intent
 from ouroboros.task_results import write_task_result, load_task_result
@@ -13,6 +14,7 @@ from ouroboros.usage_admission import task_billing_fields
 from supervisor import queue, queue_schedules as schedules
 from supervisor.followup_policy import observed_store, record_restart
 from tests.test_schedule_followup import _ctx
+from tests._store_shared import delete_result
 
 pytestmark = pytest.mark.serial
 ORIGIN = 'root-1'
@@ -93,8 +95,10 @@ def test_new_relation_required_and_unrecorded_legacy_keeps_its_own_wallet_until_
     result = task_billing_fields(task, task['id'], 999.0, root, pin_initial=True, persist_initial=False)
     assert (result['billing_group_id'], result['billing_group_limit_usd']) == ('legacy-fired', 999.0)
     garbled_task = {'id': 'garbled-fired', 'metadata': {'schedule_id': 'garbled'}}
-    assert task_billing_fields(garbled_task, 'garbled-fired', 999.0, root, pin_initial=True,
-                               persist_initial=False)['billing_group_id'].startswith('unavailable:')
+    from ouroboros.usage_ledger import BillingAuthorityUnavailable
+    with pytest.raises(BillingAuthorityUnavailable) as refused:
+        task_billing_fields(garbled_task, 'garbled-fired', 999.0, root, pin_initial=True, persist_initial=False)
+    assert (refused.value.kind, refused.value.cause) == ('refused', 'related_followup_unbound')
     assert load_task_result(root, task['id']) is None
     # Only an actual Stop holds it; its release then needs the relationship decision.
     stop(root)
@@ -249,7 +253,7 @@ def test_group_scope_includes_sibling_and_original_late_charge(world):
     queue.check_scheduled_tasks()
     [task] = pending
     fields = task_billing_fields(task, task['id'], 999.0, root)
-    for who, amount in ((ORIGIN, 4.0), ('sibling', 4.0)):
+    for who, amount in ((ORIGIN, 5.0), ('sibling', 5.0)):  # known spend reaches the group's $10
         with ua.usage_scope(ua.UsageScope(drive_root=root, task_id=who, root_task_id=who,
                                          source='test', root_limit_usd=10.0, **BINDING)):
             reservation = ua.reserve_attempt(ua.AttemptRequest(model='openai/gpt-5.2', provider='openai', reservation_usd=amount))
@@ -289,17 +293,15 @@ def test_no_speculative_release_and_existing_first_cause_does_not_hide_stop(worl
 
 
 def test_failed_stop_transfer_keeps_active_intent_and_completed_result(world, monkeypatch):
-    import ouroboros.cancel_intents as ci
+    from ouroboros import store, task_store
     _, root, _ = world
     intent = stop(root)
     write_task_result(root, ORIGIN, 'completed', result='Answer survives')
-    real = ci.update_json_locked
-    def fail_result(path, *args, **kwargs):
-        if path.name != 'cancel_intents.json':
-            raise OSError('result persistence refused')
-        return real(path, *args, **kwargs)
-    monkeypatch.setattr(ci, 'update_json_locked', fail_result)
-    with pytest.raises(OSError, match='persistence refused'):
+
+    def fail_result(*_args, **_kwargs):  # the result's store write refuses; the intents file write stays real
+        raise store.StoreError('result persistence refused')
+    monkeypatch.setattr(task_store, 'patch_document', fail_result)
+    with pytest.raises(store.StoreError, match='persistence refused'):
         settle_intent(root, ORIGIN, outcome='already_settled')
     assert active_intent(root, ORIGIN)['followup_stop'] == intent['followup_stop']
     assert load_task_result(root, ORIGIN)['result'] == 'Answer survives'
@@ -523,8 +525,9 @@ def _assignment_world(world, monkeypatch, count=1):
     _, _, workers = _install_queue(root, monkeypatch)
     sent = []
     for wid in range(count):
-        workers.WORKERS[wid] = SimpleNamespace(wid=wid, busy_task_id=None,
-            in_q=SimpleNamespace(put=lambda task, wid=wid: sent.append((wid, copy.deepcopy(task)))))
+        workers.WORKERS[wid] = affirm_ready(SimpleNamespace(wid=wid, busy_task_id=None,
+            in_q=SimpleNamespace(put=lambda task, wid=wid: sent.append((wid, copy.deepcopy(task)))
+                                 if task.get("type") != "worker_quiescence" else None)))
     return (ctx, root, workers.PENDING), workers, sent
 
 
@@ -567,7 +570,7 @@ def test_consumed_row_retained_until_actual_work_settles(world, monkeypatch, sta
     elif state == 'running':
         write_task_result(root, task['id'], 'running')
     elif state == 'missing':
-        path.unlink()
+        delete_result(root, task['id'])
     elif state == 'unreadable':
         path.write_text('{torn')
     queue.check_scheduled_tasks()

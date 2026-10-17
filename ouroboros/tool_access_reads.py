@@ -1,14 +1,15 @@
-"""Inherited physical read bindings, derived from existing task provenance.
+"""Shared runtime and inherited workspace bindings for read operations.
 
-The policy is parent-equivalent reading, not a path grant list. Each delegation
-edge records where its parent actually worked; exact parent links recover earlier
-bindings even when every child selects a different starting folder. Writes never
-consult this projection.
+Ordinary foci can address canonical runtime data independently of their execution
+drive. Only children inherit ancestor workspaces, through exact parent links.
+Dispatch still enforces task and Presence restrictions; writes never consult
+this projection.
 """
 from __future__ import annotations
 
 import pathlib
 from typing import Any
+from ouroboros.store import StoreError
 
 
 def _access():
@@ -59,7 +60,7 @@ def _parent_records(ctx: Any):
                 return
             seen.add(parent)
             current = load_task_result(canonical, parent, strict=True) or {}
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, StoreError):
             return  # Missing historical provenance does not invent a different folder.
         if not current:
             return
@@ -69,9 +70,13 @@ def _parent_records(ctx: Any):
 def inherited_read_roots(ctx: Any) -> list[tuple[str, pathlib.Path]]:
     """Physical aliases of existing logical roots, for READ operations alone."""
     access = _access()
-    if access.active_tool_profile(ctx) not in {"local_readonly_subagent", "acting_subagent"}:
-        return []
     roots = [("runtime_data", access.canonical_data_root(ctx))]
+    if access.active_tool_profile(ctx) not in {"local_readonly_subagent", "acting_subagent"}:
+        from ouroboros.presence_authority import presence_ceiling_from_context
+
+        # A Presence grant addresses its existing physical roots; ordinary
+        # read parity must not expand a selected runtime_data='.' ceiling.
+        return roots if presence_ceiling_from_context(ctx) is None else []
     for record in _parent_records(ctx):
         edge = _value(record, "parent_workspace")
         candidates = [("active_workspace", edge.get("root"))] if isinstance(edge, dict) else []
@@ -139,3 +144,43 @@ def admit_child_start_folder(ctx: Any, value: Any, params: dict) -> str:
     binding = _access().build_resolved_resource_binding(
         ctx, root=root or "user_files", operation="read", path=folder)
     return str(binding.target_path)
+
+
+def scheduled_origin(ctx: Any) -> str:
+    """The task a scheduled follow-up was registered from, for READS only (#1488, owner 2026-10-13 A).
+
+    Related and independent schedules alike: the origin's materials, not its money,
+    deadline, controls, candidate or Git paths. Named only by the HOST-written
+    occurrence receipt (``schedule_admission``) of this actor's root, never by task
+    metadata an ordinary admission may carry, so its retry and its children read
+    that root's origin and nothing further back. Absent or malformed grants nothing.
+    An unreadable receipt grants nothing NOW and is read again next time: only what a
+    completed read showed is remembered for this actor, never a transient fault.
+    Disclosed cost: a folderless readonly helper copies every permitted lineage file
+    (``delegate_readonly_inputs``), so each such start copies the origin's whole
+    ``task_drive``/``artifact_store``, and one unreadable origin file refuses it.
+    """
+    meta = getattr(ctx, "task_metadata", None)
+    root_id = str((meta if isinstance(meta, dict) else {}).get("root_task_id") or getattr(ctx, "task_id", "") or "")
+    cached = getattr(ctx, "_scheduled_origin", None)  # (root it was read for, origin)
+    if isinstance(cached, tuple) and cached[0] == root_id:
+        return cached[1]
+    try:
+        from ouroboros.task_results import load_task_result, validate_task_id
+
+        row = load_task_result(_access().canonical_data_root(ctx), validate_task_id(root_id), strict=True) or {}
+    except Exception:
+        return ""  # unknown is not absence: deny this read, ask the receipt again on the next one
+    origin = ""
+    try:
+        receipt = row.get("schedule_admission") if isinstance(row.get("schedule_admission"), dict) else {}
+        frozen = receipt.get("task") if isinstance(receipt.get("task"), dict) else {}
+        if receipt.get("status") == "accepted" and receipt.get("token") and str(frozen.get("id") or "") == root_id:
+            origin = str(((frozen.get("metadata") or {}).get("followup_origin") or {}).get("task_id") or "")
+    except Exception:
+        origin = ""  # a malformed receipt proves no origin
+    try:
+        setattr(ctx, "_scheduled_origin", (root_id, origin))
+    except Exception:
+        pass
+    return origin

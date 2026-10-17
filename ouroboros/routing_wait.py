@@ -78,7 +78,7 @@ def wait_for_promotion_admission(
             and str(admission.get("routing_token") or "") == routing_token
         ):
             status = str(admission.get("status") or "")
-            if status in {"scheduled", "rejected", "unconfirmed"}:
+            if status in {"scheduled", "rejected", "unconfirmed", "not_started"}:
                 # The EFFECTIVE destination rides back with the receipt. The
                 # admission handler re-resolves an implicit promote's project
                 # under the claim lock, so the project the caller ASKED for and
@@ -137,8 +137,56 @@ def wait_for_routing_annotation(
     while True:
         receipt = chat_annotation_receipt(root, client_message_id, routing_token)
         status = str(receipt.get("status") or "")
-        if status in {"delivered", "needs_manual_target", "rejected", "unconfirmed"}:
+        if status in {"delivered", "read", "needs_manual_target", "rejected", "unconfirmed"}:
             return receipt
         if time.monotonic() >= deadline:
             return {"status": "unconfirmed", "reason": "confirmation_timeout"}
         time.sleep(poll_sec)
+
+
+# A promote and a route mint a root: their positive outcome is the canonical admission.
+ADMISSION_ROUTING_ACTIONS = frozenset({"promote_chat_to_task", "route_to_project"})
+
+
+def routing_act_fields(root: Path, client_message_id: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """One recorded routing act as every reader shows it: the decision turn's startup
+    receipts and the live observer (``loop_model_call._append_routing_receipts``).
+
+    A promote or route reads ``scheduled`` only from its admission, read exactly as
+    its own waiter reads it (one pass, no wait; the annotation is the negative-only
+    fallback), so no reader states an admission the waiter cannot confirm. Any other
+    act's receipt is its annotation. A refusal keeps its code; a manifest says how
+    many files were not attached.
+    """
+    action, target = str(row.get("action") or ""), str(row.get("target") or "")
+    settled = wait_for_promotion_admission(
+        root, target, str(row.get("routing_token") or ""),
+        client_message_id=client_message_id, timeout_sec=0,
+    ) if action in ADMISSION_ROUTING_ACTIONS else row
+    status, reason = str(settled.get("status") or "unconfirmed"), str(settled.get("reason") or "")
+    manifest = row.get("attachment_manifest") if isinstance(row.get("attachment_manifest"), list) else []
+    rejected = sum(1 for item in manifest if isinstance(item, dict) and item.get("status") == "rejected")
+    return {
+        "action": action, "target": target, "target_label": str(row.get("target_label") or ""),
+        "status": status, "ts": str(row.get("ts") or settled.get("confirmed_at") or ""),
+        "project_id": str(row.get("project_id") or ""),
+        **({"retry_available": True} if settled.get("retry_available") is True else {}),
+        **({"reason": reason} if reason and status in {"rejected", "needs_manual_target"} else {}),
+        **({"files_not_attached": rejected} if rejected else {}),
+    }
+
+
+def routing_act_lines(acts: Any) -> list:
+    """One line per act (``routing_act_fields``), oldest first: the observer's row and the
+    facts it compares against render the same way."""
+    def where(act: Dict[str, Any]) -> str:
+        label, target = str(act.get("target_label") or ""), str(act.get("target") or "")
+        return f"{label} ({target})" if label and target and label != target else (label or target or "no target")
+
+    def note(act: Dict[str, Any]) -> str:
+        return "".join((f" ({act['reason']})" if act.get("reason") else "",
+                        ", explicit retry via start_task available" if act.get("retry_available") else "",
+                        f", {act['files_not_attached']} file(s) not attached" if act.get("files_not_attached") else ""))
+
+    return [f"- {act.get('action') or '?'} → {where(act)}: {act.get('status') or 'unknown'}{note(act)}, "
+            f"recorded {act.get('ts') or '?'}" for act in sorted(acts, key=lambda row: str(row.get("ts") or ""))]

@@ -193,13 +193,15 @@ def test_a_symlinked_headless_task_root_is_not_a_lineage_base(geometry, linked):
 
 # --- the named predecessor, one hop, and the READ-only grant ---------------------
 
-def test_continuation_reads_its_headless_predecessor_but_not_the_hop_before(geometry):
+def test_continuation_task_alias_is_one_hop_while_canonical_reads_share_runtime(geometry):
     registry, _ctx = continuation_registry(geometry)
 
     for out in _reads(registry, "task_drive", geometry.pred_notes):
         assert "PRED_HEADLESS_BYTES" in out, out
-    for out in _reads(registry, "task_drive", geometry.grand_notes):
-        assert "GRANDPRED_BYTES" not in out and "outside selected root" in out, out
+    named, inferred = _reads(registry, "task_drive", geometry.grand_notes)
+    assert "GRANDPRED_BYTES" not in named and "outside selected root=task_drive" in named, named
+    assert "GRANDPRED_BYTES" in inferred and "runtime_data:" in inferred, inferred
+    assert lineage_read_base(_ctx, "task_drive", geometry.grand_notes) is None
 
 
 def test_a_headless_lineage_drive_is_read_only_while_the_own_drive_stays_writable(geometry):

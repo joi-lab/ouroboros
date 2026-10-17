@@ -18,7 +18,8 @@ from ouroboros import task_pacing
 from ouroboros.loop_transport import TransportWaitEpisode, end_episode_budget as _end_episode_budget
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.context_fit import messages_carry_native_images
-from ouroboros.usage_accounting import BudgetExceeded
+from ouroboros.usage_accounting import BillingAuthorityUnavailable, BudgetExceeded, ControlAuthorityUnavailable
+from ouroboros.utils import truncate_within_limit
 
 
 from typing import TYPE_CHECKING
@@ -51,6 +52,13 @@ def _check_budget_limits(
     budget_remaining_usd: Optional[float],
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """Budget decision after every unfinished spending round, tool and no-tool alike.
+
+    ``ctx.budget_tail`` names the tail, and a cold Resume re-enters the tail
+    recorded in ``resume_point.budget_tail``. Response handling anchors nanny
+    requests before saving; only the tool tail arms tool controls. An
+    accepted answer returns before this check, so it buys no extra paid final.
+    """
     accumulated_usage = ctx.accumulated_usage
     raw_task_cost = accumulated_usage.get("cost")
     task_cost = float(raw_task_cost) if raw_task_cost is not None else None
@@ -93,7 +101,7 @@ def _check_budget_limits(
     # global-share ceiling is global money.
     pause_scope = "root" if cost_ceiling.root_cap_usd is not None else "global"
     tree_info = _loop()._loop_tree_accounting(refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC)
-    tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
+    tree_cost = tree_info.get("settled_usd") if isinstance(tree_info, dict) else None
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
         tree_cost_usd=tree_cost,
         task_cost_usd=task_cost,
@@ -110,9 +118,14 @@ def _check_budget_limits(
     # very number that paused the task; the ledger fence at the full cap still
     # arbitrates every send. A stop that needs no wrap-up room at all
     # (``wrapup_fits is False``) is unchanged.
-    last_fit_relaxed = bool(getattr(getattr(getattr(ctx, "tools", None), "_ctx", None),
-                                    "_budget_resume_last_fit_relaxed", False))
-    if prompt_estimate > 0 and (global_remaining is not None or (cost_ceiling.root_cap_usd is not None and deciding is not None)):
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    last_fit_relaxed = bool(getattr(tool_ctx, "_budget_resume_last_fit_relaxed", False))
+    # The prospective wrap-up probes are an explicit profile's authored margin. A
+    # producer allowance stops when known spend reaches it, never one call early.
+    authority = task_pacing.COST_STOP_EXPLICIT if tool_ctx is None else task_pacing.cost_stop_authority(tool_ctx)
+    explicit = authority == task_pacing.COST_STOP_EXPLICIT
+    if explicit and prompt_estimate > 0 and (
+            global_remaining is not None or (cost_ceiling.root_cap_usd is not None and deciding is not None)):
         finish_reason = task_pacing.wrapup_last_fit_text(deciding, cost_ceiling, global_remaining)
         forced_prompt = f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}"
         request_args = dict(model=ctx.active_model, prompt_tokens=prompt_estimate,
@@ -187,17 +200,21 @@ def _check_budget_limits(
             # Presence arm the prepared prompt set is withdrawn: it would silence the ordinary reply.
             if tools_ctx is not None:
                 tools_ctx._presence_forced_declaration, tools_ctx._presence_forced_pending = presence_arm
-    if deciding is not None and ceiling_usd is not None and deciding > ceiling_usd:
+    # A producer allowance is spent once known spend REACHES it, like every ledger
+    # limit; an explicit profile keeps its authored edge (strictly over its point).
+    reached = deciding is not None and ceiling_usd is not None and (
+        deciding >= ceiling_usd if authority == task_pacing.COST_STOP_PRODUCER else deciding > ceiling_usd)
+    if reached:
         if spend_basis == task_pacing.SPEND_BASIS_TREE:
             spent_text = (
-                f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds, "
-                f"subagents included; own calls ${task_cost:.3f})"
+                f"Task tree spent ${deciding:.3f} (known spend, subagents included; "
+                f"own calls ${task_cost:.3f})"
                 if task_cost is not None
-                else f"Task tree spent ${deciding:.3f} (ledger-accounted incl. in-flight holds)"
+                else f"Task tree spent ${deciding:.3f} (known spend, subagents included)"
             )
         elif spend_basis == task_pacing.SPEND_BASIS_OWN_TREE_UNKNOWN:
             spent_text = (
-                f"Task spent ${deciding:.3f} on its OWN calls (the tree-accounted total "
+                f"Task spent ${deciding:.3f} on its OWN calls (the tree's known total "
                 "is unavailable right now, so subagent spend is not included — this is a "
                 "lower bound)"
             )
@@ -208,12 +225,22 @@ def _check_budget_limits(
             if cost_ceiling.root_cap_usd is not None else ""
         )
         finish_reason = (
-            f"{spent_text}, over the in-task cost ceiling ${ceiling_usd:.2f}{cap_text}. "
-            "Budget exhausted."
+            f"{spent_text}, {'over' if deciding > ceiling_usd else 'at'} the in-task cost ceiling ${ceiling_usd:.2f} "
+            f"({cost_ceiling.basis or 'resolved at task start'}){cap_text}. Budget exhausted."
         )
         accumulated_usage["cost_stop_spend_basis"] = spend_basis
         budget_pause.request_pause(ctx, rail=budget_pause.RAIL_GRACEFUL_CEILING,
                                    scope=pause_scope, reason_text=finish_reason)
+        if not explicit:
+            # Only an explicit profile authored room for a final answer. The fence checks the
+            # wider tree cap and wallet, never a producer allowance (or an inherited number
+            # whose author is unreadable), so a recap here would be paid past it: an actor
+            # without a continuation ends on the host's notice, services finalized first.
+            accumulated_usage.update(execution_status="failed", reason_code="budget_exhausted")
+            trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
+            _loop()._finalize_forced_services(ctx, trace)
+            return _loop()._forced_fallback_result(ctx, trace, finish_reason, "budget_exhausted",
+                                                   source="budget_host_fallback")
         return _loop()._forced_final_answer(
             ctx,
             prompt=f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}",
@@ -345,7 +372,7 @@ def _soft_land_exhausted_ceiling(
     )
     tree_info = _loop()._loop_tree_accounting(refresh=True, max_age_sec=0.0)
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
-        tree_cost_usd=tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None,
+        tree_cost_usd=tree_info.get("settled_usd") if isinstance(tree_info, dict) else None,
         task_cost_usd=float(limit_ctx.accumulated_usage.get("cost") or 0.0),
         root_cap_usd=cost_ceiling.root_cap_usd,
     )
@@ -370,19 +397,6 @@ def _service_finalization_evidence(llm_trace: Dict[str, Any]) -> list[Dict[str, 
     """Return the stable, answer-relevant part of service finalization events."""
 
     rows: list[Dict[str, Any]] = []
-    stable_fields = (
-        "service_id",
-        "name",
-        "task_id",
-        "lifecycle",
-        "backend",
-        "pid",
-        "port",
-        "artifact_outputs",
-        "artifact_output_failed",
-        "artifact_audit_gap",
-        "log_finalization",
-    )
     for event in llm_trace.get("verification_events") or []:
         if not isinstance(event, dict) or str(event.get("kind") or "") not in {
             "services_stopped",
@@ -390,19 +404,12 @@ def _service_finalization_evidence(llm_trace: Dict[str, Any]) -> list[Dict[str, 
             "service_finalization_error",
         }:
             continue
-        services = []
-        for service in event.get("services") or []:
-            if not isinstance(service, dict):
-                continue
-            services.append({
-                key: service.get(key)
-                for key in stable_fields
-                if service.get(key) not in (None, "", [], {})
-            })
+        services = [_service_identity_projection(service)
+                    for service in event.get("services") or [] if isinstance(service, dict)]
         rows.append({
             "kind": str(event.get("kind") or ""),
             "services": services,
-            "error": str(event.get("error") or ""),
+            "error": truncate_within_limit(str(event.get("error") or ""), 2000),
         })
     return rows
 
@@ -464,7 +471,8 @@ def _handle_budget_exceeded(
                 physical_calls = None
     except Exception:
         log.exception("Could not inspect task attempts after budget rail")
-    direct_chat = bool(getattr(ctx.tools._ctx, "is_direct_chat", False))
+    from ouroboros.task_carrier import inline_execution
+    direct_chat = inline_execution(ctx.tools._ctx)
     replay_safe = physical_calls == 0 and not direct_chat
     scope = str(getattr(exc, "limit_scope", "global") or "global")
     resource_limit = {
@@ -597,6 +605,57 @@ def _handle_budget_exceeded(
     return message, ctx.accumulated_usage, ctx.llm_trace
 
 
+def _handle_authority_unavailable(
+    exc: BillingAuthorityUnavailable | ControlAuthorityUnavailable,
+    ctx: _LoopExitContext,
+    *,
+    limit_ctx: Optional[_RoundLimitContext] = None,
+    episode: Optional[TransportWaitEpisode] = None,
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """An authority that cannot be established is no money fact (owner 2026-10-14, ab53 = A).
+
+    An unreadable billing authority or dispatch fence parks the SAME thought on the
+    exact pause under reason ``authority``, member-only: its Resume rereads the original
+    group and global authority strictly, and its sent runs are observed, never stopped
+    (00a5 = A). That raises, so this returns only when no exact pause can be saved, or
+    for a refused billing authority (missing lineage, foreign binding): then an
+    infrastructure interruption keeps the saved work, with no root fence, budget advice
+    or paid wrap-up, and never promises that waiting fixes it.
+    """
+    billing = isinstance(exc, BillingAuthorityUnavailable)
+    subject = "billing authority" if billing else "dispatch-fence authority"
+    code = f"billing_authority_{exc.kind}" if billing else "control_authority_unreadable"
+    if episode is not None:
+        _end_episode_budget(episode, ctx.drive_logs, ctx.task_id,
+                            limit_ctx.active_model if limit_ctx is not None else "", detail=code)
+    usage = ctx.accumulated_usage
+    if exc.kind == "unreadable" and limit_ctx is not None:
+        limit_ctx.tools, limit_ctx.llm_trace = ctx.tools, ctx.llm_trace
+        # The failed authority may name a billing group; the saved member keeps its own root lineage.
+        budget_pause.request_pause(
+            limit_ctx, rail=budget_pause.RAIL_BILLING_AUTHORITY if billing else budget_pause.RAIL_CONTROL_AUTHORITY,
+            scope="task", reason_text=str(exc))
+    fact = {"kind": exc.kind, "cause": exc.cause, "root_task_id": getattr(exc, "root_task_id", ""), "detail": str(exc),
+            "exact_pause_unavailable": str(usage.get("exact_pause_unavailable") or "")}
+    usage.update(execution_status="infra_failed", reason_code=code, billing_authority=fact)
+    ctx.llm_trace["billing_authority"] = fact
+    message = (
+        f"⚠️ No new paid call was admitted at this boundary: this task's billing lineage is missing or not its own "
+        f"({exc}). This is not a budget limit, and neither waiting nor a budget change repairs it. "
+        "Work already saved stays retained."
+        if exc.kind == "refused" else
+        f"⚠️ No new paid call was admitted at this boundary: this task's {subject} could not be read ({exc}), "
+        f"and its exact pause could not be saved ({fact['exact_pause_unavailable'] or 'no actor context'}). "
+        "This is not a budget limit. Work already saved stays retained; nothing unsaved is promised back.")
+    if limit_ctx is None:
+        _loop()._finalize_task_services(ctx)
+        return message, usage, ctx.llm_trace
+    limit_ctx.tools, limit_ctx.llm_trace = ctx.tools, ctx.llm_trace
+    _loop()._finalize_forced_services(limit_ctx, ctx.llm_trace)
+    return _loop()._forced_fallback_result(limit_ctx, ctx.llm_trace, message, code,
+                                           source="authority_host_notice")
+
+
 def _cleanup_loop_resources(
     stateful_executor: Any,
     ctx: _LoopExitContext,
@@ -604,9 +663,8 @@ def _cleanup_loop_resources(
     """Release attempt-scoped executors, services, and delegated runs."""
     if ctx.trace_ctx is not None:
         ctx.trace_ctx._execution_trace = ctx.previous_execution_trace
-    # This attempt's tool-future quiescence rows end with it (#1196): a pause
-    # only got here after they settled, and any other exit is on the task's own
-    # control rail; the registry prunes nothing across attempts by itself.
+    # Caller release has already transferred any physical tail before this
+    # logical exit. Prune only joined observations; old-attempt tails stay owned.
     try:
         budget_pause.forget_tool_scope(ctx.tools._ctx)
     except Exception:
@@ -639,6 +697,7 @@ def _cleanup_loop_resources(
         return
     try:
         from ouroboros.delegate_custody import custody_root, release_task_runs
+        from ouroboros.delegate_custody_reconcile import attach_only_gateway
 
         # A delegated run is a resource this task HOLDS, like a service or
         # an executor: a terminalized parent leaving one running has a
@@ -646,8 +705,10 @@ def _cleanup_loop_resources(
         # covers a worker dying before here; this is the ordinary path. The
         # run is cancelled only behind a DELIBERATE owner terminal (B1-A); the
         # durable result is usually not written yet at this point, so a live
-        # run is left to the next sweep, which re-reads it.
-        release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id)
+        # run is left to the next sweep, which re-reads it. Exit does not
+        # admit: the transport attaches only (a dead daemon is never started
+        # from a loop exit) and no pending invocation is replayed here.
+        release_task_runs(custody_root(ctx.tools._ctx), ctx.task_id, gateway_factory=attach_only_gateway)
     except Exception:
         log.debug("Failed to release delegated runs for task %s", ctx.task_id, exc_info=True)
 
@@ -667,12 +728,19 @@ def _service_identity_projection(service: Dict[str, Any]) -> Dict[str, Any]:
         "artifact_output_failed",
         "artifact_audit_gap",
         "log_finalization",
+        "state",
+        "stop_failed",
+        "cleanup_dispatched",
+        "stop_error",
     )
-    return {
-        key: service.get(key)
-        for key in fields
-        if service.get(key) not in (None, "", [], {})
-    }
+    projected = {}
+    for key in fields:
+        value = service.get(key)
+        if key == "stop_error" and value not in (None, ""):
+            value = truncate_within_limit(str(value), 2000)
+        if value not in (None, "", [], {}):
+            projected[key] = value
+    return projected
 
 
 def _finalize_task_services(ctx: _LoopExitContext) -> bool:
@@ -707,27 +775,27 @@ def _finalize_task_services(ctx: _LoopExitContext) -> bool:
                 continue
             seen.add(signature)
             fresh.append(service)
-        stopped = [service for service in fresh if service.get("lifecycle") != "kept"]
-        kept = [service for service in fresh if service.get("lifecycle") == "kept"]
-        if stopped:
+        stopped, kept, pending = [], [], []
+        for service in fresh:
+            if (service.get("lifecycle") == "cleanup_pending" or service.get("stop_failed")
+                    or service.get("cleanup_dispatched") is False or service.get("state") == "cleanup_pending"):
+                pending.append(_service_identity_projection(service))
+            elif service.get("lifecycle") == "kept":
+                kept.append(service)
+            else:
+                stopped.append(service)
+        for kind, services in (("services_stopped", stopped),
+                               ("service_finalization_error", pending), ("services_kept", kept)):
+            if not services:
+                continue
+            details = {"services": services}
+            if kind == "service_finalization_error":
+                details["error"] = "service cleanup was not confirmed"
             _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-                "checkpoint_kind": "services_stopped",
-                "services": stopped,
+                "checkpoint_kind": kind, **details,
             })
-            ctx.llm_trace.setdefault("verification_events", []).append({
-                "kind": "services_stopped",
-                "services": stopped,
-            })
-        if kept:
-            _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-                "checkpoint_kind": "services_kept",
-                "services": kept,
-            })
-            ctx.llm_trace.setdefault("verification_events", []).append({
-                "kind": "services_kept",
-                "services": kept,
-            })
-        return bool(stopped or kept)
+            ctx.llm_trace.setdefault("verification_events", []).append({"kind": kind, **details})
+        return bool(fresh)
     except Exception as exc:
         log.debug("Failed to stop task services", exc_info=True)
         event = {
@@ -752,15 +820,14 @@ def _finalize_task_services(ctx: _LoopExitContext) -> bool:
 def _finish_tool_round_budget(
     ctx: _RoundLimitContext, budget_remaining_usd: Optional[float],
     cost_ceiling: "task_pacing.CostCeiling", active_model: str,
-    active_use_local: bool, active_effort: str, tool_calls: Optional[list[Dict[str, Any]]] = None,
+    active_use_local: bool, active_effort: str,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Complete the existing budget decision after warm or cold owner input.
 
-    Only a freshly executed tool batch advances the nanny's metered baseline;
-    cold continuation owes the budget decision, never execution of old tools.
+    The batch's delegate requests were observed with its response, before any
+    save or park, so a cold continuation owes only this decision: no old tool
+    is executed and no nanny anchor is rebuilt here.
     """
-    if tool_calls is not None:
-        _loop()._note_nanny_delegate_activity(ctx.tools._ctx, ctx.round_idx, ctx.accumulated_usage, tool_calls)
     _loop()._prepare_post_tool_budget_context(
         ctx.tools, ctx, ctx.llm_trace, active_model, active_use_local, active_effort)
     result = _loop()._check_budget_limits(ctx, budget_remaining_usd, cost_ceiling=cost_ceiling)
@@ -781,8 +848,7 @@ def _finish_no_tool_round_budget(
     called tools — but only the tool tail ever reached `_check_budget_limits`,
     so a task that kept re-answering under review feedback could run past the
     ceiling untouched (#1223). This is the tool tail's own comparison and
-    nothing else: no metered-baseline bookkeeping (no tools ran) and no
-    `_prepare_post_tool_budget_context`, whose delivery-control arming belongs
+    nothing else: no `_prepare_post_tool_budget_context`, whose delivery-control arming belongs
     to a tool batch's effects. The current delivery candidate is untouched, so a
     eligible budget exit checkpoints the answer the round produced. Its cold
     continuation must return to this tail without tool-only control arming.
@@ -866,7 +932,7 @@ def authored_completion_budget_exhausted(ctx: Any, budget_remaining: float | Non
     if cap is None:
         return False
     tree = _loop()._loop_tree_accounting(refresh=True, max_age_sec=0.0)
-    deciding, basis = task_pacing.resolve_deciding_spend(tree_cost_usd=(tree or {}).get("accounted_usd"),
+    deciding, basis = task_pacing.resolve_deciding_spend(tree_cost_usd=(tree or {}).get("settled_usd"),
         task_cost_usd=ctx.accumulated_usage.get("cost"), root_cap_usd=cap)
     if deciding is not None and deciding >= cap:
         ctx.accumulated_usage["cost_stop_spend_basis"] = basis

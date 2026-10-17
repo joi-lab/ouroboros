@@ -68,11 +68,17 @@ def test_write_text_helper_is_atomic(tmp_path):
     assert target.read_text(encoding="utf-8") == "NEW"
 
 
-def test_atomic_write_json_still_works(tmp_path):
-    target = tmp_path / "d.json"
-    atomic_write_json(target, {"a": 1, "b": [2, 3]})
-    import json
-    assert json.loads(target.read_text(encoding="utf-8")) == {"a": 1, "b": [2, 3]}
+@pytest.mark.parametrize("name", ["d.json", "settings.json"])
+@pytest.mark.parametrize("newline", [False, True])
+def test_atomic_write_json_format_and_roundtrip(tmp_path, name, newline):
+    target = tmp_path / name
+    payload = {"a": "café", "b": [2, 3]}
+    atomic_write_json(target, payload, trailing_newline=newline)
+    content = target.read_text(encoding="utf-8")
+    expected = (json.dumps(payload, ensure_ascii=False, indent=2)
+                if name == "settings.json" else '{"a":"café","b":[2,3]}')
+    assert content == expected + ("\n" if newline else "")
+    assert json.loads(content) == payload
 
 
 def test_replace_retries_windows_sharing_violation_then_succeeds(tmp_path, monkeypatch):
@@ -276,7 +282,7 @@ def test_atomic_write_json_lands_exact_bytes(tmp_path):
     same on every platform."""
     target = tmp_path / "state.json"
     atomic_write_json(target, {"a": [1, 2], "b": "x"}, trailing_newline=True)
-    assert target.read_bytes() == b'{\n  "a": [\n    1,\n    2\n  ],\n  "b": "x"\n}\n'
+    assert target.read_bytes() == b'{"a":[1,2],"b":"x"}\n'
 
 
 def test_supervisor_state_atomic_write_text_lands_every_byte_on_short_writes(tmp_path, monkeypatch):

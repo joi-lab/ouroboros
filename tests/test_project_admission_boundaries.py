@@ -7,10 +7,11 @@ import pytest
 from ouroboros import projects_registry as registry
 from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import queue, workers
-from tests.test_project_hold_recovery import accepted, restore_unreadable, worker
+from tests.test_project_hold_recovery import accepted, restore_unreadable, resume_after_app_stop, worker
 from tests.test_project_semantic_admission import room, task  # noqa: F401
 from tests.test_schedule_occurrence import q  # noqa: F401
 from tests.test_swarm_host_admission import host  # noqa: F401
+from tests.worker_pool_support import affirm_ready
 
 pytestmark = pytest.mark.serial
 
@@ -62,6 +63,10 @@ def test_explicit_promotion_carries_only_confirmed_own_folder_basis(host, tmp_pa
         path, committed = restore_unreadable(host)
         path.write_bytes(committed)
     sent = worker(host, monkeypatch)
+    if held:
+        workers.assign_tasks()
+        assert not sent
+        resume_after_app_stop(host, "explicit")
     workers.assign_tasks()
     workers.assign_tasks()
     assert [row["id"] for row in sent] == ["explicit"]
@@ -119,15 +124,13 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
         queue.enqueue_task({"id": f"main-{i}", "type": "task", "chat_id": 1, "text": "Independent work"})
     sent = worker(host, monkeypatch)
     for i in range(1, worker_count):
-        workers.WORKERS[i] = SimpleNamespace(wid=i, busy_task_id=None, reaping=False,
-            in_q=SimpleNamespace(put=lambda row: sent.append(copy.deepcopy(row))))
+        workers.WORKERS[i] = affirm_ready(SimpleNamespace(wid=i, busy_task_id=None, reaping=False,
+            in_q=SimpleNamespace(put=lambda row: sent.append(copy.deepcopy(row)) if row.get("type") != "worker_quiescence" else None)))
     attempts = []
     persist, write, read = queue.persist_queue_snapshot, task_admission.write_task_result, task_admission.load_task_result
 
     def snapshot(**kwargs):
-        if (kwargs.get("reason") == "worker_launch_claimed"
-                and not any(row["id"].startswith("main-") and row.get("admitted_dispatch") == "possible"
-                            for row in host.pending)):
+        if kwargs.get("reason") == "worker_launch_locator" and not attempts:  # the head's, before any mark
             attempts.append("held")
             return False
         return persist(**kwargs)
@@ -146,8 +149,8 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
             raise OSError("synthetic unavailable proof readback")
         return read(root, tid, **kwargs)
 
-    def schedule_readback(tid):
-        attempts.append(tid)
+    def schedule_row(candidate, **_kwargs):  # the occurrence row, the last step before the put
+        attempts.append(candidate["id"])
         raise OSError("synthetic unavailable schedule proof")
 
     with monkeypatch.context() as patch:
@@ -158,7 +161,7 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
         elif boundary == "readback":
             patch.setattr(task_admission, "load_task_result", readback)
         else:
-            patch.setattr(schedule_occurrence, "_read_back", schedule_readback)
+            patch.setattr(schedule_occurrence, "mark_occurrence_row", schedule_row)
         workers.assign_tasks()
     assert [row["id"] for row in sent] == [f"main-{i}" for i in range(worker_count)]
     assert attempts == ["held"]
@@ -176,17 +179,21 @@ def test_failed_head_proof_keeps_custody_without_starving_other_work(host, tmp_p
 
 @pytest.mark.parametrize("bad_id", [7, " target ", None, "", "missing"])
 @pytest.mark.parametrize("restoring", [False, True])
-def test_origin_only_membership_cannot_normalize_corrupt_binding(room, bad_id, restoring):  # noqa: F811
+@pytest.mark.parametrize("exact", [False, True])
+def test_only_exact_membership_checks_corrupt_binding(room, bad_id, restoring, exact):  # noqa: F811
     ref = {"chat_id": 1, "client_message_id": "source", "text_sha256": "a" * 64}
     registry.create_project(room.root, "7")
     binding = {"source_ref": ref}
     if bad_id != "missing":
         binding["project_id"] = bad_id
-    registry._save_bindings(room.root, {"bindings": {"origin-sibling": binding}})
+    registry._save_bindings(room.root, {"bindings": {"fresh-sibling" if exact else "origin-sibling": binding}})
     rejected = room.queue.enqueue_task(task("fresh-sibling", project_id="", origin_message_ref=ref),
                                       restoring_snapshot=restoring)
-    assert rejected.get("_admission_blocked") == "project_routing_fence_lookup_failed"
-    assert not room.pending
+    if exact:
+        assert rejected.get("_admission_blocked") == "project_routing_fence_lookup_failed"
+        assert not room.pending
+    else:
+        assert not rejected.get("_admission_blocked") and rejected["project_id"] == ""
     expected = "7" if bad_id == 7 else "target" if bad_id == " target " else ""
     assert registry.project_id_for_origin(room.root, ref) == expected  # tolerant display is unchanged
 
@@ -200,14 +207,10 @@ def test_unrelated_corrupt_origin_does_not_block_healthy_membership(room, same_o
     if bad_id != "missing":
         malformed["project_id"] = bad_id
     registry._save_bindings(room.root, {"bindings": {
-        "origin-sibling": {"project_id": "target", "source_ref": ref}, "corrupt": malformed}})
+        "fresh-sibling": {"project_id": "target", "source_ref": ref}, "corrupt": malformed}})
     result = room.queue.enqueue_task(task("fresh-sibling", project_id="", origin_message_ref=ref))
-    if same_origin:
-        assert result.get("_admission_blocked") == "project_routing_fence_lookup_failed"
-        assert not room.pending
-    else:
-        assert not result.get("_admission_blocked")
-        assert room.pending[0]["project_id"] == "target"
+    assert not result.get("_admission_blocked")
+    assert room.pending[0]["project_id"] == "target"
 
 
 def test_known_registry_outage_skips_binding_reads_but_recovery_checks_them(host, tmp_path, monkeypatch):  # noqa: F811
@@ -225,13 +228,16 @@ def test_known_registry_outage_skips_binding_reads_but_recovery_checks_them(host
     monkeypatch.setattr(registry, "project_binding_for_task", observed)
     sent = worker(host, monkeypatch)
     workers.assign_tasks()
-    assert not reads
+    assert set(reads) <= {"main"}  # Only the healthy candidate checks for a committed placement.
     assert [row["id"] for row in sent] == ["main"]
     assert all(row["_project_admission_restore_hold"] for row in host.pending)
     path.write_bytes(committed)
     workers.WORKERS[0].busy_task_id = None
     workers.assign_tasks()
     assert {"held", "second"} <= set(reads)
+    assert [row["id"] for row in sent] == ["main"]
+    resume_after_app_stop(host, "held")
+    workers.assign_tasks()
     assert [row["id"] for row in sent] == ["main", "held"]
 
 
@@ -248,7 +254,7 @@ def test_global_snapshot_failure_blocks_every_candidate_without_dropping_rows(ho
     with monkeypatch.context() as patch:
         patch.setattr(queue, "persist_queue_snapshot", unavailable)
         workers.assign_tasks()
-    assert attempts == ["worker_launch_claimed", "worker_launch_claimed"]
+    assert attempts == ["worker_launch_locator", "worker_launch_locator"]
     assert not sent and not queue.RUNNING and workers.WORKERS[0].busy_task_id is None
     assert [row["id"] for row in host.pending] == [head["id"], "main"]
     workers.assign_tasks()
@@ -256,14 +262,18 @@ def test_global_snapshot_failure_blocks_every_candidate_without_dropping_rows(ho
 
 
 @pytest.mark.parametrize("missing", [False, True])
-def test_origin_only_membership_cannot_turn_closed_room_into_unregistered_work(room, missing):  # noqa: F811
+@pytest.mark.parametrize("exact", [False, True])
+def test_only_exact_membership_inherits_closed_room_refusal(room, missing, exact):  # noqa: F811
     ref = {"chat_id": 1, "client_message_id": "source", "text_sha256": "a" * 64}
     registry._save_bindings(room.root, {"bindings": {
-        "origin-sibling": {"project_id": "target", "source_ref": ref}}})
+        "fresh-sibling" if exact else "origin-sibling": {"project_id": "target", "source_ref": ref}}})
     if missing:
         registry._save(room.root, {"projects": []})
     else:
         registry.begin_project_deletion(room.root, "target")
     result = room.queue.enqueue_task(task("fresh-sibling", project_id="", origin_message_ref=ref))
-    assert result.get("_admission_blocked") in {"project_routing_fence", "project_routing_fence_changed"}
-    assert not room.pending
+    if exact:
+        assert result.get("_admission_blocked") in {"project_routing_fence", "project_routing_fence_changed"}
+        assert not room.pending
+    else:
+        assert not result.get("_admission_blocked") and result["project_id"] == ""

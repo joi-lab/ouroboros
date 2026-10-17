@@ -5,6 +5,7 @@ import json
 from types import SimpleNamespace
 
 from ouroboros.gateway.history import make_chat_history_endpoint
+from tests._store_shared import seed_result
 
 
 def test_chat_history_preserves_subagent_lane_group_metadata(tmp_path):
@@ -464,17 +465,14 @@ def test_history_annotation_after_quota_resolves_in_window_card(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "windowed.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "windowed", {
             "_schema_version": 1,
             "task_id": "windowed",
             "status": "completed",
             "cost_usd": 0.42,
             "cost_final": True,
             "reason_code": "",
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(
@@ -720,10 +718,7 @@ def test_chat_history_settled_result_overrides_pre_final_summary_finality(tmp_pa
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "settled-summary.json").write_text(
-        json.dumps({"_schema_version": 1, "task_id": "settled-summary", "status": "completed"}),
-        encoding="utf-8",
-    )
+    seed_result(tmp_path, "settled-summary", {"_schema_version": 1, "task_id": "settled-summary", "status": "completed"})
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -753,8 +748,7 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "cost-terminal.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "cost-terminal", {
             "_schema_version": 1,
             "task_id": "cost-terminal",
             "status": "completed",
@@ -763,9 +757,7 @@ def test_chat_history_attaches_terminal_cost_truth_from_task_result(tmp_path):
             "cost_final": True,
             "cost_usd_with_children": 2.75,
             "cost_with_children_partial": False,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -806,8 +798,7 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "cost-override.json").write_text(
-        json.dumps({
+    seed_result(tmp_path, "cost-override", {
             "_schema_version": 1,
             "task_id": "cost-override",
             "status": "completed",
@@ -816,9 +807,7 @@ def test_chat_history_terminal_cost_truth_overrides_row_embedded_snapshot(tmp_pa
             "cost_final": True,
             "cost_usd_with_children": 2.5,
             "cost_with_children_partial": False,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "10"})))
@@ -1106,9 +1095,9 @@ def test_chat_history_replays_the_live_subtree_ceiling_for_a_running_root(tmp_pa
         ("root-empty", "running", {}),
         ("root-done", "completed", {"accounted_upper_bound_usd": 0.42, "cost_final": True}),
     ):
-        (results / f"{task_id}.json").write_text(json.dumps({
+        seed_result(tmp_path, task_id, {
             "_schema_version": 1, "task_id": task_id, "status": status, "metadata": {}, **extra,
-        }), encoding="utf-8")
+        })
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(SimpleNamespace(query_params={"limit": "50"})))

@@ -1,15 +1,8 @@
-"""Contracts for the bounded paid repeat after a post-dispatch transport death.
+"""Explicit low-level transport-death repeat custody and shared round recovery.
 
-A DISPATCHED request whose socket died with a typed transport death (httpx
-ReadError / WriteError / RemoteProtocolError, or the requests ProtocolError /
-RemoteDisconnected shape) is `provider_outcome_unknown`; an inline Presence
-turn's PRIMARY round dispatch alone may repeat it at most twice per round (every
-other turn's new generation after an unknown outcome is the round recovery,
-``tests/test_unknown_fallback_first.py``), each repeat a NEW
-physical attempt with its own ledger lifecycle (the earlier rows stay unresolved
-at their upper bound). Every other surface keeps the no-resend doctrine, the
-classifier is unchanged, and every durable `llm_api_error` row tells the truth
-about what happens next.
+Production turns use configured fallback and paced unknown recovery. The explicit
+low-level repeat API remains covered so retained repeat facts keep their no-resend
+fence, physical identities and unknown costs.
 """
 
 from __future__ import annotations
@@ -35,6 +28,7 @@ from ouroboros.loop_llm_call import (
     provider_no_call_source,
 )
 from ouroboros.tools.registry import ToolRegistry
+from tests._usage_store_testing import ledger_rows
 
 MESSAGES = [{"role": "user", "content": "hi"}]
 OK_RESPONSE = ({"role": "assistant", "content": "done"}, {"prompt_tokens": 1, "completion_tokens": 1})
@@ -132,9 +126,7 @@ def data_root(tmp_path, monkeypatch):
 
 
 def _ledger(root):
-    path = root / ua.LEDGER_REL
-    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    return [row for row in rows if row.get("kind") == "attempt"]
+    return [row for row in ledger_rows(root) if row.get("kind") == "attempt"]
 
 
 class _LedgerLLM:
@@ -185,9 +177,9 @@ def test_two_deaths_then_success_are_three_ledger_lifecycles(data_root, tmp_path
         by_attempt.setdefault(row["attempt_id"], []).append(row["state"])
     assert len(by_attempt) == 3  # never a reused reservation
     assert list(by_attempt.values()) == [
-        ["reserved", "dispatched", "unresolved"],
-        ["reserved", "dispatched", "unresolved"],
-        ["reserved", "dispatched", "settled"],
+        ["unresolved"],
+        ["unresolved"],
+        ["settled"],
     ]
     assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 2.0
     api_errors = _events(tmp_path, "llm_api_error")
@@ -203,19 +195,26 @@ def test_two_deaths_then_success_are_three_ledger_lifecycles(data_root, tmp_path
 
 
 def test_budget_refusal_on_the_second_send_propagates_untouched(data_root, tmp_path, no_sleep, monkeypatch):
-    """The unresolved upper bound of the dead send counts against admission: a
-    BudgetExceeded from reserve_attempt on the repeat propagates as-is and no
-    further physical attempt is dispatched (sol s9)."""
+    """A BudgetExceeded from reserve_attempt on the repeat propagates as-is and no
+    further physical attempt is dispatched (sol s9). The dead send's unresolved bound
+    is exposure, not spending (#1487); the repeat is refused because another task's
+    KNOWN charge reached the $1.50 wallet while the first send died."""
     monkeypatch.setenv("TOTAL_BUDGET", "1.5")
-    llm = _LedgerLLM(data_root, lambda: httpx.ReadError("died"), reservation_usd=1.0)
+
+    def death_while_known_spend_lands():
+        ua.record_subscription_session("other-session", drive_root=data_root, route="subscription",
+                                       task_id="other", root_task_id="other", spend_usd=1.5)
+        return httpx.ReadError("died")
+
+    llm = _LedgerLLM(data_root, death_while_known_spend_lands, reservation_usd=1.0)
     usage = {}
     with pytest.raises(ua.BudgetExceeded) as raised:
         _primary_call(llm, tmp_path, usage)
 
     assert raised.value.limit_scope == "global"
     assert llm.calls == 2
-    rows = _ledger(data_root)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved"]
+    rows = [row for row in _ledger(data_root) if row.get("task_id") == "t-death"]
+    assert [row["state"] for row in rows] == ["unresolved"]
     assert len(_events(tmp_path, "llm_api_error")) == 1  # only the death itself was a provider failure
     assert _events(tmp_path, "llm_non_retryable_same_request") == []
     # A budget refusal proves only that a reservation was refused, not that the granted
@@ -310,33 +309,21 @@ def test_sleep_refusal_after_the_second_grant_keeps_only_the_real_repeat(tmp_pat
 
 
 def test_admission_refusal_after_a_granted_repeat_keeps_the_unknown_fence(tmp_path, monkeypatch, no_sleep):
-    """If the loop-top admission gate refuses the granted repeat anyway (clock
-    moved between the grant and the re-check), the refusal must not relabel the
-    unresolved request as `deadline_exhausted`: the forced-final rail would then
-    dial a NEW paid request over a possibly live one."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    checks = {"n": 0}
-
+    """The explicit low-level repeat grant never turns unknown custody into a deadline refusal."""
+    checks = []
     def exhausted_after_the_grant(**_kwargs):
-        checks["n"] += 1
-        return checks["n"] > 3  # loop-top, pre-send, the grant's re-check pass; the next admission refuses
-
+        checks.append(True)
+        return len(checks) > 3
     monkeypatch.setattr(call_mod, "owner_deadline_exhausted", exhausted_after_the_grant)
-    llm = _ScriptedLLM(_death, _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
-    _result, usage, trace = run_llm_loop(**kwargs)
-
-    assert llm.calls == 1  # the refused repeat and the forced-final rail both dispatched nothing
+    llm, usage = _ScriptedLLM(_death, _death), {}
+    msg, _cost = _primary_call(llm, tmp_path, usage)
+    assert msg is None and llm.calls == 1
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
     assert usage["_last_llm_retry_same_request"] is False
     assert len(_events(tmp_path, "llm_not_dispatched")) == 1
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-    assert TRANSPORT_DEATHS_KEY not in usage  # the granted-but-unsent repeat is un-counted
-    assert "were repeated" not in _result  # the hint names only real repeats
+    assert provider_no_call_source(usage, True)[0] == "provider_outcome_unknown_no_resend"
+    assert TRANSPORT_DEATHS_KEY not in usage
+
 
 
 def test_attempt_loop_ceiling_stays_the_outer_bound_and_the_flag_stays_truthful(tmp_path, no_sleep, monkeypatch):
@@ -422,8 +409,8 @@ def test_requests_chunked_body_disconnect_repeats_on_the_same_rail(data_root, tm
     for row in _ledger(data_root):
         by_attempt.setdefault(row["attempt_id"], []).append(row["state"])
     assert list(by_attempt.values()) == [
-        ["reserved", "dispatched", "unresolved"],
-        ["reserved", "dispatched", "settled"],
+        ["unresolved"],
+        ["settled"],
     ]
     assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
     api_errors = _events(tmp_path, "llm_api_error")
@@ -506,33 +493,27 @@ def _no_chain(**_kwargs):
 
 
 def _presence_turn(kwargs):
-    """Inline Presence, the one caller that keeps the bounded paid-repeat rail."""
+    """Stamp the production inline Presence caller class."""
     kwargs["task_type"] = "presence"
     kwargs["tools"]._ctx.is_direct_chat = True
     kwargs["tools"]._ctx.current_task_type = "presence"
     return kwargs
 
 
-def test_primary_round_dispatch_exhaustion_takes_the_unknown_no_resend_terminal(tmp_path, monkeypatch, no_sleep):
-    """End to end through the real round dispatcher: three deaths, then the
-    forced-final rail ships the salvage WITHOUT a provider call and the terminal
-    text names the repeats."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
+def test_presence_unknown_wait_exhaustion_never_forces_another_generation(tmp_path, monkeypatch, no_sleep):
+    """A spent interactive wait keeps the original unknown attempt and dispatches no summary."""
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
+    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, _death, _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
-    result, usage, trace = run_llm_loop(**kwargs)
+    monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 0)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable", lambda *_a, **_k: pytest.fail("spent wait"))
+    llm = _ScriptedLLM(_death, _death)
+    result, usage, trace = run_llm_loop(**_presence_turn(_loop_kwargs(tmp_path, llm, [])))
+    assert llm.calls == 1 and no_sleep == [] and TRANSPORT_DEATHS_KEY not in usage
+    assert usage["execution_status"] == "infra_failed" and usage["reason_code"] == "provider_unavailable"
+    assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
+    assert "no terminal provider outcome" in result.lower()
 
-    assert llm.calls == 3  # zero further dials of any kind: no forced-final resend
-    assert usage.get("execution_status") == "infra_failed"
-    assert usage.get("reason_code") == "provider_unavailable"
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-    assert "2 earlier physical attempt(s) of the last dispatched round" in result
-    assert "no further retry or paid fallback was sent" in result
 
 
 def test_primary_round_dispatch_recovers_after_two_deaths(tmp_path, monkeypatch, no_sleep):
@@ -606,39 +587,17 @@ def test_unexpected_loop_error_carries_accumulated_evidence_to_owner_projection(
     assert trace["tool_calls"][0]["trace_ref"]["call_id"]
 
 
-@pytest.mark.parametrize("turn_flag", ["presence"])
-def test_counter_survives_the_wait_episodes_free_redial_of_the_same_round(tmp_path, monkeypatch, no_sleep, turn_flag):
-    """death → released ConnectError → wait episode → free redial → death →
-    death: the round stays bounded by two paid repeats in total (sol s1). The
-    same holds for an interactive turn, whose episode is bounded by the task
-    idle timeout instead of the queue rails: the episode's free redial of the
-    same round neither clears nor re-arms the round record."""
-    monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda _sec, _wake: False)
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, _released_connect, _death, _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    if turn_flag:
-        _presence_turn(kwargs)
-    _result, usage, trace = run_llm_loop(**kwargs)
+def test_explicit_repeat_record_survives_free_redial_of_the_same_round(tmp_path, no_sleep):
+    """Legacy low-level consumers retain their explicit repeat count across a released call."""
+    usage = {}
+    first = _ScriptedLLM(_death, _released_connect)
+    msg, _cost = _primary_call(first, tmp_path, usage)
+    assert msg is None and first.calls == 2 and usage[TRANSPORT_DEATHS_KEY]["count"] == 1
+    later = _ScriptedLLM(_death, _death, _death)
+    msg, _cost = _primary_call(later, tmp_path, usage)
+    assert msg is None and later.calls == 2 and usage[TRANSPORT_DEATHS_KEY]["count"] == 2
+    assert provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
 
-    assert llm.calls == 4  # death, connect (free), death, death — the fifth script step never runs
-    api_errors = _events(tmp_path, "llm_api_error")
-    assert [(row["error_kind"], row["retry_same_request"]) for row in api_errors] == [
-        ("provider_outcome_unknown", True),
-        ("transport_unavailable", True),
-        ("provider_outcome_unknown", True),
-        ("provider_outcome_unknown", False),
-    ]
-    assert len(_events(tmp_path, "llm_non_retryable_same_request")) == 1
-    assert [row["phase"] for row in _events(tmp_path, "network_wait")] == ["entered", "waiting", "ended"]
-    waiting = [row for row in _events(tmp_path, "network_wait") if row["phase"] == "waiting"]
-    assert ("window_remaining_sec" in waiting[0]) is bool(turn_flag)  # the idle bound was live for the interactive kinds only
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-    assert usage[TRANSPORT_DEATHS_KEY]["count"] == 2
 
 
 # ------------------------------------------------ zero repeats everywhere else
@@ -660,21 +619,22 @@ def test_forced_final_call_never_repeats_a_transport_death(tmp_path, no_sleep):
     assert no_sleep == []
 
 
-@pytest.mark.parametrize("attempt_cap,expected_calls", [(None, 3), (2, 1)])
-def test_round_dispatcher_opts_in_only_the_primary(tmp_path, no_sleep, attempt_cap, expected_calls):
-    """attempt_cap is set only for fallback-chain candidates (the primary passes
-    None): candidates get zero paid repeats, an inline Presence primary its bounded two."""
+@pytest.mark.parametrize("attempt_cap", [None, 2])
+def test_round_dispatcher_leaves_unknown_recovery_to_the_shared_round(tmp_path, no_sleep, attempt_cap):
+    """Presence primary and fallback calls both return unknown to the shared recovery owner."""
+    from copy import deepcopy
     llm = _ScriptedLLM(_death, _death)
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     ctx = SimpleNamespace(
-        llm=llm, messages=MESSAGES, tools=registry, active_model="test-model", tool_schemas=None,
+        llm=llm, messages=deepcopy(MESSAGES), tools=registry, active_model="test-model", tool_schemas=[],
+        context_fit_plan=None, active_context_mode="max", drive_root=tmp_path,
         active_effort="low", max_retries=3, drive_logs=tmp_path, task_id="t-cand", round_idx=1,
         event_queue=None, accumulated_usage={}, task_type="presence", active_use_local=False,
     )
     msg, _cost = loop_mod._dispatch_round_model(ctx, None, attempt_cap=attempt_cap)
+    assert msg is None and llm.calls == 1 and no_sleep == []
+    assert TRANSPORT_DEATHS_KEY not in ctx.accumulated_usage
 
-    assert llm.calls == expected_calls
-    assert (msg is not None) is (attempt_cap is None)
 
 
 def test_default_budget_is_zero_for_every_direct_caller(tmp_path, no_sleep):
@@ -764,15 +724,11 @@ def test_repeat_failing_with_another_class_ends_the_round_on_the_unknown_termina
     same-model burst, the forced-final dial or the paid chain while attempt #1
     of the round is still unresolved: exactly two sends, the unknown no-resend
     terminal, a truthful row for the repeat, and a hint that names both facts."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     llm = _ScriptedLLM(_death, lambda: _status_failure(status), _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
-    result, usage, trace = run_llm_loop(**kwargs)
+    usage = {}
+    msg, _cost = _primary_call(llm, tmp_path, usage)
+    assert msg is None
+    result = loop_transport.provider_recovery_hint(usage)
 
     assert llm.calls == 2  # no burst, no forced-final dial, no chain candidate
     assert [(row["error_kind"], row["retry_same_request"]) for row in _events(tmp_path, "llm_api_error")] == [
@@ -780,9 +736,9 @@ def test_repeat_failing_with_another_class_ends_the_round_on_the_unknown_termina
     ]
     non_retryable = _events(tmp_path, "llm_non_retryable_same_request")
     assert [row["error_kind"] for row in non_retryable] == [kind]
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
+    assert provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
     assert usage.get("execution_status") == "infra_failed"
-    assert usage.get("reason_code") == "provider_unavailable"
+    assert usage.get("reason_code") == "llm_api_error"
     assert usage["_last_llm_error_kind"] == kind  # the sticky kind stays real
     assert RETRY_WALL_EXHAUSTED_KEY not in usage
     assert usage[TRANSPORT_DEATHS_KEY]["count"] == 1
@@ -791,24 +747,15 @@ def test_repeat_failing_with_another_class_ends_the_round_on_the_unknown_termina
     assert "no further retry or paid fallback was sent" in result
 
 
-def test_repeat_returning_an_empty_response_ends_the_round_and_keeps_the_record(tmp_path, monkeypatch, no_sleep):
-    """The empty/incomplete-response retry is fenced the same way, and the
-    record survives the response object (it clears only on a USABLE reply)."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, EMPTY_RESPONSE, _death, _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
-    _result, usage, trace = run_llm_loop(**kwargs)
-
-    assert llm.calls == 2  # the empty repeat is not retried; the third death never happens
+def test_explicit_repeat_returning_an_empty_response_keeps_the_record(tmp_path, no_sleep):
+    """The retained explicit repeat API clears custody only on a usable response."""
+    llm, usage = _ScriptedLLM(_death, EMPTY_RESPONSE, _death), {}
+    msg, _cost = _primary_call(llm, tmp_path, usage)
+    assert msg is None and llm.calls == 2
     assert len(_events(tmp_path, "provider_incomplete_response")) == 1
     assert usage[TRANSPORT_DEATHS_KEY]["count"] == 1
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-    assert usage.get("reason_code") == "provider_unavailable"
+    assert provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
+
 
 
 def test_no_call_rail_fences_on_the_round_record_whatever_the_sticky_kind():
@@ -877,8 +824,7 @@ def test_stop_path_without_a_record_stops_instead_of_crashing(tmp_path):
 
 
 def test_native_subagent_child_primary_dispatch_opts_in(tmp_path, monkeypatch, no_sleep):
-    """A native API subagent child runs the ordinary run_llm_loop: its rounds are
-    primary rounds of its own loop and get the bounded transport-death rail."""
+    """A native API child uses the same paced unknown recovery as every turn."""
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
     monkeypatch.setattr(loop_transport, "upstream_transport_reachable", lambda *a, **kw: {"kind": "upstream_http", "status_code": 200})
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", lambda *a: False)
@@ -908,29 +854,15 @@ def _overflow_failure():
     return exc
 
 
-def test_repeat_failing_as_context_overflow_takes_the_unknown_terminal(tmp_path, monkeypatch, no_sleep):
-    """A granted repeat rejected as a context overflow must not open the
-    compaction retry or the overflow-salvage terminal while attempt #1 of the
-    round is unresolved: the unknown no-resend rail wins and the hint names
-    both facts."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
-    monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, _overflow_failure, _death, _death)
-    notes = []
-    kwargs = _loop_kwargs(tmp_path, llm, notes)
-    _presence_turn(kwargs)  # Inline Presence alone retains the bounded repeat rail.
-    result, usage, trace = run_llm_loop(**kwargs)
+def test_explicit_repeat_context_overflow_keeps_unknown_custody(tmp_path, no_sleep):
+    """A low-level repeat's refusal cannot mint retry authority over the preceding unknown."""
+    llm, usage = _ScriptedLLM(_death, _overflow_failure, _death), {}
+    msg, _cost = _primary_call(llm, tmp_path, usage)
+    assert msg is None and llm.calls == 2
+    assert usage["_last_llm_error_kind"] == "context_overflow" and usage[TRANSPORT_DEATHS_KEY]["count"] == 1
+    assert provider_no_call_source(usage, False)[0] == "provider_outcome_unknown_no_resend"
+    assert "the repeat failed as context_overflow" in loop_transport.provider_recovery_hint(usage)
 
-    assert llm.calls == 2
-    assert usage["_last_llm_error_kind"] == "context_overflow"
-    assert usage[TRANSPORT_DEATHS_KEY]["count"] == 1
-    assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-    assert usage.get("execution_status") == "infra_failed"
-    assert usage.get("reason_code") == "provider_unavailable"
-    assert "the repeat failed as context_overflow" in result
-    assert "no further retry or paid fallback was sent" in result
 
 
 def test_refused_free_redial_keeps_the_base_deadline_stamps(tmp_path, no_sleep):
@@ -999,7 +931,7 @@ def test_proxy_tunnel_failure_keeps_the_base_unknown_terminal(data_root, tmp_pat
 
     assert msg is None
     assert llm.calls == 1
-    assert [row["state"] for row in _ledger(data_root)] == ["reserved", "dispatched", "unresolved"]
+    assert [row["state"] for row in _ledger(data_root)] == ["unresolved"]
     assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
     assert usage["_last_llm_retry_same_request"] is False
@@ -1007,7 +939,7 @@ def test_proxy_tunnel_failure_keeps_the_base_unknown_terminal(data_root, tmp_pat
     assert no_sleep == []
     assert provider_no_call_source(usage, False) == ("provider_outcome_unknown_no_resend", False)
 
-    # And through run_llm_loop: no wait episode, the base unknown no-resend terminal, no forced dial.
+    # The ordinary loop can recover this unknown; an exhausted wait still sends nothing.
     monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
@@ -1017,11 +949,12 @@ def test_proxy_tunnel_failure_keeps_the_base_unknown_terminal(data_root, tmp_pat
         exc.physical_attempt_capture = _capture(provider="anthropic")
         return exc
 
+    monkeypatch.setattr(loop_transport, "get_task_idle_timeout_sec", lambda: 0)
     loop_llm = _ScriptedLLM(scripted, scripted)
     kwargs = _presence_turn(_loop_kwargs(tmp_path, loop_llm, []))
     _result, loop_usage, trace = run_llm_loop(**kwargs)
     assert loop_llm.calls == 1
-    assert _events(tmp_path, "network_wait") == []
+    assert [row["phase"] for row in _events(tmp_path, "network_wait")] == ["entered", "ended"]
     assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
 
 
@@ -1091,8 +1024,8 @@ def test_rejected_stream_settles_and_walks_the_fallback_chain_without_a_wait_epi
     for row in _ledger(data_root):
         by_attempt.setdefault(row["attempt_id"], []).append(row)
     assert [[row["state"] for row in rows] for rows in by_attempt.values()] == [
-        ["reserved", "dispatched", "settled"],
-        ["reserved", "dispatched", "settled"],
+        ["settled"],
+        ["settled"],
     ]
     rejected = list(by_attempt.values())[0][-1]
     assert rejected["cost_usd"] == 0.02 and rejected["prompt_tokens"] == 40 and rejected["completion_tokens"] == 9
@@ -1164,8 +1097,8 @@ def test_code_less_stream_error_without_usage_keeps_the_upper_bound_and_still_wa
     for row in _ledger(data_root):
         by_attempt.setdefault(row["attempt_id"], []).append(row)
     assert [[row["state"] for row in rows] for rows in by_attempt.values()] == [
-        ["reserved", "dispatched", "unresolved"],
-        ["reserved", "dispatched", "settled"],
+        ["unresolved"],
+        ["settled"],
     ]
     assert ua.usage_projection(data_root)["unresolved_upper_bound_usd"] == 1.0
     api_errors = _events(tmp_path, "llm_api_error")

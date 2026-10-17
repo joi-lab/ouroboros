@@ -472,12 +472,14 @@ def events(data_root, event_type: str) -> list:
 
 
 def task_result(data_root, task_id: str) -> dict:
-    path = pathlib.Path(data_root) / "task_results" / f"{task_id}.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    from tests._store_shared import read_result
+    return read_result(pathlib.Path(data_root), task_id) or {}
 
 
-def task_result_bytes(data_root, task_id: str) -> bytes:
-    return (pathlib.Path(data_root) / "task_results" / f"{task_id}.json").read_bytes()
+def task_result_signature(data_root, task_id: str):
+    """``(write_seq, updated_at)`` of the stored row: changes on every write, like the file bytes did."""
+    from tests._store_shared import result_signature
+    return result_signature(pathlib.Path(data_root), task_id)
 
 
 def chat_bytes(data_root) -> bytes:

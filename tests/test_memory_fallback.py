@@ -143,6 +143,36 @@ def test_consciousness_off_or_unknown_makes_exactly_one_light_call(tmp_path, mon
     assert {entry["task_id"] for entry in draft["host_stamp"]["tasks"]} == {"bound", "kid"}
 
 
+@pytest.mark.parametrize("carrier", ["prefatory_prose", "separate_reasoning"])
+def test_only_the_structured_account_reaches_the_chronicle_view(tmp_path, monkeypatch, light, carrier):
+    """Transport commentary is not the account; literal examples inside it are not a filter target."""
+    from ouroboros import memory_view as mv
+
+    shared.world(tmp_path)
+    _consciousness(monkeypatch, False)
+    account = "The owner discussed the literal example <think>keep this</think>."
+    commentary = "PRIVATE_REASONING_SENTINEL"
+    answer = json.dumps({"text": account, "quotes": []})
+
+    class Reply(_Light):
+        def chat(self, **kwargs):
+            msg, usage = super().chat(**kwargs)
+            if carrier == "prefatory_prose":
+                msg["content"] = f"<think>{commentary}</think>\n" + msg["content"]
+            else:
+                msg["reasoning_content"] = commentary
+            return msg, usage
+
+    run = _run(tmp_path, Reply(answer))
+    assert run.outcome == "published", run
+    [draft] = _drafts(tmp_path)
+    assert draft["text"] == account
+    task = {"id": "turn0001", "chat_id": 1}
+    story = mv.render_story(mv.capture_memory_view(tmp_path, task, mv.view_spec_for_task(task, tmp_path)))
+    assert account in story and commentary not in story
+    assert draft["author"]["kind"] == "helper" and len(draft["covers"]["rows"]) == 2
+
+
 def test_before_activation_no_call_and_no_new_file(tmp_path, monkeypatch, light):
     shared.world(tmp_path, activate=False)
     _consciousness(monkeypatch, False)
@@ -465,7 +495,7 @@ def test_a_part_draft_with_a_stale_room_head_is_a_conflict_without_receipt(tmp_p
 
     run = _run(tmp_path, _Light(during=meanwhile), direct=True, trace=_narrative_trace(store))
     assert (run.outcome, run.kind) == ("conflict", "revision_conflict")
-    assert _drafts(tmp_path) == [] and mf.FALLBACK_REFUSALS_KEY not in store.scan_state()
+    assert _drafts(tmp_path) == [] and _receipts(tmp_path) == {}
 
 
 def test_a_page_sealed_by_the_mind_during_the_call_is_a_conflict_and_not_retried(tmp_path, monkeypatch, light):
@@ -475,7 +505,7 @@ def test_a_page_sealed_by_the_mind_during_the_call_is_a_conflict_and_not_retried
     llm = _Light(during=lambda: _mind_page(tmp_path, alpha, 6, 6))
     run = _run(tmp_path, llm)
     assert (run.outcome, run.kind) == ("conflict", "already_sealed")
-    assert _drafts(tmp_path) == [] and mf.FALLBACK_REFUSALS_KEY not in ChronicleStore(tmp_path).scan_state()
+    assert _drafts(tmp_path) == [] and _receipts(tmp_path) == {}
     # The next root does not repeat it: alpha's remaining row is a new stretch.
     llm = _Light()
     assert _run(tmp_path, llm).unit.segment.rows[0][2] == 7
@@ -498,13 +528,13 @@ def test_a_quote_of_the_rows_own_speaker_is_published_and_a_wrong_speaker_is_ref
     assert run.outcome == "published", run
     [draft] = _drafts(tmp_path)
     assert draft["quotes"] == [{"address": beta_q, "text": "beta question", "speaker": "human"}]
-    assert run.unit.key not in ChronicleStore(tmp_path).scan_state().get(mf.FALLBACK_REFUSALS_KEY, {})
+    assert run.unit.key not in _receipts(tmp_path)
 
 
 # --- refusals, receipts and interruptions ------------------------------------------------------------
 
 def _receipts(root):
-    return ChronicleStore(root).scan_state().get(mf.FALLBACK_REFUSALS_KEY, {})
+    return mi.fallback_refusals(ChronicleStore(root).scan_state())
 
 
 @pytest.mark.parametrize("case", ["not_json", "output_truncated", "empty_summary", "context_overflow"])
@@ -531,11 +561,20 @@ def test_a_refusal_leaves_a_receipt_that_skips_the_same_input_on_the_same_route(
         assert receipt["response_ref"] is None
     unit = {u.record_id: u for u in mi.legacy_units(ChronicleStore(tmp_path), tmp_path)}[alpha_unit]
     assert unit.refusal["kind"] == kind and not unit.folded
-    # Same input, same route: alpha is not paid for again; the next unit is drafted instead.
+    # Same input/route never repeats. A refused fitted prefix leaves an untouched
+    # suffix eligible before the next legacy unit, even when the window is tiny.
+    first_row = run.unit.segment.rows[0][0]
     light.labels.clear()
     again = _Light("still not json") if case == "not_json" else llm
     again.prompts.clear()
     run = _run(tmp_path, again)
+    if case == "context_overflow":
+        assert run.unit.record_id == alpha_unit and run.unit.key != alpha_unit
+        assert run.unit.segment.from_addr != first_row and len(run.unit.segment.rows) == 1
+        assert _receipts(tmp_path)[run.unit.key]["input_sha256"] != receipt["input_sha256"]
+        assert light.labels == ["memory_fallback_page"] and not again.prompts
+        light.labels.clear()
+        run = _run(tmp_path, again)
     assert run.unit.record_id == beta_unit and light.labels == ["memory_fallback_page"]
     assert all("Project Alpha" not in prompt for prompt in again.prompts)
     # Another Light route: alpha is drafted again.
@@ -659,7 +698,7 @@ def test_a_paid_answer_whose_publication_raises_is_billed_without_a_receipt(tmp_
 
 
 def test_the_writer_never_nominates_knowledge_or_touches_the_old_dialogue_files(tmp_path, monkeypatch, light):
-    from ouroboros import consolidator, knowledge
+    from ouroboros import knowledge
 
     shared.world(tmp_path)
     _consciousness(monkeypatch, False)
@@ -668,7 +707,6 @@ def test_the_writer_never_nominates_knowledge_or_touches_the_old_dialogue_files(
     def forbidden(*_a, **_k):
         raise AssertionError("the fallback writer does not write knowledge")
 
-    monkeypatch.setattr(consolidator, "_write_knowledge_entries", forbidden)
     monkeypatch.setattr(knowledge, "write_knowledge_note", forbidden)
     assert _run(tmp_path, _Light()).outcome == "published"
     assert {name: (tmp_path / "memory" / name).read_bytes() for name in frozen} == frozen
@@ -720,3 +758,195 @@ def test_the_stage_reads_a_returned_failure_with_the_post_task_classifier(tmp_pa
         "", {"cost": None, "_consolidation_errors": [{"kind": kind}]}))
     env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
     assert pts._run_memory_fallback_draft(env, {"id": "r"}, _Light(), tmp_path / "logs", {}) == kind
+
+
+# --- useful parts and source-bound repeat suppression -----------------------------------------------
+
+def _part_fixture(root, monkeypatch, count=2):
+    shared.world(root)
+    _consciousness(monkeypatch, False)
+    store, ids = ChronicleStore(root), []
+    for n in range(count):
+        result = store.publish_page(room_id="1", text=(f"The owner limited project {n} to research. " * 40),
+            author=shared.MIND, covers={"rows": [f"research-{n}"], "stream_span": [100 + n, 100 + n]})
+        assert result.ok
+        ids.append(result.record["id"])
+    trace = {mi.VIEW_TRACE_KEY: {"role": "integrator", "room_id": "1", "floor": {
+        "steps": {"F5": count}, "pointer_records": ids, "newest_addressed_row": None,
+        "by_budget": 0, "mode": "max", "window_tokens": 272_000}}}
+    return store, ids, trace
+
+
+def test_part_keep_original_preserves_source_and_suppresses_same_attempt(tmp_path, monkeypatch, light):
+    from ouroboros import memory_view as mv
+    answer = json.dumps({"keep_original": True, "reason": "Already concise."})
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch)
+    originals = [store.get(i) for i in ids]
+    run = _run(tmp_path, _Light(answer), direct=True, trace=trace)
+    assert (run.outcome, run.kind) == ("kept_original", "keep_original")
+    assert [store.get(i) for i in ids] == originals
+    assert not any(r.get("folded_into") for r in store.room_records("1") if r["id"] in ids)
+    receipt = _receipts(tmp_path)[run.unit.key]
+    assert (tmp_path / receipt["response_ref"]["read"]["arguments"]["path"]).read_text() == answer
+    again = _Light()
+    assert _run(tmp_path, again, direct=True, trace=trace).outcome == "nothing"
+    assert again.prompts == []
+    view = mv.render_story(mv.capture_memory_view(tmp_path, {"chat_id": 1}, mv.view_spec_for_task({"chat_id": 1}, tmp_path)))
+    assert "A helper could not fold" not in view and all(i in view for i in ids)
+    light.model = "test/another-light"
+    assert _run(tmp_path, _Light(), direct=True, trace=trace).outcome == "published"
+
+
+def test_rejected_published_input_is_skipped_without_scan_receipt_including_index_rebuild(tmp_path, monkeypatch, light):
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch)
+    answer = json.dumps({"text": "The owner limited both projects to research.", "quotes": []})
+    run = _run(tmp_path, _Light(answer), direct=True, trace=trace)
+    assert run.outcome == "published"
+    assert not _receipts(tmp_path)
+    assert store.decide(run.record_id, False, shared.MIND, "Keep the separate accounts.").ok
+    metadata = store.get(run.record_id)["metadata"]
+    assert store.rejected_input("1", run.unit.key, metadata["input_sha256"], metadata["light_binding"])
+    # The disposable projection is rebuilt from original records, not a migration
+    # that invents a new input identity for the prior prompt.
+    store.index_path.unlink()
+    again = _Light()
+    assert _run(tmp_path, again, direct=True, trace=trace).outcome == "nothing"
+    assert not again.prompts and not _receipts(tmp_path)
+    monkeypatch.setattr(mf, "_PART", mf._PART + "\nPreserve the individual project names.")
+    assert _run(tmp_path, _Light(answer), direct=True, trace=trace).outcome == "published"
+
+
+def test_suppressed_fitted_prefix_reaches_untouched_suffix_with_one_call(tmp_path, monkeypatch, light):
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch, count=3)
+    # A measured one-member window; these are the real fitting/selection owners.
+    unit = next(mf.candidate_units(tmp_path, store, mi.shortage_from_trace(trace), allow_legacy=False))
+    single = mf.build_writer_input(tmp_path, store, mf.replace(unit, member_ids=tuple(ids[:1])), budget_tokens=None)
+    monkeypatch.setattr(mf, "_light_fit", lambda _: (len(single.prompt) + 10, len))
+    kept = _run(tmp_path, _Light(json.dumps({"keep_original": True, "reason": "Keep this one."})), direct=True, trace=trace)
+    assert kept.outcome == "kept_original"
+    llm = _Light(json.dumps({"keep_original": True, "reason": "Also keep this one."}))
+    second = _run(tmp_path, llm, direct=True, trace=trace)
+    assert len(llm.prompts) == 1 and second.unit.member_ids == tuple(ids[1:])
+    assert ids[0] not in llm.prompts[0] and ids[1] in llm.prompts[0]
+
+
+def test_noop_part_does_not_degrade_the_post_task_stage(tmp_path, monkeypatch, light):
+    from ouroboros import post_task_synthesis as pts
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch)
+    llm = _Light(json.dumps({"keep_original": True, "reason": "Nothing useful to fold."}))
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    assert pts._run_memory_fallback_draft(env, {"id": "root-task", "budget_drive_root": str(tmp_path),
+        "_is_direct_chat": True}, llm, tmp_path / "logs", trace) == ""
+    assert len(llm.prompts) == 1
+    events = [json.loads(line) for line in (tmp_path / "logs/events.jsonl").read_text().splitlines()]
+    assert next(e for e in events if e.get("type") == "memory_fallback_draft")["outcome"] == "kept_original"
+
+
+def test_keep_original_is_not_a_page_result_or_a_malformed_part(tmp_path, monkeypatch, light):
+    shared.world(tmp_path)
+    _consciousness(monkeypatch, False)
+    text = json.dumps({"keep_original": True, "reason": "No useful fold."})
+    assert _run(tmp_path, _Light(text)).kind == "invalid"
+    assert mf._parse(text, part=True) == {"keep_original": True, "reason": "No useful fold."}
+    for bad in ({"keep_original": True}, {"keep_original": "true", "reason": "x"},
+                {"keep_original": True, "reason": "x", "text": "contradictory"}):
+        assert mf._parse(json.dumps(bad), part=True) is None
+
+
+def test_each_receipt_appends_only_its_own_delta_and_clear_survives_rebuild(tmp_path):
+    shared.world(tmp_path)
+    store = ChronicleStore(tmp_path)
+    increments = []
+    for n in range(60):
+        key = f"open:1:{n:012d}"
+        receipt = {"input_sha256": "a" * 64, "light_binding": {"model": "test/light"},
+                   "response_ref": {"detail": "x" * 900}, "task_id": f"t{n:02d}"}
+        before = store.log_path.stat().st_size
+        mf._set_refusal(store, key, receipt)
+        increments.append(store.log_path.stat().st_size - before)
+    # Exact synthetic keys/values have equal byte lengths. This falsifies the
+    # whole-map writer even when every receipt still describes a live unit.
+    assert len(set(increments)) == 1, increments
+    assert len(_receipts(tmp_path)) == 60
+    before = store.log_path.stat().st_size
+    mf._set_refusal(store, "open:1:000000000000", None)
+    assert 0 < store.log_path.stat().st_size - before < increments[0]
+    after_clear = store.log_path.read_bytes()
+    mf._set_refusal(store, "open:1:000000000000", None)
+    mf._set_refusal(store, "never-refused", None)
+    assert store.log_path.read_bytes() == after_clear
+    store.index_path.unlink()
+    assert len(_receipts(tmp_path)) == 59
+    assert "open:1:000000000000" not in _receipts(tmp_path)
+
+
+def test_old_map_suppression_clear_and_raw_source_remain_readable(tmp_path, monkeypatch, light):
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch)
+    unit, draft = mf.select_unit(tmp_path, store, mi.shortage_from_trace(trace), allow_legacy=False,
+        binding=mf.light_binding(), fit=lambda: mf._light_fit(mf.light_binding()))
+    old = {"input_sha256": draft.input_sha256, "light_binding": mf.light_binding(),
+           "kind": "invalid", "response_ref": {"read": {"arguments": {"path": "old-answer.txt"}}}}
+    store.publish([], scan_state={"fallback_refusals": {unit.key: old}})
+    untouched = store.log_path.read_bytes()
+    llm = _Light()
+    assert _run(tmp_path, llm, direct=True, trace=trace).outcome == "nothing" and not llm.prompts
+    light.model = "test/changed"
+    assert _run(tmp_path, _Light(), direct=True, trace=trace).outcome == "published"
+    assert unit.key not in _receipts(tmp_path)
+    assert store.scan_state()["fallback_refusals"][unit.key] == old
+    assert store.log_path.read_bytes().startswith(untouched)
+    store.index_path.unlink()
+    assert unit.key not in _receipts(tmp_path)
+    assert store.scan_state()["fallback_refusals"][unit.key]["response_ref"] == old["response_ref"]
+
+
+@pytest.mark.parametrize("count", [12, 24])
+def test_suppressed_runs_read_each_room_once_per_unchanged_head(tmp_path, monkeypatch, light, count):
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch, count=count * 2)
+    # Alternate pointers form disjoint runs in ONE room, not count separate rooms.
+    trace[mi.VIEW_TRACE_KEY]["floor"]["pointer_records"] = ids[::2]
+    shortage = mi.shortage_from_trace(trace)
+    for unit in mf.candidate_units(tmp_path, store, shortage, allow_legacy=False):
+        draft = mf.build_writer_input(tmp_path, store, unit, budget_tokens=None)
+        mf._set_refusal(store, unit.key, {"input_sha256": draft.input_sha256,
+            "light_binding": mf.light_binding(), "kind": "keep_original"})
+    calls, delivered = [], []
+    read = store.room_records
+    def observed(room, **kwargs):
+        rows = read(room, **kwargs)
+        calls.append(str(room))
+        delivered.append(len(rows))
+        return rows
+    monkeypatch.setattr(store, "room_records", observed)
+    assert mf.select_unit(tmp_path, store, shortage, allow_legacy=False,
+        binding=mf.light_binding(), fit=lambda: (None, mf._chars_measure)) is None
+    assert calls == ["1"], (count, calls, sum(delivered))
+    # A correction is new input; a later pass must not retain a stale room view.
+    assert store.correct(ids[0], "The later owner correction limits project zero to Alpha only.", shared.MIND).ok
+    chosen = mf.select_unit(tmp_path, store, shortage, allow_legacy=False,
+        binding=mf.light_binding(), fit=lambda: (None, mf._chars_measure))
+    assert chosen is not None and "Alpha only" in chosen[1].prompt
+    assert calls == ["1", "1"]
+
+
+def test_room_reuse_does_not_hide_a_correction_between_candidates(tmp_path, monkeypatch, light):
+    store, ids, trace = _part_fixture(tmp_path, monkeypatch, count=4)
+    trace[mi.VIEW_TRACE_KEY]["floor"]["pointer_records"] = ids[::2]
+    shortage = mi.shortage_from_trace(trace)
+    first = next(mf.candidate_units(tmp_path, store, shortage, allow_legacy=False))
+    draft = mf.build_writer_input(tmp_path, store, first, budget_tokens=None)
+    mf._set_refusal(store, first.key, {"input_sha256": draft.input_sha256,
+        "light_binding": mf.light_binding(), "kind": "keep_original"})
+    read, calls = store.room_records, []
+    def racing(room, **kwargs):
+        rows = read(room, **kwargs)
+        calls.append(str(room))
+        if len(calls) == 1:
+            assert store.correct(ids[2], "NEW LIMIT: the third project is read-only.", shared.MIND).ok
+        return rows
+    monkeypatch.setattr(store, "room_records", racing)
+    selected = mf.select_unit(tmp_path, store, shortage, allow_legacy=False,
+        binding=mf.light_binding(), fit=lambda: (None, mf._chars_measure))
+    assert calls == ["1", "1"]
+    assert selected[0].member_ids == (ids[2],)
+    assert "NEW LIMIT: the third project is read-only." in selected[1].prompt

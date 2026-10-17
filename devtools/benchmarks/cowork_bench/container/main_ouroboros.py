@@ -394,17 +394,28 @@ def collect_audit_artifacts(task_root: pathlib.Path, task_id: str, secrets: list
     """
     target = task_root / "ouroboros"
     target.mkdir(parents=True, exist_ok=True)
-    sources = [pathlib.Path(OUROBOROS_DATA) / "logs" / name for name in _AUDIT_LOGS]
-    if task_id:
-        sources.append(pathlib.Path(OUROBOROS_DATA) / "task_results" / f"{task_id}.json")
-    for source in sources:
+    texts: list[tuple[str, str]] = []
+    for name in _AUDIT_LOGS:
         try:
-            text = source.read_text(encoding="utf-8", errors="replace")
+            texts.append((name, (pathlib.Path(OUROBOROS_DATA) / "logs" / name).read_text(encoding="utf-8", errors="replace")))
         except OSError:
             continue
-        staged = target / f".{source.name}.tmp"
+    if task_id:
+        # The task record lives in the data root's store; the install's own interpreter reads it
+        # through the store code, so the artefact is the document the gateway would serve.
+        reader = ("import json, sys\nfrom ouroboros.task_store import read_document\n"
+                  "print(json.dumps(read_document(sys.argv[1], sys.argv[2])))")
+        try:
+            dumped = subprocess.run([OUROBOROS_PYTHON, "-c", reader, OUROBOROS_DATA, task_id], cwd=OUROBOROS_SRC,
+                                    capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            dumped = None
+        if dumped is not None and dumped.returncode == 0 and dumped.stdout.strip() not in ("", "null"):
+            texts.append((f"{task_id}.json", dumped.stdout))
+    for name, text in texts:
+        staged = target / f".{name}.tmp"
         staged.write_text(scrub(text, secrets), encoding="utf-8")
-        staged.replace(target / source.name)
+        staged.replace(target / name)
 
 
 def write_bench_logs(task_config, status: str, started: datetime, summary: Mapping[str, Any], final_answer: str) -> None:

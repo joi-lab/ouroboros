@@ -11,6 +11,7 @@ import pytest
 
 from ouroboros import delegate_custody as custody
 from ouroboros import delegate_output
+from ouroboros.artifacts import task_artifact_dir_path
 from ouroboros.tool_capabilities import tool_result_limit
 from tests.test_delegate_retry_consumers import (
     TerminalGateway, bind_gateway, call, durable_run, retry_context,
@@ -23,8 +24,17 @@ pytestmark = pytest.mark.serial
 
 @pytest.fixture(autouse=True)
 def reader_coverage(monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import task_status
     from ouroboros.tools import delegate
 
+    # This test has no supervisor refreshing its synthetic queue. Keep only
+    # the ownership clock fixed while exercising slow, paged EOF reads; the
+    # separate retry-consumer tests still test stale-snapshot rejection.
+    clock = task_status.time
+    now = clock.time()
+    monkeypatch.setattr(task_status, "time", SimpleNamespace(
+        time=lambda: now, monotonic=clock.monotonic, sleep=clock.sleep))
     coverage = {}
     monkeypatch.setattr(delegate_output, "_READ_COVERAGE", coverage)
     monkeypatch.setattr(delegate, "_READ_COVERAGE", coverage)
@@ -41,7 +51,7 @@ def read_whole(ctx, artifact):
     lines = Path(artifact["abs_path"]).read_text(encoding="utf-8").splitlines(keepends=True)
     for number, line in enumerate(lines, 1):
         for offset in range(0, max(len(line), 1), stride):
-            result = call(ctx, "read_file", root="task_drive", path=artifact["path"],
+            result = call(ctx, "read_file", root=artifact["root"], path=artifact["path"],
                           start_line=number, max_lines=1, start_char=offset)
             assert result.status == "ok", result.text
 
@@ -74,9 +84,14 @@ def test_predecessor_ack_does_not_count_as_successor_eof(tmp_path, monkeypatch, 
     assert not delivery["consumed"]
     artifact = delivery["artifact"]
     assert artifact["sha256"] == original["sha256"]
-    assert Path(artifact["abs_path"]).is_relative_to(ctx.drive_root)
+    # #1573: the retry READER stages the starter's run into its OWN canonical store
+    # (also from a forked drive); custody records that actual staging task.
+    data = custody.custody_root(ctx)
+    assert artifact["source"]["task_id"] == ctx.task_id != held.task_id
+    assert Path(artifact["abs_path"]).is_relative_to(task_artifact_dir_path(data, ctx.task_id))
+    assert custody.replay(data)[held.run_id].output_source == artifact["source"]
     for start in (1, artifact["lines"]):
-        result = call(ctx, "read_file", root="task_drive", path=artifact["path"],
+        result = call(ctx, "read_file", root=artifact["root"], path=artifact["path"],
                       start_line=start, max_lines=1)
         assert result.status == "ok", result.text
     assert len(receipts(ctx)) == 1, "head and tail must leave the unread middle unacknowledged"
@@ -103,6 +118,12 @@ def test_successor_receipt_invalidates_for_different_same_length_content(tmp_pat
     read_whole(ctx, first)
     assert wait_result(ctx, held.run_id)["output_delivery"]["consumed"]
     gateway.output = "B" * 120000
+    # A new exact body observation invalidates cached output; reading an already
+    # retained complete result itself no longer waits for a remote refresh.
+    from ouroboros import delegate_collection, delegate_custody_current
+    root = custody.custody_root(ctx)
+    assert delegate_collection.observe_run(root, delegate_custody_current.run(root, held.run_id),
+                                           gateway.get_run(held.run_id))
     second = wait_result(ctx, held.run_id)["output_delivery"]
     assert not second["consumed"]
     assert second["artifact"]["bytes"] == first["bytes"]
@@ -149,8 +170,8 @@ def test_foreign_read_never_mints_a_receipt_without_terminal_retry_authority(
     artifact = delegate_output._stage_full_output(ctx, held.run_id, "completed body\n")
     assert artifact is not None
     assert custody.emit(custody.custody_root(ctx), custody.OUTPUT_SPILLED, {
-        "run_id": held.run_id, "task_id": held.task_id, "artifact": artifact["path"],
-        "staged": True, "full_content": True, "sha256": artifact["sha256"],
+        "run_id": held.run_id, "task_id": held.task_id, "artifact": artifact["source"]["path"],
+        "source": artifact["source"], "staged": True, "full_content": True, "sha256": artifact["sha256"],
     })
     read_whole(ctx, artifact)
     assert not receipts(ctx)

@@ -61,6 +61,11 @@ uv pip install --python "$BUILD_PYTHON" -q -r "$BUILD_REQUIREMENTS"
 
 echo "--- Installing agent dependencies into python-standalone ---"
 uv pip install --python "$PORTABLE_PYTHON" -q -r requirements-runtime.lock
+# The source-launcher handoff cannot import the frozen launcher's private PYZ.
+DESKTOP_REQUIREMENTS="build/linux-desktop-requirements.txt"
+uv export --locked --no-dev --extra desktop \
+    --no-emit-project --no-hashes --no-annotate --output-file "$DESKTOP_REQUIREMENTS"
+uv pip install --python "$PORTABLE_PYTHON" -q -r "$DESKTOP_REQUIREMENTS"
 
 echo "--- Fetching exact Claudexor runtime seed ---"
 "$PORTABLE_PYTHON" scripts/fetch_claudexor_runtime.py --output-dir claudexor-runtime

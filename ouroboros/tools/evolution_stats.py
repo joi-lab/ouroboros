@@ -8,13 +8,14 @@ import os
 import re
 import subprocess
 import time
-from pathlib import Path
 from typing import Any
+
+from ouroboros.config import resolve_repo_dir
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 log = logging.getLogger(__name__)
 
 _VERSION_RE = re.compile(r"v(\d+\.\d+\.\d+)")
-_REPO_DIR = Path(os.environ.get("OUROBOROS_REPO_DIR", str(Path.home() / "Ouroboros" / "repo")))
 
 MAX_POINTS = 100
 
@@ -23,7 +24,7 @@ def _git(args: list[str], timeout: int = 15) -> str:
     try:
         r = subprocess.run(
             ["git"] + args,
-            cwd=str(_REPO_DIR),
+            cwd=str(resolve_repo_dir()),  # per call: the serving checkout, never a home default
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -127,7 +128,7 @@ def _collect_data() -> list[dict[str, Any]]:
     return points
 
 
-def _push_to_github(data: dict[str, Any]) -> str:
+def _push_to_github(data: dict[str, Any]) -> tuple[bool, str]:
     """Push evolution.json to the repo's docs/ folder via GitHub API."""
     import base64
     import requests
@@ -136,7 +137,7 @@ def _push_to_github(data: dict[str, Any]) -> str:
 
     token = os.environ.get("GITHUB_TOKEN", "").strip()
     if not token:
-        return "error: GITHUB_TOKEN not found"
+        return False, "error: GITHUB_TOKEN not found"
 
     repo_setting = os.environ.get("GITHUB_REPO", "").strip()
     if "/" in repo_setting:
@@ -145,7 +146,7 @@ def _push_to_github(data: dict[str, Any]) -> str:
         user = os.environ.get("GITHUB_USER", "").strip()
         repo_slug = f"{user}/{repo_setting}" if user and repo_setting else ""
     if not repo_slug:
-        return "error: GITHUB_REPO not configured (expected owner/repo)"
+        return False, "error: GITHUB_REPO not configured (expected owner/repo)"
     file_path = "docs/evolution.json"
     branch = os.environ.get("GITHUB_BRANCH", "ouroboros")
 
@@ -176,11 +177,11 @@ def _push_to_github(data: dict[str, Any]) -> str:
 
         put_r = session.put(url, headers=headers, json=payload, timeout=15)
     if put_r.status_code in [200, 201]:
-        return f"pushed {len(data.get('points', []))} points to {file_path}"
-    return f"error: {put_r.status_code} — {put_r.text[:200]}"
+        return True, f"pushed {len(data.get('points', []))} points to {file_path}"
+    return False, f"error: {put_r.status_code} — {put_r.text[:200]}"
 
 
-def generate_evolution_stats() -> str:
+def generate_evolution_stats(ctx: Any = None) -> str:
     """Collect git-based evolution metrics and push to docs/evolution.json.
 
     Returns a human-readable summary string.
@@ -198,13 +199,16 @@ def generate_evolution_stats() -> str:
         "points": points,
     }
 
-    result = _push_to_github(data)
+    published, result = _push_to_github(data)
     last = points[-1]
-    return (
+    text = (
         f"evolution_stats: {result} | "
         f"span={points[0]['ts'][:10]}…{last['ts'][:10]} | "
         f"py_lines={last['py_lines']} bible={last['bible_bytes']}B system={last['system_bytes']}B"
     )
+    if not published:
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=text))
+    return text
 
 
 def get_tools():
@@ -230,6 +234,6 @@ def get_tools():
                     "required": [],
                 },
             },
-            lambda ctx, **_: generate_evolution_stats(),
+            lambda ctx, **_: generate_evolution_stats(ctx),
         )
     ]

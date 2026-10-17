@@ -62,6 +62,7 @@ from devtools.benchmarks.common.server_runner import (  # noqa: E402
     seed_owner_state,
 )
 from ouroboros.config import SETTINGS_DEFAULTS  # noqa: E402
+from ouroboros.event_token_totals import event_token_totals  # noqa: E402
 from ouroboros.tool_call_log import CALL_SETTLED, CALL_STARTED, CALL_WAIT_ENDED, logical_calls  # noqa: E402
 from checker import grade_generic  # noqa: E402
 from make_fixtures_v2 import T3_NEW_CMDSTR, T3_NEW_STRIP, T3_NEW_SUDO  # noqa: E402
@@ -371,6 +372,7 @@ def _mine_metrics(data_root: pathlib.Path, task_id: str) -> dict:
              "cache_write_tokens": 0, "cost_usd": 0.0, "llm_calls": 0}
     usage_by_source: dict[str, int] = {}
     seen_usage_rows: set = set()
+    token_rows: list[dict] = []
     for events_file in sorted(set(data_root.rglob("events.jsonl"))):
         for row in _iter_jsonl(events_file):
             if row.get("type") != "llm_usage" or not _matches_task(row, task_id):
@@ -386,10 +388,7 @@ def _mine_metrics(data_root: pathlib.Path, task_id: str) -> dict:
                 continue
             seen_usage_rows.add(key)
             usage["llm_calls"] += 1
-            usage["prompt_tokens"] += int(u.get("prompt_tokens") or 0)
-            usage["completion_tokens"] += int(u.get("completion_tokens") or 0)
-            usage["cached_tokens"] += int(u.get("cached_tokens") or 0)
-            usage["cache_write_tokens"] += int(u.get("cache_write_tokens") or 0)
+            token_rows.append(row)
             src = str(row.get("source") or "?")
             usage_by_source[src] = usage_by_source.get(src, 0) + 1
             try:
@@ -397,6 +396,8 @@ def _mine_metrics(data_root: pathlib.Path, task_id: str) -> dict:
             except (TypeError, ValueError):
                 pass
     usage["calls_by_source"] = usage_by_source
+    usage["token_evidence"] = event_token_totals(token_rows)
+    usage.update({name: evidence["total"] for name, evidence in usage["token_evidence"].items()})
 
     tool_calls: Counter[str] = Counter()
     tool_errors: Counter[str] = Counter()
@@ -479,6 +480,10 @@ def _one_run(server: IsolatedServer, run_root: pathlib.Path, data_root: pathlib.
 
 
 def _summarize(rows: list[dict]) -> dict:
+    def average_tokens(runs: list[dict], name: str) -> int | None:
+        values = [r["usage"].get(name) for r in runs]
+        return None if any(value is None for value in values) else round(sum(values) / len(values))
+
     by_config: dict[str, dict] = {}
     for key in sorted({(r.get("task", "t1_rename"), r["config"]) for r in rows}):
         task_name, config = key
@@ -489,13 +494,23 @@ def _summarize(rows: list[dict]) -> dict:
         for r in sub:
             edit_calls.update(r["edit_tool_calls"])
             edit_errors.update(r["edit_tool_errors"])
+        combined_tokens = event_token_totals([])
+        for r in sub:
+            evidence = r["usage"].get("token_evidence") or event_token_totals([r["usage"]])
+            for name, total in combined_tokens.items():
+                for field in ("known_total", "known_count", "unknown_count", "legacy_zero_count"):
+                    total[field] += evidence[name][field]
+        for total in combined_tokens.values():
+            if total["known_count"] and not (total["unknown_count"] or total["legacy_zero_count"]):
+                total["total"] = total["known_total"]
         by_config[f"{task_name}/{config}"] = {
             "runs": n,
             "pass_rate": round(sum(1 for r in sub if r["pass"]) / n, 2),
             "avg_files_matched": round(sum(r["files_matched"] for r in sub) / n, 1),
             "avg_wall_sec": round(sum(r["wall_sec"] for r in sub) / n, 1),
-            "avg_prompt_tokens": round(sum(r["usage"]["prompt_tokens"] for r in sub) / n),
-            "avg_completion_tokens": round(sum(r["usage"]["completion_tokens"] for r in sub) / n),
+            "avg_prompt_tokens": average_tokens(sub, "prompt_tokens"),
+            "avg_completion_tokens": average_tokens(sub, "completion_tokens"),
+            "token_evidence": combined_tokens,
             "avg_cost_usd": round(sum(r["usage"]["cost_usd"] for r in sub) / n, 4),
             "avg_llm_calls": round(sum(r["usage"]["llm_calls"] for r in sub) / n, 1),
             "edit_tool_calls": dict(edit_calls),

@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import datetime as _dt
 import hashlib
+import io
 import json
 import logging
 import math
@@ -116,40 +117,6 @@ def emit_cognitive_operation_event(
     except Exception:
         log.debug("Failed to emit cognitive operation event", exc_info=True)
 
-
-def emit_main_llm_call_state_event(
-    event_queue: Any,
-    *,
-    task_id: str,
-    task_attempt: Any,
-    llm_call_id: str,
-    execution_id: str,
-    round_id: str,
-    call_attempt: int,
-    phase: str,
-) -> None:
-    """Publish one typed main-LLM in-flight fact to the supervisor.
-
-    This is a direct control-plane event, not a UI ``log_event``.  It has no
-    elapsed-time expiry: the supervisor uses it only to spare the idle rail
-    while the exact call is active; deadline, budget, cancellation, and the
-    absolute task ceiling remain independent hard axes.
-    """
-    if event_queue is None:
-        return
-    try:
-        event_queue.put({
-            "type": "main_llm_call_state",
-            "task_id": str(task_id or ""),
-            "task_attempt": task_attempt,
-            "llm_call_id": str(llm_call_id or ""),
-            "execution_id": str(execution_id or ""),
-            "round_id": str(round_id or ""),
-            "call_attempt": int(call_attempt),
-            "phase": str(phase or ""),
-        })
-    except Exception:
-        log.debug("Failed to emit main LLM call state event", exc_info=True)
 
 def sha256_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -325,7 +292,12 @@ def _write_fd_fully(fd: int, data: bytes, target: pathlib.Path) -> None:
 
 
 def write_bytes_atomic(path: pathlib.Path, content: bytes, *, fsync: bool = False) -> None:
-    """Atomically overwrite ``path`` with exact bytes."""
+    """Atomically overwrite ``path`` with exact bytes.
+
+    A crash leaves the complete old or new file; ``fsync`` is opt-in, so power-loss
+    durability is not promised, and appends are a separate non-atomic contract.
+    Byte-exact: no newline translation on any platform.
+    """
 
     def _write(tmp: pathlib.Path) -> None:
         if not fsync:
@@ -343,28 +315,22 @@ def write_bytes_atomic(path: pathlib.Path, content: bytes, *, fsync: bool = Fals
 
 
 def write_text_atomic(path: pathlib.Path, content: str, *, fsync: bool = False) -> None:
-    """Atomically overwrite ``path`` with ``content`` encoded UTF-8, BYTE-EXACT.
-
-    The file receives exactly ``content.encode("utf-8")`` on every platform:
-    the newlines the caller wrote are the newlines on disk. This is the
-    contract every caller in this tree needs — durable JSON state (through
-    ``atomic_write_json``), receipts, run manifests, projection files, and the
-    agent's own file writes/edits, which round-trip source text that Python
-    reads back with universal newlines.
-
-    It used to be "platform newline semantics": both lanes translated ``\\n``
-    to ``\\r\\n`` on Windows (``Path.write_text`` in text mode, and ``os.open``
-    without ``O_BINARY``). Nothing asked for that translation, while a
-    byte-compared manifest, a hashed receipt and an LF source file the agent
-    merely re-saved were all silently rewritten by it.
-    """
+    """Atomically overwrite ``path`` with ``content`` encoded UTF-8, BYTE-EXACT: the newlines the caller
+    wrote are the newlines on disk on every platform — the contract of durable JSON state (``atomic_write_json``),
+    receipts, run manifests, projection files and the agent's own file writes/edits, which round-trip source
+    text that Python reads back with universal newlines."""
     write_bytes_atomic(pathlib.Path(path), content.encode("utf-8"), fsync=fsync)
+
+
+def machine_json(payload: Any) -> str:
+    """The one compact text of machine JSON state (files and the current store's task bodies)."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
 def atomic_write_json(path: pathlib.Path, payload: Any, *, trailing_newline: bool = False,
                       fsync: bool = False) -> None:
-    """Atomically persist a JSON value (object or list) via a sibling temp file."""
-    content = json.dumps(payload, ensure_ascii=False, indent=2)
+    """Atomically persist ``machine_json``; keep settings.json human-readable."""
+    content = json.dumps(payload, ensure_ascii=False, indent=2) if pathlib.Path(path).name == "settings.json" else machine_json(payload)
     if trailing_newline:
         content += "\n"
     write_text_atomic(pathlib.Path(path), content, fsync=fsync)
@@ -427,7 +393,11 @@ def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0,
 
 
 def read_json_dict(path: pathlib.Path) -> Optional[Dict[str, Any]]:
-    """Return a JSON object from ``path`` or ``None`` when absent/invalid."""
+    """Return a JSON object from ``path`` or ``None`` when absent/invalid.
+
+    ``None`` covers absent, unreadable, invalid and non-object alike; callers
+    wanting a fresh store collapse it to ``{}`` themselves.
+    """
     path = pathlib.Path(path)
     if not path.is_file():
         return None
@@ -447,6 +417,7 @@ def update_json_locked(
     stale_sec: float = 90.0,
     strict_existing_dict: bool = False,
     reject_existing_empty_dict: bool = False,
+    after_write: Any = None,
 ) -> Dict[str, Any]:
     """Locked read-modify-write of a durable JSON dict file.
 
@@ -496,6 +467,8 @@ def update_json_locked(
         if updated is None:
             return current
         atomic_write_json(path, updated)
+        if after_write is not None:
+            after_write(updated)  # still under the writer lock; a crash leaves extra debt
         return updated
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
@@ -541,7 +514,7 @@ def assert_test_data_path(path: pathlib.Path) -> None:
 
 def append_jsonl(
     path: pathlib.Path, obj: Dict[str, Any], *, ensure_record_boundary: bool = False,
-    require_lock: bool = False,
+    require_lock: bool = False, lock_timeout_sec: float = 2.0,
 ) -> bool:
     """Append a JSON object as a line to a JSONL file (concurrent-safe).
 
@@ -551,6 +524,11 @@ def append_jsonl(
     whole-file reconciliation: unlike high-volume observational logs, they may
     not fall back to an unlocked append after lock timeout. Both lanes take the
     shared owner-aware lock primitive, so a live holder is never displaced.
+    ``lock_timeout_sec=0`` takes one attempt without a contention wait, for
+    shutdown callers whose grace has expired; unlocked fallback is unchanged.
+    Runtime ``logs/*.jsonl`` rows are streamed to the ``set_log_sink`` sink, minus
+    types with a dedicated live owner (``WORKER_LOG_SINK_SUPPRESSED_TYPES``, server
+    superset ``SERVER_LOG_SINK_SUPPRESSED_TYPES``): one event, one live frame.
     Returns ``True`` on successful write, ``False`` when all retries
     failed (which is also logged at WARNING). Important events
     (``task_done``, ``llm_round``, escalation messages) need that signal
@@ -577,16 +555,12 @@ def append_jsonl(
     _written = False
 
     try:
-        # ONE lock primitive for both lanes. The unlocked lane used to hand-roll
-        # its own O_CREAT|O_EXCL + age-reclaim loop — the duplicate this module's
-        # own contract tells feature code not to write — and the copy was NOT
-        # owner-aware, so a high-volume appender could delete the lock of a LIVE
-        # holder (the memory-journal compactor rewrites a journal under exactly
-        # this lock). Owner-aware everywhere: a live holder is waited out and the
-        # non-required lane then appends unlocked, exactly as before.
+        # One owner-aware lock primitive for both lanes: a live holder (e.g. the
+        # memory-journal compactor) is waited out, never displaced; the
+        # non-required lane then appends unlocked.
         lock_fd = acquire_exclusive_file_lock(
             lock_path,
-            timeout_sec=2.0,
+            timeout_sec=lock_timeout_sec,
             stale_sec=10.0,
             poll_sec=0.01,
             owner_aware_stale=True,
@@ -660,11 +634,8 @@ def append_jsonl(
         log.warning("append_jsonl: all write attempts failed for %s", path, exc_info=True)
     finally:
         release_exclusive_file_lock(lock_path, lock_fd)
-        # Live-stream only runtime LOG files. chat.jsonl has its own live
-        # channel (the chat frame family), and state/memory/receipt jsonl
-        # stores are durable data, not a log feed — streaming them made every
-        # ledger append a raw WS "log" frame (noise the Logs panel's backfill
-        # never mirrors: it requests events/tools/progress/supervisor only).
+        # Live-stream only runtime LOG files: chat.jsonl has its own live channel,
+        # and state/memory/receipt stores are durable data, not a log feed.
         if (
             _written
             and _log_sink is not None
@@ -681,6 +652,15 @@ def append_jsonl(
     return _written
 
 
+def jsonl_window(handle: Any, size: int, tail_bytes: Optional[int] = None) -> bytes:
+    """The whole lines of the last ``tail_bytes`` of a ``size``-byte file in ONE read (no per-block GIL hand-off)."""
+    if tail_bytes is None or size <= tail_bytes:
+        return handle.read(size)
+    handle.seek(size - tail_bytes - 1)
+    data = handle.read(tail_bytes + 1)
+    return data[data.find(b"\n") + 1:] if b"\n" in data else b""
+
+
 def iter_jsonl_objects(
     path: pathlib.Path,
     max_entries: Optional[int] = None,
@@ -689,19 +669,15 @@ def iter_jsonl_objects(
     gap_reasons: Optional[set[str]] = None,
     _handle: Any = None,  # Internal borrowed stream; its caller owns closing.
 ) -> Iterator[Any]:
-    """Yield parseable JSONL entries; max_entries applies to raw tail lines."""
+    """Yield parseable JSONL entries; max_entries applies to raw tail lines; a tail is one read."""
     path = pathlib.Path(path)
     if (max_entries is not None and max_entries <= 0) or (tail_bytes is not None and tail_bytes <= 0):
         return
     try:
         with (contextlib.nullcontext(_handle) if _handle is not None else path.open("rb")) as handle:
             if tail_bytes is not None:
-                file_size = path.stat().st_size
-                if file_size > tail_bytes:
-                    start = file_size - tail_bytes
-                    handle.seek(start - 1)
-                    if handle.read(1) != b"\n":
-                        handle.readline()
+                handle = io.BytesIO(jsonl_window(handle, os.fstat(handle.fileno()).st_size
+                                                 if _handle is None else path.stat().st_size, tail_bytes))
             if max_entries:
                 # Keep one raw sentinel so callers can distinguish an exact
                 # bounded tail from a suffix. Parsed-object counts cannot prove
@@ -794,6 +770,40 @@ def jsonl_archive_segments(
     return sorted(found)
 
 
+_CLOSED_SEGMENTS: Dict[str, tuple] = {}  # chain path -> (live identity, archive/ mtime, closed segments)
+
+
+def _closed_segments(path: pathlib.Path, live_stat: Any, *, strict: bool) -> List[Tuple[pathlib.Path, Any]]:
+    """A chain's rotated segments with their stats, oldest first, without the live file's alias; a complete
+    listing is reused while the live inode and ``archive/``'s mtime hold, the newest archive re-stat'ed."""
+    try:
+        key = (live_stat.st_dev, live_stat.st_ino, os.stat(path.parent.parent / "archive").st_mtime_ns)
+    except (AttributeError, OSError):
+        key = None
+    if key is not None and (cached := _CLOSED_SEGMENTS.get(str(path))) is not None and cached[0] == key:
+        with contextlib.suppress(OSError):
+            return [*cached[1][:-1], *((segment, segment.stat()) for segment, _stat in cached[1][-1:])]
+    try:  # a listing that skipped anything is never reused
+        segments, complete, closed = jsonl_archive_segments(path, strict=True), True, []
+    except JsonlChainUnreadable:
+        if strict:
+            raise
+        segments, complete, closed = [], False, []
+    for segment in segments:
+        try:
+            stat = segment.stat()
+        except OSError as exc:
+            if strict and not isinstance(exc, FileNotFoundError):
+                raise JsonlChainUnreadable(f"cannot stat {segment}: {exc}") from exc
+            complete = False
+            continue
+        if key is None or (stat.st_dev, stat.st_ino) != key[:2]:
+            closed.append((segment, stat))
+    if key is not None and complete:
+        _CLOSED_SEGMENTS[str(path)] = (key, tuple(closed))
+    return closed
+
+
 @contextlib.contextmanager
 def jsonl_chain_handles(
     path: pathlib.Path, *, strict: bool = False,
@@ -851,15 +861,8 @@ def jsonl_chain_handles(
                     raise JsonlChainUnreadable(f"cannot open or stat {path}: {exc}") from exc
                 live_stat = None
             entries, ends, total = [], [], 0
-            for segment in [*jsonl_archive_segments(path, strict=strict), path]:
-                try:
-                    stat = live_stat if segment == path else segment.stat()
-                except OSError as exc:
-                    if strict and not isinstance(exc, FileNotFoundError):
-                        raise JsonlChainUnreadable(f"cannot stat {segment}: {exc}") from exc
-                    continue
-                if stat is None or (segment != path and live_stat is not None
-                        and (stat.st_dev, stat.st_ino) == (live_stat.st_dev, live_stat.st_ino)):
+            for segment, stat in [*_closed_segments(path, live_stat, strict=strict), (path, live_stat)]:
+                if stat is None:
                     continue
                 total += stat.st_size
                 entries.append([segment, stat, segment == path])

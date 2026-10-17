@@ -7,6 +7,7 @@ import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
 from tests.test_batch4_repair_compositions import _running
+from tests._store_shared import delete_result, result_exists, result_signature, seed_result
 
 pytestmark = pytest.mark.serial
 
@@ -103,7 +104,10 @@ def test_pause_during_process_preparation_prevents_process_start(tmp_path, monke
         args['name'] = 'held'
     result = registry.execute_result('start_service' if service else 'run_command', args)
     assert not marker.exists(), result
-    assert result.code == 'OWNER_PAUSE_NOT_STARTED', result
+    # The process was not launched, but its tool handler/preparation did run.
+    assert result.code == 'OWNER_OPERATION_REFUSED', result
+    assert result.meta['owner_pause_not_started'] is False
+    assert result.meta.get('operation_outcome') != 'completed_no_effect'
     assert not load_task_result(tmp_path, 'root').get('launch_handoffs')
 
 
@@ -133,7 +137,7 @@ def test_exact_consumer_retirement_releases_writer_not_cash(tmp_path, monkeypatc
             write_task_result(tmp_path, 'root', 'failed', reason_code='provider_unavailable')
             assert any(b['kind'] == 'model_handoff' for b in conflicting_writers(q, 'root'))
             if retirement == 'write_failed':
-                monkeypatch.setattr(model_wait, 'update_json_locked', lambda *_a, **_k: (_ for _ in ()).throw(OSError('disk')))
+                monkeypatch.setattr(model_wait, 'put_handoffs', lambda *_a, **_k: (_ for _ in ()).throw(OSError('disk')))
         row = load_task_result(tmp_path, 'root')
         retired = row.get('retired_model_consumers', {})
         if retirement in {'other_consumer', 'other_attempt', 'missing'}:
@@ -187,42 +191,39 @@ def test_worker_crash_is_continuable_but_owner_stop_stays_final(tmp_path, monkey
 
 @pytest.mark.parametrize("existing", [False, True])
 def test_standalone_registry_does_not_create_inadmissible_authority(tmp_path, existing):
-    import json
     from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.task_results import task_result_path
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = registry._ctx.root_task_id = "standalone"
-    path = task_result_path(tmp_path, "standalone")
     if existing:
-        path.write_text(json.dumps({"task_id": "standalone", "owner_pause": {"state": "requested"}}))
-        original = path.read_bytes()
+        seed_result(tmp_path, "standalone", {"task_id": "standalone", "owner_pause": {"state": "requested"}})
+        original = result_signature(tmp_path, "standalone")
     for _ in range(2):
         result = registry.execute_result("knowledge_read", {"not_an_argument": 1})
         assert result.code == ("OWNER_PAUSE_NOT_STARTED" if existing else "TOOL_ARG_ERROR")
     if existing:
-        assert path.read_bytes() == original
+        assert result_signature(tmp_path, "standalone") == original
     else:
-        assert not path.exists()
+        assert not result_exists(tmp_path, "standalone")
 
 
 def test_bound_tool_authority_loss_is_not_a_standalone_operation(tmp_path):
     from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     registry._ctx.task_id = 'managed'
     registry._ctx.task_lifecycle_bound = True
     for existed in (False, True):
         if existed:
             write_task_result(tmp_path, 'managed', 'running')
-            task_result_path(tmp_path, 'managed').unlink()
+            delete_result(tmp_path, 'managed')
         result = registry.execute_result('knowledge_read', {'not_an_argument': 1})
         assert result.code == 'OWNER_PAUSE_NOT_STARTED'
-        assert not task_result_path(tmp_path, 'managed').exists()
+        assert not result_exists(tmp_path, 'managed')
 
 
 def test_child_tool_reads_canonical_metadata_root_fence(tmp_path):
     from ouroboros.tools.registry import ToolRegistry
-    from ouroboros.task_results import write_task_result, task_result_path
+    from ouroboros.task_results import write_task_result
     from ouroboros.owner_pause import install_fence
     canonical, fork = tmp_path / 'canonical', tmp_path / 'fork'
     write_task_result(canonical, 'root', 'running')
@@ -234,19 +235,18 @@ def test_child_tool_reads_canonical_metadata_root_fence(tmp_path):
     registry._ctx.task_metadata = {'root_task_id': 'root', 'budget_drive_root': str(canonical)}
     result = registry.execute_result('knowledge_read', {'not_an_argument': 1})
     assert result.meta['control_reason'] == 'owner_pause'
-    assert not task_result_path(fork, 'child').exists()
+    assert not result_exists(fork, 'child')
 
 
 @pytest.mark.parametrize('projection', ['model', 'owner', 'budget'])
 def test_projection_writers_cannot_manufacture_lifecycle_authority(tmp_path, projection):
     from ouroboros import model_wait, owner_wait, budget_pause
-    from ouroboros.task_results import task_result_path
     call = {'model': lambda: model_wait.mutate_wait(tmp_path, 'missing', 'wait', lambda _: {'state': 'waiting'}),
             'owner': lambda: owner_wait.set_owner_wait(tmp_path, 'missing', {'state': 'waiting'}),
             'budget': lambda: budget_pause.set_budget_pause(tmp_path, 'missing', {'state': 'pausing'})}[projection]
     with pytest.raises(ValueError, match="lifecycle owner"):
         call()
-    assert not task_result_path(tmp_path, 'missing').exists()
+    assert not result_exists(tmp_path, 'missing')
 
 
 def test_retired_answer_consumer_cannot_start_a_late_tool(tmp_path):
@@ -282,7 +282,7 @@ def test_authority_lock_unavailability_is_unsent_infrastructure_not_owner_pause(
     @contextmanager
     def recovered(*_a, **_k):
         if len(checks) == 1:
-            raise owner_pause.OwnerPauseRefused('owner_launch_authority_unavailable')
+            raise owner_pause.LaunchBusy('contention')
         yield
     monkeypatch.setattr(owner_pause, 'launch_admission', recovered)
     error = model_wait.ModelWaitInterrupted('owner_launch_authority_unavailable')
@@ -320,13 +320,13 @@ def test_enqueue_snapshot_and_first_reservation_keep_original_billing_without_li
 def test_focused_node_control_consumers():
     import pathlib
     import shutil
-    import subprocess
+    from tests.group_run import run_in_group
     root = pathlib.Path(__file__).resolve().parents[1]
     node = shutil.which('node')
     assert node, 'focused frontend verification requires the provided Node runtime'
-    result = subprocess.run([node, '--test', 'web/tests/task_continue.test.js',
-                             'web/tests/chat_activity_block.test.js', 'web/tests/activity_schedule_time.test.js'],
-                            cwd=root, capture_output=True, text=True, timeout=60)
+    result = run_in_group([node, '--test', 'web/tests/task_continue.test.js',
+                           'web/tests/chat_activity_block.test.js', 'web/tests/activity_schedule_time.test.js'],
+                          cwd=root, timeout=60)
     print(result.stdout)
     assert result.returncode == 0, result.stdout + result.stderr
 

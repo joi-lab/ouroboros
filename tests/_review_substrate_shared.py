@@ -20,3 +20,10 @@ class FakeLLM:
             "summary": f"reviewed by {kwargs['model']}",
         }
         return {"content": json.dumps(body)}, {"prompt_tokens": 10, "completion_tokens": 5}
+
+
+def user_text(content):
+    """A request message's content as text — cache-block lists and plain strings alike."""
+    if isinstance(content, list):
+        return "".join(str(block.get("text") or "") for block in content if isinstance(block, dict))
+    return str(content or "")

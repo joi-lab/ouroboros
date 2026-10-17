@@ -1,4 +1,4 @@
-"""A transport timeout leaves remote effects unknown until a server-specific read."""
+"""Timeout projections distinguish clean unsent preparation from unknown effects."""
 
 from __future__ import annotations
 
@@ -47,12 +47,15 @@ def test_timeout_disclosure_survives_registry_and_status_read(
     """Use real client wait/cancel and registry dispatch; only the peer is controlled."""
     calls = []
     effects = []
-    closed_sessions = []
+    closed_sessions, closed_transports = [], []
     first_session = True
 
     @asynccontextmanager
     async def transport(_cfg):
-        yield None, None
+        try:
+            yield None, None
+        finally:
+            closed_transports.append(True)
 
     class Session:
         def __init__(self, *_streams):
@@ -94,19 +97,25 @@ def test_timeout_disclosure_survives_registry_and_status_read(
         text = result.text
     else:
         text = registry.execute("mcp_controlled__apply", args)
-    _assert_unknown(text)
+    if timeout_phase == "initialize":
+        assert "The tool call was not submitted" in text
+        assert "session and transport have closed" in text
+    else:
+        _assert_unknown(text)
+    if projection == "typed":
+        assert result.meta.get("mcp_call_not_sent") is (timeout_phase == "initialize")
     assert "reconcile" in TOOL_CODE_SPECS["MCP_TIMEOUT"].recovery
     expected = ["op-667"] if timeout_phase == "after_effect" else []
     assert effects == expected
     assert len(calls) == len(expected)  # No implicit replay after timeout.
-    assert closed_sessions == [True]  # Local close is not a remote cancel receipt.
+    assert closed_sessions == closed_transports == [True]  # Local close is not a remote cancel receipt.
 
     status = registry.execute_result("mcp_controlled__status", args)
     assert (status.status, status.code) == ("ok", "OK")
     assert status.text.endswith(json.dumps(expected))
     assert calls[-1] == ("status", args)
     assert effects == expected
-    assert closed_sessions == [True, False]
+    assert closed_sessions == [True, False] and closed_transports == [True, True]
 
 
 def test_real_stdio_effect_before_timeout_is_reconciled_by_status_read(tmp_path, registry):

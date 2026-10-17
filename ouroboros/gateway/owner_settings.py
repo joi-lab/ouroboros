@@ -8,7 +8,9 @@ auto-grant, context mode, safety mode, desktop keep-running), and the atomic
 ``_owner_write_settings`` with a whole document — not by wearing the decorator:
 the capability-evidence acknowledgement writes its own route-fingerprinted
 ledger and never touches settings.json, so it is NOT one of these and holds no
-settings lock. Four
+settings lock. Incidental writers outside those endpoints (the launcher's confirmed
+decisions, the agent's ``set_tool_timeout``) pass ``fields_on_saved_document``: their
+named fields land and nothing else, so they author no runtime mode they did not name. Four
 invariants live in this module because each of them was previously
 re-implemented (or silently skipped) per call site:
 
@@ -78,6 +80,9 @@ class SettingsDocumentBusy(TimeoutError):
     A writer wedged inside its hot-reload side effects would otherwise hold
     every later writer forever — the onboarding save among them ("Saving..."
     with nothing ever written). Typed so the endpoints answer it honestly.
+
+    The bound refuses the waiting writer; it never interrupts the holder, which
+    keeps the lock until its body ends.
     """
 
 
@@ -236,7 +241,7 @@ def settings_document_digest() -> str:
         return f"unreadable:{type(exc).__name__}:{uuid4()}"
 
 
-def _owner_read_settings_raw() -> Dict[str, Any]:
+def _owner_read_settings_raw(document_out: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Read settings for owner endpoints without applying runtime-mode ratchets.
 
     "Raw" is about the RATCHETS, never about the migrations: the document is normalized
@@ -248,23 +253,54 @@ def _owner_read_settings_raw() -> Dict[str, Any]:
     again. The READ is the loader's too: one verified primitive, so a pinned benchmark
     snapshot that changed refuses this reader exactly as it refuses ``load_settings``
     instead of serving the unverified file as defaults-with-a-document. Only the
-    ratchets and the one-window context-pair persistence are skipped here."""
+    ratchets and the one-window context-pair persistence are skipped here. ``document_out``
+    receives the normalized document alone: what the owner has authored, no defaults."""
     from ouroboros import config as _config
 
     # An existing (even unreadable) document keeps the optional bounds it ran under.
     merged = _defaults_for_settings_document(_config.SETTINGS_PATH.exists())
+    document: Dict[str, Any] = {}
     try:
         raw = read_settings_json_verified(_config.SETTINGS_PATH)
         if isinstance(raw, dict):
             raw = normalize_context_mode_compat(
                 raw, settings_path=_config.SETTINGS_PATH, warn_ambiguous=True,
             )
-            merged.update(_config.normalize_settings_raw(raw))
+            document = _config.normalize_settings_raw(raw)
     except SettingsIntegrityError:
         raise
     except Exception:
         log.debug("Failed to read raw owner settings; using defaults", exc_info=True)
+    if document_out is not None:
+        document_out.update(document)
+    merged.update(_config.normalize_effort_document(document))
     return merged
+
+
+def _owner_settings_document() -> Dict[str, Any]:
+    """The normalized settings document alone (what the owner authored, no defaults)."""
+    document: Dict[str, Any] = {}
+    _owner_read_settings_raw(document_out=document)
+    return document
+
+
+def fields_on_saved_document(changes: Dict[str, Any]) -> Callable[[Dict[str, Any]], Dict[str, Any]]:
+    """The ``_owner_update_settings`` transform of an incidental writer: exactly ``changes`` land on
+    the document as it is on disk inside that lock. Nothing the merged read shows is authored beside
+    them (a default, an environment value, an unauthored proposal) and every saved value stays as the
+    read translates it, a pending next-boot runtime mode included, so the ratchets meet only unchanged
+    values. A document this creates carries the optional bounds as they resolve now, because a
+    document's presence turns their absence into the legacy finite value
+    (``settings_scales.defaults_for_settings_document``)."""
+    def land(_read: Dict[str, Any]) -> Dict[str, Any]:
+        from ouroboros import config as _config
+        from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY
+
+        if _config.SETTINGS_PATH.exists():
+            return {**_owner_settings_document(), **changes}
+        effective = _config.load_settings_lock_held()
+        return {**{key: effective[key] for key in OPTIONAL_BOUND_LEGACY}, **changes}
+    return land
 
 
 def _owner_write_settings(
@@ -300,6 +336,7 @@ def _owner_write_settings(
         allow_safety_lowering=allow_safety_lowering,
         precondition=precondition,
         boundary=boundary,
+        whole_document=True,
     )
 
 
@@ -318,6 +355,7 @@ def _owner_update_settings(
     allow_safety_lowering: bool = False,
     precondition: Optional[Callable[[], str]] = None,
     boundary: Optional[CommitBoundary] = None,
+    whole_document: bool = False,
 ) -> None:
     """Read, change and persist ONE settings document inside ONE settings lock.
 
@@ -344,7 +382,10 @@ def _owner_update_settings(
     ``SettingsLockUnavailable`` before anything is read, checked or written), the
     persistence prologue (`config.prepare_settings_for_persist`, which proves the
     context/safety ratchets against the value ON DISK) runs while that lock is held rather
-    than before it, and ``boundary`` flips the instant the bytes land."""
+    than before it, and ``boundary`` flips the instant the bytes land. A model slot the document
+    never authored and the transform left as read is not written (``unedited_unauthored_slots``),
+    unless the caller names it in ``authored_keys`` (a wait card's explicit choice, default-equal
+    included) or hands over a ``whole_document`` it authored (Settings save, onboarding)."""
     from ouroboros import config as _config
 
     _config._guard_live_settings_write()
@@ -362,13 +403,21 @@ def _owner_update_settings(
             refusal = str(precondition() or "")
             if refusal:
                 raise SettingsPreconditionFailed(refusal)
-        proposed = transform(_owner_read_settings_raw())
+        document: Dict[str, Any] = {}
+        current = _owner_read_settings_raw(document_out=document)
+        shown = dict(current)
+        proposed = transform(current)
         if proposed is None:
             return
         to_write = _config.prepare_settings_for_persist(
             dict(proposed), authored_keys=authored_keys,
             allow_context_lowering=allow_context_lowering,
             allow_safety_lowering=allow_safety_lowering)
+        if not whole_document:
+            from ouroboros.server_runtime import unedited_unauthored_slots
+
+            for key in unedited_unauthored_slots(document, to_write, shown) - set(authored_keys):
+                to_write.pop(key, None)
         write_text_atomic(_config.SETTINGS_PATH, _config.serialize_settings(to_write))
         if boundary is not None:
             boundary.commit()
@@ -386,7 +435,9 @@ __all__ = [
     "_owner_audit",
     "owner_audit",
     "_owner_read_settings_raw",
+    "_owner_settings_document",
     "_owner_update_settings",
+    "fields_on_saved_document",
     "_owner_write_settings",
     "owner_write_guard",
     "post_commit_failure_response",

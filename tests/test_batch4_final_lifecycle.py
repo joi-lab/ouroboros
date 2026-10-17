@@ -6,6 +6,7 @@ import pytest
 from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx
 from tests.test_batch4_repair_compositions import _running
 from tests.test_budget_pause_holds import _idle_worker
+from tests._store_shared import unreadable_result
 
 pytestmark = pytest.mark.serial
 
@@ -61,8 +62,8 @@ def test_child_writer_sleep_hold_is_typed_and_retries_after_settlement(tmp_path,
     ctx, limit = _loop_ctx(tmp_path, "root")
     ctx._model_sleep = {"sleep_id": "s", "mode": "cold", **model_sleep.selectors(ctx, wake_after_sec=3600)}
     original, census, holds = model_sleep.cold_blockers, [], []
-    def initial_census(source):
-        blockers = original(source)
+    def initial_census(source, **kwargs):
+        blockers = original(source, **kwargs)
         census.append(blockers)
         if len(census) == 1:
             write_task_result(tmp_path, "child", "scheduled", launch_handoffs={"external": {"tool": "opaque"}})
@@ -86,18 +87,16 @@ def test_child_writer_sleep_hold_is_typed_and_retries_after_settlement(tmp_path,
 
 def test_malformed_member_sleep_authority_is_typed_and_not_owner_intent(tmp_path, monkeypatch):
     from ouroboros import owner_pause
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
 
     _install_queue(tmp_path, monkeypatch)
     write_task_result(tmp_path, "root", "running", root_task_id="root")
     write_task_result(tmp_path, "child", "running", root_task_id="root")
-    path = task_result_path(tmp_path, "child")
-    path.write_text("{malformed", encoding="utf-8")
+    unreadable_result(monkeypatch, "child")
     source = SimpleNamespace(task_id="child", root_task_id="root", budget_drive_root=tmp_path)
     with pytest.raises(owner_pause.OwnerPauseRefused, match="model_sleep_authority_unreadable"):
         with owner_pause.launch_admission(source):
             pytest.fail("unreadable authority must not dispatch")
-    assert path.read_text() == "{malformed"
     assert not owner_pause.read_fence(tmp_path, "root")
     from ouroboros.tools.registry import ToolRegistry
     registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
@@ -108,7 +107,7 @@ def test_malformed_member_sleep_authority_is_typed_and_not_owner_intent(tmp_path
     # sleep authority, and the text never attributes the refusal to an owner Pause.
     assert "authority could not be read" in result.text
     assert "(model_sleep_authority_unreadable)" in result.text and "the owner paused" not in result.text
-    assert not owner_pause.read_fence(tmp_path, "root") and path.read_text() == "{malformed"
+    assert not owner_pause.read_fence(tmp_path, "root")
 
 
 @pytest.mark.parametrize("cause,expected", [

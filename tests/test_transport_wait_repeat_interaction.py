@@ -1,23 +1,9 @@
-"""Cross-phase contracts of the two transport rails.
+"""Paced transport recovery and retained legacy repeat-custody precedence.
 
-The free wait episode (a released pre-dispatch failure, $0, ``transport_unavailable``)
-and the paid repeat rail (a dispatched typed transport death, ``provider_outcome_unknown``)
-never overlap, and while the round holds a repeat record that record outranks the
-wait terminal:
-
-- a dispatched death on an inline Presence turn (the one caller that keeps the
-  repeat rail) takes the repeat rail and never opens a wait episode;
-- configured alternatives run before waiting and after paced failed redials;
-  an unresolved Presence repeat record blocks them throughout;
-- an episode exhausted on a round that still holds a repeat record ends on the
-  record's source, worded as both the wait and the unresolved attempt — and that
-  wording names the class the repeat was RELEASED with (it rides the round record,
-  so the generic no-call terminal names it too), never the later refusal that
-  closed the window or the later free redial's own class;
-- the terminal precedence is decided once, at the provider-death rail: a round
-  record outranks the latched wait cause, which outranks the overflow salvage —
-  so the ``context_overflow`` a failed route walk leaves behind never turns a
-  waited-out outage into the overflow terminal.
+Production Presence uses the ordinary round recovery. A historical repeat record
+still outranks wait and overflow terminal causes and never authorizes a new paid
+fallback; fixtures name that retained record explicitly instead of recreating the
+retired Presence-specific repeat policy.
 """
 
 from __future__ import annotations
@@ -47,6 +33,22 @@ from tests.test_transport_death_retry import (
 )
 
 
+def _held_repeat(kwargs):
+    """A retained round with one unresolved explicit repeat, before its next free redial."""
+    registry, model = kwargs["tools"], kwargs["llm"]
+    original = model.chat
+    seeded = False
+    def send(**options):
+        nonlocal seeded
+        if not seeded:
+            usage = registry._ctx._accumulated_usage
+            usage[TRANSPORT_DEATHS_KEY] = {"round_id": f"{usage['execution_id']}:round:1",
+                "count": 1, "backoff_sec": 4.0, "error_kind": "transport_unavailable"}
+            seeded = True
+        return original(**options)
+    model.chat = send
+
+
 def _failing_walk(walks):
     """A configured-route walk that finds no answer and records the kind it was entered with."""
     def chain(**kwargs):
@@ -65,44 +67,28 @@ def no_sleep(monkeypatch):
     return sleeps
 
 
-@pytest.mark.parametrize("turn_flag", ["presence"])
-@pytest.mark.parametrize("deaths", [2, 3])
-def test_interactive_turn_death_takes_the_repeat_rail_and_never_enters_a_wait_episode(
-    tmp_path, monkeypatch, no_sleep, turn_flag, deaths,
+@pytest.mark.parametrize("deaths", [1, 2])
+def test_presence_unknown_uses_paced_recovery_without_paid_repeat_counter(
+    tmp_path, monkeypatch, no_sleep, deaths,
 ):
-    """An inline Presence turn whose DISPATCHED request died with a typed
-    transport death is on the paid repeat rail (its round dispatch is primary),
-    never in the free wait episode: `provider_outcome_unknown` is not the
-    episode's `transport_unavailable`, so no `network_wait` event exists, the
-    interactive idle bound never starts, and an exhausted round ends on the
-    unknown no-resend terminal, not on the wait window's."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
-    monkeypatch.setattr(
-        loop_transport, "interruptible_wait_sleep",
-        lambda _sec, _wake: pytest.fail("a dispatched death must never open a wait episode"),
-    )
+    """Raw HTTP losses use the same paced continuation as ordinary turns."""
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
+    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACKS", raising=False)
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable",
+                        lambda *_a, **_kw: {"kind": "upstream_http", "status_code": 200})
+    clock = _FakeClock(monkeypatch)
     llm = _ScriptedLLM(*([_death] * deaths))
-    notes = []
-    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))
-    result, usage, trace = run_llm_loop(**kwargs)
+    result, usage, _trace = run_llm_loop(**_presence_turn(_loop_kwargs(tmp_path, llm, [])))
+    assert result == "done" and llm.calls == deaths + 1
+    assert no_sleep == [] and len(clock.sleeps) == deaths
+    assert clock.sleeps == [4.0, 8.0][:deaths]
+    assert TRANSPORT_DEATHS_KEY not in usage
+    assert usage["transport_recovery"]["old_outcome"] == "unknown"
+    events = _events(tmp_path, "network_wait")
+    assert len([row for row in events if row["phase"] == "entered"]) == 1
+    assert events[-1]["phase"] == "recovered"
 
-    assert llm.calls == 3  # the primary send plus two paid repeats
-    assert no_sleep == [4.0, 8.0]  # the repeat rail's backoffs, never the episode's wait
-    assert _events(tmp_path, "network_wait") == []
-    assert not any("provider connection" in note.lower() for note in notes)
-    if deaths == 2:
-        assert result == "done"
-        assert usage.get("reason_code") is None
-        assert TRANSPORT_DEATHS_KEY not in usage
-    else:
-        assert usage.get("execution_status") == "infra_failed"
-        assert trace.get("forced_finalization", {}).get("source") == "provider_outcome_unknown_no_resend"
-        assert usage[TRANSPORT_DEATHS_KEY]["count"] == 2
-        assert "2 earlier physical attempt(s) of the last dispatched round" in result
-        assert "waited and redialed" not in result and "no wait window" not in result
 
 
 @pytest.mark.parametrize("turn,with_record", [
@@ -128,7 +114,7 @@ def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unk
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    script = ([_death] if with_record else []) + [_released_connect] * 12
+    script = [_released_connect] * 12
     llm = _ScriptedLLM(*script)
     notes = []
     kwargs = _loop_kwargs(tmp_path, llm, notes)
@@ -137,15 +123,17 @@ def test_wait_episode_exhausted_on_a_round_holding_a_repeat_record_takes_the_unk
         kwargs["tools"]._ctx.task_metadata = {"deadline_at": deadline.isoformat()}
     else:
         _presence_turn(kwargs)
+    if with_record:
+        _held_repeat(kwargs)
     result, usage, trace = run_llm_loop(**kwargs)
-    # Each failed redial may revisit alternatives; an unresolved Presence repeat never may.
+    # Each failed redial may revisit alternatives; a retained repeat record never may.
     if with_record:
         assert walks == []
     else:
         assert len(walks) > 1 and set(walks) == {"transport_unavailable"}
 
-    assert (3 if with_record else 2) <= llm.calls <= len(script)  # the episode ended; the turn never recovered
-    assert no_sleep == ([4.0] if with_record else [])  # one repeat backoff; released redials never re-arm it
+    assert 2 <= llm.calls <= len(script)  # the episode ended; the turn never recovered
+    assert no_sleep == []  # only free redials follow the retained record
     ended = [row["detail"] for row in _events(tmp_path, "network_wait") if row["phase"] == "ended"]
     assert ended == ["deadline_after_final_redial" if turn == "managed" else "interactive_wait_window_exhausted"]
     assert usage["execution_status"] == "infra_failed"
@@ -188,9 +176,10 @@ def test_deadline_refused_redial_still_names_the_class_the_repeat_was_released_w
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, _released_connect, _released_connect)
+    llm = _ScriptedLLM(_released_connect, _released_connect)
     notes = []
-    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))  # Inline Presence alone keeps the paid-repeat rail.
+    kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))
+    _held_repeat(kwargs)
     # Room for the grant (backoff 4 s + the admission reserve) and for one wait.
     metadata = {"deadline_at": (
         datetime.now(timezone.utc) + timedelta(seconds=get_finalization_grace_sec() + 8)
@@ -206,8 +195,8 @@ def test_deadline_refused_redial_still_names_the_class_the_repeat_was_released_w
     monkeypatch.setattr(loop_transport, "interruptible_wait_sleep", _window_closes_while_waiting)
     result, usage, trace = run_llm_loop(**kwargs)
 
-    assert llm.calls == 2  # the primary send and its granted repeat; the redial never dispatched
-    assert no_sleep == [4.0] and len(clock.sleeps) == 1
+    assert llm.calls == 1  # the free attempt released; the next redial never dispatched
+    assert no_sleep == [] and len(clock.sleeps) == 1
     assert [row["reason_code"] for row in _events(tmp_path, "llm_not_dispatched")] == ["deadline_exhausted"]
     ended = [row["detail"] for row in _events(tmp_path, "network_wait") if row["phase"] == "ended"]
     assert ended == ["deadline_refused_dispatch"]
@@ -232,13 +221,14 @@ def test_generic_terminal_names_the_class_the_repeat_was_released_with(tmp_path,
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "other/model")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
-    llm = _ScriptedLLM(_death, _released_connect, lambda: _status_failure(400))
+    llm = _ScriptedLLM(_released_connect, lambda: _status_failure(400))
     notes = []
     kwargs = _presence_turn(_loop_kwargs(tmp_path, llm, notes))
+    _held_repeat(kwargs)
     result, usage, trace = run_llm_loop(**kwargs)
 
-    assert llm.calls == 3  # the primary send, its released repeat, one free redial
-    assert no_sleep == [4.0]
+    assert llm.calls == 2  # released attempt, then one free redial
+    assert no_sleep == []
     ended = [row["detail"] for row in _events(tmp_path, "network_wait") if row["phase"] == "ended"]
     assert ended == ["error_kind_changed:bad_request"]
     assert usage["_last_llm_error_kind"] == "bad_request"  # the free redial's class stays the sticky kind
@@ -270,7 +260,8 @@ def test_fallback_chain_fence_holds_inside_a_wait_episode_too(monkeypatch):
     rejoinable = {"_pending_transport_outcome": {"same_operation_recoverable": True}}
     assert loop_transport.fallback_chain_allowed(routable, "provider_outcome_unknown", None, rejoinable) is False
     presence = SimpleNamespace(exact_model_route=False, task_id="t", current_task_type="presence")
-    assert loop_transport.fallback_chain_allowed(presence, "provider_outcome_unknown", None, {}) is False
+    assert loop_transport.fallback_chain_allowed(presence, "provider_outcome_unknown", None, {}) is True
+    assert not loop_transport.fallback_chain_allowed(presence, "provider_outcome_unknown", None, rejoinable)
     assert loop_transport.fallback_chain_allowed(presence, "transport_unavailable", None, {}) is True
     assert not hasattr(episode, "local_pass_used")
 
@@ -350,7 +341,7 @@ def test_latched_wait_cause_outranks_the_overflow_a_failed_local_pass_left(tmp_p
         interactive=turn != "managed", is_deadline_exhausted=False,
     )
     assert result == base  # byte-identical zero-wait outage wording
-    assert "Could not establish a provider connection" in result
+    assert "The request did not reach the provider" in result
     assert "context exceeded" not in result
     # The published projection says what the terminal said: no overflow kind under the wait terminal's reason code.
     assert derive_loop_outcome(result, usage, trace)["failure"] == {"kind": "provider", "reason_code": "provider_unavailable"}
@@ -358,11 +349,13 @@ def test_latched_wait_cause_outranks_the_overflow_a_failed_local_pass_left(tmp_p
 
 def test_context_overflow_with_no_episode_keeps_the_overflow_salvage(tmp_path, monkeypatch):
     """Control for the precedence: a primary dispatch rejected as a context
-    overflow with NO wait episode never walks the chain (a local fallback being
-    configured changes nothing) and keeps the overflow terminal unchanged —
-    source ``context_overflow_local_salvage``, ``llm_api_error``, the window
-    wording."""
-    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _no_chain)
+    overflow with NO wait episode walks the configured routes exactly once after
+    the primary's own recovery ladder (owner decision 7A, rung f: the candidates
+    inherit the view the ladder left) and, when that walk finds no answer, keeps
+    the overflow terminal unchanged — source ``context_overflow_local_salvage``,
+    ``llm_api_error``, the window wording."""
+    walks = []
+    monkeypatch.setattr(loop_mod, "_run_cross_model_fallback_chain", _failing_walk(walks))
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", "local/candidate")
     monkeypatch.setenv("USE_LOCAL_FALLBACK", "1")
@@ -370,7 +363,7 @@ def test_context_overflow_with_no_episode_keeps_the_overflow_salvage(tmp_path, m
     notes = []
     result, usage, trace = run_llm_loop(**_loop_kwargs(tmp_path, llm, notes))
 
-    assert llm.calls == 1
+    assert llm.calls == 1 and walks == ["context_overflow"]  # one walk, entered with the refusal's own kind
     assert _events(tmp_path, "network_wait") == []
     assert usage["_last_llm_error_kind"] == "context_overflow"
     assert usage["execution_status"] == "infra_failed"

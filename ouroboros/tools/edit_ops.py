@@ -1,35 +1,37 @@
-"""Advanced repo editing tools: apply_patch and edit_batch.
+"""Advanced editing tools: apply_patch and edit_batch.
 
 Two editing primitives beyond exact-match ``edit_text`` and full-file
 ``write_file``:
 
 - ``apply_patch``  — context-anchored multi-file diff (V4A-style, no line
-  numbers): hunks locate themselves by surrounding lines plus optional ``@@``
-  anchors. Atomic VALIDATION across all files/hunks: any unmatched hunk aborts
-  the whole patch before a single byte is written, with per-hunk diagnostics.
+  numbers): every hunk is placed against the whole original file by its exact
+  context (else ignoring trailing whitespace only) plus optional ``@@``
+  anchors, and the placement must be unique. Indentation is never adapted.
 - ``edit_batch``   — batch of COUNTED exact replacements, validated as a whole.
   Each edit declares how many occurrences it expects (default 1); a count
   mismatch aborts the whole batch before anything is written. This is the safe
-  form of "replace all".
+  form of "replace all". ``edit_text`` with ``edits`` reuses it for one file.
 
 Atomicity is over VALIDATION, not the write phase: nothing is written until every
 file, hunk and count resolves, but the writes themselves are a per-file sequence,
 so a mid-write I/O fault can leave earlier files applied. That case discloses
-itself (``EDIT_OPS_PARTIAL_WRITE_FAILED``), names the written files and marks the
-advisory snapshot stale.
+itself (``EDIT_OPS_PARTIAL_WRITE_FAILED``) with the written, failed and
+not-attempted files, and marks the advisory snapshot stale. An explicit
+``Delete File`` first stores the file's exact current bytes as an immutable
+task artifact; a failed capture refuses the patch before any effect.
 
-Both target the repo lanes only (active_workspace / system_repo) and reuse the
-same guard chain as ``edit_text``: path canonicalization FIRST (see
-``_resolve_edit_target`` — a guard that judges a different spelling than the
-write uses is not a guard), then root access, protected artifact paths,
-project-room write guard, protected runtime paths. Because their paths ride
-inside the payload rather than a ``path`` arg, the dispatch gates in
+Both target the seven writable roots of ``edit_text`` and reuse the same physical
+target binding and write policy (``_edit_mutation_block``): a guard that judges
+a different spelling than the write uses is not a guard. Because their paths
+ride inside the payload rather than a ``path`` arg, the dispatch gates in
 ``registry.py`` read them back out through ``_payload_write_paths`` so the
-acting-subagent and protected-write fences apply identically.
+acting-subagent and protected-write fences apply identically. A final Python or
+JSON parse failure on a repo lane is reported after the write, never a refusal.
 
 ``locate_edit_miss`` is the one bounded diagnosis all three exact editors attach
 when their needle is not in the file (edit_text through ``core._str_match_replace``):
 the closest region, the first differing line and the ``read_file`` window to copy from.
+Matching splits on LF; every line number shown is ``read_file``'s.
 
 (An ``edit_sketch`` fast-apply tool — strong-model sketch merged by the cheap
 LIGHT model — lived here through the editbench evaluation and was removed: the
@@ -49,10 +51,12 @@ lane-wide newline contract is not this module's to change.
 
 from __future__ import annotations
 
+import bisect
 import difflib
 import json
 import logging
 import pathlib
+import re
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,11 +65,8 @@ from ouroboros.tools.arg_feedback import payload_item_feedback, with_argument_no
 from ouroboros.config import get_runtime_mode
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,
-    is_protected_runtime_path,
     mode_allows_protected_write,
-    normalize_repo_path,
     protected_paths_in,
-    protected_write_block_message,
 )
 from ouroboros.tool_access import (
     ResolvedResourceBinding,
@@ -94,11 +95,91 @@ _EDIT_BATCH_ITEM_PROPERTIES: Dict[str, Dict[str, Any]] = {
 }
 _EDIT_BATCH_ITEM_KEYS: Tuple[str, ...] = tuple(_EDIT_BATCH_ITEM_PROPERTIES)
 _EDIT_BATCH_ITEM_REQUIRED: Tuple[str, ...] = ("path", "old_str", "new_str")
+_FILE_ROOT_DESCRIPTION = (
+    "When omitted, relative paths use active_workspace; absolute paths select the permitted "
+    "physical root (including user_files for home paths). Explicit roots remain explicit."
+)
 
 
 # ---------------------------------------------------------------------------
 # Shared target resolution (mirrors the edit_text guard chain)
 # ---------------------------------------------------------------------------
+
+def _edit_mutation_block(ctx: ToolContext, binding: ResolvedResourceBinding,
+                         path: str, *, operation: str = "write") -> str:
+    """Physical write policy shared by single, batch and patch editors."""
+    from ouroboros.config import SETTINGS_PATH, get_runtime_mode
+    from ouroboros.tools.core import (
+        _native_payload_mutation_block_reason, _binding_skill_control_plane_path,
+        is_skill_control_plane_path, _is_skill_owner_state_target,
+        is_skill_owner_state_alias, _is_workspace_executor_control_state_path,
+        _project_store_access_block, _normalize_data_read_path,
+        artifact_store_path_block_reason, is_skill_create_typo,
+    )
+    from ouroboros.protected_artifacts import block_reason_for_path
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    target = binding.target_path
+    root = binding.root
+    if reason := block_reason_for_path(ctx, target, operation, binding):
+        return f"protected artifact path blocked: {reason}"
+    from ouroboros.runtime_mode_policy import (
+        is_protected_runtime_path, mode_allows_protected_write,
+        normalize_repo_path, protected_write_block_message,
+    )
+    from ouroboros.tools.tool_resolution import body_relative_path
+    from ouroboros.workspace_copies import is_system_copy
+
+    if (body_path := body_relative_path(ctx, binding, own_body_copy=is_system_copy(ctx))) is not None:
+        relative = normalize_repo_path(body_path)
+        from ouroboros.tools.registry import _authorized_managed_update_resolver
+
+        if (is_protected_runtime_path(relative)
+                and not mode_allows_protected_write(get_runtime_mode())
+                and not _authorized_managed_update_resolver(ctx)):
+            return protected_write_block_message(path=relative, runtime_mode=get_runtime_mode(), action="edit")
+    if root in {"active_workspace", "system_repo"} and binding.source in {
+        "active_workspace", "system_repo", "project_room"
+    }:
+        return ""
+    # The shared reservation applies its own mode rule, exactly as write_file reads it.
+    if root == "artifact_store":
+        if reason := artifact_store_path_block_reason(target, base_path=binding.base_path):
+            return f"artifact_store path blocked: {reason}"
+    if mode_has_unrestricted_agency(get_runtime_mode()):
+        return ""
+    data_root = binding.state_drive_root
+    if reason := _native_payload_mutation_block_reason(target, data_root):
+        return reason
+    if (_binding_skill_control_plane_path(binding)
+            or is_skill_control_plane_path(target, data_root)):
+        return "skill provenance, launcher seed and marketplace control-plane state"
+    if (_is_skill_owner_state_target(target, data_root)
+            or is_skill_owner_state_alias(target, data_root)):
+        return "skill review, enablement, grants and marketplace owner state"
+    if (_is_workspace_executor_control_state_path(target, binding.base_path)
+            or _is_workspace_executor_control_state_path(target, data_root)):
+        return "workspace executor process control-plane state"
+    try:
+        settings = pathlib.Path(SETTINGS_PATH)
+        if (target.exists() and settings.exists() and target.samefile(settings)) or (
+            target.parent.resolve() == settings.parent.resolve()
+            and target.name.lower() == settings.name.lower()
+        ):
+            return "settings.json is owner-edited control-plane state"
+    except OSError:
+        pass
+    if root == "runtime_data":
+        if block := _project_store_access_block(_normalize_data_read_path(ctx, path)):
+            return block
+    if (binding.source in {"external", "clawhub", "ouroboroshub"}
+            and not binding.base_path.exists()
+            and (binding.source != "external" or is_skill_create_typo(
+                payload_root=binding.base_path, bucket="external",
+                rel_within_payload=target.relative_to(binding.base_path).as_posix()))):
+        return "skill payload not found; create an external skill through its manifest first"
+    return ""
+
 
 def _resolve_edit_target(
     ctx: ToolContext,
@@ -107,6 +188,9 @@ def _resolve_edit_target(
     *,
     error_tag: str,
     _resolved_binding: ResolvedResourceBinding | None = None,
+    operation: str = "edit",
+    bucket: str = "",
+    skill_name: str = "",
 ) -> Tuple[Optional[pathlib.Path], str, Optional[ResolvedResourceBinding], str]:
     """Resolve ``path`` under ``root`` with the same guards as edit_text.
 
@@ -122,22 +206,17 @@ def _resolve_edit_target(
 
     if not path or not str(path).strip():
         return None, "", None, f"⚠️ {error_tag}: path is required."
-    normalized, block = _access_or_block(ctx, root, "edit")
+    normalized, block = _access_or_block(ctx, root, operation)
     if block:
         return None, "", None, block
-    if normalized not in {"active_workspace", "system_repo"}:
-        return None, "", None, (
-            f"⚠️ {error_tag}: root={normalized!r} is not supported; "
-            "these tools edit repo lanes only (active_workspace / system_repo). "
-            "Use write_file/edit_text for data-plane roots."
-        )
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
-            ctx, root=normalized, operation="edit", path=path,
+            ctx, root=normalized, operation=operation, path=path,
+            bucket=bucket, skill_name=skill_name,
         )
     except Exception as exc:  # noqa: BLE001 - target selection must fail closed
         return None, "", None, f"⚠️ {error_tag}: {type(exc).__name__}: {exc}"
-    if binding.root != normalized:
+    if binding.root != normalized or binding.operation != operation:
         return None, "", None, (
             f"⚠️ {error_tag}: internal target binding root mismatch "
             f"({binding.root!r} != {normalized!r})."
@@ -147,36 +226,9 @@ def _resolve_edit_target(
         rel = target.relative_to(binding.base_path).as_posix()
     except ValueError:
         return None, "", None, f"⚠️ {error_tag}: selected target escapes its repository root."
-    from ouroboros.protected_artifacts import block_reason_for_path
-
-    if reason := block_reason_for_path(ctx, target, "write", binding):
-        return None, "", None, (
-            f"⚠️ {error_tag}: protected artifact path blocked: {reason}"
-        )
-    norm = normalize_repo_path(rel)
-    if (
-        binding_targets_system_repo(ctx, binding)
-        and is_protected_runtime_path(norm)
-        and not mode_allows_protected_write(_runtime_mode())
-        # The assisted managed-update resolver edits whatever official file the
-        # merge conflicts on; git._repo_write and _str_replace_editor both carry
-        # this exemption, so withholding it here would make these tools the one
-        # lane that cannot finish a conflict resolution.
-        and not _authorized_resolver(ctx)
-    ):
-        return None, "", None, protected_write_block_message(
-            path=norm, runtime_mode=_runtime_mode(), action="edit"
-        )
+    if reason := _edit_mutation_block(ctx, binding, path):
+        return None, "", None, f"⚠️ {error_tag}: {reason}"
     return target, safe_relpath(rel), binding, ""
-
-
-def _authorized_resolver(ctx: ToolContext) -> bool:
-    try:
-        from ouroboros.tools.registry import _authorized_managed_update_resolver
-
-        return bool(_authorized_managed_update_resolver(ctx))
-    except Exception:
-        return False
 
 
 def _runtime_mode() -> str:
@@ -203,6 +255,7 @@ def _finish_mutation(
     binding: ResolvedResourceBinding | None = None,
 ) -> str:
     """Advisory invalidation + the standard commit/patch-artifact footer."""
+    from ouroboros.review import diff_pulse
     from ouroboros.tools.commit_gate import _invalidate_advisory
 
     try:
@@ -228,14 +281,13 @@ def _finish_mutation(
         if ctx.is_workspace_mode():
             footer += " " + workspace_edit_note(ctx)
         return footer
-    footer = (
-        "Files are on disk but NOT committed. Run commit_reviewed when ready.\n"
-        "⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
-    )
+    footer = "Files are on disk but NOT committed. Run commit_reviewed when ready."
     # A pro-mode edit of a protected surface announces itself here exactly as it
     # does from git._repo_write / _str_replace_editor (the protected-write contract
     # in ARCHITECTURE "Safety and runtime mode" and SYSTEM.md "Safety-critical
     # files"): the mode ALLOWS the write, and the notice is what keeps it visible.
+    pulse = diff_pulse(binding.base_path, changed_paths)
+    footer += f"\n{pulse}" if pulse else ""
     protected = protected_paths_in(changed_paths)
     if protected and mode_allows_protected_write(_runtime_mode()):
         footer += "\n\n" + core_patch_notice(protected)
@@ -249,6 +301,9 @@ def _partial_write_failure(
     tag: str,
     detail: str,
     binding: ResolvedResourceBinding | None = None,
+    *,
+    pending: List[str] = (),
+    recovery: List[str] = (),
 ) -> str:
     """Report an I/O failure that landed AFTER some files were already written.
 
@@ -257,10 +312,21 @@ def _partial_write_failure(
     error mid-sequence leaves the earlier files applied. Those files are real
     worktree mutations, so the advisory snapshot must go stale here exactly as it
     would on success; otherwise `commit_reviewed` would accept them against a
-    pre-review taken before they existed. The residual is disclosed, not hidden.
+    pre-review taken before they existed. The residual is disclosed, not hidden:
+    changed and not-attempted files are named, and a caller is never told to
+    repeat edits that already landed.
     """
+    skipped = f"\nNot attempted: {', '.join(pending)}." if pending else ""
+    copies = ("\nRecovery copies:\n" + "\n".join(recovery)) if recovery else ""
 
     if changed_paths:
+        if binding is not None and binding.skill_name:
+            from ouroboros.contracts.task_constraint import normalize_task_constraint
+            from ouroboros.skill_repair_admission import advance_repair_expected_hash
+
+            constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+            if constraint and constraint.has_selected_skill:
+                advance_repair_expected_hash(binding.state_drive_root, constraint, task_id=ctx.task_id)
         footer = _finish_mutation(ctx, changed_paths, source_tool, binding)
         # NOT the tools' own *_ERROR prefix: those read as validation refusals
         # (a counted/context miss) and are classified as policy denials. This is a
@@ -268,11 +334,11 @@ def _partial_write_failure(
         # failure, so it carries its own prefix and lands in the generic `error`.
         return (
             f"⚠️ EDIT_OPS_PARTIAL_WRITE_FAILED ({tag}): {detail}\n"
-            f"PARTIALLY APPLIED — these files WERE written: {', '.join(changed_paths)}. "
-            "Re-read them before retrying; advisory pre-review is now stale.\n"
-            + footer
+            f"PARTIALLY APPLIED — these files WERE written: {', '.join(changed_paths)}.{skipped}\n"
+            "Do not repeat this call: read the written files and continue from their current content."
+            f"{copies}\n" + footer
         )
-    return f"⚠️ {tag}: {detail}\nNothing was written."
+    return f"⚠️ {tag}: {detail}\nNothing was written.{skipped}{copies}"
 
 
 def _line_positions(text: str, needle: str, limit: int = 5) -> List[str]:
@@ -282,9 +348,130 @@ def _line_positions(text: str, needle: str, limit: int = 5) -> List[str]:
         idx = text.find(needle, start)
         if idx < 0:
             break
-        positions.append(f"line {text[:idx].count(chr(10)) + 1}")
+        positions.append(f"line {edit_source_line(text, idx)}")
         start = idx + 1
     return positions
+
+
+def edit_source_line(text: str, offset: int) -> int:
+    """Locate a source position using read_file's splitlines boundary rule."""
+    offset = max(0, min(len(text), offset))
+    end = 0
+    number = 1
+    for number, line in enumerate(text.splitlines(keepends=True), 1):
+        end += len(line)
+        if offset < end:
+            return number
+    return number
+
+
+# Line boundaries str.splitlines (and so read_file) honours besides LF.
+_OTHER_LINE_BOUNDARIES = frozenset("\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+class _ReaderLines:
+    """read_file's 1-based line numbers for LF-split line indexes.
+
+    Patch grammar and locator matching split on LF; every number shown to the
+    model is the reader's, so a file holding another Unicode line boundary is
+    cited exactly where read_file shows it. Plain LF text needs no index.
+    """
+
+    def __init__(self, text: str) -> None:
+        self._ends: Optional[List[int]] = None
+        if _OTHER_LINE_BOUNDARIES.isdisjoint(text):
+            return
+        self._length, self._ends, self._starts, offset = len(text), [], [], 0
+        for line in text.splitlines(keepends=True):
+            offset += len(line)
+            self._ends.append(offset)
+        offset = 0
+        for line in text.split("\n"):
+            self._starts.append(offset)
+            offset += len(line) + 1
+
+    def line(self, index: int) -> int:
+        """The reader line where LF line ``index`` (0-based) begins."""
+        if self._ends is None:
+            return index + 1
+        offset = self._starts[index] if index < len(self._starts) else self._length
+        return bisect.bisect_right(self._ends, offset) + 1
+
+    def count(self, index: int, lines: int) -> int:
+        """Reader lines spanned by ``lines`` LF lines from ``index``."""
+        return max(1, self.line(index + lines) - self.line(index)) if self._ends is not None else lines
+
+
+_EDIT_PREVIEW_LINE_CHARS = 240   # per numbered post-edit row
+_EDIT_PREVIEW_MAX_CHARS = 4_000  # whole post-edit preview, site notes included
+
+
+def numbered_edit_preview(text: str, offsets: List[int], *, max_sites: int = 8) -> str:
+    """Bounded numbered post-edit context at actual edited source positions.
+
+    Rows carry read_file's own number-and-tab prefix, so every surface shows
+    one line-number form and one line definition. A long row and the whole
+    preview are cut through the shared disclosed bound; the site notes survive it.
+    """
+    from ouroboros.tools.core_file_tools import _display_prefix
+    from ouroboros.utils import truncate_within_limit
+
+    if not text:
+        return "(empty file after edit; no surviving source lines)"
+    lines = text.splitlines()
+    chosen: set[int] = set()
+    for offset in offsets[:max_sites]:
+        line = edit_source_line(text, offset)
+        chosen.update(range(max(1, line - 2), min(len(lines), line + 2) + 1))
+    rows = "\n".join(_display_prefix(number) + truncate_within_limit(lines[number - 1], _EDIT_PREVIEW_LINE_CHARS)
+                     for number in sorted(chosen))
+    notes = []
+    if any(offset >= len(text) for offset in offsets[:max_sites]):
+        notes.append("Edit site is at end of file; nearest surviving source lines shown.")
+    if len(offsets) > max_sites:
+        notes.append(f"… {len(offsets) - max_sites} more edit site(s)")
+    tail = "\n".join(notes)
+    room = _EDIT_PREVIEW_MAX_CHARS - len(tail) - bool(tail)
+    return "\n".join(part for part in (truncate_within_limit(rows, room), tail) if part)
+
+
+def newline_normalization_note(target: pathlib.Path) -> str:
+    """Disclose the existing universal-newline read and LF write behavior."""
+    try:
+        raw = target.read_bytes()
+    except OSError:
+        return ""
+    return "⚠️ Existing CRLF/CR line endings were normalized to LF." if b"\r" in raw else ""
+
+
+def _repo_edit_binding(binding: ResolvedResourceBinding) -> bool:
+    """Git recovery applies to repo lanes, never a payload reached by a repo alias."""
+    return binding.root in {"active_workspace", "system_repo"} and binding.source in {
+        "active_workspace", "system_repo", "project_room"
+    }
+
+
+def _edit_content_block(binding: ResolvedResourceBinding, content: str, force: bool) -> str:
+    """The existing shrink policy of the target's lane, before any edit write."""
+    from ouroboros.tools.core import _check_data_shrink_guard
+    from ouroboros.tools.git_repo_edit import _check_shrink_guard
+
+    if _repo_edit_binding(binding):
+        return _check_shrink_guard(binding, content, force) or ""
+    return _check_data_shrink_guard(binding.target_path, content, force) or ""
+
+
+def edit_syntax_note(binding: ResolvedResourceBinding | None, content: str) -> str:
+    """Report, never refuse, a final Python/JSON parse failure of an exact edit on a repo lane.
+
+    Moving code can leave a file invalid between steps; full overwrites and
+    commits keep their own blocking syntax checks.
+    """
+    if binding is None or not _repo_edit_binding(binding):
+        return ""
+    rel = binding.target_path.relative_to(binding.base_path).as_posix()
+    syntax = _syntax_check(rel, content)
+    return f"⚠️ SYNTAX_WARNING: {syntax} in {rel}; the edit WAS applied." if syntax else ""
 
 
 # ---------------------------------------------------------------------------
@@ -327,23 +514,26 @@ def _at(file_line: str, needle_line: str, position: str) -> bool:
     return file_line.startswith(needle_line) if position == "last" else file_line == needle_line
 
 
-def _excerpt(file_lines: List[str], start: int, count: int) -> str:
+def _excerpt(file_lines: List[str], start: int, count: int, lines: _ReaderLines) -> str:
+    from ouroboros.tools.core_file_tools import _display_prefix
+
     end = min(len(file_lines), start + count)
     shown = min(end - start, _LOCATE_EXCERPT_LINES)
-    width = len(str(start + shown)) + 1
-    rows = [f"{start + i + 1:>{width}}| {_cut(file_lines[start + i])}" for i in range(shown)]
+    rows = [_display_prefix(lines.line(start + i)) + _cut(file_lines[start + i]) for i in range(shown)]
     if end - start > shown:
-        rows.append(f"{'':>{width}}| … {end - start - shown} more line(s) of the region not shown")
+        rows.append(f"… {end - start - shown} more line(s) of the region not shown")
     return "\n".join(rows)
 
 
-def _first_difference(file_lines: List[str], start: int, old_lines: List[str]) -> Optional[Tuple[int, str, str]]:
-    """The first ``(line_no, file_bytes, needle_bytes)`` where the raw lines disagree."""
-    for k, (needle_line, position) in enumerate(zip(old_lines, _positions(len(old_lines)))):
+def _first_difference(file_lines: List[str], start: int, old_lines: List[str],
+                      *, whole_lines: bool = False) -> Optional[Tuple[int, str, str]]:
+    """The first ``(lf_index, file_bytes, needle_bytes)`` where the raw lines disagree."""
+    positions = ["inner"] * len(old_lines) if whole_lines else _positions(len(old_lines))
+    for k, (needle_line, position) in enumerate(zip(old_lines, positions)):
         if start + k >= len(file_lines):
-            return start + k + 1, "<end of file>", needle_line
+            return start + k, "<end of file>", needle_line
         if not _at(file_lines[start + k], needle_line, position):
-            return start + k + 1, file_lines[start + k], needle_line
+            return start + k, file_lines[start + k], needle_line
     return None
 
 
@@ -354,6 +544,21 @@ def _whitespace_reason(file_line: str, needle_line: str) -> str:
         lead = lambda s: len(s) - len(s.lstrip())  # noqa: E731 - local one-liner
         return f"indentation differs: file {lead(file_line)} leading chars, needle {lead(needle_line)}"
     return "tabs and spaces differ" if file_line.expandtabs() == needle_line.expandtabs() else "whitespace differs inside the line"
+
+
+_READ_NUMBER = re.compile(r" *(\d+)\t")
+
+
+def _without_read_numbers(needle: str) -> str:
+    """``needle`` without consecutive read_file row prefixes, or ``""`` when it has none."""
+    rows = needle.splitlines(keepends=True)
+    found = [_READ_NUMBER.match(row) for row in rows]
+    if not rows or not all(found):
+        return ""
+    numbers = [int(match.group(1)) for match in found]
+    if numbers != list(range(numbers[0], numbers[0] + len(numbers))):
+        return ""
+    return "".join(row[match.end():] for row, match in zip(rows, found))
 
 
 def whole_file_preview(text: str, limit: int = _WHOLE_FILE_PREVIEW_CHARS) -> str:
@@ -369,6 +574,7 @@ def _bounded(block: str, notes: List[str]) -> str:
 def locate_edit_miss(
     text: str, old_str: str, *, cursor_line: int = 1, needle_name: str = "old_str",
     max_candidates: int = _LOCATE_MAX_CANDIDATES,
+    whole_lines: bool = False,
 ) -> str:
     """Bounded, actionable diagnosis of why ``old_str`` is not in ``text``: the
     closest region, the FIRST line where the file's bytes differ from the needle
@@ -376,9 +582,8 @@ def locate_edit_miss(
     (CR/CRLF) → a whitespace-relaxed line match (indentation, trailing, tabs; a
     needle may start or end mid-line) → the nearest region by the needle's most
     distinctive line and difflib similarity. Every tier is bounded (lines scanned,
-    candidates scored, excerpt and block size). ``cursor_line`` (1-based) is where
-    the caller's search began — apply_patch hunks apply in file order, so a region
-    before it is reported as such: the fix is reordering, not retyping."""
+    candidates scored, excerpt and block size). Hunk diagnostics match whole
+    lines; exact replacement diagnostics retain their substring vocabulary."""
     if not old_str:
         return ""
     if not text:
@@ -390,13 +595,21 @@ def locate_edit_miss(
     if "\r" in old_str or "\r" in text:  # tier 0: universal-newline reads leave the file LF-only
         n_text, n_old = (s.replace("\r\n", "\n").replace("\r", "\n") for s in (text, old_str))
         if n_old.strip() and n_old in n_text:
-            line = n_text[: n_text.index(n_old)].count("\n") + 1
+            index, n_lines = n_text[: n_text.index(n_old)].count("\n"), _ReaderLines(n_text)
+            line = n_lines.line(index)
             side = (f"{needle_name} carries CR (\\r) characters the file does not" if "\r" not in text
                     else "the file carries CR (\\r) characters")
             return _bounded(
                 f"{needle_name} matches at line {line} once line endings are normalized: {side}. Use LF (\\n) only.\n"
-                f"Re-read that region (read_file start_line={line} max_lines={n_old.count(chr(10)) + 1}) "
+                f"Re-read that region (read_file start_line={line} "
+                f"max_lines={n_lines.count(index, n_old.count(chr(10)) + 1)}) "
                 f"and copy the exact bytes into {needle_name}.", notes)
+    if (unnumbered := _without_read_numbers(old_str)).strip() and unnumbered in text:
+        line = edit_source_line(text, text.index(unnumbered))
+        return _bounded(
+            f"{needle_name} carries read_file line numbers (the number and tab before each line are "
+            f"display, not file text). Without them it matches at line {line}: copy only the text "
+            "after each line's tab.", notes)
     old_lines = old_str.split("\n")
     while old_lines and not old_lines[0].strip():
         old_lines.pop(0)
@@ -406,11 +619,13 @@ def locate_edit_miss(
         return _bounded(f"{needle_name} is whitespace only; include at least one non-blank line.", notes)
     total = len(old_lines)  # the whole needle; only the window below is compared, and that is said
     old_lines = old_lines[:_LOCATE_MAX_OLD_LINES]
-    n, positions = len(old_lines), _positions(len(old_lines))
+    n = len(old_lines)
+    positions = ["inner"] * n if whole_lines else _positions(n)
     if total > n:
         notes.append(f"(only the first {n} of {total} {needle_name} lines were compared; the miss may be after them)")
     needle = [_norm_ws(line) for line in old_lines]
     hay = [_norm_ws(line) for line in file_lines]
+    reader = _ReaderLines(text)
 
     def fits(start: int) -> bool:  # every needle line at its position, whitespace aside (short-circuits)
         return start + n <= len(hay) and all(_at(hay[start + k], needle[k], positions[k]) for k in range(n))
@@ -419,35 +634,35 @@ def locate_edit_miss(
         return sum(1 for k in range(n) if start + k < len(hay) and _at(hay[start + k], needle[k], positions[k]))
 
     def span(start: int) -> str:
-        end = min(len(file_lines), start + n)
-        return f"line {start + 1}" if end == start + 1 else f"lines {start + 1}–{end}"
+        first = reader.line(start)
+        last = first + reader.count(start, min(len(file_lines), start + n) - start) - 1
+        return f"line {first}" if last == first else f"lines {first}–{last}"
 
     def render(head: str, start: int, extra: List[str]) -> str:
-        diff = _first_difference(file_lines, start, old_lines)
-        body = [head, _excerpt(file_lines, start, n)]
+        diff = _first_difference(file_lines, start, old_lines, whole_lines=whole_lines)
+        body = [head, _excerpt(file_lines, start, n, reader)]
         if diff:
-            body.append(f"first difference at line {diff[0]}:\n  file   : {_cut(diff[1])!r}\n  {needle_name:<7}: {_cut(diff[2])!r}")
-        if start + 1 < cursor_line:
-            body.append(f"Note: that region is BEFORE line {cursor_line}, where this search started: hunks apply "
-                        "in file order — move this hunk earlier or add an @@ anchor above the region.")
-        body += extra + [f"Re-read that region (read_file start_line={start + 1} max_lines={total}) "
+            body.append(f"first difference at line {reader.line(diff[0])}:\n"
+                        f"  file   : {_cut(diff[1])!r}\n  {needle_name:<7}: {_cut(diff[2])!r}")
+        body += extra + [f"Re-read that region (read_file start_line={reader.line(start)} "
+                         f"max_lines={reader.count(start, total)}) "
                          f"and copy the exact bytes into {needle_name}."]
         return _bounded("\n".join(body), notes)
 
     relaxed = [i for i in range(len(hay) - n + 1) if fits(i)][:5]  # tier 1: the same lines, whitespace aside
     if relaxed:
         start = relaxed[0]
-        diff = _first_difference(file_lines, start, old_lines)
+        diff = _first_difference(file_lines, start, old_lines, whole_lines=whole_lines)
         reason = (_whitespace_reason(diff[1], diff[2]) if diff
                   else (f"its first {n} lines match exactly; the difference is in the {total - n} lines after them, "
                         "which were not compared") if total > n
-                  else "the bytes match" if start + 1 < cursor_line else "only leading/trailing blank lines differ")
-        also = f"; also at lines {', '.join(str(i + 1) for i in relaxed[1:])}" if len(relaxed) > 1 else ""
+                  else "only leading/trailing blank lines differ")
+        also = f"; also at lines {', '.join(str(reader.line(i)) for i in relaxed[1:])}" if len(relaxed) > 1 else ""
         return render(f"{needle_name} matches {span(start)} ignoring whitespace ({reason}){also}. "
                       "The file's exact bytes are:", start, [])
     anchor_k = max(range(n), key=lambda k: len(needle[k]))  # tier 2: the needle's most distinctive line
     anchor = needle[anchor_k]
-    hits = [i for i, line in enumerate(hay) if anchor and anchor in line][:_LOCATE_MAX_ANCHOR_HITS]
+    hits = [i for i, line in enumerate(hay) if anchor and (anchor == line if whole_lines else anchor in line)][:_LOCATE_MAX_ANCHOR_HITS]
     if not hits and len(anchor) >= 3:
         distinct: Dict[str, int] = {}
         for i, line in enumerate(hay):
@@ -461,9 +676,10 @@ def locate_edit_miss(
             f"No line similar to {needle_name} was found ({len(file_lines)} lines scanned). The text may live in "
             "another file or have changed since you read it: search_code for a distinctive fragment, then re-read.",
             notes)
-    scored = sorted((-matched(s), abs(s + 1 - cursor_line), s) for s in {max(0, i - anchor_k) for i in hits})
-    score, _distance, start = scored[0]
-    others = [str(s + 1) for _sc, _d, s in scored[1:max_candidates]]
+    scored = sorted((-matched(s), -difflib.SequenceMatcher(None, anchor, hay[min(s + anchor_k, len(hay)-1)]).ratio(),
+                     abs(s + 1 - cursor_line), s) for s in {max(0, i - anchor_k) for i in hits})
+    score, _similarity, _distance, start = scored[0]
+    others = [str(reader.line(s)) for _sc, _sim, _d, s in scored[1:max_candidates]]
     return render(
         f"Nearest region: {span(start)} ({-score} of {n} {needle_name} line(s) match ignoring whitespace):",
         start, [f"Other candidate region(s) start at line(s): {', '.join(others)}."] if others else [])
@@ -477,6 +693,7 @@ _PATCH_END = "*** End Patch"
 _UPDATE_HDR = "*** Update File:"
 _ADD_HDR = "*** Add File:"
 _DELETE_HDR = "*** Delete File:"
+_PATCH_HEADERS = {_UPDATE_HDR: "update", _ADD_HDR: "add", _DELETE_HDR: "delete"}
 
 
 @dataclass
@@ -516,16 +733,9 @@ def _parse_patch(patch: str) -> Tuple[List[_FileOp], str]:
         if directive == _strip_directive_tail(_PATCH_END) and raw.lstrip().startswith("***"):
             seen_end = True
             continue
-        if raw.startswith(_UPDATE_HDR):
-            current = _FileOp("update", _strip_directive_tail(raw[len(_UPDATE_HDR):]))
-            ops.append(current)
-            continue
-        if raw.startswith(_ADD_HDR):
-            current = _FileOp("add", _strip_directive_tail(raw[len(_ADD_HDR):]))
-            ops.append(current)
-            continue
-        if raw.startswith(_DELETE_HDR):
-            current = _FileOp("delete", _strip_directive_tail(raw[len(_DELETE_HDR):]))
+        header = next((h for h in _PATCH_HEADERS if raw.startswith(h)), None)
+        if header is not None:
+            current = _FileOp(_PATCH_HEADERS[header], _strip_directive_tail(raw[len(header):]))
             ops.append(current)
             continue
         if raw.startswith("***"):
@@ -594,95 +804,151 @@ def patch_target_paths(patch: str) -> List[str]:
     return [op.path for op in ops if op.path]
 
 
-def _find_sequence(
-    file_lines: List[str], seq: List[str], start: int, *, fuzzy: bool
-) -> List[int]:
-    """Indices >= start where ``seq`` matches ``file_lines`` (cap 5)."""
-    if not seq:
-        return []
-    matches: List[int] = []
-    if fuzzy:
-        hay = [l.rstrip() for l in file_lines]
-        needle = [l.rstrip() for l in seq]
-    else:
-        hay = file_lines
-        needle = seq
-    n = len(needle)
-    for i in range(start, len(hay) - n + 1):
-        if hay[i:i + n] == needle:
-            matches.append(i)
-            if len(matches) >= 5:
-                break
-    return matches
+def normalize_patch_paths(patch: str, normalize) -> str:
+    """Rewrite valid file directives only; guards and handler consume the same payload."""
+    ops, error = _parse_patch(patch)
+    if error:
+        return patch
+    paths = iter(normalize(op.path) for op in ops)
+    lines = patch.splitlines(keepends=True)
+    for index, raw in enumerate(lines):
+        header = next((h for h in _PATCH_HEADERS if raw.startswith(h)), None)
+        if header is not None:
+            ending = "\r\n" if raw.endswith("\r\n") else "\n" if raw.endswith("\n") else ""
+            lines[index] = f"{header} {next(paths)}{ending}"
+    return "".join(lines)
+
+
+def _context_matches(hay: List[str], needle: List[str], anchors: List[int]) -> List[int]:
+    """Every start where ``needle`` matches ``hay`` at or after an ``@@`` anchor line."""
+    width = len(needle)
+    first = min(anchors) if anchors else 0
+    return [i for i in range(first, len(hay) - width + 1) if hay[i:i + width] == needle]
 
 
 def _apply_hunks_to_text(
-    content: str, hunks: List[_Hunk], path: str
+    content: str, hunks: List[_Hunk], path: str, *, _sites: Optional[List[int]] = None,
 ) -> Tuple[Optional[str], List[str], str]:
-    """Apply hunks in order. Returns (new_content, notes, error)."""
+    """Validate every hunk against the original file, then apply disjoint spans.
+
+    A repeated Update File directive is the explicit way to chain against a
+    preceding result; hunks inside one directive never gain placement from a
+    previous hunk. Context matches exactly, else ignoring trailing whitespace
+    only, and the placement must be unique. Unchanged context keeps the file's
+    bytes and added lines keep the patch's bytes; indentation is never adapted,
+    so a miss shows the region and its exact bytes instead.
+    """
     file_lines = content.split("\n")
+    reader = _ReaderLines(content)
     notes: List[str] = []
-    cursor = 0
+    errors: List[str] = []
+    changes: List[Tuple[int, int, List[str], int]] = []
+    hunk_sites: Dict[int, List[int]] = {}
+    old_line_sites: Dict[int, List[int]] = {}
+    trimmed: Optional[List[str]] = None
     for hi, hunk in enumerate(hunks, 1):
         old = [t for p, t in hunk.lines if p in (" ", "-")]
-        new = [t for p, t in hunk.lines if p in (" ", "+")]
-        start = cursor
-        if hunk.anchor:
-            anchor_hits = [
-                i for i in range(start, len(file_lines)) if hunk.anchor in file_lines[i]
-            ]
-            if not anchor_hits:
-                return None, notes, (
-                    f"hunk {hi}: @@ anchor {hunk.anchor!r} not found in {path} "
-                    f"after line {start + 1}"
-                )
-            start = anchor_hits[0]
-        if not old:
-            if not hunk.anchor:
-                return None, notes, (
-                    f"hunk {hi}: pure insertion needs an @@ anchor or context lines"
-                )
-            pos = start + 1
-            file_lines[pos:pos] = new
-            cursor = pos + len(new)
+        anchors = [i for i, line in enumerate(file_lines) if hunk.anchor in line] if hunk.anchor else []
+        if hunk.anchor and not anchors:
+            errors.append(f"hunk {hi}: @@ anchor {hunk.anchor!r} not found in {path}")
             continue
-        matches = _find_sequence(file_lines, old, start, fuzzy=False)
-        fuzzy_used = False
+        if not old and not hunk.anchor:
+            errors.append(f"hunk {hi}: pure insertion needs an @@ anchor or context lines")
+            continue
+        if not old:
+            if len(anchors) != 1:
+                errors.append(f"hunk {hi}: @@ anchor is ambiguous in {path} — matches at "
+                              + ", ".join(f"line {reader.line(i)}" for i in anchors[:5]))
+                continue
+            pos = anchors[0] + 1
+            changes.append((pos, pos, [t for p, t in hunk.lines if p == "+"], hi))
+            hunk_sites[hi] = [0]
+            continue
+        matches = _context_matches(file_lines, old, anchors)
+        trailing = not matches
+        if trailing:
+            trimmed = trimmed if trimmed is not None else [line.rstrip() for line in file_lines]
+            matches = _context_matches(trimmed, [line.rstrip() for line in old], anchors)
         if not matches:
-            matches = _find_sequence(file_lines, old, start, fuzzy=True)
-            fuzzy_used = bool(matches)
-        if not matches:
-            preview = "\n".join("    " + l for l in old[:6])
-            return None, notes, (
-                f"hunk {hi}: context not found in {path} (searched from line {start + 1}). "
-                f"Hunk expects these consecutive lines:\n{preview}\n"
-                "Copy the exact lines from the file (read_file) into the hunk context.\n"
-                + locate_edit_miss(
-                    "\n".join(file_lines), "\n".join(old),
-                    cursor_line=start + 1, needle_name="the hunk context",
-                )
+            preview = "\n".join("    " + line for line in old[:6])
+            errors.append(
+                f"hunk {hi}: context not found in {path}. Hunk expects these consecutive lines:\n"
+                f"{preview}\nCopy exact lines from read_file.\n"
+                + locate_edit_miss(content, "\n".join(old), needle_name="the hunk context", whole_lines=True)
             )
-        if len(matches) > 1:
-            where = ", ".join(f"line {m + 1}" for m in matches)
-            return None, notes, (
-                f"hunk {hi}: context is ambiguous in {path} — matches at {where}. "
-                "Add an @@ anchor (e.g. '@@ def name') or more context lines."
-            )
+            continue
+        if len(matches) != 1:
+            errors.append(f"hunk {hi}: context is ambiguous in {path} — matches at "
+                          + ", ".join(f"line {reader.line(m)}" for m in matches[:5])
+                          + ". Add an @@ anchor or more context lines.")
+            continue
         pos = matches[0]
-        file_lines[pos:pos + len(old)] = new
-        cursor = pos + len(new)
-        if fuzzy_used:
-            notes.append(
-                f"hunk {hi}: matched ignoring trailing whitespace — the replaced lines, "
-                "INCLUDING context lines, now carry the patch's trailing whitespace"
-            )
+        actual = file_lines[pos:pos + len(old)]
+        replacement: List[str] = []
+        local_sites: List[int] = []
+        old_sites: List[int] = []
+        old_index = 0
+        for prefix, line in hunk.lines:
+            if prefix in {" ", "-"}:
+                old_sites.append(len(replacement))
+            if prefix == " ":
+                replacement.append(actual[old_index])
+                old_index += 1
+            elif prefix == "-":
+                local_sites.append(len(replacement))
+                old_index += 1
+            else:
+                local_sites.append(len(replacement))
+                replacement.append(line)
+        changes.append((pos, pos + len(old), replacement, hi))
+        hunk_sites[hi] = local_sites
+        old_line_sites[hi] = old_sites
+        if trailing:
+            notes.append(f"hunk {hi}: context matched ignoring trailing whitespace; "
+                         "unchanged context keeps the file's bytes")
+    ordered = sorted(changes, key=lambda item: (item[0], item[1]))
+    for left, right in zip(ordered, ordered[1:]):
+        if right[0] < left[1] or right[0] == left[0]:
+            errors.append(f"hunks {left[3]} and {right[3]} overlap in {path}")
+    if errors:
+        return None, notes, "\n".join(errors)
+    # These are placement coordinates, not a second diff alignment. Keep earlier
+    # directive sites attached to their surviving lines across explicit chaining.
+    points: List[int] = []
+    if _sites is not None:
+        for site in _sites:
+            line, shift = content.count("\n", 0, site), 0
+            for start, end, replacement, hi in ordered:
+                if start <= line < end:
+                    line = start + shift + old_line_sites[hi][line - start]
+                    break
+                if end <= line:
+                    shift += len(replacement) - (end - start)
+            else:
+                line += shift
+            points.append(line)
+        shift = 0
+        for start, end, replacement, hi in ordered:
+            points.extend(start + shift + local for local in hunk_sites[hi])
+            shift += len(replacement) - (end - start)
+    for start, end, replacement, _ in reversed(ordered):
+        file_lines[start:end] = replacement
+    if _sites is not None:
+        starts, offset = [], 0
+        for line in file_lines:
+            starts.append(offset)
+            offset += len(line) + 1
+        _sites[:] = [starts[min(point, len(starts) - 1)] if starts else 0 for point in points]
     return "\n".join(file_lines), notes, ""
 
 
 def _apply_patch(
     ctx: ToolContext,
     patch: str,
-    root: str = "active_workspace",
+    root: str | None = None,
+    bucket: str = "",
+    skill_name: str = "",
+    force: bool = False,
     _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
 ) -> str:
     def no_effect(text: str) -> str:
@@ -698,13 +964,22 @@ def _apply_patch(
     ops, err = _parse_patch(patch)
     if err:
         return no_effect(err)
+    from ouroboros.tools.tool_resolution import inferred_file_root
+
+    root, root_error = inferred_file_root(ctx, "apply_patch", root, [op.path for op in ops])
+    if root_error:
+        return no_effect(root_error)
 
     # Phase 1: resolve + validate everything BEFORE any write (atomicity).
     planned_writes: List[Tuple[pathlib.Path, str, str]] = []  # (target, rel_path, content)
     planned_deletes: List[Tuple[pathlib.Path, str]] = []
     summaries: List[str] = []
     all_notes: List[str] = []
+    errors: List[str] = []
     seen: Dict[str, str] = {}  # rel path -> pending content (chained updates)
+    deleted: set[str] = set()
+    sites: Dict[str, List[int]] = {}
+    bindings: Dict[str, ResolvedResourceBinding] = {}
     supplied_bindings = (
         tuple(_resolved_binding)
         if isinstance(_resolved_binding, tuple)
@@ -721,42 +996,78 @@ def _apply_patch(
             root,
             error_tag="APPLY_PATCH_BLOCKED",
             _resolved_binding=next(binding_iter, None),
+            operation="edit" if op.kind == "update" else "write",
+            bucket=bucket, skill_name=skill_name,
         )
         if terr:
-            return no_effect(terr)
+            errors.append(f"{op.path}: {terr}")
+            continue
+        if mutation_binding is not None and item_binding.base_path != mutation_binding.base_path:
+            errors.append(f"{op.path}: mixed physical bases require separate calls")
+            continue
         mutation_binding = mutation_binding or item_binding
+        bindings[rel] = item_binding
         if op.kind == "add":
             if rel in seen or target.exists():
-                return no_effect(
+                errors.append(
                     f"⚠️ APPLY_PATCH_ERROR: Add File {op.path}: file already exists. "
                     "Use '*** Update File:' to modify it."
                 )
+                continue
             content = "\n".join(op.add_lines)
             if content and not content.endswith("\n"):
                 content += "\n"
             planned_writes.append((target, rel, content))
             seen[rel] = content
+            sites[rel] = [0]
             summaries.append(f"✅ Added {rel} ({len(op.add_lines)} lines)")
             continue
         if op.kind == "delete":
+            if reason := _edit_mutation_block(ctx, item_binding, op.path, operation="delete"):
+                errors.append(f"Delete File {op.path}: {reason}")
+                continue
+            from ouroboros.protected_artifacts import block_reason_for_path
+
+            # Every explicit deletion first preserves the exact bytes, so reading
+            # and copying them must be as authorized as the delete itself.
+            recovery_denial = next((reason for operation in ("read_bytes", "copy")
+                                   if (reason := block_reason_for_path(
+                                       ctx, target, operation, item_binding))), "")
+            if recovery_denial:
+                errors.append(f"Delete File {op.path}: recovery capture blocked: {recovery_denial}")
+                continue
+            if rel in seen or rel in deleted:
+                errors.append(f"Delete File {op.path}: conflicts with another operation on this file")
+                continue
             if not target.exists():
-                return no_effect(f"⚠️ APPLY_PATCH_ERROR: Delete File {op.path}: file not found.")
+                errors.append(f"⚠️ APPLY_PATCH_ERROR: Delete File {op.path}: file not found.")
+                continue
+            if not _repo_edit_binding(item_binding) and not force:
+                errors.append(f"⚠️ APPLY_PATCH_ERROR: Delete File {op.path}: data-root deletion requires force=true.")
+                continue
             planned_deletes.append((target, rel))
+            deleted.add(rel)
             summaries.append(f"✅ Deleted {rel}")
             continue
         # update
+        if rel in deleted:
+            errors.append(f"Update File {op.path}: conflicts with Delete File on this file")
+            continue
         if rel in seen:
             content = seen[rel]
         else:
             if not target.exists():
-                return no_effect(f"⚠️ APPLY_PATCH_ERROR: Update File {op.path}: file not found.")
+                errors.append(f"⚠️ APPLY_PATCH_ERROR: Update File {op.path}: file not found.")
+                continue
             try:
                 content = target.read_text(encoding="utf-8")
             except Exception as e:  # noqa: BLE001 - report unreadable target
-                return no_effect(f"⚠️ APPLY_PATCH_ERROR: cannot read {op.path}: {e}")
-        new_content, notes, herr = _apply_hunks_to_text(content, op.hunks, rel)
+                errors.append(f"⚠️ APPLY_PATCH_ERROR: cannot read {op.path}: {e}")
+                continue
+        new_content, notes, herr = _apply_hunks_to_text(content, op.hunks, rel, _sites=sites.setdefault(rel, []))
         if herr:
-            return no_effect(f"⚠️ APPLY_PATCH_ERROR: {herr}\nNothing was applied (the patch is atomic).")
+            errors.append(f"{op.path}: {herr}")
+            continue
         seen[rel] = new_content
         planned_writes.append((target, rel, new_content))
         added = sum(1 for h in op.hunks for p, _ in h.lines if p == "+")
@@ -764,36 +1075,95 @@ def _apply_patch(
         summaries.append(f"✅ Updated {rel} ({len(op.hunks)} hunk(s), +{added}/-{removed} lines)")
         all_notes.extend(f"{rel}: {n}" for n in notes)
 
+    if errors:
+        return no_effect("⚠️ APPLY_PATCH_ERROR: validation failed; NOTHING was written. Problems:\n"
+                         + "\n".join("  - " + problem for problem in errors))
+
     # Phase 2: write. Dedup chained updates so each file is written once (final content).
     final_content: Dict[str, Tuple[pathlib.Path, str]] = {}
     for target, rel, content in planned_writes:
         final_content[rel] = (target, content)
+    syntax_notes: List[str] = []
+    for rel, (target, content) in final_content.items():
+        if refusal := _edit_content_block(bindings[rel], content, force):
+            return no_effect(f"⚠️ APPLY_PATCH_ERROR: {refusal}\nNothing was written.")
+        if note := newline_normalization_note(target):
+            all_notes.append(f"{rel}: {note}")
+        if note := edit_syntax_note(bindings[rel], content):
+            syntax_notes.append(note)
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.skill_repair_admission import repair_write_cas_error, advance_repair_expected_hash
+
+    constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    repair_binding = next((b for b in bindings.values() if b.skill_name), None)
+    if repair_binding and constraint and constraint.has_selected_skill:
+        if refusal := repair_write_cas_error(repair_binding.state_drive_root, constraint,
+                                             task_id=ctx.task_id, repair_task=True):
+            return no_effect(refusal)
+    # Every explicit deletion first stores the file's exact current bytes as an
+    # immutable task artifact. A failed capture refuses the whole patch.
+    recovery: List[str] = []
+    if planned_deletes:
+        from ouroboros.artifacts import copy_file_to_task_artifacts
+
+        try:
+            for target, rel in planned_deletes:
+                record = copy_file_to_task_artifacts(ctx, target, kind="delete_recovery", immutable=True)
+                if not record:
+                    raise OSError(f"{rel} is not a regular file")
+                if pathlib.Path(record["path"]).resolve() == target.resolve():
+                    raise OSError(f"{rel} is itself the registered copy; deleting it would leave none")
+                recovery.append(f"{rel}: artifact_store:{record['name']} (sha256 {record['sha256'][:12]})")
+        except Exception as exc:
+            return no_effect(f"⚠️ APPLY_PATCH_ERROR: recovery capture failed: {exc}. Nothing was deleted or edited.")
     changed_paths: List[str] = []
+    registered_outputs: List[str] = []
+    pending = [*final_content, *(rel for _target, rel in planned_deletes)]
+
+    def partial(detail: str, *, landed: bool = False) -> str:
+        return _partial_write_failure(ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR", detail,
+                                      mutation_binding, recovery=recovery,
+                                      pending=pending[len(changed_paths) + (0 if landed else 1):])
+
     for rel, (target, content) in final_content.items():
         try:
             write_text(target, content)
         except Exception as e:  # noqa: BLE001 - surface the failed path
-            return _partial_write_failure(
-                ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
-                f"write failed for {rel}: {e}",
-                mutation_binding,
-            )
+            return partial(f"write failed for {rel}: {e}")
         changed_paths.append(rel)
+        if bindings[rel].root == "user_files":
+            from ouroboros.artifacts import copy_file_to_task_artifacts
+
+            try:
+                record = copy_file_to_task_artifacts(ctx, target, kind="user_file")
+                if not record:
+                    raise OSError("user file recovery copy was not registered")
+                registered_outputs.append(f"ARTIFACT_OUTPUTS: registered user file -> artifact_store:{record['name']}")
+            except Exception as exc:
+                return partial(f"{rel} WAS written but its user artifact registration failed: {exc}", landed=True)
     for target, rel in planned_deletes:
         try:
             target.unlink()
         except Exception as e:  # noqa: BLE001 - surface the failed path
-            return _partial_write_failure(
-                ctx, changed_paths, "apply_patch", "APPLY_PATCH_ERROR",
-                f"delete failed for {rel}: {e}",
-                mutation_binding,
-            )
+            return partial(f"delete failed for {rel}: {e}")
         changed_paths.append(rel)
 
+    if repair_binding and constraint and constraint.has_selected_skill:
+        advance_repair_expected_hash(repair_binding.state_drive_root, constraint, task_id=ctx.task_id)
+
     footer = _finish_mutation(ctx, changed_paths, "apply_patch", mutation_binding)
-    body = "\n".join(summaries)
+    body = "\n".join([*summaries, *syntax_notes])
     if all_notes:
         body += "\nNotes:\n" + "\n".join("  " + n for n in all_notes)
+    if recovery:
+        body += "\nRecovery copies:\n" + "\n".join(recovery)
+    if registered_outputs:
+        body += "\n" + "\n".join(registered_outputs)
+    previews = []
+    for rel, (_, content) in final_content.items():
+        previews.append(f"Context after {rel}:\n{numbered_edit_preview(content, sites[rel] or [0])}")
+    if previews:
+        body += "\n" + "\n".join(previews)
     return f"{body}\n{footer}"
 
 
@@ -804,11 +1174,21 @@ def _apply_patch(
 def _edit_batch(
     ctx: ToolContext,
     edits: List[Dict[str, Any]],
-    root: str = "active_workspace",
+    root: str | None = None,
+    bucket: str = "",
+    skill_name: str = "",
+    force: bool = False,
     _resolved_binding: ResolvedResourceBinding | tuple[ResolvedResourceBinding, ...] | None = None,
+    source_tool: str = "edit_batch",
 ) -> str:
     if not edits or not isinstance(edits, list):
         return "⚠️ EDIT_BATCH_ERROR: edits must be a non-empty array."
+    from ouroboros.tools.tool_resolution import inferred_file_root
+
+    root, root_error = inferred_file_root(ctx, "edit_batch", root,
+                                          [str(e.get("path") or "") for e in edits if isinstance(e, dict)])
+    if root_error:
+        return root_error
     item_refusal, notes = payload_item_feedback(
         ctx, edits, _EDIT_BATCH_ITEM_PROPERTIES, item_label="edit", options={"root": root},
     )
@@ -816,6 +1196,8 @@ def _edit_batch(
         return item_refusal
     contents: Dict[str, str] = {}
     targets: Dict[str, pathlib.Path] = {}
+    bindings: Dict[str, ResolvedResourceBinding] = {}
+    sites: Dict[str, List[int]] = {}
     applied: List[str] = []
     errors: List[str] = []
     supplied_bindings = (
@@ -823,6 +1205,8 @@ def _edit_batch(
         if isinstance(_resolved_binding, tuple)
         else ((_resolved_binding,) if _resolved_binding is not None else ())
     )
+    if supplied_bindings and len(supplied_bindings) != len(edits):
+        return "⚠️ EDIT_BATCH_ERROR: internal target binding count mismatch."
     binding_iter = iter(supplied_bindings)
     mutation_binding: ResolvedResourceBinding | None = None
     located = 0  # misses diagnosed so far (bounded per call)
@@ -854,9 +1238,13 @@ def _edit_batch(
             root,
             error_tag="EDIT_BATCH_BLOCKED",
             _resolved_binding=item_binding,
+            bucket=bucket, skill_name=skill_name,
         )
         if terr:
             errors.append(f"edit {idx}: {terr.lstrip('⚠️ ')}")
+            continue
+        if mutation_binding is not None and item_binding.base_path != mutation_binding.base_path:
+            errors.append(f"edit {idx}: mixed physical bases require separate calls")
             continue
         mutation_binding = mutation_binding or item_binding
         if rel not in contents:
@@ -869,6 +1257,8 @@ def _edit_batch(
                 errors.append(f"edit {idx} ({rel}): cannot read: {e}")
                 continue
             targets[rel] = target
+            bindings[rel] = item_binding
+            sites[rel] = []
         text = contents[rel]
         occurrences = text.count(old_str)
         if occurrences != count:
@@ -882,6 +1272,24 @@ def _edit_batch(
                 located += 1
                 errors[-1] += "\n" + textwrap.indent(locate_edit_miss(text, old_str), "      ")
             continue
+        positions: List[int] = []
+        search = 0
+        for _ in range(count):
+            position = text.find(old_str, search)
+            positions.append(position)
+            search = position + len(old_str)
+        delta = len(new_str) - len(old_str)
+        def moved_site(site: int) -> int:
+            earlier = 0
+            for position in positions:
+                if position <= site < position + len(old_str):
+                    return position + earlier
+                if position < site:
+                    earlier += delta
+            return site + earlier
+
+        sites[rel] = [moved_site(site) for site in sites[rel]]
+        sites[rel].extend(position + index * delta for index, position in enumerate(positions))
         contents[rel] = text.replace(old_str, new_str)
         applied.append(f"edit {idx} ({rel}): replaced {count} occurrence(s)")
     if errors:
@@ -889,22 +1297,58 @@ def _edit_batch(
             "⚠️ EDIT_BATCH_ERROR: batch aborted, NOTHING was written (atomic). Problems:\n"
             + "\n".join("  - " + e for e in errors)
         )
+    for rel, text in contents.items():
+        if refusal := _edit_content_block(bindings[rel], text, force):
+            return f"⚠️ EDIT_BATCH_ERROR: {refusal}\nNothing was written."
+        if note := newline_normalization_note(targets[rel]):
+            notes.append(f"{rel}: {note}")
+        if note := edit_syntax_note(bindings[rel], text):
+            notes.append(note)
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.skill_repair_admission import repair_write_cas_error, advance_repair_expected_hash
+
+    constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
+    repair_binding = next((b for b in bindings.values() if b.skill_name), None)
+    if repair_binding and constraint and constraint.has_selected_skill:
+        if refusal := repair_write_cas_error(repair_binding.state_drive_root, constraint,
+                                             task_id=ctx.task_id, repair_task=True):
+            return refusal
     changed: List[str] = []
+    registered_outputs: List[str] = []
+    order = list(contents)
     for rel, text in contents.items():
         try:
             write_text(targets[rel], text)
         except Exception as e:  # noqa: BLE001 - surface the failed path
             return _partial_write_failure(
-                ctx, changed, "edit_batch", "EDIT_BATCH_ERROR",
+                ctx, changed, source_tool, "EDIT_BATCH_ERROR",
                 f"write failed for {rel}: {e}",
-                mutation_binding,
+                mutation_binding, pending=order[len(changed) + 1:],
             )
         changed.append(rel)
-    footer = _finish_mutation(ctx, changed, "edit_batch", mutation_binding)
+        if bindings[rel].root == "user_files":
+            from ouroboros.artifacts import copy_file_to_task_artifacts
+
+            try:
+                record = copy_file_to_task_artifacts(ctx, targets[rel], kind="user_file")
+                if not record:
+                    raise OSError("user file recovery copy was not registered")
+                registered_outputs.append(f"ARTIFACT_OUTPUTS: registered user file -> artifact_store:{record['name']}")
+            except Exception as exc:
+                return _partial_write_failure(ctx, changed, source_tool, "EDIT_BATCH_ERROR",
+                                              f"{rel} WAS written but its user artifact registration failed: {exc}",
+                                              mutation_binding, pending=order[len(changed):])
+    if repair_binding and constraint and constraint.has_selected_skill:
+        advance_repair_expected_hash(repair_binding.state_drive_root, constraint, task_id=ctx.task_id)
+    footer = _finish_mutation(ctx, changed, source_tool, mutation_binding)
+    previews = "\n".join(f"Context after {rel}:\n{numbered_edit_preview(contents[rel], sites[rel])}"
+                         for rel in changed)
+    if registered_outputs:
+        previews += "\n" + "\n".join(registered_outputs)
     return with_argument_notes(ctx, (
-        f"✅ edit_batch applied {len(applied)} edit(s) across {len(changed)} file(s):\n"
+        f"✅ {source_tool} applied {len(applied)} edit(s) across {len(changed)} file(s):\n"
         + "\n".join("  " + a for a in applied)
-        + f"\n{footer}"
+        + f"\n{previews}\n{footer}"
     ), notes)
 
 
@@ -984,15 +1428,24 @@ def get_tools() -> List[ToolEntry]:
                 "+each line of the new file prefixed with +\n"
                 "*** Delete File: old/file.py\n"
                 "*** End Patch\n"
-                "Hunks locate themselves by their exact context lines (copy them from "
-                "read_file); the optional @@ anchor disambiguates repeated contexts. "
-                "Prefer this over many edit_text calls for scattered multi-file changes. "
+                "Each hunk is placed in the whole original file by its exact context lines "
+                "(copy them from read_file, without the line numbers; trailing whitespace may "
+                "differ, indentation may not) and must match exactly one place; the optional "
+                "@@ anchor disambiguates repeated contexts. Repeat '*** Update File:' to chain "
+                "edits on an already patched file. Delete File stores the file's exact bytes "
+                "as a task artifact first. On a repo root, a written file whose final Python/JSON "
+                "does not parse (Add File included) is reported as SYNTAX_WARNING after it is "
+                "applied, never refused; write_file keeps its own full-write check. "
+                "Prefer this over many edit_text calls for related multi-file changes. "
                 "NOT for rewrites touching most of a file — there the patch grows as "
                 "large as the file itself; use write_file instead."
             ),
             "parameters": {"type": "object", "properties": {
                 "patch": {"type": "string", "description": "The full patch text (envelope lines optional)."},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "artifact_store", "user_files", "skill_payload"], "description": _FILE_ROOT_DESCRIPTION},
+                "bucket": {"type": "string", "description": "Skill payload bucket for root=skill_payload."},
+                "skill_name": {"type": "string", "description": "Skill slug for root=skill_payload."},
+                "force": {"type": "boolean", "default": False, "description": "Confirm an intentional shrink (>30% smaller); required to delete a file outside the repo roots."},
             }, "required": ["patch"]},
         }, _apply_patch, is_code_tool=True, mutates_worktree=True),
         ToolEntry("edit_batch", {
@@ -1011,7 +1464,10 @@ def get_tools() -> List[ToolEntry]:
                 "edits": {"type": "array", "items": {"type": "object",
                     "properties": {k: dict(v) for k, v in _EDIT_BATCH_ITEM_PROPERTIES.items()},
                     "required": list(_EDIT_BATCH_ITEM_REQUIRED)}},
-                "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace"},
+                "root": {"type": "string", "enum": ["active_workspace", "system_repo", "runtime_data", "task_drive", "artifact_store", "user_files", "skill_payload"], "description": _FILE_ROOT_DESCRIPTION},
+                "bucket": {"type": "string", "description": "Skill payload bucket for root=skill_payload."},
+                "skill_name": {"type": "string", "description": "Skill slug for root=skill_payload."},
+                "force": {"type": "boolean", "default": False, "description": "Confirm an intentional shrink (>30% smaller)."},
             }, "required": ["edits"]},
         }, _edit_batch, is_code_tool=True, mutates_worktree=True),
     ]

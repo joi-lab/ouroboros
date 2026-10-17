@@ -26,6 +26,7 @@ import time
 import uuid
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 from supervisor.state import append_jsonl
+from ouroboros.observability import stamp_finalization_enqueue
 from ouroboros.utils import utc_now_iso
 
 
@@ -91,15 +92,16 @@ def wake_gate_open() -> bool:
     return not reason or conversation_admitted_during_update(reason)
 
 
-def owner_conversation_admitted(chat_id: int) -> bool:
+def owner_conversation_admitted(chat_id: int, client_message_id: str = "") -> bool:
     """Admit one owner chat turn: open gate, or a resolver-held update.
 
-    A refused turn gets the pool's existing lock notice (``_repo_writer_turn_allowed``).
+    A refused turn gets the pool's existing lock notice (``_repo_writer_turn_allowed``),
+    naming the submission it answers.
     """
     reason = _pool().repo_writer_admission_closed()
     if not reason or conversation_admitted_during_update(reason):
         return True
-    return bool(_pool()._repo_writer_turn_allowed(chat_id))
+    return bool(_pool()._repo_writer_turn_allowed(chat_id, client_message_id))
 
 
 def preload_owner_control_path() -> list[str]:
@@ -154,7 +156,7 @@ def handle_chat_direct(
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
 ) -> None:
-    if not owner_conversation_admitted(chat_id):
+    if not owner_conversation_admitted(chat_id, str((task_metadata or {}).get("client_message_id") or "")):
         return
     _handle_chat_direct_locked(
         chat_id, text, image_data,
@@ -190,12 +192,35 @@ def _handle_chat_direct_locked(
 
 
 def _host_operation_failure(metadata: Optional[dict]) -> dict:
-    """Optional terminal correlation for the host's preaccepted skill messages."""
+    """A refusal's correlation: the owner submission it answers (only that
+    ``Sending...`` settles) and, for the host's preaccepted skill messages,
+    their terminal correlation."""
     from ouroboros.task_finalization import host_operation_reply_kwargs
 
-    if (metadata or {}).get("_host_operation"):
-        return host_operation_reply_kwargs((metadata or {}).get("origin_message_ref"), "failed")
-    return {}
+    meta = metadata or {}
+    source = meta.get("origin_message_ref") if meta.get("_host_operation") else None
+    return host_operation_reply_kwargs(source, "failed", str(meta.get("client_message_id") or ""))
+
+
+def _rejected_rows(manifest: Any) -> list:
+    """The rejected declarations of one staging manifest."""
+    return [row for row in (manifest or []) if isinstance(row, dict) and row.get("status") == "rejected"]
+
+
+def _record_attachment_rejections(
+    task: Dict[str, Any], chat_id: int, metadata: Optional[dict], manifest: Any, *, started: bool,
+) -> None:
+    """One failure-only diagnostic row: the per-file reasons the owner's chat no longer carries."""
+    rows = [{key: row.get(key) for key in ("ordinal", "label", "status", "reason", "rule") if row.get(key) is not None}
+            for row in _rejected_rows(manifest)]
+    try:
+        append_jsonl(_pool().DRIVE_ROOT / "logs" / "supervisor.jsonl", {
+            "ts": utc_now_iso(), "type": "attachments_rejected", "task_id": str(task.get("id") or ""),
+            "chat_id": int(chat_id or 0), "started": started,
+            "origin_message_ref": (metadata or {}).get("origin_message_ref"), "rejected": rows,
+        })
+    except Exception:
+        log.debug("attachments_rejected row failed", exc_info=True)
 
 
 def _broadcast_task_named(msg: dict) -> None:
@@ -271,7 +296,7 @@ def _admit_chat_task(
 
     quiet = is_consciousness_origin(task_metadata)  # a wake: the alarm reports the refusal, not the chat
     with _pool()._repo_writer_gate_lock:
-        if not (wake_gate_open() if quiet else owner_conversation_admitted(chat_id)):
+        if not (wake_gate_open() if quiet else owner_conversation_admitted(chat_id, client_msg_id)):
             return None
         activity = registry.register(
             task["id"], chat_id,
@@ -350,29 +375,32 @@ def _admit_chat_task(
             from ouroboros.gateway.tasks import _render_attachment_lines
 
             manifest = stage_task_attachments(_pool().DRIVE_ROOT, str(task["id"]), uploads)
-            rendered = _render_attachment_lines(manifest)
             # Partial staging is the default (В25c, capinv-447); a FULLY-rejected
             # set stays atomic — the task would start with none of its material.
             if attachment_manifest_all_rejected(manifest):
                 from ouroboros.artifacts import remove_staged_attachments
+                from ouroboros.project_dialogue import routing_refusal_cause
 
                 remove_staged_attachments(manifest)
+                _record_attachment_rejections(task, chat_id, task_metadata, manifest, started=False)
+                # No mind will read this message: one short typed mark in owner words
+                # (closed class), never the model's block; the files are on the owner's
+                # bubble and the per-file causes in the diagnostic row.
+                cause = routing_refusal_cause("promote_chat_to_task", "rejected", "attachment_admission_rejected")
+                count = len(_rejected_rows(manifest))
                 _pool().send_with_budget(
-                    chat_id,
-                    f"⚠️ Task not started: every attachment was rejected.\n{rendered}",
+                    chat_id, f"{cause} ({count} file{'' if count == 1 else 's'})" if count else cause,
                     **_host_operation_failure(task_metadata),
-                    role="system", system_type="attachment_notice")
+                    role="system", system_type="task_not_started")
                 registry.unregister(task["id"])
                 return None
             from ouroboros.artifacts import attachment_manifest_projection
             authority = attachment_manifest_projection(_pool().DRIVE_ROOT, str(task["id"]), manifest)
             rendered = _render_attachment_lines(authority)
             if attachment_manifest_has_rejections(manifest):
-                _pool().send_with_budget(
-                    chat_id,
-                    "⚠️ Some declared attachments could not be staged; the task "
-                    f"starts with the rest.\n{rendered}",
-                    role="system", system_type="attachment_notice")
+                # The turn starts with the rejected rows in its own block and
+                # tells the owner itself; the host keeps only the diagnostic.
+                _record_attachment_rejections(task, chat_id, task_metadata, manifest, started=True)
             if manifest:
                 manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(_pool().DRIVE_ROOT)
@@ -402,7 +430,8 @@ def _admit_chat_task(
             except Exception as exc:
                 _pool()._report_binding_failure(task["id"], pid, exc, path="direct_project_turn")
         if not task["text"]:
-            task["text"] = "(image attached)" if image_data else ""
+            from ouroboros.chat_uploads import attachment_placeholder
+            task["text"] = attachment_placeholder(image_data, task_metadata)
         # A Main turn is named lazily: the turn queue below fires the namer on
         # the first non-addressing tool call (owner decision Q7=A, 16.09), so a
         # greeting costs no naming call and a working turn gets a title as its
@@ -413,6 +442,8 @@ def _admit_chat_task(
         # here, before the contract reads them (consciousness_authority).
         apply_consciousness_authority(task)
         attach_task_contract(task)
+        from ouroboros.tool_access_roots import freeze_tool_profile
+        freeze_tool_profile(task)
 
         # Announce the authoritative start immediately (owner decision 2A):
         # the client's `Sending...` retires on this receipt (once the census
@@ -496,40 +527,17 @@ def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
                     and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
                 remaining.append(event)
                 continue
-            task_id = str(event.get("task_id") or task.get("id") or "")
-            try:
-                from types import SimpleNamespace
-
-                from supervisor import queue as queue_mod
-                from supervisor.events_budget import install_exact_budget_pause
-                from supervisor.message_bus import get_bridge
-
-                pool = _pool()
-                shim = SimpleNamespace(
-                    RUNNING=pool.RUNNING, PENDING=pool.PENDING, WORKERS=pool.WORKERS, DRIVE_ROOT=pool.DRIVE_ROOT,
-                    sort_pending=queue_mod.sort_pending, persist_queue_snapshot=queue_mod.persist_queue_snapshot,
-                    bridge=get_bridge(),
-                )
-                install_exact_budget_pause(shim, task_id, checkpoint, evt=event, source="direct_turn_inline_park")
-                append_jsonl(
-                    pool.DRIVE_ROOT / "logs" / "supervisor.jsonl",
-                    {"ts": utc_now_iso(), "type": "direct_turn_budget_pause_parked_inline",
-                     "task_id": task_id, "chat_id": event.get("chat_id"),
-                     "pause_id": str(checkpoint.get("pause_id") or "")},
-                )
-            except Exception:
-                log.error("Direct turn %s could not be parked inline; its pause event takes the ordinary path",
-                          task_id, exc_info=True)
+            from supervisor.direct_pause import park_direct_pause
+            if not park_direct_pause(task, event):
                 remaining.append(event)
-            finally:
-                from ouroboros.budget_pause import end_dispatch_fence
-
-                end_dispatch_fence(task_id)  # quiescent actor unwound; the durable row owns the dispatch hold
         for e in remaining:
-            _pool().get_event_q().put(turn_queue.stamp(e))
+            _pool().get_event_q().put(stamp_finalization_enqueue(turn_queue.stamp(e)))
         ok = True
     except Exception as e:
-        _report_direct_chat_error(admitted, e)
+        from supervisor.direct_pause import recover_direct_pause
+        ok = recover_direct_pause(task)
+        if not ok:
+            _report_direct_chat_error(admitted, e)
     finally:
         registry.unregister(task["id"])
     return ok
@@ -574,10 +582,11 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
                 )
             except Exception:
                 log.debug("Failed-turn typing announce failed", exc_info=True)
-        failure_meta = _host_operation_failure(task_metadata)
+        # The keyed final concludes its own turn and linked Sending; it keeps only the host-operation source.
+        correlation = _host_operation_failure(task_metadata).get("progress_meta", {})
         progress_meta = {"task_terminal_status": "failed"}
-        if failure_meta:
-            progress_meta["origin_message_ref"] = failure_meta["progress_meta"]["origin_message_ref"]
+        if "origin_message_ref" in correlation:
+            progress_meta["origin_message_ref"] = correlation["origin_message_ref"]
         initiator = str((task_metadata or {}).get("initiator") or "")
         if initiator:
             progress_meta["initiator"] = initiator

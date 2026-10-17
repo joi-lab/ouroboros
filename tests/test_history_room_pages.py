@@ -11,6 +11,7 @@ import os
 from ouroboros.gateway import history_paging
 from ouroboros.gateway.history_segments import SegmentSummary, room_segment_lens, segment_summary
 from tests.test_chat_history_paging import isolated_runtime, pages, request, row, write  # noqa: F401
+from tests._room_shared import RoomsFromBindings
 
 
 def foreign_archives(root, stamp, count=3):
@@ -110,9 +111,9 @@ def test_the_read_ceiling_bounds_each_request_but_loses_nothing(tmp_path, monkey
 
 
 def test_main_and_rooms_sharing_its_lens_never_skip_an_archive():
-    assert room_segment_lens(1, {7}, [], {"task": 7}) is None
-    assert room_segment_lens(42, {7}, [], {"task": 7}) is None
-    may_hold = room_segment_lens(7, {7}, [], {"task": 7, "other": 8})
+    assert room_segment_lens(1, {7}, [], RoomsFromBindings({"task": 7})) is None
+    assert room_segment_lens(42, {7}, [], RoomsFromBindings({"task": 7})) is None
+    may_hold = room_segment_lens(7, {7}, [], RoomsFromBindings({"task": 7, "other": 8}))
     assert may_hold(SegmentSummary(frozenset({7}), frozenset(), frozenset()))
     assert may_hold(SegmentSummary(frozenset({1}), frozenset({"task"}), frozenset()))
     assert not may_hold(SegmentSummary(frozenset({1, 8}), frozenset({"other"}), frozenset()))

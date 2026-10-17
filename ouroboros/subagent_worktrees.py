@@ -14,6 +14,10 @@ not ``.git`` scoped). Tree-proportional work never runs under it (#1241):
 listing, classifying, hashing, populating, copying (and re-recording the copied
 bytes' stat) and deleting a snapshot's files happen outside the lock, so one
 huge inventory delays only its own task.
+
+Registry updates are whole-file read-modify-write, O(rows). Eligible untracked
+text is hashed into the target's object database; once the pin or branch is
+deleted those blobs are unreachable objects until ``git gc``.
 """
 
 from __future__ import annotations
@@ -48,6 +52,9 @@ _BRANCH_PREFIX = "subagent/"
 # baseline ref namespace. The ref pins the baseline commit against GC for as
 # long as the snapshot lives; it is deleted with the snapshot.
 _KIND_DELEGATED_EXEC = "delegated_exec"
+# Own-body authoring candidates (``body_candidate.py``): retention is decided by
+# unique work and last use, never by age alone, and never by a child task's id.
+_KIND_BODY_CANDIDATE = "body_candidate"
 _BASELINE_REF_PREFIX = "refs/ouroboros/delegated/"
 
 # Serializes worktree mutations within this process; the on-disk lock serializes
@@ -242,11 +249,31 @@ def _force_rmtree(path: Path) -> None:
     On Windows git pack/object files under ``.git`` are read-only, and
     ``shutil.rmtree(ignore_errors=True)`` silently FAILS to delete them, leaving
     the directory behind. The onerror hook clears the read-only bit and retries
-    so genesis-project / worktree teardown actually removes the tree."""
+    so genesis-project / worktree teardown actually removes the tree. It only adds
+    owner bits, only inside the tree and never through a link (a target may live
+    outside it): a removal its folder refuses makes that folder writable, and a
+    folder that could not be listed is made listable and removed in turn."""
+    root = os.path.abspath(path)
+
+    def _linked(info):  # a link, or a Windows junction (reparse point)
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400)
+
+    def _grant(target, bits):
+        info = os.lstat(target)  # one look: the mode written is this entry's own
+        if os.path.commonpath([root, target]) == root and not _linked(info):
+            os.chmod(target, stat.S_IMODE(info.st_mode) | bits)
+
     def _on_error(func, p, _exc):
+        p = os.path.abspath(p)  # a relative tree reports relative paths
         try:
-            os.chmod(p, stat.S_IWRITE)
-            func(p)
+            if func in (os.unlink, os.remove, os.rmdir):
+                if os.path.dirname(p) != os.path.dirname(root):
+                    _grant(os.path.dirname(p), stat.S_IRWXU)
+                _grant(p, stat.S_IRWXU if os.path.isdir(p) else stat.S_IWRITE | stat.S_IREAD)
+                func(p)
+            elif not _linked(os.lstat(p)) and os.path.isdir(p):
+                _grant(p, stat.S_IRWXU)
+                shutil.rmtree(p, onerror=_on_error)
         except Exception:
             pass
 
@@ -550,12 +577,17 @@ def _git_env(repo_dir: Path, *args: str, env: Dict[str, str],
 
 def provision_execution_snapshot(
     *, target_root: Any, task_id: Any, snapshot_id: str,
-    worktree_root: Optional[Any] = None, data_dir: Optional[Any] = None,
+    worktree_root: Optional[Any] = None, data_dir: Optional[Any] = None, independent: bool = False,
 ) -> ExecutionSnapshotHandle:
-    """Provision a run-owned current-tree snapshot; custody owns its lifetime."""
+    """Provision a run-owned current-tree snapshot; custody owns its lifetime.
+
+    ``independent`` (an evidence-only investigation, #1609) makes the execution
+    root a private clone instead of a linked worktree, so the run's own Git
+    operations never reach the target's refs, stash or config; the clone still
+    compares working files as the target does (``_adopt_source_comparison``)."""
     return _provision_git_copy(
         target_root=target_root, task_id=task_id, snapshot_id=snapshot_id,
-        worktree_root=worktree_root, data_dir=data_dir,
+        worktree_root=worktree_root, data_dir=data_dir, independent=independent,
     )
 
 
@@ -569,6 +601,7 @@ def _provision_git_copy(
     task_copy: bool = False,
     parent_task_id: str = "",
     source_is_system_repo: bool = True,
+    independent: bool = False,
 ) -> ExecutionSnapshotHandle | WorktreeHandle:
     """Snapshot ``target_root``'s REAL current tree into a private execution root.
 
@@ -759,8 +792,12 @@ def _provision_git_copy(
             wt_path.parent.mkdir(parents=True, exist_ok=True)
             if task_copy:
                 _git(target, "worktree", "add", "--no-checkout", "--force", str(wt_path), branch)
+            elif independent:
+                clone_private_checkout(Path(git_dir), wt_path, head=baseline_sha)
             else:
                 _git(target, "worktree", "add", "--detach", "--no-checkout", str(wt_path), baseline_sha)
+        if independent:
+            _adopt_source_comparison(target, Path(git_dir), wt_path)
         # Populate outside the lock: the same reset git's own `worktree add` runs
         # (no submodule recursion) — minus the target's post-checkout hook.
         _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
@@ -844,6 +881,67 @@ def isolated_git_env() -> Dict[str, str]:
     return env
 
 
+def clone_private_checkout(source: Path, dest: Path, *, head: str = "") -> None:
+    """An INDEPENDENT private clone of ``source`` at ``dest``, with nothing checked out.
+
+    A linked worktree shares its repository's refs, stash, config and hooks, so an
+    ordinary ``git stash``/``branch``/``tag``/``config`` run inside it lands in the
+    author's repository. This clone borrows the source's object store read-only
+    (``--shared`` alternates; objects it writes stay its own) and owns everything
+    else. Its ``origin`` remote is removed, so no push has a default target.
+    ``head`` becomes its detached HEAD; the caller populates index and worktree.
+    """
+    env = isolated_git_env()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for args in (["clone", "--shared", "--no-checkout", "--quiet", str(source), str(dest)],
+                 ["-C", str(dest), "remote", "remove", "origin"],
+                 *([["-C", str(dest), "update-ref", "--no-deref", "HEAD", head]] if head else [])):
+        subprocess.run(["git", *args], capture_output=True, check=True, env=env, timeout=600)
+
+
+# What git consults, besides the tree's own .gitattributes, to convert and
+# compare working files: line endings and executable-bit trust.
+_COMPARISON_CONFIG = r"^core\.(autocrlf|eol|filemode|attributesfile)$"
+
+
+def _adopt_source_comparison(target: Path, git_dir: Path, clone: Path) -> None:
+    """Make an independent clone convert and compare working files as its source does.
+
+    The baseline was hashed through the source's EFFECTIVE conversion; the
+    copied bytes are re-hashed in the clone (the provisioning check, the child's
+    own Git, the capture), which sees only the system/global scope of the config
+    a linked worktree would share. So the source's effective values of these
+    keys that the clone does not already see, and its ``info/attributes``, are
+    written into the clone. Data only: no filter, driver, hook or other
+    executable setting is transferred, so a baseline that depends on one still
+    refuses at the provisioning check.
+    """
+    def effective(repo: Path) -> Dict[str, str]:
+        listed = _git(repo, "config", "-z", "--get-regexp", _COMPARISON_CONFIG, check=False).stdout
+        # Later scopes win; a valueless entry is a boolean true.
+        return {key: value if newline else "true"
+                for key, newline, value in (item.partition("\n") for item in listed.split("\0") if item)}
+
+    inherited = effective(clone)
+    for key, value in effective(target).items():
+        if key == "core.attributesfile":
+            # Keep this lower-precedence input separate from info/attributes.
+            # A relative path may name ignored data absent from the clone.
+            source_path = _git(target, "config", "-z", "--path", "--get", key).stdout.rstrip("\0")
+            source_file = target / source_path
+            if source_file.is_file():
+                private_file = clone / ".git" / "info" / "source-attributes"
+                private_file.parent.mkdir(exist_ok=True)
+                private_file.write_bytes(source_file.read_bytes())
+                value = str(private_file)
+        if inherited.get(key) != value:
+            _git(clone, "config", "--local", key, value)
+    attributes = git_dir / "info" / "attributes"
+    if attributes.is_file():
+        (clone / ".git" / "info").mkdir(exist_ok=True)
+        (clone / ".git" / "info" / "attributes").write_bytes(attributes.read_bytes())
+
+
 def payload_git_metadata_refusal(exec_root: Path) -> str:
     """lstat-trust check on a child-writable snapshot's Git metadata, or "".
 
@@ -865,6 +963,91 @@ def payload_git_metadata_refusal(exec_root: Path) -> str:
     return ""
 
 
+class _RawBlobWriter:
+    """ONE ``git fast-import`` storing the raw blobs of one staging call.
+
+    A Git process per blob would cost a process start per file. Each blob is
+    framed by its exact length (``data <n>``), so payload bytes are never parsed
+    as commands, and fast-import opens no path and applies no attribute, filter
+    or eol conversion. Each id is read back (``get-mark``) before the next blob
+    is sent and stderr goes to a file, so no unread pipe can fill and stall the
+    writer. The ids name stored objects only after the explicit ``done``
+    (``--done``) and exit 0 (``finish``); any other end kills the process.
+    By default fast-import holds a blob, its predecessor and a delta of them in
+    memory; ``core.bigFileThreshold`` streams every blob over 1 MiB (the
+    ``--big-file-threshold`` option reaches only the first blob in Git 2.53),
+    and the written pack is kept rather than exploded into loose objects by a
+    second process; large payloads need not stay in Git's delta search.
+    """
+
+    def __init__(self, root: Path, env: Dict[str, str]):
+        self._root, self._env, self._errors = root, env, None
+        self._proc: Optional[subprocess.Popen] = None
+
+    def __enter__(self) -> "_RawBlobWriter":
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._proc is not None:
+            if self._proc.poll() is None:
+                self._proc.kill()  # it never acknowledged ``done``: nothing it wrote is staged
+            self._proc.wait()
+            for pipe in (self._proc.stdin, self._proc.stdout):
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        if self._errors is not None:
+            self._errors.close()
+
+    def _failure(self, detail: bytes) -> subprocess.CalledProcessError:
+        if self._proc.poll() is None:
+            self._proc.kill()
+        self._errors.seek(0)
+        return subprocess.CalledProcessError(
+            self._proc.wait(), self._proc.args, detail, self._errors.read() or detail)
+
+    def write(self, blob: bytes) -> str:
+        """Store one blob; its object id."""
+        if self._proc is None:
+            import tempfile
+
+            self._errors = tempfile.TemporaryFile()
+            self._proc = subprocess.Popen(
+                ["git", "-c", "core.bigFileThreshold=1m", "-c", "fastimport.unpackLimit=0",
+                 "fast-import", "--quiet", "--done"], cwd=str(self._root), env=self._env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._errors)
+        try:
+            self._proc.stdin.write(b"blob\nmark :1\ndata %d\n" % len(blob))
+            self._proc.stdin.write(blob)
+            self._proc.stdin.write(b"\nget-mark :1\n")
+            self._proc.stdin.flush()
+        except OSError as exc:  # the process is gone: its status and stderr say why
+            raise self._failure(str(exc).encode()) from exc
+        answer = self._proc.stdout.readline().strip()
+        if not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", answer):
+            raise self._failure(b"no object id from fast-import: " + answer[:80])
+        return answer.decode("ascii")
+
+    def finish(self) -> None:
+        """End the stream; raises unless every written blob is now a stored object."""
+        if self._proc is None:
+            return
+        try:
+            self._proc.stdin.write(b"done\n")
+            self._proc.stdin.close()
+        except OSError as exc:
+            raise self._failure(str(exc).encode()) from exc
+        trailing = self._proc.stdout.read()
+        if self._proc.wait() != 0 or trailing:
+            raise self._failure(trailing[:200])
+
+
+class RawStagingIncomplete(subprocess.CalledProcessError):
+    """``update-index --index-info`` exited 0, but the index lacks records as sent."""
+
+    def __str__(self) -> str:
+        return self.stderr.decode("utf-8", "replace")
+
+
 def stage_raw_payload_inventory(
     worktree: Path, rel_paths: Any, env: Dict[str, str],
     baseline_modes: Optional[Dict[str, str]] = None,
@@ -873,40 +1056,48 @@ def stage_raw_payload_inventory(
 
     ``git add``/worktree ``update-index`` run clean/eol filters from a child- or
     payload-authored ``.gitattributes`` (CRLF staged as LF — reproduced by
-    review), so every regular file is hashed with ``hash-object --no-filters``
-    over raw bytes and staged via ``--index-info``; ``.gitattributes`` is just
-    content, a symlink stages as 120000 over its raw link-target bytes. Modes:
+    review), so each file's raw bytes are read here, one file at a time, stored
+    by ONE ``git fast-import`` for the whole inventory (``_RawBlobWriter``) and
+    staged via ``--index-info``, both in the caller's ``env`` (its index, object
+    database and config); ``.gitattributes`` is just content, a symlink stages
+    as 120000 over its raw link-target bytes. Modes:
     with ``baseline_modes`` (capture) regular files pin to the baseline mode for
     existing paths / 100644 for new ones so an executable-bit flip can never
-    ride a patch; without it (provisioning) the real on-disk mode is recorded.
+    ride a patch; without it (provisioning/reviewer capture) on-disk modes ride.
+    ``--index-info`` exits 0 even when it skips a path Git refuses (``..``, a
+    ``.git`` component, a Windows device name), so each record is sent in its
+    ``ls-files --stage`` shape and ONE such read must list it back verbatim.
     Returns the paths whose on-disk executable bit diverges from the staged mode.
     """
     root = Path(worktree)
     lines: List[bytes] = []
     divergent: List[str] = []
-    for rel in sorted(str(p) for p in rel_paths):
-        path = root / rel
-        if path.is_symlink():
-            blob, mode = os.readlink(os.fsencode(str(path))), "120000"
-        else:
-            blob = path.read_bytes()
-            executable = bool(path.stat().st_mode & 0o111)
-            if baseline_modes is None:
-                mode = "100755" if executable else "100644"
+    with _RawBlobWriter(root, env) as writer:
+        for rel in sorted(str(p) for p in rel_paths):
+            path = root / rel
+            if path.is_symlink():
+                blob, mode = os.readlink(os.fsencode(str(path))), "120000"
             else:
-                base = baseline_modes.get(rel, "")
-                mode = base if base in ("100644", "100755") else "100644"
-                if executable != (mode == "100755"):
-                    divergent.append(rel)
-        hashed = subprocess.run(
-            ["git", "hash-object", "--no-filters", "-w", "--stdin"],
-            cwd=str(root), capture_output=True, env=env, input=blob, check=True)
-        sha = hashed.stdout.decode("ascii", errors="replace").strip()
-        lines.append(f"{mode} {sha}\t{rel}".encode("utf-8", errors="surrogateescape"))
-    subprocess.run(
-        ["git", "update-index", "-z", "--index-info"],
-        cwd=str(root), capture_output=True, env=env,
-        input=b"\0".join(lines) + b"\0" if lines else b"", check=True)
+                blob = path.read_bytes()
+                executable = bool(path.stat().st_mode & 0o111)
+                if baseline_modes is None:
+                    mode = "100755" if executable else "100644"
+                else:
+                    base = baseline_modes.get(rel, "")
+                    mode = base if base in ("100644", "100755") else "100644"
+                    if executable != (mode == "100755"):
+                        divergent.append(rel)
+            sha = writer.write(blob)
+            lines.append(f"{mode} {sha} 0\t{rel}".encode("utf-8", errors="surrogateescape"))
+        writer.finish()
+    update = subprocess.run(["git", "update-index", "-z", "--index-info"], cwd=str(root), capture_output=True,
+                            env=env, input=b"\0".join(lines) + b"\0" if lines else b"", check=True)
+    listed = set(_git_env(root, "ls-files", "--stage", "-z", env=env).stdout.split(b"\0"))
+    unstaged = [line.partition(b"\t")[2] for line in lines if line not in listed]
+    if unstaged:  # names at most five; Git's own stderr is carried as evidence, never parsed
+        detail = b"update-index exited 0, but the index lacks %d of %d records as sent (%s); git: %s" % (
+            len(unstaged), len(lines), b", ".join(unstaged[:5]), update.stderr.strip()[:300])
+        raise RawStagingIncomplete(update.returncode, update.args, update.stdout, detail)
     return divergent
 
 
@@ -969,20 +1160,27 @@ def _reproduce_confined_link(target_root: Path, src_link: Path, dest_link: Path)
     return True
 
 
-def _copy_payload_inventory(target: Path, dest: Path) -> int:
+def _copy_payload_inventory(target: Path, dest: Path, *, manifest_entry: str = "",
+                            manifest_scripts: Optional[List[Dict[str, Any]]] = None,
+                            preserve_links: bool = True) -> int:
     """Copy the exact skill-loader-visible inventory of ``target`` into ``dest``.
 
     The loader inventory is the SSOT walk (cache/control-dir exclusions, symlink
     escape exclusion, credential-shape refusal) — no second filesystem walk is
-    invented. A file reached through a symlinked ancestor directory reproduces
-    the ancestor LINK once instead of materializing a second copy under it.
+    invented; a declared manifest entry or script joins it even under an excluded
+    folder, exactly as it joins the content hash. A file reached through a
+    symlinked ancestor directory reproduces the ancestor LINK once instead of
+    materializing a second copy under it. Read-only review views set
+    ``preserve_links=False`` to retain each inventory path's bytes even when a
+    link points into an excluded dependency folder; they copy no extra files.
     """
     from ouroboros.skill_loader import _iter_payload_files
 
     resolved_target = target.resolve()
     dest.mkdir(parents=True, exist_ok=False)
     copied = 0
-    for path in _iter_payload_files(resolved_target):
+    for path in _iter_payload_files(resolved_target, manifest_entry=manifest_entry,
+                                    manifest_scripts=manifest_scripts):
         rel = path.relative_to(resolved_target)
         # A symlinked ANCESTOR directory is reproduced as the link itself; the
         # linked content is copied at its real (confined) location by its own
@@ -991,7 +1189,7 @@ def _copy_payload_inventory(target: Path, dest: Path) -> int:
         via_link = False
         for part in rel.parts[:-1]:
             ancestor = ancestor / part
-            if ancestor.is_symlink():
+            if preserve_links and ancestor.is_symlink():
                 link_rel = ancestor.relative_to(resolved_target)
                 if _reproduce_confined_link(resolved_target, ancestor, dest / link_rel):
                     copied += 1
@@ -1001,7 +1199,7 @@ def _copy_payload_inventory(target: Path, dest: Path) -> int:
             continue
         out = dest / rel
         out.parent.mkdir(parents=True, exist_ok=True)
-        if path.is_symlink():
+        if preserve_links and path.is_symlink():
             if _reproduce_confined_link(resolved_target, path, out):
                 copied += 1
             continue
@@ -1208,7 +1406,7 @@ def remove_worktree(
     entries = _load_registry(data_dir, strict=True, op="remove_worktree")
     match: Optional[Dict[str, Any]] = None
     for entry in entries:
-        if entry.get("kind") == _KIND_DELEGATED_EXEC:
+        if entry.get("kind") in (_KIND_DELEGATED_EXEC, _KIND_BODY_CANDIDATE):
             continue
         if task_id and entry.get("task_id") == str(task_id):
             match = entry
@@ -1228,6 +1426,8 @@ def remove_worktree(
     wt_path = Path(match.get("path") or "")
     if _deletable(wt_path, root) and wt_path.exists():
         _force_rmtree(wt_path)  # the checkout's files go first, OUTSIDE the lock (#1241)
+    from ouroboros import body_candidate
+    body_candidate.discard_scratch(match)  # an own-body copy's sibling process environment, unless retained
     with _ops_lock(root, op="remove_worktree", task_id=str(task_id or ""), timeout_sec=lock_wait_sec):
         _remove_paths(Path(match.get("git_dir") or match.get("repo_dir") or "."), wt_path, match.get("branch") or "", allowed_root=root)
         survivors = [
@@ -1254,8 +1454,31 @@ def prune_orphans(
     removed: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
     repos: set[str] = set()
+    # A candidate's verdict reads its whole tree (and may capture it), so it is
+    # computed before the lock; under the lock the row is read again and a removing
+    # verdict is applied only while it still describes that row and that checkout
+    # (`body_candidate.verdict_holds`). A row first seen under the lock is kept.
+    from ouroboros import body_candidate
+    verdicts = {
+        str(entry.get("path") or ""): body_candidate.retention_verdict(
+            entry, data_dir=data_dir,
+            expired=max(float(entry.get("created_at") or 0), float(entry.get("used_at") or 0)) < cutoff)
+        for entry in _load_registry(data_dir, strict=True, op="prune_orphans")
+        if entry.get("kind") == _KIND_BODY_CANDIDATE}
     with _ops_lock(root, op="prune"):
         for entry in _load_registry(data_dir, strict=True, op="prune_orphans"):
+            if entry.get("kind") == _KIND_BODY_CANDIDATE:
+                verdict = verdicts.get(str(entry.get("path") or "")) or {"remove": False}
+                if not verdict["remove"] or not body_candidate.verdict_holds(entry, verdict, data_dir=data_dir):
+                    kept.append(entry)
+                    continue
+                body_candidate.discard_scratch(entry)
+                _remove_paths(Path(str(entry.get("git_dir") or entry.get("repo_dir") or ".")),
+                              Path(str(entry.get("path") or "")),
+                              "" if verdict.get("keep_branch") else str(entry.get("branch") or ""),
+                              allowed_root=root)
+                removed.append(entry)
+                continue
             if entry.get("kind") == _KIND_DELEGATED_EXEC:
                 # Delegated execution snapshots have their OWN lifecycle: they persist
                 # until the run's explicit patch disposition, and the startup GC
@@ -1273,6 +1496,7 @@ def prune_orphans(
             if created < cutoff or not path_exists:
                 if repo_dir or wt_path:
                     _remove_paths(Path(repo_dir or "."), Path(wt_path), entry.get("branch") or "", allowed_root=root)
+                body_candidate.discard_scratch(entry)
                 removed.append(entry)
             else:
                 kept.append(entry)
@@ -1288,3 +1512,12 @@ def prune_orphans(
 def list_worktrees(data_dir: Optional[Any] = None) -> List[Dict[str, Any]]:
     """Return registered worktree records (for UI / inspection)."""
     return _load_registry(data_dir)
+
+
+def registered_checkout(path: Any, data_dir: Optional[Any] = None) -> bool:
+    """Is ``path`` one of this registry's own checkouts (a child's copy, a delegated
+    execution snapshot, a body candidate)? A soft read: an unreadable registry answers no."""
+    target = Path(str(path or "")).resolve()
+    return bool(str(path or "").strip()) and any(
+        Path(str(entry.get("path"))).resolve() == target
+        for entry in _load_registry(data_dir) if entry.get("path"))

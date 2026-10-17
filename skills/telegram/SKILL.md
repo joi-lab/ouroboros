@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.11
+version: 1.3.0
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -13,7 +13,7 @@ subscribe_events: [chat.outbound, chat.typing, chat.photo, chat.video, chat.docu
 conflicts: [telegram-bridge, telegram-miniapp-poc]
 when_to_use: The owner wants to communicate with and control Ouroboros through Telegram.
 model_experience:
-  what_model_sees: No new tools; the skill relays owner messages, photos and files (documents, video, audio, voice) from Telegram into the normal chat and mirrors replies back, so conversation turns may originate from Telegram without any visible difference. An owner's answer to a quiz card tapped or replied to in Telegram arrives through the same decision ingress as a web-card answer.
+  what_model_sees: No new tools; Telegram owner text, photos and files enter normal chat. Replies to mirrored messages carry host reply references for the mind to interpret, never routing instructions. Quiz answers use the web card's decision ingress. Answers to earlier owner messages use native Telegram replies.
   token_effect: Near-zero while idle — no per-round schema cost; incoming Telegram media arrive as ordinary attachments and cost what any chat attachment costs.
 timeout_sec: 60
 companion_processes:
@@ -40,29 +40,32 @@ memory, so the bot ships no dictionary and follows any language the owner choose
 keep their ordinary command-mode rules even in replies; quote a literal command
 as code or include it inside an explanation to send it as a quiz answer.
 
-Version 1.1 adds richer Telegram formatting, native MP3/M4A playback, and
-inline link keyboards. Version 1.1.1 fixes the task-done push, which read the
-lifecycle axis as a whole object and warned on every finished task. Version 1.2
-adds inbound files, answerable quiz cards, a truthful `degraded` bridge status
-while token validation is deferred by a dead network, and a task-done push whose
-word and icon follow the host's task phase (done, done with warnings, failed,
-cancelled).
+Version 1.3 remembers every mirrored part, including media and completion
+notices, in a bounded durable message map. Replying passes its host row or work
+reference through normal chat; Ouroboros decides what it means. Unknown or
+evicted ids add nothing. Answers to an earlier owner message from this Telegram
+chat use a native reply; answers to its latest owner message stay unquoted.
+Silent mode edits only within one task episode and reply origin; Continue
+episodes remain separate messages. Relay success stays silent; a host-reported
+failure arrives as one line. A relayed row quotes the owner's words verbatim as
+plain text, under where he wrote them and with the file names, above the note.
+Quiz buttons and replies keep their decision path; earlier parts of a long
+question carry ordinary references.
 
 Version 1.2.1 marks questions that wait for an owner answer and clears the
 waiting line after an answer submitted through Telegram.
 Version 1.2.3 serves the stored settings on GET settings/save so the Settings
 form shows saved values before Save, and shortens the four long option labels.
-Version 1.2.4 always sends one short line when a task does not finish cleanly, with
-the same status word and reason sentence the task card shows; the task-completion
-toggle now only adds the clean finishes.
+Version 1.2.4 introduced a non-clean completion notice even with the task toggle off;
+version 1.2.14 replaces that policy with a true opt-out (below).
 Version 1.2.5 shows the whole quiz card: its project, the host's facts about the
 asking task, and every option's detail, with localized field names; a card too
 long for one Telegram message arrives as ordered parts followed by the keyboard
 message, and nothing authored is cut.
-Version 1.2.6 edits a sent question card when the host publishes its lifecycle
-(`chat.quiz_state`): an answer given on the web settles it, a closed wait drops the
-waiting line while the buttons stay, and a finished task says a late answer still
-counts as your message. The card only moves forward — nothing reopens an answer.
+Version 1.2.6 edits a sent question card on its lifecycle (`chat.quiz_state`): a
+web answer settles it, a closed wait drops the waiting line yet keeps buttons,
+a finished task says a late answer still counts, and (1.2.13) a question closed
+unanswered states that and its reason without buttons. Answers and closures are final.
 An open question (no options) is the same whole card without buttons; it asks for
 a reply in your own words.
 
@@ -81,6 +84,22 @@ for the whole installation through the host's one writer, and the bridge's own
 menu, buttons, card hints and notifications are read through the install's
 translation memory (a line it lacks is generated like a browser miss). The
 retired bridge-only `TELEGRAM_LANGUAGE` setting is migrated once.
+
+Version 1.2.12 starts the Mini App when the Ouroboros server is a container's
+PID 1 without an init. PID 1 counts as the server only when the host named
+itself so; a companion adopted by init or a subreaper still stops.
+
+Version 1.2.14 makes `TELEGRAM_NOTIFY_TASKS=off` suppress every additional task
+completion notice, failures and cancellations included. On sends completion
+notices with the host's material causes; pure review provenance and missing
+host-verification receipts stay in task details, without declaring success.
+Required, unresolved or unknown review obligations remain disclosed. Previously
+stored Off values now mean no extra notices; no setting is migrated or added.
+The status-only Main mirror follows this toggle too; preserved intermediate
+content still arrives. Ordinary replies, files and questions are independent, as is
+`TELEGRAM_SILENT_MODE` (editing consecutive replies). IDs observed while Off
+remain seen, so enabling does not replay that backlog. Older summary rows without
+the host's compact cause projection retain their original reason text when On.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled

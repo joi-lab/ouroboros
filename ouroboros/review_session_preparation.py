@@ -6,9 +6,10 @@ waits, collects, recovers or cancels an operation.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ouroboros.deadline_utils import bounded_seconds
+from ouroboros.delegate_start_instructions import HOST_FACTS_INSTRUCTION
 from ouroboros.triad_review import default_output_contract, review_output_shape
 
 
@@ -16,8 +17,13 @@ def render_review_session_prompt(request: Any, slot: Any, task: str) -> str:
     """The session wrapper, shared by source preparation's exact first-send measurement."""
     contract = str((request.policy or {}).get("output_contract") or "")
     contract = contract or default_output_contract(review_output_shape(request.surface))
+    access = str(getattr(slot, "session_access", "") or "readonly")
     return "\n".join((
-        "You are an independent Ouroboros reviewer slot running as a read-only agent session.",
+        ("You are an independent Ouroboros reviewer slot running as a read-only agent session."
+         if access == "readonly" else
+         f"You are an independent Ouroboros reviewer slot running as an agent session with {access} "
+         "technical access in a private checking folder.")
+        + HOST_FACTS_INSTRUCTION,  # an agent session has a shell HOME; the raw API reviewer prompt does not
         f"Surface: {request.surface}", f"Role hint: {slot.role_hint or 'general reviewer'}", "", task, "",
         "OUTPUT CONTRACT (your host parses this structurally):",
         contract + "\nThis contract governs the unwrapped substantive deliverable; emit any host-required transport metadata outside it exactly as separately instructed.",
@@ -27,25 +33,34 @@ def render_review_session_prompt(request: Any, slot: Any, task: str) -> str:
 
 def prepare_review_session_request(invocation: Any, route: Any, *,
                                    prompt: str, root: str, thread_id: str,
-                                   schema_asked: bool) -> Dict[str, Any]:
-    """Prepare and measure the exact wire request; no start, wait or recovery effects."""
+                                   schema_asked: bool, ephemeral: bool = False, shape: Any = None,
+                                   execution: Optional[Dict[str, Any]] = None,
+                                   instructions: str = "") -> Dict[str, Any]:
+    """Prepare and measure the exact wire request; no start, wait or recovery effects.
+
+    ``shape`` is the seat's run shape (read-only unless its configured access is
+    writable); a writable seat names its private checking copy in ``execution``
+    and its own ``instructions``."""
     from ouroboros.review_execution import ReviewRouteUnavailable, _CLAUDEXOR_MAX_SECONDS
     from ouroboros.subagents import delegated_run_shape
-    shape = delegated_run_shape(False)
+    shape = shape or delegated_run_shape(False, str(getattr(invocation, "access", "") or "readonly"))
     seconds = bounded_seconds(invocation.timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS)
-    instructions, use_thread, output_schema = invocation.instructions, invocation.use_thread, invocation.output_schema
+    use_thread, output_schema = invocation.use_thread, invocation.output_schema
+    instructions = instructions or invocation.instructions
     run_request = {
         "prompt": prompt,
         "instructions": instructions,
         "authPreference": "subscription",
         "mode": shape.mode,
         "access": shape.access,
-        "scope": {"kind": "project", "root": root},
+        "scope": {"kind": "project", "root": root, **({"ephemeral": True} if ephemeral else {})},
         # A one-element explicit pool is the pin; primaryHarness is only preference.
         "harnesses": [route.route_id],
         "primaryHarness": route.route_id,
         "maxSeconds": seconds,
     }
+    if execution:
+        run_request["execution"] = dict(execution)
     if use_thread:
         run_request["_use_thread"] = True
         run_request["_thread_id"] = thread_id
@@ -58,7 +73,7 @@ def prepare_review_session_request(invocation: Any, route: Any, *,
     if schema_asked:
         run_request["outputSchema"] = output_schema
     if invocation.source_delivery:
-        from ouroboros.tools.scope_review_session import SESSION_INLINE_DIFF_CEILING_CHARS
+        from ouroboros.tools.review_brief_coupling import SESSION_INLINE_DIFF_CEILING_CHARS
         serialized = json.dumps(run_request, ensure_ascii=False)
         invocation.source_delivery.update(first_send_chars=len(serialized),
                                           first_send_bytes=len(serialized.encode("utf-8")),

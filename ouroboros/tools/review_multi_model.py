@@ -13,6 +13,8 @@ import logging
 import os
 from typing import Any, Optional, TYPE_CHECKING
 
+from ouroboros.settings_integrity import live_effort_range
+from ouroboros.configured_subagents import MAX_CONFIGURED_SUBAGENTS
 from ouroboros.review_substrate import SLOT_ID_PREFIX
 
 if TYPE_CHECKING:  # annotation-only names; lazy under future annotations, never imported at runtime
@@ -38,7 +40,9 @@ def _rev():
     return review
 
 
-MAX_MODELS = 10
+# The commit panel is the review pool: every marked catalog row runs, so the
+# fan-out ceiling is the catalog's own ceiling (26), not a separate lane cap.
+MAX_MODELS = MAX_CONFIGURED_SUBAGENTS
 
 
 CONCURRENCY_LIMIT = 5
@@ -87,27 +91,49 @@ def _review_output_budget() -> int:
     return max(8192, min(raw, 65536))
 
 
-def triad_api_messages(prompt: str, stable_prefix_len: int, content: str) -> tuple:
+def review_request_task_id(ctx: Any) -> str:
+    """The task a review request runs under; a seat's ``artifact_store`` reads resolve there."""
+    return str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review"
+
+
+def review_output_allowance(model: str, window: int = 0, **binding) -> int:
+    """The review reservation within the exact route's known maximum response; unknown keeps it.
+    A ``window`` from ``reviewer_context_window`` supplies the account it was observed on."""
+    from ouroboros.response_limits import response_allowance
+    from ouroboros.reviewer_window import observed_binding
+
+    return response_allowance(str(model or ""), _review_output_budget(), **observed_binding(window, binding))
+
+
+def triad_api_messages(prompt: str, stable_prefix_len: int, content: str,
+                       *, layer: str = "body") -> tuple:
     """The exact api-row message pair of a triad panel, and the BIBLE text it
-    carries ("" when BIBLE.md could not be loaded).
+    carries ("" when BIBLE.md could not be loaded, or when the checklist
+    ``layer`` is ``core``: a subject that is not the Ouroboros body is not
+    governed by the constitution, so the head carries no constitutional
+    preamble and no BIBLE — `review_body_fact.layer_for`).
 
     One builder for both consumers: the fan-out sends these messages, and the
     commit gate's wave admission measures them — a reservation priced on
     anything else would admit a wave the ledger then refuses seat by seat.
     """
-    bible_text = _rev().load_governance_doc(_rev()._REPO_ROOT, "BIBLE.md", on_missing="explicit")
-    if bible_text:
-        stable_head = (
-            _CONSTITUTIONAL_PREAMBLE
-            + "### BIBLE.md (Full Text)\n\n" + bible_text
-            + "\n\n---\n\n## REVIEW INSTRUCTIONS\n\n"
-        )
+    bible_text = ""
+    if layer != "body":
+        stable_head = "## REVIEW INSTRUCTIONS\n\n"
     else:
-        log.warning("Proceeding without BIBLE.md — constitutional compliance cannot be guaranteed")
-        stable_head = (
-            _CONSTITUTIONAL_PREAMBLE
-            + "(BIBLE.md could not be loaded)\n\n## REVIEW INSTRUCTIONS\n\n"
-        )
+        bible_text = _rev().load_governance_doc(_rev()._REPO_ROOT, "BIBLE.md", on_missing="explicit")
+        if bible_text:
+            stable_head = (
+                _CONSTITUTIONAL_PREAMBLE
+                + "### BIBLE.md (Full Text)\n\n" + bible_text
+                + "\n\n---\n\n## REVIEW INSTRUCTIONS\n\n"
+            )
+        else:
+            log.warning("Proceeding without BIBLE.md — constitutional compliance cannot be guaranteed")
+            stable_head = (
+                _CONSTITUTIONAL_PREAMBLE
+                + "(BIBLE.md could not be loaded)\n\n## REVIEW INSTRUCTIONS\n\n"
+            )
     # System content is split at the caller-declared stable/dynamic boundary so
     # the byte-stable prefix (constitutional preamble + BIBLE + the prompt's own
     # stable governance head) carries a provider cache marker; per-round evidence
@@ -136,7 +162,9 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                                 surface: str = "multi_model_review",
                                 session_policy: dict = None,
                                 usage_attribution: dict = None,
-                                retry_key: str = "", task_evidence: dict = None) -> str:
+                                retry_key: str = "", task_evidence: dict = None,
+                                layer: str = "body", checking_source: dict = None,
+                                preflight_execution: dict = None) -> str:
     if models is None:
         models = []
     try:
@@ -153,17 +181,25 @@ def _handle_multi_model_review(ctx: ToolContext, content: str = "",
                     _multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
                                               routes, session_task, session_root, row_plan,
                                               surface, session_policy, usage_attribution,
-                                              retry_key, task_evidence),
+                                              retry_key, task_evidence, layer=layer, checking_source=checking_source,
+                                              preflight_execution=preflight_execution),
                 ).result()
         except RuntimeError:
             result = asyncio.run(_multi_model_review_async(content, prompt, models, ctx, stable_prefix_len,
                                                            routes, session_task, session_root, row_plan,
                                                            surface, session_policy, usage_attribution,
-                                                           retry_key, task_evidence))
-        return json.dumps(result, ensure_ascii=False)
+                                                           retry_key, task_evidence, layer=layer, checking_source=checking_source,
+                                                           preflight_execution=preflight_execution))
+        text = json.dumps(result, ensure_ascii=False)
+        if "error" in result:
+            from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))
+        return text
     except Exception as e:
         log.error("Multi-model review failed: %s", e, exc_info=True)
-        return json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)
+        from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR",
+            text=json.dumps({"error": f"Review failed: {e}"}, ensure_ascii=False)))
 
 
 async def _query_model(
@@ -181,19 +217,28 @@ async def _query_model(
     session_profile: str = "",
     surface: str = "multi_model_review", session_policy: dict = None, usage_attribution: dict = None,
     retry_key: str = "", subagent_id: str = "", use_local: bool | None = None, task_evidence: dict = None,
-    native_retrieval: bool = False,
+    native_retrieval: bool = False, resolved_wave_id: str = "",
+    session_access: str = "", checking_source: dict = None, preflight_execution: dict = None,
 ):
     async with semaphore:
         slot = None
         try:
+            if bool(getattr(ctx, "_review_reconcile_only", False)):
+                from ouroboros.tools.review_change_custody import collect_recorded_commit_actor
+                actor = await asyncio.get_running_loop().run_in_executor(
+                    None, contextvars.copy_context().run,
+                    lambda: collect_recorded_commit_actor(ctx, surface, slot_id, retry_key),
+                )
+                return _actor_query_result(model, actor, slot_id)
             from ouroboros.review_execution import ReviewRouteKind, delivery_retrieves
             from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
             slot_route = route if route is not None else ReviewRouteKind.API_CHAT
             delegated = slot_route is ReviewRouteKind.AGENT_SESSION
-            # RETRIEVES class (session row, native api row or configured-subagent
-            # api row): the compact session task replaces the assembled pack.
+            # RETRIEVES class (session row, or an api row saved as ``native``):
+            # the compact session task replaces the assembled pack. The row's
+            # catalog id is identity, never a delivery signal (F8).
             native_retrieval = bool(native_retrieval) and not delegated
-            retrieves = native_retrieval or delivery_retrieves(slot_route, subagent_id)
+            retrieves = delivery_retrieves(slot_route, native_retrieval)
             from ouroboros.review_evidence import commit_review_evidence_refs, commit_review_evidence_section
             evidence = task_evidence or {}
             policy = dict(session_policy or {"output_contract": _rev().REVIEW_JSON_ARRAY_CONTRACT}) if retrieves else {}
@@ -207,7 +252,7 @@ async def _query_model(
                 goal="Run independent multi-model review over the supplied evidence.",
                 # 5.2: a retrieving slot never receives the assembled api pack.
                 messages=[] if retrieves else messages,
-                task_id=str(getattr(ctx, "task_id", "") or "multi_model_review") if ctx is not None else "multi_model_review",
+                task_id=review_request_task_id(ctx),
                 call_type="multi_model_review",
                 max_tokens=_out_budget,
                 default_temperature=0.2,
@@ -215,12 +260,16 @@ async def _query_model(
                 session_task=session_task if retrieves else "",
                 session_root=session_root if retrieves else "",
                 policy=policy,
-                evidence={"task_execution": evidence} if evidence else {},
+                # The wave's frozen exhibits, persisted with the request for an exact rejoin.
+                evidence={**({"task_execution": evidence} if evidence else {}),
+                          **({"preflight_execution": preflight_execution} if preflight_execution else {})},
                 evidence_refs=commit_review_evidence_refs(evidence),
                 usage_attribution=usage_attribution or {},
+                resolved_wave_id=resolved_wave_id,
                 task_attempt=getattr(ctx, "task_attempt", None) if ctx is not None else None,
                 retry_key=str(retry_key or ""),
                 reconcile_only=bool(getattr(ctx, "_review_reconcile_only", False)),
+                checking_source=dict(checking_source or {}) if delegated else {},
                 # The owner deadline is a bound of every retrieving episode; it
                 # reaches the row here exactly as the advisory passes it.
                 deadline_at=_rev()._owner_deadline_at(ctx),
@@ -228,7 +277,7 @@ async def _query_model(
             slot = ReviewSlot(
                 slot_id=slot_id,
                 model=model,
-                effort=effort or _rev()._cfg.resolve_effort("review"),
+                effort=effort or live_effort_range()["max"],  # an absent vector tail: an Auto reviewer's level
                 max_tokens=_out_budget,
                 default_temperature=0.2,
                 role_hint=TRIAD_ROLE_HINT,
@@ -237,7 +286,9 @@ async def _query_model(
                 session_target=session_target if delegated else "",
                 session_profile=session_profile,
                 subagent_id=str(subagent_id or ""),
-                native_retrieval_override=True if native_retrieval else None,
+                # Explicit both ways for an api row: the slot's own delivery fact.
+                native_retrieval_override=None if delegated else bool(native_retrieval),
+                session_access=str(session_access or "") if delegated else "",
             )
             loop = asyncio.get_running_loop()
             # run_in_executor copies no context: carry the usage scope (and its
@@ -254,33 +305,25 @@ async def _query_model(
                 ),
             )
             actor = (run_result.actors or [{}])[0]
-            # Carry the substrate's real row id instead of re-deriving position.
-            ran_as = str(actor.get("slot_id") or slot_id)
-            typed = {key: actor.get(key) for key in _rev().TYPED_FAILURE_FACT_KEYS if actor.get(key) not in (None, "")}
-            if actor.get("status") not in {"ok", "empty"}:
-                return model, {
-                    "error": f"Error: {actor.get('error') or actor.get('status') or 'review failed'}",
-                    "usage": actor.get("usage") or {},
-                    "slot_id": ran_as,
-                    **_rev()._review_operation_fields(actor),
-                    "prompt_ref": actor.get("prompt_ref") or {},
-                    "response_ref": actor.get("response_ref") or {},
-                    **typed,
-                }, None
-            payload = {
-                "choices": [{"message": {"content": actor.get("raw_text") or ""}}],
-                "usage": actor.get("usage") or {},
-                "slot_id": ran_as,
-                **_rev()._review_operation_fields(actor),
-                "prompt_ref": actor.get("prompt_ref") or {},
-                "response_ref": actor.get("response_ref") or {},
-            }
-            return model, payload, None
+            return _actor_query_result(model, actor, slot_id)
         except Exception as e:
             # Preserve full review errors; helper adds an omission note if needed.
             error_msg = _rev().truncate_review_artifact(str(e), limit=4000)
             error = f"Error: {error_msg}"
             return model, _rev()._review_query_error_payload(ctx=ctx, model=model, messages=messages, slot_id=slot_id, error=error, slot=slot), None
+
+
+def _actor_query_result(model, actor, slot_id):
+    """The same parser input for a fresh response and an exact collected one."""
+    payload = {"usage": actor.get("usage") or {}, "slot_id": str(actor.get("slot_id") or slot_id),
+               **_rev()._review_operation_fields(actor),
+               "prompt_ref": actor.get("prompt_ref") or {}, "response_ref": actor.get("response_ref") or {}}
+    if actor.get("status") not in {"ok", "empty"}:
+        payload.update(error=f"Error: {actor.get('error') or actor.get('status') or 'review failed'}")
+        payload.update({key: actor.get(key) for key in _rev().TYPED_FAILURE_FACT_KEYS if actor.get(key) not in (None, "")})
+    else:
+        payload["choices"] = [{"message": {"content": actor.get("raw_text") or ""}}]
+    return model, payload, None
 
 
 async def _multi_model_review_async(content: str, prompt: str,
@@ -293,9 +336,14 @@ async def _multi_model_review_async(content: str, prompt: str,
                                      surface: str = "multi_model_review",
                                      session_policy: dict = None,
                                      usage_attribution: dict = None,
-                                     retry_key: str = "", task_evidence: dict = None):
+                                     retry_key: str = "", task_evidence: dict = None,
+                                     layer: str = "body", checking_source: dict = None,
+                                     preflight_execution: dict = None):
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.reviewer_slot_config import row_plan_retrieves
+
+    if not isinstance(models, list) or not all(isinstance(m, str) for m in models):
+        return {"error": "models must be a list of strings"}
 
     row_routes = list(routes or []) + [ReviewRouteKind.API_CHAT] * max(0, len(models) - len(routes or []))
     # Per-row strength/target/identity vectors (6.1). Absent tails keep the
@@ -310,15 +358,23 @@ async def _multi_model_review_async(content: str, prompt: str,
     row_ids = _row_vector("slot_ids", lambda idx: _rev().slot_id_for_row(idx + 1))
     row_actors = _row_vector("subagent_ids", lambda idx: "")
     row_local = _row_vector("use_local", lambda idx: None)
+    row_access = _row_vector("session_accesses", lambda idx: "")
+    # One brief per seat (PR-3 B): a retrieving row carries ITS OWN two-part
+    # brief, answer policy and reading root; an absent entry keeps the shared one.
+    row_tasks = _row_vector("session_tasks", lambda idx: "")
+    row_policies = _row_vector("session_policies", lambda idx: None)
+    row_roots = _row_vector("session_roots", lambda idx: "")
     # Pack assembly follows the RETRIEVES class, not the route name: a native
-    # or configured-subagent api row retrieves with its own tools and must
-    # never trigger (or be counted into) the assembled pack.
-    plan = {**(row_plan or {}), "routes": row_routes, "subagent_ids": row_actors}
+    # api row retrieves with its own tools and must never trigger (or be counted
+    # into) the assembled pack. The class is the plan's explicit ``retrieves``
+    # vector; an uncovered row is its route's own class (a bare api row receives
+    # the packet) — never inferred from its catalog id (F8).
+    plan = {**(row_plan or {}), "routes": row_routes}
     row_retrieves = [row_plan_retrieves(plan, idx) for idx in range(len(models))]
     any_api_rows = not all(row_retrieves)
     if not content:
         return {"error": "content is required"}
-    if not prompt and any_api_rows:
+    if not prompt and any_api_rows and not getattr(ctx, "_review_reconcile_only", False):
         return {"error": "prompt is required"}
     if not models:
         return {"error": "models list is required"}
@@ -330,23 +386,43 @@ async def _multi_model_review_async(content: str, prompt: str,
     # Built ONLY when an api row will send it — a panel of session rows never
     # assembles the api pack (5.2); the constitutional flag below stays a fact
     # about the repository either way.
-    if any_api_rows:
-        messages, bible_text = triad_api_messages(prompt, stable_prefix_len, content)
+    if bool(getattr(ctx, "_review_reconcile_only", False)):
+        messages, bible_text = [], ""
+    elif any_api_rows:
+        messages, bible_text = triad_api_messages(prompt, stable_prefix_len, content, layer=layer)
     else:
         messages = []
-        bible_text = _rev().load_governance_doc(_rev()._REPO_ROOT, "BIBLE.md", on_missing="explicit")
+        # The core layer carries no constitution on any delivery (review_body_fact.layer_for).
+        bible_text = "" if layer != "body" else _rev().load_governance_doc(
+            _rev()._REPO_ROOT, "BIBLE.md", on_missing="explicit")
 
+    # One round, one wave: each row sends its own request, so a fan-out without a paid-cycle
+    # key names its round here (review_records.resolve_review_wave); attribution only.
+    from ouroboros.review_records import new_review_wave_id
+
+    fan_out_wave = "" if retry_key or (usage_attribution or {}).get("review_wave_id") else new_review_wave_id()
+    if checking_source is None and not getattr(ctx, "_review_reconcile_only", False):
+        # Standalone callers also bind one source before fan-out. The change
+        # consumer supplies its existing FrozenSubject and skips this snapshot.
+        from types import SimpleNamespace
+        from ouroboros.review_checking import SUBJECT_INDEX, wave_checking_source
+
+        checking_source = wave_checking_source(session_root,
+            [SimpleNamespace(route=route, session_access=access) for route, access in zip(row_routes, row_access)],
+            data_root=_rev().review_drive_root(ctx), subject=SUBJECT_INDEX)
     semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
     llm_client = _rev().LLMClient()
     tasks = [
         _query_model(llm_client, m, messages, semaphore, ctx, slot_id=row_ids[idx],
-                     route=row_routes[idx], session_task=session_task, session_root=session_root,
+                     route=row_routes[idx], session_task=row_tasks[idx] or session_task,
+                     session_root=row_roots[idx] or session_root,
                      effort=row_efforts[idx], session_target=row_targets[idx],
                      session_profile=row_profiles[idx], surface=surface,
-                     session_policy=session_policy, usage_attribution=usage_attribution,
+                     session_policy=row_policies[idx] or session_policy, usage_attribution=usage_attribution,
                      retry_key=retry_key, subagent_id=row_actors[idx], use_local=row_local[idx], task_evidence=task_evidence,
-                     native_retrieval=row_retrieves[idx] and row_routes[idx] is ReviewRouteKind.API_CHAT
-                     and not row_actors[idx])
+                     preflight_execution=preflight_execution,
+                     resolved_wave_id=fan_out_wave, session_access=row_access[idx], checking_source=checking_source,
+                     native_retrieval=row_retrieves[idx] and row_routes[idx] is ReviewRouteKind.API_CHAT)
         for idx, m in enumerate(models)
     ]
     results = await asyncio.gather(*tasks)

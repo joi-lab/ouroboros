@@ -11,6 +11,7 @@ to the performer that raises the exit signal.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import time
 from typing import Any
@@ -20,6 +21,8 @@ from ouroboros.server_process import (
 )
 
 _RESTARTABLE_UPDATE_PHASES = frozenset({"pending_boot_smoke", "applying_replace"})
+_LAST_RETURNING: set = set()  # this process's Restart: the ids its transaction returns
+_LAST_RETURN_TX: dict = {"id": ""}  # ...and the one transaction that names them
 
 
 def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
@@ -66,15 +69,31 @@ def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
     # Everything reversible is behind us (checkout landed, no-resume
     # intent durable): from here the restart always follows, and every
     # unconfirmed stop is a critical diagnostic, never a deferral.
-    stopped_task_ids = _stop_owned_work(ctx)
+    try:
+        stopped_task_ids = _stop_owned_work(ctx)
+    except Exception:
+        # The stop may not veto. Continuing this generation instead would leave the durable
+        # flags above live under it (reviews and pauses read them as a stop, follow-ups as a
+        # restart in progress): the restart follows, and the next start reconciles the rest.
+        log.critical("Owner restart: stopping owned work raised; the restart proceeds and the next "
+                     "generation reconciles the remainder", exc_info=True)
+        stopped_task_ids = []  # unknown: the notice claims no stopped task
+    except BaseException:
+        from supervisor.queue import reopen_queue_returns
+
+        reopen_queue_returns("owner_restart")  # no exit follows here: this generation keeps admitting
+        raise
     try:
         if reply is not None:
             # Say only what happened: with nothing owned the stop sentence
-            # named a task that was never running, and queued work is now
-            # held rather than stopped.
+            # named a task that was never running; saved work returns after it.
             held = _owner_restart_held_count(ctx)
+            returning = len(_LAST_RETURNING)
             notice = ("Stopping active task. New settings apply to the next message."
                       if stopped_task_ids else "New settings apply to the next message.")
+            if returning:
+                notice += (f" {returning} task{'' if returning == 1 else 's'} will continue from "
+                           f"{'its' if returning == 1 else 'their'} saved state after the restart.")
             if held:
                 notice += (f" {held} queued task{'' if held == 1 else 's'} held until you resume "
                            f"{'it' if held == 1 else 'them'}.")
@@ -120,16 +139,20 @@ def _stop_owned_work(ctx: Any) -> list:
     Runs AFTER the checkout gate and the durable no-resume flags, so nothing
     here can veto: an unconfirmed step is a critical diagnostic with custody
     retained, and the next generation's startup custody sweep reconciles the
-    remainder (owner restart is a no-resume cause; nothing is adopted). In
-    order: one durable cancel intent per owned live id (saved pauses excluded),
-    ``kill_workers`` with Panic's ``reconcile_delegate_custody=False``, the
-    owner-only ``hold_never_started`` (the never-started queue is held under
-    the same ids, not cancelled) and the typed ``owner_restart`` cause every
-    task it settles records (an earlier Stop keeps its own), delegated-run cancellation
-    through the public owner-gone seam over the attach-only gateway, and the
-    attested owned-daemon stop exactly as Panic makes it. Between the cancel
-    intents and that stop nothing may call ``ensure_owned_gateway`` — it would
-    start a dead daemon — which is what the two flags above guarantee.
+    remainder. First prepare the retained-return transaction: native saved
+    work returns only after its fresh acknowledgment, while prior holds stay.
+    Record cancel intents for owned live ids outside that return set (saved
+    pauses excluded), then ``kill_workers`` with ``retain_saved_work``,
+    ``preserve_pending``, preserved owner waits and
+    ``reconcile_delegate_custody=False``. Tasks actually settled record the
+    typed ``owner_restart`` cause (an earlier Stop keeps its own). External
+    runs gain no adoption authority from native continuation: request cancellation
+    through the public owner-gone seam over the attach-only gateway, the
+    attested owned-daemon stop exactly as Panic makes it, and finally the
+    generation's one bounded stop of its owned processes (``stop_owned_work``),
+    which the teardown and the restart watcher later join. Between the cancel
+    intents and the daemon stop nothing may call ``ensure_owned_gateway`` — it
+    would start a dead daemon — which is what the two flags above guarantee.
 
     Returns the owned live task ids it addressed — captured ONCE, before the
     stop makes them unreadable — so the caller can tell the owner what was
@@ -138,8 +161,14 @@ def _stop_owned_work(ctx: Any) -> list:
     from ouroboros.cancel_intents import request_cancel
     from ouroboros.claudexor_daemon import read_owned_gateway
     from ouroboros.delegate_custody import reconcile_orphaned_runs
+    from ouroboros.owned_shutdown import begin_owned_stop
 
-    stopped = _owned_live_task_ids(ctx)
+    begin_owned_stop(DATA_DIR)  # the grace starts here; every pending stop is recorded before any wait
+    returning, owner_waits = _prepare_owner_restart_returns(ctx)
+    _LAST_RETURNING.clear()
+    _LAST_RETURNING.update(returning)
+    # owner 2026-10-08 (quiz d2f7532b): this Restart returns saved work instead of stopping it
+    stopped = [task_id for task_id in _owned_live_task_ids(ctx) if task_id not in returning]
     for task_id in stopped:
         try:
             request_cancel(DATA_DIR, task_id, reason="Owner restart", source="owner_restart",
@@ -151,8 +180,9 @@ def _stop_owned_work(ctx: Any) -> list:
         confirmed = ctx.kill_workers(
             force=True, terminal_status="cancelled",
             result_reason="Owner restart stopped this task before process restart.",
-            reconcile_delegate_custody=False, hold_never_started=True, stop_source="owner_restart",
-            **_managed_update_pending_kwargs(),
+            reconcile_delegate_custody=False, stop_source="owner_restart",
+            retain_saved_work=True, preserve_running_task_ids=owner_waits,
+            **{"preserve_pending": True, **_managed_update_pending_kwargs()},
         )
     except Exception:
         log.critical("Owner restart: worker shutdown raised; the restart proceeds and the next "
@@ -161,13 +191,60 @@ def _stop_owned_work(ctx: Any) -> list:
         if confirmed is False:
             log.critical("Owner restart: worker shutdown is unconfirmed; the restart proceeds and "
                          "the next generation reconciles the remainder")
-    try:
+    try:  # attach only; no replay_pending: a Restart re-POSTs nothing, the next generation's sweep does
         reconcile_orphaned_runs(DATA_DIR, running_task_ids=set(), gateway_factory=read_owned_gateway)
     except Exception:
         log.warning("Owner restart: delegated-run cancellation did not complete; custody retained",
                     exc_info=True)
     _stop_owned_daemon("Owner restart")
+    from ouroboros.owned_shutdown import stop_owned_work
+
+    stop_owned_work(DATA_DIR)  # unconfirmed records stay stamped for the next start; never a veto
     return stopped
+
+
+def _prepare_owner_restart_returns(ctx: Any) -> tuple:
+    """The owner's Restart returns active work (owner 2026-10-08, quiz d2f7532b).
+
+    One restart transaction names it before anything stops: parked owner waits
+    (cold handoffs), interrupted runs and direct turns with saved working
+    state, and the formerly runnable queue. The launcher's exit-42
+    acknowledgement makes it fresh; without that the next boot holds it all.
+    Returns ``(returning_ids, owner_wait_ids)``; a failure returns nothing.
+    """
+    import uuid
+
+    try:
+        from ouroboros.owner_wait import prepare_owner_wait_handoffs
+        from supervisor.queue import name_queue_returns
+        from supervisor.restart_retention import prepare_restart_returns
+        from supervisor.workers import direct_chat_turns
+
+        _LAST_RETURN_TX["id"] = ""
+        transaction_id = uuid.uuid4().hex
+        owner_waits = prepare_owner_wait_handoffs(DATA_DIR, ctx.RUNNING, transaction_id, include_sleep=False)
+        returning = prepare_restart_returns(DATA_DIR, dict(ctx.RUNNING or {}),
+                                            name_queue_returns(ctx.PENDING or [], "owner_restart"),
+                                            transaction_id=transaction_id, direct=direct_chat_turns(),
+                                            owner_wait_ids=owner_waits)
+        _LAST_RETURN_TX["id"] = transaction_id
+        return returning | owner_waits, owner_waits
+    except Exception:
+        log.warning("Owner restart: saved work returns were not prepared; the next boot holds them", exc_info=True)
+        return set(), set()
+
+
+def arm_owner_restart_transaction() -> str:
+    """A direct re-exec after the owner's Restart carries ONLY the transaction this
+    Restart prepared — never another door's (an aborted update's) still-active one."""
+    from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV, arm_active_planned_restart_transaction
+
+    os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+    own = _LAST_RETURN_TX["id"]
+    if own and arm_active_planned_restart_transaction(DATA_DIR) == own:
+        return own
+    os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+    return ""
 
 
 def _stop_owned_daemon(label: str) -> None:
@@ -215,12 +292,11 @@ def _stop_owned_daemon_for_new_pin() -> None:
     startup sweep and resumed parents close them as absent (no invented spend).
     """
     from ouroboros.claudexor_daemon import owned_daemon_provisioned, read_owned_gateway
-    from ouroboros.claudexor_runtime import load_runtime_pin
 
     if not owned_daemon_provisioned():
         return
     try:
-        pin = load_runtime_pin()
+        pin = _next_generation_pin()
         if pin is None:
             return
         with read_owned_gateway() as gateway:
@@ -236,6 +312,26 @@ def _stop_owned_daemon_for_new_pin() -> None:
                 "in flight end with this one", serving[0] or "unknown", serving[1][:12] or "unknown",
                 pin.version, pin.build_sha[:12])
     _stop_owned_daemon("Planned restart")
+
+
+def _next_generation_pin():
+    """The engine pin the NEXT generation selects.
+
+    Ordinarily the landed checkout's own tracked pin file. When a store switch intent is
+    recorded, the restart exit's seam moves the checkout to the intent's target after this
+    cleanup: that target's pin is the answer (``store_switch.next_engine_pin``). When this
+    restart carries a bound body adoption whose switch changes that file, the next
+    generation boots the candidate commit: its pin is read from that commit
+    (``body_adoption.bound_candidate_file``), through the same validating parser.
+    """
+    from ouroboros import body_adoption, config, store_switch
+    from ouroboros.claudexor_runtime import _PIN_FILENAME, load_runtime_pin
+
+    intent = store_switch.read_switch_intent(DATA_DIR)
+    if intent is not None:
+        return store_switch.next_engine_pin(config.REPO_DIR, intent["target_sha"])
+    raw = body_adoption.bound_candidate_file(DATA_DIR, "ouroboros/" + _PIN_FILENAME)
+    return load_runtime_pin() if raw is None else load_runtime_pin(data=raw)
 
 
 def _live_running_task_ids(ctx: Any) -> list:
@@ -326,6 +422,32 @@ def _safe_restart_serialized(safe_restart_fn, *, reason: str, unsynced_policy: s
         return safe_restart_fn(reason=reason, unsynced_policy=unsynced_policy)
     finally:
         release_update_lock(lock_fh)
+
+
+def _noticed_bootstrap(safe_restart_fn):
+    """Bootstrap's ``safe_restart``: a failure after it RAN (a refused checkout step, dependency
+    sync, the import test) is also told in the owner's chat as the message's headline line; the
+    whole message, Git's output included, stays in the returned value, the log and supervisor.jsonl.
+    A reset blocked to protect local changes is told as kept files, not as a failure.
+    ``_safe_restart_serialized``'s deliberate deferrals never call it and stay silent."""
+    def run(**kwargs):
+        ok, msg = safe_restart_fn(**kwargs)
+        if not ok:
+            headline = (str(msg).splitlines() or ["no detail"])[0]
+            kept = headline.partition(": ")[2]  # after "Failed checkout <branch>"
+            text = (f"Startup kept the current files: {kept}" if kept.startswith("Reset blocked (")
+                    else f"Startup bootstrap failed: {headline}")
+            try:
+                from supervisor.message_bus import notification_chat_route, send_with_budget
+                from supervisor.state import load_state
+
+                owner_chat = notification_chat_route(load_state().get("owner_chat_id"))
+                if owner_chat is not None:
+                    send_with_budget(owner_chat, text, role="system", system_type="startup_notice")
+            except Exception:
+                log.warning("Bootstrap failure notice was not delivered", exc_info=True)
+        return ok, msg
+    return run
 
 
 def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:

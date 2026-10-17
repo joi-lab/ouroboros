@@ -17,6 +17,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.registry import ToolRegistry
 from tests.test_acceptance_history import _finish, _fixture, review_policy  # noqa: F401
 from tests.test_review_operation_collection import _checkpointed_operation, TASK, forbid_effects as forbid_effects
+from tests._store_shared import seed_result
 
 
 def _foreign_sources(f):
@@ -136,6 +137,7 @@ def test_partial_copyback_retry_retains_exact_history_without_replacing_subject(
         return store(root, *args, **kwargs)
 
     with monkeypatch.context() as fail:
+        fail.setattr("ouroboros.source_retention.os.link", lambda *_a, **_k: (_ for _ in ()).throw(OSError("link unavailable")))
         fail.setattr(artifacts, "store_actor_source_bytes", fail_history_destination)
         first = _finish(f)
         retry_child_task_refs(f.root, f.worker, f.tid)
@@ -210,9 +212,8 @@ def test_canonical_history_reader_rejects_bound_but_invalid_subject(tmp_path, fi
         source_id="acceptance_historical", data=json.dumps(record).encode(), extension="json")
     # Simulate corrupted canonical HOST metadata, bypassing replica protection
     # only in the fixture. Even a valid CAS hash is not historical identity.
-    path = f.root / "task_results" / (f.tid + ".json")
     row["acceptance_debt"] = {**debt, "source_ref": ref}
-    path.write_text(json.dumps(row))
+    seed_result(f.root, f.tid, row)
     result = json.loads(_get_task_result(_caller(f), f.tid, review_source_sha256=ref["sha256"]))
     assert result["review_source"]["status"] == "unavailable"
     assert result["review_source"]["reason"] == "source_identity_mismatch"
@@ -340,9 +341,13 @@ def test_frozen_request_uses_existing_source_closure_after_current_state_and_aut
 ])
 def test_legacy_checkpoint_cold_maintenance_requires_exact_same_root_claim(tmp_path, monkeypatch, forbid_effects, mutation):
     from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
-    from ouroboros.task_results import task_result_path
     from supervisor.terminal_delivery import pending_deliveries
 
+    # Cold maintenance publishes through the supervisor transport; keep that
+    # transport local so a long isolated test root needs no AF_UNIX socket.
+    import queue
+    events = queue.Queue()
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda **_kw: events)
     checkpoint, binding = _checkpointed_operation(tmp_path, legacy=True)
     ref = checkpoint['source_ref']
     original_bytes = read_actor_source_bytes(tmp_path, TASK, ref)
@@ -397,7 +402,7 @@ def test_legacy_checkpoint_cold_maintenance_requires_exact_same_root_claim(tmp_p
     owner = checkpoint.pop('owner_id')
     row['review_operations'] = {owner: {**checkpoint, 'surface': 'task_acceptance', 'state': 'dispatched'}}
     # Deliberately corrupt canonical facts, not a caller-supplied alias/result.
-    task_result_path(tmp_path, TASK).write_text(json.dumps(row))
+    seed_result(tmp_path, TASK, row)
     report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
     after = load_task_result(tmp_path, TASK)
     assert read_actor_source_bytes(tmp_path, TASK, ref) == original_bytes

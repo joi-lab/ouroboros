@@ -20,8 +20,10 @@ STOP_NOTICE = "Stopping active task. New settings apply to the next message."
 
 
 def _rows(root):
+    """Supervisor rows other than the store's own first-touch import receipt."""
     path = root / "logs" / "supervisor.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    return [row for row in rows if row.get("type") != "current_store_import"]
 
 
 def _gate(callback, **kwargs):

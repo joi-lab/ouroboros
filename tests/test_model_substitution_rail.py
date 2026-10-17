@@ -21,6 +21,7 @@ from ouroboros.loop_transport import (
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
 
 from tests.test_llm_claudexor import Gateway, MODEL, ROUTE, result
+from tests._usage_store_testing import ledger_rows
 
 OTHER_ACCOUNT = {**ROUTE, "credentialProfileId": "account-b", "accountFingerprint": "fingerprint-b"}
 
@@ -83,8 +84,8 @@ def test_substituted_round_is_discarded_and_asked_again(setup, asynchronous):
     assert row["discarded_usage"] == {"input_tokens": 20, "output_tokens": 7, "cached_input_tokens": 12}
     assert row["task_id"] == "task-one" and row["physical_attempt_id"]
     # Two settled physical attempts: the discarded generation was paid for too.
-    rows = [entry for entry in (root / ua.LEDGER_REL).read_text().splitlines() if entry]
-    assert len(rows) >= 2
+    rows = ledger_rows(root)
+    assert len(rows) >= 2 and all(row["state"] == "settled" for row in rows)
 
 
 def test_second_request_drops_the_substituting_account_preference(setup):
@@ -370,31 +371,33 @@ def test_an_unknown_outcome_is_never_treated_as_a_substitution(setup):
     assert not events(root, "model_served_mismatch") and len(gateway.creates) == 1
 
 
-def test_no_outer_paid_repeat_can_nest_another_redo_budget_on_this_transport():
+def test_no_outer_paid_repeat_can_nest_another_redo_budget_on_this_transport(setup):
     """The rail's budget cannot be multiplied by the transport-death repeat.
 
-    A reviewer read the two bounded budgets as a product. They never meet: this
-    transport's route is loopback by construction, and a loopback route is
-    excluded from the paid repeat class, so no outer repeat starts a second
-    call whose redos begin again.
+    A reviewer read the two bounded budgets as a product. They never meet: a
+    dispatched Claudexor operation whose outcome is unknown surfaces without any
+    HTTP cause (the engine still owns it; control loss rejoins it), so the typed
+    transport-death walk finds no death and no outer repeat starts a second call
+    whose redos begin again. The daemon's loopback address is not the guard: each
+    attempt states that the model runs remotely, so a not-started receipt is a
+    free outage, never a stopped local server (12.10 incident).
     """
-    from ouroboros.transport_custody import is_loopback_base_url, is_retryable_transport_death
-
-    target = LLMClient()._resolve_remote_target(MODEL)
-    assert target["provider"] == "claudexor" and is_loopback_base_url(target["base_url"])
     import httpx
+    from ouroboros.transport_custody import is_retryable_transport_death
 
-    def died(loopback):
-        # A typed transport death on a dispatched send: the ONLY thing left to
-        # decide the verdict is the route's locality.
-        error = transport.ClaudexorModelError({"code": "model_operation_failed", "message": "died"})
-        error.__cause__ = httpx.ReadError("connection reset")
-        error.physical_attempt_capture = SimpleNamespace(
-            state="dispatched", provider="claudexor", route_is_loopback=loopback)
-        return error
-
-    assert is_retryable_transport_death(died(False)) is True
-    assert is_retryable_transport_death(died(True)) is False
+    _root, gateway, client = setup
+    gateway.results = [substituted()]
+    gateway.dispatch = ["unknown"]
+    with pytest.raises(transport.ClaudexorModelError) as raised:
+        call(client)
+    error = raised.value
+    assert error.__cause__ is None and error.physical_attempt_capture.route_is_loopback is False
+    assert is_retryable_transport_death(error) is False
+    # Counter-direction: the walk still finds a real dispatched death.
+    died = transport.ClaudexorModelError({"code": "model_operation_failed", "message": "died"})
+    died.__cause__ = httpx.ReadError("connection reset")
+    died.physical_attempt_capture = SimpleNamespace(state="dispatched", provider="claudexor", route_is_loopback=False)
+    assert is_retryable_transport_death(died) is True
 
 
 def test_a_discarded_generation_never_becomes_the_live_turn(setup, monkeypatch):
@@ -453,7 +456,7 @@ def test_the_refusal_is_its_own_kind_that_rotates_without_cooling_the_model():
     ({"_last_llm_error_kind": "bad_request", "_last_llm_provider_code": "invalid_continuation"},
      "refused the stored continuation"),
     ({"_last_llm_error_kind": "bad_request", "_last_llm_provider_code": "unsupported_parameter"},
-     "rejected the request shape"),
+     "rejected as invalid for this route"),
 ])
 def test_the_owner_terminal_names_the_real_refusal(usage, expected):
     assert expected in provider_recovery_hint(usage)

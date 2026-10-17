@@ -11,7 +11,7 @@ from ouroboros import delegate_custody as custody
 from ouroboros import observability
 from ouroboros.delegate_pending import request_body
 from tests._delegated_transport_shared import (
-    _LiveRunStub, _nanny_ctx,
+    _LiveRunStub, _nanny_ctx, _select_transport_access,
     _owned_gateway_uses_each_test_transport,  # noqa: F401 -- autouse fixture
 )
 from tests._review_session_route_shared import fake_route as _fake_route
@@ -53,7 +53,7 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
             return ref
         return real_write(root, body, **kwargs)
 
-    def emit(root, kind, payload):
+    def emit(root, kind, payload, **kwargs):
         if kind == custody.START_REQUESTED:
             assert order == ["blob"]
             assert "request" not in payload
@@ -61,13 +61,16 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
             if failure == "event":
                 return False
             order.append("event")
-        return real_emit(root, kind, payload)
+        return real_emit(root, kind, payload, **kwargs)
 
     if surface == "review":
         stub_type = request.getfixturevalue("fake_route")
     else:
         stub = _LiveRunStub()
         stub_type = type(stub)
+        # A READ-ONLY child: technical access alone decides the run shape (#1609),
+        # and this readonly-only daemon serves exactly that request.
+        _select_transport_access(monkeypatch, "readonly")
         monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
         monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *a, **k: stub)
     original_start = stub_type.start_run
@@ -105,17 +108,23 @@ def test_canonical_body_and_event_precede_dispatch(tmp_path, monkeypatch, reques
         assert order == ["blob", "event", "dispatch"]
 
 
-def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
+@pytest.mark.parametrize("access,geometry", [
+    ("readonly", None), ("full", None),
+    ("full", {"workspaceKind": "directory", "scopePaths": [], "isolation": "live"}),
+])
+def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path, access, geometry):
     from ouroboros.review_thread_continuity import start_review_thread_turn
+    from ouroboros.review_session_custody import recorded_review_shape
 
     body = {"prompt": "Привет\n" + "x" * 80_000,
             "instructions": "Authorization: Bearer EXAMPLE-NOT-A-REAL-CREDENTIAL",
-            "authPreference": "subscription", "mode": "ask", "access": "readonly",
+            "authPreference": "subscription", "mode": "ask" if access == "readonly" else "agent", "access": access,
             "scope": {"kind": "project", "root": str(tmp_path)},
             "harnesses": ["codex"], "primaryHarness": "codex", "maxSeconds": 300,
             "credentialProfileId": None, "_use_thread": True, "_thread_id": "thread-1",
-            "execution": {"delegated": False, "isolation": "in_place"},
             "outputSchema": {"type": "object", "properties": {"passed": {"type": "boolean"}}}}
+    if geometry is not None:
+        body["execution"] = {"delegated": True, "workspaceRoot": str(tmp_path / "copy"), **geometry}
     original = copy.deepcopy(body)
     assert custody.record_start_requested(tmp_path, invocation_id="review", task_id="task", request=body)
     row = _start_rows(tmp_path)[0]
@@ -123,6 +132,7 @@ def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
     restored = custody.invocation_record(tmp_path, "review")["request"]
     assert restored == body == original
     assert _digest(restored) == _digest(body)
+    assert recorded_review_shape(restored) is not None
     projections = []
 
     class Gateway:
@@ -133,7 +143,13 @@ def test_raw_review_envelope_and_thread_projection_round_trip(tmp_path):
     for envelope in (body, restored):
         start_review_thread_turn(Gateway(), envelope["_thread_id"], envelope, idempotency_key="review")
     assert projections[0] == projections[1]
-    assert not {"_thread_id", "_use_thread", "scope", "execution"} & projections[0][1].keys()
+    projected = projections[0][1]
+    assert not {"_thread_id", "_use_thread", "scope"} & projected.keys()
+    if geometry is None:
+        assert "execution" not in projected, "legacy requests acquire no new geometry during replay"
+    else:
+        assert projected["execution"] == geometry
+    assert body == original
 
 
 def test_legacy_inline_wins_even_beside_an_unreadable_ref(tmp_path, monkeypatch):
@@ -158,9 +174,11 @@ def test_unreadable_ref_keeps_request_unknown_and_retry_refuses(tmp_path, damage
         Path(row["request_ref"]["path"]).unlink()
     elif damage == "corrupt":
         Path(row["request_ref"]["path"]).write_bytes(b"not gzip")
-    else:
+    else:  # the stored request row itself carries a malformed reference
+        from ouroboros import obligations
+
         row["request_ref"]["size"] = "invalid"
-        custody.event_log_path(tmp_path).write_text(json.dumps(row) + "\n", encoding="utf-8")
+        obligations.add(tmp_path, "custody_open", "invocation:lost", {"request": row})
     assert custody.invocation_record(tmp_path, "lost")["request"] is None
     pending = custody.pending_invocations(tmp_path)
     assert [row["invocation_id"] for row in pending] == ["lost"]
@@ -194,6 +212,7 @@ def test_lost_ack_keeps_the_original_start_claim_when_its_body_is_unreadable(tmp
             return {"runId": "original-run"}
 
     stub = LostAcknowledgment()
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gateway, "ClaudexorGateway", lambda *args, **kwargs: stub)
     ctx = _nanny_ctx(tmp_path, task_id="owner")

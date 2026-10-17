@@ -11,7 +11,9 @@ from unittest.mock import patch
 import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
+from tests._usage_store_testing import ledger_rows
 from tests.test_owner_continue import NONCE, _interrupted
+from tests._store_shared import seed_result
 
 pytestmark = pytest.mark.serial
 
@@ -42,9 +44,8 @@ def test_retired_local_answer_owner_releases_same_continue_without_settling_mone
             asyncio.run(ua.execute_physical_attempt_async(request, failed_async_send))
         else:
             ua.execute_physical_attempt(request, failed_send)
-    ledger = tmp_path / ua.LEDGER_REL
-    before = ledger.read_bytes()
-    final = json.loads(before.splitlines()[-1])
+    before = ledger_rows(tmp_path)
+    final = before[-1]
     assert final["state"] == "unresolved"
     assert final["local_answer_owner_pid"] == os.getpid()
     held = admit_continuation("pred-1", action_nonce=NONCE)
@@ -60,16 +61,13 @@ def test_retired_local_answer_owner_releases_same_continue_without_settling_mone
     replay = admit_continuation("pred-1", action_nonce=NONCE)
     assert replay["successor_task_id"] == successor
     assert len(workers.PENDING) == 1
-    assert ledger.read_bytes() == before, "writer classification must not mutate money"
+    assert ledger_rows(tmp_path) == before, "writer classification must not mutate money"
     projection = ua.usage_projection(tmp_path, billing_group_id="pred-1")
+    # Releasing a local-writer hold neither settles nor forgets its liability: the
+    # bound stays disclosed exposure, and (#1487) it is never counted as spending.
     assert projection["unresolved_upper_bound_usd"] == 0.5
-    # Releasing a local-writer hold does not restore its monetary room.
-    sent = []
-    with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id=successor, root_task_id=successor)):
-        with pytest.raises(ua.BudgetExceeded):
-            ua.execute_physical_attempt(ua.AttemptRequest(
-                model="m", provider="test", reservation_usd=20.0), lambda: sent.append(True))
-    assert sent == [] and ledger.read_bytes() == before
+    assert projection["settled_usd"] == 0.0 and projection["accounted_usd"] == 0.5
+    assert ledger_rows(tmp_path) == before
     # An actual late receipt still settles the same liability.
     reservation = ua.AttemptReservation(final["attempt_id"], tmp_path, "m", "test", 0.5)
     ua.settle_attempt(reservation, {}, cost_usd=0.7, cost_final=True)
@@ -101,11 +99,11 @@ def test_unbound_model_and_generic_tool_effects_survive_terminal_owner(tmp_path,
 def test_unreadable_pause_preserves_cause_and_prevents_physical_send(tmp_path, monkeypatch):
     from ouroboros import owner_pause, usage_accounting as ua
     from ouroboros.llm_attempt import PhysicalDispatchInterrupted
-    from ouroboros.task_results import task_result_path
+    from tests._store_shared import seed_result, unreadable_result
 
     monkeypatch.setenv("TOTAL_BUDGET", "100")
-    path = task_result_path(tmp_path, "root")
-    path.write_text("{torn")
+    seed_result(tmp_path, "root", {"status": "running"})
+    unreadable_result(monkeypatch, "root")  # the store cannot answer for the root's row
     source = SimpleNamespace(task_id="root", root_task_id="root", drive_root=tmp_path)
     with pytest.raises(owner_pause.OwnerPauseRefused, match="owner_pause_authority_unreadable"):
         with owner_pause.launch_admission(source):
@@ -117,7 +115,7 @@ def test_unreadable_pause_preserves_cause_and_prevents_physical_send(tmp_path, m
             root_task_id="root", reservation_usd=0.5), lambda: sent.append(True))
     assert exc.value.control_reason == "owner_pause_authority_unreadable"
     assert sent == []
-    assert json.loads((tmp_path / ua.LEDGER_REL).read_text().splitlines()[-1])["state"] == "released"
+    assert ledger_rows(tmp_path)[-1]["state"] == "released"
 
 
 def test_restart_retains_legacy_unknown_and_saved_zero_dispatch_without_inference(tmp_path, monkeypatch):
@@ -181,36 +179,39 @@ def test_owner_pause_cause_survives_root_selection_but_not_new_budget_pause(tmp_
     assert child[BUDGET_HOLD_KEY]["root_grant_id"] == "g2"
 
 
-def test_indexed_census_preserves_legacy_members_and_reloads_only_changed_foreign_rows(tmp_path, monkeypatch):
-    from ouroboros import task_result_facts as scan
+def test_indexed_census_preserves_legacy_members_and_reads_no_foreign_body(tmp_path, monkeypatch):
+    """The census selects the tree by the typed ``root_task_id`` column: a legacy member whose
+    root lives only in its metadata is still read (its column is NULL), the 1000 foreign roots
+    are never decoded, and an unavailable store refuses the census instead of narrowing it."""
+    from ouroboros import task_store
     from ouroboros.model_sleep import cold_blockers
-    from ouroboros.task_results import stamp_task_result_schema, task_result_path, write_task_result
+    from ouroboros.store import StoreBusy
+    from ouroboros.task_results import stamp_task_result_schema, write_task_result
     from supervisor.continuation_admission import conflicting_writers
 
     queue, _, _ = _install_queue(tmp_path, monkeypatch)
-    write_task_result(tmp_path, "root", "running", root_task_id="root")
-    path = task_result_path(tmp_path, "legacy-child")
-    path.write_text(json.dumps(stamp_task_result_schema({
+    seed_result(tmp_path, "legacy-child", stamp_task_result_schema({
         "task_id": "legacy-child", "status": "completed", "metadata": {"root_task_id": "root"},
-        "launch_handoffs": {"op": {"tool": "external_write"}}})))
+        "launch_handoffs": {"op": {"tool": "external_write"}}}))
     for number in range(1000):
         task_id = f"foreign-{number}"
-        task_result_path(tmp_path, task_id).write_text(json.dumps(stamp_task_result_schema({
-            "task_id": task_id, "status": "completed", "root_task_id": task_id})))
-    parsed = []
-    reader = scan.read_json_dict
-    monkeypatch.setattr(scan, "read_json_dict", lambda path: (parsed.append(path.name), reader(path))[1])
+        seed_result(tmp_path, task_id, stamp_task_result_schema({
+            "task_id": task_id, "status": "completed", "root_task_id": task_id}))
+    write_task_result(tmp_path, "root", "running", root_task_id="root")  # first touch imports the files above
+    from ouroboros import task_results
+    decoded = []
+    real = task_store.read_document
+    for module in (task_store, task_results):
+        monkeypatch.setattr(module, "read_document", lambda root, task_id: (decoded.append(task_id), real(root, task_id))[1])
     assert any(b.get("task_id") == "legacy-child" for b in conflicting_writers(queue, "root"))
-    assert len(parsed) == 1002
-    parsed.clear()
+    assert "legacy-child" in decoded and not any(task_id.startswith("foreign-") for task_id in decoded)
+    decoded.clear()
     context = SimpleNamespace(drive_root=tmp_path, task_id="root", root_task_id="root")
     assert any(b.get("detail") == "legacy-child" for b in cold_blockers(context))
-    assert parsed == []
-    changed = task_result_path(tmp_path, "foreign-0")
-    changed.write_text("{torn")
-    assert any(b["kind"] == "tree_census_unreadable" for b in conflicting_writers(queue, "root"))
-    assert parsed == ["foreign-0.json"]
-    changed.unlink()
+    assert not any(task_id.startswith("foreign-") for task_id in decoded)
+    with monkeypatch.context() as busy:
+        busy.setattr(task_store, "open_store", lambda *a, **kw: (_ for _ in ()).throw(StoreBusy("busy")))
+        assert any(b["kind"] == "tree_census_unreadable" for b in conflicting_writers(queue, "root"))
     assert any(b.get("task_id") == "legacy-child" for b in conflicting_writers(queue, "root"))
 
 
@@ -280,24 +281,30 @@ def test_settled_continue_observes_off_lock_and_revalidates_owner_authority(tmp_
     assert bool(budget_hold_fact(workers.PENDING[0])) is (race != "none")
 
 
-def test_compaction_keeps_local_consumer_binding_and_late_receipt(tmp_path, monkeypatch):
-    from ouroboros import usage_accounting as ua
-    from tests.fixtures_usage_compaction import _compact, _ledger_rows, _seed_mixed_ledger, age_fixture_clock
+def test_export_and_import_keep_local_consumer_binding_and_late_receipt(tmp_path, monkeypatch):
+    from ouroboros import usage_accounting as ua, usage_store
 
     monkeypatch.setenv("TOTAL_BUDGET", "100")
-    age_fixture_clock(monkeypatch)
-    _seed_mixed_ledger(tmp_path)
+    for index in range(3):
+        settled = ua.reserve_attempt(ua.AttemptRequest(model="m", provider="test", drive_root=tmp_path,
+            task_id=f"done-{index}", root_task_id=f"done-{index}", reservation_usd=0.1))
+        ua.mark_dispatched(settled)
+        ua.settle_attempt(settled, {}, cost_usd=0.1, cost_final=True)
     reservation = ua.reserve_attempt(ua.AttemptRequest(model="m", provider="test", drive_root=tmp_path,
         task_id="local", root_task_id="local", reservation_usd=0.5))
     ua.mark_dispatched(reservation, local_answer_owner_pid=os.getpid())
     ua.mark_unresolved(reservation, "unknown response")
-    chain = [r for r in _ledger_rows(tmp_path) if r["attempt_id"] == reservation.attempt_id]
-    assert _compact(tmp_path) is not None
-    retained = [r for r in _ledger_rows(tmp_path) if r["attempt_id"] == reservation.attempt_id]
-    assert [{k: v for k, v in r.items() if k not in {"seq", "pre_compaction_seq"}} for r in retained] == [
-        {k: v for k, v in r.items() if k not in {"seq", "pre_compaction_seq"}} for r in chain]
+
+    def current():
+        row = {r["attempt_id"]: r for r in ledger_rows(tmp_path)}[reservation.attempt_id]
+        return {key: value for key, value in row.items() if key != "seq"}
+
+    before = current()
+    # The downgrade export, then the next access's one-time import of it.
+    usage_store.export_journal(tmp_path)
+    assert current() == before
     ua.settle_attempt(reservation, {}, cost_usd=0.7, cost_final=True)
-    row = _ledger_rows(tmp_path)[-1]
+    row = current()
     assert row["local_answer_owner_pid"] == os.getpid() and row["cost_usd"] == 0.7
 
 
@@ -395,7 +402,7 @@ root = Path({str(tmp_path)!r})
 ua._reservation_cost = lambda request: 0.25
 scope = ua.UsageScope(drive_root=root, task_id="successor", root_task_id="successor",
     root_limit_usd=10, global_limit_usd=100, billing_group_id="original",
-    billing_group_limit_usd=0.1, billing_group_limit_source="initial_task_admission")
+    billing_group_limit_usd=0.0, billing_group_limit_source="initial_task_admission")
 with ua.usage_scope(scope):
     verdict = review_wave_budget_gate(SimpleNamespace(task_id="successor", pending_events=[]),
         surface="test", models=["test/model"], prompt_chars=100)
@@ -444,10 +451,10 @@ def test_escaping_tool_exception_keeps_unknown_effects_after_owner_terminal(tmp_
         with tool_handoff(source, "external_write"):
             with operation_start(source):
                 raise TimeoutError("request sent, response unknown")
-    claim = load_task_result(tmp_path, "root")["launch_handoffs"]
+    claim = load_task_result(tmp_path, "root").get("launch_handoffs", {})
     assert claim
     write_task_result(tmp_path, "root", "cancelled")
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == claim
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == claim
     assert any(b["kind"] == "tool_handoff" for b in conflicting_writers(queue, "root"))
 
 

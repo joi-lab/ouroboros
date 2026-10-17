@@ -1,9 +1,10 @@
 """
 Policy-based safety check for tool calls.
 
-Built-ins use explicit policy entries; unknown tools default to one light-model
-check. Structured resource admission precedes the assessment; review evidence
-and actual execution remain independent of the Cyber advisory decision.
+Built-ins carry an explicit policy (a ``TOOL_POLICY`` entry, else their own
+``ToolEntry`` declaration); unknown tools default to one light-model check.
+Structured resource admission precedes the assessment; review evidence and
+actual execution remain independent of the Cyber advisory decision.
 """
 
 import ast
@@ -31,12 +32,20 @@ log = logging.getLogger(__name__)
 POLICY_SKIP = "skip"
 POLICY_CHECK = "check"
 POLICY_CHECK_CONDITIONAL = "check_conditional"
+POLICY_VALUES = frozenset({POLICY_SKIP, POLICY_CHECK, POLICY_CHECK_CONDITIONAL})
 
-# Unknown/agent-created tools get one cheap LLM recheck.
+# A tool with neither a table entry nor a valid declaration (every extension
+# and MCP tool among them) gets one cheap LLM recheck.
 DEFAULT_POLICY = POLICY_CHECK
 
-# Must cover every built-in exported from ouroboros/tools; invariant-tested.
+# Protected per-tool policy. It outranks a built-in's own declaration
+# (``ToolEntry.safety_policy``), so editing a tool module never lowers a listed
+# tool. Each built-in has exactly one home, here or its declaration
+# (invariant-tested).
 TOOL_POLICY: Dict[str, str] = {
+    # Typed host maintenance enforces existing actor/resource/Pause authority.
+    "inspect_harness": POLICY_SKIP,
+    "maintain_harness": POLICY_SKIP,
     # Read-only / trivially safe.
     "read_file": POLICY_SKIP,
     "list_files": POLICY_SKIP,
@@ -54,10 +63,14 @@ TOOL_POLICY: Dict[str, str] = {
     "codebase_health": POLICY_SKIP,
     "search_code": POLICY_SKIP,
     "query_code": POLICY_SKIP,
+    "query_data": POLICY_SKIP,
     "list_available_tools": POLICY_SKIP,
     "memory_map": POLICY_SKIP,
     "analyze_screenshot": POLICY_SKIP,
     "vlm_query": POLICY_SKIP,
+    "generate_image": POLICY_SKIP,
+    "list_image_models": POLICY_SKIP,
+    "recover_image": POLICY_SKIP,
     "view_image": POLICY_SKIP,
     "ocr_pdf": POLICY_SKIP,
     "youtube_transcript": POLICY_SKIP,
@@ -78,6 +91,8 @@ TOOL_POLICY: Dict[str, str] = {
     "wait_task": POLICY_SKIP,
     "wait_tasks": POLICY_SKIP,
     "await_messages": POLICY_SKIP,
+    "continue_in_background": POLICY_SKIP,
+    "pause_task": POLICY_SKIP, "resume_task": POLICY_SKIP, "continue_task": POLICY_SKIP,
     "list_projects": POLICY_SKIP,
     "switch_model": POLICY_SKIP,
     "service_status": POLICY_SKIP,
@@ -100,10 +115,9 @@ TOOL_POLICY: Dict[str, str] = {
     # and persisted only by join_ledger; neither branch has an external/repo effect.
     "tree_note": POLICY_SKIP,
     "tree_read": POLICY_SKIP,
-    "promote_chat_to_task": POLICY_SKIP,
-    "ensure_project_scope": POLICY_SKIP,
-    "route_to_project": POLICY_SKIP,
-    "steer_task": POLICY_SKIP,
+    "start_task": POLICY_SKIP,
+    "move_to_project": POLICY_SKIP,
+    "tell_task": POLICY_SKIP,
     "update_scratchpad": POLICY_SKIP,
     "update_identity": POLICY_SKIP,
     "memory_update_registry": POLICY_SKIP,
@@ -143,6 +157,9 @@ TOOL_POLICY: Dict[str, str] = {
     "discard_child_result": POLICY_SKIP,
     "override_delegation_constraint": POLICY_SKIP,
     "request_restart": POLICY_SKIP,
+    # Provisions (or rebinds) this task's own body candidate under the isolated worktree
+    # root: no serving-tree write, no external effect; the mode gates live in the handler.
+    "prepare_self_change": POLICY_SKIP,
     "request_deep_self_review": POLICY_SKIP,
     "set_tool_timeout": POLICY_SKIP,
     "toggle_evolution": POLICY_SKIP,
@@ -164,6 +181,7 @@ TOOL_POLICY: Dict[str, str] = {
     "enable_tools": POLICY_SKIP,
     "preflight_review": POLICY_SKIP,
     "advisory_review": POLICY_SKIP,  # compat alias of preflight_review
+    "review_change": POLICY_SKIP,
     "start_service": POLICY_CHECK_CONDITIONAL,
     "stop_service": POLICY_SKIP,
 
@@ -633,6 +651,7 @@ _REMOTE_PROVIDER_KEYS = (
     "DEEPSEEK_API_KEY",
     "ZAI_API_KEY",
     "OPENAI_COMPATIBLE_API_KEY",
+    "OPENAI_COMPATIBLE_BASE_URL",  # an endpoint without auth is configured access too
     "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     "GIGACHAT_CREDENTIALS",
     "GIGACHAT_PASSWORD",
@@ -685,19 +704,14 @@ def _light_model_has_reachable_provider(light_model: str) -> bool:
             str(runtime_setting("GIGACHAT_PASSWORD", "") or "").strip()
         )
         return has_creds or has_basic
+    if key_type == "openai-compatible":  # the lane's one endpoint/key pair, blank key = no auth
+        from ouroboros.provider_models import provider_has_credentials
+
+        return provider_has_credentials("openai-compatible")
     env_key = _PROVIDER_KEY_ENV.get(key_type)
     if env_key is None:
         return True
-    if not str(runtime_setting(env_key, "") or "").strip():
-        return False
-    if key_type == "openai-compatible":
-        base_url = (
-            str(runtime_setting("OPENAI_COMPATIBLE_BASE_URL", "") or "").strip()
-            or str(runtime_setting("OPENAI_BASE_URL", "") or "").strip()
-        )
-        if not base_url:
-            return False
-    return True
+    return bool(str(runtime_setting(env_key, "") or "").strip())
 
 
 def _safety_deadline_epoch(ctx: Optional[Any]) -> Optional[float]:
@@ -1338,12 +1352,17 @@ def check_safety(
     ctx: Optional[Any] = None,
     python_resolution: Optional[Any] = None,
     resolved_binding: Optional[Any] = None,
+    declared_policy: str = "",
 ) -> Tuple[bool, str]:
-    """Return ``(allowed, warning_or_error)`` for one tool call."""
+    """Return ``(allowed, warning_or_error)`` for one tool call.
+
+    ``declared_policy`` is a first-party ``ToolEntry``'s own declaration; a
+    ``TOOL_POLICY`` entry outranks it and an invalid value is ``DEFAULT_POLICY``."""
     # Arguments can be None for no-parameter tool calls.
     tool_name = str(tool_name or "").strip()
     arguments = arguments or {}
-    policy = TOOL_POLICY.get(tool_name, DEFAULT_POLICY)
+    declared = declared_policy if isinstance(declared_policy, str) else ""
+    policy = TOOL_POLICY.get(tool_name) or (declared if declared in POLICY_VALUES else DEFAULT_POLICY)
 
     if policy == POLICY_SKIP:
         return True, ""

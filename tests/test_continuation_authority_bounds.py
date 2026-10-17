@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
+from tests._store_shared import seed_result
 
 
 def _authority_source(task_id: str) -> dict:
@@ -18,9 +19,7 @@ def _authority_source(task_id: str) -> dict:
 def _write_result(root, row: dict) -> None:
     result_dir = root / "task_results"
     result_dir.mkdir(exist_ok=True)
-    (result_dir / f"{row['task_id']}.json").write_text(
-        json.dumps({"_schema_version": 1, **row}), encoding="utf-8",
-    )
+    seed_result(root, row['task_id'], {"_schema_version": 1, **row})
 
 
 def test_host_salvage_automatic_authority_is_bounded_but_explicit_read_is_full(

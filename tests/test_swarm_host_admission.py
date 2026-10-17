@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -21,11 +22,14 @@ from ouroboros.project_dialogue import build_owner_message_ref
 from ouroboros.projects_registry import create_project, project_binding_for_task
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.utils import append_jsonl
+from tests._store_shared import unreadable_result
+from tests._socket_seal import block_network_except_socketpair
 from supervisor import git_ops, queue, state, worker_chat_lane as lane, workers
 from supervisor.events import _handle_promote_chat_to_task
 
 pytestmark = pytest.mark.serial
 EXACT_OWNER = "  Исследуй варианты A и B.\nСначала уточни ограничения.  \n"
+WORDLESS = "(image attached)"
 SURFACE = {"channel": "web", "viewport": {"width": 1280, "height": 800}}
 CONSTRAINT = {"mode": "normal"}
 REFUSALS = {
@@ -127,8 +131,8 @@ def host(tmp_path, monkeypatch, request):
     monkeypatch.setattr(LLMClient, "chat_async", forbidden_model_async)
     monkeypatch.setattr(lane, "_run_chat_task", forbidden_lane)
     monkeypatch.setattr("ouroboros.server_owner_routing._decision_turn_metadata", forbidden_model)
-    monkeypatch.setattr(socket.socket, "connect", forbidden_model)
-    monkeypatch.setattr(socket.socket, "connect_ex", forbidden_model)
+    # Later asyncio/TestClient loops also need their Windows self-pipe, not provider access.
+    block_network_except_socketpair(monkeypatch, forbidden_model)
     ctx = SimpleNamespace(
         DRIVE_ROOT=root, PENDING=pending, RUNNING=running, WORKERS=pool, bridge=bridge,
         enqueue_task=queue.enqueue_task, persist_queue_snapshot=queue.persist_queue_snapshot,
@@ -150,22 +154,26 @@ def host(tmp_path, monkeypatch, request):
                            run_async=event_loop.run_until_complete)
 
 
-def incoming_case(host, room, *, caption_only=False):
+def incoming_case(host, room, *, caption_only=False, wordless=False):
     project_id, chat_id = "", 1
     if room == "project":
         project_id = "room-project"
         project = create_project(host.root, project_id, name="Room Project")
         chat_id = int(project["chat_id"])
-    client_message_id = f"swarm-probe-{room}-{'caption' if caption_only else 'text'}"
+    kind = "wordless" if wordless else "caption" if caption_only else "text"
+    client_message_id = f"swarm-probe-{room}-{kind}"
+    # A wordless send's canonical row holds the host placeholder, not owner words.
+    logged = WORDLESS if wordless else EXACT_OWNER
     ref = build_owner_message_ref(chat_id=chat_id, client_message_id=client_message_id,
-                                  ts="2026-09-12T12:00:00Z", text=EXACT_OWNER)
+                                  ts="2026-09-12T12:00:00Z", text=logged)
     append_jsonl(host.root / "logs/chat.jsonl", {"ts": ref["ts"], "role": "user", "chat_id": chat_id,
-                 "client_message_id": client_message_id, "text": EXACT_OWNER})
+                 "client_message_id": client_message_id, "text": logged,
+                 **({"text_placeholder": True} if wordless else {})})
     source = host.root / "input.txt"
     source.write_bytes(b"exact-owner-attachment\n")
     incoming = {
-        "chat_id": chat_id, "text": "" if caption_only else EXACT_OWNER,
-        "image_caption": EXACT_OWNER if caption_only else "", "log_text": EXACT_OWNER,
+        "chat_id": chat_id, "text": "" if caption_only or wordless else EXACT_OWNER,
+        "image_caption": EXACT_OWNER if caption_only else "", "log_text": logged,
         "client_message_id": client_message_id, "origin_message_ref": ref,
         "source": "web", "task_constraint": CONSTRAINT,
         "task_metadata": {"force_plan": True, "force_plan_source": "swarm",
@@ -225,6 +233,26 @@ def test_swarm_press_admits_root_without_any_model_call(host, room, caption_only
     assert fact["scheduled_result"]["status"] == "scheduled"
     assert not host.notices
     assert not (host.root / "memory/owner_mailbox/existing-project-root.jsonl").exists()
+
+
+@pytest.mark.parametrize("room", ["main", "project"])
+def test_swarm_press_admits_a_wordless_attachment_message(host, room):
+    # The web gateway no longer invents a caption for an uploaded photo: a send with
+    # attachments and no words reaches routing with neither, under the row's placeholder.
+    case = incoming_case(host, room, wordless=True)
+    server._route_owner_message(host.bridge, host.ctx, case.incoming)
+    fact = capture(host, case)
+    assert host.attempts == [] and not host.notices
+    assert len(host.pending) == 1
+    task = host.pending[0]
+    assert task["id"] == case.task_id and str(task.get("project_id") or "") == case.project_id
+    assert task["objective"] == task["origin_message_text"] == WORDLESS
+    assert task["origin_message_ref"] == case.ref
+    assert task["metadata"]["force_plan"] is True and task["metadata"]["force_plan_source"] == "swarm"
+    assert len(task["attachment_manifest"]) == 1
+    assert Path(task["attachment_manifest"][0]["abs_path"]).read_bytes() == case.source.read_bytes()
+    assert [row["status"] for row in fact["annotations"]] == ["scheduled"]
+    assert fact["scheduled_result"]["status"] == "scheduled"
 
 
 @pytest.mark.parametrize("room", ["main", "project"])
@@ -290,7 +318,7 @@ def test_replayed_client_message_id_admits_nothing_new(host, room, phase):
 
 
 @pytest.mark.parametrize("collision", ["reserved", "different_token", "unreadable", "live_only"])
-def test_replay_identity_requires_original_durable_token(host, collision):
+def test_replay_identity_requires_original_durable_token(host, monkeypatch, collision):
     case = incoming_case(host, "main")
     host.pending.append({"id": case.task_id})
     if collision in {"reserved", "different_token"}:
@@ -301,9 +329,7 @@ def test_replay_identity_requires_original_durable_token(host, collision):
     if collision == "reserved":
         queue.ADMISSION_RESERVATIONS[case.task_id] = "other-token"
     if collision == "unreadable":
-        path = host.root / "task_results" / f"{case.task_id}.json"
-        path.parent.mkdir(exist_ok=True)
-        path.write_text("{broken")
+        unreadable_result(monkeypatch, case.task_id, root=host.root)
     result = queue.reserve_task_admission(case.task_id, case.token, drive_root=host.root)
     assert result == {"status": "blocked", "reason": (
         "task_id_lookup_failed" if collision == "unreadable" else "duplicate_task_id"
@@ -334,3 +360,88 @@ def test_existing_admission_refusal_text_and_order(host, failure):
     assert budget_calls == ([] if failure == "update" else [{"strict": True}])
     assert not host.pending and not fact["annotations"] and not fact["scheduled_result"]
     assert not host.attempts
+
+
+def _tcp_fallback_host(monkeypatch, request):
+    """The host fixture over Windows' TCP socketpair, wherever this interpreter carries it."""
+    if not hasattr(socket, "_fallback_socketpair"):
+        pytest.skip("this interpreter exposes no TCP socketpair fallback to exercise")
+    monkeypatch.setattr(socket, "socketpair", socket._fallback_socketpair)
+    return request.getfixturevalue("host")
+
+
+def test_a_new_event_loop_builds_its_self_pipe_under_the_network_seal(monkeypatch, request):
+    host = _tcp_fallback_host(monkeypatch, request)
+    assert asyncio.run(asyncio.sleep(0, result="ran")) == "ran"
+    worker = []
+    portal = threading.Thread(target=lambda: worker.append(asyncio.run(asyncio.sleep(0, result="thread"))))
+    portal.start()
+    portal.join()
+    assert worker == ["thread"] and host.attempts == []
+
+
+def test_only_a_socketpairs_own_loopback_connect_passes_the_network_seal(monkeypatch, request):
+    listener = socket.create_server(("127.0.0.1", 0))
+    request.addfinalizer(listener.close)
+    listener.setblocking(False)
+    port = listener.getsockname()[1]
+    entered, release, pairing, armed = threading.Event(), threading.Event(), [], []
+    real_socketpair = socket.socketpair
+
+    def arrivals():
+        accepted = []
+        while True:
+            try:
+                accepted.append(listener.accept()[0])
+            except BlockingIOError:
+                break
+        for sock in accepted:
+            sock.close()
+        return len(accepted)
+
+    def sealed(address, method="connect"):
+        sock = socket.socket()
+        try:
+            with pytest.raises(ForbiddenModelEntry):
+                getattr(sock, method)(address)
+            with pytest.raises(OSError):
+                sock.getpeername()
+        finally:
+            sock.close()
+
+    def probe(*args, **kwargs):
+        if not armed:  # the host's own loop, prepared before the seal
+            return real_socketpair(*args, **kwargs)
+        if threading.current_thread() is not threading.main_thread():
+            entered.set()
+            assert release.wait(30)
+            return "held"
+        own = socket.socket()
+        own.connect(("127.0.0.1", port))  # the pair's own numeric loopback connect
+        own.close()
+        assert arrivals() == 1
+        for address in (("0.0.0.0", port), ("localhost", port), ("192.0.2.1", port)):
+            sealed(address)
+        sealed(("127.0.0.1", port), "connect_ex")
+        with pytest.raises(ForbiddenModelEntry):
+            LLMClient.chat(None)
+        assert arrivals() == 0
+        return "paired"
+
+    monkeypatch.setattr(socket, "socketpair", probe)
+    host = request.getfixturevalue("host")
+    armed.append(True)
+    assert socket.socketpair() == "paired" and len(host.attempts) == 5
+    pairing_thread = threading.Thread(target=lambda: pairing.append(socket.socketpair()))
+    pairing_thread.start()
+    try:
+        assert entered.wait(30)
+        sealed(("127.0.0.1", port))  # another thread inside the pairing window stays sealed
+    finally:
+        release.set()
+        pairing_thread.join()
+    assert pairing == ["held"]
+    for address in (("127.0.0.1", port), ("192.0.2.1", port)):
+        sealed(address)  # outside any socketpair
+    sealed(("127.0.0.1", port), "connect_ex")
+    assert arrivals() == 0 and len(host.attempts) == 9

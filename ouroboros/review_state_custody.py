@@ -110,6 +110,7 @@ def checkpoint_pending_review_invocation(
         raise ValueError("pending review invocation checkpoint is incomplete")
     if expected["surface"] not in {"multi_model_review", "scope_review"}:
         raise ValueError(f"unsupported commit-review surface {surface!r}")
+    still_sends = _left_before_launch_still_sends(expected["operation_id"])
 
     def _mutate(state: AdvisoryReviewState) -> None:
         current = state.latest_attempt_for(
@@ -141,7 +142,12 @@ def checkpoint_pending_review_invocation(
         row = matches[0]
         if str(row.get("operation_id") or "") != expected["operation_id"]:
             raise ValueError("reserved commit-review operation identity changed")
-        if str(row.get("operation_state") or "") != "in_flight":
+        row_state = str(row.get("operation_state") or "")
+        if row_state == "pending_dispatch" and still_sends:
+            # The author left this seat on an addressed message before its first launch (G1's receptive
+            # yield records it pending_dispatch); it still sends, and this start makes it in flight.
+            row["operation_state"] = "in_flight"
+        elif row_state != "in_flight":  # a Pause preparation never sends; a settled or lost row stays closed
             raise ValueError("reserved commit-review operation is not in flight")
         prior = str(row.get("pending_invocation_id") or "")
         if prior and prior != expected["invocation_id"]:
@@ -152,6 +158,18 @@ def checkpoint_pending_review_invocation(
         current.updated_ts = _rs()._utc_now()
 
     _rs().update_state(pathlib.Path(drive_root), _mutate)
+
+
+def _left_before_launch_still_sends(operation_id: str) -> bool:
+    """This process's live seat for ``operation_id`` was detached by an addressed message, not by
+    Pause: its preparation goes on and sends. The caller is that seat itself, about to start."""
+    from ouroboros.review_custody import _ACTIVE, _ACTIVE_LOCK
+    from ouroboros.review_pause import ADDRESSED_EVENT
+
+    with _ACTIVE_LOCK:
+        entry = next((item for item in _ACTIVE.values() if item.operation_id == operation_id), None)
+        return bool(entry is not None and getattr(entry, "author_left_for", "") == ADDRESSED_EVENT
+                    and not getattr(entry, "pause_before_launch", False))
 
 
 def _attempt_history_evictable(item: "CommitAttemptRecord") -> bool:

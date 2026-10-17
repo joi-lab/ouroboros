@@ -20,13 +20,15 @@ test('update failure renders the rollback stash disclosure without losing diagno
         rolled_back: true, rollback: note, stash_note: note,
     } });
     assert.ok(rendered.includes(note));
+    // The update, not necessarily the checkout: a rollback may verify its target already present.
+    assert.ok(rendered.includes('the update was rolled back') && !rendered.includes('checkout was rolled back'));
     assert.equal(rendered.split(`git stash apply ${stash}`).length - 1, 1);
     const pending = applyFailureText({ message: 'write failed', body: {
         reason: 'stash_recovery_incomplete', rolled_back: false,
         stash_note: 'Automatic recovery is unconfirmed; current files were left unchanged.',
     } });
     assert.ok(pending.includes('unconfirmed'));
-    assert.ok(!pending.includes('the checkout was rolled back'));
+    assert.ok(!pending.includes('was rolled back'));
 });
 
 
@@ -128,7 +130,8 @@ test('detailed Updates UI makes destructive replacement an explicit recovery act
     // Restart now is honest about refusals: apiFetch does not reject on 4xx/5xx.
     assert.match(source, /async function restartNow\(\)/);
     assert.match(source, /if \(!resp\.ok\) throw new Error/);
-    assert.match(source, /Rollback completed:.*Restart Ouroboros to finish/s);
+    assert.match(source, /Rollback \$\{data\.switch_deferred \? 'recorded' : 'completed'\}:.*Restart Ouroboros to finish/s);
+    assert.match(source, /Rollback \$\{data\.switch_deferred \? 'requested' : 'successful'\}:.*Server is restarting/s);
     assert.match(source, /Rollback failed:.*Runtime shutdown was incomplete/s);
 
     const pillSource = readFileSync(new URL('../modules/update_status.js', import.meta.url), 'utf8');
@@ -203,6 +206,19 @@ test('Replace carries an in-flight latch that render respects across re-renders'
     const body = fn.slice(0, fn.indexOf('async function', 10));
     assert.match(body, /replaceInFlight = true;[\s\S]*updatePreflight/);
     assert.match(body, /finally \{\s*replaceInFlight = false;\s*render\(\);/);
+});
+
+test('Replace outcomes say a restart was requested, never that the version already landed', () => {
+    const src = readFileSync(new URL('../modules/updates.js', import.meta.url), 'utf8');
+    const fn = src.slice(src.indexOf('async function replaceWithOfficial'));
+    const body = fn.slice(0, fn.indexOf('async function', 10));
+    const toasts = [...body.matchAll(/showToast\('([^']*)'/g)].map((match) => match[1]);
+    assert.deepEqual(toasts, [
+        'Recovery needs a restart that could not be requested. Restart Ouroboros to finish.',
+        'Restart requested to finish recovery with the official version.',
+        'Recovery failed: ',
+    ]);
+    assert.ok(toasts.every((text) => !/restored|landed/i.test(text)));
 });
 
 test('restart refresh waits for a real reconnect before honoring boot status', () => {

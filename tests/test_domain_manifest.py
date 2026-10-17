@@ -18,6 +18,8 @@ red path is unreachable is coverage in form only).
 """
 from __future__ import annotations
 
+import ast
+import hashlib
 import importlib.util
 import pathlib
 import textwrap
@@ -265,3 +267,73 @@ def test_generated_block_replacement_is_idempotent():
     twice = check_domains.manifest_with_generated_block(once, block)
     assert once == twice
     assert once.count(check_domains.GENERATED_BEGIN) == 1
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("terminal_newline", [False, True])
+def test_duplicate_segments_match_parser_byte_columns(tmp_path, monkeypatch, newline, terminal_newline):
+    """The consumer must slice parser lines, not splitlines' Unicode separators."""
+    from scripts import domain_graph
+
+    source = (
+        "# non-ASCII prefix: café\n"
+        "@decorate('λ')\n"
+        "async def outer(é):\n"
+        "\ttext = 'é\u0085\u2028\u2029\\v'  \n"
+        "\tdef inner(): return '🦋'  # excluded trailing comment\n"
+        "\treturn text\n"
+        "\n"
+        "class Café:\n"
+        "\f    @decorate\n"
+        "\f    def method(self):\n"
+        "        text = '''first\n"
+        "second\fline\n"
+        "third'''\n"
+        "        return text\n"
+        "if True:\n"
+        "    def conditional(): return 'not traversed'\n"
+        "def one_line(): return '尾'"
+    ) + ("\n" if terminal_newline else "")
+    for name in ("a.py", "b.py"):
+        (tmp_path / name).write_bytes(source.replace("\n", newline).encode("utf-8"))
+    parsed_source = (tmp_path / "a.py").read_text(encoding="utf-8")
+    tree = ast.parse(parsed_source)
+    outer, cls, one_line = tree.body[0], tree.body[1], tree.body[3]
+    nodes = [("outer", outer), ("outer.inner", outer.body[1]),
+             ("Café.method", cls.body[0]), ("one_line", one_line)]
+    expected_segments = [ast.get_source_segment(parsed_source, node) for _, node in nodes]
+    assert "@decorate" not in expected_segments[0]
+    assert "excluded trailing comment" not in expected_segments[1]
+    observed = []
+    normalize = domain_graph._normalize_body
+
+    def record(segment):
+        observed.append(segment)
+        return normalize(segment)
+
+    monkeypatch.setattr(domain_graph, "_normalize_body", record)
+    manifest = _mini_manifest(tmp_path, {"a.py": "DA", "b.py": "DB"})
+    rows = duplicate_bodies(manifest, tmp_path, min_lines=1)
+    expected = sorted(
+        f"{hashlib.sha256(normalize(segment).encode('utf-8')).hexdigest()[:16]} "
+        f"a.py::{name} b.py::{name}" for (name, _), segment in zip(nodes, expected_segments)
+    )
+    assert observed == expected_segments * 2
+    assert rows == expected and len(rows) == 4
+
+
+def test_duplicate_scan_reads_changed_sources_and_preserves_syntax_errors(tmp_path):
+    """A local index is one scan's data, never a path/mtime cache or shared tree."""
+    a, b = tmp_path / "a.py", tmp_path / "b.py"
+    a.write_bytes(_COPY_BODY.encode("utf-8"))
+    b.write_bytes(a.read_bytes())
+    manifest = _mini_manifest(tmp_path, {"a.py": "DA", "b.py": "DB"})
+    original = duplicate_bodies(manifest, tmp_path)
+    assert len(original) == 1
+    b.write_bytes(_COPY_BODY.replace("total - 100", "total + 100").encode("utf-8"))
+    assert duplicate_bodies(manifest, tmp_path) == []
+    b.write_bytes(b"def broken(\n")
+    with pytest.raises(SyntaxError):
+        duplicate_bodies(manifest, tmp_path)
+    b.write_bytes(a.read_bytes())
+    assert duplicate_bodies(manifest, tmp_path) == original

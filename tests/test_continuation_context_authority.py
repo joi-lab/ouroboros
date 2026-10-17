@@ -34,6 +34,106 @@ def _summary(root, task_id: str, text: str) -> None:
     })
 
 
+@pytest.mark.parametrize("result", ["Use the existing tower", "r" * 20_000, "\x00" * 6_000])
+def test_helper_brief_keeps_the_answer_source_and_conditions_across_rebuilds(result):
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.main_context_authority import project_helper_predecessor_authority
+
+    authority = {
+        "task_id": "prior", "source": _source("prior"), "status": "completed", "result": result,
+        "origin_message_text": "  Owner: keep the tower.\nUse three levels.  ",
+        "verification_receipts": [{"evidence": "old receipt " * 300}],
+        "task_contract": {"objective": "Build the tower", "context": "never use native/API fallback",
+                          "delegation_budget": {"intent_note": "L1 asks L2 to spawn L3"},
+                          "predecessor_authority": {"task_id": "earlier", "result": "earlier body"}},
+    }
+    envelope = build_task_contract({"predecessor_authority": authority})["predecessor_authority"]
+    before = copy.deepcopy(envelope)
+    if isinstance(envelope["result"], dict):
+        assert len(json.dumps(envelope["result"], ensure_ascii=False)) > 15_000  # wrapper included
+    brief = project_helper_predecessor_authority(envelope)
+    for key in ("task_id", "source", "status", "result", "task_contract", "origin_message_text",
+                "authority_sha256", "authority_chars", "digest_semantics"):
+        assert brief[key] == before[key]
+    assert "predecessor_authority" not in brief["task_contract"]
+    assert "verification_receipts" not in brief
+    assert brief["omitted_fields"]["verification_receipts"] == len(json.dumps(
+        envelope["verification_receipts"], ensure_ascii=False, sort_keys=True))
+    wire = json.dumps(brief, ensure_ascii=False, sort_keys=True)
+    assert json.dumps(project_helper_predecessor_authority(brief), ensure_ascii=False, sort_keys=True) == wire
+    rebuilt = build_task_contract({"predecessor_authority": brief})["predecessor_authority"]
+    assert json.dumps(rebuilt, ensure_ascii=False, sort_keys=True) == wire
+    assert project_helper_predecessor_authority(authority) == brief  # legacy normalization is shared
+    assert envelope == before
+    brief["task_contract"]["delegation_budget"]["intent_note"] = "changed only in the copy"
+    assert envelope == before
+
+
+@pytest.mark.parametrize("selection", ["shared", "declared"])
+def test_child_grandchild_and_external_session_keep_the_same_predecessor_brief(selection):
+    from types import SimpleNamespace
+
+    from ouroboros.contracts.task_contract import build_task_contract
+    from ouroboros.subagent_work_order import assignment_instructions, compile_external_work_order
+    from ouroboros.tools.control_scheduling import _build_child_subagent_contract
+
+    root = build_task_contract({"task_contract": {
+        "objective": "Continue the tower", "input_sources": selection,
+        "predecessor_authority": {
+            "task_id": "prior", "source": _source("prior"), "authority_sha256": "a" * 64,
+            "result": "The tower stands", "origin_message_text": "Keep the old tower",
+            "task_contract": {"context": "never use native/API fallback",
+                              "constraints": "L1 asks L2 to spawn L3"},
+            "verification_receipts": [{"evidence": "RECEIPT_BODY"}],
+        },
+    }})
+    before = copy.deepcopy(root)
+    child = _build_child_subagent_contract({"tid": "child", "parent_contract": root})
+    grandchild = _build_child_subagent_contract({"tid": "grandchild", "parent_contract": child})
+    brief = child["predecessor_authority"]
+    assert grandchild["predecessor_authority"] == brief
+    assert brief["source"] == before["predecessor_authority"]["source"]
+    assert brief["authority_sha256"] == "a" * 64
+    assert "verification_receipts" not in brief and brief["omitted_fields"]["verification_receipts"] > 0
+    for contract in (root, child, grandchild):
+        instructions = assignment_instructions(SimpleNamespace(task_contract=contract))
+        session, _ = json.JSONDecoder().raw_decode(instructions.split("\n", 1)[1])
+        assert session["predecessor_authority"] == brief
+        assert "RECEIPT_BODY" not in instructions
+    for contract in (child, grandchild):
+        leaf = compile_external_work_order({"task_contract": contract})
+        assert "get_task_result" in leaf and "RECEIPT_BODY" not in leaf
+        for words in ("The tower stands", "Keep the old tower", "never use native/API fallback",
+                      "L1 asks L2 to spawn L3"):
+            assert (words in leaf) == (selection == "shared")
+    assert build_task_contract({"task_contract": grandchild}) == grandchild
+    assert root == before
+
+
+@pytest.mark.parametrize("selection", ["shared", "declared"])
+def test_a_task_without_a_predecessor_never_acquires_an_empty_brief(selection):
+    from types import SimpleNamespace
+
+    from ouroboros.subagent_work_order import assignment_instructions
+    from ouroboros.tools.control_scheduling import _build_child_subagent_contract
+
+    child = _build_child_subagent_contract({"tid": "fresh", "parent_contract": {"input_sources": selection}})
+    assert "predecessor_authority" not in child
+    instructions = assignment_instructions(SimpleNamespace(task_contract=child))
+    session, _ = json.JSONDecoder().raw_decode(instructions.split("\n", 1)[1])
+    assert "predecessor_authority" not in session and "full report" not in instructions
+
+
+def test_legacy_declared_reference_keeps_unknown_omission_sizes_and_cannot_regain_bodies():
+    from ouroboros.main_context_authority import project_helper_predecessor_authority
+
+    reference = {"source": _source("prior"), "omitted_fields": ["result", "task_contract"]}
+    brief = project_helper_predecessor_authority(reference, declared=True)
+    assert brief == {"source": reference["source"], "omitted_fields": {"result": None, "task_contract": None}}
+    assert project_helper_predecessor_authority(brief) == brief
+    assert project_helper_predecessor_authority(brief, declared=True) == brief
+
+
 def test_a_stored_authored_narrative_wins_without_chat_access(tmp_path):
     # Nothing writes an authored narrative any more; the readers keep serving the
     # ones earlier versions stored beside a task result and in the chat log.
@@ -322,22 +422,6 @@ def test_exception_overflow_text_survives_a_generic_response_body():
     assert result.retry_same_request is False
 
 
-def test_router_selector_is_explicit_and_schema_requires_it(tmp_path):
-    from ouroboros.tools.control import _promote_chat_to_task, _route_to_project, get_tools
-
-    ctx = type("Ctx", (), {"pending_events": [], "event_queue": None, "drive_root": tmp_path})()
-    assert "predecessor_task_id is required" in _promote_chat_to_task(ctx, "work")
-    assert "predecessor_task_id is required" in _promote_chat_to_task(ctx, "work", predecessor_task_id=None)
-    assert ctx.pending_events == []
-    assert "predecessor_task_id is required" in _route_to_project(ctx, "missing", "work")
-    assert "predecessor_task_id is required" in _route_to_project(
-        ctx, "missing", "work", predecessor_task_id=None,
-    )
-    entries = {entry.name: entry for entry in get_tools()}
-    assert "predecessor_task_id" in entries["promote_chat_to_task"].schema["parameters"]["required"]
-    assert "predecessor_task_id" in entries["route_to_project"].schema["parameters"]["required"]
-
-
 def test_context_overflow_skips_cross_model_and_forced_provider_calls(tmp_path, monkeypatch):
     import queue
 
@@ -384,3 +468,135 @@ def test_context_overflow_skips_cross_model_and_forced_provider_calls(tmp_path, 
     assert usage["_last_llm_error_kind"] == "context_overflow"
     outcome = derive_loop_outcome(result, usage, trace)
     assert outcome["failure"]["error_kind"] == "context_overflow"
+
+
+_PLAN_GAP_RULE = "Do not treat this plan/review authority as complete."
+
+
+def _pull_source(task_id: str) -> dict:
+    """The exact host-issued predecessor pointer a Continue startup accepts."""
+    return {"kind": "task_result", "task_id": task_id, "tool": "get_task_result",
+            "arguments": {"task_id": task_id, "include_authority": True}}
+
+
+def _plan_predecessor(root, task_id: str, damage: str) -> dict:
+    """A failed predecessor whose plan the real writer recorded, then damaged as named."""
+    from ouroboros import artifacts
+    from ouroboros.task_results import write_task_result
+    from tests.test_task_source_carrier_identity import _legacy_damage, _promotion, _record_plan
+
+    spec, plan = _record_plan(root, task_id)
+    wave, fields = plan["waves"][-1], {}
+    if damage == "spec_missing":
+        (artifacts.task_artifact_dir_path(root, task_id) / wave["spec_source_ref"]["path"]).unlink()
+    elif damage == "dialogue_missing":  # read after the spec, unwrapped: a raw OSError
+        wave["dialogue_source_ref"] = {"kind": "task_source", "root": "artifact_store", "size": 1, "sha256": "0" * 64,
+                                       "path": "source_handles/context_checkpoints/plan-dialogue-gone.jsonl"}
+        fields["plan_review_state"] = plan
+    else:  # the Quotas row: path-less placeholders, each path kept in a fact, the bytes intact
+        damaged, facts = _legacy_damage(plan, task_id)
+        fields.update(plan_review_state=damaged, child_ref_promotion=_promotion("complete", facts, []))
+    write_task_result(root, task_id, "failed", result="Provider unavailable.", reason_code="provider_unavailable",
+                      task_contract={"objective": "Build the tower"}, **fields)
+    return spec
+
+
+@pytest.mark.parametrize("damage", ["spec_missing", "dialogue_missing", "legacy_gap"])
+def test_continue_carries_an_unreadable_predecessor_plan_as_a_named_gap_through_every_projection(tmp_path, damage):
+    """Startup -> bounded envelope -> root Runtime context -> helper briefs -> get_task_result."""
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from ouroboros.context import build_llm_messages
+    from ouroboros.main_context_authority import project_helper_predecessor_authority
+    from ouroboros.store import open_store
+    from ouroboros.task_results import load_plan_review_state
+    from ouroboros.task_store import signature
+    from ouroboros.tools.control import _get_task_result
+    from ouroboros.tools.plan_review_artifacts import PlanReviewSourceUnavailable
+    from ouroboros.tools.registry import ToolContext
+    from tests.test_doc_context import _make_env_and_memory
+
+    env, memory = _make_env_and_memory(tmp_path)
+    root, predecessor = env.drive_root, "plan-predecessor"
+    spec = _plan_predecessor(root, predecessor, damage)
+    with open_store(root, write=False) as txn:
+        row_text, revision = txn.body_text(predecessor), signature(root, predecessor, txn=txn)
+    task = {"id": "plan-successor", "type": "task", "text": "continue", "budget_drive_root": str(root),
+            "predecessor_authority_source": _pull_source(predecessor)}
+
+    assert validate_task_authority_sources(env, task) == {}  # the successor starts and decides
+
+    error = {"spec_missing": "PlanReviewSourceUnavailable", "dialogue_missing": "FileNotFoundError"}.get(damage)
+    gap = error and {"status": "authority_source_unavailable", "code": "PLAN_REVIEW_SOURCE_UNAVAILABLE",
+                     "task_id": predecessor, "error": error, "rule": _PLAN_GAP_RULE}
+    envelope = task["predecessor_authority"]
+    assert envelope.get("plan_review_source_gap") == gap
+    if not gap:  # the recorded address was restored in memory and the operative spec read whole
+        assert envelope["plan_review_state"]["decision_core"]["goal"] == spec["goal"]
+    rendered = json.dumps(build_llm_messages(env=env, memory=memory, task=task)[0], ensure_ascii=False)
+    assert ("plan_review_source_gap" in rendered and _PLAN_GAP_RULE in rendered) == bool(gap)
+    for declared in (False, True):
+        brief = project_helper_predecessor_authority(envelope, declared=declared)
+        assert brief.get("plan_review_source_gap") == gap
+        assert project_helper_predecessor_authority(brief, declared=declared) == brief
+    ctx = ToolContext(repo_dir=env.repo_dir, drive_root=root)
+    for flag, independent in (("include_authority", "authority"), ("include_work_order_source", "work_order_source"),
+                              ("include_completion_source", "completion_source"),
+                              ("include_focus_source", "focus_source")):
+        payload = json.loads(_get_task_result(ctx, predecessor, **{flag: True}))
+        assert payload["status"] == "available" and independent in payload
+        assert payload["authority"].get("plan_review_source_gap") == gap
+    with pytest.raises((PlanReviewSourceUnavailable, OSError)):
+        load_plan_review_state(root, predecessor)  # deciders stay strict
+    with open_store(root, write=False) as txn:
+        assert txn.body_text(predecessor) == row_text
+        assert signature(root, predecessor, txn=txn) == revision  # even an identical rewrite is forbidden
+
+
+def test_a_named_predecessor_whose_row_reads_back_empty_refuses_the_start(tmp_path):
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from tests.test_doc_context import _make_env_and_memory
+
+    env, _memory = _make_env_and_memory(tmp_path)
+    task = {"id": "next", "type": "task", "text": "continue", "predecessor_authority_source": _pull_source("never-written")}
+
+    refusal = validate_task_authority_sources(env, task)
+
+    assert refusal["reason_code"] == "authority_source_unavailable"
+    assert refusal["detail"] == "named predecessor task result is missing or unreadable"
+    assert refusal["source"]["task_id"] == "never-written" and "predecessor_authority" not in task
+
+
+def test_the_current_tasks_own_unreadable_plan_source_still_refuses_typed(tmp_path):
+    """Owner answer 2A: only a predecessor's plan becomes a gap; the task's own plan still refuses."""
+    from ouroboros import artifacts
+    from ouroboros.agent_startup_checks import validate_task_authority_sources
+    from tests.test_doc_context import _make_env_and_memory
+    from tests.test_task_source_carrier_identity import _record_plan
+
+    env, _memory = _make_env_and_memory(tmp_path)
+    _spec, plan = _record_plan(env.drive_root, "own-plan")
+    (artifacts.task_artifact_dir_path(env.drive_root, "own-plan") / plan["waves"][-1]["spec_source_ref"]["path"]).unlink()
+
+    refusal = validate_task_authority_sources(env, {"id": "own-plan", "title": "Cat plan", "text": "continue"})
+
+    assert refusal["reason_code"] == "authority_source_unavailable"
+    assert refusal["source"]["kind"] == "plan_review_state" and refusal["human_label"] == "Cat plan"
+
+
+def test_the_runtime_gap_of_the_current_tasks_plan_comes_from_the_same_constructor(tmp_path):
+    """context.py and the predecessor projection share one gap: one shape, one rule text."""
+    from ouroboros import artifacts
+    from ouroboros.context import _task_authority_projection, build_llm_messages
+    from tests.test_doc_context import _make_env_and_memory
+    from tests.test_task_source_carrier_identity import _record_plan
+
+    env, memory = _make_env_and_memory(tmp_path)
+    _spec, plan = _record_plan(env.drive_root, "own-plan")
+    (artifacts.task_artifact_dir_path(env.drive_root, "own-plan") / plan["waves"][-1]["spec_source_ref"]["path"]).unlink()
+    task = {"id": "own-plan", "type": "task", "text": "continue"}
+
+    assert _task_authority_projection(env, task)["plan_review_authority"] == {
+        "status": "authority_source_unavailable", "code": "PLAN_REVIEW_SOURCE_UNAVAILABLE", "task_id": "own-plan",
+        "error": "PlanReviewSourceUnavailable", "rule": _PLAN_GAP_RULE,
+        "source": {"tool": "get_task_result", "arguments": {"task_id": "own-plan", "include_authority": True}}}
+    assert _PLAN_GAP_RULE in json.dumps(build_llm_messages(env=env, memory=memory, task=task)[0], ensure_ascii=False)

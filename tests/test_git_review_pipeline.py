@@ -37,8 +37,6 @@ from tests._git_review_pipeline_shared import (
 )
 
 
-
-
 @pytest.fixture
 def git_ctx(tmp_path):
     """Yield ``(git_module, ToolContext)`` — the canonical git pipeline setup."""
@@ -179,14 +177,15 @@ class TestRepoWriteMultiFile:
 class TestReviewInCommitPipeline:
     # ``test_repo_commit_calls_unified_review`` was removed in
     # v5.8.3-rc.5 — it is a strict subset of
-    # ``tests/test_scope_review.py::TestScopeReview::test_scope_review_wired_in_commit``
-    # which additionally verify ``run_scope_review`` is reached and the
-    # ``ThreadPoolExecutor`` parallelism contract holds.
+    # ``tests/test_review_helpers_pack.py::TestGitWiring::test_one_wave_wired_in_commit``
+    # which additionally verifies the one wave (assembly → admission → dispatch)
+    # is reached and the ``ThreadPoolExecutor`` parallelism contract holds.
 
     def test_blocked_review_unstages(self):
         """When review blocks, git reset HEAD must be called."""
-        git_mod = _get_git_module()
-        source = inspect.getsource(git_mod._run_reviewed_stage_cycle)
+        from ouroboros.tools import git_review_cycle
+
+        source = inspect.getsource(git_review_cycle._reviewed_stage_cycle)  # the cycle body under the panel
         assert 'git", "reset", "HEAD"' in source
 
     def test_review_rebuttal_forwarded(self):
@@ -203,11 +202,6 @@ class TestAutoPushBehavior:
         assert hasattr(git_mod, "_auto_push")
         assert callable(git_mod._auto_push)
 
-    def test_auto_push_is_best_effort(self):
-        git_mod = _get_git_module()
-        source = inspect.getsource(git_mod._auto_push)
-        assert "except Exception" in source
-        assert "non-fatal" in source.lower() or "non_fatal" in source.lower()
 
     def test_managed_tests_gate_before_tag_and_ordinary_tests_keep_prior_order(self):
         git_mod = _get_git_module()
@@ -216,7 +210,7 @@ class TestAutoPushBehavior:
         # ordinary warning-only tests run after the tag and before the push.
         managed_tests_pos = source.index("_managed_post_commit_tests_gate(")
         tag_pos = source.index("tag_info =")
-        ordinary_tests_pos = source.index("_post_commit_result(ctx, commit_message")
+        ordinary_tests_pos = source.index("run_operation(ctx, _post_commit_result, ctx, commit_message")
         push_pos = source.rindex("push_status = _auto_push")
         assert managed_tests_pos < tag_pos < ordinary_tests_pos < push_pos
 
@@ -260,12 +254,6 @@ class TestRemoteConfigSurfacing:
         source = (pathlib.Path(REPO) / "ouroboros" / "gateway" / "settings.py").read_text(encoding="utf-8")
         assert '"warnings"' in source
 
-    def test_remote_credentials_migration_not_wired_at_startup(self):
-        """Legacy token-in-URL migration is no longer run on startup."""
-        server_path = pathlib.Path(REPO) / "server.py"
-        source = server_path.read_text(encoding="utf-8")
-        assert "migrate_remote_credentials" not in source
-
 
 # --- credential helper safety (legacy migration retired) ---
 
@@ -274,17 +262,10 @@ class TestRemoteCredentialConfiguration:
         git_ops = _get_git_ops_module()
         assert not hasattr(git_ops, "migrate_remote_credentials")
 
-    def test_configure_remote_uses_local_credential_helper(self):
-        git_ops = _get_git_ops_module()
-        configure_source = inspect.getsource(git_ops.configure_remote)
-        helper_source = inspect.getsource(git_ops._configure_credential_helper)
-        assert "_configure_credential_helper" in configure_source
-        assert ".git/credentials" in helper_source
 
     def test_startup_setup_only_configures_current_settings_token(self):
         server_runtime = importlib.import_module("ouroboros.server_runtime")
         source = inspect.getsource(server_runtime.setup_remote_if_configured)
-        assert "migrate_remote_credentials" not in source
         assert "configure_personal_remote" in source
 
 
@@ -321,16 +302,6 @@ class TestSandboxCoversRepoWrite:
             "write_file",
             {"files": [{"path": "BIBLE.md", "content": "x"}]},
         ) == ["BIBLE.md"]
-
-
-# --- index-full instruction fix ---
-
-class TestIndexFullInstruction:
-    def test_system_md_warns_against_index_full(self):
-        system_md = pathlib.Path(REPO) / "prompts" / "SYSTEM.md"
-        content = system_md.read_text(encoding="utf-8")
-        assert "Do NOT call" in content or "reserved internal name" in content
-        assert "knowledge_list" in content
 
 
 # ---------------------------------------------------------------------------

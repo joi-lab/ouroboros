@@ -8,7 +8,11 @@ from typing import Any, Dict, Optional, Tuple
 
 
 def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tuple[bool, str]:
-    """Restore one exact commit after pinning committed and dirty local state."""
+    """Restore one exact commit after pinning committed and dirty local state.
+
+    Raises ``IndexLockRefusal`` (``before_tree_effects``) when Git refused its single reset
+    while taking this checkout's index lock: the keep branch and rescue made before it stay.
+    """
     from supervisor import git_ops as _g
 
     rc, target_sha, error = _g.git_capture(
@@ -42,10 +46,21 @@ def rollback_to_version(tag_or_sha: str, reason: str = "manual_rollback") -> Tup
             f"{incomplete}"
         )
 
-    _g._guard_live_repo_destructive_git(["git", "reset", "--hard", target_sha])
-    rc, _out, error = _g.git_capture(["git", "reset", "--hard", target_sha])
+    cmd = ["git", "reset", "--hard", target_sha]
+    _g._guard_live_repo_destructive_git(cmd)
+    rc, out, error = _g.git_capture(cmd, repair_index=False)
     if rc != 0:
-        return False, f"git reset failed: {error}"
+        from supervisor.git_ops_reset import IndexLockRefusal, _index_lock_refused
+
+        if not _index_lock_refused(cmd, subprocess.CompletedProcess(cmd, rc, out, error)):
+            return False, f"git reset failed: {error}"  # it may have moved the tree: the caller stays fenced
+        refusal = IndexLockRefusal(rc, cmd, output=out, stderr=error)
+        refusal.before_tree_effects = True  # this reset is the only tree command; Git died taking its lock
+        _g.append_jsonl(_g.DRIVE_ROOT / "logs" / "supervisor.jsonl", {
+            "ts": _g.utc_now_iso(), "type": "checkout_step_failed", "reason": reason, "target": tag_or_sha,
+            "cmd": " ".join(cmd), "returncode": rc, "stderr": error, "keep_branch": keep_branch,
+            "rescue_path": rescue.get("path")})
+        raise refusal
     from supervisor.git_ops_reset import _record_checkout_facts
 
     state = {"current_sha": target_sha.strip()}

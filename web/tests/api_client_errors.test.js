@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { fetchJson } from '../modules/api_client.js';
+import { fetchJson, signInUrl } from '../modules/api_client.js';
 
 function respond(status, body) {
     const prior = globalThis.fetch;
@@ -61,4 +61,12 @@ test('rejectOkFalse still reads the structured error of a 200 body', async () =>
             /Nothing to restore\./,
         );
     } finally { restore(); }
+});
+
+// Only the gate's 401 on the readiness and state reads sends a page here; the
+// return keeps the page address and drops only the reload bookkeeping.
+test('the sign-in return keeps the page address', () => {
+    assert.equal(signInUrl('http://h/'), '/auth/login?next=%2F');
+    assert.equal(signInUrl('http://h/ui/?a=1&_ouro_refresh=5#chat'), '/auth/login?next=%2Fui%2F%3Fa%3D1%23chat');
+    assert.equal(signInUrl('https://h:8443/?_ouro_reason=ui-source&_ouro_refresh=1'), '/auth/login?next=%2F');
 });

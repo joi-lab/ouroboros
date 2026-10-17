@@ -39,7 +39,10 @@ def test_swarm_managed_root_starts_agent_script_over_loopback(quoted_legacy_mark
         first = request("mock-model", True)
         [call] = first["tool_calls"]
         assert call["function"]["name"] == "plan_task"
-        assert json.loads(call["function"]["arguments"]) == script["agent"][0]["arguments"]
+        args = json.loads(call["function"]["arguments"])
+        assert args == script["agent"][0]["arguments"]
+        # The live organ's form — one write+ask; the retired spec form is refused at $0 and would hold the Swarm gate.
+        assert args["ask"] == "council" and args["affected_paths"] == [] and args["done_when"] and "spec" not in args
         assert stub.roles == ["agent"]
         assert set(stub.consumed()) == {"agent", "child", "probe"}
         remaining_agent = len(script["agent"]) - 1

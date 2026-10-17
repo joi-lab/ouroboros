@@ -1,4 +1,4 @@
-"""Structured review-evidence collection for summaries, reflections, and UX."""
+"""Structured review-evidence collection for task results, acceptance evidence and UX."""
 
 from __future__ import annotations
 
@@ -165,6 +165,17 @@ def _accept_repo_diff(ctx: Any, *, include_recent_commit: bool, drive_root: Any,
     return repo_diff, diff_meta
 
 
+def _accept_service_finalization(ev: Dict[str, Any], prov: Dict[str, str], llm_trace: Dict[str, Any],
+                                 drive_root: Any, task_id: str) -> None:
+    """Teardown facts arise outside any tool call: the panel reads the author's
+    complete redacted projection as evidence, never a veto. Its typed log refs
+    are host edges the review source closure retains for retrieving readers."""
+    from ouroboros.loop_forced_finalization import _service_finalization_projection
+
+    if rows := _service_finalization_projection(llm_trace, drive_root=drive_root, task_id=task_id):
+        ev["service_finalization"], prov["service_finalization"] = rows, "host_attested"
+
+
 def build_task_acceptance_evidence(
     ctx: Any,
     *,
@@ -180,17 +191,15 @@ def build_task_acceptance_evidence(
     acceptance_dialogue_history: List[Dict[str, Any]] | None = None,
     budget_chars: int = 0,
 ) -> Dict[str, Any]:
-    """Process-aware task-acceptance evidence packet (v6.51.0 idea-2). Typed sections with
-    explicit PROVENANCE tags (`host_attested`/`agent_supplied`/`tool_result`/`artifact`/
-    `hidden_or_restricted`): full task contract, a first-class verification_summary (red
-    receipts surfaced), the host-collected redacted repo_diff, a bounded+redacted tool-call
-    trajectory (HOW it was solved), and a leak-safe artifact manifest. Bounded by a DISCLOSED
-    truncation budget (P1). Shared by the agent-tool and host-forced acceptance paths so the
-    reviewer can critique outcome AND process (Bible P3/P12/P2). The reviewer prompt
-    (review_substrate) is the authority that applies the anti-cheat boundary — it must never
-    credit success to `hidden_or_restricted` evidence."""
+    """Shared agent-tool/host acceptance packet with explicit provenance and bounds.
+    Contract, receipts, diff, trajectory and artifacts describe outcome/process;
+    historical inputs are a separate exhibit, never effective criteria. The
+    review_substrate prompt applies the anti-cheat boundary: hidden/restricted
+    evidence cannot certify success. Every omitted range is disclosed (P1).
+    """
     from ouroboros.observability import redact_projection
     from ouroboros.outcomes import read_context_verification_receipts
+    from ouroboros.context_input_selection import historical_inputs_exhibit
 
     ev: Dict[str, Any] = {}
     prov: Dict[str, str] = {}
@@ -208,8 +217,7 @@ def build_task_acceptance_evidence(
         "parent_task_id": str(meta.get("parent_task_id") or ""),
         "project_id": str(meta.get("project_id") or getattr(ctx, "project_id", "") or ""),
     }
-    prov["canonical_payload"] = "host_attested"
-    prov["aliases"] = "host_attested"
+    prov["canonical_payload"] = prov["aliases"] = "host_attested"
     supplied_section = accept_agent_supplied_section(agent_evidence)
     if supplied_section:
         # Demoted repo_diff + structural redaction, through the ONE helper the
@@ -217,12 +225,9 @@ def build_task_acceptance_evidence(
         ev["agent_supplied"] = supplied_section
         prov["agent_supplied"] = "agent_supplied"
     contract = _accept_task_contract(ctx)
-    # W2: resolve the claims that bind this task through the ONE seam — ingress
-    # first, plan-frozen only when ingress is empty. The packet VIEW carries them;
-    # the durable/live contract is never mutated.
-    claims, claims_source, plan_exhibit = _accept_effective_claims(
-        ctx, contract, drive_root, task_id,
-    )
+    # Ingress claims win; plan-frozen claims fill only an empty ingress. This
+    # changes the packet view, never the durable/live contract.
+    claims, claims_source, plan_exhibit = _accept_effective_claims(ctx, contract, drive_root, task_id)
     if claims_source in {"plan_review", "author_plan"}:
         contract = {**contract, "acceptance_claims": claims}
     receipts = read_context_verification_receipts(ctx, task_id, fallback_root=drive_root) if task_id else []
@@ -230,6 +235,8 @@ def build_task_acceptance_evidence(
     # learns whether the owner door stamped this run before it weighs the corpus.
     ev["run_origin"] = _accept_run_origin(ctx, drive_root, task_id)
     prov["run_origin"] = "host_attested"
+    ev["historical_author_inputs"] = historical_inputs_exhibit(ctx, drive_root, task_id)
+    prov["historical_author_inputs"] = "host_attested"
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
         # This is an immutable verbatim corpus, not a parsed decision ledger:
@@ -305,19 +312,30 @@ def build_task_acceptance_evidence(
             ev["skill_lifecycle_history_coverage"] = skill_history_coverage
             prov["skill_lifecycle_history_coverage"] = "host_attested"
             ev["skill_lifecycle_complete"] = bool(skill_history_coverage.get("complete"))
-    repo_diff, diff_meta = _accept_repo_diff(
-        ctx, include_recent_commit=include_recent_commit, drive_root=drive_root, task_id=task_id)
+    material = (llm_trace or {}).get("acceptance_material") or {}
+    workspace = material.get("workspace") or {}
+    if material:
+        ev["acceptance_material"] = {**material, **({"workspace": {
+            key: value for key, value in workspace.items() if key != "repo_diff"}} if workspace else {})}
+        prov["acceptance_material"] = "host_attested"
+    if workspace:
+        repo_diff, diff_meta = workspace["repo_diff"], {
+            "source_ref": workspace["repo_diff_source_ref"], "capture_disclosure": workspace["repo_diff_capture"]}
+    else:
+        repo_diff, diff_meta = _accept_repo_diff(
+            ctx, include_recent_commit=include_recent_commit, drive_root=drive_root, task_id=task_id)
     ev["repo_diff"] = repo_diff
     prov["repo_diff"] = "host_attested"
-    # Identity/size/gaps of the private source this text was projected from.
-    # The raw bytes and their host-private ref deliberately stay out of the packet.
+    # Disclose capture identity/size/gaps; private raw bytes/refs stay outside the packet.
     if diff_meta.get("capture_disclosure"):
         ev["repo_diff_capture"] = redact_projection(diff_meta["capture_disclosure"]).value
         prov["repo_diff_capture"] = "host_attested"
     if diff_meta.get("source_ref"):
         ev["repo_diff_source_ref"] = redact_projection(diff_meta["source_ref"]).value
         prov["repo_diff_source_ref"] = "host_attested"
-    partial_sources: List[Dict[str, Any]] = [dict(diff_meta["issue"])] if diff_meta.get("issue") else []
+    partial_sources: List[Dict[str, Any]] = list(material.get("issues") or [])
+    if diff_meta.get("issue"):
+        partial_sources.append(dict(diff_meta["issue"]))
     if subtree_statuses is not None:
         ev["terminal_subtree_statuses"] = [dict(row) for row in subtree_statuses if isinstance(row, dict)]
         from ouroboros.depth_evidence import build_depth_summary
@@ -338,8 +356,8 @@ def build_task_acceptance_evidence(
             if omitted:
                 ev["tool_trajectory_omitted_leading"] = omitted
                 ev["tool_trajectory_complete"] = False
-        if unresolved:
-            partial_sources.extend(unresolved)
+        partial_sources.extend(unresolved)
+        _accept_service_finalization(ev, prov, llm_trace, drive_root, task_id)
         notes = llm_trace.get("reasoning_notes") or []
         if notes:
             ev["reasoning_notes"] = truncate_review_artifact("\n".join(str(n) for n in notes), limit=_ACCEPT_NOTES_CAP)
@@ -388,13 +406,9 @@ def build_task_acceptance_evidence(
         # rebuttal → acceptance loops. Host facts only; the disposition reason stays
         # under agent_supplied (clean provenance, BIBLE P3).
         obligations = [o for o in (llm_trace.get("acceptance_obligations") or []) if isinstance(o, dict)]
-        # Count cap (v6.71.1): OPEN obligations are ACTIVE BLOCKING STATE — the panel
-        # adjudicates them and a clean PASS closes them, so clipping an open row would
-        # let the loop close obligations the reviewers never saw (triad r4, P1/P3).
-        # Every open row therefore always ships; only HISTORICAL disposed rows are
-        # capped (most-recent fill up to _ACCEPT_OBLIGATIONS_MAX total), disclosed.
-        # An open set too large to fit fails closed downstream via the packet budget
-        # (__immutable_core_overflow__ → DEGRADED), never via silent hiding.
+        # Every open obligation ships: reviewers cannot close unseen blocking
+        # state. Only disposed history is count-capped, with omissions disclosed.
+        # Oversized open sets fail downstream (__immutable_core_overflow__), never hide.
         if len(obligations) > _ACCEPT_OBLIGATIONS_MAX:
             open_rows = [o for o in obligations if obligation_is_pending(o)]
             disposed_rows = [o for o in obligations if not obligation_is_pending(o)]
@@ -408,9 +422,7 @@ def build_task_acceptance_evidence(
                 })
             obligations = kept
         if obligations:
-            ev["acceptance_obligations"] = [
-                _accept_obligation_row(o) for o in obligations
-            ]
+            ev["acceptance_obligations"] = [_accept_obligation_row(o) for o in obligations]
             prov["acceptance_obligations"] = "host_attested"
     if drive_root is not None and task_id:
         arts = _accept_artifact_manifest(drive_root, task_id, _accept_protected_set(ctx))
@@ -429,8 +441,7 @@ def build_task_acceptance_evidence(
                                 "reason": "bounded_history_projection", "source_ref": coverage.get("source_ref") or {}})
     if partial_sources:
         ev["__unresolved_partial_artifacts__"] = partial_sources
-    # Set task_type BEFORE budget enforcement so the whole packet stays deterministically
-    # bounded — callers must NOT mutate the packet after the builder returns (review round-4).
+    # Add task type before fitting; callers cannot mutate the returned bounded packet.
     if str(task_type).strip():
         ev["task_type"] = str(task_type)
         prov["task_type"] = "host_attested"
@@ -587,32 +598,29 @@ def capture_commit_review_evidence(ctx: Any) -> dict:
             "original_refs": copy.deepcopy(refs)}
 
 
-def restore_commit_review_evidence(ctx: Any, source_ref: dict) -> dict:
-    """Recover one preflight view from its recorded canonical source identity."""
-    from ouroboros.artifacts import read_actor_source_bytes
-    from ouroboros.tool_access import canonical_data_root
+def pending_commit_review_evidence(ctx: Any, key: str = "task_execution") -> dict:
+    """Read the frozen request's evidence on reconciliation, never current trace (``key``:
+    this browser/vision exhibit, or ``preflight_execution``, the test execution fact)."""
+    from ouroboros.tools.review_change_custody import recorded_commit_assignment
 
-    root = canonical_data_root(ctx)
-    raw = read_actor_source_bytes(root, ctx.task_id, source_ref)
-    text = raw.decode("utf-8")
-    return {"source_ref": dict(source_ref), "task_id": ctx.task_id, "data_root": str(root),
-            "source_chars": len(text), "source_status": "ready", "source_complete": None,
-            "selected_count": None, "gap_count": None,
-            "preview": truncate_within_limit(text, _ACCEPT_NOTES_CAP), "original_refs": []}
-
-
-def pending_commit_review_evidence(ctx: Any) -> dict:
-    """Read the frozen request's evidence on reconciliation, never current trace."""
     attempt = getattr(ctx, "_pending_review_attempt", None)
     scope = getattr(attempt, "scope_raw_result", {}) or {}
-    rows = [*(getattr(attempt, "triad_raw_results", []) or []), *(scope.get("raw_results") or [scope])]
-    for row in rows:
+    rows = [(surface, row) for surface, values in (
+        ("multi_model_review", getattr(attempt, "triad_raw_results", []) or []),
+        ("scope_review", scope.get("raw_results") or [scope])) for row in values]
+    for surface, row in rows:
         try:
-            payload = _commit_source_payload(ctx, (row.get("prompt_ref") or {}).get("redacted_projection_ref") or {})
-            request = payload.get("request") or {}
-            if request.get("task_id") != ctx.task_id:
-                continue
-            evidence = (request.get("evidence") or {}).get("task_execution")
+            if row.get("operation_id"):
+                # The write-ahead roster survives a crash before result prompt_refs.
+                # Validate its original request against this operation's full custody.
+                request, _slot = recorded_commit_assignment(ctx, surface, row)
+                evidence = (request.evidence or {}).get(key)
+            else:  # Older rows retain only their exact selected prompt source.
+                payload = _commit_source_payload(ctx, (row.get("prompt_ref") or {}).get("redacted_projection_ref") or {})
+                request = payload.get("request") or {}
+                if request.get("task_id") != ctx.task_id:
+                    continue
+                evidence = (request.get("evidence") or {}).get(key)
             if isinstance(evidence, dict) and evidence:
                 return evidence
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -747,7 +755,6 @@ def collect_review_evidence(
     """
     from ouroboros.review_state import (
         _LEGACY_CURRENT_REPO_KEY,
-        advisory_commit_ready,
         compute_snapshot_hash,
         load_state,
         make_repo_key,
@@ -801,11 +808,6 @@ def collect_review_evidence(
         "current_repo": {
             "snapshot_hash": snapshot_hash[:12] if snapshot_hash else "",
             "advisory_status": str(getattr(current_run, "status", "") or "missing"),
-            "repo_commit_ready": advisory_commit_ready(
-                current_run is not None and current_run.status in ("fresh", "bypassed", "skipped"),
-                open_obligations, open_debts,
-                matching_run=current_run if getattr(current_run, "repo_key", None) == repo_key and repo_key else None,
-            ),
             "bypass_reason": str(getattr(current_run, "bypass_reason", "") or ""),
             "stale_reason": str(getattr(state, "last_stale_reason", "") or "") if stale_matches_repo else "",
             "stale_ts": str(getattr(state, "last_stale_from_edit_ts", "") or "") if stale_matches_repo else "",
@@ -847,162 +849,6 @@ def collect_review_evidence(
         evidence["omitted_corrupt"] > 0,
     ])
     return evidence
-
-
-_ACCEPTANCE_PANEL_ROW_KEYS = (
-    "panel_id", "surface", "authority", "aggregate_signal", "transport_status",
-    "parse_status", "quorum", "superseded",
-)
-
-
-def _acceptance_panel_prompt_row(panel: Dict[str, Any]) -> Dict[str, Any]:
-    row = {key: panel.get(key) for key in _ACCEPTANCE_PANEL_ROW_KEYS if key in panel}
-    reason = str(panel.get("reason") or "")
-    if reason:
-        limit = 300
-        row["reason"] = truncate_review_artifact(reason, limit=limit)
-        row["reason_omitted_chars"] = max(0, len(reason) - limit)
-        refs = [
-            actor.get("response_ref") for actor in (panel.get("actors") or [])
-            if isinstance(actor, dict) and actor.get("response_ref")
-        ]
-        if refs:
-            row["response_refs"] = refs
-    return row
-
-
-_FOREIGN_ADVISORY_KEYS = ("foreign_advisory_runs", "omitted_foreign_advisory_runs")
-
-
-def _foreign_advisory_section(evidence: Dict[str, Any]) -> str:
-    """Render another task's advisory runs under a heading that says whose they are.
-
-    Rows split out by ``collect_review_evidence`` are repository context, so
-    they must reach the reader — but never inside the block a summariser or a
-    reflection reads as "my review record". The heading names the owning task
-    ids, because the identity is exactly what a reader needs to not adopt the
-    failures.
-    """
-    rows = [row for row in (evidence.get("foreign_advisory_runs") or []) if isinstance(row, dict)]
-    omitted = int(evidence.get("omitted_foreign_advisory_runs") or 0)
-    if not rows and not omitted:
-        return ""
-    owners = sorted({str(row.get("task_id") or "") for row in rows} - {""})
-    return (
-        "ADVISORY RUNS OF OTHER TASKS (NOT this task's work — do not report them as my own):\n"
-        f"owning task_ids: {', '.join(owners) if owners else '(none recorded)'}; "
-        f"shown={len(rows)}; omitted={omitted}.\n"
-        "These ran on the same checkout for a different task. They are evidence about the\n"
-        "repository, never this task's errors, decisions or obligations.\n"
-        + json.dumps(rows, ensure_ascii=False, indent=2)
-    )
-
-
-def format_review_evidence_for_prompt(
-    evidence: Dict[str, Any],
-    *,
-    max_chars: int = 0,
-    acceptance_panels: Any = None,
-    plan_review: Any = None,
-    **_kwargs,
-) -> str:
-    """Format review evidence as JSON for prompt injection.
-
-    ``plan_review`` is the task's plan-review facts slice (``plan_review_facts``),
-    already bounded by its builder: it leads the text and consumes none of
-    ``max_chars``, which keeps bounding the commit/advisory and acceptance evidence.
-
-    When *max_chars* is 0 (default) the full JSON is returned — no truncation.
-    Callers that inject evidence into bounded prompts (summaries, reflections)
-    can pass a positive *max_chars* to get an explicit omission note instead
-    of silent clipping.
-
-    ``acceptance_panels`` leads with the task's OWN acceptance-panel projection.
-    The commit/advisory lens knows nothing about it, so its absence statement
-    names the lens it describes rather than claiming the task bought no review.
-
-    Another task's advisory runs leave the main JSON body entirely and are
-    rendered last, under their own attributing heading.
-    """
-    evidence = {key: value for key, value in evidence.items() if key != "task_inputs"} if isinstance(evidence, dict) else {}
-    foreign_section = _foreign_advisory_section(evidence)
-    if foreign_section:
-        evidence = {key: value for key, value in evidence.items() if key not in _FOREIGN_ADVISORY_KEYS}
-    rows = [
-        _acceptance_panel_prompt_row(panel)
-        for panel in (acceptance_panels if isinstance(acceptance_panels, list) else [])
-        if isinstance(panel, dict)
-    ]
-    task_id = str(evidence.get("task_id") or _kwargs.get("task_id") or "")
-    source_ref: Dict[str, Any] = (
-        {"kind": "task_result", "reader": "get_task_result", "task_id": task_id}
-        if task_id else {}
-    )
-    if not source_ref:
-        source_ref = next((
-            ref for row in rows for ref in (row.get("response_refs") or [])
-            if isinstance(ref, dict) and ref
-        ), {})
-    sections: List[str] = []
-    if rows:
-        from ouroboros._outcome_receipts import disclosed_list_projection
-
-        keep = len(rows)
-        projection = disclosed_list_projection(
-            rows, key="records", limit=keep, item=lambda row: row,
-        )
-        while source_ref and max_chars > 0 and keep > 1:
-            candidate = "TASK ACCEPTANCE PANELS:\n" + json.dumps(
-                projection, ensure_ascii=False, indent=2,
-            )
-            if len(candidate) <= max_chars:
-                break
-            keep -= 1
-            projection = disclosed_list_projection(
-                rows, key="records", limit=keep, item=lambda row: row,
-            )
-        if projection["records_omitted"]:
-            projection["omission_note"] = "whole trailing panel records omitted"
-            projection["omission_source_ref"] = source_ref
-        sections.append(
-            "TASK ACCEPTANCE PANELS:\n"
-            + json.dumps(projection, ensure_ascii=False, indent=2)
-        )
-    if foreign_section and max_chars > 0:
-        # The attributing section is part of the same budget, but it is ANOTHER
-        # task's record: it takes at most a quarter of the bound, so the task's
-        # own evidence (what the reflection and the Pattern Register learn from)
-        # keeps the rest. Charging the untruncated section first let three long
-        # foreign runs squeeze the own body down to one character.
-        foreign_cap = max(1, max_chars // 4)
-        if len(foreign_section) > foreign_cap:
-            foreign_section = truncate_review_artifact(foreign_section, limit=foreign_cap)
-    if evidence and evidence.get("has_evidence"):
-        rendered_evidence = json.dumps(evidence, ensure_ascii=False, indent=2)
-        prefix_chars = len(sections[0]) + 2 if sections else 0
-        prefix_chars += len(foreign_section) + 2 if foreign_section else 0
-        limit = max_chars - prefix_chars if max_chars > 0 else 0
-        if source_ref and max_chars > 0 and len(rendered_evidence) > max(1, limit):
-            rendered_evidence = truncate_review_artifact(
-                rendered_evidence, limit=max(1, limit),
-            )
-            rendered_evidence += (
-                f"\n⚠️ OMISSION SOURCE: review evidence truncated at {max_chars} chars; "
-                f"canonical source_ref={json.dumps(source_ref, ensure_ascii=False)}"
-            )
-        sections.append(rendered_evidence)
-    if foreign_section:
-        room = max_chars - sum(len(section) + 2 for section in sections) if max_chars > 0 else 0
-        sections.append(
-            truncate_review_artifact(foreign_section, limit=max(1, room))
-            if max_chars > 0 and len(foreign_section) > max(1, room) else foreign_section
-        )
-    body = "\n\n".join(sections) if sections else "(no commit/advisory review evidence recorded for this task)"
-    if isinstance(plan_review, dict) and plan_review:
-        from ouroboros.plan_review_facts import render_plan_review_section
-
-        return render_plan_review_section(plan_review) + "\n\n" + body
-    return body
 
 
 def _attempt_to_dict(item: Any) -> Dict[str, Any]:

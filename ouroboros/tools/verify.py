@@ -72,6 +72,30 @@ def _bounded(text: Any, cap: int) -> str:
     return t[:cap] + f"\n…[truncated {len(t) - cap} of {len(t)} chars]"
 
 
+def _publish_verification(ctx: ToolContext, text: str, receipt: dict, *, compared: bool, detail: str = "") -> str:
+    """Publish the recorded criterion verdict beside the call's own outcome (#1585).
+
+    Only after the receipt is durable. The check ran (or timed out): ``status`` is the
+    receipt's pass/fail and exit, signal and timeout stay on the process-facts channel.
+    ``matched`` is published only where a comparison was evaluated (``compared``): never
+    for a timeout, a check with no ``expected``, or bytes_equal without a byte verdict.
+    New receipts store null in these cases; historical records stay unchanged. The
+    ``detail`` then names the refused operand, missing file or cmp failure. The call's generic
+    classification is the legacy adapter's, so a handled FAIL is still a completed call.
+    """
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter, _publish_tool_result, _replace_tool_result
+
+    fact = {key: receipt[key] for key in ("status", "contract_kind", "expected_match", "check_rendering",
+                                          "criterion_id", "criterion_source") if receipt.get(key)}
+    fact.update(check=_bounded(receipt.get("check"), 200), receipt_ts=receipt["ts"])
+    if compared:
+        fact["matched"] = bool(receipt["matched"])
+    if detail:
+        fact["detail"] = _bounded(detail, 300)
+    typed = LegacyTextResultAdapter.from_text("verify_and_record", text)
+    return _publish_tool_result(ctx, _replace_tool_result(typed, meta_updates={"verification": fact}))
+
+
 def _receipt_custody_failure(kind: str, detail: str = "") -> str:
     suffix = f" Observed result: {detail}" if detail else ""
     return (
@@ -172,7 +196,9 @@ def _check_has_exit_masking(argv: List[str]) -> tuple[bool, list[str]]:
 
 
 # Public name for the SECOND consumer: run_command/run_script read the same
-# sensor to disclose a masked green in their result envelope.
+# sensor to disclose a masked green in their result envelope: on an exit-0 result
+# they append one EXIT_MASKING_NOTE and publish `exit_masking_reasons` in the
+# result meta; status and exit code are unchanged and no receipt is written.
 check_exit_masking = _check_has_exit_masking
 
 
@@ -303,18 +329,21 @@ def _bytes_equal_confinement_block(
 
 def _compare_files_bytes_equal(
     ctx: ToolContext, artifact_paths: List[str], work_dir: pathlib.Path, *, use_executor: bool
-) -> tuple[bool, str]:
+) -> tuple[bool | None, str]:
     """v6.60.0 expected_match="bytes_equal": byte-for-byte comparison of exactly TWO
     files (artifact_paths[0] vs [1]) — the golden-file/migration-parity shape a weaker
     substring check silently under-verifies. Runs on the SAME surface as the check
     (executor `cmp` in-container when the cwd is executor-mapped, host chunked read
     otherwise). Both operands are CONFINED first (see _bytes_equal_confinement_block).
     Returns (equal, detail); detail carries a BOUNDED hexdump around the first
-    divergence so the receipt shows WHERE the bytes differ, never whole files."""
+    divergence so the receipt shows WHERE the bytes differ, never whole files.
+    ``equal`` is None when no byte verdict was reached (a refused operand, a missing
+    file, cmp without an exit status or outside its 0/1 verdicts): still a FAIL, never
+    a claim that the bytes differ (#1585)."""
     a_raw, b_raw = str(artifact_paths[0]).strip(), str(artifact_paths[1]).strip()
     refusal = _bytes_equal_confinement_block(ctx, a_raw, b_raw, use_executor=use_executor)
     if refusal:
-        return False, refusal
+        return None, refusal
     if use_executor:
         from ouroboros.workspace_executor import execute as _executor_execute
 
@@ -326,15 +355,16 @@ def _compare_files_bytes_equal(
         try:
             rc = int(rc_raw)
         except (TypeError, ValueError):
-            return False, f"bytes_equal: executor cmp returned no exit status for {a_raw} vs {b_raw}"
+            return None, f"bytes_equal: executor cmp returned no exit status for {a_raw} vs {b_raw}"
         out = redact_process_data((res.stdout or "") + ("\n" + res.stderr if res.stderr else "")).strip()
         if rc == 0:
             return True, f"bytes_equal: {a_raw} == {b_raw} (executor cmp)"
-        if rc > 1:
+        if rc != 1:
             # cmp semantics: 0=equal, 1=differ, >1=trouble (missing file, missing cmp
-            # binary =127). Still a FAIL, but the receipt names the INFRA cause instead
-            # of misattributing a tooling absence as byte divergence (triad r3).
-            return False, (
+            # binary =127; a signal-killed cmp is no verdict either). Still a FAIL, but the
+            # receipt names the INFRA cause instead of misattributing a tooling absence as
+            # byte divergence (triad r3).
+            return None, (
                 f"bytes_equal infra error (cmp exit {rc}, not a byte verdict) "
                 f"({a_raw} vs {b_raw}): {out[:400] or 'no output'}"
             )
@@ -347,7 +377,7 @@ def _compare_files_bytes_equal(
     a_path, b_path = _resolve(a_raw), _resolve(b_raw)
     for label, path in ((a_raw, a_path), (b_raw, b_path)):
         if not path.is_file():
-            return False, f"bytes_equal: file not found: {label}"
+            return None, f"bytes_equal: file not found: {label}"
     a_size, b_size = a_path.stat().st_size, b_path.stat().st_size
     offset = 0
     first_diff = -1
@@ -766,16 +796,16 @@ def _verify_and_record(
             )
             # Same renderer as the completed-run receipt below, so it carries the same
             # stamp: a timeout red must be reconcilable by the later green of that argv.
-            receipt.update({"status": "fail", "returncode": None, "matched": False, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
+            receipt.update({"status": "fail", "returncode": None, "matched": None, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": f"check timed out after {timeout}s"})
             receipt.update({k: v for k, v in _facts.items() if k in _RECEIPT_PROCESS_KEYS})
             if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
                 return _receipt_custody_failure(
                     kind, f"check timed out after {timeout}s",
                 )
-            return (
+            return _publish_verification(ctx, (
                 f"verify_and_record [{kind}] FAIL: check timed out after {timeout}s. "
                 f"root={binding.root}, cwd={binding.target_path}. Receipt recorded."
-            )
+            ), receipt, compared=False, detail=receipt["summary"])
         # Full output captured in-handler BEFORE any transport truncation.
         out = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         rc = res.returncode
@@ -797,17 +827,16 @@ def _verify_and_record(
         else:
             matched = (not expected_s) or _expected_matches(out, expected_s, match_mode)
         passed = (rc == 0) and matched
+        compared = matched is not None if match_mode == "bytes_equal" else bool(expected_s)
         # `shlex.join`, never `" ".join` (v6.78.0): this text is the verification's
         # IDENTITY downstream (`_outcome_receipts.receipt_canonical_identity`), and a
         # space-join is not injective — argv `["echo","a b"]` and `["echo","a","b"]`
         # rendered identically, so a green on one could clear a red on the other.
         # `shlex.join` is the exact inverse of the lexer that identity re-tokenizes with
         # (`shell_parse.shell_tokens`), so the stored text round-trips back to this argv.
-        # The rendering is STAMPED beside the text (round 8): changing the renderer without
-        # recording which one ran re-opened the very collision above ACROSS versions — an
-        # old space-joined `echo a b` and a new `shlex.join` of a different argv read the
-        # same. The stamp makes the two incomparable instead of falsely equal.
-        receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched), "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
+        # The rendering stamp makes old/new spellings incomparable: changing only
+        # the renderer reopens the collision across versions.
+        receipt.update({"status": "pass" if passed else "fail", "returncode": rc, "matched": bool(matched) if compared else None, "check": shlex.join(argv), "check_rendering": CHECK_RENDERING_SHLEX_JOIN, "summary": _bounded(out, _RECEIPT_OUTPUT_CAP)})
         # D6/D7 disclosure keys (node-runtime sprint stream B), now copied from
         # the one publication above — see _RECEIPT_PROCESS_KEYS for which keys
         # and why. Disclosure-only: receipt IDENTITY (`check` text) and
@@ -836,15 +865,16 @@ def _verify_and_record(
             ) + f"\n\n{_bounded(out, _TOOL_OUTPUT_CAP)}"
         verdict = "PASS" if passed else "FAIL"
         exp_note = f" expected={expected_s!r}" if expected_s else ""
-        return (
+        return _publish_verification(ctx, (
             f"verify_and_record [{kind}] {verdict}: exit={rc}{exp_note}; "
             f"root={binding.root}, cwd={binding.target_path}. Host-attested receipt recorded.\n\n"
             f"{_bounded(out, _TOOL_OUTPUT_CAP)}"
-        )
+        ), receipt, compared=compared, detail=_cmp_detail if match_mode == "bytes_equal" else "")
 
     if kind == "artifact_observation":
         paths = [str(p) for p in (artifact_paths or []) if str(p or "").strip()]
         obs_status, detail = _observe_artifacts(ctx, paths)
+        # 20 paths stored; _outcome_receipts' identity carries the omitted count and full-set hash.
         receipt.update({"status": obs_status, "paths": paths[:20], "summary": detail})
         if not append_verification_receipt(drive_root, task_id, redact_process_data(receipt)):
             return _receipt_custody_failure(kind, f"{obs_status}: {detail}")
@@ -879,38 +909,36 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("verify_and_record", {
             "name": "verify_and_record",
             "description": (
-                "Verify your deliverable BEFORE claiming it is done, and record a durable host-attested "
-                "receipt. The host RUNS your declared check and attests the result — one call replaces the "
-                "verification run you would do anyway. Pick contract_kind: visible_verifier / explicit_command "
-                "(run `check`, pass on exit 0 and, if given, `expected` substring present) · explicit_metric "
-                "(run `check`, pass when the `expected` metric string appears) · artifact_observation (the host "
-                "confirms the declared artifact_paths exist) · no_visible_machine_contract (honest escape hatch: "
-                "no machine check exists; your best proxy + risk is recorded for review) · delegation_zero_run "
-                "(configured session actors only: record a typed incomplete/unknown decision when no "
-                "physical leaf was started, with zero_run_decision and zero_run_basis). Recording a receipt "
-                "suppresses the receipt_absent transparency flag on a clean turn. ANTI-CHEAT: verify ONLY against "
-                "PUBLIC task info — the instruction text, examples embedded in it, installed oracles, and your own "
-                "independent checks. NEVER read a hidden /tests/ dir, solution.sh, copied verifier code, or look up "
-                "the answer online."
+                "Verify BEFORE claiming completion; the host runs your check and records a durable attested "
+                "receipt, replacing a separate verification run. contract_kind: visible_verifier/explicit_command "
+                "run check and pass on exit 0 plus any expected substring; explicit_metric runs check and "
+                "requires the expected metric string; artifact_observation confirms artifact_paths exist; "
+                "no_visible_machine_contract records your best proxy and risk for review when no machine "
+                "check exists; delegation_zero_run records an incomplete/unknown decision for configured "
+                "session actors whose physical leaf never started (zero_run_decision + zero_run_basis). "
+                "A receipt suppresses receipt_absent on a clean turn. Verify ONLY against PUBLIC task "
+                "instructions, embedded examples, installed oracles and your independent checks. NEVER "
+                "read hidden /tests/, solution.sh or copied verifier code, or look up the answer online."
             ),
             "parameters": {"type": "object", "properties": {
-                "contract_kind": {"type": "string", "enum": list(_CONTRACT_KINDS), "description": "How the deliverable is verifiable — you declare it (the host never guesses)."},
-                "criterion_id": {"type": "string", "default": "", "description": "Optional id of the task_contract acceptance claim this receipt supports. Use ids from task_contract.acceptance_claims when present."},
-                "criterion_source": {"type": "string", "enum": ["task_stated", "agent_defined"], "default": "agent_defined", "description": "Where this success criterion came from: task_stated (the task/instructions state it) or agent_defined (you synthesized it). Flag-only honesty — an agent_defined criterion asks you to double-check it is equivalent to what the task actually requires."},
-                "criterion_basis": {"type": "string", "default": "", "description": "Optional one-line basis for an agent_defined criterion: why this check is sufficient evidence for the task's real requirement."},
-                "zero_run_decision": {"type": "string", "enum": list(_ZERO_RUN_DECISIONS), "description": "For delegation_zero_run only: the actor's typed decision when no selected physical leaf was started."},
-                "zero_run_basis": {"type": "string", "description": "For delegation_zero_run only: concise host-visible evidence or blocker; required and never inferred from final prose."},
-                "check": {"description": "The verification command: an argv list (['pytest','-q']) or a shell one-liner string. Required for visible_verifier/explicit_command/explicit_metric.", "type": ["array", "string"], "items": {"type": "string"}},
-                "expected": {"type": "string", "default": "", "description": "Optional expected substring/metric in the check output (explicit_command/explicit_metric)."},
-                "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "How `expected` is matched: substring (default) · exact (whole stripped output equals expected) · exact_line (expected equals one stripped output line) · json_equals (output and expected parse to equal JSON, key-order tolerant) · bytes_equal (after the check runs, artifact_paths=[a, b] are compared BYTE-FOR-BYTE — golden files, migration parity; the receipt records a bounded hexdump of the first divergence). Use a stricter mode when the task gives a worked example / exact output."},
-                "artifact_paths": {"type": "array", "items": {"type": "string"}, "description": "Deliverable paths. For artifact_observation the host confirms they exist (existence/size only, never content) — observable roots are the active workspace plus every resource root the ACTIVE profile can already read (for orchestrating parents that includes subagent_projects and deliverables, so a parent CAN confirm a child's deliverable in the projects tree; child/readonly profiles lack those roots); a path outside these is a non-fatal refused_out_of_scope, not a failure. For run-kind checks (visible_verifier/explicit_command/explicit_metric) the host ALSO probes (after the check) whether each declared path that is RELATIVE to the check's working directory (cwd) still exists and records an advisory artifact_lifecycle flag — catching a check that built then deleted its own deliverable."},
-                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Run-kind only: explicit environment variable → saved setting key mapping, with existing Settings-selection authority and secret masking."},
+                "contract_kind": {"type": "string", "enum": list(_CONTRACT_KINDS), "description": "Declare how the deliverable is verifiable; the host never guesses."},
+                "criterion_id": {"type": "string", "default": "", "description": "Supported claim id from task_contract.acceptance_claims, when present."},
+                "criterion_source": {"type": "string", "enum": ["task_stated", "agent_defined"], "default": "agent_defined", "description": "task_stated: stated in task/instructions; agent_defined: synthesized by you. Flag only: double-check an agent_defined criterion matches the actual requirement."},
+                "criterion_basis": {"type": "string", "default": "", "description": "Optional line explaining why an agent_defined check sufficiently proves the task's requirement."},
+                "zero_run_decision": {"type": "string", "enum": list(_ZERO_RUN_DECISIONS), "description": "delegation_zero_run only: actor's typed decision when no selected physical leaf started."},
+                "zero_run_basis": {"type": "string", "description": "Required for delegation_zero_run: concise host-visible evidence/blocker, never inferred from final prose."},
+                "check": {"description": "Command as argv (['pytest','-q']) or shell one-liner. Required for visible_verifier/explicit_command/explicit_metric.", "type": ["array", "string"], "items": {"type": "string"}},
+                "expected": {"type": "string", "default": "", "description": "Expected output substring/metric for explicit_command/explicit_metric."},
+                "expected_match": {"type": "string", "enum": list(_EXPECTED_MATCH_KINDS), "default": "substring", "description": "Match expected as substring (default), exact (whole stripped output), exact_line (one stripped output line), or json_equals (parsed JSON equality, ignoring key order). bytes_equal compares artifact_paths=[a, b] byte-for-byte after check, recording a bounded hexdump of the first divergence (golden files/migration parity). Prefer stricter matching for worked examples/exact output."},
+                "artifact_paths": {"type": "array", "items": {"type": "string"}, "description": "Deliverable paths. artifact_observation checks existence/size, never content, in the active workspace and the ACTIVE profile's readable resource roots. Orchestrating parents include subagent_projects/deliverables and can confirm child deliverables; child/readonly profiles lack those roots. Outside paths return non-fatal refused_out_of_scope. Run kinds (visible_verifier/explicit_command/explicit_metric) also check after execution that paths RELATIVE to cwd still exist; advisory artifact_lifecycle flags expose checks that delete their deliverables."},
+                "env_from_settings": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Run kinds: environment variable → saved setting key mapping; existing Settings-selection authority and secret masking apply."},
                 "cwd": {
                     "type": "string",
                     "default": "",
                     "description": (
                         "For run-kind checks, omit for active_workspace; use system_repo[/subdir] "
-                        "for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill."
+                        "for Ouroboros or skill_payload[/subdir] with bucket+skill_name for a skill. "
+                        "Docker backend aliases inside active_workspace are accepted."
                     ),
                 },
                 "bucket": {

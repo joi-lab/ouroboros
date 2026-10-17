@@ -8,22 +8,23 @@ Main moves on — so they live together:
 * the wave wakes Main at its own quorum and again when the last slot settles,
   and the wake carries each reviewer's own verdict
   (``announce_acceptance_settlement``);
-* final delivery of a text-only rewrite under that panel's feedback buys no
-  second panel (``_deliver_under_running_panel``), whether feedback returned
-  ready or pending. Main waits for a pending panel — the
+* final delivery rejoins that paid panel (``_deliver_under_running_panel``),
+  whether feedback returned ready or pending. Main waits for a pending panel — the
   default, and the only option under blocking enforcement — or consciously
-  finishes; a panel that PASSED the earlier revision accepts the task and the
-  owner row says so (fork 1=B), while a changed subject (criteria, material
-  evidence, owner source) or any other settled verdict hands the
-  delivery to the ordinary acceptance path with the collected verdicts in its
-  dialogue history;
+  finishes where policy permits. Once the settled feedback reached Main, a panel
+  that PASSED the earlier revision accepts a text-only rewrite and the owner row
+  says so (fork 1=B); a changed subject (criteria, material evidence, owner
+  source) or any other verdict takes the ordinary acceptance path, with the
+  collected verdicts retained in its dialogue history;
 * a panel that settles after its task ended is collected at $0, republished on
   the task's own review projection with the host's own settlement note and a
   neutral late-evidence fact (which version the reviewers read, what the host
   proved it emitted, when it settled and the exact source), and announced once
   in the task's room as one row of that card's Reviews group
-  (``attach_late_acceptance_settlement``). The fact is evidence for Ouroboros
-  to judge, never a host decision: no model turn starts here (fork 2=A). A
+  (``attach_late_acceptance_settlement``), and kept in view in that room's
+  memory until the mind releases it (``late_review_marks``). The fact is
+  evidence for Ouroboros to judge, never a host decision: no model turn starts
+  here (fork 2=A). A
   worker that no longer holds the trace falls back to the canonical published
   source, and a controller that died is collected by the existing maintenance
   pass through the same ``settle_acceptance_operation``;
@@ -281,7 +282,7 @@ def acceptance_settlement_message(request: Any, wave: Dict[str, Any]) -> str:
     early = len(wave.get("answered_before_release_ids") or ())
     head = ACCEPTANCE_SETTLEMENT_WAKE.format(
         retry_key=str(getattr(request, "retry_key", "") or ""),
-        settled=early + sum(1 for status in slots.values() if status),
+        settled=early + sum(1 for status in slots.values() if status and status != "unresolved"),
         total=max(int(wave.get("total") or 0), len(slots) + early),
     )
     lines = _reviewer_lines(wave)
@@ -353,7 +354,7 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
     mailbox, which is drained before every round and also ends an acceptance
     park. Once the task is terminal there is nobody to wake: the same verdicts
     are attached to the task result and announced once in the task's own room,
-    so the owner sees them and the next turn reads them in chat history. Never a
+    so the owner sees them and that room's next turn keeps them in view. Never a
     model turn, never a second paid dispatch. Runs on the settlement thread,
     outside custody locks.
     """
@@ -379,7 +380,8 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
         from ouroboros.owner_mailbox import write_task_message
         trace = _settlement_trace(usage_ctx, str(getattr(request, "retry_key", "") or ""))
         source = next(({"task_id": task_id, "run_index": index,
-                        "binding_hash": str(run.get("binding_hash") or "")}
+                        "binding_hash": str(run.get("binding_hash") or ""),
+                        "settled": bool(wave.get("slots")) and all((wave.get("slots") or {}).values())}
                        for index, run in enumerate((trace or {}).get("review_runs") or [])
                        if run.get("authority") == "host_root"
                        and (run.get("request") or {}).get("retry_key") == request.retry_key), None)
@@ -432,60 +434,119 @@ def awaited_panel_has_settled(tools_ctx: Any, llm_trace: Dict[str, Any]) -> bool
 
 
 def acceptance_choice_offered() -> bool:
-    """Whether the host can honour a wait/finish choice on this install.
+    """Effective nonblocking review permits an explicit early finish, Cyber included."""
+    from ouroboros.config import get_review_enforcement
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
 
-    Blocking enforcement always waits; Cyber Pro never does (Main's final
-    response is its decision there, unchanged). Only advisory enforcement on an
-    ordinary runtime mode leaves the choice to Main, so only there is it offered.
-    """
-    from ouroboros.config import get_review_enforcement, get_runtime_mode
-    from ouroboros.runtime_mode_policy import runtime_mode_at_least
-
-    return (get_review_enforcement() != "blocking"
-            and not runtime_mode_at_least(get_runtime_mode(), "cyber_pro"))
+    return not review_enforcement_blocks(get_review_enforcement())
 
 
 def acceptance_wait_chosen(tools_ctx: Any) -> bool:
     """Waiting is the default; only an explicit, current ``finish`` releases an
     answer over a panel that is still running where the install lets Main choose."""
-    from ouroboros.config import get_review_enforcement, get_runtime_mode
-    from ouroboros.runtime_mode_policy import runtime_mode_at_least
+    return (not acceptance_choice_offered()
+            or str(getattr(tools_ctx, "_acceptance_pending_review_choice", "") or "") != "finish")
 
-    if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+
+def continue_acceptance_wait(tools_ctx: Any, trace: dict, messages: list, task_id: str) -> bool:
+    """Collect paid work before preparation, preserving identity through owner mail.
+    Arrival is not exposure; offer settled feedback before a new author decision.
+    Stop remains independent.
+    """
+    from ouroboros.loop_acceptance_review import acceptance_run_pending, _offer_acceptance_feedback, acceptance_feedback_text
+    from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
+
+    if not any(isinstance(run, dict) and run.get("authority") == "host_root" for run in trace.get("review_runs") or []):
         return False
-    if get_review_enforcement() == "blocking":
+    reconcile_pending_acceptance_runs(trace, drive_root=tools_ctx.drive_root, usage_ctx=tools_ctx)
+    run = panel_awaiting_this_turn(tools_ctx, trace)
+    if (not run or not acceptance_wait_chosen(tools_ctx)
+            or (getattr(tools_ctx, "_completion_selected", None) or {}).get("action") == "stop"):
+        return False
+    if acceptance_run_pending(run):
         return True
-    return str(getattr(tools_ctx, "_acceptance_pending_review_choice", "") or "") != "finish"
+    if not run.get("settled_feedback_delivered"):
+        from ouroboros.loop_acceptance import _end_task_acceptance_fence
+        _end_task_acceptance_fence(tools_ctx, outcome="revision")
+        context = SimpleNamespace(llm_trace=trace, messages=messages, task_id=task_id,
+                                  review_binding={"binding_hash": run.get("binding_hash")})
+        _offer_acceptance_feedback(context, acceptance_feedback_text(SimpleNamespace(**run)))
+        return True
+    return False
+
+
+def _feedback_standing(tools_ctx: Any, llm_trace: Dict[str, Any], run: Dict[str, Any]) -> str:
+    """Why settled feedback cannot speak for a text-only rewrite at $0; "" when it can."""
+    from ouroboros.loop_delivery import delivery_subject_hash
+    from ouroboros.loop_messages import owner_source_sha256
+
+    reviewed_text = (run.get("request") or {}).get("subject", "")
+    if run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed_text):
+        return "material"  # A held rewrite may have acquired new material after supersession.
+    if run.get("superseded_by_revision") and run.get("superseded_reason") != "delivery_candidate_replaced":
+        return "superseded"  # The existing subject/effect owner already invalidated this feedback.
+    reviewed_source = str(run.get("owner_source_sha256") or "")
+    if reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or ""):
+        return "owner_source"  # supersession is sticky, so premises are compared here
+    if not run.get("settled_feedback_delivered"):
+        return "unexposed"  # the settled feedback reaches Main before any decision rests on it
+    return ""
+
+
+def _previous_revision_pass(llm_trace: Dict[str, Any], run: Dict[str, Any]) -> bool:
+    """A rewrite Main nominated itself asked for its own review: the earlier PASS never stands in for it."""
+    reviewed_text = (run.get("request") or {}).get("subject", "")
+    nominated = [(call.get("request") or {}).get("subject") for call in llm_trace.get("acceptance_evidence_calls") or []
+                 if isinstance(call, dict) and call.get("status") == "deferred_to_host_acceptance"]
+    return str(run.get("aggregate_signal") or "").upper() == "PASS" and nominated[-1:] in ([], [reviewed_text])
+
+
+def delivery_approves_clean_feedback(tools_ctx: Any, llm_trace: Dict[str, Any], run: Dict[str, Any],
+                                     subject_hash: str) -> bool:
+    """Whether ordinary delivery approves the current subject from this clean feedback at $0.
+
+    Consult the same paid-run selector as ordinary delivery before considering a
+    text-only rewrite. Latest feedback may be B's PASS while delivery will replay
+    A's superseded FAIL; neither replay can authorize an informed finish of A."""
+    from ouroboros.review_substrate import task_acceptance_is_clean
+    from ouroboros.loop_acceptance_review import _prior_acceptance_run, acceptance_paid_identity
+
+    _, prior = _prior_acceptance_run(
+        tools_ctx, llm_trace, "", paid_identity=acceptance_paid_identity(subject_hash, llm_trace),
+    )
+    if prior is not None:
+        return (not prior.get("superseded_by_revision") and prior.get("subject_hash") == subject_hash
+                and task_acceptance_is_clean(SimpleNamespace(**prior)))
+    # No paid run matches the selected material: preserve the ordinary delivery
+    # rejoin for a genuinely new text-only rewrite of the latest exposed PASS.
+    if not run or not task_acceptance_is_clean(SimpleNamespace(**run)):
+        return False
+    if not run.get("superseded_by_revision"):
+        return run.get("subject_hash") == subject_hash
+    return (run.get("subject_hash") != subject_hash and not _feedback_standing(tools_ctx, llm_trace, run)
+            and _previous_revision_pass(llm_trace, run))
 
 
 def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
-    """A DELIVERY is not a nomination: it neither buys a panel nor is refused one.
-
-    The paid panel keeps its identity whether it returned ready or pending.
-    While it runs, Main waits (the default and the only option under blocking
-    enforcement) or consciously finishes. Once it has settled on the earlier
-    revision: a PASS accepts the task on the reviewers' word and the owner row
-    says so (fork 1=B); any other verdict is not a verdict on this answer, so the
-    ordinary path decides — a new panel while the review cap allows, otherwise
-    its typed capacity refusal — with the collected verdicts already in its
-    dialogue history. ``None`` means "not this case": a changed subject is one
-    (the ordinary path reviews it), and while the panel is still running a
-    text-only rewrite buys a NEW panel only when Main nominates it again
-    (``_acceptance_review_only``).
-    """
+    """Rejoin paid work for an informed author selection. A rewrite keeps the earlier
+    verdict's identity, never its authority over new material or premises: once the
+    settled feedback reached Main, a PASS on the earlier revision accepts a text-only
+    rewrite with the honest previous_revision_accepted row (fork 1=B)."""
     from ouroboros import loop
     from ouroboros.loop_acceptance_review import (
         _end_acceptance_terminal, _finish_cyber_acceptance,
         _set_applied_host_acceptance_impact, acceptance_run_pending,
     )
-    from ouroboros.loop_delivery import delivery_subject_hash
-    from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
 
     tools_ctx = ctx.tools._ctx
-    if prior_run is not None or getattr(tools_ctx, "_acceptance_review_only", False):
+    if getattr(tools_ctx, "_acceptance_review_only", False):
         return None
     run = panel_awaiting_this_turn(tools_ctx, ctx.llm_trace)
+    if run is not None and acceptance_run_pending(run):
+        return True if acceptance_wait_chosen(tools_ctx) else _finish_cyber_acceptance(ctx, SimpleNamespace(**run))
+    if prior_run is not None:
+        return None
     if run is None:
         # Initial release may return a completed panel. Its delivered feedback
         # belongs to this turn without pretending the operation is still pending.
@@ -494,59 +555,48 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         if (not run or not run.get("feedback_delivered")
                 or run.get("superseded_reason") != "delivery_candidate_replaced"):
             return None
-    reviewed_text = (run.get("request") or {}).get("subject", "")
-    if run.get("subject_hash") != delivery_subject_hash(tools_ctx, ctx.llm_trace, reviewed_text):
-        return None  # A held rewrite may have acquired new material after supersession.
-    if run.get("superseded_by_revision") and run.get("superseded_reason") != "delivery_candidate_replaced":
-        return None  # The existing subject/effect owner already invalidated this feedback.
+    standing = _feedback_standing(tools_ctx, ctx.llm_trace, run)
+    if standing in {"material", "superseded"}:
+        return None
     # Older owner premises cannot authorize this delivery (owner rule 4=A).
     # The panel keeps its physical custody and still arrives as advice.
-    reviewed_source = str(run.get("owner_source_sha256") or "")
-    if reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or ""):
-        tools_ctx._task_acceptance_pending = ""
-        return None
-    if acceptance_run_pending(run):
-        if acceptance_wait_chosen(tools_ctx):
-            ctx.emit_progress("Task acceptance review is still running; holding the answer for its verdict.")
-            return True
-        return _finish_cyber_acceptance(ctx, SimpleNamespace(**run))
     tools_ctx._task_acceptance_pending = ""
-    if str(run.get("aggregate_signal") or "").upper() != "PASS":
-        return None
+    if standing:
+        return None  # older premises, or settled feedback that has not reached Main yet
     result = SimpleNamespace(**run)
-    _set_applied_host_acceptance_impact(run, result, requires_revision=False)
-    ctx.llm_trace.setdefault("review_decision", {}).update({
-        "panel_id": str(run.get("panel_id") or ""),
-        "binding_hash": str(run.get("binding_hash") or ""),
-    })
-    _end_acceptance_terminal(ctx, "pass")
-    loop._set_acceptance_decision(ctx.llm_trace, {
-        "status": ACCEPTANCE_ACCEPTED,
-        "reason": REASON_PREVIOUS_REVISION_ACCEPTED,
-        "source": "task_acceptance_review",
-        "reviewer_signal": "PASS",
-        "reviewed_panel_id": str(run.get("panel_id") or ""),
-        "reviewed_candidate_hash": str(run.get("candidate_hash") or ""),
-    })
-    ctx.emit_progress(
-        "Task acceptance review: PASS on the earlier revision of this answer; accepted on the "
-        "reviewers' word (the rewrite itself was not re-reviewed)."
-    )
-    return False
+    if _previous_revision_pass(ctx.llm_trace, run):
+        _set_applied_host_acceptance_impact(run, result, requires_revision=False)
+        ctx.llm_trace.setdefault("review_decision", {}).update({
+            "panel_id": str(run.get("panel_id") or ""),
+            "binding_hash": str(run.get("binding_hash") or ""),
+        })
+        _end_acceptance_terminal(ctx, "pass")
+        loop._set_acceptance_decision(ctx.llm_trace, {
+            "status": ACCEPTANCE_ACCEPTED,
+            "reason": REASON_PREVIOUS_REVISION_ACCEPTED,
+            "source": "task_acceptance_review",
+            "reviewer_signal": "PASS",
+            "reviewed_panel_id": str(run.get("panel_id") or ""),
+            "reviewed_candidate_hash": str(run.get("candidate_hash") or ""),
+        })
+        ctx.emit_progress(
+            "Task acceptance review: PASS on the earlier revision of this answer; accepted on the "
+            "reviewers' word (the rewrite itself was not re-reviewed)."
+        )
+        return False
+    if not (getattr(tools_ctx, "_completion_selected", None) or {}).get("action") == "finish":
+        return None
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
+    if not review_enforcement_blocks("blocking"):
+        return _finish_cyber_acceptance(ctx, result)
+    return None  # Ordinary admission/reuse alone can approve any other current subject.
 
 
 def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_reason: str) -> Dict[str, Any]:
-    """What a forced rail may honestly record about the panel its turn owns.
-
-    Every rail bypass reason says "the answer was never reviewed", so one may
-    be stamped only when no panel ran. The turn's own panel is collected at $0
-    first — the same free collection delivery performs — and then speaks for
-    itself: a clean PASS on the SAME subject accepts the answer on the
-    reviewers' word; reviewers who had not answered leave it unaccepted with
-    ``review_pending``, because an answer that has not arrived is a gap and
-    never a verdict; any other settled outcome leaves it unaccepted with no
-    verdict established. Returns the decision fields the recorder merges — the
-    existing acceptance vocabulary only, no reason is minted here.
+    """Collect the turn's panel at $0 before recording a forced rail. Only no
+    panel permits an unreviewed bypass. Clean PASS needs the same subject;
+    pending work stays unaccepted with review_pending, other outcomes unaccepted
+    without a verdict. Return existing decision fields, never a new reason.
     """
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.loop_delivery import delivery_subject_hash
@@ -580,13 +630,8 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
 
 
 def _unsettled_clause(run: Dict[str, Any]) -> str:
-    """The verdict clause of a panel that settled without a PASS or FAIL.
-
-    It states what the host holds (no settled verdict), not what the panel did:
-    DEGRADED can be a reviewer's own deliberate answer. A reviewer whose PHYSICAL
-    outcome the host does not know — custody lost, or a dispatch still owed —
-    did not stay silent, so the row names it as unknown.
-    """
+    """No settled verdict: DEGRADED may be deliberate. Lost custody or an owed
+    dispatch means unknown physical outcome, never reviewer silence."""
     unknown = sum(1 for actor in (run.get("actors") or [])
                   if isinstance(actor, dict)
                   and (bool(actor.get("late_result_pending"))
@@ -766,15 +811,14 @@ def canonical_acceptance_trace(root: Any, task_id: str, retry_key: str, *,
 
 def _collected_wave(run: Dict[str, Any]) -> Dict[str, Any]:
     """The reviewers' own lines for a wave whose release roster died with its worker."""
-    from ouroboros.review_custody import _settled_slot_verdict
+    from ouroboros.review_custody import RELEASED_UNRESOLVED, _settled_slot_verdict
 
     slots, verdicts = {}, {}
-    for actor in run.get("actors") or []:
-        if not isinstance(actor, dict):
-            continue
+    for actor in (row for row in run.get("actors") or [] if isinstance(row, dict)):
         slot_id = str(actor.get("slot_id") or "")
-        slots[slot_id] = "" if actor.get("operation_state") in {"pending_dispatch", "in_flight"} else str(actor.get("status") or "settled")
-        if slots[slot_id]:
+        slots[slot_id] = {"pending_dispatch": "", "in_flight": "", "custody_lost": RELEASED_UNRESOLVED}.get(
+            actor.get("operation_state"), str(actor.get("status") or "settled"))  # unknown is not settled (#1547)
+        if slots[slot_id] not in {"", RELEASED_UNRESOLVED}:
             verdicts[slot_id] = _settled_slot_verdict(SimpleNamespace(**{"raw_text": "", "error": "", **actor}))
     return {"slots": slots, "verdicts": verdicts, "total": len(slots)}
 
@@ -808,8 +852,9 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     outbox (durably owed, keyed by ``delivery_id``; a second settlement of the
     same wave, concurrent or later, finds that notice already owed or delivered
     and queues no second live copy). The owner
-    sees it; the next turn reads it in chat history, and one bounded reflection
-    row carries the settled verdict to the learning log (plan_review_facts).
+    sees it; the next turn of that room keeps it in view until the mind releases
+    it, and one bounded reflection row carries the settled verdict to the
+    learning log (plan_review_facts).
     """
     return settle_acceptance_operation(
         usage_ctx, retry_key=str(getattr(request, "retry_key", "") or ""),
@@ -821,13 +866,12 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
                                 controller: Any = None) -> str:
     """Collect one wave of a terminal task purely, publish it and announce it once.
 
-    Returns ``announced`` (publication read back, row enqueued), ``published``
-    (read back; the row was already owed or delivered),
-    ``settled`` (nothing was pending), ``pending`` (still in flight),
-    ``unpublished`` (the canonical record or durable notice custody did not
-    take the settlement; retry duty remains), ``source_unreadable`` (a published source exists but cannot
-    be read: never duplicated from the checkpoint) or ``unavailable`` (no trace
-    and no canonical source).
+    A completed ``historical_acceptance`` run without a ``late_settlement`` is stamped and published as if advanced.
+    Returns ``announced`` (publication read back, row enqueued), ``published`` (read back; the row
+    was already owed or delivered), ``settled`` (nothing was pending), ``pending`` (still in
+    flight), ``unpublished`` (the canonical record or durable notice custody did not take the
+    settlement; retry duty remains), ``source_unreadable`` (a published source exists but cannot
+    be read: never duplicated from the checkpoint) or ``unavailable`` (no trace and no canonical source).
     """
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
@@ -948,7 +992,28 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
         _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
     if outcome == ENQUEUE_QUEUED:  # a NEW announcement, whichever path made it: one learning row, never on a replay
         learn_from_late_settlement(root, result, retry_key)
+    if _keep_late_review_in_view(root, task_id, delivery_id, chat_id, panel) == "failed":
+        return _unpublished(task_id, retry_key, "unpublished")  # the mark is owed like the notice; its repeat is $0
     return "announced" if outcome == ENQUEUE_QUEUED else "published"
+
+
+def _keep_late_review_in_view(root: Any, task_id: str, delivery_id: str, chat_id: Any, panel: Dict[str, Any]) -> str:
+    """The published verdict stays in view in the task's own room until the mind releases it (#1738).
+
+    Every settler of the wave reaches this with the same stored panel, so the mark is one per
+    notice: a repeat is ``unchanged`` and a released mark stays released (``late_review_marks``).
+    """
+    from ouroboros.late_review_marks import publish_late_review
+
+    late = panel["late_settlement"]
+    reviewed = late.get("reviewed_subject") if isinstance(late.get("reviewed_subject"), dict) else {}
+    return publish_late_review(root, {
+        "surface": "task_acceptance", "task_id": task_id, "publication_id": delivery_id, "chat_id": chat_id,
+        "lines": str(late.get("note") or "").splitlines(), "settled_at": str(late.get("settled_at") or ""),
+        "subject": {"panel_id": str(reviewed.get("panel_id") or ""),
+                    "subject_sha256": str(reviewed.get("subject_sha256") or ""),
+                    "reviewed_revision": str(late.get("reviewed_revision") or "unknown")},
+        "source_ref": panel.get("applied_source_ref") or {}}).status
 
 
 def _unpublished(task_id: str, retry_key: str, status: str) -> str:
@@ -998,3 +1063,5 @@ def expose_acceptance_feedback(trace: Dict[str, Any], messages: list, task_id: s
             if (isinstance(run, dict) and run.get("authority") == "host_root"
                     and str(run.get("binding_hash") or "") == source.get("binding_hash", "")):
                 run["feedback_delivered"] = True
+                if source.get("settled"):
+                    run["settled_feedback_delivered"] = True

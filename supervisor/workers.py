@@ -20,6 +20,7 @@ from supervisor.message_bus import send_with_budget
 from supervisor.message_bus import coerce_chat_identity  # noqa: F401 -- worker_health leaf reads it via the _pool() handle
 from ouroboros.config import DATA_DIR, REPO_DIR as CONFIG_REPO_DIR, WORKER_SPAWN_GRACE_SEC
 from ouroboros.depth_evidence import parse_task_depth
+from ouroboros.model_wait import stamp_execution_handoff
 from ouroboros.review_owner_custody import (
     reconcile_confirmed_dead_review_owners as _reconcile_review_owners,
 )
@@ -91,6 +92,12 @@ class Worker:
     # Unlike temporary reaping, the readiness owner exhausted its bounded attempts.
     readiness_exhausted: bool = False
     process_birth: str = ""  # captured while this exact Process is alive; never inferred after death
+    ready_identity: tuple[int, str] | None = None
+    booting: bool = False  # positive readiness-owner reservation, not arbitrary reaping
+    quiescence_token: str = ""
+    quiescence_confirmed: bool = False
+    retiring: bool = False  # intentional, charged until observed dead; never crash recovery
+    resume_hold: str = ""  # this tick's authorized warm Resume: held idle slot, or the parked author
 
 
 _EVENT_Q = None
@@ -101,25 +108,32 @@ _EVENT_Q_SHUTDOWN = False
 _WORKER_POOL_DISABLED_REASON = ""
 
 
-def get_event_q():
+def get_event_q(*, create: bool = True):
     """Return the process-lifetime supervisor event bus, creating it lazily.
 
     Worker-pool generations are replaceable; the producers that publish onto
     this bus (direct chat, active turns, and workers) are not.
     Rotating the queue during a pool respawn strands those producers on an
     undrained queue, so only a new server process creates a new bus.
+    Producers without an injected endpoint may read the existing server bus
+    with ``create=False``; they never create an undrained child-local bus.
     """
     global _EVENT_Q, _EVENT_Q_MANAGER, _EVENT_Q_GENERATION
     with _EVENT_Q_LOCK:
         if _EVENT_Q_SHUTDOWN:
             raise RuntimeError("supervisor event bus is shutting down")
         if _EVENT_Q is None:
+            if not create:
+                raise RuntimeError("supervisor event bus is not attached")
             # A raw multiprocessing.Queue has an asynchronous feeder and its
             # pipe can be corrupted when a worker is force-killed mid-frame.
             # A manager-backed queue serializes synchronously in the producer
             # and isolates each producer connection, so replacing/killing a
             # worker generation cannot wedge the process-lifetime bus.
-            _EVENT_Q_MANAGER = _get_ctx().Manager()
+            from supervisor.event_observation import EventQueueManager
+
+            _EVENT_Q_MANAGER = EventQueueManager(ctx=_get_ctx())
+            _EVENT_Q_MANAGER.start()
             _EVENT_Q = _EVENT_Q_MANAGER.Queue()
             _EVENT_Q_GENERATION = f"{os.getpid()}:{uuid.uuid4().hex[:12]}"
             try:
@@ -240,6 +254,23 @@ def open_repo_writer_admission(expected_reason: str = "") -> bool:
     return True
 
 
+def open_repo_writer_admission_after_update_abort(expected_reason: str = "") -> bool:
+    """Publish stopped saved work before any writer can use a released update gate."""
+    from supervisor.restart_retention import recover_aborted_update
+    from supervisor.update_merge import active_update_tx
+
+    with _queue_lock:
+        if active_update_tx():
+            return False
+        with _repo_writer_gate_lock:
+            if expected_reason and _repo_writer_gate_reason != expected_reason:
+                return False
+        if not recover_aborted_update(DRIVE_ROOT, RUNNING, PENDING):
+            log.warning("Update abort retains writer admission: saved-work handoff is unconfirmed")
+            return False
+        return open_repo_writer_admission(expected_reason=expected_reason)
+
+
 def repo_writer_admission_closed() -> str:
     with _repo_writer_gate_lock:
         reason = _repo_writer_gate_reason
@@ -281,14 +312,17 @@ def drain_repo_writers(timeout: float = 30.0) -> List[str]:
     return get_direct_activity_registry().wait_until_empty(float(timeout))
 
 
-def _repo_writer_turn_allowed(chat_id: int) -> bool:
+def _repo_writer_turn_allowed(chat_id: int, client_message_id: str = "") -> bool:
     reason = repo_writer_admission_closed()
     if not reason:
         return True
     try:
+        from ouroboros.task_finalization import host_operation_reply_kwargs
+
         send_with_budget(
             chat_id,
             "🔒 An update is using the repository. Try this message again when it finishes.",
+            **host_operation_reply_kwargs(None, "", client_message_id),
             role="system", system_type="managed_update_notice")
     except Exception:
         log.debug("Could not report managed-update writer gate", exc_info=True)
@@ -920,9 +954,10 @@ def _audit_delegate_terminal_custody(
         return
     try:
         from ouroboros import delegate_terminal
+        from ouroboros.delegate_custody_reconcile import attach_only_gateway
 
-        audit = delegate_terminal.terminal_reconcile_task(
-            DRIVE_ROOT, task_id, trigger=trigger,
+        audit = delegate_terminal.terminal_reconcile_task(  # a kill boundary: attach only, no replay
+            DRIVE_ROOT, task_id, trigger=trigger, gateway_factory=attach_only_gateway,
         )
         delegate_terminal.record_terminal_reconciliation(
             DRIVE_ROOT, task_id, audit,
@@ -955,6 +990,12 @@ def _settle_terminalization_task(
     event_already_published: bool = False, stop_source: str = "",
 ) -> bool:
     """Write and publish one shutdown outcome, retaining custody on any failure."""
+    if trigger == "deadline":
+        # An expired queued row (#939) settles off Q on the reaper, which keeps the row.
+        from supervisor.queue_timeouts import _queue_pending_deadline
+
+        _queue_pending_deadline(task)
+        return False
     task_id = str(task.get("id") or "").strip()
     if not task_id:
         return False
@@ -1056,6 +1097,12 @@ def _retry_terminalization_pending() -> Tuple[List[str], List[str]]:
         if spec is None:
             survivors.append(task)
             continue
+        if spec["trigger"] == "deadline":  # reaper-owned, settled off Q (#939)
+            from supervisor.queue_timeouts import _queue_pending_deadline
+
+            _queue_pending_deadline(task)
+            survivors.append(task)
+            continue
         raw_marker = task.get(_TERMINALIZATION_RETRY_FIELD) if isinstance(task, dict) else None
         marker_before = dict(raw_marker) if isinstance(raw_marker, dict) else None
         task_id = str(task.get("id") or "").strip() if isinstance(task, dict) else ""
@@ -1096,9 +1143,6 @@ def _retry_terminalization_pending_for_assignment(queue: Any) -> None:
         )
 
 
-_WORKER_PIDS_FILENAME = "worker_pids.json"
-
-
 def _reconcile_confirmed_dead_review_owner(owner_pid: int) -> None:
     _reconcile_review_owners(DRIVE_ROOT, {owner_pid})
 
@@ -1119,12 +1163,11 @@ def spawn_workers(n: int = 0) -> None:
     # Never hold the queue's process-local threading.RLock across fork: a child
     # would inherit it owned by a vanished thread.  The dedicated lifecycle lock
     # is not used by worker code and serializes competing full-pool starts/kills.
-    reap_orphaned_workers()
     _CTX = mp.get_context(_WORKER_START_METHOD)
     event_q = get_event_q()
     events_cursor, spawned_at = events_log_cursor(), time.time()
 
-    count = n or MAX_WORKERS
+    count = n or 1
     append_jsonl(
         DRIVE_ROOT / "logs" / "supervisor.jsonl",
         {
@@ -1144,7 +1187,7 @@ def spawn_workers(n: int = 0) -> None:
             in_q = _CTX.Queue()
             proc = spawn_worker_process(_CTX, i, in_q, event_q, REPO_DIR, DRIVE_ROOT)
             # Unassignable until the readiness seam observes this child's worker_ready row.
-            new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None, reaping=True)
+            new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None, reaping=True, booting=True)
     except Exception:
         for worker in new_workers.values():
             try:
@@ -1169,7 +1212,7 @@ def spawn_workers(n: int = 0) -> None:
         WORKERS.update(new_workers)
         _WORKER_POOL_DISABLED_REASON = ""
         _LAST_SPAWN_TIME = time.time()
-    _record_worker_pids()
+    _record_worker_processes()
     # Readiness + SHA verification run off-loop so spawn does not block the supervisor loop.
     threading.Thread(target=_verify_worker_sha_after_spawn, args=(dict(new_workers), events_cursor, 1, spawned_at), daemon=True).start()
 
@@ -1188,12 +1231,13 @@ def kill_workers(
     reconcile_review_custody: bool = True,
     hold_never_started: bool = False,
     stop_source: str = "",  # a stop door's typed cause (``_write_failure_result``)
+    retain_saved_work: bool = False,  # an application stop: saved work survives it (#1563)
 ) -> bool:
     global _WORKER_POOL_DISABLED_REASON
     from supervisor import queue, restart_retention as retention  # every door retains saved pauses
     with _queue_lock:
         if disable_reason:
-            _WORKER_POOL_DISABLED_REASON = str(disable_reason)
+            previous_disable_reason, _WORKER_POOL_DISABLED_REASON = _WORKER_POOL_DISABLED_REASON, str(disable_reason)
             # Publish the admission fence before slow process-tree teardown so
             # concurrent ingress can refuse without starting project/workspace
             # side effects while workers are being joined.
@@ -1203,42 +1247,52 @@ def kill_workers(
                 fence_persisted = False
                 log.warning("Failed to persist worker-pool disable fence", exc_info=True)
             if not fence_persisted:
-                # No worker or queue mutation happened yet.  Re-open the local
-                # pool admission so an aborted managed update can recover it.
-                _WORKER_POOL_DISABLED_REASON = ""
+                # No worker or queue mutation happened yet: restore the prior fence (an aborted
+                # update reopens an enabled pool; a crash-storm latch keeps its membership frozen).
+                _WORKER_POOL_DISABLED_REASON = previous_disable_reason
                 log.error("Worker shutdown blocked: disable fence was not durable")
                 return False
         cleared_running = len(RUNNING)
-        for w in WORKERS.values():
-            if w.proc.pid:
-                kill_worker_tree(w.proc.pid)
-            elif w.proc.is_alive():
-                w.proc.terminate()
-        for w in WORKERS.values():
-            w.proc.join(timeout=3)
-        _kill_survivors()
+        doomed = list(WORKERS.values())
+        for w in doomed:
+            # The timeout reaper's ownership mark: assignment, the health check
+            # and the crash detector skip the slot while it is torn down below.
+            w.reaping = True
+    # Kill and join OUTSIDE the queue lock: the lifecycle serializer still
+    # excludes pool starts and kills, and ingress/stop doors are not held.
+    for w in doomed:
+        if w.proc.pid:
+            kill_worker_tree(w.proc.pid)
+        elif w.proc.is_alive():
+            w.proc.terminate()
+    for w in doomed:
+        w.proc.join(timeout=3)
+    _kill_survivors()
+    from supervisor.worker_process import close_worker_stop_channel
+    for w in doomed:
+        close_worker_stop_channel(w.proc)
+    with _queue_lock:
         dead_pids: set[int] = set()
-        for w in WORKERS.values():
+        unconfirmed_pids: list[int] = []
+        for w in doomed:
             try:
                 if w.proc.pid and not w.proc.is_alive():
                     dead_pids.add(int(w.proc.pid))
                     from supervisor.worker_health import retire_confirmed_worker_consumers
                     retire_confirmed_worker_consumers(w, RUNNING.get(w.busy_task_id))
+                else:
+                    unconfirmed_pids.append(int(w.proc.pid or 0))
             except Exception:
+                unconfirmed_pids.append(int(getattr(w.proc, "pid", 0) or 0))
                 log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
-        from supervisor.worker_process import close_worker_stop_channel
-        for w in WORKERS.values():
-            close_worker_stop_channel(w.proc)
         WORKERS.clear()
-        orphaned_ids = []
-        drained_ids = []
-        terminalization_retry_ids = []
+        orphaned_ids, drained_ids, terminalization_retry_ids = [], [], []
         # #1196: an exact mid-run budget pause survives the physical epoch. Its
         # PENDING carrier and its durable ``paused`` row are left exactly as they
         # are — never cancelled here, never ``pending_parent_interrupted`` — so the
         # next boot's ``restore_pending_from_snapshot`` re-validates the durable
         # authority and parks the same task id again (or holds it, typed).
-        retained_paused_ids = []
+        retained_paused_ids: list = []
         cleanup_ok = True
         try:
             done_status = terminal_status or "failed"
@@ -1247,25 +1301,16 @@ def kill_workers(
                 DRIVE_ROOT, owner_restart=hold_never_started or stop_source == "owner_restart")
             retention.park_saved_running_rows(RUNNING, PENDING, preserve_running, DRIVE_ROOT,
                                              sleep_hold_reason=sleep_hold_reason)
-            running_task_ids = set(RUNNING) - preserve_running
+            # An application stop keeps rows whose attempt saved work in RUNNING for the next boot.
+            retained_running_ids = retention.retain_saved_running(RUNNING, preserve_running, DRIVE_ROOT) \
+                if retain_saved_work else []
+            kept_running = preserve_running | set(retained_running_ids)  # neither is interrupted here
+            running_task_ids = set(RUNNING) - kept_running
             interrupted_roots = {
                 str((meta.get("task") or {}).get("root_task_id") or task_id)
                 for task_id, meta in RUNNING.items()
-                if isinstance(meta, dict) and task_id not in preserve_running
+                if isinstance(meta, dict) and task_id not in kept_running
             }
-
-            def _settle_killed_pending(
-                task: Dict[str, Any], *, reason: str, status: str, trigger: str,
-            ) -> bool:
-                """Return true only after pending custody is durably terminal."""
-                return _settle_terminalization_task(
-                    task,
-                    reason=reason,
-                    status=status,
-                    trigger=trigger,
-                    reconcile_delegate_custody=reconcile_delegate_custody,
-                    stop_source=stop_source,
-                )
 
             def _retain_killed_pending(
                 task: Dict[str, Any], *, reason: str, status: str, trigger: str,
@@ -1315,10 +1360,15 @@ def kill_workers(
                         orphaned_ids.append(str(task_id))
                     RUNNING.pop(str(task_id), None)
                     continue
+                if task_id in retained_running_ids:
+                    continue
                 if task_id in preserve_running:
+                    from supervisor.events_budget import fold_consumed_resume
+                    fold_consumed_resume(meta, DRIVE_ROOT)
                     successor = dict(task)
                     continuing_wait = isinstance(successor.get("_owner_wait_resume"), dict)
                     successor["_attempt"] = int(meta.get("attempt") or task.get("_attempt") or 1) + (0 if continuing_wait else 1)
+                    stamp_execution_handoff(successor, meta)  # #939: no fresh explicit time
                     try:
                         from ouroboros.owner_hurry import retry_reset
 
@@ -1328,10 +1378,7 @@ def kill_workers(
                                 DRIVE_ROOT, str(task_id), reason="planned_restart_requeue",
                             )
                     except Exception:
-                        log.debug(
-                            "Planned-restart retry reset failed for %s", task_id,
-                            exc_info=True,
-                        )
+                        log.debug("Planned-restart retry reset failed for %s", task_id, exc_info=True)
                     PENDING.insert(0, successor)
                     RUNNING.pop(str(task_id), None)
                     continue
@@ -1392,8 +1439,12 @@ def kill_workers(
                 if preserve_pending and tid in preserve_running:
                     PENDING.append(task)
                     continue
-                if retention.retained_pending(task, sleep_hold_reason=sleep_hold_reason):
-                    retained_paused_ids.append(tid)
+                paused = retention.retained_pending(task, sleep_hold_reason=sleep_hold_reason)
+                # Accepted work never ends with the application (boot decides), except a child
+                # whose parent this stop interrupted: invariant 19 settles it as before.
+                if paused or retain_saved_work and not retention.child_of_interrupted(
+                        task, running_task_ids, interrupted_roots):
+                    retained_paused_ids.extend([tid] if paused else [])
                     PENDING.append(task)
                     continue
                 if not preserve_pending and hold_never_started and retention.hold_never_started(
@@ -1409,13 +1460,17 @@ def kill_workers(
                         "cancelled", "pending_parent_interrupted")
                 else:
                     reason, status, trigger = result_reason, done_status, "pending_pool_kill"
-                if _settle_killed_pending(task, reason=reason, status=status, trigger=trigger):
+                # True only after pending custody is durably terminal.
+                if _settle_terminalization_task(task, reason=reason, status=status, trigger=trigger,
+                                                reconcile_delegate_custody=reconcile_delegate_custody,
+                                                stop_source=stop_source):
                     drained_ids.append(tid)
                 else:
                     # Failed durable settlement keeps non-dispatchable retry
                     # custody, never a lost row or permission to run it again.
                     PENDING.append(_retain_killed_pending(task, reason=reason, status=status, trigger=trigger))
-            if orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids or retention.held_ids(PENDING):
+            if (orphaned_ids or drained_ids or terminalization_retry_ids or retained_paused_ids
+                    or retained_running_ids or retention.held_ids(PENDING)):
                 append_jsonl(
                     DRIVE_ROOT / "logs" / "supervisor.jsonl",
                     {
@@ -1425,6 +1480,7 @@ def kill_workers(
                         "drained_pending": drained_ids,
                         "terminalization_retry": terminalization_retry_ids,
                         **({"retained_budget_paused": retained_paused_ids} if retained_paused_ids else {}),
+                        **({"retained_saved_work": retained_running_ids} if retained_running_ids else {}),
                         **({"held_for_owner_restart": held} if (held := retention.held_ids(PENDING)) else {}),
                     },
                 )
@@ -1442,6 +1498,15 @@ def kill_workers(
         log.warning("Failed to persist queue snapshot after worker shutdown", exc_info=True)
     if not snapshot_ok:
         log.error("Worker shutdown completed without a durable final queue snapshot")
+    global _LAST_WORKER_EXIT_CENSUS
+    _LAST_WORKER_EXIT_CENSUS = {
+        "ts": utc_now_iso(),
+        "doomed": sorted(int(w.proc.pid or 0) for w in doomed),
+        "dead": sorted(dead_pids),
+        "unconfirmed": sorted(unconfirmed_pids),
+        "cleanup_ok": bool(cleanup_ok),
+        "snapshot_ok": bool(snapshot_ok),
+    }
     if cleared_running:
         append_jsonl(
             DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -1452,6 +1517,22 @@ def kill_workers(
             },
         )
     return bool(cleanup_ok and snapshot_ok)
+
+
+_LAST_WORKER_EXIT_CENSUS: Optional[dict] = None
+
+
+def last_worker_exit_census() -> Optional[dict]:
+    """The PID census of the latest ``kill_workers`` in this process, or None before any.
+
+    ``doomed`` are the worker PIDs that round tore down, ``dead`` those whose
+    exit the join confirmed, ``unconfirmed`` the rest (still alive after the
+    survivor sweep, or unknown). A body adoption arms only on a census whose
+    ``unconfirmed`` list is empty: the ``bool`` return of ``kill_workers`` is
+    about cleanup and the final snapshot, not about which readers of the
+    checkout are gone, and a census is never inferred from that boolean.
+    """
+    return dict(_LAST_WORKER_EXIT_CENSUS) if _LAST_WORKER_EXIT_CENSUS else None
 
 
 def _persist_pending_terminalization_retries(task_ids: List[str]) -> None:
@@ -1763,7 +1844,7 @@ def _drop_cancelled_pending() -> bool:
     if not PENDING:
         return True
     try:
-        from ouroboros.project_admission import hold_unreadable_result
+        from supervisor.restart_retention import conserve_unreadable_pending
         from ouroboros.task_results import (
             STATUS_CANCEL_REQUESTED, STATUS_CANCELLED, _TRULY_TERMINAL_STATUSES,
             load_task_result, write_task_result,
@@ -1838,9 +1919,9 @@ def _drop_cancelled_pending() -> bool:
                 )
                 survivors.extend(pending_rows[index:])
                 break
-            if marker is not None or not tid or hold_unreadable_result(t):
-                # Accepted Project work first losing its result keeps the same row;
-                # this pass's hold revalidation persists it (restore's rule).
+            if marker is not None or not tid or conserve_unreadable_pending(t):
+                # Saved pauses and accepted Project work keep their same row;
+                # each continuation's existing hold remains its authority.
                 survivors.append(t)
             else:
                 survivors.append(_make_terminalization_retry_task(
@@ -2067,11 +2148,11 @@ def _drop_assignable_evolution_tasks(deferred_ids: set[str]) -> list[str]:
     return blocked_ids
 
 
-def _running_subagent_count(root_task_id: str) -> int:
+def _running_subagent_count(root_task_id: str, running=None) -> int:
     if not root_task_id:
         return 0
     count = 0
-    for meta in RUNNING.values():
+    for meta in RUNNING.values() if running is None else running:
         task = meta.get("task") if isinstance(meta, dict) else None
         if (
             isinstance(task, dict)
@@ -2082,7 +2163,8 @@ def _running_subagent_count(root_task_id: str) -> int:
     return count
 
 
-def _assignment_depth_reservation_admits(candidate: dict) -> bool:
+def _assignment_depth_reservation_admits(candidate: dict, running=None) -> bool:
+    running = list(RUNNING.values() if running is None else running)
     root_task_id = str(candidate.get("root_task_id") or "")
     parent_id = str(candidate.get("parent_task_id") or "").strip()
     if not root_task_id or not parent_id:
@@ -2091,12 +2173,12 @@ def _assignment_depth_reservation_admits(candidate: dict) -> bool:
         str((meta.get("task") if isinstance(meta, dict) else {}).get("id") or "") == parent_id
         and str((meta.get("task") if isinstance(meta, dict) else {}).get("root_task_id") or "") == root_task_id
         and str((meta.get("task") if isinstance(meta, dict) else {}).get("delegation_role") or "") == "subagent"
-        for meta in RUNNING.values()
+        for meta in running
     )
     if not parent_running:
         return False
     direct_running_children = sum(
-        1 for meta in RUNNING.values()
+        1 for meta in running
         if isinstance(meta, dict)
         and isinstance(meta.get("task"), dict)
         and str(meta["task"].get("root_task_id") or "") == root_task_id
@@ -2175,15 +2257,13 @@ from supervisor.worker_pool_lifecycle import (  # noqa: E402, F401 -- intentiona
     disable_exhausted_worker_pool,
     _first_worker_event_since,
     _kill_survivors,
-    _record_worker_pids,
+    _record_worker_processes,
     _serialized_worker_lifecycle,
     _verify_worker_sha_after_spawn,
-    _worker_pids_path,
     _write_failure_result,
     events_log_cursor,
     kill_worker_tree,
     kill_workers_for_update,
-    reap_orphaned_workers,
     respawn_worker,
 )
 from supervisor.worker_process import (  # noqa: E402, F401 -- intentional public re-exports

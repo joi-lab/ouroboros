@@ -18,7 +18,9 @@ from ouroboros import (
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
     _owned_gateway_uses_each_test_transport,
     _plain_ctx,
+    _select_transport_access,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(tmp_path):
@@ -35,7 +37,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     disclosed = tmp_path / "disclosed"
     record_subscription_session("s-free", drive_root=disclosed, route="r", task_id="t1",
                                 root_task_id="t1", spend_usd=0.0)
-    rows = [json.loads(l) for l in (disclosed / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(disclosed)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 0.0 and row["cost_final"] is True
     assert usage_projection(disclosed)["cost_final"] is True
@@ -43,7 +45,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     charged = tmp_path / "charged"
     record_subscription_session("s-billed", drive_root=charged, route="r", task_id="t1",
                                 root_task_id="t1", spend_usd=4.10)
-    rows = [json.loads(l) for l in (charged / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(charged)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 4.10, "a real charge must ride the ledger as money"
     assert row["cost_final"] is True
@@ -51,7 +53,7 @@ def test_a_subscription_session_settles_at_zero_and_keeps_the_projection_final(t
     unknown = tmp_path / "unknown"
     record_subscription_session("s-quiet", drive_root=unknown, route="r", task_id="t1",
                                 root_task_id="t1")
-    rows = [json.loads(l) for l in (unknown / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(unknown)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_final"] is False, "an undisclosed spend is not a proven zero"
     assert row["pricing_known"] is False
@@ -78,7 +80,10 @@ def test_a_session_is_not_counted_as_a_physical_provider_call(tmp_path):
     assert breakdown["subscription_sessions"] == 1
 
 
-def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monkeypatch):
+@pytest.mark.parametrize("spend_field, expected, final", [
+    ({"spendUsd": 4.10}, 4.10, True), ({}, None, False), ({"spendUsd": 0.0}, 0.0, True),
+])
+def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monkeypatch, spend_field, expected, final):
     """`_terminal_payload` is what the nanny RELAYS to its parent, so it must not
     contradict the row. It used to hardcode `$0.00 / final` — the exact shape the
     settlement fix exists to eliminate — so a billed run settled honestly in the ledger
@@ -109,15 +114,12 @@ def test_the_agent_facing_cost_tells_the_same_story_as_the_ledger(tmp_path, monk
         delegate._CUSTODY.clear()
         return out
 
-    billed = _wait_with_spend({"spendUsd": 4.10})["cost"]
-    assert billed["cost_usd"] == 4.10, "a billed run must not be relayed as free"
-    assert "BILLED" in billed["note"]
-
-    undisclosed = _wait_with_spend({})["cost"]
-    assert undisclosed["cost_usd"] is None and undisclosed["cost_final"] is False
-
-    free = _wait_with_spend({"spendUsd": 0.0})["cost"]
-    assert free["cost_usd"] == 0.0 and free["cost_final"] is True
+    # These are independent physical runs, not three contradictory replies
+    # for an already-settled identity whose retained source remains authoritative.
+    cost = _wait_with_spend(spend_field)["cost"]
+    assert cost["cost_usd"] == expected and cost["cost_final"] is final
+    if expected:
+        assert "BILLED" in cost["note"], "a billed run must not be relayed as free"
 
 
 def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
@@ -155,12 +157,11 @@ def test_settlement_reads_the_harnesss_own_spend_field(tmp_path, monkeypatch):
     json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     delegate._CUSTODY.clear()
 
-    rows = [json.loads(line) for line
-            in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     row = next(r for r in rows if r.get("kind") == "subscription_session")
     assert row["cost_usd"] == 4.10, "the harness's reported spend must reach the ledger"
     assert row["cost_final"] is True
-    assert retired == ["prj-ours"], "a registration we created is retired on settle"
+    assert retired == [], "settlement keeps the registration for the owner's continuation"
 
 
 def test_d29_applied_credential_profile_reaches_the_durable_record(tmp_path, monkeypatch):
@@ -269,8 +270,7 @@ def _settled_run(tmp_path, monkeypatch, summary, observed=None):
     ctx.task_metadata = {"root_task_id": "t-a"}
     payload = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     delegate._CUSTODY.clear()
-    rows = [json.loads(line) for line
-            in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     events = [json.loads(line) for line
               in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
     return (payload,
@@ -403,6 +403,9 @@ def test_no_receipt_on_a_failed_settlement_and_one_after_the_successful_retry(tm
                 requested_model="sonnet")
     assert subagent_last_delegation() == {}, "receipt minted on a FAILED settlement"
 
+    # The terminal owner retries settlement independently of an already-ready
+    # foreground answer. No extra runtime or second physical run is created.
+    custody_mod.release_task_runs(tmp_path / "w1", "t-a")
     _waited_run(tmp_path / "w1", monkeypatch,
                 {"state": "succeeded", "spendUsd": 0.0, "model": "claude-opus-5"},
                 requested_model="sonnet")
@@ -558,6 +561,9 @@ def test_the_start_request_asks_for_the_substrate_it_claims(tmp_path, monkeypatc
             return {"runId": "run-1"}
         def close(self): pass
 
+    # A READ-ONLY child (the stub serves readonly only): technical access alone decides
+    # the run shape now (#1609); the billing substrate asked for is the same either way.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
@@ -588,6 +594,7 @@ def test_a_202_handle_without_a_run_id_is_a_live_run_not_a_failure(tmp_path, mon
         def start_run(self, request, *, idempotency_key=""): return {"jobId": "job-42"}   # 202: no runId yet
         def close(self): pass
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
@@ -618,6 +625,7 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
     def _boom(*a, **k):
         raise ua.UsageAccountingError("usage accounting lock unavailable")
 
+    record_session = ua.record_subscription_session
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     monkeypatch.setattr(ua, "record_subscription_session", _boom)
     delegate._CUSTODY.clear()
@@ -631,8 +639,15 @@ def test_a_failed_ledger_write_leaves_the_session_retryable(tmp_path, monkeypatc
 
     json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
     assert custody.settled is False, "a lost write must stay retryable"
-    # Retirement is INDEPENDENT of the ledger write: the round-2 commit claimed
-    # this while the fixture owned no project, so deleting the call stayed
-    # green — a leak per failed settle, and a halted run never settles again.
-    assert retired == ["prj-ours"], "owned registration retired even on failure"
+    assert retired == [], "failed accounting must preserve the continuation's project"
+    monkeypatch.setattr(ua, "record_subscription_session", record_session)
+    ready = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=1))
+    assert ready["output_delivery"]["complete"] and not ready["settlement"]["settled"]
+    assert not dcust.replay(tmp_path)["run-1"].settled
+    dcust.release_task_runs(tmp_path, "t-a", gateway_factory=_Stub)
+    custody = dcust.replay(tmp_path)["run-1"]
+    assert custody.settled is True
+    sessions = [row for row in ledger_rows(tmp_path) if row.get("kind") == "subscription_session"]
+    assert len(sessions) == 1 and sessions[0]["cost_final"] is True
+    assert retired == [], "successful retry still defers retirement to the owner-line sweep"
     delegate._CUSTODY.clear()

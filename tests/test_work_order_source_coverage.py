@@ -7,6 +7,7 @@ import hashlib
 from types import SimpleNamespace
 
 import pytest
+from tests._store_shared import read_result
 
 
 def _fixture(tmp_path):
@@ -80,6 +81,7 @@ def _started_entry(tmp_path, request, sha):
         work_order_source_request=request,
         execution_root=str(tmp_path / "snapshot"),
         target_root=str(tmp_path / "repo"),
+        authority_source="external_workspace_root",  # an acting run: its capture may be applied
     )
     assert custody.record_started(tmp_path, entry)
     custody._CUSTODY[entry.run_id] = entry
@@ -101,7 +103,7 @@ def _source_response(request, text, start, end):
 def test_actor_first_coordination_appendix_preserves_complete_text():
     import ouroboros.tools.delegate as delegate
 
-    authority = SimpleNamespace(delegated=False, access="readonly")
+    authority = SimpleNamespace(delegated=False, access="readonly", investigation=False)
     context = " \n" + "яё𐍈🚀\n" * 55_000 + "DECISIVE_TAIL\n "
     instructions = delegate._host_instructions(authority, coordination_context=context)
     assert instructions.endswith(context)
@@ -202,7 +204,7 @@ def test_orphaned_pending_recovery_preserves_partial_source_gate(tmp_path, monke
 
 
 def test_existing_task_result_reader_returns_the_same_canonical_range(tmp_path):
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
     from ouroboros.subagent_work_order import canonical_work_order_source
     from ouroboros.tools.control import _get_task_result
 
@@ -216,7 +218,7 @@ def test_existing_task_result_reader_returns_the_same_canonical_range(tmp_path):
         task_contract=dict(ctx.task_contract),
         task_constraint={},
     )
-    stored = json.loads(task_result_path(tmp_path, "source-child", create=False).read_text())
+    stored = read_result(tmp_path, "source-child")
     assert "workspace_root" not in stored
     assert "workspace_mode" not in stored
     expected_text, reason = canonical_work_order_source(ctx, request)

@@ -15,6 +15,7 @@ from pathlib import Path  # noqa: F401
 from typing import Any, Callable, Dict, List, Optional  # noqa: F401
 
 from ouroboros.config import (
+    EFFORT_SCALE,
     apply_settings_to_env,  # noqa: F401
     get_max_subagent_depth,  # noqa: F401
     load_settings,  # noqa: F401
@@ -28,7 +29,7 @@ from ouroboros.contracts.task_contract import (
     normalize_allowed_resources,  # noqa: F401
 )
 from ouroboros.tools.control_delegation import (
-    _ensure_project_scope,
+    _move_to_project,
     admitted_depth_cap,  # noqa: F401
     child_budget_for_schedule,  # noqa: F401
     normalize_required_capabilities,  # noqa: F401
@@ -98,102 +99,83 @@ log = logging.getLogger(__name__)
 # the parent for the whole requested window on ids that exist nowhere.
 
 
-# promote_chat_to_task tool description (hoisted from get_tools for the
-# 300-line function gate; v6.70.0 added the ground-truth-probe contract).
-_PROMOTE_CHAT_DESCRIPTION = (
-    "Promote real work out of this conversation into a supervised pooled task "
-    "while the conversation remains available. Tools, files and several steps can "
-    "stay in the conversation; promote when independent work is useful — its own "
-    "queue slot, admission and reviews, steerable from chat — or when the owner "
-    "explicitly asks for a separate task. "
-    "Before framing the objective around an EXISTING artifact "
-    "('check/fix/extend the X skill/file'), ground-truth its existence with one cheap probe "
-    "first (skills: list_skills; files: list_files) — memory of past work is not evidence "
-    "the referent still exists. Always give a short, human-readable task `title`. To "
-    "CREATE A NEW NAMED PROJECT and start the work there (owner asked to 'create a "
-    "project called X and …'), set `project_name` — the project is created now and "
-    "a NEW independent task starts in it; the task you are in stays where it is. To "
-    "move THIS task into a project use ensure_project_scope instead (my own judgment: "
-    "the owner's phrasing is intent, not a keyword trigger — I name the project from "
-    "what they actually want it called, and do not just answer or spawn a project-less "
-    "task). `project_id` starts the new task in an existing project. If your task "
-    "carries a planning obligation (Swarm force_plan) that no plan review has met, the "
-    "obligation moves to the new task and your own further work here is unplanned. "
-    "When this new task continues one specific settled result (any settled status; from "
-    "the host manifest, recent_tasks or get_task_result — any project, the "
-    "list is a hint; a helper's result is continued with its root named), pass its internal "
-    "id as `predecessor_task_id`; pass an empty string for fresh work. A live root "
-    "(steer_task instead) or a pending promote is refused. "
-    "`workspace_root` points at a working folder. A project-scoped task inherits "
-    "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
-    "shell/git tools operate there, not on the Ouroboros repo); pass "
-    "workspace='none' for a folder-less task. Owner follow-ups can steer the "
-    "running task. Report creation only when this tool returns "
-    "OK; PROMOTE_REJECTED or PROMOTE_UNCONFIRMED means the task must not be "
-    "claimed as created, and UNCONFIRMED must not be retried automatically."
+_START_TASK_DESCRIPTION = (
+    "Start a NEW, separate independent work with its own task id and card. "
+    "The work reading the current request already exists and can do that request itself. "
+    "move_to_project places THIS work in a room with the same id. "
+    "For an EXISTING artifact, ground-truth its existence with one cheap probe "
+    "(list_skills/list_files): memory of past work is not evidence it still exists. "
+    "Give the separate work a short title and objective. project_name creates a named room; "
+    "project_id selects an existing room. workspace_root selects its folder; "
+    "workspace='none' opts out of the room's default folder. "
+    "A durable pending intent means accepted, waiting to start; inspect its recorded "
+    "outcome before explicitly retrying an uncertain admission."
 )
 
 
+_ROOT_EFFORT_PARAM = {"type": "string", "enum": list(EFFORT_SCALE), "description": (
+    "Optional: the reasoning effort the NEW task starts on; applied in Cyber Pro only — otherwise the "
+    "task starts at my human's recommended level and the result says so. Omit for that level.")}
+
+
 _SCHEDULE_SUBAGENT_DESCRIPTION = (
-    "Schedule a live subagent (a child of Ouroboros). Returns task_id for later retrieval. "
-    "DEFAULT is READ-ONLY: the child inspects local repo/data/history plus web/browser and "
-    "returns findings (apart from knowledge notes, memory marks and chronicle drafts in its own name, it cannot "
-    "write local state, commit, enable tools, or run shell/review/runtime/skills). Set write_surface to spawn a "
-    "MUTATIVE (acting) child that "
-    "writes on the selected surface. You remain the sole committer of the live Ouroboros body. "
-    "workspace_root selects the starting folder; omission inherits it. self_worktree copies "
-    "that Git source's current eligible files, including uncommitted work: return its patch "
-    "through integrate_subagent_patch for parallel changes / best-of-N. Native children on "
-    "external_workspace write directly to the SHARED external project directory (write_root or "
-    "the parent workspace); integrate_subagent_patch verifies the files already there without reapplying. "
-    "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
-    "empty git repo under the durable projects root; the project directory IS the deliverable, not "
-    "integrated into this repo). "
-    "An installed skill payload under data/ is NOT a write_surface (runtime data is never one, by "
-    "design): mutate it YOURSELF via delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...) "
-    "— a child cannot open a payload delegation — and schedule children only as read-only "
-    "designers/reviewers for that work. "
-    "COOPERATIVE MULTI-BUILDER vs GENESIS: when SEVERAL builder children must contribute to ONE new "
-    "deliverable together, give each write_surface=external_workspace and OMIT write_root — the host "
-    "mints ONE shared git tree the whole subagent tree writes into cooperatively (deeper descendants "
-    "inherit it), and you verify their combined files with integrate_subagent_patch. Use genesis only when EACH child "
-    "should own its OWN standalone durable repo (e.g. best-of-N separate builds). "
-    "Harness-delegated work uses a private snapshot; integrate_delegated_patch handles that separate patch. "
-    "Mutative children cannot commit or enable tools; children may write knowledge notes and memory "
-    "marks in their own name and publish chronicle pages and parts only as drafts, which the integrating mind "
+    "Schedule a live child of Ouroboros; returns task_id. Default native READ-ONLY children inspect "
+    "local repo/data/history and web/browser. Each returns findings; apart from knowledge notes, memory marks "
+    "and chronicle drafts in its own name, it cannot write local state, commit, enable tools, or run "
+    "shell/review/runtime/skills. write_surface selects a MUTATIVE (acting) child; you alone commit "
+    "the live Ouroboros body. workspace_root selects the starting folder or inherits yours. "
+    "self_worktree copies that Git source's current eligible files, including uncommitted work, into an isolated tree; "
+    "use integrate_subagent_patch for its parallel/best-of-N patch. Native children on "
+    "external_workspace write directly to the SHARED external directory (write_root or parent workspace); "
+    "integrate_subagent_patch verifies those files without reapplying. For several builders of ONE "
+    "new deliverable, use external_workspace and OMIT write_root: the host creates one shared Git "
+    "tree, inherited by descendants; integrate_subagent_patch verifies their combined files. "
+    "genesis gives EACH child a separate empty Git repo under the durable projects root, for a new "
+    "game/site/app/Ouroboros or independent best-of-N builds; the project directory IS the deliverable, "
+    "never integrated into this repo. Acting harness work uses a private snapshot and integrate_delegated_patch. "
+    "A non-acting Agent session keeps configured access in an evidence-only private checking copy; "
+    "access='readonly' selects read-only session execution. Its captured changes are retained as evidence, "
+    "not product patches: do not call integrate_delegated_patch to apply or reject them. "
+    "Runtime data, including installed skill payloads, is never a write_surface. For skill mutation, "
+    "call delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...) "
+    "yourself; children cannot open payload delegation and may only design/review it read-only. "
+    "Mutative children cannot commit or enable tools; children may write knowledge notes and memory marks "
+    "in their own name and publish chronicle pages and parts only as drafts, which the integrating mind "
     "accepts or rejects (chronicle_write kind=decision); identity and scratchpad stay with the parent. Cyber-effective "
-    "children inherit selected review, skill and runtime tools; explicit task restrictions remain. Nested delegation "
-    "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
-    "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
-    "request propagates structurally instead of collapsing into one flat layer. "
-    "BURST + ABSORB: independent children scheduled in the same round run concurrently; absorb "
-    "them with wait_tasks(any_terminal), which returns whichever finishes first. On cache-write-priced "
-    "routes each sibling launched before the first sibling's first response pays its own full "
-    "prefix write, so burst buys latency and spacing buys cash; your call. "
-    "EXCHANGE OF ADDRESSED TURNS: to make children participants whose position is not "
-    "their whole participation, state the rules in objective/constraints (what is interim, "
-    "whom to address, what ends participation); a native child reaches you, a sibling or any "
-    "task in its tree with forward_to_worker and waits with await_messages, and its final answer ends its "
-    "participation; a session (delegate_start) continues in the SAME session through "
-    "delegate_answer when it can ask mid-run, else a later turn is a NEW run. Always retrieve "
-    "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
+    "children inherit selected review/skill/runtime tools, subject to explicit task restrictions. "
+    "Nested delegation obeys configured depth/cap limits; delegation_intent, may_mutate and may_fan_out "
+    "propagate requests for further children/grandchildren structurally. Independent children scheduled "
+    "in one round run concurrently; wait_tasks(any_terminal) absorbs whichever finishes first. On "
+    "cache-write-priced routes, each sibling launched before the first sibling's first response pays "
+    "a full prefix write: choose burst latency or spaced cost savings. For ongoing addressed turns, "
+    "state in objective/constraints what is interim, whom to address and what ends participation. "
+    "Native children use forward_to_worker for you, siblings or any task in their tree, await_messages "
+    "to wait, and a final answer to end participation. For sessions, answer mid-run questions with "
+    "delegate_answer; after settlement, delegate_start(subagent_id=..., continue_from=run_id, prompt=...) starts another "
+    "run, reusing the session where possible or retained evidence in a new session; repetition may be "
+    "needed. Retrieve the handoff with get_task_result, wait_task or wait_tasks before relying on it."
 )
 
 
 def get_tools() -> List[ToolEntry]:
-    from ouroboros.config import EFFORT_SCALE
+    from ouroboros.tools.control_maintenance import maintenance_tool_entries
+    from ouroboros.tools.control_mind import mind_tool_entries
+
     return [
+        *maintenance_tool_entries(),
+        *mind_tool_entries(),
         ToolEntry("finish_task", {"name": "finish_task",
             "description": "Select the complete answer and request completion of your current task. "
                 "Use finish after considering the observed work, or stop with a rationale naming unfinished work. "
-                "Select exactly one of answer or a host-offered answer_sha256. This grants no success, cancels no children, and retains all configured review and owner controls.",
+                "Select exactly one of answer or a host-offered answer_sha256. On a consciousness wake's own turn, silent=true finishes with no owner-facing line (no answer needed; any answer stays internal), refused while your human awaits a reply. This grants no success, cancels no children, and retains all configured review and owner controls.",
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["finish", "stop"]}, "answer": {"type": "string", "description": "The complete answer, including a short correction."},
                 "answer_sha256": {"type": "string", "description": "Exact offered retained or whole held response hash."},
-                "rationale": {"type": "string", "description": "For stop, what remains unfinished."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
+                "rationale": {"type": "string", "description": "For stop, what remains unfinished; the owner reads it as the stop's cause on the task row. Optional for finish. Over an exposed local acceptance-preparation failure, state the caveat here for author_finish; without it, the host retains the preparation-failure cause, not a validation rejection."}, "acceptance_subject": {"type": "object", "properties": {"owner_source_sha256": {"type": "string"},
                     "effective_criteria": {"type": "string"}, "material_tool_indices": {"type": "array", "items": {"type": "integer"}},
                 }, "required": ["owner_source_sha256"]},
                 "pending_review": {"type": "string", "enum": ["wait", "finish"], "default": "wait"},
+                "silent": {"type": "boolean", "default": False, "description": "Only a consciousness wake's own turn: end with no owner-facing line; the durable result records wake_silent."},
             }, "required": ["action"]}}, _finish_task),
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -202,49 +184,43 @@ def get_tools() -> List[ToolEntry]:
                 "seconds": {"type": "integer", "description": "New timeout in seconds (>= 1)"},
             }, "required": ["seconds"]},
         }, _set_tool_timeout),
-        ToolEntry("request_restart", {
-            "name": "request_restart",
-            "description": "Ask supervisor to restart runtime after a reviewed local commit or a non-evolution clean no-op; evolution requires its exact active commit receipt.",
-            "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
-        }, _request_restart),
+        *self_change_tool_entries(),
         ToolEntry("promote_to_stable", {
             "name": "promote_to_stable",
             "description": "Promote ouroboros -> ouroboros-stable. Call when you consider the code stable.",
             "parameters": {"type": "object", "properties": {"reason": {"type": "string"}}, "required": ["reason"]},
         }, _promote_to_stable),
-        ToolEntry("promote_chat_to_task", {
-            "name": "promote_chat_to_task",
-            "description": _PROMOTE_CHAT_DESCRIPTION,
+        ToolEntry("start_task", {
+            "name": "start_task",
+            "description": _START_TASK_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 "properties": {
                     "objective": {"type": "string", "description": "What the task must accomplish."},
-                    "title": {"type": "string", "description": "A short human-readable task name (<=80 chars, e.g. 'Tic-tac-toe game'). Reused as the project name if the owner later turns the task into a project — so coin a clean, concise one.", "default": ""},
-                    "project_name": {"type": "string", "description": "Set ONLY to create a brand-new NAMED project now and start a NEW independent task in it (e.g. 'airi research'); to move THIS task into a project use ensure_project_scope. The display name; a filesystem id is derived from it.", "default": ""},
+                    "title": {"type": "string", "description": "Short task name the owner sees on its card and on the Main receipt, <=80 chars; also the Project name if the owner converts the task. The objective is not shown in its place."},
+                    "project_name": {"type": "string", "description": "Display name of a NEW Project for the NEW task; its filesystem id is derived. Use move_to_project to move THIS task instead.", "default": ""},
                     "expected_output": {"type": "string", "description": "What done looks like.", "default": ""},
                     "project_id": {"type": "string", "description": "Optional EXISTING project scope (filesystem-clean id).", "default": ""},
-                    "workspace_root": {"type": "string", "description": "Optional absolute working-folder path (validated at admission as an ordinary folder or Git worktree root outside the Ouroboros repo/data). Git-specific operations require a Git worktree; ordinary file and process work is supported directly in a validated folder. When omitted for a project-scoped task, the project's registered working_dir is used by default. Leave empty to work in Ouroboros's own repository (the Main default).", "default": ""},
-                    "workspace": {"type": "string", "description": "Pass 'none' to opt OUT of the project room's default working folder (a folder-less task in a folder-ful project). Leave empty otherwise.", "default": ""},
-                    "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
-                    "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (any settled status; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
+                    "workspace_root": {"type": "string", "description": "Absolute ordinary folder or Git worktree root outside Ouroboros repo/data, validated at admission. File/process work supports ordinary folders; Git operations need a worktree. Omit for the Project's registered working_dir or, in Main, Ouroboros's own repo.", "default": ""},
+                    "workspace": {"type": "string", "description": "'none' opts out of the Project's default folder; empty otherwise.", "default": ""},
+                    "context_requires_self_body_docs": {"type": "boolean", "description": "True for work on Ouroboros code, including copies elsewhere: this task gets the full development handbook in Max. Low/Nano and helpers keep their usual book maps.", "default": False},
+                    "source": {"type": "string", "description": "Attach an existing folder or clone a git URL (https://... or git@host:path) server-side into the projects root; private auth failures are typed auth_required. Registers the folder with provenance + trusted_at as the Project/task workspace. Use for work on a supplied repo/folder.", "default": ""},
+                    "reasoning_effort": _ROOT_EFFORT_PARAM,
                 },
-                "required": ["objective", "predecessor_task_id"],
+                "required": ["objective", "title"],
             },
-        }, _promote_chat_to_task),
-        ToolEntry("ensure_project_scope", {
-            "name": "ensure_project_scope",
+        }, _start_task),
+        ToolEntry("move_to_project", {
+            "name": "move_to_project",
             "description": (
-                "Create (or attach to) a named Ouroboros PROJECT and bind THE CURRENT running "
-                "task to it DURABLY. Use this when you are ALREADY working a task and realize it "
-                "should be a named project (the owner asked to 'create a project called X', or the "
-                "work has grown into a real deliverable) — instead of a bare filesystem mkdir. "
-                "Unlike promote_chat_to_task (which starts a NEW independent task in a project), "
-                "this binds the task you are in: its journal_write and per-project knowledge start "
-                "working, and its live progress routes to the project thread. The result states "
-                "the REAL outcome the host recorded — the durable binding, a typed refusal, or "
-                "unconfirmed — never a promise. Idempotent for the same project; a task already "
-                "bound to a different project stays there (a requested name is carried to that "
-                "project as a rename). A planning obligation stays with this task."
+                "Place this work in a named Project room, keeping its task id and card. "
+                "Use it when the current request belongs in a project; only this work moves. "
+                "Its journal, knowledge tools and progress routing use the room immediately. "
+                "The current execution keeps its folder and writer lease until readmission "
+                "at the next execution boundary; knowledge is not automatically reloaded. "
+                "The result reports the recorded durable binding, refusal or unconfirmed outcome. "
+                "A task already bound to a room stays there; a requested name renames that room. "
+                "A planning obligation stays with this task."
             ),
             "parameters": {
                 "type": "object",
@@ -254,59 +230,32 @@ def get_tools() -> List[ToolEntry]:
                 },
                 "required": [],
             },
-        }, _ensure_project_scope),
+        }, _move_to_project),
         ToolEntry("list_projects", {
             "name": "list_projects",
             "description": (
                 "List the owner's projects (id, name, recency, running flag) — read-only. "
                 "Use it in a main-chat turn to decide whether a message belongs to an existing "
-                "project, then route it there with route_to_project."
+                "project, then place this work there with move_to_project."
             ),
             "parameters": {"type": "object", "properties": {
                 "limit": {"type": "integer", "default": 50, "description": "Max projects to list."},
             }},
         }, _list_projects),
-        ToolEntry("route_to_project", {
-            "name": "route_to_project",
-            "description": (
-                "Route a main-chat message to an EXISTING project so the work continues in that "
-                "project's own context (memory/journal/thread), keeping the main chat free. Use "
-                "when a message clearly belongs to a known project (call list_projects first if "
-                "unsure of the id). If confidence is low or several projects/tasks could match, "
-                "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
-                "needs_manual_target acknowledgement with host-validated task options and New task "
-                "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-                "use promote_chat_to_task instead. When continuing one settled result (any project; "
-                "the host list is a hint), pass its internal `predecessor_task_id`; pass an empty "
-                "string for fresh work. Returns a visible routing receipt."
-            ),
+        ToolEntry("tell_task", {
+            "name": "tell_task",
+            "description": "Send a note to another work, with optional exact owner quotes selected from "
+                           "your held owner_quote_handles. The note is yours; quoted words remain the owner's. "
+                           "The work reads it at its next checkpoint. Paused work keeps the mail without resuming. "
+                           "Use forward_to_worker for messages inside your task tree. "
+                           "Presence can address work of its own binding only.",
             "parameters": {"type": "object", "properties": {
-                "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
-                "message": {"type": "string", "description": "The owner message / work to route into the project."},
-                "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
-                "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (any settled status; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
-                "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional, ONLY with project_id='': the task/project ids you consider plausible, in preference order. The typed picker shows them first; ids not in the host-built option list are ignored."},
-            }, "required": ["message", "predecessor_task_id"]},
-        }, _route_to_project),
-        ToolEntry("steer_task", {
-            "name": "steer_task",
-            "description": (
-                "Deliver a message to any host-listed active independent root (a running or pending "
-                "root task; hidden/headless roots included) — YOU pick from current_chat.addressable_root_tasks, "
-                "main_routing_manifest.root_tasks, or the [INDEPENDENT_ROOTS] note. Use it when a message "
-                "continues or redirects a task already in flight, instead of spawning a duplicate. Who "
-                "you are decides how it lands: in an owner conversation turn it is delivered as the "
-                "owner's steering text; from a task it is written as a message from THIS task (never "
-                "owner text, no file attachments), and the result says written, not read. The task picks "
-                "it up at its next step. If no running task clearly fits, use promote_chat_to_task "
-                "(new work) or answer inline — never steer a task you are unsure about. "
-                "A Presence-bound turn can steer only work in its own binding; the host checks it."
-            ),
-            "parameters": {"type": "object", "properties": {
-                "task_id": {"type": "string", "description": "Id of the running task to steer (from current_chat.running_tasks)."},
-                "message": {"type": "string", "description": "The follow-up / steering message to deliver to that task."},
-            }, "required": ["task_id", "message"]},
-        }, _steer_task),
+                "task_id": {"type": "string", "description": "Work to receive the message."},
+                "note": {"type": "string", "default": "", "description": "Your own words and context."},
+                "quote": {"type": "array", "items": {"type": "string"}, "default": [],
+                          "description": "Owner row addresses held by this turn; exact words and attachments travel together."},
+            }, "required": ["task_id"]},
+        }, _tell_task),
         ToolEntry("schedule_subagent", {
             "name": "schedule_subagent",
             "description": _SCHEDULE_SUBAGENT_DESCRIPTION,
@@ -322,9 +271,10 @@ def get_tools() -> List[ToolEntry]:
         # cancel_task + peek_task + discard_child_result are registered by ouroboros/tools/join_ledger.py.
         ToolEntry("request_deep_self_review", {
             "name": "request_deep_self_review",
-            "description": "Request a deep self-review of the entire Ouroboros project against the Constitution, on the configured deep-review reviewer row (Settings → Agents → Review lanes; absent, the OUROBOROS_MODEL_DEEP_SELF_REVIEW model runs one packed Atlas review): a packed API model reads the Atlas plus the full core memory whitelist; a configured subagent or agent session reads the repository itself with read-only tools and receives the same memory whitelist inline byte-exact (memory is never receipt-checked). Results go to chat and memory.",
+            "description": "Request a deep self-review of the entire Ouroboros project against the Constitution: review_change(subject=system, surface=system) with one seat — the enabled catalog row you name in `reviewer` (review pool member or not), else the Main model. An API row runs a bounded read-only inspection episode, an agent-session row uses its configured access (writable sessions run in a private checking copy and retain evidence without applying changes); both receive the core memory whitelist inline byte-exact (memory is never receipt-checked). The report goes to chat and memory/deep_review.md, with the surface=system review record linked.",
             "parameters": {"type": "object", "properties": {
                 "reason": {"type": "string", "description": "Why you want a review (context for the reviewer)"},
+                "reviewer": {"type": "string", "description": "One enabled catalog row by id or handle; empty = the Main model"},
             }, "required": ["reason"]},
         }, _request_deep_self_review),
         ToolEntry("chat_history", {
@@ -367,6 +317,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
+                "reply_to_relay": {"type": "string", "description": "Reply to a drained relay in its source room. Empty selects the single open relay; omit for an ordinary room message."},
                 "destination": {"type": "string", "enum": ["current", "main"], "default": "current",
                                 "description": "'current' (default): this conversation's room. 'main': the "
                                                "owner's main chat, for a brief plain-text notice that belongs "
@@ -411,9 +362,10 @@ def get_tools() -> List[ToolEntry]:
                 "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one "
                 "starts, clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX. A wake-up calling this sets its own "
                 "next one; a wake-up already pending keeps its time; with consciousness off it is stored for later. "
-                "The alarm still adjusts it: a failed wake-up doubles the interval (up to MAX), a pending event "
-                "brings the next wake-up forward, a skipped one retries after MIN (an exhausted allowance waits for "
-                "its reset), and no wake-up starts sooner than MIN after the last wake-up, boot or skip."),
+                "The alarm still adjusts it: a failed wake-up doubles the interval (up to MAX), a skipped one "
+                "retries after MIN (an exhausted allowance waits for its reset), and no wake-up starts sooner than "
+                "MIN after the last wake-up, boot or skip. Events never bring a wake-up forward; the next one "
+                "observes them."),
             "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
         }, _set_next_wakeup),
         ToolEntry("switch_model", {
@@ -426,7 +378,7 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "model": {"type": "string", "description": "Model name (e.g. anthropic/claude-sonnet-4). Leave empty to keep current."},
                 "effort": {"type": "string", "enum": list(EFFORT_SCALE),
-                           "description": "Reasoning effort level (adapted down per route when a model tops out lower). Leave empty to keep current."},
+                           "description": "Reasoning effort for the next round, inside my human's effort range. Main keeps its level outside Cyber Pro (delegate deeper thinking: schedule_subagent(effort=…)); a child, an evolution task or a wake moves inside the range; a pinned or model-named focus keeps its level. Leave empty to keep current."},
                 "primary": {"type": "string", "enum": ["return", "wait"],
                             "description": ("Omit to keep the current route. Return to this turn's primary route: its model, role and account policy "
                                             "(Auto stays Auto) plus the owner's wait-card choice; effort stays. 'return': "
@@ -436,24 +388,7 @@ def get_tools() -> List[ToolEntry]:
                                             "Not with model.")},
             }, "required": []},
         }, _switch_model),
-        ToolEntry("get_task_result", {
-            "name": "get_task_result",
-            "description": "Read the effective result or exact authority of a task, including one bounded canonical work-order source range when requested.",
-            "parameters": {"type": "object", "required": ["task_id"], "properties": {
-                "task_id": {"type": "string", "description": "Task ID returned by scheduling or exposed by the host routing manifest."},
-                "known_result_sha256": {"type": "string", "description": "Optional child_result_sha256 from a previous read. An exact match omits only unchanged result/trace text, retaining current facts and a full-read reference. Omit for full text; explicit authority/source requests always return their requested view."},
-                "include_authority": {"type": "boolean", "default": False, "description": "Return the exact selected result, task contract, origin, artifact references, and current plan-review authority."},
-                "include_work_order_source": {"type": "boolean", "default": False, "description": "Return the canonical work-order source projection; provide both source_start_char and source_end_char for the exact bounded range."},
-                "include_completion_source": {"type": "boolean", "default": False,
-                                              "description": "Read the full stored completion observations for this task, including returns omitted from the summary. Omit bounds for source length/hash, then request explicit character ranges."},
-                "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
-                "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
-                "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
-                "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
-                "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical source range. A range outside the source returns no text: the answer names complete_chars and the range received, and is an argument error."},
-                "presence_scope": {"type": "string", "enum": ["own_binding"], "description": "Presence tasks only: read just independent work started from this Presence binding (any of its conversations) or this task's own tree."},
-            }},
-        }, _get_task_result),
+        get_task_result_entry(),
         ToolEntry("wait_task", {
             "name": "wait_task",
             "description": "Wait for ONE subtask to reach a terminal status and return its effective result: the full single-child handoff once it settled (or when your known_result_sha256 no longer matches); a return BEFORE it settled carries the compact wait_tasks projection plus delegated_runs (its open delegated runs with dated observation facts, no liveness verdict). May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
@@ -467,7 +402,7 @@ def get_tools() -> List[ToolEntry]:
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
             "name": "wait_tasks",
-            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, accounted_upper_bound_usd, cost_final, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays on disk in task_results/<task_id>.json (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon so you can steer, review, or override mid-flight, or on an unread message in your own mailbox (reason=owner_mailbox_pending); the ordinary loop then handles delivery and acknowledgement. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
+            "description": "Wait for MULTIPLE subtasks at once and return a compact structural projection per child (task_id, status, accounted_upper_bound_usd, cost_final, child_result_sha256, outcome_axes, result, trace_summary, capability_delta when the child has something to disclose, duplicate_of) — the right tool to ABSORB a batch of independent children you scheduled in one burst. The full per-child envelope stays in the task store (child_result_sha256 pins the exact result you saw; get_task_result returns the full result text plus trace/outcome summaries). With mode=any_terminal it returns as soon as the FIRST child finishes (handle it, then call again for the rest) instead of blocking serially. The JSON also includes live_child_status (running/scheduled/terminal per child) and may early_return (before all terminal) on a child tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon so you can steer, review, or override mid-flight, or on an unread message in your own mailbox (reason=owner_mailbox_pending); the ordinary loop then handles delivery and acknowledgement. An id no surface of this tree ever minted (no task result, no queue row, no tree-ledger row) is flagged unknown_task_id — 'not yet registered or never scheduled' — and unknown_task_ids + a compact children_roster of your ACTUAL direct children are attached so you can repair the wait set instead of re-polling phantoms.",
             "parameters": {"type": "object", "required": ["task_ids"], "properties": {
                 "task_ids": {"type": "array", "items": {"type": "string"}, "description": "Task IDs returned by schedule_subagent."},
                 "known_result_sha256_by_task": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Optional task_id to previously obtained child_result_sha256 map. Matching children omit only result/trace and return result_unchanged plus a full-read reference. Missing or different hashes return the usual complete body/trace. Current status/cost/outcome/capability facts remain; wait timing is unchanged."},
@@ -496,21 +431,18 @@ from ouroboros.tools.control_events import (  # noqa: E402, F401 -- intentional 
     _wait_for_routing_annotation,
 )
 from ouroboros.tools.control_routing import (  # noqa: E402, F401 -- intentional public re-exports
-    _MISSING_PREDECESSOR_SELECTOR,
     _attach_client_surface,
     _attach_origin_from_metadata,
-    _attach_predecessor_authority_from_metadata,
     _finish_swarm_handoff,
     _list_projects,
-    _predecessor_selector_error,
-    _promote_chat_to_task,
-    _route_to_project,
-    _steer_task,
+    _start_task,
 )
 from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional public re-exports
     _chat_history,
     _evolution_restart_block_reason,
+    _prepare_self_change,
     _promote_to_stable,
+    self_change_tool_entries,
     _request_deep_self_review,
     _request_restart,
     _finish_task,
@@ -528,10 +460,10 @@ from ouroboros.tools.control_runtime import (  # noqa: E402, F401 -- intentional
 # v7next F2 (D07): moved spans live in their owner leaves; re-exported here
 # so this facade stays the single import surface for callers and tests.
 from ouroboros.tools.control_subagent_spec import (  # noqa: E402, F401 -- intentional public re-exports
-    RETIRED_SCHEDULE_PARAMS,
     VALID_SUBTASK_MEMORY_MODES,
     _INTERNAL_SCHEDULE_OPTIONS,
     _validated_schedule_fields,
+    requested_child_effort,
     schedule_subagent_param_names,
     schedule_subagent_properties,
 )
@@ -563,6 +495,7 @@ from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intent
     _await_messages,
     _children_roster_projection,
     await_messages_entry,
+    get_task_result_entry,
     _count_live_sibling_children,
     _get_task_result,
     _subtask_outcome_summary,
@@ -578,3 +511,5 @@ from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intent
 # _schedule_task and HIDDEN_LEGACY_SCHEDULE_PARAMS above (the moved spans own
 # the definitions; the attribute consumer reads it off the registered handler).
 setattr(_schedule_task, "_hidden_legacy_params", HIDDEN_LEGACY_SCHEDULE_PARAMS)
+
+from ouroboros.tools.control_relay import _tell_task

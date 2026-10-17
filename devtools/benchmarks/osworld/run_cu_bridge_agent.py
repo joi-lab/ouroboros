@@ -133,6 +133,8 @@ def _cu_actor_preflight(settings_path: Path, server: str) -> dict[str, Any]:
         measured_model = str(loaded.get("OUROBOROS_MODEL") or "").strip()
         if not measured_model:
             raise ValueError("settings must declare measured OUROBOROS_MODEL")
+        if loaded.get("OUROBOROS_TASK_REVIEW_MODE") != "required":
+            failures.append("declared task review mode must be required")
         declared = runtime_actor_snapshot(loaded, expected_model=measured_model)
         failures.extend(f"declared settings {item}" for item in declared["mismatches"])
     except Exception as exc:
@@ -141,6 +143,8 @@ def _cu_actor_preflight(settings_path: Path, server: str) -> dict[str, Any]:
 
     try:
         target_settings = _api(server, "GET", "/api/settings", timeout=10)
+        if target_settings.get("OUROBOROS_TASK_REVIEW_MODE") != "required":
+            failures.append("executing server task review mode must be required")
         target = runtime_actor_snapshot(target_settings, expected_model=measured_model)
         failures.extend(f"target server {item}" for item in target["mismatches"])
     except Exception as exc:

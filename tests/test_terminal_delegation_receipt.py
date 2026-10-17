@@ -12,6 +12,7 @@ from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.task_result_schema import stamp_task_result_schema  # v7 ABI-2: unstamped rows are quarantined
+from tests._store_shared import seed_result
 
 
 def _execution_evidence(
@@ -127,26 +128,18 @@ def test_history_rehydrates_receipt_on_latest_terminal_progress_consumer(tmp_pat
     results = tmp_path / "task_results"
     results.mkdir()
     for task_id, cost in (("summary", 0.0), ("stale", 1.25), ("retry", 2.5)):
-        (results / f"{task_id}.json").write_text(
-            json.dumps(stamp_task_result_schema(_completed_task_result(task_id, cost))),
-            encoding="utf-8",
-        )
+        seed_result(tmp_path, task_id, stamp_task_result_schema(_completed_task_result(task_id, cost)))
     absent = _completed_task_result("absent", 1.25)
     absent.pop("actual_substrate")
     absent["subagent_envelope"] = {"executor_route": "claude=opus"}
-    (results / "absent.json").write_text(json.dumps(stamp_task_result_schema(absent)), encoding="utf-8")
-    (results / "original.json").write_text(
-        json.dumps(
-            stamp_task_result_schema(
+    seed_result(tmp_path, "absent", stamp_task_result_schema(absent))
+    seed_result(tmp_path, "original", stamp_task_result_schema(
                 {
                     "task_id": "original",
                     "status": "interrupted",
                     "retry_task_id": "retry",
                 }
-            )
-        ),
-        encoding="utf-8",
-    )
+            ))
 
     response = asyncio.run(
         make_chat_history_endpoint(tmp_path)(

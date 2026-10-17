@@ -103,24 +103,31 @@ for (const [room, chatId, destination, visible] of [
             f.emit('message_annotation', receipt);
             const owner = f.owner();
             const note = owner.querySelector('.msg-routing-annotation');
-            const actions = owner.querySelector('.msg-routing-actions');
-            assert.equal(note.textContent, 'Started task · Requested Project › Requested work');
-            assert.equal(Boolean(actions), visible);
+            // A receipt that names another room is ONE line: the owner's words, then the Project reference. In the destination
+            // room itself it keeps its text and offers nothing.
+            const references = () => note.children.filter((node) => node.classList?.contains('chat-quiz-project'));
+            const reference = references()[0];
+            assert.equal(note.classList.contains('has-reference'), visible);
+            if (visible) assert.equal(note.children[0].textContent, 'Started as a task in');
+            else assert.equal(note.textContent, 'Started task · Requested Project › Requested work');
+            assert.equal(Boolean(reference), visible);
+            assert.equal(owner.querySelector('.msg-routing-actions'), null, 'no second padded row');
             f.emit('message_annotation', receipt);
-            assert.equal(owner.querySelector('.msg-routing-actions'), actions, 'same receipt keeps the same action row');
+            assert.equal(references()[0], reference, 'same receipt keeps the same reference');
             for (const revision of [1, 2]) {
                 await f.instance.refreshHistory({ revision });
                 assert.equal(f.owner(), owner, 'history updates the canonical bubble in place');
                 assert.equal(owner.querySelector('.msg-routing-annotation'), note);
-                assert.equal(owner.querySelectorAll('.msg-routing-actions').length, visible ? 1 : 0);
+                assert.equal(references().length, visible ? 1 : 0);
             }
         } finally { f.close(); }
         const replay = fixture(history, chatId);
         try {
             await replay.instance.refreshHistory({ revision: 1 });
-            assert.equal(Boolean(replay.owner().querySelector('.msg-routing-actions')), visible, 'cold history uses its own room');
-            assert.equal(replay.owner().querySelector('.msg-routing-annotation').textContent,
-                'Started task · Requested Project › Requested work');
+            const cold = replay.owner().querySelector('.msg-routing-annotation');
+            assert.equal(cold.children.some((node) => node.classList?.contains('chat-quiz-project')), visible, 'cold history uses its own room');
+            if (visible) assert.equal(cold.children[0].textContent, 'Started as a task in');
+            else assert.equal(cold.textContent, 'Started task · Requested Project › Requested work');
         } finally { replay.close(); }
     });
 }

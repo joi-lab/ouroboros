@@ -112,6 +112,29 @@ class TestCacheHitRateInvariant:
         assert _compute_cache_hit_rate(env) == 0.0
         assert "LOW CACHE HIT RATE" in build_health_invariants(env)
 
+    def test_historical_cache_zeros_are_not_measured_misses(self, tmp_path):
+        """Record contract LEGACY_RULE (#1578): an unstamped or v1 zero may be an older
+        writer's unknown-to-zero projection, so after an upgrade those rounds must not
+        read as measured misses and fire LOW CACHE HIT RATE. Their positive counts and
+        every v2 count, a v2 zero included, stay measurements; null and malformed
+        counters measure nothing and void no neighbour."""
+        from ouroboros.context_health import _compute_cache_hit_rate
+
+        legacy_zero = [{"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 0, **stamp}
+                       for stamp in ({}, {"record_contract_version": 1}) * 3]
+        legacy_hit = [{"type": "llm_round", "prompt_tokens": 1000, "cached_tokens": 600}] * 5
+        unknown = [{"type": "llm_round", "record_contract_version": 2, "prompt_tokens": 1000, "cached_tokens": bad}
+                   for bad in (None, -1, True)]
+        env = self._make_env(tmp_path, [json.dumps(row) for row in legacy_zero])
+        assert _compute_cache_hit_rate(env) is None
+        assert "cache hit rate" not in build_health_invariants(env).lower()
+        env = self._make_env(tmp_path, [json.dumps(row) for row in legacy_zero + legacy_hit + unknown])
+        assert _compute_cache_hit_rate(env) == 0.6
+        assert "OK: cache hit rate (60%)" in build_health_invariants(env)
+        self._emit_producer_rounds(tmp_path, 0, count=7)  # the real producer's v2 zeros ARE misses
+        assert _compute_cache_hit_rate(env) == pytest.approx(3000 / 12000)
+        assert "LOW CACHE HIT RATE" in build_health_invariants(env)
+
     def test_a_window_with_fewer_than_five_reporting_rounds_stays_unknown(self, tmp_path):
         """The five-round threshold counts MEASUREMENTS, not rounds. Three
         reporters beside three silent rounds are still too thin a sample to
@@ -353,17 +376,6 @@ class TestHotStoreGrowthInvariant:
         result = build_health_invariants(env)
         assert "HOT STORE GROWTH" not in result
 
-    def test_ledger_growth_warns_with_lock_remediation(self, tmp_path):
-        from ouroboros.context_budget import USAGE_LEDGER_WARN_BYTES
-
-        env = _make_health_env(tmp_path)
-        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
-
-        result = build_health_invariants(env)
-        assert "HOT STORE GROWTH" in result
-        assert "state/usage_attempts.jsonl" in result
-        assert "monetary lock" in result
-
     def test_rotated_log_thresholds_are_regression_tripwires(self, tmp_path):
         """events/tools/supervisor/task_reflections rotate on the supervisor
         tick (CPL4-C1..C4); their thresholds fire only when rotation is broken."""
@@ -413,11 +425,10 @@ class TestHotStoreGrowthInvariant:
 
     def test_isolated_benchmark_sentinel_suppresses_warnings(self, tmp_path):
         from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
-        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES, USAGE_LEDGER_WARN_BYTES
+        from ouroboros.context_budget import PROGRESS_LOG_WARN_BYTES
 
         env = _make_health_env(tmp_path)
         _grow_file(tmp_path / "logs" / "progress.jsonl", PROGRESS_LOG_WARN_BYTES + 1)
-        _grow_ledger(tmp_path / "state" / "usage_attempts.jsonl", USAGE_LEDGER_WARN_BYTES + 1)
         (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
 
         result = build_health_invariants(env)
@@ -490,12 +501,16 @@ def test_health_invariants_come_first_in_dynamic_context(tmp_path):
         task={"id": "task-a", "type": "task", "text": "hello"},
     )
 
-    dynamic_text = messages[0]["content"][2]["text"]
+    dynamic_text = messages[0]["content"][-1]["text"]
     # Knowledge and my rooms lead the changing block; the runtime sections follow, health first.
     assert dynamic_text.startswith("## Shared understanding")
     assert dynamic_text.index("## This room (Main)") < dynamic_text.index("## Health Invariants")
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Scratchpad")
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Drive state")
+    # #1731: the root keeps its contract discipline, and no root context orders a result review
+    # before finalizing: under Auto the review is the author's own typed nomination.
+    assert "## Task Contract Discipline" in dynamic_text and "state your success criteria early" in dynamic_text
+    assert "task_acceptance_review" not in dynamic_text.split("## Task Contract Discipline", 1)[1].split("\n## ", 1)[0]
 
 
 def test_health_invariants_come_first_in_a_consciousness_wake_context(tmp_path):
@@ -553,9 +568,9 @@ def test_health_invariants_come_first_in_a_consciousness_wake_context(tmp_path):
               "metadata": {"initiator": "consciousness", "usage_category": "consciousness"}},
     )
 
-    dynamic_text = messages[0]["content"][2]["text"]
+    dynamic_text = messages[0]["content"][-1]["text"]
     assert dynamic_text.startswith("## Shared understanding")
-    assert "## This room" not in dynamic_text  # a wake has no current room
+    assert "\n## This room (Main) — head " in dynamic_text  # a wake reads Main as its room, as the Main turn does
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Scratchpad")
     assert dynamic_text.index("## Health Invariants") < dynamic_text.index("## Drive state")
 

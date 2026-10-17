@@ -42,10 +42,13 @@ def test_provider_test_max_tokens_pinned():
     assert PROVIDER_TEST_MAX_TOKENS == 16
 
 
-def test_scope_review_max_tokens():
-    """scope_review.py _SCOPE_MAX_TOKENS must be ≥100000."""
-    from ouroboros.tools.scope_review import _SCOPE_MAX_TOKENS
-    assert _SCOPE_MAX_TOKENS >= 100_000
+def test_two_part_seat_output_budget_is_the_one_review_budget():
+    """One wave: a seat answering both parts reserves the same review output
+    budget as a packet seat (floor 8192, cap 65536) — there is no separate
+    scope output reservation any more."""
+    from ouroboros.tools.review_multi_model import _review_output_budget
+
+    assert 8_192 <= _review_output_budget() <= 65_536
 
 
 def test_llm_client_default_max_tokens():
@@ -73,7 +76,7 @@ def test_vision_query_default_max_tokens():
 
 
 def test_summary_and_background_token_budgets():
-    """Summary/reflection/background paths must stay above the raised floors."""
+    """Summary/background paths must stay above the raised floors."""
     from pathlib import Path
     from ouroboros import context_compaction
 
@@ -84,7 +87,6 @@ def test_summary_and_background_token_budgets():
         # The Light answer ceiling is one named constant since the memory
         # writers landed; the floor itself is pinned on the constant below.
         "ouroboros/consolidator.py": "max_tokens=LIGHT_ANSWER_CEILING_TOKENS",
-        "ouroboros/reflection.py": "max_tokens=16384",
         "ouroboros/tools/skill_publish.py": "max_tokens=8192",
     }
     for path, needle in expectations.items():
@@ -95,24 +97,23 @@ def test_summary_and_background_token_budgets():
     # facts row buys no model call, so the synthesis leaf holds no summary call.
     synthesis = Path("ouroboros/post_task_synthesis.py").read_text(encoding="utf-8")
     assert "chat_observed" not in synthesis and 'call_type="task_summary"' not in synthesis
+    # The reflection log is a store only: no automatic lesson or register call remains.
+    assert "chat_observed" not in Path("ouroboros/reflection.py").read_text(encoding="utf-8")
     assert context_compaction._SUMMARY_OUTPUT_TOKENS == 32_768
     assert context_compaction._summarizer_spec()["output_budget"] == 32_768
 
 
-def test_native_review_episode_ceiling_is_ssot_and_round_cap_is_retired():
-    """The native inspection episode (the advisory/actor-row successor of the
-    retired Claude-SDK max-turns budget) reads its transcript CEILING from
-    config SSOT with a shipped default, never a hardcoded literal — and has
-    no round cap at all (P13: the floor is hardcoded, never the ceiling)."""
+def test_native_review_character_and_round_caps_are_retired():
+    """Native execution keeps real resource limits without artificial ceilings."""
     from ouroboros.config import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS
     from ouroboros import review_native_episode
-    from ouroboros.review_native_episode import review_native_max_transcript_chars
 
-    assert SETTINGS_DEFAULTS["OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS"] == "900000"
+    assert "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS" not in SETTINGS_DEFAULTS
+    assert "OUROBOROS_REVIEW_NATIVE_MAX_TRANSCRIPT_CHARS" in RETIRED_SETTING_KEYS
     assert "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS" not in SETTINGS_DEFAULTS
     assert "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS" in RETIRED_SETTING_KEYS
     assert not hasattr(review_native_episode, "review_native_max_rounds")
-    assert review_native_max_transcript_chars() >= 10_000
+    assert not hasattr(review_native_episode, "review_native_max_transcript_chars")
 
 
 def test_claude_code_sdk_only_no_cli_fallback():
@@ -142,7 +143,7 @@ def test_review_prompt_token_budget_is_ssot():
     # Plan review reserves output headroom inside the reviewer window (same class of
     # fix as scope review), but v6.80.0 replaced its module constants with PER-SLOT
     # calibrated caps: every slot cap must still stay inside the shared SSOT.
-    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS
     from ouroboros.tools.review_synthesis import per_slot_input_token_limits
 
     limits = per_slot_input_token_limits(
@@ -335,13 +336,13 @@ def test_measured_density_never_loosens_a_models_own_review_pack_cap(tmp_path, m
     assert limit("anthropic/claude-fable-5") < tightened
 
 
-def test_scope_normalize_defaults_pass_severity_only():
+def test_coupling_normalize_defaults_pass_severity_only():
     """PASS rows may omit severity (semantically void there); FAIL rows must
     carry an explicit valid severity because it decides blocking (fail-closed)."""
-    from ouroboros.tools.scope_review import _SCOPE_REQUIRED_ITEMS, _normalize_scope_items
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS, normalize_scope_items
 
     items = []
-    required = sorted(_SCOPE_REQUIRED_ITEMS)
+    required = sorted(SCOPE_REQUIRED_ITEMS)
     for idx, item_id in enumerate(required):
         if idx == 0:
             items.append({"item": item_id, "verdict": "FAIL", "severity": "advisory",
@@ -350,33 +351,33 @@ def test_scope_normalize_defaults_pass_severity_only():
             # PASS rows WITHOUT severity — the fable-5 output shape.
             items.append({"item": item_id, "verdict": "PASS",
                           "reason": "verified against the staged diff and context"})
-    normalized, err = _normalize_scope_items(items)
+    normalized, err = normalize_scope_items(items)
     assert err == "", f"PASS rows without severity must normalize cleanly: {err}"
     assert len(normalized) == len(required)
 
     # A FAIL row without severity stays invalid (fail-closed).
     bad = list(items)
     bad[0] = {"item": required[0], "verdict": "FAIL", "reason": "a concrete finding with enough words"}
-    _normalized, err = _normalize_scope_items(bad)
+    _normalized, err = normalize_scope_items(bad)
     assert "missing or invalid severity" in err
 
 
-def test_scope_actor_record_surfaces_error_text():
-    """A non-responded scope actor record must carry the failure text so a
+def test_seat_actor_record_surfaces_error_text():
+    """A non-responded seat's actor record must carry the failure text so a
     provider 400 is visible in the verdict without observability digging."""
-    from ouroboros.tools.review_helpers import build_scope_actor_record
-    from ouroboros.tools.scope_review import ScopeReviewResult
+    from ouroboros.triad_review import parse_seat_answers
 
-    failed = ScopeReviewResult(
-        blocked=True,
-        block_message="SCOPE_REVIEW_BLOCKED: Error code: 400 - prompt is too long",
-        model_id="anthropic/claude-fable-5",
-        status="error",
-    )
-    record = build_scope_actor_record(failed, slot_id="scope_slot_1")
-    assert "400" in record["error"]
-    ok = ScopeReviewResult(model_id="m", status="responded", raw_text="[]")
-    assert build_scope_actor_record(ok, slot_id="s")["error"] == ""
+    # The envelope of a failed seat carries the failure text as its ``text``
+    # (review_response._parse_model_response); the record keeps it as raw_text.
+    parsed = parse_seat_answers({"results": [
+        {"model": "anthropic/claude-fable-5", "slot_id": "slot_1", "verdict": "ERROR",
+         "text": "Error: Error code: 400 - prompt is too long"},
+        {"model": "m", "slot_id": "slot_2", "text": "[]\nNO_FINDINGS"},
+    ]}, {"slot_1": ("change", "coupling"), "slot_2": ("change",)})
+    failed, ok = (record.to_dict() for record in parsed.actor_records)
+    assert failed["status"] == "error" and "400" in failed["raw_text"]
+    assert failed["answers"] == {} and failed["parts"] == ["change", "coupling"]
+    assert ok["status"] == "responded" and ok["answers"]["change"]["verdict"] == "PASS"
 
 
 def test_tool_timeout_uses_max_of_settings_and_per_tool():
@@ -408,24 +409,6 @@ def test_tool_timeout_settings_wins_when_higher():
     assert result == 900, f"Expected 900 (settings), got {result}"
 
 
-def test_review_evidence_no_truncation_by_default():
-    """format_review_evidence_for_prompt must NOT truncate by default (max_chars=0)."""
-    from ouroboros.review_evidence import format_review_evidence_for_prompt
-    big = {"has_evidence": True, "task_id": "task-review", "data": "x" * 10000}
-    result = format_review_evidence_for_prompt(big)
-    assert "truncated" not in result.lower()
-    assert len(result) > 10000
-
-
-def test_review_evidence_bounded_with_omission_note():
-    """format_review_evidence_for_prompt truncates with explicit omission note when max_chars>0."""
-    from ouroboros.review_evidence import format_review_evidence_for_prompt
-    big = {"has_evidence": True, "task_id": "task-review", "data": "x" * 10000}
-    result = format_review_evidence_for_prompt(big, max_chars=500)
-    assert "OMISSION NOTE" in result
-    assert "truncated at 500 chars" in result
-
-
 def test_review_evidence_no_obligation_cap():
     """collect_review_evidence default max_obligations must be None (no cap)."""
     import inspect
@@ -444,12 +427,14 @@ def test_run_script_timeout_360():
     assert rs[0].timeout_sec == 360
 
 
-def test_advisory_pre_review_timeout_covers_tests_and_review():
-    """Both names share the finite envelope around tests and the critic."""
-    from ouroboros.tools.claude_advisory_review import get_tools, _preflight_tool_timeout_sec
-    entries = {entry.name: entry for entry in get_tools()}
+def test_preflight_review_timeout_is_the_review_change_envelope():
+    """Both names are the same review_change action, so they share its finite envelope."""
+    from ouroboros.tools import preflight_review, review_change
+    [envelope] = [entry.timeout_sec for entry in review_change.get_tools() if entry.name == "review_change"]
+    entries = {entry.name: entry for entry in preflight_review.get_tools()}
+    assert envelope > 0
     for name in ("preflight_review", "advisory_review"):
-        assert entries[name].timeout_sec == _preflight_tool_timeout_sec()
+        assert entries[name].timeout_sec == envelope
 
 
 def test_repository_index_collapses_junk_dirs():
@@ -458,18 +443,6 @@ def test_repository_index_collapses_junk_dirs():
     from ouroboros.tools.review_helpers import _FULL_REPO_SKIP_DIR_PREFIXES
     for prefix in ("assets/", "tests/", "devtools/"):
         assert prefix in _FULL_REPO_SKIP_DIR_PREFIXES, f"{prefix} not in skip list"
-
-
-def test_summary_and_reflection_callers_use_bounded_evidence():
-    """The reflection prompt builder (the one paid synthesis reader since the paid
-    summary's removal) must call format_review_evidence_for_prompt with max_chars."""
-    from pathlib import Path
-
-    for filename in ("ouroboros/reflection.py",):
-        src = Path(filename).read_text(encoding="utf-8")
-        assert "format_review_evidence_for_prompt(" in src
-        # Must pass max_chars argument (not rely on default 0)
-        assert "max_chars=" in src, f"{filename} must call format_review_evidence_for_prompt with max_chars"
 
 
 def test_obligation_context_shows_all():
@@ -495,7 +468,7 @@ def test_unevidenced_reviewer_keeps_the_full_window_assumption(tmp_path, monkeyp
 
     from ouroboros import capability_evidence
     from ouroboros.reviewer_window import REVIEWER_FULL_WINDOW, reviewer_context_window
-    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS
     from ouroboros.tools.review_synthesis import per_slot_input_token_limits
 
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
@@ -527,7 +500,7 @@ def test_known_small_window_reviewer_gets_its_real_window(tmp_path, monkeypatch)
 
     from ouroboros import capability_evidence
     from ouroboros.reviewer_window import reviewer_context_window
-    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS
     from ouroboros.tools.review_synthesis import per_slot_input_token_limits
 
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
@@ -714,7 +687,7 @@ def test_plan_review_sizing_honors_the_local_route(monkeypatch, tmp_path):
     failure on a supported install."""
     _local_only_install(monkeypatch, tmp_path)
 
-    from ouroboros.tools.plan_review import _PLAN_REVIEW_MAX_TOKENS
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS as _PLAN_REVIEW_MAX_TOKENS
     from ouroboros.tools.review_synthesis import per_slot_input_token_limits
 
     model = "openai/gpt-5.6-terra"
@@ -780,46 +753,3 @@ def test_update_letter_max_tokens_pinned():
     from ouroboros.update_letter import UPDATE_LETTER_MAX_TOKENS
 
     assert UPDATE_LETTER_MAX_TOKENS == 1024
-
-
-def test_acceptance_panels_reach_the_synthesis_prompts():
-    """AP7/F27: the post-task summariser and the reflection were told there was
-    no review evidence even when the task bought an acceptance panel — the
-    commit/advisory lens simply does not know about it. The panels ride along,
-    and the absence statement names the lens it describes."""
-    from ouroboros.review_evidence import format_review_evidence_for_prompt
-
-    panels = [{
-        "panel_id": "panel_1", "surface": "task_acceptance", "authority": "host",
-        "aggregate_signal": "DEGRADED", "transport_status": "not_dispatched",
-        "parse_status": "malformed", "superseded": False,
-        "quorum": {"required": 2, "contributed": 0, "configured": 3},
-        "reason": "slot_1:degraded_partial_source: the exact source is unavailable",
-    }]
-    out = format_review_evidence_for_prompt({}, max_chars=8000, acceptance_panels=panels)
-    assert "TASK ACCEPTANCE PANELS" in out
-    assert "no structured review evidence" not in out
-    assert "DEGRADED" in out and "not_dispatched" in out
-    assert '"required": 2' in out and '"contributed": 0' in out
-    assert "degraded_partial_source" in out
-
-    # No lens and no panels: the sentinel names WHICH evidence is absent.
-    bare = format_review_evidence_for_prompt({}, max_chars=8000)
-    assert bare == "(no commit/advisory review evidence recorded for this task)"
-
-    # Both together, and the existing bound still applies.
-    both = format_review_evidence_for_prompt(
-        {"has_evidence": True, "task_id": "task-review", "data": "x" * 10_000}, max_chars=500,
-        acceptance_panels=panels,
-    )
-    assert "OMISSION NOTE" in both
-    assert "truncated at 500 chars" in both
-
-
-def test_summary_and_reflection_callers_pass_the_acceptance_panels():
-    from pathlib import Path
-
-    # The paid summary caller is gone (TZ-2 C5); reflection is the one caller.
-    for filename in ("ouroboros/reflection.py",):
-        src = Path(filename).read_text(encoding="utf-8")
-        assert "acceptance_panels=" in src, filename

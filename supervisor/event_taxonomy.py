@@ -30,6 +30,22 @@ Tiers, exhaustive:
     the log-event handler, so it never needs a dispatch key of its own. Without
     a row here such an event reads as a producer nobody answers.
 
+Lanes, exhaustive (``lane``): the one supervisor event bus carries two lanes and
+its single consumer always serves ``control`` before ``telemetry``
+(``supervisor/event_observation.py``), so a stream of worker telemetry can never
+sit in front of a chat message or a start/stop/control event (owner decision,
+14 Oct 2026). ``telemetry`` is the three high-volume streams whose handlers take
+no runtime action and need no RUNNING row to be correct — heartbeats, usage
+rows and the ``log_event`` envelope with every nested kind it carries. Everything
+authority-changing stays ``control``: every ``send_message`` (progress narration
+is a chat row), ``task_done``, scheduling, cancel, owner/model waits, worker
+readiness and quiescence, the cognitive-operation lifecycle, fences, restart.
+The rare ``telemetry_only`` tier rows stay in the control lane too: they are
+single typed facts, not streams, and their readers (health checks, audits)
+expect them in FIFO order with the task's own control events. A kind without a
+row rides the control lane. The lane is declared here once; the bus reads it
+and the drain loop never carries a second classification.
+
 The table is data. Nothing here decides policy or dispatches anything; the
 dispatch table stays the single execution authority.
 """
@@ -46,19 +62,27 @@ NESTED_LOG_EVENT = "nested_log_event"
 
 TIERS: Tuple[str, ...] = (WORKER_HANDLER, TELEMETRY_ONLY, SERVER_INTERCEPT, NESTED_LOG_EVENT)
 
+CONTROL_LANE = "control"
+TELEMETRY_LANE = "telemetry"
+
+LANES: Tuple[str, ...] = (CONTROL_LANE, TELEMETRY_LANE)
+
 
 @dataclass(frozen=True)
 class EventDisposition:
-    """Who answers one event kind, and where its producers live."""
+    """Who answers one event kind, where its producers live, and which lane it rides."""
 
     tier: str
     answered_by: str
     producers: Tuple[str, ...]
     note: str = ""
+    idle_input: bool = False  # its handler can change an existing task-idle input
+    lane: str = CONTROL_LANE  # the bus lane; a nested kind names the envelope's lane
 
 
-def _handled(answered_by: str, *producers: str, note: str = "") -> EventDisposition:
-    return EventDisposition(WORKER_HANDLER, answered_by, tuple(producers), note)
+def _handled(answered_by: str, *producers: str, note: str = "", idle_input: bool = False,
+             lane: str = CONTROL_LANE) -> EventDisposition:
+    return EventDisposition(WORKER_HANDLER, answered_by, tuple(producers), note, idle_input, lane)
 
 
 def _telemetry(*producers: str, note: str = "") -> EventDisposition:
@@ -70,51 +94,55 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "acceptance_fence": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent.py"),
     "budget_pause": _handled(
-        "supervisor.events_budget", "ouroboros/agent.py"),
+        "supervisor.events_budget", "ouroboros/agent.py", idle_input=True),
+    "mind_task_control": _handled(
+        "supervisor.events_mind_controls", "ouroboros/tools/control_mind.py", idle_input=True),
     "budget_resume_child": _handled(
         # #1196 (owner Q9): the resumed root's model selects one paused child.
-        "supervisor.events_budget", "ouroboros/tools/join_ledger.py"),
+        "supervisor.events_budget", "ouroboros/tools/join_ledger.py", idle_input=True),
     "budget_root_fence": _handled(
         # v7 L-B split: the loop's fence emitter lives in the budget leaf.
         "supervisor.events_budget", "ouroboros/agent.py", "ouroboros/loop_budget.py"),
     "cancel_task": _handled(
         "supervisor.events_runtime_controls", "ouroboros/tools/join_ledger.py"),
     "cognitive_operation": _handled(
-        "supervisor.cognitive_operations", "ouroboros/utils.py"),
+        "supervisor.cognitive_operations", "ouroboros/utils.py", idle_input=True),
     "deep_self_review_request": _handled(
         "supervisor.events_runtime_controls", "ouroboros/tools/control_runtime.py"),
     "ensure_project_scope": _handled(
         "supervisor.events_project_routing", "ouroboros/tools/control_delegation.py"),
     "external_wait_lease": _handled(
-        "supervisor.events_worker_reports", "ouroboros/delegate_progress.py"),
+        "supervisor.events_worker_reports", "ouroboros/delegate_progress.py", idle_input=True),
     "llm_usage": _handled(
         "supervisor.events_budget", "ouroboros/agent.py",
         "ouroboros/pricing.py", "ouroboros/tools/search.py", "ouroboros/tools/vision.py",
-        "ouroboros/tools/skill_publish.py"),
+        "ouroboros/tools/skill_publish.py", idle_input=True, lane=TELEMETRY_LANE,
+        note="the producer's per-task endpoint stamps lineage and chat by value; "
+             "the handler fills a missing field from RUNNING only as a fallback"),
     "log_event": _handled(
-        "supervisor.events_worker_reports", "ouroboros/utils.py",
+        "supervisor.events_worker_reports", "ouroboros/utils.py", lane=TELEMETRY_LANE,
         note="the envelope every worker log line rides; the payload types that "
              "need their own answer are the nested_log_event rows below"),
     "main_llm_call_state": _handled(
-        "supervisor.events", "ouroboros/utils.py",
-        note="the last handler still resolving on the facade itself"),
+        "supervisor.events", "ouroboros/loop_llm_call.py",
+        note="the last handler still resolving on the facade itself", idle_input=True),
     "owner_message_injected": _handled(
         # v7 L-B split: the drain that emits the receipt lives in the round-limits leaf.
         "supervisor.events_runtime_controls", "ouroboros/loop_round_limits.py"),
-    "owner_wait": _handled("supervisor.worker_owner_wait", "ouroboros/owner_wait.py"),
+    "owner_wait": _handled("supervisor.worker_owner_wait", "ouroboros/owner_wait.py", idle_input=True),
+    "worker_quiescent": _handled("supervisor.worker_pool_lifecycle", "supervisor/worker_process.py"),
     "project_digest": _handled(
         "supervisor.events_project_routing", "ouroboros/agent_task_pipeline.py"),
     "promote_chat_to_task": _handled(
         "supervisor.events_project_routing", "ouroboros/tools/control_routing.py"),
+    "rollback_request": _handled("supervisor.events_runtime_controls", "ouroboros/tools/git_rollback.py"),
     "promote_to_stable": _handled(
         "supervisor.events_runtime_controls", "ouroboros/tools/control_runtime.py"),
     "review_late_result": _handled(
         "supervisor.cognitive_operations", "ouroboros/review_custody.py"),
-    "routing_manual_target": _handled(
-        "supervisor.events_project_routing", "ouroboros/tools/control_routing.py"),
     "schedule_subagent": _handled(
         "supervisor.events_schedule_task", "ouroboros/tools/control_scheduling.py",
-        note="the only producer of the schedule handler; the schedule_task key "
+        idle_input=True, note="the only producer of the schedule handler; the schedule_task key "
              "retired beside this row had none"),
     "send_document": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
@@ -122,11 +150,16 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "send_message": _handled(
         "supervisor.events_chat_delivery", "ouroboros/agent.py",
-        "supervisor/task_reaper.py", "supervisor/terminal_delivery.py"),
+        "supervisor/task_reaper.py", "supervisor/terminal_delivery.py", idle_input=True),
     "send_photo": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "send_quiz": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
+    "send_quiz_state": _handled(
+        "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py",
+        "ouroboros/gateway/task_decision.py",
+        note="persists an explicit closure reason and discharges its delivery; "
+             "the live quiz_state frame is a separate transport discriminator"),
     "send_video": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "skill_exec_failed": _handled(
@@ -134,7 +167,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "skill_exec_finished": _handled(
         "supervisor.events_worker_reports", "ouroboros/tools/skill_exec.py"),
     "steer_task": _handled(
-        "supervisor.steering", "ouroboros/tools/control_routing.py",
+        "supervisor.steering", "ouroboros/tools/control_relay.py",
         "ouroboros/gateway/routing_decision.py"),
     "task_dispatch_resolved": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_dispatch.py"),
@@ -142,11 +175,12 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_worker_reports", "ouroboros/tools/project_journal.py"),
     "task_done": _handled(
         "supervisor.events_task_done", "ouroboros/agent_task_pipeline.py",
-        "supervisor/queue.py", "supervisor/task_reaper.py", "supervisor/worker_health.py"),
+        "supervisor/queue.py", "supervisor/task_reaper.py", "supervisor/worker_health.py", idle_input=True),
     "task_heartbeat": _handled(
-        "supervisor.events_worker_reports", "ouroboros/agent.py"),
+        "supervisor.events_worker_reports", "ouroboros/agent.py", lane=TELEMETRY_LANE,
+        note="liveness only: a heartbeat of a task that already left RUNNING is a no-op"),
     "task_model_wait": _handled(
-        "supervisor.task_model_wait", "ouroboros/model_wait.py"),
+        "supervisor.task_model_wait", "ouroboros/model_wait.py", idle_input=True),
     "task_metrics": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_task_pipeline.py"),
     "toggle_consciousness": _handled(
@@ -157,10 +191,6 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_chat_delivery", "ouroboros/agent.py"),
 
     # --- telemetry_only: recorded in the ledger, no runtime action follows -----
-    "advisory_contract_warning": _telemetry(
-        "ouroboros/tools/preflight_review_run.py"),
-    "advisory_suspect_result": _telemetry(
-        "ouroboros/tools/preflight_review_run.py"),
     "plan_task_deadline_skip": _telemetry(
         "ouroboros/tools/plan_review_runtime.py",
         note="the fact that a deadline left no useful planning window"),
@@ -169,19 +199,14 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "review_density_probe": _telemetry(
         "ouroboros/tools/review_admission.py",
         note="one bounded exact-model send that calibrates tokenizer density before a size refusal"),
-    "review_scope_delivery_migrated": _telemetry(
-        "ouroboros/tools/review_admission.py",
-        note="one-time disclosure that a stored bare api scope row now delivers by retrieval "
-             "(a bounded native inspection episode) instead of the retired packet"),
-    "review_scope_lead_unobserved": _telemetry(
-        "ouroboros/tools/parallel_review.py",
-        note="the commit gate's scope-first hold ended without observing the scope seat's own reservation"),
     "review_wave_admission_unavailable": _telemetry(
         "ouroboros/tools/parallel_review.py",
-        note="the commit gate's money admission raised: the wave dispatched unadmitted (fail-open) "
-             "and without the scope-first hold"),
+        note="the commit gate's money admission raised: the wave dispatched unadmitted (fail-open)"),
     "review_wave_budget_insufficient": _telemetry(
         "ouroboros/tools/review_helpers.py"),
+    "review_wave_billing_authority_unavailable": _telemetry(
+        "ouroboros/tools/review_helpers.py",
+        note="not money: the precheck fails open and each seat refuses typed and unsent"),
     "review_wave_budget_partial_unknown": _telemetry(
         "ouroboros/tools/review_helpers.py",
         note="the v6.69.0-class omission: the fix registered one branch of "
@@ -200,25 +225,30 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "handler before dispatch",
     ),
 
-    # --- nested_log_event -----------------------------------------------------
+    # --- nested_log_event (they ride the log_event envelope's telemetry lane) --
     "review_reference": EventDisposition(
         NESTED_LOG_EVENT, "supervisor.events_worker_reports",
         ("ouroboros/tools/plan_review_references.py",),
         "an opaque Plan-detail invalidation: the nested branch forwards it live "
         "and its producer appends the durable copy to progress.jsonl itself",
+        lane=TELEMETRY_LANE,
     ),
     "task_checkpoint": EventDisposition(
         NESTED_LOG_EVENT, "supervisor.events_worker_reports",
-        ("ouroboros/agent.py", "ouroboros/loop_messages.py"),
-        "persisted to events.jsonl from inside log_event.data; the worker log "
-        "sink suppresses the duplicate copy, so the nested branch is the only "
-        "place it can be answered",
+        ("ouroboros/loop_messages.py",),
+        "the one producer (the budget-pause checkpoint in agent.py and every loop "
+        "checkpoint ride through it) appends the durable rows itself (events.jsonl, "
+        "and progress.jsonl for a System row) before emitting the one live frame; "
+        "the worker log sink suppresses the append's copy and the nested branch "
+        "only addresses and pushes that frame",
+        lane=TELEMETRY_LANE,
     ),
     "task_start_settings_reload_failed": EventDisposition(
         NESTED_LOG_EVENT, "supervisor.events_worker_reports",
         ("ouroboros/subagent_runtime.py",),
-        "a durable owner disclosure (#285) persisted by the same nested branch: "
+        "a durable owner disclosure (#285) persisted by the nested branch: "
         "without it the fact evaporates on the next page load",
+        lane=TELEMETRY_LANE,
     ),
 }
 

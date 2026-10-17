@@ -87,20 +87,11 @@ def _route_project_chat_to_running_task(
     task_metadata: Any = None,
     image_data: Any = None,
 ) -> str:
-    """Deliver a Project follow-up to the sole RUNNING/PENDING root mailbox.
+    """Deliver ordinary room input to its sole live reader, under admission locks.
 
-    Multi-project (v6.32.0): a focused project room with exactly ONE active pooled
-    task IS that task's context, so a follow-up is delivered to it as a TRANSPORT
-    invariant (the loop drains the mailbox every round) — there is no routing CHOICE
-    to make. But when the room has ZERO or MORE THAN ONE steerable task, picking a
-    target is a JUDGMENT, and code must never make it mechanically (BIBLE P5 LLM-first,
-    v6.34.0 WS1): this returns "" so the message flows to the decision turn, where the
-    agent sees `current_chat.running_tasks` and chooses `steer_task` / `promote_chat_to_task`.
-    Returns the delivered task id, or "" (no delivery — fall through to the decision lane).
-
-    A chat is a project thread by REGISTRY membership, not a bare numeric range —
-    large external-transport (Telegram-style) chat ids must not be misclassified and
-    have their owner messages swallowed.
+    Queued or paused roots remain explicit tell_task targets, never implicit
+    readers. Zero or several readers starts a fresh head in this room; the
+    model chooses whether to relay, move, detach, answer or start work.
     """
     try:
         if not _project_id_for_registered_chat(ctx, chat_id):
@@ -108,7 +99,7 @@ def _route_project_chat_to_running_task(
     except Exception:
         return ""
     try:
-        steerable = _addressable_root_tasks(ctx, chat_id)
+        steerable = [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("room_reader")]
         # Exactly one candidate => unambiguous transport. Zero or many => a routing
         # decision the AGENT must make (P5/WS1), so do not deliver here.
         if len(steerable) != 1:
@@ -205,6 +196,10 @@ def _route_project_chat_to_running_task(
                 ctx, task_drive, tid, task_metadata, image_data,
             )
             if direct_lock_held:
+                from ouroboros.room_reader import is_reading
+                if not is_reading(task_drive, tid, task_obj or candidate, running=True):
+                    _drop_staged_inputs()
+                    return ""
                 # AR2-6 (fable): the direct-agent lane used to skip the
                 # cancel-pending admission check the queue lane makes below — a
                 # direct turn whose cancellation is pending must not accept a
@@ -218,11 +213,11 @@ def _route_project_chat_to_running_task(
                 _queue_lock.acquire()
                 queue_lock_held = True
                 live_meta = getattr(ctx, "RUNNING", {}).get(tid)
-                still_pending = any(
-                    isinstance(row, dict) and str(row.get("id") or "") == tid
-                    for row in list(getattr(ctx, "PENDING", []) or [])
-                )
-                if live_meta is None and not still_pending:
+                if isinstance(live_meta, dict):
+                    task_obj = live_meta.get("task") if isinstance(live_meta.get("task"), dict) else live_meta
+                from ouroboros.room_reader import is_reading
+                if not is_reading(task_drive, tid, task_obj, running=live_meta is not None,
+                                  fences=getattr(ctx, "BUDGET_ROOT_FENCES", None)):
                     return ""
                 # A worker may remain RUNNING to finish paid post-work after its
                 # answer/result settled. Its solve loop no longer drains this
@@ -293,15 +288,8 @@ def _route_project_chat_to_running_task(
             task_metadata["_attachment_report"] = attachment_report
         if isinstance(task_metadata, dict):
             task_metadata["_routing_target_label"] = target_label
-        if attachment_report:
-            try:
-                ctx.send_with_budget(
-                    chat_id,
-                    f"📎 Attachment staging report for {target_label or 'Task'}:\n"
-                    f"{attachment_report}",
-                    role="system", system_type="attachment_notice")
-            except Exception:
-                log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
+        # A landed delivery publishes no row: the receipt the caller records
+        # from this stash carries the manifest; the task's mailbox carries the block.
         return tid
     except Exception:
         log.debug("Mailbox follow-up routing failed; falling back to direct lane", exc_info=True)
@@ -509,28 +497,18 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         else:
             event["origin_suppressed"] = True
         try:
-            outcome = _handle_promote_chat_to_task(event, ctx)
+            _handle_promote_chat_to_task(event, ctx)
         except Exception:
             log.warning("Direct skill-repair promotion failed", exc_info=True)
-            outcome = {
+            # Minted OUTSIDE the handler, so its publication boundary never saw it.
+            _notify_host_initiated_refusal(ctx, event, {
                 "status": "needs_manual_target",
                 "reason": "repair_promotion_failed",
                 "task_id": task_id,
-            }
-            # Minted OUTSIDE the handler, so its publication boundary never saw it.
-            _notify_host_initiated_refusal(ctx, event, outcome)
-        outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled", "task_id": task_id}
-        outcome_status = str(outcome.get("status") or "needs_manual_target")
-        if outcome_status == "scheduled":
-            try:
-                ctx.send_with_budget(
-                    chat_id,
-                    f"✅ Repair task {task_id} was accepted and durably scheduled.",
-                    role="system", system_type="task_admission_notice")
-            except Exception:
-                log.debug("Repair promotion success notification failed", exc_info=True)
-        # A refusal is already told by the promote handler's typed System row
-        # (host_initiated) plus the receipt under the owner's message.
+            })
+        # A landed repair publishes no row: the receipt under the owner's message and
+        # the task's own card carry it. A refusal is told by the promote handler's
+        # typed System row (host_initiated) plus that receipt.
         return
     try:
         reserved_project = _reserved_project_for_chat(ctx, chat_id)
@@ -598,16 +576,19 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         from supervisor.events import _handle_promote_chat_to_task
         from ouroboros.gateway.routing_decision import _derived_identity
 
-        if not owner_conversation_admitted(chat_id):
+        from ouroboros.task_finalization import host_operation_reply_kwargs
+
+        if not owner_conversation_admitted(chat_id, client_message_id):
             return
+        answers = host_operation_reply_kwargs(None, "", client_message_id)  # the refusal settles only this Sending
         try:  # bridge intake runs on the supervisor loop: same pre-check contract as assignment
             remaining = budget_remaining(load_state(), strict=True, allow_stale=True)
         except Exception:
-            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", role="system", system_type="task_admission_notice")
+            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **answers, role="system", system_type="task_admission_notice")
             return
         if remaining <= 0:
             try:
-                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", role="system", system_type="task_admission_notice")
+                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **answers, role="system", system_type="task_admission_notice")
             except Exception:
                 pass
             return
@@ -617,7 +598,10 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         )
         event = {
             "type": "promote_chat_to_task", "task_id": task_id,
-            "routing_token": routing_token, "objective": text or image_caption,
+            # A wordless attachment message takes its canonical row's placeholder as
+            # the objective, the same text a direct turn receives; attachments ride below.
+            "routing_token": routing_token,
+            "objective": text or image_caption or str(incoming.get("log_text") or ""),
             "chat_id": chat_id, "project_id": project_id,
             "client_message_id": client_message_id, "task_constraint": task_constraint,
             "force_plan": True, "force_plan_source": task_metadata.get("force_plan_source"),
@@ -635,7 +619,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             event["origin_suppressed"] = True
         _handle_promote_chat_to_task(event, ctx)
         return
-    if project_id:
+    if project_id and not task_metadata.get("late_answer"):
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,

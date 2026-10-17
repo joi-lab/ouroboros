@@ -10,15 +10,14 @@ HARD acceptance gates (the command's exit status):
      `budget: emergency` (via the guarded supervisor.state.reset_per_task_budget), and
   2. the live repo working tree is untouched.
 DIAGNOSTICS (recorded in the ledger, NOT gating exit status): growth of the isolated
-task_reflections.jsonl (memory-carry signal — for project-scoped workspace tasks the
-durable memory actions land in the per-project store, so canonical reflection growth is
-informational, not a hard proof) and --self-mod absorb (see below).
+memory/knowledge_history.jsonl (memory-carry signal: the mind authors durable lessons
+itself through knowledge_write, so growth is informational, not a hard proof — a task
+may teach nothing worth writing) and --self-mod absorb (see below).
 
   --self-mod additionally exercises the real supervisor evolution loop (os.execvpe
-  restart + absorb machinery). Project-scoped workspace tasks can now feed a
-  sanitized global improvement/promotion channel while project facts remain in
-  the per-project store; absorb may occur when that channel promotes a concrete
-  improvement. Proofs #1 and #2 hold regardless of whether a promotion is chosen.
+  restart + absorb machinery). Project facts remain in the per-project store; absorb
+  may occur when an enabled promotion chooses a concrete improvement. Proofs #1 and
+  #2 hold regardless of whether a promotion is chosen.
 
 Usage (from repo/):
   python -m devtools.benchmarks.evolve_smoke --tasks 2 --timeout 300 [--self-mod] [--keep]
@@ -61,8 +60,8 @@ def _git(args: list[str], cwd: pathlib.Path) -> tuple[int, str]:
     return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
-def _reflections_count(data_root: pathlib.Path) -> int:
-    path = data_root / "logs" / "task_reflections.jsonl"
+def _knowledge_revisions_count(data_root: pathlib.Path) -> int:
+    path = data_root / "memory" / "knowledge_history.jsonl"
     try:
         return sum(1 for _ in path.open("r", encoding="utf-8")) if path.exists() else 0
     except OSError:
@@ -143,7 +142,7 @@ def main() -> int:
     (data_root / sstate.ISOLATED_BENCHMARK_SENTINEL).write_text("isolated benchmark data root\n", encoding="utf-8")
 
     live_status_before = _git(["status", "--porcelain"], REPO_DIR)[1]
-    refl_before = _reflections_count(data_root)
+    refl_before = _knowledge_revisions_count(data_root)
     emergency_seen = False
     budget_resets: list[bool] = []
     absorbed_before = absorbed_cycles_done(data_root)
@@ -170,7 +169,7 @@ def main() -> int:
             text = json.dumps(result).lower()
             emerg = ("budget: emergency" in text) or ("budget exhausted" in text)
             emergency_seen = emergency_seen or emerg
-            _log(f"task {i}: status={result.get('status')} emergency={emerg} reflections={_reflections_count(data_root)}")
+            _log(f"task {i}: status={result.get('status')} emergency={emerg} knowledge_revisions={_knowledge_revisions_count(data_root)}")
             did_reset = sstate.reset_per_task_budget(data_root, confirm_isolated=True)
             budget_resets.append(bool(did_reset))
             if args.self_mod and i < int(args.tasks):
@@ -179,14 +178,14 @@ def main() -> int:
     finally:
         server.stop()
 
-    refl_after = _reflections_count(data_root)
+    refl_after = _knowledge_revisions_count(data_root)
     live_status_after = _git(["status", "--porcelain"], REPO_DIR)[1]
     acceptance = {
-        "reflections_grew": refl_after > refl_before,
+        "knowledge_revised": refl_after > refl_before,
         "no_budget_emergency": not emergency_seen,
         "budget_reset_worked": all(budget_resets) if budget_resets else False,
         "live_repo_untouched": live_status_before == live_status_after,
-        "refl_before": refl_before, "refl_after": refl_after,
+        "knowledge_rows_before": refl_before, "knowledge_rows_after": refl_after,
         "absorbed_cycles": absorbed_cycles_done(data_root) - absorbed_before,
     }
     ledger_path = run_root / "evolve_smoke_ledger.json"

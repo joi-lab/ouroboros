@@ -753,3 +753,60 @@ def test_disable_stops_sidecar_restores_menu_once_and_returns_to_idle(
 
 async def _async_value(value: Any) -> Any:
     return value
+
+
+@pytest.mark.parametrize(
+    "initial,named,current,windows,expected",
+    [
+        (4242, None, 4242, False, 4242),  # legacy host: ordinary parent
+        (1, None, 1, False, 0),  # legacy host: PID 1 stays refused
+        (1, "1", 1, False, 1),  # bare container server named itself
+        (1, "4242", 1, False, 0),  # server died before import: init adopted us
+        (777, "4242", 777, False, 0),  # ... or a subreaper did
+        (4242, "4242", 777, False, 0),  # reparented between import and check
+        (4242, "4242", 4242, False, 4242),
+        (1, "junk", 1, False, 0),  # unreadable name keeps the legacy rule
+        (4242, "9999", 4242, True, 4242),  # Windows never reparents
+    ],
+)
+def test_server_parent_requires_the_named_spawner_when_present(
+    monkeypatch: pytest.MonkeyPatch, initial: int, named: str | None, current: int, windows: bool, expected: int
+) -> None:
+    monkeypatch.setattr(companion, "_INITIAL_PARENT_PID", initial)
+    monkeypatch.setattr(companion, "IS_WINDOWS", windows)
+    monkeypatch.setattr(companion.os, "getppid", lambda: current)
+    if named is None:
+        monkeypatch.delenv(companion._PARENT_PID_ENV, raising=False)
+    else:
+        monkeypatch.setenv(companion._PARENT_PID_ENV, named)
+    assert companion._server_parent_pid() == expected
+
+
+@pytest.mark.parametrize("named", ["1", None])
+def test_pid1_server_passes_the_startup_parent_check_only_when_named(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, named: str | None
+) -> None:
+    lifelines: list[int] = []
+    probed: list[int] = []
+
+    def lifeline(parent: int, *_args: Any, **_kwargs: Any) -> Any:
+        lifelines.append(parent)
+        raise companion.ShutdownRequested("stop after the parent check")
+
+    monkeypatch.setenv("OUROBOROS_SKILL_STATE_DIR", str(companion._safe_state_dir(tmp_path / "state")))
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token")
+    if named is None:
+        monkeypatch.delenv(companion._PARENT_PID_ENV, raising=False)
+    else:
+        monkeypatch.setenv(companion._PARENT_PID_ENV, named)
+    monkeypatch.setattr(companion, "_INITIAL_PARENT_PID", 1)
+    monkeypatch.setattr(companion, "IS_WINDOWS", False)
+    monkeypatch.setattr(companion.os, "getppid", lambda: 1)
+    monkeypatch.setattr(companion, "require_isolated_process_group", lambda: None)
+    monkeypatch.setattr(companion, "_pid_alive", lambda pid: probed.append(pid) or True)
+    monkeypatch.setattr(companion, "start_parent_lifeline", lifeline)
+    code = asyncio.run(companion.run())
+    if named:
+        assert (code, probed, lifelines) == (0, [1], [1])
+    else:
+        assert (code, probed, lifelines) == (1, [], [])

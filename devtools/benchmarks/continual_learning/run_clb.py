@@ -129,6 +129,7 @@ def render_run_settings(base_path: pathlib.Path, run_dir: pathlib.Path, *, solve
         # A benchmark template mode is an explicit operator declaration.
         settings["OUROBOROS_CONTEXT_MODE_AUTO_LOW"] = "false"
     settings = normalize_context_mode_compat(settings)
+    settings["OUROBOROS_TASK_REVIEW_MODE"] = "required"
     settings.pop("OUROBOROS_MODEL_HEAVY", None)
     settings.pop("USE_LOCAL_HEAVY", None)
     bare = _bare_model(solve_model)
@@ -332,6 +333,10 @@ def _fidelity_report(settings: dict, args: argparse.Namespace,
         "declared": settings.get("OUROBOROS_REVIEW_ENFORCEMENT"),
         "status": _env_status,
     }
+    gap["OUROBOROS_TASK_REVIEW_MODE"] = {
+        "declared": "required",
+        "status": "requested in rendered settings and child environment; executing external adapter settings and pre-review output producer are not attested by this launcher",
+    }
     _subagents_status = (
         "exported in env and materialized in isolated settings by the host adapter"
         if not args.docker and subagents_forwarded
@@ -421,7 +426,7 @@ def _sanitized_child_env(run_dir: pathlib.Path, settings: dict, args: argparse.N
         # Operator patch 2026-07-23: forward review MODE (not just enforcement) and
         # subagent depth so a submittable "review required" / no-swarm run is achievable
         # from the launcher instead of silently living on defaults (auto / depth 2).
-        "OUROBOROS_TASK_REVIEW_MODE": str(settings.get("OUROBOROS_TASK_REVIEW_MODE") or "auto"),
+        "OUROBOROS_TASK_REVIEW_MODE": "required",
         "OUROBOROS_MAX_SUBAGENT_DEPTH": str(settings.get("OUROBOROS_MAX_SUBAGENT_DEPTH") or 2),
         "CLBENCH_SOLVE_DISABLED_TOOLS": (
             _dt if isinstance((_dt := settings.get("CLBENCH_SOLVE_DISABLED_TOOLS") or []), str)

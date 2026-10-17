@@ -159,13 +159,13 @@
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "            const { timelineUpdate } = upsertToolFoldRow(record, summary, normalizeLogTs(rawTs), rawTs);"
+    "value": "            const changed = placeReplayedEvidence(record, summary, metrics.tool_evidence, rawTs, normalizeLogTs)"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {"
+    "value": "if (closedPhase && !initialContent) {"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
@@ -189,13 +189,13 @@
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "settleLiveCard(record, summary.phase || 'done', wasFinished);"
+    "value": "settleLiveCard(record, wasFinished);"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "function settleLiveCard(record, phase, wasFinished) {"
+    "value": "function settleLiveCard(record, wasFinished) {"
   },
   {
     "id": "test_chat_progress_updates_route_into_live_card",
@@ -225,13 +225,13 @@
     "id": "test_live_card_recovery_keeps_step_failures_non_terminal",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "const desiredPhase = desiredLiveCardPhase(record, record.finished ? summary.phase || 'done' : '');"
+    "value": "const desiredPhase = desiredLiveCardPhase(record, closedPhase || (record.finished ? summary.phase || 'done' : ''));"
   },
   {
     "id": "test_live_card_recovery_keeps_step_failures_non_terminal",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "record.finished = isTerminalTaskPhase(nextPhase, summary.terminal);"
+    "value": "record.finished = Boolean(closedPhase) || isTerminalTaskPhase(nextPhase, summary.terminal);"
   },
   {
     "id": "test_live_card_recovery_keeps_step_failures_non_terminal",
@@ -489,7 +489,13 @@
     "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
     "path": "web/style.css",
     "kind": "contains",
-    "value": ".chat-live-card:not([data-finished=\"1\"]) .chat-live-phase:is(.working, .thinking, .progress, .calling, .context)"
+    "value": ".chat-live-phase[data-motion=\"1\"]::before, .chat-live-phase-secondary[data-motion=\"1\"] { animation: none; }"
+  },
+  {
+    "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
+    "path": "web/style.css",
+    "kind": "contains",
+    "value": ".chat-live-phase[data-motion=\"1\"]::before {\n    animation: live-dot-breathe"
   },
   {
     "id": "test_live_card_has_inline_typing_dots_and_pulsing_phase_badge",
@@ -751,15 +757,15 @@
   },
   {
     "id": "test_swarm_and_context_dom_present",
-    "path": "web/modules/chat.js",
+    "path": "web/modules/composer_owner_controls.js",
     "kind": "contains",
-    "value": "data-mode=\"low\""
+    "value": "const CONTEXT_MODES = ['nano', 'low', 'max'];"
   },
   {
     "id": "test_swarm_and_context_dom_present",
-    "path": "web/modules/chat.js",
+    "path": "web/modules/composer_owner_controls.js",
     "kind": "contains",
-    "value": "data-mode=\"max\""
+    "value": "role=\"radio\" tabindex=\"-1\" aria-checked=\"false\" data-mode=\"${mode}\""
   },
   {
     "id": "test_swarm_and_context_dom_present",
@@ -831,13 +837,13 @@
     "id": "test_context_segmented_css_exists",
     "path": "web/style.css",
     "kind": "contains",
-    "value": ".chat-context-mode[data-context-mode=\"max\"] .chat-seg[data-mode=\"max\"]"
+    "value": ".chat-context-mode .chat-seg[aria-checked=\"true\"]"
   },
   {
     "id": "test_context_segmented_css_exists",
     "path": "web/style.css",
     "kind": "contains",
-    "value": ".chat-context-mode[data-context-mode=\"low\"] .chat-seg[data-mode=\"low\"]"
+    "value": ".chat-context-mode[data-context-mode=\"low\"] {"
   },
   {
     "id": "test_swarm_armed_marker_css",
@@ -871,9 +877,9 @@
   },
   {
     "id": "test_context_segment_click_handler",
-    "path": "web/modules/chat.js",
+    "path": "web/modules/composer_owner_controls.js",
     "kind": "contains",
-    "value": "event.target.closest('.chat-seg')"
+    "value": "event.target?.closest?.('.chat-seg')"
   },
   {
     "id": "test_context_segment_click_handler",
@@ -903,7 +909,7 @@
     "id": "test_history_replay_resyncs_after_reconnect",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "fromReconnect: isReconnect"
+    "value": "isReconnect ? syncHistory({ fromReconnect: true })"
   },
   {
     "id": "test_history_replay_resyncs_after_reconnect",
@@ -933,7 +939,13 @@
     "id": "test_sync_history_sweep_rederives_block_presence",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "                for (const rec of liveCardRecords.values()) {\n                    reorderDirtyCardIfNeeded(rec);\n                    ensureLiveCardVisible(rec);\n                }"
+    "value": "                for (const [id, record] of liveCardRecords) {\n                    mountReplayedCard(record);"
+  },
+  {
+    "id": "test_sync_history_sweep_rederives_block_presence",
+    "path": "web/modules/chat.js",
+    "kind": "contains",
+    "value": "                function mountReplayedCard(rec) {\n                    if (rec?._anchorOrderDirty && !rec.isSubagent && rec.root?.isConnected) {\n                        insertMessageNode(rec.root, { reorderExisting: true });\n                        rec._anchorOrderDirty = false;\n                    }\n                    ensureLiveCardVisible(rec);\n                }"
   },
   {
     "id": "test_sync_history_sweep_rederives_block_presence",
@@ -975,7 +987,7 @@
     "id": "test_history_replay_preserves_failed_task_summary_phase",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(record));"
+    "value": "finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(liveCardRecords.get(taskId)));"
   },
   {
     "id": "test_history_replay_preserves_failed_task_summary_phase",
@@ -1065,7 +1077,7 @@
     "id": "test_cancel_run_confirm_and_cascade",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "openTaskControlMenu(btn, {"
+    "value": "openTaskControls(btn, record.groupId, {"
   },
   {
     "id": "test_cancel_run_confirm_and_cascade",
@@ -1089,7 +1101,7 @@
     "id": "test_inflight_keyed_final_scoped_conclusion",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "recordConcludedActivity(explicitTaskId);"
+    "value": "recordConcludedActivity(explicitTaskId, taskTerminalPhase(msg));"
   },
   {
     "id": "test_inflight_keyed_final_scoped_conclusion",
@@ -1221,7 +1233,7 @@
     "id": "test_chat_block_chrome_follows_work",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "        const wanted = isMain && work && record.root.dataset.projectBound !== '1'"
+    "value": "portals.syncConvert(record, isMain && work && !isPortal(record) && !(window.__ouroTaskBindings || {})[record.groupId]);"
   },
   {
     "id": "test_chat_block_chrome_follows_work",

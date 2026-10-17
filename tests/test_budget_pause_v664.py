@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from tests.worker_pool_support import affirm_ready
 
 
 def _install_queue(tmp_path, monkeypatch):
@@ -26,12 +27,12 @@ def _install_queue(tmp_path, monkeypatch):
 def test_queued_task_does_not_auto_resume_after_budget_increase(tmp_path, monkeypatch):
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     sent = []
-    worker = SimpleNamespace(
+    worker = affirm_ready(SimpleNamespace(
         wid=0,
         busy_task_id=None,
         reaping=False,
         in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))),
-    )
+    ))
     workers.WORKERS[0] = worker
     task = {"id": "paused-task", "admitted_dispatch": "none", "type": "task", "chat_id": 0, "priority": 1}
     workers.PENDING.append(task)

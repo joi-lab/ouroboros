@@ -4,7 +4,7 @@ import json
 import pytest
 
 from ouroboros.gateway.history import _assemble_history_response
-from ouroboros.owner_quiz import record_asked, record_answered, quiz_states
+from ouroboros.owner_quiz import record_asked, record_answered, quiz_states, mark_discharged
 from ouroboros.owner_wait import set_owner_wait
 from ouroboros.projects_registry import create_project
 from ouroboros.task_results import write_task_result
@@ -28,6 +28,7 @@ def test_evicted_closed_question_uses_durable_ask_wait_evidence(tmp_path, requir
                 "quiz": {"quiz_id": qid, "question": qid, "options": ["A", "B"],
                          "state": "open", "wait_for_answer": required}})
             record_answered(tmp_path, "t", quiz_id=qid, option_index=0, request_id="answer")
+            mark_discharged(tmp_path, "t", qid)
     set_owner_wait(tmp_path, "t", {"quiz_id": "q16", "wait_id": "w", "state": "waiting"})
     assert "q0" not in quiz_states(tmp_path, "t")
     rows = json.loads(_assemble_history_response(tmp_path, project["chat_id"], 100, 0))["messages"]

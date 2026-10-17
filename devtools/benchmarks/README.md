@@ -85,7 +85,7 @@ harnesses and official result files remain the scoring authority.
 All committed bench settings templates share these disclosed defaults:
 
 - Cost pacing (v6.56.0): tasks with a finite budget receive latched in-task
-  COST milestones (50/25/10% remaining + ~80%-spent wrap-up note) from the
+  COST facts (50/25/10% remaining + ~80%-spent crossing) from the
   `task_pacing` SSOT; `budget_profile.cost_hard_stop_pct=0` (SWE-Pro/PB
   profiles) disables the in-task hard stop AND the wrap-up affordability rail,
   so deadline/rounds own the bounds.

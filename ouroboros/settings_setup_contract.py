@@ -7,6 +7,7 @@ import os
 from typing import Any, Dict, Optional, Tuple
 
 from ouroboros.config import SETTINGS_DEFAULTS, VALID_RUNTIME_MODES
+from ouroboros.review_run_isolation import run_cap_from_env
 from ouroboros.provider_models import (
     ANTHROPIC_DIRECT_DEFAULTS,
     CLOUDRU_DIRECT_DEFAULTS,
@@ -20,7 +21,6 @@ from ouroboros.secret_masking import (
     CONFIGURED_SECRET_PLACEHOLDER,
     MASKED_SECRET_SETTING_KEYS as SECRET_SETTING_KEYS,
 )
-from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 from ouroboros.model_slots import (
     MODEL_ACCOUNTS_KEY, MODEL_CONTEXT_WINDOWS_KEY, MODEL_PROCESSING_PREFERENCES_KEY,
     PROCESSING_PREFERENCE_KEY, normalize_model_role_options, normalize_processing_preference,
@@ -88,7 +88,16 @@ def resolve_total_budget_usd() -> Optional[float]:
     no entry at all -- so absence resolves to the product default here. A
     non-positive value IS an owner decision and keeps its historical meaning of
     no finite global budget.
+
+    A run cap a launcher set BEFORE settings load (``review_run_isolation``; its one
+    producer is the isolated contributor review lane) is that process tree's whole
+    global limit and the saved document is not consulted: the isolated ledger
+    starts empty, so a saved lifetime budget would otherwise become a fresh
+    allowance there. An unreadable cap is a zero allowance, never "no limit".
     """
+    run_cap = run_cap_from_env()
+    if run_cap is not None:
+        return run_cap
     raw = _saved_total_budget() or str(os.environ.get("TOTAL_BUDGET", "") or "").strip()
     default = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"])
     if not raw:
@@ -127,8 +136,12 @@ _MODEL_DEFAULTS = {
     "anthropic": {key: value for key, value in ANTHROPIC_DIRECT_DEFAULTS.items() if key != "heavy"},
     # No defaults: model names are server-specific; user must fill all slots.
     "openai-compatible": {"main": "", "light": "", "vision": "", "fallback": ""},
+    # Several direct providers and no router: the owner chooses Main; no provider is guessed.
+    "direct-multi": {"main": "", "light": "", "vision": "", "fallback": ""},
 }
-_MODEL_DEFAULTS["local"] = dict(_MODEL_DEFAULTS["openrouter"])
+# Local-only: Light follows the local Main and Fallbacks is no chain (the boot proposal,
+# server_runtime.provider_slot_proposals); Main keeps the shipped id as the local label.
+_MODEL_DEFAULTS["local"] = {**_MODEL_DEFAULTS["openrouter"], "light": "", "fallback": ""}
 for _profile_defaults in _MODEL_DEFAULTS.values():
     _profile_defaults.setdefault("consciousness", "")
     _profile_defaults.setdefault("vision", "")
@@ -177,7 +190,7 @@ _PROFILE_SPECS = {
 
 _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "note", "settingsInputId", "settingsToggleId"), (
     ("main", "mainModel", "OUROBOROS_MODEL", "main-model", "Main Model", "Primary reasoning and long-form work.", "s-model", "s-local-main"),
-    ("light", "lightModel", "OUROBOROS_MODEL_LIGHT", "light-model", "Light Model", "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main.", "s-model-light", "s-local-light"),
+    ("light", "lightModel", "OUROBOROS_MODEL_LIGHT", "light-model", "Light Model", "Fast summaries, lightweight internal work and the default Fast scout. Empty uses Main.", "s-model-light", "s-local-light"),
     ("vision", "visionModel", "OUROBOROS_MODEL_VISION", "vision-model", "Vision Model", "Caption and VLM lane. Empty uses Main.", "s-model-vision", ""),
     ("consciousness", "consciousnessModel", "OUROBOROS_MODEL_CONSCIOUSNESS", "consciousness-model", "Consciousness Model", "High-horizon background consciousness. Empty uses Main.", "s-model-consciousness", "s-local-consciousness"),
     ("fallback", "fallbackModel", "OUROBOROS_MODEL_FALLBACKS", "fallback-model", "Fallback Model", "Fallback and resilience path.", "s-model-fallback", "s-local-fallback"),
@@ -185,14 +198,14 @@ _MODEL_SLOTS = _rows(("slot", "stateKey", "settingKey", "inputId", "label", "not
 
 _REVIEW_MODES = _rows(("value", "label", "tone", "className", "copy"), (
     ("advisory", "Advisory", "Flexible", "advisory", "Review still runs. After feedback, Ouroboros can fix, reject or finish; raw reviewer findings remain visible."),
-    ("blocking", "Blocking", "Strict", "blocking", "Slower and more expensive, but much safer. Critical review findings stop commits, which dramatically reduces the chance of gradual code degradation."),
+    ("blocking", "Blocking", "Strict", "blocking", "Outside Cyber Pro Access, unresolved critical review findings block commits. Cyber Pro keeps the findings as evidence for Ouroboros's decision."),
 ))
 
 _RUNTIME_MODES = _rows(("value", "label", "tone", "className", "copy"), (
     ("light", "Light", "Safest", "light", "Self-modification of the main repo is disabled. Best for trying Ouroboros out without repo self-modification."),
     ("advanced", "Advanced", "Default", "advanced", "Self-modification of the evolutionary layer is allowed (current behaviour). Protected core/contract/release files stay guarded by Advanced mode."),
-    ("pro", "Pro", "Power", "pro", "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal triad + scope review gate."),
-    ("cyber_pro", "Cyber Pro", "Maximum power", "cyber-pro", "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review scope and Blocking or Advisory enforcement remain owner-controlled."),
+    ("pro", "Pro", "Power", "pro", "Direct protected-surface mode. Protected core/contract/release edits are allowed on disk, but commits still require the normal review gate."),
+    ("cyber_pro", "Cyber Pro", "Maximum power", "cyber-pro", "Host and configuration authority, including credentials, models, Supervisor and protected rewrites. Review still runs and the Blocking or Advisory choice is kept, but review findings do not block actions in Cyber Pro: they are evidence for Ouroboros, which decides."),
 ))
 
 _LOCAL_ROUTING_MODES = _rows(("value", "buttonLabel", "label", "flags"), (
@@ -225,17 +238,15 @@ _BUDGET_FIELDS = [
         "settingsInputId": "s-settings-per-task-cost",
         "title": "Per-task cost cap",
         "label": "Per-task Cost Cap (USD)",
-        # The wrap-up sentence is only true above the planning margin: a cap at
-        # or below it resolves to `exhausted_soft_land`, which force-finalizes at
-        # the TOP of round 0 — no work rounds at all. The field still accepts
-        # such a cap (owner power stays), so the note states the consequence
-        # instead of the setting silently meaning something else.
+        # Owner 2026-10-03 Q4-A / 2026-10-07: the cap is the limit itself, decided
+        # on known spend; no default share of the wallet or margin before it.
         "note": (
-            "Hard cap over one task's WHOLE tree, subagents included: further model calls are "
-            "refused and the task is force-stopped once the tree's accounted spend reaches this "
-            "(a graceful wrap-up fires just before). The wrap-up itself needs about "
-            f"${COST_PLANNING_MARGIN_USD:.2f} of room, so a cap at or below that finalizes the "
-            "task immediately instead of running any work rounds."
+            "Hard cap over one task's WHOLE tree, subagents included: new model calls are "
+            "refused once the tree's known spend (confirmed and estimated) reaches it. A resumable "
+            "task then pauses with its work saved; a run that cannot be resumed ends as "
+            "budget-exhausted instead. Calls already in flight settle normally and can take the "
+            "total past the cap. Reservations and unresolved charges are shown separately, not "
+            "counted as spending. Raising the cap does not resume a paused task."
         ),
         "default": float(SETTINGS_DEFAULTS.get("OUROBOROS_PER_TASK_COST_USD", 50.0)),
         "min": "0.01",
@@ -271,7 +282,7 @@ _SUBSCRIPTION_FIELDS = _rows(("id", "payloadKey", "label", "note"), (
     ("skip-subscription-presets", SKIP_SUBSCRIPTION_PRESETS_FIELD, "Finish without agent defaults", "Completes onboarding without moving reviewers and subagents onto the connected subscriptions. Everything stays editable in Settings afterwards."),
 ))
 
-_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.8-flash", "x-ai/grok-4.6", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "deepseek::deepseek-v4-pro", "deepseek::deepseek-v4-flash", "zai::glm-5.3", "zai::glm-5.3-flash", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
+_MODEL_SUGGESTIONS = list(dict.fromkeys(("google/gemini-3.8-flash", "x-ai/grok-4.6", "openai/gpt-6.1-sol", "openai/gpt-6-luna", "anthropic/claude-opus-5.5", "openai/gpt-5.6-terra", "openai/gpt-5.6-sol", "openai/gpt-5.6-luna", "openai::gpt-5.6-terra", "openai::gpt-5.6-sol", "openai::gpt-5.6-luna", "anthropic/claude-sonnet-5", "anthropic/claude-opus-5", "anthropic::claude-sonnet-5", "anthropic::claude-opus-5", "anthropic::claude-opus-4-6", "deepseek/deepseek-v4-pro", "deepseek::deepseek-v4-pro", "deepseek::deepseek-v4-flash", "zai::glm-5.3", "zai::glm-5.3-flash", "openai-compatible::meta-llama/compatible", "cloudru::zai-org/GLM-4.7", "minimax::MiniMax-M3", "minimax::MiniMax-M2.7")))
 
 
 def _string(value: Any) -> str:
@@ -462,7 +473,11 @@ def build_initial_setup_state(settings: dict, host_mode: str = "desktop") -> dic
     state["modelContextWindows"] = normalize_model_role_options(MODEL_CONTEXT_WINDOWS_KEY, settings.get(MODEL_CONTEXT_WINDOWS_KEY))[0]
     state["processingPreference"] = normalize_processing_preference(settings.get(PROCESSING_PREFERENCE_KEY))
     state["modelProcessingPreferences"] = normalize_model_role_options(MODEL_PROCESSING_PREFERENCES_KEY, settings.get(MODEL_PROCESSING_PREFERENCES_KEY))[0]
-    state.update({slot["stateKey"]: _string(settings.get(slot["settingKey"])) or defaults[slot["slot"]] for slot in _MODEL_SLOTS})
+    # A loaded settings document carries every slot (defaults-merged), so a blank one
+    # is a saved "inherit Main" and shows as saved; only a slot the document lacks
+    # takes the profile default. A fresh install's wizard proposes its defaults itself.
+    state.update({slot["stateKey"]: _string(settings[slot["settingKey"]]) if slot["settingKey"] in settings
+                  else defaults[slot["slot"]] for slot in _MODEL_SLOTS})
     return state
 
 
@@ -504,6 +519,17 @@ def wizard_authors_safety_light() -> bool:
 
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
+    """Structural validation shared by the desktop and web wizard.
+
+    Returns ``(prepared_settings, None)`` or ``({}, error)``. Requires a remote key
+    or URL, a local model source, or an agent subscription (a pending connection or
+    a selected Claudexor model); a local-only setup must route at least one active
+    lane locally. Main is required unless a subscription is pending; Light, Vision,
+    Consciousness and Fallback are not validated, so empty keeps its inheritance
+    semantics. Enforcement and runtime mode are closed enums, budgets finite and
+    positive, the MiniMax region is closed, and a Hugging Face local source needs a
+    filename. Credential length is checked only on fields changed in the payload,
+    so an unchanged short stored value cannot discard the whole form."""
     subscriptions_connected, skip_presets = parse_subscription_intent(data)
     pending_subscription = subscriptions_connected and not skip_presets
     selected_subscription = provider_for_model(_string(data.get("OUROBOROS_MODEL"))) == "claudexor"

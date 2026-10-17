@@ -80,24 +80,6 @@ def test_manual_request_uses_the_shared_typed_materializer(tmp_path, monkeypatch
     assert context.tools._ctx._pending_compaction is None
 
 
-def test_old_main_trigger_authorities_are_deleted():
-    from pathlib import Path
-
-    source = Path("ouroboros/loop.py").read_text(encoding="utf-8")
-    budget = Path("ouroboros/context_budget.py").read_text(encoding="utf-8")
-    for symbol in (
-        "EMERGENCY_COMPACTION_CHARS",
-        "LOW_EMERGENCY_COMPACTION_CHARS",
-        "COMPACTION_HYSTERESIS_REGION_GROWTH",
-        "COMPACTION_HYSTERESIS_ROUNDS",
-        "_compaction_floor_chars",
-        "_emergency_keep_recent",
-    ):
-        assert symbol not in source
-        assert symbol not in budget
-    assert "round_idx > 6" not in source
-
-
 # --- earlier capsules are re-folded only after the provider's own refusal ----------------------
 
 def _long_earlier_capsule(run, monkeypatch):

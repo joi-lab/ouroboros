@@ -38,7 +38,8 @@ from ouroboros.request_wire_recovery import (
 )
 from ouroboros.utils import sanitize_tool_result_for_log
 from ouroboros.config import runtime_setting
-from ouroboros._usage_response import observed_processing_mode
+from ouroboros._usage_response import observed_processing_mode, provider_cost_value
+from ouroboros.event_usage import REPORTED_TOKENS_KEY
 
 
 # The moved warnings keep the logger identity they were emitted under.
@@ -131,17 +132,9 @@ class _OpenAICompatibleLaneMixin:
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
-        # Blind models receive an explicit image placeholder on both branches,
-        # preserving canonical blocks. Check qualified and bare identities:
-        # direct names lose their provider prefix, while a compatible route's
-        # vendor-prefixed bare name may carry the only recognizable vision prefix.
-        # OpenRouter's two spellings coincide; vision-capable models pass unchanged.
-        from ouroboros.provider_models import supports_vision
-        if not (
-            supports_vision(str(target.get("usage_model") or resolved_model))
-            or supports_vision(resolved_model)
-        ):
-            messages = self._replace_image_blocks_with_placeholder(messages)
+        # Image blocks are encoded as received: whether this route gets pixels,
+        # a caption or a marker was decided by the send policy (vision_routing),
+        # never by this builder from a model name.
         messages = _project_openai_family_system(target, messages)
         # Official direct OpenAI Chat uses the current completion-token carrier:
         # provider-wide; model names are not capability authority across routes.
@@ -199,12 +192,14 @@ class _OpenAICompatibleLaneMixin:
                     # its caller-declared affinity instead.
                     kwargs["prompt_cache_key"] = cache_identity
             requested_effort = normalize_reasoning_effort(reasoning_effort)
-            if direct_openai:
-                # Effort-carrying routes honor the OUROBOROS_EFFORT_* lanes
-                # instead of dropping them like generic compatible lanes.
-                # Keyed on the PROVIDER id, not a target capability field, so
-                # a hand-built target (fixtures, probes) cannot silently drop
-                # the carriage; request-wire recovery adapts on a provider 400.
+            if provider not in {"deepseek", "zai"}:
+                # Every Chat Completions route carries the owner's effort in the
+                # standard field: direct OpenAI, MiniMax, Cloud.ru and any
+                # OpenAI-compatible server alike. No provider or model list
+                # decides it — unknown is not no — so a route that refuses the
+                # field or a value is adapted by request-wire recovery on that
+                # exact route's own rejection, requested and sent kept apart.
+                # DeepSeek and Z.ai keep their measured projections below.
                 kwargs["reasoning_effort"] = requested_effort
             elif provider == "deepseek":
                 # Same carriage, projected onto DeepSeek's wire dialect
@@ -264,23 +259,23 @@ class _OpenAICompatibleLaneMixin:
             apply_processing_preference(target, kwargs)
             return kwargs
 
-        if any(isinstance(m, dict) and "reasoning_content" in m for m in messages):
-            # ``reasoning_content`` is direct-provider custody (DeepSeek and
-            # MiniMax); OpenRouter responses drop it. OR upstreams of other families
-            # reject the echoed field, and leaving it here would also trip the
-            # replay-artifact pin below (allow_fallbacks=False), silently
-            # killing same-model failover for a mixed transcript. Dropping it
-            # from the OR physical copy restores the exact pre-DeepSeek OR
-            # wire; the canonical transcript is untouched. Keyed on key
-            # PRESENCE, not truthiness: an empty-string echo (a legal kept
-            # value) must not ride the OR wire either.
-            messages = [
-                (
-                    {k: v for k, v in m.items() if k != "reasoning_content"}
-                    if isinstance(m, dict) else m
-                )
-                for m in messages
-            ]
+        # OpenRouter cannot echo direct-provider ``reasoning_content`` (DeepSeek
+        # and MiniMax), even when empty: upstreams reject it, and malformed values
+        # would also pin same-model failover below. Only change the physical copy.
+        messages = [dict(m) if isinstance(m, dict) else m for m in messages]
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            message.pop("reasoning_content", None)
+            flat, details = message.get("reasoning"), message.get("reasoning_details")
+            # Drop only a complete exact text duplicate. All ordered entries must
+            # qualify; signed details and unknown metadata remain byte-identical.
+            if (message.get("role") == "assistant"
+                    and isinstance(flat, str) and flat and isinstance(details, list) and details
+                    and all(isinstance(entry, dict) and entry.get("type") == "reasoning.text"
+                            and isinstance(entry.get("text"), str) for entry in details)
+                    and "".join(entry["text"] for entry in details) == flat):
+                message.pop("reasoning")
         effort = normalize_reasoning_effort(reasoning_effort)
         raw_return_reasoning = runtime_setting("OUROBOROS_RETURN_REASONING")
         return_reasoning = (
@@ -411,8 +406,16 @@ class _OpenAICompatibleLaneMixin:
         prompt_cache_ttl: Optional[str] = None,
         wire_completion: Any = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Normalize an OpenAI-compatible response; skip_cost_fetch keeps no_proxy pure."""
-        usage = resp_dict.get("usage") or {}
+        """Normalize a reply without generation lookup; skip_cost_fetch also skips tariffs."""
+        usage = dict(resp_dict.get("usage") or {})
+        price_candidates = (
+            usage.get("cost"), usage.get("total_cost"), resp_dict.get("total_cost_usd"),
+        )
+        usage["cost"] = next((cost for value in price_candidates
+                              if (cost := provider_cost_value(value)) is not None), None)
+        usage.pop("cost_invalid", None)  # Host fact, never a provider usage extension.
+        if usage["cost"] is None and any(value is not None for value in price_candidates):
+            usage["cost_invalid"] = True
         if "service_tier" in resp_dict:
             usage["service_tier"] = resp_dict["service_tier"]
         attach_processing_receipt(target, usage)
@@ -427,6 +430,7 @@ class _OpenAICompatibleLaneMixin:
             usage.pop("reasoning_effort_clamped", None)
             usage.pop("provider_error", None)
             usage.pop("wire_layout", None)
+            usage.pop(REPORTED_TOKENS_KEY, None)
             # The projected wire shape of THIS call's candidate (per-call target, never a
             # thread-local): the request blob keeps the canonical messages, the sealed
             # physical candidate keeps the exact wire, this fact says which one was sent.
@@ -546,14 +550,6 @@ class _OpenAICompatibleLaneMixin:
                 if cache_write:
                     usage["cache_write_tokens"] = int(cache_write)
 
-        if target.get("supports_openrouter_extensions") and not skip_cost_fetch:
-            if usage.get("cost") is None:
-                gen_id = resp_dict.get("id") or ""
-                if gen_id:
-                    cost = self._fetch_generation_cost(gen_id, target)
-                    if cost is not None:
-                        usage["cost"] = cost
-
         usage["provider"] = str(target.get("provider") or "openrouter")
         usage["resolved_model"] = str(target.get("usage_model") or target.get("resolved_model") or "")
         if prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
@@ -562,7 +558,8 @@ class _OpenAICompatibleLaneMixin:
         _write_split = self._cache_write_split(usage)
         if _write_split and not usage.get("cache_write_tokens_by_ttl"):
             usage["cache_write_tokens_by_ttl"] = _write_split
-        if usage.get("cost") is None and (usage.get("prompt_tokens") or usage.get("completion_tokens")):
+        if (usage.get("cost") is None and not usage.get("cost_invalid")
+                and (usage.get("prompt_tokens") or usage.get("completion_tokens"))):
             from ouroboros.pricing import estimate_cost_optional
 
             estimated_cost = estimate_cost_optional(

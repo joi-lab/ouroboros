@@ -14,13 +14,23 @@ settle_run, pending invocations, retry binding, the orphan sweep), so a
 user's own project vanished when a delegated run finished. A registration
 marked persistent survives every retirement path; only ownership of the
 one-shot snapshot registrations is discharged.
+
+A root Ouroboros mints for one task, run or review (a registry checkout, a
+folderless read-only scratch, a review checkout or input view without a sticky
+thread) is not an identity at all: it declares ``scope.ephemeral`` and registers
+nothing, so it never becomes a permanent engine project or a ghost later.
 """
 
 from __future__ import annotations
 
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
 
 from ouroboros._usage_rows import REVIEW_ATTRIBUTION_KEYS
+
+# Does this engine's ``POST /v2/projects`` answer carry ``created``? Learned per engine
+# identity (version, build) from the answers themselves: the field's presence decides,
+# never a version. Unobserved or absent keeps the previous GET-then-POST flow.
+_CREATED_REPORTED: Dict[Tuple[str, str], bool] = {}
 
 
 def review_owned_source(source: Any) -> bool:
@@ -32,6 +42,77 @@ def review_owned_source(source: Any) -> bool:
     ONE reading of it (issue #1006).
     """
     return str(source or "").startswith("review_substrate")
+
+
+# The evidence-only purpose of a private checking copy (#1609): a researcher or an
+# external reviewer may run configured checks there, and its copy may name the tree
+# it was made from, but nothing it produces is ever integrated into that tree.
+INVESTIGATION_AUTHORITY = "investigation"
+_NO_APPLY_AUTHORITY_SOURCES = frozenset({INVESTIGATION_AUTHORITY, "readonly"})
+
+
+def no_write_authority(root: str, *, investigation: bool) -> dict:
+    """The mutation-authority facts of a run that writes nothing back: read-only, or an
+    evidence-only investigation whose root is provenance, never an apply target."""
+    return {"target_root": root, "source": INVESTIGATION_AUTHORITY if investigation else "readonly",
+            "capture_mode": "evidence" if investigation else "none"}
+
+
+def _fact(record: Any, key: str) -> Any:
+    return record.get(key) if isinstance(record, dict) else getattr(record, key, None)
+
+
+def candidate_apply_possible(record: Any) -> bool:
+    """Could this run's captured work be integrated into the tree it was made from?
+
+    ONE reading of the first-wins authority facts, shared by every integration
+    branch and every observer: a ``RunCustody``, a pending-invocation row or an
+    ``invocation_record`` all carry ``authority_source``, ``snapshot_id`` and
+    ``resource_ref``. False on the evidence-only (or readonly) authority source,
+    or on no recorded source over no capture binding at all: nothing was captured
+    that could be applied. That absence does not say the run never wrote, which
+    ``independent_review_without_apply`` must prove separately. Every other shape,
+    an unknown source included, stays possible: a conservative answer, not
+    proof of permission.
+    """
+    source = str(_fact(record, "authority_source") or "")
+    if source in _NO_APPLY_AUTHORITY_SOURCES:
+        return False
+    if source:
+        return True
+    ref = _fact(record, "resource_ref")
+    directory_copy = (isinstance(ref, dict) and ref.get("workspace_kind") == "directory"
+                      and ref.get("strategy") == "copy")
+    return bool(str(_fact(record, "snapshot_id") or "")) or directory_copy
+
+
+def _recorded_readonly_ask(record: Any) -> bool:
+    """The read-only reviewer's own recorded shape: a STARTED row's granted
+    ``access``/``mode``, or a pending row's stored wire request, is readonly Ask
+    with no private execution binding. Absent shape facts prove nothing."""
+    request = _fact(record, "request")
+    request = request if isinstance(request, dict) else {}
+    return (str(_fact(record, "access") or request.get("access") or "") == "readonly"
+            and str(_fact(record, "mode") or request.get("mode") or "") == "ask"
+            and not request.get("execution") and not str(_fact(record, "execution_root") or ""))
+
+
+def independent_review_without_apply(record: Any) -> bool:
+    """A run its REVIEW panel owns that cannot change the reviewed candidate.
+
+    True only for a recognized review-owned ``source`` together with positive
+    no-write evidence: the evidence-only (or readonly) authority a #1609 start
+    records, or, on a row without that fact (an explicitly read-only reviewer
+    seat, or one from before it), its recorded readonly Ask shape with no
+    capture binding. An unknown or missing source, or missing shape, is never
+    independent.
+    """
+    if not review_owned_source(_fact(record, "source")):
+        return False
+    authority = str(_fact(record, "authority_source") or "")
+    if authority:
+        return authority in _NO_APPLY_AUTHORITY_SOURCES
+    return not candidate_apply_possible(record) and _recorded_readonly_ask(record)
 
 
 def persistent_registration(execution_root: str, access: str) -> bool:
@@ -69,18 +150,62 @@ def record_persistent(record) -> bool:
     return persistent_registration(str(workspace_root or ""), str(request.get("access") or ""))
 
 
-def resolve_registration(gateway, scope_root: str, execution_root: str, access: str):
-    """Register (or adopt) the scope root and decide the marker in one step.
+def minted_review_root(root: str, drive: Any) -> bool:
+    """A tree minted for one review: an isolated review checkout (``<data>/state/review_checkouts``),
+    a retained review-input snapshot (``source_handles/review_inputs`` of a task under the data
+    root) or a checkout the subagent worktree registry holds (a child's copy, a body candidate).
+    Any other root, an owner's project or the system repository, keeps its registration
+    wherever it lives, even under the data root."""
+    import pathlib
 
-    Returns ``(project_id, owned_project_id, project_persistent)``: an
-    existing registration is adopted unowned; a fresh one is owned by this
-    start; #362 marks the stable-target case persistent so no retire path
-    deletes the user's own project.
+    from ouroboros.subagent_worktrees import registered_checkout
+    from ouroboros.tools.review_subject import CHECKOUT_SUBDIR
+
+    path, data = pathlib.Path(root).resolve(), pathlib.Path(drive).resolve()
+    parts = path.relative_to(data).parts if path.is_relative_to(data) else ()
+    return (parts[:2] == ("state", CHECKOUT_SUBDIR)
+            or any(parts[i:i + 2] == ("source_handles", "review_inputs") for i in range(len(parts) - 1))
+            or registered_checkout(root))
+
+
+def resolve_registration(gateway, scope_root: str, execution_root: str, access: str, *, minted: bool = False):
+    """Register (or adopt) the scope root and decide the markers in one step.
+
+    Returns ``(project_id, owned_project_id, project_persistent, ephemeral)``. A
+    ``minted`` root on an engine that accepts ``scope.ephemeral``
+    (``config.CLAUDEXOR_EPHEMERAL_SCOPE_MIN_VERSION``) registers nothing: ``("",
+    "", False, True)``. Otherwise an existing registration is adopted unowned; a
+    fresh one is owned by this start; #362 marks the stable-target case
+    persistent so no retire path deletes the user's own project. Ownership comes
+    from the engine's ``created`` once its answers carry it (one POST, no
+    ``GET /v2/projects`` over every project); until then the previous flow runs,
+    and on an unobserved engine one optional POST beside a found root learns it.
+    A gateway without ``project_registration`` (an older client or a test double)
+    keeps the previous flow exactly.
     """
-    existing_project = gateway.find_project_id(scope_root)
-    project_id = existing_project or gateway.register_project(scope_root)
-    owned_project_id = "" if existing_project else project_id
-    return project_id, owned_project_id, persistent_registration(execution_root, access)
+    from ouroboros.config import CLAUDEXOR_EPHEMERAL_SCOPE_MIN_VERSION
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable, engine_at_least
+
+    version = str(getattr(gateway, "engine_version", "") or "")
+    if minted and engine_at_least(version, CLAUDEXOR_EPHEMERAL_SCOPE_MIN_VERSION):
+        return "", "", False, True
+    persistent = persistent_registration(execution_root, access)
+    register = getattr(gateway, "project_registration", None)
+    identity = (version, str(getattr(gateway, "engine_build_sha", "") or ""))
+    reported = _CREATED_REPORTED.get(identity) if register is not None else False
+    existing = "" if reported else gateway.find_project_id(scope_root)
+    if register is None or (existing and reported is False):
+        project_id = existing or gateway.register_project(scope_root)
+        return project_id, ("" if existing else project_id), persistent, False
+    try:
+        project_id, created = register(scope_root)
+    except ClaudexorUnavailable:
+        if not existing:
+            raise
+        return existing, "", persistent, False  # the previous flow needed no POST here
+    _CREATED_REPORTED[identity] = created is not None
+    owned = created if created is not None else not (existing or reported)
+    return project_id, (project_id if owned else ""), persistent, False
 
 
 # How a run's ``maxSeconds`` was decided (#1196), recorded on the START_REQUESTED
@@ -109,26 +234,36 @@ STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
         "authority_source", "access", "mode", "isolation",
         "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
         "work_order_coverage", "authority_fingerprint",
-        # #1196: the prior run this start explicitly continues (a confirmed
-        # wall-clock expiry), "" for every ordinary start.
-        "continuation_of",
+        # The prior run this start explicitly continues ("" for every ordinary
+        # start) and, when it continues IN that run's snapshot, its own capture
+        # identity and the task that keeps the snapshot's baseline and lock.
+        "continuation_of", "capture_id", "snapshot_task_id",
     )
 )
-# None means an old row omitted the choice; '' is a captured default choice.
-STARTED_OPTION_FIELDS = ("effort", "processing_preference")
+# None means an old row omitted the choice; '' is a captured default choice. ``row_effort`` is
+# the configured row's pin ('' = Auto) beside ``effort``, the LEAF level the engine ran.
+STARTED_OPTION_FIELDS = ("effort", "processing_preference", "row_effort")
 # Progress carried forward from a previous row: an idempotent re-start writes a
 # SECOND started row; replacing wholesale would forget a settlement and put a
 # finished run back into the orphan sweep (which would cancel it).
 STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
     "ledger_recorded", "settled", "containment_disclosed", "unread_disclosed",
-    "output_artifact", "output_complete", "output_sha", "output_consumed",
-    "patch_captured", "patch_disposed", "patch_apply_pending")
+    "output_artifact", "output_complete", "output_sha", "output_consumed", "output_source",
+    "patch_captured", "patch_disposed", "patch_apply_pending", "superseded_by")
+# The closing facts SETTLED wrote (and the fault CONTAINMENT_FAULT recorded): a later
+# STARTED row never carries them, so replacing wholesale would forget a run's cost,
+# its spend disclosure, the engine's model/profile/locators and an unresolved fault,
+# or the owner's recorded terminal-wake acknowledgement.
+STARTED_SETTLEMENT_FACTS: Tuple[str, ...] = (
+    "terminal_state", "terminal_reason", "engine_model", "access_profile",
+    "spend_disclosed", "spend_estimated", "cost_usd",
+    "settled_at", "engine_locator", "terminal_ack_attempt")
 # Binding/authority facts are FIRST-WINS (R1-2): a later idempotent STARTED row
 # may be minted by a context that no longer knows the original binding; the
 # first recorded fact is authoritative and is never erased or retargeted.
 STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
     "snapshot_id", "execution_root", "execution_binding_fingerprint", "baseline_sha", "target_root",
-    "authority_source", "resource_ref", "selected_subagent_id",
+    "capture_id", "snapshot_task_id", "authority_source", "resource_ref", "selected_subagent_id",
     "config_fingerprint", "work_order_fingerprint", "work_order_coverage",
     "authority_fingerprint", "work_order_source_request", "category", "source",
     *REVIEW_ATTRIBUTION_KEYS)

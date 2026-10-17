@@ -7,7 +7,7 @@ Split out of ``supervisor/events.py`` at the module-size boundary;
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, WEB_UI_CHAT_ID
 
@@ -43,6 +43,27 @@ def bound_project_chat_id(ctx: Any, task_id: Any, parent_task_id: Any = "", root
     return resolve_project_chat(
         getattr(ctx, "DRIVE_ROOT", None), task_id, parent_task_id, root_task_id
     )
+
+
+def resolve_quiz_publication(root: Any, task_id: str, block: dict, proposed_chat: Any,
+                             parent_task_id: str = "", root_task_id: str = "") -> int:
+    """Strict new publication routing; a durable address wins every later binding."""
+    if "publication_chat_id" in block:
+        if (type(block["publication_chat_id"]) is not int
+                or block.get("publication_evidence") not in {"pre_exposure", "history"}):
+            raise ValueError("publication_address_unknown")
+        return block["publication_chat_id"]
+    from ouroboros.projects_registry import RoomResolver
+
+    # Use the public task-tree room rule before the immutable publication is bound.
+    # Its strict read distinguishes missing from unavailable; later retries never resolve again.
+    resolved = RoomResolver(root, strict=True)(task_id, parent_task_id, root_task_id)
+    if resolved:
+        proposed_chat = resolved
+    if type(proposed_chat) is not int:
+        raise ValueError("chat_unresolved")
+    chat_id = proposed_chat
+    return WEB_UI_CHAT_ID if chat_id == HIDDEN_CHAT_ID else chat_id
 
 
 def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *,
@@ -118,13 +139,16 @@ def ingress_chat_id(raw_chat_id: Any, drive_root: Any, project_id: Any = "", *,
 def address_task_event(running: Any, drive_root: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     """Give a task-scoped live event its explicit audience (owner decision Q1=A).
 
-    Worker diagnostics (llm_api_error, tool_timeout, ...) carry only their own
-    task_id — never lineage or a chat — so a Project child's error used to fall
-    through to the legacy "no address -> Main" default and mint an empty
-    Working... card there (issue #296 residual). The supervisor holds the
-    host-attested truth: fill missing parent/root from the RUNNING row, let the
-    Project binding win (a post-hoc bound task keeps its original chat_id on
-    the row, so the binding must take precedence — same order as
+    Worker diagnostics (llm_api_error, tool_timeout, ...) used to carry only
+    their own task_id — never lineage or a chat — so a Project child's error
+    fell through to the legacy "no address -> Main" default and minted an
+    empty Working... card there (issue #296 residual). The producer's per-task
+    endpoint (``TurnEventQueue``) now stamps lineage and chat by value on the
+    telemetry it emits, which is what lets a frame handled after its task left
+    RUNNING still route; this reader keeps the host-attested fallback for
+    frames that carry less: fill missing parent/root from the RUNNING row, let
+    the Project binding win (a post-hoc bound task keeps its original chat_id
+    on the row, so the binding must take precedence — same order as
     _handle_task_heartbeat), otherwise preserve an explicit chat_id already on
     the event (0 is a real session — the Skill Review panel — never "missing";
     a None value is absence, not an address), otherwise stamp the task row's
@@ -148,6 +172,8 @@ def address_task_event(running: Any, drive_root: Any, payload: Dict[str, Any]) -
     for key in ("parent_task_id", "root_task_id"):
         if not payload.get(key) and task_row.get(key):
             payload[key] = str(task_row[key])
+    if task_row.get("_execution_owner"):
+        payload.setdefault("execution_owner", dict(task_row["_execution_owner"]))
     if task_row.get("_is_direct_chat"):
         # A direct turn resumed from its exact budget pause runs on a pooled
         # worker (#1196): its frames keep the lane fact the direct lane would
@@ -187,59 +213,128 @@ def address_ctx_event(ctx: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
+# The task-tree attribution a durable usage row declares and a late frame needs
+# to route: the same six fields ``events_budget._handle_llm_usage`` used to copy
+# from RUNNING, now stamped by value at the producer (the fallback stays).
+TASK_LINEAGE_FIELDS: Tuple[str, ...] = (
+    "root_task_id", "parent_task_id", "delegation_role",
+    "task_group_id", "requested_model_lane", "effective_model_lane",
+)
+# The kinds a pooled task's endpoint stamps: the telemetry lane, whose handlers
+# may run after the task left RUNNING. Control events keep their producer shape.
+_TELEMETRY_KINDS = frozenset({"llm_usage", "log_event"})
+
+
+def task_lineage(task: Any) -> Dict[str, str]:
+    """The lineage a task row carries, by value, in the fields the usage row declares."""
+    source = task if isinstance(task, dict) else {}
+    return {key: str(source[key]) for key in TASK_LINEAGE_FIELDS if source.get(key)}
+
+
 class TurnEventQueue:
-    """Address a direct/ephemeral turn's task-scoped events BY VALUE at the
-    producer boundary: the turn's DirectActivityRegistry entry (its only chat
-    authority) dies with the turn while the supervisor drains its queued
-    events LATER, so the address must ride the event itself (the ingress
-    capture rule of DEVELOPMENT.md). Wraps the turn's real queue and stamps
-    the turn chat onto its own still-unaddressed task-scoped payloads."""
+    """Address a turn's or a pooled task's task-scoped events BY VALUE at the
+    producer boundary (the ingress capture rule of DEVELOPMENT.md).
+
+    A direct/ephemeral turn's DirectActivityRegistry entry (its only chat
+    authority) dies with the turn, and a pooled task's RUNNING row is popped by
+    its ``task_done``, while the supervisor drains their queued telemetry LATER
+    (the telemetry lane is served after control, never before it), so the
+    address and the lineage must ride the event itself. Wraps the real queue and
+    stamps the chat, the ``_is_direct_chat`` lane fact and the task's lineage
+    onto its own still-unaddressed task-scoped payloads; explicit producer values
+    always win. One endpoint per task, created at task start and handed down:
+    a late callback holding a previous task's endpoint keeps THAT task's facts
+    while a warm worker runs its next task, and a frame of another task passes
+    through untouched. The ``task_dispatch_resolved`` seam the worker already
+    reports refreshes the resolved lane facts by value.
+
+    ``telemetry_only`` (the pooled factory ``task_event_queue``) limits the stamp
+    to the telemetry lane — ``llm_usage`` and ``log_event`` payloads — because a
+    pooled task's control events are handled while its RUNNING row exists and
+    keep their producer shape. The direct lane stamps every task-scoped event,
+    plus its turn-only extras: the origin label and the Stop marker on work frames.
+    """
 
     def __init__(self, inner: Any, task_id: Any, chat_id: Any, initiator: Any = "",
-                 on_first_work: Optional[Callable[[], None]] = None) -> None:
+                 on_first_work: Optional[Callable[[], None]] = None, *,
+                 lineage: Optional[Dict[str, Any]] = None, direct_chat: bool = True,
+                 telemetry_only: bool = False) -> None:
         self._inner = inner
         self._task_id = str(task_id or "")
-        self._chat_id = int(chat_id or 0)
+        # None is absence (a task admitted without an address stamps none);
+        # 0 is a real session, the hidden partition, and is stamped as such.
+        self._chat_id = None if chat_id is None else int(chat_id)
         self._initiator = str(initiator or "")
+        self._lineage = task_lineage(lineage)
+        self._direct_chat = bool(direct_chat)
+        self._telemetry_only = bool(telemetry_only)
         # Fired once, on the first frame this proxy stamps as WORK (below):
         # the lane hangs the turn namer on it, so a turn is named exactly
         # when its block becomes a task card and never for a greeting.
         self._on_first_work = on_first_work
 
+    @property
+    def task_id(self) -> str:
+        return self._task_id
+
+    def stamp_payload(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """Stamp one of this task's own task-scoped payloads in place (lineage, chat, lane fact)."""
+        for key, value in self._lineage.items():
+            if not data.get(key):
+                data[key] = value
+        if data.get("chat_id") is None and self._chat_id is not None:
+            data["chat_id"] = self._chat_id
+        # The lane fact rides the same events by the same rule: a live tool or
+        # progress frame names its direct turn on arrival, so the header pill
+        # keeps the census verdict (Thinking…) beside the block before the
+        # census lists the turn; chrome never reads it. A direct turn resumed
+        # from its exact budget pause on a pooled worker (#1196) keeps it too.
+        if self._direct_chat:
+            data.setdefault("_is_direct_chat", True)
+        return data
+
     def stamp(self, item: Any) -> Any:
-        if isinstance(item, dict):
-            data = item.get("data") if item.get("type") == "log_event" else item
-            if isinstance(data, dict) and str(data.get("task_id") or "") == self._task_id:
-                if data.get("chat_id") is None:
-                    data["chat_id"] = self._chat_id
-                # The lane fact rides the same events by the same rule: a live
-                # tool or progress frame names its direct turn on arrival, so
-                # the header pill keeps the census verdict (Thinking…) beside
-                # the block before the census lists the turn; chrome never reads it.
-                data.setdefault("_is_direct_chat", True)
-                # The turn's origin label (a consciousness wake-up) rides the
-                # same events, so a tool-only wake is filed and labelled from
-                # its first frame; an owner's turn carries no initiator.
-                if self._initiator:
-                    data.setdefault("initiator", self._initiator)
-                # The host-attested Stop marker rides the turn's WORK frames as
-                # it rides its narration rows (events_chat_delivery stamps those
-                # through the same registry): a turn that only calls tools
-                # offers Stop on the block its rows already justify, and a turn
-                # that does neither keeps no block to hang a Stop on. An
-                # addressing call (``routing_action``) is a receipt, not work:
-                # it carries no marker, so an addressing-only turn keeps no block.
-                if (
-                    data.get("type") in ("tool_call_started", "tool_call_finished")
-                    and not data.get("routing_action")
-                ):
-                    data.setdefault("cancelable", True)
-                    if self._on_first_work is not None:
-                        callback, self._on_first_work = self._on_first_work, None
-                        try:
-                            callback()
-                        except Exception:
-                            log.debug("first-work callback failed for %s", self._task_id, exc_info=True)
+        if not isinstance(item, dict):
+            return item
+        kind = str(item.get("type") or "")
+        data = item.get("data") if kind == "log_event" else item
+        if not isinstance(data, dict) or str(data.get("task_id") or "") != self._task_id:
+            return item
+        if kind == "task_dispatch_resolved":
+            # The worker's own dispatch resolution (XG-2R.1) is the one place the
+            # effective lane becomes known inside the task: refresh by value.
+            resolution = item.get("resolution")
+            if isinstance(resolution, dict):
+                self._lineage.update(task_lineage(resolution))
+            return item
+        if self._telemetry_only and kind not in _TELEMETRY_KINDS:
+            return item
+        self.stamp_payload(data)
+        if self._telemetry_only:
+            return item
+        # The turn's origin label (a consciousness wake-up) rides the
+        # same events, so a tool-only wake is filed and labelled from
+        # its first frame; an owner's turn carries no initiator.
+        if self._initiator:
+            data.setdefault("initiator", self._initiator)
+        # The host-attested Stop marker rides the turn's WORK frames as
+        # it rides its narration rows (events_chat_delivery stamps those
+        # through the same registry): a turn that only calls tools
+        # offers Stop on the block its rows already justify, and a turn
+        # that does neither keeps no block to hang a Stop on. An
+        # addressing call (``routing_action``) is a receipt, not work:
+        # it carries no marker, so an addressing-only turn keeps no block.
+        if (
+            data.get("type") in ("tool_call_started", "tool_call_finished")
+            and not data.get("routing_action")
+        ):
+            data.setdefault("cancelable", True)
+            if self._on_first_work is not None:
+                callback, self._on_first_work = self._on_first_work, None
+                try:
+                    callback()
+                except Exception:
+                    log.debug("first-work callback failed for %s", self._task_id, exc_info=True)
         return item
 
     def put(self, item: Any, *args: Any, **kwargs: Any) -> Any:
@@ -247,6 +342,48 @@ class TurnEventQueue:
 
     def put_nowait(self, item: Any) -> Any:
         return self._inner.put_nowait(self.stamp(item))
+
+    def delivery_outstanding(self, delivery_id: str) -> Optional[bool]:
+        from supervisor.event_observation import delivery_outstanding
+        return delivery_outstanding(self._inner, delivery_id)
+
+    def put_unless_outstanding(self, item: Any) -> bool:
+        return self._inner.put_unless_outstanding(self.stamp(item))
+
+
+# This process's task endpoints by task id, for the rows the worker's log sink
+# forwards (a row a worker appended itself carries only its task id). Keyed by
+# the FRAME's own task, never by "the current task": a late row of a finished
+# task is stamped with that task's facts while the next task runs. Entries are
+# tiny and bounded by the distinct tasks this process served, so none is evicted.
+_TASK_ENDPOINTS: Dict[str, TurnEventQueue] = {}
+
+
+def task_event_queue(inner: Any, task: Dict[str, Any]) -> TurnEventQueue:
+    """The pooled task's per-task endpoint, created at task start and handed down.
+
+    Captures the task's chat (``None`` when it carries none; 0 is the hidden
+    partition and is kept) and its lineage by value, stamps only the telemetry
+    lane, and registers itself for the process's log sink."""
+    chat_id = task.get("chat_id")
+    try:
+        chat_id = None if chat_id in (None, "") else int(chat_id)
+    except (TypeError, ValueError):
+        chat_id = None
+    endpoint = TurnEventQueue(inner, str(task.get("id") or ""), chat_id, lineage=task,
+                              direct_chat=bool(task.get("_is_direct_chat")), telemetry_only=True)
+    if endpoint.task_id:
+        _TASK_ENDPOINTS[endpoint.task_id] = endpoint
+    return endpoint
+
+
+def stamp_recorded_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Stamp a worker-appended row with ITS task's facts before the sink forwards it live.
+
+    A row of a task this process never ran (or ran before this registry existed)
+    passes through unchanged; the supervisor's RUNNING fallback still applies."""
+    endpoint = _TASK_ENDPOINTS.get(str(row.get("task_id") or "")) if isinstance(row, dict) else None
+    return endpoint.stamp_payload(row) if endpoint is not None else row
 
 
 def make_server_log_sink(bridge: Any, drive_root: Any, running: Any = None):

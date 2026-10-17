@@ -138,8 +138,7 @@ def test_a_settled_acceptance_run_is_never_collected_twice(tmp_path, monkeypatch
 
 
 def test_an_uncollectable_pending_run_is_left_alone_and_never_raises(tmp_path, monkeypatch):
-    """Fail-soft like ``plan_review_collect.collect_before_gate``: the pass
-    continues, the run stays pending, and nothing dispatches."""
+    """Fail-soft: the pass continues, the run stays pending, and nothing dispatches."""
     from ouroboros import review_dispatch
 
     monkeypatch.setattr("ouroboros.review_substrate.run_review_request",
@@ -531,19 +530,36 @@ def test_two_late_panels_of_one_task_each_announce_their_own_row(tmp_path, monke
     assert any("passed" in r["text"] for r in rows) and any("rejected" in r["text"] for r in rows)
 
 
-def test_an_owner_followup_sets_the_running_panel_aside(tmp_path):
-    """Fable review round 4: after the owner changes the requirements, the answer
-    Main writes for them is not a delivery under the panel that reviewed the old
-    ones — the latch clears, so the ordinary path decides while the old panel's
-    verdicts still arrive as advice."""
+@pytest.mark.parametrize("choice", [None, "wait", "finish"])
+def test_an_owner_followup_sets_the_running_panel_aside(tmp_path, choice):
+    """New input reopens delivery, retaining the paid panel and the wait choice.
+
+    The earlier verdict cannot authorize changed requirements. Arrival itself
+    cannot cancel the review or choose early finish on the author's behalf.
+    """
     from ouroboros import loop
     from tests.test_delivery_forced_finalization import _forced_test_context
 
     _loop, registry, _ctx, trace = _forced_test_context(tmp_path)
     registry._ctx._task_acceptance_pending = "binding-one"
+    registry._ctx._task_acceptance_reviewed = True
+    if choice is not None:
+        registry._ctx._acceptance_pending_review_choice = choice
     trace["review_decision"] = {}
+    paid = _host_run(binding_hash="binding-one", paid_identity="paid-one")
+    trace["review_runs"] = [paid]
+    before = json.loads(json.dumps(paid))
+    trace["task_completion"] = {"status": "accepted"}
+    trace["root_phase_checkpoint"] = {"status": "pass"}
     loop._supersede_task_acceptance_for_owner_followup(registry._ctx, trace)
-    assert registry._ctx._task_acceptance_pending == ""
+    assert registry._ctx._task_acceptance_pending == "binding-one"
+    assert getattr(registry._ctx, "_acceptance_pending_review_choice", None) == choice
+    assert registry._ctx._task_acceptance_reviewed is False
+    assert "task_completion" not in trace and "root_phase_checkpoint" not in trace
+    assert trace["review_runs"] == [paid]
+    assert {key: paid[key] for key in before} == before  # raw actors/request/paid identity stay exact
+    assert paid["applied_decision"]["reason"] == "owner_followup"
+    assert trace["review_decision"]["eligibility"] == "pending_owner_followup"
     assert trace["acceptance_decision"]["reason"] == "owner_followup"
 
 

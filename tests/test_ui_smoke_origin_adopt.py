@@ -1,11 +1,13 @@
-"""Browser proof for #895: two Main root cards born from ONE owner message convert into ONE Project.
+"""Browser proof for the one-work placement rule: two Main root cards born from ONE owner message
+are independent works, each converting into its OWN Project.
 
-Seeds two completed managed roots (T1, T2) carrying the same ingress origin, as Main root
-cards. Converting T1 creates the Project; converting T2 must ADOPT it (same chip name, one
-registry row), never mint a second one. A direct conversation turn keeps no conversion
+Seeds two managed roots (T1, T2) carrying the same ingress origin, as Main root cards. A shared
+message origin is provenance only (`projects_registry.origin_claim_lock`,
+`project_placement.pending_placement`: placement never consults siblings): converting T1 binds T1
+alone and leaves T2 an independent Main work with its own conversion control until T2 itself is
+converted, which creates T2's own Project. A direct conversation turn keeps no conversion
 control (docs/DESIGN.md "Conversation activity block": conversion is the model's addressing
-call, never a card button), so both cards here are managed roots — the case the origin key
-exists for.
+call, never a card button), so both cards here are managed roots.
 
 Run: OUROBOROS_RUN_UI_SMOKE=1 OUROBOROS_DATA_DIR=$(mktemp -d) python -m pytest \
   tests/test_ui_smoke_origin_adopt.py -o addopts="" -m ui_browser -q
@@ -71,7 +73,7 @@ def _seed(data_dir: pathlib.Path) -> dict:
     return ref
 
 
-def test_ui_two_cards_one_origin_convert_into_one_project(direct_server_with_data, tmp_path):  # noqa: F811
+def test_ui_two_cards_one_origin_convert_into_their_own_projects(direct_server_with_data, tmp_path):  # noqa: F811
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import sync_playwright
 
@@ -102,28 +104,35 @@ def test_ui_two_cards_one_origin_convert_into_one_project(direct_server_with_dat
             page.screenshot(path=str(shots / "02_first_converted.png"), full_page=True)
             projects = page.request.get(f"{url}/api/projects").json()["projects"]
             assert len(projects) == 1, projects
-            first_name = c1.inner_text().strip().splitlines()[0]
+            # A converted card leads with its own work title and names its Project in the one
+            # reference (DESIGN "Project work entries", #1706): adoption shares the reference.
+            first = (c1.get_attribute("data-project-id"), c1.locator(".chat-live-project-name").inner_text())
+            assert first[0] == projects[0]["id"], (first, projects)
 
-            # The sibling card: its button is still there (this task is completed, so
-            # the sibling claim never bound it), and converting it must ADOPT.
+            # The sibling shares only the origin: it is an independent work that stays unbound
+            # with its own conversion control, and converting it creates ITS Project.
             btn = c2.locator("[data-turn-into-project]")
             assert btn.count() == 1
+            assert c2.locator(".chat-live-project-card-btn").count() == 0
+            assert not c2.get_attribute("data-project-id")
             # JS click: a toast from the first conversion can sit over the button.
             btn.first.evaluate("b => b.click()")
             c2.locator(".chat-live-project-card-btn").first.wait_for(
                 state="visible", timeout=20_000,
             )
-            page.screenshot(path=str(shots / "03_second_adopted.png"), full_page=True)
+            page.screenshot(path=str(shots / "03_second_own_project.png"), full_page=True)
             projects = page.request.get(f"{url}/api/projects").json()["projects"]
-            assert len(projects) == 1, [p.get("id") for p in projects]
-            second_name = c2.inner_text().strip().splitlines()[0]
-            assert first_name == second_name, (first_name, second_name)
+            assert len(projects) == 2, [p.get("id") for p in projects]
+            second = (c2.get_attribute("data-project-id"), c2.locator(".chat-live-project-name").inner_text())
+            assert second != first and second[0] != first[0], (first, second)
+            assert {first[0], second[0]} == {p["id"] for p in projects}, (first, second, projects)
+            assert c1.get_attribute("data-project-id") == first[0]
 
             # A card that is already bound can STILL have its button on screen (a phone
             # that missed the refresh, the Telegram mini app, a second tab). Replay the
             # exact request the client sends — api_client.js::projectFromTask POSTs
             # /api/projects/from-task with the default id chat_activity.js derives — and
-            # the server adopts that Project instead of minting one or answering 4xx.
+            # the server adopts the task's OWN Project instead of minting one or answering 4xx.
             replay = page.request.post(f"{url}/api/projects/from-task", data={
                 "task_id": "t2promoted", "id": "task-t2promoted",
                 "name": "", "objective_hint": ORIGIN_TEXT,
@@ -131,11 +140,12 @@ def test_ui_two_cards_one_origin_convert_into_one_project(direct_server_with_dat
             assert replay.status == 200, replay.text()
             replayed = replay.json()
             assert replayed["adopted"] is True, replayed
-            assert replayed["project"]["id"] == projects[0]["id"]
-            assert len(page.request.get(f"{url}/api/projects").json()["projects"]) == 1
+            assert replayed["project"]["id"] == second[0]
+            assert len(page.request.get(f"{url}/api/projects").json()["projects"]) == 2
 
             bindings = json.loads((data_dir / "state" / "project_task_bindings.json").read_text())["bindings"]
-            assert bindings["t1direct"]["project_id"] == bindings["t2promoted"]["project_id"]
+            assert bindings["t1direct"]["project_id"] == first[0]
+            assert bindings["t2promoted"]["project_id"] == second[0]
 
             page.reload(wait_until="domcontentloaded")
             _wait_status(page, "Online", timeout=30_000)
@@ -211,9 +221,10 @@ def _seed_live_sibling(data_dir: pathlib.Path) -> None:
     }), encoding="utf-8")
 
 
-def test_ui_live_sibling_loses_button_without_reload(direct_server_with_data, tmp_path):  # noqa: F811
-    """Converting the completed root's card binds the LIVE sibling root too: its Main card drops
-    the convert button and shows the Project pointer after the state refresh, with no reload."""
+def test_ui_live_sibling_keeps_its_own_button_until_converted_without_reload(direct_server_with_data, tmp_path):  # noqa: F811
+    """Converting the completed root's card binds only that root: the LIVE sibling root sharing its
+    origin keeps its convert button and gets no Project pointer after the state refresh. Converting
+    the sibling itself then shows its own Project pointer on its Main card, with no reload."""
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import sync_playwright
 
@@ -244,8 +255,23 @@ def test_ui_live_sibling_loses_button_without_reload(direct_server_with_data, tm
 
             c1.locator("[data-turn-into-project]").first.evaluate("b => b.click()")
             c1.locator(".chat-live-project-card-btn").first.wait_for(state="visible", timeout=20_000)
-            # No reload: the sibling's button must go and a pointer must appear on the next
-            # /api/state refresh (projects_changed triggers it; the poll is the backstop).
+            # No reload: the state refresh that shows the converted card's Project (projects_changed
+            # triggers it; the poll is the backstop) must leave the independent sibling unbound.
+            page.wait_for_function(
+                "() => document.querySelector('#chat-messages .chat-live-card[data-task-id=\"l1direct\"]')"
+                "?.dataset.projectId",
+                timeout=45_000,
+            )
+            state = page.request.get(f"{url}/api/state").json()
+            assert "l1direct" in state["task_bindings"] and "l2root" not in state["task_bindings"], state["task_bindings"]
+            bindings = json.loads((data_dir / "state" / "project_task_bindings.json").read_text())["bindings"]
+            assert "l1direct" in bindings and "l2root" not in bindings, sorted(bindings)
+            assert c2.locator("[data-turn-into-project]").count() == 1
+            assert c2.locator(".chat-live-project-card-btn").count() == 0
+            assert not c2.get_attribute("data-project-id")
+            page.screenshot(path=str(shots / "12_live_sibling_unbound_no_reload.png"), full_page=True)
+
+            c2.locator("[data-turn-into-project]").first.evaluate("b => b.click()")
             try:
                 page.wait_for_function(
                     "() => { const c = document.querySelector('#chat-messages .chat-live-card[data-task-id=\"l2root\"]');"
@@ -253,22 +279,22 @@ def test_ui_live_sibling_loses_button_without_reload(direct_server_with_data, tm
                     timeout=45_000,
                 )
             except Exception:
-                page.screenshot(path=str(shots / "12_FAIL_live_sibling.png"), full_page=True)
+                page.screenshot(path=str(shots / "13_FAIL_live_sibling.png"), full_page=True)
                 import shutil
                 for rel in ("logs/supervisor.jsonl", "logs/events.jsonl", "state/queue_snapshot.json"):
                     src = data_dir / rel
                     if src.exists():
-                        shutil.copy(src, shots / ("12_FAIL_" + rel.replace("/", "_")))
-                (shots / "12_FAIL_state.json").write_text(json.dumps({
+                        shutil.copy(src, shots / ("13_FAIL_" + rel.replace("/", "_")))
+                (shots / "13_FAIL_state.json").write_text(json.dumps({
                     "state": page.request.get(f"{url}/api/state").json(),
                     "card_html": page.evaluate("() => (document.querySelector('#chat-messages .chat-live-card[data-task-id=\"l2root\"]') || {}).outerHTML || null"),
                 }, indent=1, default=str)[:20000])
                 raise
-            page.screenshot(path=str(shots / "12_live_sibling_pointer_no_reload.png"), full_page=True)
+            page.screenshot(path=str(shots / "13_live_sibling_own_pointer_no_reload.png"), full_page=True)
             projects = page.request.get(f"{url}/api/projects").json()["projects"]
-            assert len(projects) == 1, [p.get("id") for p in projects]
+            assert len(projects) == 2, [p.get("id") for p in projects]
             bindings = json.loads((data_dir / "state" / "project_task_bindings.json").read_text())["bindings"]
-            assert bindings["l1direct"]["project_id"] == bindings["l2root"]["project_id"]
+            assert bindings["l1direct"]["project_id"] != bindings["l2root"]["project_id"]
             assert not page.locator('.toast.error, .toast-error, [data-toast-tone="error"]').count()
         finally:
             browser.close()

@@ -80,10 +80,12 @@ export class ElementStub {
     setAttribute(name, value) { this.attributes.set(name, String(value)); }
     getAttribute(name) { return this.attributes.get(name) || ''; }
     removeAttribute(name) { this.attributes.delete(name); }
+    hasAttribute(name) { return this.attributes.has(name); }
     appendChild(node) { return this.insertBefore(node, null); }
     append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
     prepend(...nodes) { const before = this.children[0] || null; nodes.forEach((node) => this.insertBefore(node, before)); }
     before(node) { return this.parentNode?.insertBefore(node, this); }
+    after(node) { const list = this.parentNode?.children || []; return this.parentNode?.insertBefore(node, list[list.indexOf(this) + 1] || null); }
     insertAdjacentElement(_position, node) { const list = this.parentNode?.children || []; return this.parentNode?.insertBefore(node, list[list.indexOf(this) + 1] || null); }
     insertBefore(node, before) {
         if (node?.isDocumentFragment) {
@@ -116,8 +118,15 @@ export class ElementStub {
         return this.children.some((child) => child.contains(node));
     }
     querySelector(selector) {
-        const id = selector.match(/^\[id="([^"]+)"\]$/)?.[1];
-        if (id) return this.ownerDocument?.byId.get(id) || null;
+        const id = selector.match(/^\[id="([^"]+)"\]$/)?.[1] || selector.match(/^#([\w-]+)$/)?.[1];
+        if (id) {
+            for (const child of this.children) {
+                if (child.id === id) return child;
+                const nested = child.querySelector(selector);
+                if (nested) return nested;
+            }
+            return null;
+        }
         const data = selector.match(/^\[data-([a-z0-9-]+)\]$/i)?.[1];
         if (data) {
             const key = data.replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
@@ -125,8 +134,14 @@ export class ElementStub {
         }
         if (selector === '.typing-bubble') return this.children.find((child) => child.classList.contains('typing-bubble')) || null;
         if (selector.startsWith('.')) {
+            // Document order, like the platform: a child, then its descendants, before the next child.
             const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.find((child) => child.classList.contains(className)) || null;
+            for (const child of this.children) {
+                if (child.classList.contains(className)) return child;
+                const nested = child.querySelector?.(selector);
+                if (nested) return nested;
+            }
+            return null;
         }
         return null;
     }

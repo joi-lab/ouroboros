@@ -18,6 +18,7 @@ import pytest
 from starlette.requests import Request
 
 from ouroboros.gateway.state import _git_checkout_identity, _runtime_repo_identity
+from ouroboros import usage_store
 
 
 SHA = "1234567890abcdef1234567890abcdef12345678"
@@ -101,10 +102,10 @@ def test_source_mode_state_gap_is_filled_from_the_checkout(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("stamped", [False, True])
-def test_api_state_serves_the_honest_identity(tmp_path, monkeypatch, stamped):
+@pytest.mark.parametrize("detached", [False, True])
+def test_api_state_serves_the_honest_identity(tmp_path, monkeypatch, stamped, detached):
     from ouroboros.gateway.state import api_state
     import ouroboros.config as config
-    from ouroboros import usage_accounting as ua
     from supervisor import queue, state, workers
 
     root = tmp_path / "data"
@@ -112,8 +113,11 @@ def test_api_state_serves_the_honest_identity(tmp_path, monkeypatch, stamped):
     (root / "logs").mkdir(parents=True)
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(root))
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(root / "settings.json"))
-    ua.ensure_legacy_imported(root)
-    monkeypatch.setattr(config, "REPO_DIR", _plain_checkout(tmp_path / "repo"))
+    usage_store.migrate_from_journal(root)
+    repo = _plain_checkout(tmp_path / "repo")
+    if detached:
+        (repo / ".git" / "HEAD").write_text(SHA + "\n", encoding="utf-8")
+    monkeypatch.setattr(config, "REPO_DIR", repo)
     monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
     monkeypatch.setattr(state, "load_state", lambda: (
         {"current_branch": "managed-branch", "current_sha": OTHER}
@@ -139,5 +143,14 @@ def test_api_state_serves_the_honest_identity(tmp_path, monkeypatch, stamped):
         assert payload["branch"] == "managed-branch"
         assert payload["sha"] == OTHER[:8]
     else:
-        assert payload["branch"] == "ouroboros"
+        assert payload["branch"] == (None if detached else "ouroboros")
         assert payload["sha"] == SHA[:8]
+    # The published schema must accept what the real state endpoint sends,
+    # not invent a branch merely to satisfy a string-only consumer.
+    import jsonschema
+    from ouroboros.gateway.schema import contract_document
+
+    schema = contract_document()["schemas"]["StateResponse"]["properties"]["branch"]
+    jsonschema.validate(payload["branch"], schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(123, schema)

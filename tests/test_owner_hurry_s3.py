@@ -383,7 +383,7 @@ def test_acceptance_panel_skips_with_typed_reason_and_zero_reviewer_calls(tmp_pa
     )
     oh.record_requested(tmp_path, "t-acc", request_id="rq", attempt=1)
     ctx = _acceptance_ctx(tmp_path, latched=True)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}, "is_error": False}]}
     assert loop_mod._run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t-acc", task_type="task",
         llm_trace=trace, drive_root=None,
@@ -429,12 +429,14 @@ def test_unlatched_task_reaches_the_normal_acceptance_machinery(tmp_path, monkey
     monkeypatch.setattr(task_pacing, "review_launch_allowed",
                         lambda snapshot: (False, "review_skipped_deadline_reserve"))
     ctx = _acceptance_ctx(tmp_path, latched=False)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}, "is_error": False}]}
     loop_mod._run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t-acc", task_type="task",
         llm_trace=trace, drive_root=None,
         messages=[{"role": "user", "content": "goal"}], emit_progress=lambda _m, *, incident=None: None,
     )
+    # Same eligible context as the latched case, so only the latch differs.
+    assert trace["review_decision"]["eligibility"] == "eligible"
     assert trace["review_decision"].get("skipped") != "owner_hurry"
     assert resolved, "the unlatched path must reach the real pacing machinery"
 
@@ -485,45 +487,39 @@ def test_required_blocking_unbounded_loop_collapses_to_zero_under_hurry(tmp_path
 # ---------------------------------------------------------------------------
 
 
-def _plan_state(kind: str) -> dict:
-    fingerprint = "a" * 64
-    state = {
-        "schema_version": 1, "current_attempt": {},
-        "latest_review_fingerprint": "", "waves": [],
-    }
+def _plan_record(kind: str) -> dict:
+    """A plan record by its gate state: ``absent`` (no plan at all), ``unsent`` (an ask that
+    reached nobody), ``held`` (an owner-marked seat's open objection), ``awaiting`` (an ask
+    whose answers are still on their way)."""
+    from ouroboros import plan_record as pr
+
+    record = pr.empty_record()
     if kind == "absent":
-        return state
-    if kind == "pending":
-        state["waves"] = [{"request_fingerprint": fingerprint, "phase": "collected"}]
-        return state
-    state["current_attempt"] = {
-        "fingerprint": fingerprint,
-        "status": "unavailable" if kind == "unavailable" else "open",
-        "reason": "reviewer unavailable" if kind == "unavailable" else "",
-    }
-    if kind == "open":
-        state["latest_review_fingerprint"] = fingerprint
-        state["waves"] = [{
-            "request_fingerprint": fingerprint, "phase": "reviewed",
-            "review_evidence_status": "integrated",
-            "review": {"aggregate_signal": "REVIEW_REQUIRED", "closed": False},
-        }]
-    return state
+        return record
+    record["revisions"].append({"n": 1, "ts": "t", "goal": "g", "plan": "p", "done_when": [], "affected_paths": [], "body": False,
+                                "content_sha256": "0" * 64})
+    seat = {"seat_id": "triad_a", "model": "m/a", "route": "api_chat", "owner_marked": True, "dispatched": True, "status": "pending"}
+    if kind == "unsent":
+        seat.update(dispatched=False, status="not_dispatched", not_dispatched_reason="health_skip")
+    elif kind == "held":
+        seat.update(status="answered", reply={"prose": "", "objections": [{"id": "o1", "text": "no"}], "withdrawn": []})
+    record["asks"].append({"ask_id": "a1", "ts": "t", "revision": 1, "message": "", "participants": [seat]})
+    return record
 
 
 @pytest.mark.parametrize(
     ("kind", "hurry_allows"),
     [
-        ("open", True), ("unavailable", True),        # locally advisory/proceed
-        ("absent", False), ("pending", False),        # remain hold
+        ("held", True), ("awaiting", True),        # locally advisory / proceed
+        ("unsent", True),                          # an ask that reached nobody: attempted, disclosed, never held (scope R1 F1)
+        ("absent", False),                         # no plan at all: the Swarm admitted the task to write one — held
     ],
 )
 def test_enforce_swarm_actions_task_local_advisory_matrix(tmp_path, monkeypatch, kind, hurry_allows):
     import ouroboros.loop as loop_mod
-    import ouroboros.task_results as tr
 
     monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
-    monkeypatch.setattr(tr, "load_plan_review_state", lambda _root, _tid: _plan_state(kind))
+    monkeypatch.setattr(oh, "_plan_facts", lambda _ctx: (_plan_record(kind), {}, False))
 
     def _swarm_held(ctx):
         trace = {"reasoning_notes": []}
@@ -540,14 +536,16 @@ def test_enforce_swarm_actions_task_local_advisory_matrix(tmp_path, monkeypatch,
         # Attribution rides the decision for the task detail.
         assert decision["owner_hurry_local_advisory"] is True
         assert decision["configured_enforcement"] == "blocking"
-    # WITHOUT the latch the same blocking install always holds these states.
+    # WITHOUT the latch the same blocking install holds the held state and the plan never
+    # written; an ask whose answers are merely awaited never held (silence holds nothing), and
+    # an ask every seat refused before dispatch is attempted — disclosed, not held (outages never hold).
     unlatched_ctx = _acceptance_ctx(tmp_path, latched=False)
     unlatched_ctx.task_metadata = {"force_plan": True}
     held_unlatched, _t = _swarm_held(unlatched_ctx)
-    assert held_unlatched is True
+    assert held_unlatched is (kind in ("held", "absent"))
     # Durable review state was never touched (the monkeypatched loader is the
-    # only read; nothing wrote a plan-review file).
-    assert not (tmp_path / "task_results").exists() or "plan_review" not in json.dumps(
+    # only read; nothing wrote a plan record).
+    assert not (tmp_path / "task_results").exists() or "plan_record" not in json.dumps(
         load_task_result(tmp_path, "t-acc") or {},
     )
 
@@ -602,7 +600,7 @@ def test_writer_never_routes_through_write_task_result():
     # Docstrings NAME the forbidden writer; the code must never CALL or import it.
     assert "write_task_result(" not in source
     assert "import write_task_result" not in source
-    assert "update_json_locked" in source
+    assert "patch_document(" in source
 
 
 # ---------------------------------------------------------------------------
@@ -741,7 +739,7 @@ def test_fresh_attempt_replays_exact_owner_text_until_terminal(
                 drive_logs=tmp_path / "logs", task_id=task_id, round_idx=1,
                 event_queue=None, accumulated_usage={}, task_type="task",
                 active_use_local=False, tools=SimpleNamespace(_ctx=first_ctx),
-                drive_root=tmp_path,
+                drive_root=tmp_path, context_fit_plan=None, active_context_mode="max",
             ),
             None,
             attempt_cap=1,
@@ -755,7 +753,7 @@ def test_fresh_attempt_replays_exact_owner_text_until_terminal(
             def __init__(self):
                 self.calls = []
                 self._ctx = SimpleNamespace(
-                    task_metadata={}, _request_wire_custom_receipts=(),
+                    task_metadata={}, _request_wire_custom_receipts=(), drive_root=tmp_path,
                 )
 
             def get_timeout(self, _name):
@@ -807,7 +805,7 @@ def test_fresh_attempt_replays_exact_owner_text_until_terminal(
             drive_logs=tmp_path / "logs", task_id=task_id, round_idx=1,
             event_queue=None, accumulated_usage={}, task_type="task",
             active_use_local=False, tools=SimpleNamespace(_ctx=successor_ctx),
-            drive_root=tmp_path,
+            drive_root=tmp_path, context_fit_plan=None, active_context_mode="max",
         ),
         None,
         attempt_cap=1,
@@ -900,8 +898,8 @@ def test_full_hurry_lifecycle_writes_zero_chat_rows_and_zero_bus_calls(tmp_path,
 
 
 def test_p3_commit_and_safety_surfaces_never_consult_hurry(monkeypatch, tmp_path):
-    """§19.7.2 item 10: no hurry predicate/import enters commit review, advisory
-    pre-review, triad/scope, deterministic gates, safety, or the tool boundary;
+    """§19.7.2 item 10: no hurry predicate/import enters commit review, the
+    preflight, triad/scope, deterministic gates, safety, or the tool boundary;
     and arming the latch leaves settings/env byte-identical."""
     import os
 
@@ -911,7 +909,8 @@ def test_p3_commit_and_safety_surfaces_never_consult_hurry(monkeypatch, tmp_path
         repo / "ouroboros" / "tools" / "registry.py",
         repo / "ouroboros" / "tools" / "git.py",
         repo / "ouroboros" / "tools" / "parallel_review.py",
-        repo / "ouroboros" / "tools" / "claude_advisory_review.py",
+        repo / "ouroboros" / "tools" / "commit_gate.py",
+        repo / "ouroboros" / "tools" / "preflight_review.py",
         repo / "prompts" / "SAFETY.md",
     ]
     for path in guarded:

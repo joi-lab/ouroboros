@@ -113,9 +113,10 @@ def seed_stamp(vsuf: str) -> str:
     return (r.stdout or "").strip() if r.returncode == 0 else ""
 
 
-def reflections(vsuf: str) -> int:
+def knowledge_revisions(vsuf: str) -> int:
+    """Authored knowledge revisions in the data volume: the mind's own memory-carry signal."""
     r = subprocess.run(["docker", "run", "--rm", "--pull=never", "-v", f"obo-data{vsuf}:/d:ro", "alpine:3",
-                        "sh", "-c", "wc -l </d/logs/task_reflections.jsonl 2>/dev/null || echo 0"],
+                        "sh", "-c", "wc -l </d/memory/knowledge_history.jsonl 2>/dev/null || echo 0"],
                        capture_output=True, text=True)
     try:
         return int((r.stdout or "0").strip().split()[0])
@@ -368,7 +369,7 @@ def main() -> int:
     done_dir = out_dir / "done_idx"
 
     # Campaign-level provenance gate + record, BEFORE anything that costs money or touches the
-    # SHARED docker daemon: the util-image pull, the volume reads (`reflections`, `seed_stamp`)
+    # SHARED docker daemon: the util-image pull, the volume reads (`knowledge_revisions`, `seed_stamp`)
     # and the baseline snapshot all now run AFTER admission. `--reset-state` stays a deliberate
     # ONE-OFF campaign action the operator passes to run_pro directly: forwarding it per
     # run_one() would wipe the carried volumes on every task and turn an evolution campaign
@@ -435,7 +436,7 @@ def main() -> int:
         # before any run_pro call, so run_pro's own preflight is too late — but AFTER
         # admission, because the pull mutates the SHARED docker daemon.
         ensure_util_image()
-        log(f"START autonomous run idx{args.start}..{args.end} vsuf='{vsuf}'; current volume reflections={reflections(vsuf)}")
+        log(f"START autonomous run idx{args.start}..{args.end} vsuf='{vsuf}'; current volume knowledge revisions={knowledge_revisions(vsuf)}")
         stamp = seed_stamp(vsuf)
         log(f"seed stamp (obo-repo{vsuf}): {stamp or '<absent: fresh volume>'}")
         manifest["extra"]["volume_seed_stamp"] = stamp
@@ -531,7 +532,7 @@ def main() -> int:
                     snapshot(lastgood, vsuf)  # new last-good = post-idx_i
                     tag = "LEGIT" if pb > 0 else "LEGIT-0B(genuine)"
                     log(f"idx{i} {tag}: patch={pb}B api_err={ae} n_events={row.get('n_events', '?')} "
-                        f"refl={reflections(vsuf)} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
+                        f"knowledge_rows={knowledge_revisions(vsuf)} degraded={r['degraded']} :: {str(r['iid'])[:46]}")
                 # exhausted path: volumes already restored above
                 rec = {"idx": i, "instance_id": r["iid"], "patch_bytes": pb if pb is not None else 0,
                        "api_err": ae, "retries": min(tries, args.max_retries),
@@ -561,7 +562,7 @@ def main() -> int:
                 break
 
         _write_summary(out_dir, results, stopped_at=None)
-        log(f"DONE idx{args.start}..{args.end}: {len(results)} tasks, volume reflections={reflections(vsuf)}")
+        log(f"DONE idx{args.start}..{args.end}: {len(results)} tasks, volume knowledge revisions={knowledge_revisions(vsuf)}")
         return _finish(0, outcome="completed")
 
 

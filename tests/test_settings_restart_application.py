@@ -25,7 +25,7 @@ def applied(monkeypatch):
     saved = dict(config.SETTINGS_DEFAULTS)
     server_process.record_applied_restart_settings({key: saved[key] for key in (
         "OUROBOROS_MAX_WORKERS", "OUROBOROS_SERVER_HOST", "OUROBOROS_HOST_SERVICE_PORT",
-        "OUROBOROS_SKILLS_REPO_PATH",
+        "OUROBOROS_SKILLS_REPO_PATH", "OUROBOROS_UI_DIR",  # the last: server_web.ServedUI.apply
     )}, server_host_source="settings")
     return saved, manager
 
@@ -35,7 +35,7 @@ def test_server_pending_truth_survives_reload_revert_and_environment_save(applie
     for key, value in {
         "OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_MAX_WORKERS": 19,
         "OUROBOROS_SERVER_HOST": "0.0.0.0", "OUROBOROS_HOST_SERVICE_PORT": 9123,
-        "OUROBOROS_SKILLS_REPO_PATH": "/example/skills",
+        "OUROBOROS_SKILLS_REPO_PATH": "/example/skills", "OUROBOROS_UI_DIR": "none",
     }.items():
         changed = {**saved, key: value}
         monkeypatch.setenv(key, str(value))  # a Save is not application
@@ -49,7 +49,7 @@ def test_missing_component_facts_stay_unknown(applied, monkeypatch):
     saved, _manager = applied
     monkeypatch.setattr(server_process, "_applied_restart_settings", {})
     state = settings._build_restart_state(saved)
-    assert len(state["unknown_keys"]) == 4
+    assert len(state["unknown_keys"]) == 5
     assert "not reported" in state["summary"]
 
 

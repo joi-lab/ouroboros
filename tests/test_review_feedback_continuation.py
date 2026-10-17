@@ -162,7 +162,7 @@ def test_feedback_exposure_uses_the_returned_main_request(tmp_path):
 @pytest.mark.parametrize("enforcement,action", [("advisory", "finish"), ("blocking", "stop")])
 def test_review_launch_floor_returns_unavailability_without_vetoing_author_time(tmp_path, monkeypatch, enforcement, action):
     from ouroboros.loop_acceptance_review import _run_task_acceptance_review_once
-    from tests.test_loop_acceptance_gate import _seed_acceptance_root
+    from tests.test_loop_acceptance_gate import _nominate_acceptance, _seed_acceptance_root
 
     monkeypatch.setattr(loop, "get_task_review_mode", lambda: "required")
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
@@ -171,7 +171,8 @@ def test_review_launch_floor_returns_unavailability_without_vetoing_author_time(
     monkeypatch.setattr(task_pacing, "build_budget_snapshot", lambda *_a, **_kw:
         task_pacing.BudgetSnapshot(has_deadline=True, remaining_sec=150, reserve_sec=120))
     monkeypatch.setattr(loop, "_execute_task_acceptance_panel", lambda *_a, **_kw: pytest.fail("review floor must deny paid dispatch"))
-    trace, messages = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}}]}, []
+    trace, messages = {"tool_calls": []}, []
+    _nominate_acceptance(trace, task_id="author-time", subject="Complete answer")
     def run(text):
         return _run_task_acceptance_review_once(tools=SimpleNamespace(_ctx=ctx), content=text,
             task_id="author-time", task_type="task", llm_trace=trace, drive_root=tmp_path,
@@ -180,9 +181,28 @@ def test_review_launch_floor_returns_unavailability_without_vetoing_author_time(
     assert trace["acceptance_review_outcome"]["reason"] == "review_skipped_deadline_reserve"
     assert not trace.get("review_runs")
     expose_acceptance_feedback(trace, messages, "author-time")
-    trace["tool_calls"].append({"tool": "task_acceptance_review", "args": {}})
-    merge_agent_acceptance_stance(trace, {"disposition": "partial", "rationale": "I inspected the unavailable review outcome.",
-        "author_action": action, "explicit_finish": True}, ctx)
+    assert trace["acceptance_review_outcome"]["feedback_delivered"]
+    # The public completion alias stages the author act; consume the batch just
+    # as the loop does, rather than forging an acceptance decision in the fixture.
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.loop_messages import capture_acceptance_observation
+    from ouroboros.loop_tool_execution import process_tool_results
+    from ouroboros.tools.review import _handle_task_acceptance_review
+    tools = SimpleNamespace(_ctx=ctx)
+    ctx._execution_trace = trace
+    ctx.drive_logs = lambda: tmp_path / "logs"
+    observed = capture_acceptance_observation(ctx, trace)
+    ctx._completion_observation = completion_observation(ctx, trace)
+    args = {"claim": "Corrected current answer", "agent_disposition": "partial",
+            "rationale": "I inspected the unavailable review outcome.", "author_action": action,
+            "acceptance_subject": {"owner_source_sha256": observed["owner_source_sha256"]}}
+    receipt = _handle_task_acceptance_review(ctx, **args)
+    process_tool_results([{"fn_name": "task_acceptance_review", "tool_call_id": "author",
+        "result": receipt, "is_error": False, "args_for_log": args, "tool_args": args,
+        "result_meta": {"status": "ok"}}], messages, trace, emit_progress=lambda *_a, **_kw: None, tools=tools)
+    loop_ctx = SimpleNamespace(tools=tools, task_id=ctx.task_id, root_task_id=ctx.task_id,
+        status_drive_root=tmp_path, drive_root=tmp_path, drive_logs=tmp_path / "logs", messages=messages)
+    assert consume_completion_request(tools, loop_ctx, trace)
     assert run("Corrected current answer") is False
     assert trace["acceptance_decision"]["reason"] == "author_" + action
     assert not trace.get("review_runs")

@@ -59,11 +59,10 @@ def isolated_project_queue(tmp_path, monkeypatch):
         lambda project_id, chat_id: broadcasts.append((project_id, chat_id)),
     )
 
-    def cancel_task(task_id: str, *, cascade: bool = False) -> bool:
+    def cancel_task(task_id: str) -> bool:
         # GR5-5: the deletion cascades lineage ROOTS only, so the fake must
         # tear down the whole subtree the real cascade would (root + every
         # task whose recorded root is the cascaded id).
-        assert cascade is True
         cancelled.append(task_id)
         removed = False
         for task in list(pending):

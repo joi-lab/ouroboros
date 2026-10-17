@@ -1,118 +1,11 @@
 """Recovered first-review and exact-author evidence regressions from the preserved Ouroboros candidate."""
 import copy
 import json
-import threading
 from types import SimpleNamespace
 import pytest
 from tests.test_loop_acceptance_gate import _seed_acceptance_root
-from tests.test_plan_review_engine import harness, _call, _control, _state  # noqa: F401
 
 pytestmark = pytest.mark.serial
-
-def test_plan_first_dispatch_then_author_repeat_keeps_exact_raw_wave(harness, monkeypatch):  # noqa: F811
-    """The plan-first dispatch now returns at the P1-2 barrier (owner batch 2, Q2=A):
-    the fresh envelope hands control back with the wave open and its rows
-    ``pending_dispatch``, the settlement thread writes one mailbox frame, and the
-    identical envelope collects the wave once. Only then does the recovered
-    regression hold: the exact raw wave survives that collection and the author's
-    repeated disposition neither re-sends nor rewrites it.
-    """
-    from ouroboros.tools import plan_review
-    from ouroboros.tools.plan_review_artifacts import read_wave
-    from tests.test_plan_review_event_route import _mailbox_entries, _wait_until
-
-    h = harness
-    h.state["enforcement"] = "advisory"
-    raw = json.dumps([{"id": "f", "class": "blocking", "breaks": "claim_1",
-                       "summary": "Unresolved criterion", "recommendation": "Prove it"}])
-    from tests.test_review_agent_session_route import AccountedFakeLLM
-    from ouroboros.tools import plan_review_runtime
-
-    transport = AccountedFakeLLM(h.drive, reply=raw)
-    release = threading.Event()
-    chat = transport.chat
-
-    def held_chat(**kwargs):
-        assert release.wait(20), "test did not release the physical reviewer calls"
-        return chat(**kwargs)
-
-    monkeypatch.setattr(transport, "chat", held_chat)
-    monkeypatch.setattr(plan_review_runtime, "LLMClient", lambda: transport)
-    ctx = h.make_ctx()
-    try:
-        barrier = _control(_call(ctx))
-        assert barrier == {"outcome": "DEGRADED", "closed": False}
-        open_wave = _state(h)["waves"][-1]
-        # Pin the pre-dispatch phase: a fast real send may otherwise settle a
-        # slot before the barrier snapshot and correctly make the wave paid.
-        assert open_wave["custody_pending"] is True and open_wave["paid"] is False
-        assert {actor["operation_state"] for actor in open_wave["actors"]} == {"pending_dispatch"}
-        assert not transport.calls
-    finally:
-        release.set()
-    assert _wait_until(lambda: len(_mailbox_entries(h.drive, ctx.task_id)) == 1)
-    dispatched = len(transport.calls)
-    first = _control(_call(ctx))  # the identical envelope collects the settled wave
-    assert first["outcome"] == "REVISE_PLAN"
-    assert len(transport.calls) == dispatched  # collected once, no second send
-    wave = _state(h)["waves"][-1]
-    assert wave["request_fingerprint"] == open_wave["request_fingerprint"]
-    assert wave["paid"] and transport.calls
-    fingerprint = wave["request_fingerprint"]
-    request = {"review_fingerprint": fingerprint, "items": [],
-               "author_disposition": {"disposition": "deferred", "rationale": "Keep the verified scope."}}
-    calls = len(transport.calls)
-    for _ in range(2):
-        out = plan_review._handle_plan_task(ctx, review_disposition=request)
-        assert "Author finish" in out
-        assert len(transport.calls) == calls
-    current = _state(h)["waves"][-1]
-    assert not current["closed"] and current["aggregate"] == "REVISE_PLAN"
-    assert current["findings"] == wave["findings"]
-    exact = read_wave(h.drive, ctx.task_id, current["wave_artifact"])
-    assert raw in json.dumps(exact, ensure_ascii=False) or any(
-        row.get("text") == raw or row.get("raw_text") == raw for row in exact.get("reviewer_outputs", [])
-    )
-    assert current["author_disposition"]["subject_hash"] == fingerprint
-
-
-def test_plan_author_cannot_replace_first_dispatch_or_bind_stale_wave(harness):  # noqa: F811
-    from ouroboros.tools import plan_review
-
-    h = harness
-    h.state["enforcement"] = "advisory"
-    transport = h.install({"s1": "", "s2": "", "s3": ""})
-    ctx = h.make_ctx()
-    request = {"review_fingerprint": "a" * 64, "items": [],
-               "author_disposition": {"disposition": "rejected", "rationale": "No repeat."}}
-    assert "UNBINDABLE" in plan_review._handle_plan_task(ctx, review_disposition=request)
-    assert not transport.calls
-    _call(ctx)
-    request["review_fingerprint"] = _state(h)["waves"][-1]["request_fingerprint"]
-    _call(ctx, goal="A different subject")
-    calls = len(transport.calls)
-    assert "STALE" in plan_review._handle_plan_task(ctx, review_disposition=request)
-    assert len(transport.calls) == calls
-
-
-def test_plan_cancellation_preserves_review_without_author_finish(harness):  # noqa: F811
-    from ouroboros.cancel_intents import request_cancel
-    from ouroboros.tools import plan_review
-
-    h = harness
-    h.state["enforcement"] = "advisory"
-    transport = h.install({"s1": "", "s2": "", "s3": ""})
-    ctx = h.make_ctx()
-    _call(ctx)
-    prior = _state(h)["waves"][-1]
-    request_cancel(h.drive, ctx.task_id, source="test", reason="Owner stopped")
-    out = plan_review._handle_plan_task(ctx, review_disposition={
-        "review_fingerprint": prior["request_fingerprint"], "items": [],
-        "author_disposition": {"disposition": "deferred", "rationale": "Stop reviewing"},
-    })
-    assert "cancellation prevents" in out
-    assert _state(h)["waves"][-1] == prior
-    assert len(transport.calls) == 1
 
 
 @pytest.mark.parametrize("case", ["same", "no_first", "stale", "blocking", "post_changed"])
@@ -185,7 +78,9 @@ def actual_acceptance(tmp_path, monkeypatch):
     # a different logical task, not merely a different directory for "task".
     task_id = "task-" + tmp_path.name
     _seed_acceptance_root(tmp_path, task_id, ctx)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "result.txt"}}]}
+    from ouroboros.artifacts import store_task_artifact_bytes
+    store_task_artifact_bytes(tmp_path, task_id, "result.txt", b"Produced result for independent review.")
+    trace = {"tool_calls": []}
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     tools = SimpleNamespace(_ctx=ctx)
     ctx._execution_trace = trace
@@ -334,22 +229,27 @@ def test_task_author_record_preserves_configured_and_effective_authority(actual_
     original = copy.deepcopy(h.host_runs()[-1])
     assert len(h.physical.calls) == 1
     expose_acceptance_feedback(h.trace, inspect.getclosurevars(h.run).nonlocals["messages"], h.ctx.task_id)
-    if explicit or runtime == "pro":
-        h.annotate()
     config.reset_runtime_mode_baseline_for_tests()
     config.initialize_runtime_mode_baseline(runtime)
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     try:
+        if not explicit:
+            # Prose after exposed feedback is not an author finish, Cyber included.
+            # Reuse the reviewed subject so this negative cannot buy a new panel.
+            h.run("Initial answer")
+            assert not h.trace["acceptance_decision"].get("author_disposition")
+            assert h.trace["acceptance_decision"]["reason"] != "author_finish"
+            assert len(h.physical.calls) == len(h.host_runs()) == 1
+        h.annotate()
         h.run("Verified revised answer")
         decision = h.trace["acceptance_decision"]
         assert decision["enforcement"] == enforcement
         assert decision["author_disposition"]["enforcement"] == "advisory"
         assert decision["reason"] == "author_finish"
-        if explicit or runtime == "pro":
-            assert len(h.physical.calls) == len(h.host_runs()) == 1
+        assert len(h.physical.calls) == len(h.host_runs()) == 1
         assert h.host_runs()[0]["actors"] == original["actors"]
-        if not explicit and runtime == "cyber_pro":
-            assert decision["author_disposition"]["source"] == "author_final_response"
+        assert h.host_runs()[0]["paid_identity"] == original["paid_identity"]
+        assert decision["author_disposition"]["source"] != "author_final_response"
         review = {"status": "fail", "acceptance_decision": decision}
         objective = _objective_axis(review)
         row = {"status": "completed", "outcome_axes": {

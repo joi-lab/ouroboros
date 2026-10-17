@@ -81,7 +81,7 @@ def run_ouroboros(prompt: str, sample_id: str = "sample", attachments: list[path
     ]
     # P6: give the agent a VISIBLE deadline STRICTLY tighter than the outer hard kill
     # (GAIA_SAMPLE_TIMEOUT_SEC). The gateway derives deadline_at = now + timeout_sec,
-    # so the agent gets 50/25/10% milestones + a save-at-10% nudge and finalizes before
+    # so the agent gets factual 50/25/10% crossings and local finalization before
     # the SIGKILL backstop. Honest: the visible deadline == the real budget minus a
     # finalization reserve (10%, capped at 240s); the agent is never told a deadline it
     # is killed before reaching. GAIA itself imposes no per-task time limit (the timeout
@@ -151,9 +151,11 @@ def run_ouroboros(prompt: str, sample_id: str = "sample", attachments: list[path
             payload = json.loads(result_json.read_text(encoding="utf-8"))
         except Exception:
             payload = {}
-    answer = payload.get("final_answer") or payload.get("result") or ""
+    # The runtime selects and retains this protocol payload before review.
+    # Narration is never a fallback answer, and this consumer does not trim it.
+    answer = payload.get("final_answer") or ""
     return {
-        "final_answer": str(answer or "").strip(),
+        "final_answer": str(answer),
         "returncode": proc.returncode,
         "result_json": str(result_json),
         # The full runtime task result is already on disk here and was read for the answer

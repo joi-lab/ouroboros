@@ -14,6 +14,7 @@ from types import SimpleNamespace
 
 from ouroboros.gateway.history import make_chat_history_endpoint
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
+from tests._store_shared import seed_result
 
 
 def _run_full(tmp_path, params):
@@ -291,8 +292,10 @@ def test_panel_chat_zero_stays_hidden_and_request_zero_still_means_main(tmp_path
 def test_panel_zero_exclusion_does_not_override_project_task_binding():
     from ouroboros.gateway.history import _make_thread_filter
 
-    project_filter = _make_thread_filter(42, {42}, [], {"root-1": 42})
-    main_filter = _make_thread_filter(1, {42}, [], {"root-1": 42})
+    from tests._room_shared import RoomsFromBindings
+
+    project_filter = _make_thread_filter(42, {42}, [], RoomsFromBindings({"root-1": 42}))
+    main_filter = _make_thread_filter(1, {42}, [], RoomsFromBindings({"root-1": 42}))
 
     row = {"task_id": "root-1"}
     assert project_filter(0, row) is True
@@ -818,9 +821,7 @@ def test_terminal_silent_child_older_than_floor_stays_dropped(tmp_path):
     (logs / "progress.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "donechild.json").write_text(
-        json.dumps({"task_id": "donechild", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "donechild", {"task_id": "donechild", "status": "completed"})
 
     msgs = _run(tmp_path, {"n_progress": "5"})
     lineage = [m for m in msgs if m.get("delegation_role") == "subagent"]
@@ -867,12 +868,8 @@ def test_stale_child_final_loses_raw_lineage_fields(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "root.json").write_text(
-        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
-    )
-    (results / "child.json").write_text(
-        json.dumps({"task_id": "child", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "root", {"task_id": "root", "status": "completed"})
+    seed_result(tmp_path, "child", {"task_id": "child", "status": "completed"})
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child")
     assert row["text"] == "child answer"  # the row itself survives, de-roled
@@ -893,14 +890,12 @@ def test_stale_legacy_child_final_skips_task_result_revival(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "root.json").write_text(
-        json.dumps({"task_id": "root", "status": "completed"}), encoding="utf-8",
-    )
-    (results / "child-legacy.json").write_text(json.dumps({
+    seed_result(tmp_path, "root", {"task_id": "root", "status": "completed"})
+    seed_result(tmp_path, "child-legacy", {
         "task_id": "child-legacy", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "root",
         "root_task_id": "root", "role": "reviewer",
-    }), encoding="utf-8")
+    })
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child-legacy")
     assert not any(field in row for field in SUBAGENT_MESSAGE_FIELDS)
@@ -919,11 +914,11 @@ def test_skill_review_group_never_inherits_legacy_subagent_lineage(tmp_path):
     (logs / "progress.jsonl").write_text("", encoding="utf-8")
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child-1.json").write_text(json.dumps({
+    seed_result(tmp_path, "child-1", {
         "task_id": "child-1", "status": "completed",
         "delegation_role": "subagent", "parent_task_id": "root-1",
         "root_task_id": "root-1", "role": "reviewer",
-    }), encoding="utf-8")
+    })
 
     row = next(m for m in _run(tmp_path, {}) if m.get("review_group"))
     assert row["task_id"] == "child-1"
@@ -970,9 +965,7 @@ def test_recent_child_final_keeps_lineage_fields(tmp_path):
     )
     results = tmp_path / "task_results"
     results.mkdir()
-    (results / "child2.json").write_text(
-        json.dumps({"task_id": "child2", "status": "completed"}), encoding="utf-8",
-    )
+    seed_result(tmp_path, "child2", {"task_id": "child2", "status": "completed"})
 
     row = next(m for m in _run(tmp_path, {}) if m.get("task_id") == "child2")
     assert row["delegation_role"] == "subagent"

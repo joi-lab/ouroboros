@@ -198,9 +198,11 @@ class TestOrphanCaptureRead:
         assert "outside selected root=artifact_store" in out, out
         custody._CUSTODY.clear()
 
-    def test_a_shared_snapshot_costs_zero_extra_replays(self, tmp_path, monkeypatch):
+    def test_a_shared_snapshot_costs_zero_extra_reads(self, tmp_path, monkeypatch):
         """R19: the resolver reads the SHARED custody snapshot when it has one,
-        and replays exactly once (never twice) when it does not."""
+        and reads the owner task's rows exactly once (never twice, never every
+        row) when it does not."""
+        from ouroboros import delegate_custody_current as current
         from ouroboros.delegate_shared import orphan_capture_read_target
         from ouroboros.delegate_terminal import custody_audit_snapshot
 
@@ -209,25 +211,27 @@ class TestOrphanCaptureRead:
         drive = custody.custody_root(ctx)
         snapshot = custody_audit_snapshot(drive)
 
-        real_replay, calls = custody.replay, []
+        real_replay, real_runs, calls, replays = custody.replay, current.runs, [], []
 
-        def _counting_replay(*args, **kwargs):
-            calls.append(1)
-            return real_replay(*args, **kwargs)
+        def _counting_runs(*args, **kwargs):
+            calls.append(args[1:])
+            return real_runs(*args, **kwargs)
 
-        monkeypatch.setattr(custody, "replay", _counting_replay)
+        monkeypatch.setattr(current, "runs", _counting_runs)
+        monkeypatch.setattr(custody, "replay", lambda *a, **k: replays.append(1) or real_replay(*a, **k))
         custody._CUSTODY.clear()
         assert orphan_capture_read_target(
             reader, block["patch_artifact"], snapshot=snapshot) is not None
-        assert calls == [], f"a shared snapshot must not replay: {len(calls)}"
+        assert calls == [], f"a shared snapshot must not read: {len(calls)}"
 
         custody._CUSTODY.clear()
         assert orphan_capture_read_target(reader, block["patch_artifact"]) is not None
-        assert len(calls) == 1, f"one replay without a snapshot, got {len(calls)}"
+        assert calls == [("task_id=?", ("t-nanny",))], f"one owner read without a snapshot, got {calls}"
 
         custody._CUSTODY.clear()
         assert orphan_capture_read_target(reader, target / "tracked.txt") is None
-        assert len(calls) == 1, "a non-capture path must not replay at all"
+        assert len(calls) == 1, "a non-capture path must not read at all"
+        assert replays == [], "no path replays every row"
         custody._CUSTODY.clear()
 
 

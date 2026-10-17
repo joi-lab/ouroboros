@@ -6,6 +6,7 @@ What is pinned, on fake process objects (no child is ever forked here):
 * respawn installs its fresh slot the same way, through the same seam, carrying its attempt count;
 * the seam opens a slot only on the child's OWN ``worker_ready`` row (matched by pid); its checkout
   SHA comparison is diagnostic and never changes admission; a foreign pid's row does not open it;
+* which process a row names (births, else the pid): tests/test_worker_readiness_identity.py;
 * no ``worker_ready`` inside the window -> the child is torn down (process tree), the slot is
   replaced through ``respawn_worker`` and a typed ``worker_ready_timeout`` row names slot, pid,
   wait and reason; its own entry progress permits one extension to the birth-relative ceiling;
@@ -15,9 +16,9 @@ What is pinned, on fake process objects (no child is ever forked here):
 * the event reader treats a missing ``events.jsonl`` as an EMPTY read (not written yet at spawn,
   the rotator's rename->touch instant, removed by hand): the watcher keeps polling and the row is
   found on whichever side of a rotation it landed;
-* the watcher's own failure is never a parked wave: an exception inside it (the reader, ``load_state``,
-  a teardown) releases every slot of the wave still booting with a typed ``worker_ready_released``
-  row (``reason=watcher_error``), degrading to the crash detector's ownership;
+* watcher failure records ``worker_ready_watcher_error`` and uses bounded replace/park;
+  unknown teardown keeps the reservation and its attempt for the reaper, never opening a
+  live unready actor; the reaper continues the same count once it observes the death;
 * the assignment path is unchanged for a ready slot: ``assign_tasks`` skips a booting slot and
   dispatches to the open one, and a slot the seam opened is dispatched to like any other.
 
@@ -74,14 +75,21 @@ def _rows(path, event_type: str) -> list:
 @pytest.fixture
 def pool(monkeypatch, tmp_path):
     """The pool facade rebound to a throwaway root with no live workers."""
-    from supervisor import worker_pool_lifecycle as lifecycle
-    from supervisor import workers
+    import queue as stdqueue
 
+    from supervisor import queue, task_reaper, workers
+    from supervisor import worker_pool_lifecycle as lifecycle
+
+    # Unconfirmed teardown hands a job to the reaper: keep it in this test, never a live thread.
+    monkeypatch.setattr(queue, "_reap_queue", stdqueue.Queue())
+    monkeypatch.setattr(queue, "_ensure_reaper_started", lambda: None)
+    monkeypatch.setattr(task_reaper, "_deferred_reap_jobs", [])
     monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
     monkeypatch.setattr(workers, "REPO_DIR", tmp_path)
     monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "_WORKER_POOL_DISABLED_REASON", "")
     monkeypatch.setattr(workers, "load_state", lambda: {"current_sha": "abc123", "owner_chat_id": 0})
-    monkeypatch.setattr(workers, "_record_worker_pids", lambda: None)
+    monkeypatch.setattr(workers, "_record_worker_processes", lambda: None)
     # A prior TestClient lifespan in the same xdist worker leaves the process-lifetime
     # event bus latched (server shutdown calls shutdown_event_q()); these tests pin the
     # readiness seam, never the bus, so the latch is isolated here — the precedent of
@@ -103,7 +111,10 @@ def _wait_for(predicate, timeout: float = 5.0):
 # (a) spawn and (b) respawn both install booting slots through the one seam
 # ---------------------------------------------------------------------------
 
-def test_spawn_installs_every_slot_booting_and_hands_the_set_to_the_readiness_seam(pool, monkeypatch):
+@pytest.mark.parametrize("cap", [1, 3, 10])
+@pytest.mark.parametrize("count", [None, 0, 2])
+@pytest.mark.parametrize("start", ["spawn_workers", "ensure_worker_pool_started"])
+def test_spawn_installs_every_slot_booting_and_hands_the_set_to_the_readiness_seam(pool, monkeypatch, cap, count, start):
     workers = pool.workers
     fake_ctx = MagicMock()
     fake_ctx.Queue.return_value = object()
@@ -119,20 +130,22 @@ def test_spawn_installs_every_slot_booting_and_hands_the_set_to_the_readiness_se
     monkeypatch.setattr(workers.mp, "get_context", lambda _method: fake_ctx)
     monkeypatch.setattr(workers, "get_event_q", lambda: object())   # the seam, not the bus
     monkeypatch.setattr(workers, "_EVENT_Q_GENERATION", "test-generation")
-    monkeypatch.setattr(workers, "reap_orphaned_workers", lambda: 0)
     handed = []
     monkeypatch.setattr(
         workers, "_verify_worker_sha_after_spawn",
         lambda slots, cursor, *rest: handed.append((dict(slots), cursor, rest)),
     )
 
-    workers.spawn_workers(2)
+    monkeypatch.setattr(workers, "MAX_WORKERS", cap)
+    launch = getattr(workers, start)
+    launch() if count is None else launch(count)
 
-    assert sorted(workers.WORKERS) == [0, 1]
+    assert sorted(workers.WORKERS) == list(range(count or 1))
+    assert workers.MAX_WORKERS == cap
     assert all(slot.reaping for slot in workers.WORKERS.values()), "a fresh slot must not be assignable"
     assert _wait_for(lambda: bool(handed))
     slots, cursor, rest = handed[0]
-    assert slots == {0: workers.WORKERS[0], 1: workers.WORKERS[1]}
+    assert slots == workers.WORKERS
     assert isinstance(cursor, tuple) and len(cursor) == 3
     attempt, spawned_at = rest
     assert attempt == 1 and 0 < spawned_at <= time.time()  # the window counts from the child's birth
@@ -140,7 +153,7 @@ def test_spawn_installs_every_slot_booting_and_hands_the_set_to_the_readiness_se
 
 def test_respawn_installs_the_fresh_slot_booting_through_the_same_seam_with_its_attempt(pool, monkeypatch):
     workers = pool.workers
-    old = workers.Worker(wid=3, proc=_FakeProc(111, alive=False), in_q=MagicMock(), busy_task_id=None, reaping=True)
+    old = workers.Worker(wid=3, proc=_FakeProc(111, alive=False), in_q=MagicMock(), busy_task_id=None, reaping=True, process_birth="test-birth")
     workers.WORKERS[3] = old
     fake_ctx = MagicMock()
     fake_ctx.Queue.return_value = MagicMock()
@@ -181,7 +194,12 @@ def seam(pool, monkeypatch, request):
 
     killed, respawned, sent = [], [], []
     monkeypatch.setattr(lifecycle, "WORKER_READY_WINDOW_SEC", 0.3)
-    monkeypatch.setattr(platform_layer, "kill_pid_tree", lambda pid, **_k: killed.append(pid))
+    def kill(pid, **_k):
+        killed.append(pid)
+        for slot in pool.workers.WORKERS.values():
+            if slot.proc.pid == pid:
+                slot.proc._alive = False
+    monkeypatch.setattr(platform_layer, "kill_pid_tree", kill)
     monkeypatch.setattr(lifecycle, "respawn_worker", lambda wid, **kw: respawned.append((wid, kw)))
     monkeypatch.setattr(pool.workers, "send_with_budget", lambda chat_id, text, **_k: sent.append((chat_id, text)))
     events = pool.root / "logs" / "events.jsonl"
@@ -196,14 +214,14 @@ def seam(pool, monkeypatch, request):
 
 
 def _booting_slot(pool, wid: int, pid: int, **proc_kwargs):
-    slot = pool.workers.Worker(wid=wid, proc=_FakeProc(pid, **proc_kwargs), in_q=MagicMock(), busy_task_id=None, reaping=True)
+    slot = pool.workers.Worker(wid=wid, proc=_FakeProc(pid, **proc_kwargs), in_q=MagicMock(), busy_task_id=None, reaping=True, booting=True, process_birth="test-birth")
     pool.workers.WORKERS[wid] = slot
     return slot
 
 
 def test_the_slot_opens_only_on_its_own_worker_ready_row_and_verifies_the_sha(pool, seam):
     slot = _booting_slot(pool, 0, 5001)
-    append_jsonl(seam.events, {"type": "worker_ready", "worker_id": 0, "pid": 5001, "git_sha": "abc123"})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "worker_id": 0, "pid": 5001, "git_sha": "abc123"})
 
     seam.run({0: slot}, seam.cursor, 1)
 
@@ -217,9 +235,10 @@ def test_the_slot_opens_only_on_its_own_worker_ready_row_and_verifies_the_sha(po
     assert _rows(seam.supervisor, "worker_ready_timeout") == []
 
 
-def test_a_foreign_pid_row_does_not_open_the_slot(pool, seam):
+@pytest.mark.parametrize("pid,birth", [(4999, "test-birth"), (5001, "old-birth")])
+def test_a_foreign_pid_or_late_old_birth_row_does_not_open_the_slot(pool, seam, pid, birth):
     slot = _booting_slot(pool, 0, 5001)
-    append_jsonl(seam.events, {"type": "worker_ready", "worker_id": 0, "pid": 4999, "git_sha": "abc123"})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": birth, "worker_id": 0, "pid": pid, "git_sha": "abc123"})
 
     seam.run({0: slot}, seam.cursor, 1)
 
@@ -373,7 +392,7 @@ def test_checkout_relation_is_a_fact_not_a_worker_admission_gate(
     update_state = MagicMock()
     monkeypatch.setattr(supervisor_state, "update_state", update_state)
     slot = _booting_slot(pool, 0, 5001)
-    append_jsonl(seam.events, {"type": "worker_ready", "worker_id": 0, "pid": 5001,
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "worker_id": 0, "pid": 5001,
                               "git_sha": observed_sha})
     real_run, queries = subprocess.run, []
 
@@ -417,7 +436,7 @@ def test_shallow_history_keeps_proven_ancestry_but_cannot_prove_non_ancestry(poo
     (pool.root / ".git" / "shallow").write_text(sha_history[boundary] + "\n", encoding="utf-8")
     monkeypatch.setattr(pool.workers, "load_state", lambda: {"current_sha": baseline, "owner_chat_id": 7})
     slot = _booting_slot(pool, 0, 5001)
-    append_jsonl(seam.events, {"type": "worker_ready", "pid": 5001, "git_sha": descendant})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "pid": 5001, "git_sha": descendant})
 
     seam.run({0: slot}, seam.cursor, 1)
 
@@ -435,7 +454,7 @@ def test_shallow_history_keeps_proven_ancestry_but_cannot_prove_non_ancestry(poo
 def test_checkout_lookup_failure_is_unavailable_without_holding_ready_capacity(pool, seam, monkeypatch, error):
     monkeypatch.setattr(pool.workers, "load_state", lambda: {"current_sha": "a" * 40, "owner_chat_id": 7})
     slot = _booting_slot(pool, 0, 5001)
-    append_jsonl(seam.events, {"type": "worker_ready", "pid": 5001, "git_sha": "b" * 40})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "pid": 5001, "git_sha": "b" * 40})
     query = MagicMock(side_effect=error)
     monkeypatch.setattr(pool.lifecycle.subprocess, "run", query)
 
@@ -520,7 +539,7 @@ def test_a_child_that_died_during_boot_is_released_to_the_crash_detector(pool, s
 
 
 def test_a_slot_the_pool_already_replaced_is_left_alone(pool, seam):
-    stale = pool.workers.Worker(wid=0, proc=_FakeProc(5004), in_q=MagicMock(), busy_task_id=None, reaping=True)
+    stale = pool.workers.Worker(wid=0, proc=_FakeProc(5004), in_q=MagicMock(), busy_task_id=None, reaping=True, process_birth="test-birth")
     _booting_slot(pool, 0, 5005)  # the pool restarted under the seam: slot 0 is a different object now
 
     seam.run({0: stale}, seam.cursor, 1)
@@ -529,7 +548,8 @@ def test_a_slot_the_pool_already_replaced_is_left_alone(pool, seam):
     assert _rows(seam.supervisor, "worker_ready_timeout") == []
 
 
-def test_a_generation_change_cannot_interleave_with_the_watcher_s_teardown_and_respawn(pool, monkeypatch):
+def test_a_generation_change_during_the_watcher_s_native_teardown_never_lets_its_respawn_evict_the_fresh_slot(
+        pool, monkeypatch):
     """rc.15 review MAJOR 2: ``_replace_unready_slot`` checked the slot's identity,
     dropped the queue lock, tore the child down and only then called
     ``respawn_worker(wid)``. A pool generation change in that gap
@@ -539,19 +559,21 @@ def test_a_generation_change_cannot_interleave_with_the_watcher_s_teardown_and_r
     terminating its process — a worker gone from WORKERS, its live child an
     orphan (the parent-sentinel lifeline does not fire: the server is alive).
 
-    The teardown and the respawn now run under the ONE lifecycle lock every
-    generation change takes (lifecycle -> queue order kept; the RLock lets the
-    nested respawn re-enter), so the change WAITS for the watcher and the
-    watcher never sees the fresh slot: the real ``respawn_worker`` on a fake
-    context, the watcher held inside its teardown while the generation change
-    is attempted through the same serializer."""
+    The respawn runs under the ONE lifecycle lock every generation change takes
+    (lifecycle -> queue order kept; the RLock lets the nested respawn re-enter),
+    after re-validating the slot's identity. The native teardown itself holds no
+    lifecycle lock (owner 14 Oct 21:09 #4: the lock guards membership, never a
+    kill or join), so the change may run while the watcher kills, and the
+    watcher then finds the fresh slot and leaves it alone: the real
+    ``respawn_worker`` on a fake context, the watcher held inside its teardown
+    while the generation change runs through the same serializer."""
     import threading
 
     import ouroboros.platform_layer as platform_layer
 
     lifecycle, workers = pool.lifecycle, pool.workers
     stale = _booting_slot(pool, 2, 5020)
-    fresh = workers.Worker(wid=2, proc=_FakeProc(5021), in_q=MagicMock(), busy_task_id=None, reaping=True)
+    fresh = workers.Worker(wid=2, proc=_FakeProc(5021), in_q=MagicMock(), busy_task_id=None, reaping=True, process_birth="test-birth")
     fake_ctx = MagicMock()
     fake_ctx.Queue.return_value = MagicMock()
     fake_ctx.Process.side_effect = lambda *_a, **_k: _FakeProc(5022)
@@ -564,6 +586,7 @@ def test_a_generation_change_cannot_interleave_with_the_watcher_s_teardown_and_r
         killed.append(pid)
         in_teardown.set()
         assert release.wait(10), "the test never released the watcher"
+        stale.proc._alive = False  # the stop lands: the watcher reaches its replace step
 
     monkeypatch.setattr(platform_layer, "kill_pid_tree", _kill)
     watcher = threading.Thread(
@@ -592,14 +615,15 @@ def test_a_generation_change_cannot_interleave_with_the_watcher_s_teardown_and_r
     assert workers.WORKERS[2] is fresh, "the fresh generation's live slot was evicted by the stale watcher"
     fresh.in_q.close.assert_not_called()
     assert killed == [5020], "only the stale child is torn down; the fresh one is never touched"
-    assert not interleaved, "the generation change ran inside the watcher's check/teardown/respawn window"
+    assert interleaved, "the generation change waited behind the watcher's native kill"
+    fake_ctx.Process.assert_not_called()  # the stale watcher re-validated and started nothing
 
 
 def test_the_first_event_reader_keeps_its_contract_over_the_list_reader(pool, seam):
     lifecycle = pool.lifecycle
-    append_jsonl(seam.events, {"type": "worker_ready", "pid": 1})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "pid": 1})
     append_jsonl(seam.events, {"type": "worker_boot", "pid": 2})
-    append_jsonl(seam.events, {"type": "worker_ready", "pid": 3})
+    append_jsonl(seam.events, {"type": "worker_ready", "process_birth": "test-birth", "pid": 3})
     assert [row["pid"] for row in lifecycle._worker_events_since(seam.cursor, "worker_ready")] == [1, 3]
     assert lifecycle._first_worker_event_since(seam.cursor, "worker_ready")["pid"] == 1
     assert lifecycle._first_worker_event_since(seam.cursor)["pid"] == 2
@@ -610,7 +634,7 @@ def test_the_first_event_reader_keeps_its_contract_over_the_list_reader(pool, se
 # (c) a missing log is an empty read; a rotation gap loses no row; the watcher never wedges
 # ---------------------------------------------------------------------------
 
-_READY_ROW = {"type": "worker_ready", "worker_id": 0, "pid": 5001, "git_sha": "abc123"}
+_READY_ROW = {"type": "worker_ready", "process_birth": "test-birth", "worker_id": 0, "pid": 5001, "git_sha": "abc123"}
 
 
 def _counting_reader(lifecycle, monkeypatch, before_poll):
@@ -686,8 +710,8 @@ def test_a_rotation_gap_during_polling_is_an_empty_read_and_the_row_is_found_on_
         "the pre-cursor noise row is in the rotated segment and stays excluded: the offset is honoured there"
 
 
-@pytest.mark.parametrize("failing", ["_worker_events_since", "load_state", "kill_pid_tree"])
-def test_a_watcher_failure_releases_the_whole_wave_to_the_crash_detector_with_a_typed_row(
+@pytest.mark.parametrize("failing", ["_worker_events_since", "load_state"])
+def test_a_watcher_failure_uses_bounded_recovery_without_opening_unready_slots(
     pool, seam, monkeypatch, caplog, failing,
 ):
     lifecycle = pool.lifecycle
@@ -697,10 +721,6 @@ def test_a_watcher_failure_releases_the_whole_wave_to_the_crash_detector_with_a_
 
     if failing == "load_state":
         monkeypatch.setattr(pool.workers, "load_state", boom)
-    elif failing == "kill_pid_tree":  # the end-of-window teardown itself raises
-        import ouroboros.platform_layer as platform_layer
-
-        monkeypatch.setattr(platform_layer, "kill_pid_tree", boom)
     else:
         monkeypatch.setattr(lifecycle, failing, boom)
     first, second = _booting_slot(pool, 0, 5001), _booting_slot(pool, 1, 5002)
@@ -708,25 +728,115 @@ def test_a_watcher_failure_releases_the_whole_wave_to_the_crash_detector_with_a_
     with caplog.at_level(logging.ERROR, logger="supervisor.worker_pool_lifecycle"):
         seam.run({0: first, 1: second}, seam.cursor, 1)  # the seam itself never raises
 
-    assert first.reaping is False and second.reaping is False, "released: the crash detector owns them now"
-    assert seam.respawned == [], "no respawn: nothing about the children is known"
-    rows = _rows(seam.supervisor, "worker_ready_released")
-    assert [(r["worker_id"], r["pid"], r["reason"], r["error_type"], r["attempt"], r["slot_released"]) for r in rows] == [
-        (0, 5001, "watcher_error", "RuntimeError", 1, True),
-        (1, 5002, "watcher_error", "RuntimeError", 1, True),
-    ]
-    assert all("events log unreadable" in r["error"] and r["waited_sec"] >= 0 for r in rows)
-    assert any(rec.levelno == logging.ERROR and rec.exc_info for rec in caplog.records), "logged with the traceback"
-    if failing == "kill_pid_tree":
-        assert [r["worker_id"] for r in _rows(seam.supervisor, "worker_ready_timeout")] == [0], "the timeout row precedes the raise"
-    else:
-        assert _rows(seam.supervisor, "worker_ready_timeout") == []
+    assert first.reaping and second.reaping
+    assert first.ready_identity is None and second.ready_identity is None
+    rows = _rows(seam.supervisor, "worker_ready_watcher_error")
+    assert [r["worker_id"] for r in rows] == [0, 1]
+    assert seam.respawned == [(0, {"ready_attempt": 2}), (1, {"ready_attempt": 2})]
+    assert any(rec.levelno == logging.ERROR and rec.exc_info for rec in caplog.records)
 
 
-def test_a_watcher_failure_after_one_slot_opened_releases_only_the_slots_still_booting(pool, seam, monkeypatch):
+class _ReaperStop(BaseException):
+    """Ends one bounded drain of the real reaper loop (it catches Exception only)."""
+
+
+def _drain_real_reaper(monkeypatch, jobs):
+    """Run the real ``reaper_loop`` dispatch and deferral over exactly these jobs."""
+    from supervisor import task_reaper
+
+    pending = list(jobs)
+
+    def get():
+        if not pending:
+            raise _ReaperStop()
+        return pending.pop(0)
+
+    monkeypatch.setattr(task_reaper, "reap_queue", SimpleNamespace(get=get, task_done=lambda: None))
+    with pytest.raises(_ReaperStop):
+        task_reaper.reaper_loop()
+
+
+def _queued(pool_queue):
+    jobs = []
+    while not pool_queue.empty():
+        jobs.append(pool_queue.get_nowait())
+    return jobs
+
+
+@pytest.mark.parametrize("cause", ["child_survives_kill", "kill_raises", "watcher_error"])
+def test_unconfirmed_teardown_keeps_the_attempt_until_the_reaper_observes_death(pool, seam, monkeypatch, cause):
+    """Reviewer counterexample: attempt 1 was marked exhausted, and its later death was never seen."""
+    import ouroboros.platform_layer as platform_layer
+    from supervisor import queue, task_reaper
+
+    lifecycle, workers = pool.lifecycle, pool.workers
+    monkeypatch.setattr(lifecycle, "WORKER_READY_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(workers, "RUNNING", {})  # health and its retry read only this pool
+    kills = []
+
+    def kill(pid, **_kwargs):
+        kills.append(pid)
+        if cause != "child_survives_kill":
+            raise RuntimeError("process tree unreadable")
+
+    monkeypatch.setattr(platform_layer, "kill_pid_tree", kill)
+    if cause == "watcher_error":
+        monkeypatch.setattr(lifecycle, "_worker_events_since", lambda *_a: (_ for _ in ()).throw(OSError("log")))
+    slot = _booting_slot(pool, 0, 5001)
+
+    seam.run({0: slot}, seam.cursor, 1)
+
+    assert workers.WORKERS[0] is slot and slot.active_capacity, "the unknown stop stays charged"
+    assert slot.reaping and not slot.booting and not slot.readiness_exhausted
+    assert not lifecycle.worker_ready(slot) and seam.respawned == []
+    job, = _queued(queue._reap_queue)
+    assert (job["kind"], job["worker"], job["attempt"]) == ("unready_worker_teardown", slot, 1)
+    assert [row["attempt"] for row in _rows(seam.supervisor, "worker_ready_timeout")] == [1]
+    # Alive: the real reaper retains the job for the next health tick, and health sees no crash.
+    _drain_real_reaper(monkeypatch, [job])
+    assert task_reaper._deferred_reap_jobs == [job] and seam.respawned == []
+    assert workers._ensure_workers_healthy_locked(queue) == ([], False) and queue._reap_queue.empty()
+    slot.proc._alive = False  # the stop lands later
+    assert workers._ensure_workers_healthy_locked(queue) == ([], False) and queue._reap_queue.empty()
+    assert _rows(seam.supervisor, "worker_dead_detected") == [], "an intended teardown is never a crash"
+    task_reaper.retry_terminal_file_recoveries()  # the ordinary health tick re-submits it
+    _drain_real_reaper(monkeypatch, _queued(queue._reap_queue))
+    assert seam.respawned == [(0, {"ready_attempt": 2})], "the same count continues, never reset to 1"
+    assert task_reaper._deferred_reap_jobs == [] and not slot.readiness_exhausted
+    assert kills == [5001, 5001], "the watcher and one live reaper pass kill; an observed death is not re-killed"
+
+
+def test_unconfirmed_final_attempt_parks_only_once_its_death_is_observed(pool, seam, monkeypatch):
+    import ouroboros.platform_layer as platform_layer
+    from supervisor import queue
+    from supervisor.task_reaper import TerminalFileRecoveryPending
+
+    lifecycle, workers = pool.lifecycle, pool.workers
+    disabled = []
+    monkeypatch.setattr(workers, "disable_exhausted_worker_pool", lambda: disabled.append(True))
+    monkeypatch.setattr(lifecycle, "WORKER_READY_MAX_ATTEMPTS", 2)
+    monkeypatch.setattr(workers, "load_state", lambda: {"current_sha": "abc123", "owner_chat_id": 7})
+    monkeypatch.setattr(platform_layer, "kill_pid_tree", lambda pid, **_k: seam.killed.append(pid))
+    slot = _booting_slot(pool, 1, 5012)
+
+    seam.run({1: slot}, seam.cursor, 2)
+
+    job, = _queued(queue._reap_queue)
+    assert job["attempt"] == 2 and not slot.readiness_exhausted and not seam.sent and not disabled
+    with pytest.raises(TerminalFileRecoveryPending):
+        lifecycle.finish_unready_teardown(job)
+    slot.proc._alive = False
+    lifecycle.finish_unready_teardown(job)
+    assert slot.readiness_exhausted and slot.reaping and workers.WORKERS[1] is slot
+    assert seam.respawned == [] and disabled == [True]
+    assert seam.sent and seam.sent[0][0] == 7 and "slot 1" in seam.sent[0][1] and "parked" in seam.sent[0][1]
+    assert [row["action"] for row in _rows(seam.supervisor, "worker_ready_timeout")] == ["parked"]
+
+
+def test_a_watcher_failure_recovers_only_current_slots_still_booting(pool, seam, monkeypatch):
     lifecycle = pool.lifecycle
     opened, booting = _booting_slot(pool, 0, 5001), _booting_slot(pool, 1, 5002)
-    replaced = pool.workers.Worker(wid=2, proc=_FakeProc(5003), in_q=MagicMock(), busy_task_id=None, reaping=True)
+    replaced = pool.workers.Worker(wid=2, proc=_FakeProc(5003), in_q=MagicMock(), busy_task_id=None, reaping=True, process_birth="test-birth")
     _booting_slot(pool, 2, 5004)  # the pool replaced slot 2 under the watcher
     append_jsonl(seam.events, _READY_ROW)
 
@@ -737,11 +847,11 @@ def test_a_watcher_failure_after_one_slot_opened_releases_only_the_slots_still_b
     _counting_reader(lifecycle, monkeypatch, before_poll)
     seam.run({0: opened, 1: booting, 2: replaced}, seam.cursor, 1)
 
-    assert opened.reaping is False and booting.reaping is False
+    assert opened.reaping is False and booting.reaping is True
     assert replaced.reaping is True and pool.workers.WORKERS[2].reaping is True, "a slot no longer ours is left alone"
     assert [r["worker_id"] for r in _rows(seam.supervisor, "worker_sha_verify")] == [0]
-    rows = _rows(seam.supervisor, "worker_ready_released")
-    assert [(r["worker_id"], r["error_type"], r["slot_released"]) for r in rows] == [(1, "OSError", True), (2, "OSError", False)]
+    assert seam.respawned == [(1, {"ready_attempt": 2})]
+    assert seam.killed == [5002]
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +876,9 @@ def test_assignment_skips_a_booting_slot_and_dispatches_to_an_open_one_unchanged
     sent = {0: [], 1: []}
     booting = SimpleNamespace(wid=0, busy_task_id=None, reaping=True, in_q=SimpleNamespace(put=lambda t: sent[0].append(dict(t))))
     ready = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=SimpleNamespace(put=lambda t: sent[1].append(dict(t))))
+    from tests.worker_pool_support import affirm_ready
+    affirm_ready(booting)
+    affirm_ready(ready)
     workers.WORKERS[0] = booting
     workers.WORKERS[1] = ready
     workers.PENDING.append({"id": "first", "type": "task", "chat_id": 0, "priority": 1})
@@ -811,6 +924,8 @@ def test_assignment_mirrors_the_running_status_for_a_root_not_only_a_subagent(tm
                       chat_id=4, expected_output="one paragraph")
     workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
                                          in_q=SimpleNamespace(put=lambda _t: None))
+    from tests.worker_pool_support import affirm_ready
+    affirm_ready(workers.WORKERS[0])
     workers.PENDING.append({
         "id": "root-1", "type": "task", "chat_id": 4, "priority": 1,
         "delegation_role": "root", "root_task_id": "root-1", "drive_root": str(tmp_path),

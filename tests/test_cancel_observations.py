@@ -13,11 +13,12 @@ from ouroboros import cancel_intents, delegate_custody
 from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.task_status import observe_cancellation_target
 from ouroboros.tools.join_ledger import _cancel_task
-from ouroboros.utils import atomic_write_json, utc_now_iso
+from ouroboros.utils import utc_now_iso
+from tests._shared import write_queue_document
 
 
 def _queue(root, task_id, *, stale=False):
-    atomic_write_json(root / "state" / "queue_snapshot.json", {
+    write_queue_document(root / "state" / "queue_snapshot.json", {
         "ts": "2000-01-01T00:00:00Z" if stale else utc_now_iso(),
         "running": [{"id": task_id}], "pending": [],
     })
@@ -120,7 +121,7 @@ def test_agent_cancel_of_a_foreign_task_records_origin_without_a_parent_decision
 
 def test_completed_child_keeps_its_result(tmp_path):
     write_task_result(tmp_path, "child", "completed", parent_task_id="parent", root_task_id="parent", delegation_role="subagent", result="finished work")
-    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {"ts": utc_now_iso(), "running": [], "pending": []})
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {"ts": utc_now_iso(), "running": [], "pending": []})
     response = _cancel_task(_caller(tmp_path), "child", "unneeded")
     assert response.startswith("Nothing to cancel:")
     assert cancel_intents.active_intent(tmp_path, "child") is None
@@ -135,10 +136,10 @@ def test_http_observation_records_transport_without_inventing_owner_identity(tmp
     write_task_result(tmp_path, "task", "running")
     _queue(tmp_path, "task")
     monkeypatch.setattr(task_queue, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(task_queue, "task_has_live_ownership", lambda task_id: True)
-    monkeypatch.setattr(task_queue, "task_subtree_is_live", lambda task_id: True)
-    monkeypatch.setattr(task_queue, "cancel_task_custody", lambda task_id: task_queue.CANCEL_CANCELLED)
-    monkeypatch.setattr(tasks, "_run_cascade_cancel", lambda task_id: True)
+    # A running row is recorded with no liveness probe; the teardown owners are
+    # stubbed so the recorded intent stays readable after the 200.
+    monkeypatch.setattr(task_queue, "cancel_task_custody", lambda task_id, **_kw: task_queue.CANCEL_CANCELLED)
+    monkeypatch.setattr(task_queue, "cancel_task_by_id", lambda task_id, **_kw: True)
     monkeypatch.setattr("ouroboros.delegate_evidence.task_execution_evidence", lambda *_a: pytest.fail("HTTP must not scan delegated descendants"))
     app = Starlette(routes=[Route("/api/tasks/{task_id}/cancel", tasks.api_task_cancel, methods=["POST"])])
     app.state.drive_root = tmp_path

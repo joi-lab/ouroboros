@@ -420,24 +420,20 @@ def _ci_job_block(job: str) -> str:
     return block.group(1)
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
 def test_each_ci_job_runs_the_node_suite_the_gate_runs(job):
-    """Both CI jobs carry the exact suite the gate runs, derived from the
-    module's own WEB_DIR/TESTS_GLOB constants so the three surfaces (gate, CI,
-    web/package.json) cannot drift apart silently."""
+    """Both CI jobs run the gate's own Node lane (`candidate_node_tests` over the
+    module's WEB_DIR/TESTS_GLOB) through the owned runner, so the three surfaces
+    (gate, CI, web/package.json) cannot drift apart silently."""
     block = _ci_job_block(job)
-    expected = f"run: cd {pn.WEB_DIR} && node --test {pn.TESTS_GLOB}"
-    assert block.count(expected) == 1, f"{job} does not run the gate's node suite exactly once"
-    # The Windows runner in full-test needs bash for the glob; keep the step
-    # byte-identical in both jobs so parity stays trivially checkable.
-    assert "shell: bash" in block.split(expected)[0].rsplit("- name:", 1)[-1]
+    assert block.count(_NODE_STEP) == 1, f"{job} does not run the gate's node suite exactly once"
     # ...and the job declares the provisioning contract, so a node regression
     # there is a loud failure instead of silent real-spawn skips.
     assert f'{_REQUIRE_NODE_ENV}: "1"' in block
 
 
 def test_full_test_provisions_node_pinned_by_sha():
-    block = _ci_job_block("full-test")
+    block = _ci_job_block("full-test-runs")
     setup = re.search(r"uses: actions/setup-node@([0-9a-f]{40})", block)
     assert setup, "full-test must provision node via a SHA-pinned actions/setup-node"
     assert "node-version: '22'" in block
@@ -456,15 +452,15 @@ def test_package_json_script_matches_the_gate_glob():
 # frozen install, the exact versions, and the one-rule config.
 
 _ESLINT_STEP = "run: cd web && npm ci --no-audit --no-fund && npm run lint:undef"
+_NODE_STEP = "run: python scripts/run_tests.py --node"
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
 def test_each_ci_job_runs_the_eslint_second_layer_after_the_node_suite(job):
     block = _ci_job_block(job)
-    node_suite = f"run: cd {pn.WEB_DIR} && node --test {pn.TESTS_GLOB}"
     assert block.count(_ESLINT_STEP) == 1, f"{job} does not run the ESLint no-undef layer exactly once"
     # A second layer is only a second opinion when the first still runs.
-    assert block.index(node_suite) < block.index(_ESLINT_STEP), (
+    assert block.index(_NODE_STEP) < block.index(_ESLINT_STEP), (
         f"{job} runs ESLint before (or instead of) the gate's node suite"
     )
     # Windows runner in full-test: bash for the `cd web && ...` chain, same as the node step.

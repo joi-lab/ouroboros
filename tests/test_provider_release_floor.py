@@ -59,11 +59,17 @@ def test_the_synthetic_reports_cover_the_live_matrix():
 
 
 @pytest.mark.parametrize("enforce", [True, False])
-def test_every_required_canary_passed_meets_the_floor_whatever_the_optional_ones_did(tmp_path, capsys, enforce):
-    code, out, written = _run(tmp_path, capsys, _junit(tmp_path, _green()), enforce=enforce)
+@pytest.mark.parametrize("optional_state", ["skipped", "failure", "error"])
+def test_every_required_canary_passed_meets_only_the_floor(tmp_path, capsys, enforce, optional_state):
+    cases = [(canary_id, optional_state if canary_id in OPTIONAL else state) for canary_id, state in _green()]
+    code, out, written = _run(tmp_path, capsys, _junit(tmp_path, cases), enforce=enforce)
     assert code == 0 and ERROR not in out
     assert f"{len(REQUIRED)} of {len(REQUIRED)} required provider canaries passed." in written
     assert ("The release floor is met." if enforce else "would pass.") in written
+    assert "a release tag at this commit would pass" not in written
+    if not enforce:
+        assert "the required-provider floor would pass" in written
+        assert "does not establish whole-job success or release approval" in written
     assert all(f"| `{canary_id}` | passed |" in written for canary_id in REQUIRED)
     assert not any(canary_id in written or canary_id in out for canary_id in OPTIONAL)
 
@@ -89,7 +95,7 @@ def test_one_required_canary_that_did_not_pass_blocks_a_tag_and_is_the_only_one_
     # The same report on a ref that is not a release tag: reported, never red.
     code, out, written = _run(tmp_path, capsys, junit, enforce=False)
     assert code == 0 and "::" not in out
-    assert f"a release tag at this commit would be blocked by: {VICTIM} ({state})." in written
+    assert f"the required-provider floor would be blocked by: {VICTIM} ({state})." in written
 
 
 def test_only_the_exact_canary_testcase_counts(tmp_path, capsys):
@@ -109,7 +115,7 @@ def test_a_missing_or_unparsable_report_blocks_a_tag_and_only_reports_elsewhere(
     assert [line for line in out.splitlines() if line.startswith("::")] == [
         f"{ERROR}provider JUnit report missing or unreadable"]
     code, out, written = _run(tmp_path, capsys, junit, enforce=False)
-    assert code == 0 and "::" not in out and "a release tag at this commit would be blocked." in written
+    assert code == 0 and "::" not in out and "the required-provider floor would be blocked." in written
 
 
 @pytest.mark.parametrize("enforce", [True, False])

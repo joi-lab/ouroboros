@@ -177,16 +177,20 @@ def test_presence_inline_cap_stays_finite_without_a_global_limit():
         resolve_presence_runtime(None, None, global_max_rounds=0)
 
 
-def test_self_check_without_a_round_limit_invents_no_remainder():
-    from ouroboros.loop import _maybe_inject_self_check
+def test_facts_line_round_without_a_round_limit_invents_no_remainder(monkeypatch):
+    """The 15-round self-check is gone (#1748); the facts line names the round and the
+    limit that binds first, or that there is none — never an invented remainder."""
+    from types import SimpleNamespace
 
-    unbounded, bounded, progress = [], [], []
-    assert _maybe_inject_self_check(15, None, unbounded, {"cost": 0.0}, progress.append) is True
-    text = unbounded[-1]["content"]
-    assert "[CHECKPOINT 1 — round 15]" in text and "Rounds remaining" not in text
-    assert _maybe_inject_self_check(15, 200, bounded, {"cost": 0.0}, progress.append) is True
-    assert "round 15/200]" in bounded[-1]["content"]
-    assert "| Rounds remaining: 185" in bounded[-1]["content"]
+    from ouroboros import loop
+    from ouroboros.loop_messages import _round_fact
+
+    ctx, tool_ctx = SimpleNamespace(round_idx=15), SimpleNamespace()
+    monkeypatch.setattr(loop, "_resolve_loop_max_rounds", lambda _ctx=None: None)
+    assert _round_fact(ctx, tool_ctx) == "round 15 (no round limit)"
+    monkeypatch.setattr(loop, "_resolve_loop_max_rounds", lambda _ctx=None: 200)
+    assert _round_fact(ctx, tool_ctx) == "round 15 of 200 max"
+    assert not hasattr(loop, "_maybe_inject_self_check")
 
 
 def test_model_wait_has_no_execution_window_or_ceiling_stop_without_a_lifetime(tmp_path, monkeypatch):

@@ -263,7 +263,14 @@ def test_every_bridge_client_carries_exactly_the_local_proxy(tmp_path, monkeypat
     assert asyncio.run(notifier._push_notification(api, 42, "done", trust_env=False)) == ("sent", None)
 
     assert [(level, message) for level, message in api.logs if level != "info"] == []
-    assert _RecordingClient.built == [(_TOKEN, {"trust_env": False, "proxy": local_proxy})] * 10
+    assert len(_RecordingClient.built) == 10
+    for index, (token, options) in enumerate(_RecordingClient.built):
+        assert token == _TOKEN
+        options = dict(options)
+        if index in {1, 3, 4, 5, 6, 7}:  # mirrored rows, excluding typing and quiz-state edits
+            assert callable(options.pop("on_message"))
+            assert options.pop("reply_to_message_id") == 0
+        assert options == {"trust_env": False, "proxy": local_proxy}
 
 
 def test_a_malformed_proxy_stops_the_bridge_without_leaking_it(tmp_path):
@@ -319,7 +326,8 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
     installed = native / "telegram"
     shutil.copytree(_ROOT, installed)
     manifest = (installed / "SKILL.md").read_text(encoding="utf-8")
-    manifest = manifest.replace("version: 1.2.11", "version: 1.2.10")
+    current_version = load_skill(_ROOT, drive).manifest.version
+    manifest = manifest.replace(f"version: {current_version}", "version: 1.2.13", 1)
     (installed / "SKILL.md").write_text(manifest, encoding="utf-8")
     (installed / ".seed-origin").write_text("seeded_from=test\n", encoding="utf-8")
     settings = {"TELEGRAM_BOT_TOKEN": _TOKEN, **({"TELEGRAM_PROXY": _PROXY} if owner_set_proxy else {})}
@@ -341,7 +349,7 @@ def test_upgrade_keeps_token_grant_and_local_proxy(
     assert _per_skill_version_resync(_ROOT.parent, native, log, drive_root=drive) == 1
     new = load_skill(installed, drive)
     grants = load_skill_grants(drive, "telegram")
-    assert new.manifest.version == "1.2.11" and new.content_hash != old.content_hash
+    assert new.manifest.version == current_version and new.content_hash != old.content_hash
     assert grants["content_hash"] == new.content_hash
     assert local_settings.read_bytes() == settings_before
     assert grants["granted_keys"] == ["TELEGRAM_BOT_TOKEN"]

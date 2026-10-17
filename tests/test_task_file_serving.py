@@ -220,6 +220,35 @@ def test_chat_media_serves_only_bytes_that_hash_to_its_name(tmp_path):
     assert client.get(f"/api/tasks/{TASK}/artifacts/{name}").status_code == 404
 
 
+@confined
+def test_an_svg_task_file_keeps_bytes_and_view_but_gets_no_script_or_origin(tmp_path):
+    """A generated SVG reaches the artifact list and send_file's card Open as a registered
+    task file (chat media is raster/video only). Exact bytes, image type and Range reads
+    stay; the chat-upload inline policy (sandbox CSP, nosniff) withholds script and this
+    origin. Raster headers are unchanged."""
+    data = tmp_path / "data"
+    svg = (b'<svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8"/>'
+           b'<script>fetch("/api/state")</script></svg>')
+    png = b"\x89PNG\r\n\x1a\n raster"
+    media = artifacts.task_artifact_dir_path(data, TASK, create=True) / "chat_media"
+    media.mkdir()
+    raster_name = f"chat-media-{sha256(png).hexdigest()}.png"
+    (media / raster_name).write_bytes(png)
+    generated = artifacts.store_task_artifact_bytes(data, TASK, f"image-{sha256(svg).hexdigest()}.svg", svg,
+                                                    kind="generated_image")
+    client = _client(data)
+    url = f"/api/tasks/{TASK}/artifacts/{generated['path']}"
+    opened = client.get(url)
+    assert opened.content == svg and opened.headers["content-type"].startswith("image/svg+xml")
+    assert opened.headers["content-security-policy"] == "sandbox"
+    assert opened.headers["x-content-type-options"] == "nosniff"
+    part = client.get(url, headers={"range": "bytes=0-3"})
+    assert (part.status_code, part.content, part.headers["content-security-policy"]) == (206, b"<svg", "sandbox")
+    raster = client.get(f"/api/tasks/{TASK}/artifacts/{raster_name}")
+    assert raster.content == png and raster.headers["content-type"] == "image/png"
+    assert "content-security-policy" not in raster.headers and "x-content-type-options" not in raster.headers
+
+
 def test_without_confined_opens_files_and_archives_fail_closed(tmp_path, monkeypatch):
     data, child, _store = _split_child(tmp_path)
     client = _client(data)

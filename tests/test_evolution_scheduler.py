@@ -17,6 +17,7 @@ from tests._evolution_state_shared import (
     _CaptureQueue,
     _active_transaction,
 )
+from tests.worker_pool_support import affirm_ready
 
 
 def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
@@ -43,7 +44,7 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     }
     pending.append(task)
     inbox, events = _CaptureQueue(), _CaptureQueue()
-    worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox)
+    worker = affirm_ready(SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox))
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "get_event_q", lambda: events)
     monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")

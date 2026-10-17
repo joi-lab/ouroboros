@@ -7,8 +7,8 @@ from ouroboros.mutation_attribution import capture_mutation_baseline
 from ouroboros.review_state import load_state
 from ouroboros.task_results import write_task_result
 from ouroboros.tools import git
-from ouroboros.tools.scope_review import ScopeReviewResult
-from tests.test_advisory_inline_freshness import candidate  # noqa: F401
+from ouroboros.review_ledger import CouplingOutcome
+from tests.test_git_review_preflight_gate import candidate  # noqa: F401
 
 
 @pytest.mark.parametrize("failure", ["critical", "scope_critical", "infra", "pending"])
@@ -37,11 +37,17 @@ def test_explicit_continuation_commits_current_bytes_without_repaying(candidate,
         finding = {"item": "budget", "severity": "critical", "verdict": "FAIL", "reason": "wrong amount"}
         ctx._last_review_critical_findings = [finding] if failure == "critical" else []
         ctx._last_triad_raw_results = [{"slot_id": "critic", "status": "responded", "parsed": [finding], "raw_text": "wrong amount"}]
-        scope = ScopeReviewResult(blocked=failure == "scope_critical", status="responded", critical_findings=[finding] if failure == "scope_critical" else [], block_message="Scope found wrong amount" if failure == "scope_critical" else "")
-        ctx._last_scope_raw_result = {"status": "responded", "critical_findings": scope.critical_findings}
+        scope = CouplingOutcome(verdict="FAIL" if failure == "scope_critical" else "PASS", blocked=failure == "scope_critical", status="responded", critical_findings=[finding] if failure == "scope_critical" else [])
         if failure in {"infra", "pending"}:
             ctx._last_triad_raw_results = [{"slot_id": "critic", "status": "error", "error": "unavailable",
                 "operation_id": "paid-original", "operation_state": "in_flight" if failure == "pending" else "settled"}]
+        if failure == "pending":
+            # Received feedback beside the live seat: the seat asked the coupling
+            # question answered while the critic is still running.
+            ctx._last_triad_raw_results.append({
+                "slot_id": "coupling", "status": "responded", "parts": ["coupling"], "raw_text": "[]",
+                "answers": {"coupling": {"status": "responded", "verdict": "PASS", "findings": [],
+                                         "critical": 0, "coverage": "full"}}})
         return ("review unavailable" if failure in {"infra", "pending"} else None), scope, "infra_failure" if failure in {"infra", "pending"} else "", []
     monkeypatch.setattr(git, "_run_parallel_review", reviewer)
     before = git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir)
@@ -73,6 +79,92 @@ def test_explicit_continuation_commits_current_bytes_without_repaying(candidate,
     refused = git._repo_commit_push(ctx, "Finish", review_reference=reference,
         author_disposition={"disposition": "accepted", "rationale": "Cannot override Blocking."})
     assert "requires Advisory" in refused
+
+
+@pytest.fixture
+def runtime_mode(request, monkeypatch):
+    from ouroboros import config
+
+    mode, enforcement = request.param
+    config.reset_runtime_mode_baseline_for_tests()
+    config.initialize_runtime_mode_baseline(mode)
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    yield mode, enforcement
+    config.reset_runtime_mode_baseline_for_tests()
+
+
+@pytest.mark.parametrize("runtime_mode", [("pro", "advisory"), ("cyber_pro", "advisory"), ("cyber_pro", "blocking"),
+                                          ("pro", "blocking")], indirect=True)
+@pytest.mark.parametrize("outcome", ["clean", "pending"])
+def test_every_nonblocking_outcome_returns_before_git(candidate, monkeypatch, runtime_mode, outcome):  # noqa: F811
+    """#1741: under Advisory or Cyber Pro every panel outcome — a clean PASS and a still-running
+    wave included — reaches the author before commit/tag/push; the commit is the author's
+    explicit continuation over the current bytes. Ordinary Blocking keeps its one-call PASS."""
+    from ouroboros import review_ledger
+    from ouroboros.tools import commit_gate
+
+    mode, enforcement = runtime_mode
+    nonblocking = mode == "cyber_pro" or enforcement == "advisory"
+    ctx = candidate
+    ctx.branch_dev = git.run_cmd(["git", "branch", "--show-current"], cwd=ctx.repo_dir).strip()
+    git.run_cmd(["git", "reset", "--hard", "HEAD"], cwd=ctx.repo_dir)
+    (ctx.repo_dir / "VERSION").write_text("1.0.0\n", encoding="utf-8")
+    git.run_cmd(["git", "add", "VERSION"], cwd=ctx.repo_dir)
+    git.run_cmd(["git", "commit", "-m", "fixture version"], cwd=ctx.repo_dir)
+    write_task_result(ctx.drive_root, ctx.task_id, "running")
+    capture_mutation_baseline(ctx.drive_root, ctx.task_id, [{"surface_type": "system_repo", "host_root": str(ctx.repo_dir)}])
+    (ctx.repo_dir / "change.py").write_text("value = 2\n", encoding="utf-8")
+    reviews, pushes = [], []
+    monkeypatch.setattr(git, "_run_review_preflight_tests", lambda *_a, **_kw: None)
+    monkeypatch.setattr(git, "_post_commit_result", lambda *_a, **_kw: None)
+    monkeypatch.setattr(git, "_auto_push", lambda *_a, **_kw: pushes.append("push") or "")
+
+    def reviewer(_ctx, message, **kw):
+        from ouroboros.review_dispatch import invoke_review_paid_stamp
+        invoke_review_paid_stamp(ctx._review_paid_stamp)
+        reviews.append(kw["review_binding_fingerprint"])
+        ctx._last_review_critical_findings = []
+        if outcome == "pending":
+            ctx._last_triad_raw_results = [{"slot_id": "critic", "status": "error", "error": "still running",
+                                            "operation_id": "paid-op", "operation_state": "in_flight",
+                                            "late_result_pending": True}]
+            return "review pending", None, "review_late_result_pending", []
+        ctx._last_triad_raw_results = [{"slot_id": "critic", "status": "responded", "parsed": [],
+                                        "raw_text": "[] — checked the change and its callers; PASS"}]
+        return None, CouplingOutcome(verdict="PASS", status="responded"), "", []
+    monkeypatch.setattr(git, "_run_parallel_review", reviewer)
+    head = git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir)
+    first = git._repo_commit_push(ctx, "Change value", skip_advisory_review=True)
+    if not nonblocking:
+        if outcome == "clean":
+            assert git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir) != head, first
+        else:
+            assert "REVIEW_PENDING" in first and git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir) == head
+        return
+    assert first.startswith("Review outcome returned before commit"), first
+    assert git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir) == head and not pushes
+    reference = json.loads(first.split("\n", 1)[1])["review_reference"]
+    critic = load_state(ctx.drive_root).attempts[-1]
+    assert critic.paid and critic.phase == ("late_wait" if outcome == "pending" else "review_only")
+    # The author corrects after reading: the old PASS must not approve the changed bytes.
+    (ctx.repo_dir / "change.py").write_text("value = 3\n", encoding="utf-8")
+    monkeypatch.setattr(git, "_run_parallel_review", lambda *_a, **_kw: pytest.fail("continuation buys no reviewer"))
+    second = git._repo_commit_push(ctx, "Change value", review_reference=reference, author_disposition={
+        "disposition": "partial", "rationale": "I read the returned outcome and corrected the value."})
+    if outcome == "pending" and mode != "cyber_pro":
+        assert "needs received feedback" in second and git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir) == head
+        return
+    assert git.run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir) != head, second
+    assert git.run_cmd(["git", "show", "HEAD:change.py"], cwd=ctx.repo_dir).strip() == "value = 3"
+    assert len(reviews) == 1 and len(pushes) == 1
+    assert ctx._commit_review_status == "author_continued", "an author continuation is never the critic's PASS"
+    final = load_state(ctx.drive_root).attempts[-1]
+    author = final.author_disposition
+    assert final.status == "succeeded" and author["review_reference"] == reference
+    assert author["subject_hash"] == final.pre_review_fingerprint != critic.pre_review_fingerprint
+    record = review_ledger.load_record(review_ledger.ledger_root(ctx), reference["review_record_id"]) or {}
+    assert author["reviewer_signal"] == ((record.get("verdict") or {}).get("aggregate") or critic.block_reason)
+    assert commit_gate.resolve_commit_review_reference(ctx, reference).pre_review_fingerprint == critic.pre_review_fingerprint
 
 
 def test_no_current_test_proof_means_no_author_commit(candidate, monkeypatch):  # noqa: F811

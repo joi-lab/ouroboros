@@ -31,10 +31,11 @@ from .lib.telegram_state import (
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
     _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
+    _mirror_options, _owner_message_seen, _owner_ingress_fields, _same_silent_episode,
 )
 from .lib import telegram_i18n, telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
-from .lib.telegram_notifier import _make_notifier
+from .lib.telegram_notifier import _make_notifier, _notify_enabled, _completion_text, _relay_text
 from .lib.miniapp_registration import _read_status, register as register_miniapp
 from .scripts.telegram_settings import (
     TelegramSettingsError,
@@ -52,11 +53,12 @@ from .scripts.telegram_settings import (
 _HONOR_ENV_PROXIES = (not in_worker_process()) and env_proxies_configured()
 
 
-def _telegram_client(api) -> TelegramClient:
+def _telegram_client(api, event=None, chat_id: int = 0) -> TelegramClient:
     """Build each bridge client with the granted token and skill-local proxy."""
     granted = api.get_settings(["TELEGRAM_BOT_TOKEN"])
     return TelegramClient(granted.get("TELEGRAM_BOT_TOKEN", ""), trust_env=_HONOR_ENV_PROXIES,
-                          proxy=telegram_proxy(pathlib.Path(api.get_state_dir())))
+                          proxy=telegram_proxy(pathlib.Path(api.get_state_dir())),
+                          **(_mirror_options(api, event, chat_id) if event is not None else {}))
 
 _SLASH_COMMAND_RE = re.compile(r"^\s*/[A-Za-z]")
 
@@ -895,6 +897,7 @@ async def _handle_owner_message(
     chat = message.get("chat") or {}
     sender = message.get("from") or {}
     chat_id = int(chat.get("id") or 0)
+    _owner_message_seen(api, chat_id, int(message.get("message_id") or 0))
     # Owner binding + filtering is already enforced at the top of
     # the update loop (TOFU for all command modes), so chat_id is
     # guaranteed to equal the pinned owner chat here.
@@ -996,6 +999,7 @@ async def _handle_owner_message(
         parked = await telegram_inbound.park_inbound_file(api, client, inbound)
     try:
         await _inject(api, {
+            **_owner_ingress_fields(api, chat_id, message, update_id),
             "text": safe_text,
             "chat_id": chat_id,
             "user_id": int(sender.get("id") or chat_id or 1),
@@ -1024,10 +1028,10 @@ def _make_outbound(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
             if not chat_id:
                 return
+            client = _telegram_client(api, event, chat_id)
             lang = telegram_i18n.language()
 
             # Subagent lifecycle → one dedicated bubble per subagent, edited in
@@ -1049,19 +1053,28 @@ def _make_outbound(api):
             if _child_row_held_for_root(api, event):
                 return
 
-            # Generic (non-subagent) progress telemetry → dropped by default; the
-            # typing indicator already signals "working". Opt in via the toggle.
-            if event.get("is_progress") and not _mirror_progress_enabled(local_settings):
+            # Progress telemetry and a root's own card rows → dropped by default (a child's row waits above,
+            # then goes as before); the typing indicator already signals "working". Opt in via the toggle.
+            if (event.get("is_progress") or (event.get("card_row") and event.get("delegation_role") != "subagent")) and not _mirror_progress_enabled(local_settings):
                 return
 
-            # Routing receipts ride the outbound bus as typed annotations with
-            # suppress_bubble (no text). The only one worth a Telegram push is
-            # the actionable refusal: a numbered destination list (#198). The
-            # owner replies with a number in plain words — the LLM router reads
-            # this list from history and dispatches the choice (P5 LLM-first,
-            # no keyword gate) — or taps the picker card in the web UI.
+            # Routing receipts are typed annotations (suppress_bubble, no text). A landed act stays silent except for a
+            # file it could not attach (no message line here to carry it); an actionable refusal is a numbered list (#198)
+            # the owner answers in plain words (the LLM router reads it from history, P5) or on the web picker card.
             if str(event.get("annotation_type") or "") == "routing_ack":
+                from supervisor.steering import _relayed_owner_message
+
+                # Named owner relays have only the annotation; synthetic acts
+                # already get their separate steer_not_delivered System row.
+                if (event.get("action") == "steer_task" and event.get("cause")
+                        and _relayed_owner_message(str(event.get("client_message_id") or ""))):
+                    line = " · ".join(str(event[key]) for key in ("target_label", "cause") if event.get(key))
+                    await client.send_message(chat_id, line, parse_mode="")
+                    return
                 if str(event.get("status") or "") != "needs_manual_target":
+                    names = [str(row.get("label") or "file") for row in event.get("attachment_manifest") or [] if isinstance(row, dict) and row.get("status") == "rejected"]
+                    if names:
+                        await client.send_message(chat_id, _LOCALIZED_TEXTS[lang].format("attachments_not_attached", names=", ".join(names)), parse_mode="")
                     return
                 raw_options = event.get("options") if isinstance(event.get("options"), list) else []
                 from ouroboros.project_dialogue import routing_option_label
@@ -1080,12 +1093,25 @@ def _make_outbound(api):
                 return
 
             text = str(event.get("text") or "").strip()
+            # A relay quotes the owner's own words above Ouroboros's note; they are sent verbatim, as plain text.
+            relayed = event.get("system_type") == "relay_entry" and isinstance(event.get("relay"), dict)
+            if relayed:
+                text = _relay_text(event["relay"], text, lang)
+            completion_summary = event.get("role") == "system" and event.get("system_type") == "project_completion_summary"
+            if completion_summary:
+                notice = event.get("completion_notice")
+                if not _notify_enabled(local_settings, "TELEGRAM_NOTIFY_TASKS"):
+                    # Preserved intermediate output is content, not the optional status line.
+                    # Unrecoverable legacy metadata must not erase unknown content.
+                    text = str(notice.get("salvage") or "") if isinstance(notice, dict) else text
+                elif isinstance(notice, dict) and isinstance(notice.get("neutral"), bool) and isinstance(notice.get("detail"), str):
+                    text = _completion_text(event, str(event.get("task_id") or ""), lang)
             if not text:
                 return
             # Honor the host's markdown hint: plain text (markdown=False) is sent
             # verbatim so literal *, _, `, [] aren't mis-parsed as Telegram
             # formatting; an absent/True hint renders markdown→HTML as before.
-            parse_mode = "" if event.get("markdown") is False else "HTML"
+            parse_mode = "" if completion_summary or relayed or event.get("markdown") is False else "HTML"
 
             # A host receipt must neither replace nor become the tracked agent reply.
             silent_on = _is_silent_mode_enabled(local_settings) and event.get("role") != "system"
@@ -1094,7 +1120,7 @@ def _make_outbound(api):
             # Silent mode: try to edit the previously tracked message in-place.
             # editMessageText returns False on any failure (too old, deleted,
             # identical content, parse error) so we fall back to sendMessage.
-            if silent_on and tracked_msg_id:
+            if silent_on and tracked_msg_id and _same_silent_episode(api, chat_id, tracked_msg_id, event):
                 edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode=parse_mode)
                 if not edited and parse_mode:
                     edited = await client.edit_message_text(chat_id, tracked_msg_id, text, parse_mode="")
@@ -1130,8 +1156,8 @@ def _make_photo(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
+            client = _telegram_client(api, event, chat_id)
             image_base64 = str(event.get("image_base64") or "").strip()
             if chat_id and image_base64:
                 # Media cannot replace a text bubble in Telegram — break the
@@ -1152,8 +1178,8 @@ def _make_video(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
+            client = _telegram_client(api, event, chat_id)
             video_base64 = str(event.get("video_base64") or "").strip()
             if chat_id and video_base64:
                 # Media cannot replace a text bubble — reset silent tracking.
@@ -1174,8 +1200,8 @@ def _make_document(api):
         file_handle = None
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
+            client = _telegram_client(api, event, chat_id)
             file_base64 = str(event.get("file_base64") or "").strip()
             file_ref = event.get("file_ref") if isinstance(event.get("file_ref"), dict) else None
             if chat_id and (file_base64 or file_ref):
@@ -1262,8 +1288,8 @@ def _make_links(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
+            client = _telegram_client(api, event, chat_id)
             if not chat_id:
                 return
             title = str(event.get("title") or "").strip() or "Links"
@@ -1299,8 +1325,8 @@ def _make_quiz(api):
     async def handle(event: Dict[str, Any]) -> None:
         try:
             local_settings = _load_settings(api)
-            client = _telegram_client(api)
             chat_id = _target_chat(local_settings, event)
+            client = _telegram_client(api, event, chat_id)
             if not chat_id:
                 return
             question = str(event.get("question") or "").strip()
@@ -1356,7 +1382,7 @@ def _make_quiz(api):
                     "message_id": int(message_id or 0), "options": labels,
                     "text": settled_text,
                 })
-                await telegram_quiz.apply_retained_fact(api, token, lang, client_factory=lambda: client)
+                await telegram_quiz.apply_retained_fact(api, token, lang, client_factory=lambda: client, published=event)
         except Exception as exc:
             api.log("error", f"Telegram quiz error: {exc}")
     return handle
@@ -1469,11 +1495,11 @@ def register(api):
                          "placeholder": "on"},
                         {"name": "TELEGRAM_NOTIFY_TASKS", "label": "Notify on task completion", "type": "select",
                          "options": [
-                             {"value": "off", "label": "Off — non-clean finishes only"},
-                             {"value": "on", "label": "On — ✅ Task done · cost · rounds"},
+                             {"value": "off", "label": "Off — no extra completion messages"},
+                             {"value": "on", "label": "On — completion messages"},
                          ],
-                         "help": "A task that ends with warnings, fails or is cancelled always sends one short "
-                                 "line, because Telegram has no task card. On adds the clean finishes.",
+                         "help": "Off also suppresses extra failure and cancellation notices. Replies, files and "
+                                 "questions still arrive; task details retain all outcomes and review evidence.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_NOTIFY_BUDGET", "label": "Notify on budget thresholds", "type": "select",
                          "options": [

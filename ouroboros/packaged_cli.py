@@ -324,6 +324,7 @@ def _run_start_index(args: Sequence[str], command_idx: int) -> int | None:
         "--attach",
         "--patch-out",
         "--timeout",
+        "--execution-timeout",
         "--actor-id",
         "--delegation-role",
     }
@@ -368,6 +369,8 @@ def _base_url_from_args(args: Sequence[str], data_dir: pathlib.Path) -> str:
     explicit = _explicit_url(args) or os.environ.get("OUROBOROS_URL", "").strip()
     if explicit:
         return explicit.rstrip("/")
+    # This is the packaged desktop root, not the caller's deployment: both
+    # resolve_packaged_runtime and _inner_cli_env deliberately ignore path overrides.
     port = DEFAULT_PORT
     try:
         raw = (data_dir / "state" / "server_port").read_text(encoding="utf-8").strip()

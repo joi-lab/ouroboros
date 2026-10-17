@@ -13,10 +13,36 @@ import queue
 import threading
 from types import SimpleNamespace
 
+import pytest
+
 import ouroboros.loop as loop_mod
+from ouroboros.acceptance_settlement import expose_acceptance_feedback
 from ouroboros.loop_acceptance import _set_acceptance_decision, _task_acceptance_eligible
 from ouroboros.loop_acceptance_review import _run_task_acceptance_review_once
 from ouroboros.loop_round_limits import _drain_incoming_messages
+
+
+def _nominate_acceptance(trace, *, task_id, subject):
+    """Record a typed root nomination at the normal tool-result boundary.
+
+    Scoped gate fixtures omit Main's transport. This is its deferred nomination
+    receipt, never a fabricated successful write or an eligibility override.
+    """
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    args = {"claim": subject, "goal": "Complete the owner task"}
+    payload = {
+        "status": "deferred_to_host_acceptance", "authoritative": False,
+        "request": {"surface": "task_acceptance", "task_id": task_id,
+                    "subject": subject, "goal": args["goal"], "checklist": ""},
+        "agent_supplied": {"acceptance_request": {**args, "checklist": ""}},
+    }
+    process_tool_results([{
+        "fn_name": "task_acceptance_review", "tool_call_id": "nominate",
+        "result": json.dumps(payload), "is_error": False,
+        "args_for_log": args, "tool_args": args, "result_meta": {"status": "ok"},
+    }], [], trace, emit_progress=lambda *_a, **_kw: None)
+    return trace
 
 
 def _seed_acceptance_root(tmp_path, task_id: str, ctx: SimpleNamespace):
@@ -165,6 +191,9 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
     # author response without manufacturing a critic capsule or reviewer PASS.
     # ... and the final seal's `admission_close_unconfirmed` note (owner 2A) in the delivery leaf.
     # The current-task unfinished-stop record is a typed writer too.
+    # Cyber now shares the explicit completion writer; the prose-only
+    # author_final_response writer was removed. The earlier revision's PASS keeps
+    # its own writer (fork 1=B), leaving 24 typed writers.
     assert len(starts) == 24, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
@@ -298,7 +327,9 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
         ]
     }
 
-    assert _task_acceptance_eligible("auto", trace, True) == (True, "auto_effect")
+    assert _task_acceptance_eligible("auto", trace, True) == (False, "skipped_conversation")
+    _nominate_acceptance(trace, task_id="task1", subject="done")
+    assert _task_acceptance_eligible("auto", trace, True) == (True, "auto_agent_request")
     assert _task_acceptance_eligible("required", trace, True)[0] is True
     assert _task_acceptance_eligible("off", trace, True)[0] is False
 
@@ -343,6 +374,8 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
         ],
         "review_runs": [{"request": {"surface": "task_acceptance"}, "aggregate_signal": "PASS"}],
     }
+    _nominate_acceptance(reviewed_trace, task_id="task1", subject="done")
+    messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     assert _run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx),
         content="done",
@@ -350,12 +383,12 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
         task_type="task",
         llm_trace=reviewed_trace,
         drive_root=tmp_path,
-        messages=[{"role": "system", "content": ""}, {"role": "user", "content": "goal"}],
+        messages=messages,
         emit_progress=lambda _msg, *, incident=None: None,
-    ) is False
+    ) is True  # Even a settled PASS must reach the author before delivery.
     assert panel_state == {"calls": 1, "reviewed_at_dispatch": False}
-    assert ctx._task_acceptance_reviewed is True
-    assert reviewed_trace["review_decision"]["trigger"] == "auto_effect_after_agent_advisory"
+    assert ctx._task_acceptance_reviewed is False
+    assert reviewed_trace["review_decision"]["trigger"] == "auto_agent_request_after_agent_advisory"
     assert len(reviewed_trace["review_runs"]) == 2
     assert reviewed_trace["review_runs"][0]["authority"] == "agent_advisory"
     assert reviewed_trace["review_runs"][0]["superseded_by_revision"] is True
@@ -363,6 +396,8 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
 
     # Defensive re-entry on the exact candidate/evidence/fence binding reapplies
     # the authoritative run but never pays for a second panel.
+    expose_acceptance_feedback(reviewed_trace, messages, "task1")
+    assert reviewed_trace["review_runs"][1]["settled_feedback_delivered"]
     ctx._task_acceptance_reviewed = False
     assert _run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx),
@@ -371,12 +406,48 @@ def test_task_acceptance_agent_tool_is_advisory_before_auto_host_gate(monkeypatc
         task_type="task",
         llm_trace=reviewed_trace,
         drive_root=tmp_path,
-        messages=[{"role": "system", "content": ""}, {"role": "user", "content": "goal"}],
+        messages=messages,
         emit_progress=lambda _msg, *, incident=None: None,
     ) is False
     assert panel_state["calls"] == 1
     assert reviewed_trace["review_decision"]["panel_reused"] is True
     assert len(reviewed_trace["review_runs"]) == 2
+
+@pytest.mark.parametrize("mode", ["auto", "required", "off"])
+@pytest.mark.parametrize("material", ["none", "write_args", "registered_output"])
+@pytest.mark.parametrize("nominated", [False, True])
+def test_root_panel_requires_nomination_or_observed_production(monkeypatch, tmp_path, mode, material, nominated):
+    from ouroboros import review_substrate
+    from ouroboros.artifacts import store_task_artifact_bytes
+
+    monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: mode)
+    ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=tmp_path)
+    _seed_acceptance_root(tmp_path, "eligibility-pair", ctx)
+    ctx.task_contract["expected_output"] = "A complete report."
+    trace = {"tool_calls": []}
+    if material == "write_args":
+        trace["tool_calls"].append({"tool": "write_file", "args": {"path": "report.txt"}})
+    elif material == "registered_output":
+        store_task_artifact_bytes(tmp_path, ctx.task_id, "report.txt", b"Actual produced report.")
+    if nominated:
+        _nominate_acceptance(trace, task_id=ctx.task_id, subject="Complete report")
+    dispatched = []
+    monkeypatch.setattr(review_substrate, "triad_delivery_slots", lambda **_kw: [object()])
+    def panel(request, **_kw):
+        dispatched.append(request)
+        return review_substrate.ReviewRunResult(
+            request={"surface": "task_acceptance"}, actors=[], parsed_findings=[],
+            aggregate_signal="DEGRADED", degraded=True, degraded_reasons=["fixture transport unavailable"],
+        )
+    monkeypatch.setattr(review_substrate, "run_review_request", panel)
+    _run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx), content="Complete report", task_id=ctx.task_id, task_type="task",
+        llm_trace=trace, drive_root=tmp_path, messages=[], emit_progress=lambda *_a, **_kw: None,
+    )
+    expected = mode != "off" and (nominated or (mode == "required" and material == "registered_output"))
+    assert len(dispatched) == int(expected), trace.get("review_decision")
+    assert len(trace.get("review_runs", [])) == int(expected)
+
 
 def _exercise_owner_followup_during_acceptance_panel(monkeypatch, tmp_path, *, direct: bool):
     import ouroboros.review_substrate as rs
@@ -477,7 +548,9 @@ def _exercise_owner_followup_during_acceptance_panel(monkeypatch, tmp_path, *, d
     def panel(*_args, **_kwargs):
         panel_calls["count"] += 1
         if panel_calls["count"] == 1:
+            from tests.test_steer_relay import held_quote
             events_mod._handle_steer_task({
+                "quotes": held_quote(tmp_path, "also satisfy the newly added criterion", chat_id),
                 "target_task_id": root_id,
                 "message": "also satisfy the newly added criterion",
                 "chat_id": chat_id,
@@ -489,6 +562,7 @@ def _exercise_owner_followup_during_acceptance_panel(monkeypatch, tmp_path, *, d
     monkeypatch.setattr(rs, "triad_delivery_slots", lambda **_kwargs: [object(), object(), object()])
     monkeypatch.setattr(rs, "run_review_request", panel)
     trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    _nominate_acceptance(trace, task_id=root_id, subject="first answer")
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     progress = []
     tools = SimpleNamespace(_ctx=acceptance_ctx)
@@ -511,7 +585,14 @@ def _exercise_owner_followup_during_acceptance_panel(monkeypatch, tmp_path, *, d
     _drain_incoming_messages(
         messages, queue.Queue(), tmp_path, root_id, None, seen, owner_ctx=acceptance_ctx,
     )
-    assert "newly added criterion" in str(messages[-1]["content"])
+    assert any("newly added criterion" in str(m.get("content")) for m in messages)
+    assert acceptance_ctx._held_owner_messages
+    _nominate_acceptance(trace, task_id=root_id, subject="revised answer")
+    assert _run_task_acceptance_review_once(
+        tools=tools, content="revised answer", task_id=root_id, task_type="task",
+        llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda text, *, incident=None: progress.append(text),
+    ) is True  # The new panel's feedback is offered before the author responds.
+    expose_acceptance_feedback(trace, messages, root_id)
     assert _run_task_acceptance_review_once(
         tools=tools, content="revised answer", task_id=root_id, task_type="task",
         llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda text, *, incident=None: progress.append(text),
@@ -548,7 +629,7 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     """WA4 (v6.36.0): host-forced `required` review records the full verdict on
     the objective axis AND feeds the agent a COMPACT improvement capsule for a
     real best_effort/blocked_with_evidence (ONE bounded pass, anti-derailment
-    framed). A solved/nothing-actionable result still finalizes with no injection."""
+    framed). A solved result is exposed once, then reused for the author's response."""
     import ouroboros.review_substrate as rs
 
     monkeypatch.setattr(loop_mod, "get_task_review_mode", lambda: "required")
@@ -558,8 +639,8 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "2")
 
     # (a) CONTRACT-VALID solved PASS (a non-empty completion_coach, as the required
-    # contract demands) with no actionable findings -> still NO injection, finalize.
-    # A coach alone must not re-loop an already-solved deliverable.
+    # contract demands) with no actionable findings -> one feedback handback.
+    # Reading that PASS must not buy an improvement pass or another panel.
     solved = rs.ReviewRunResult(
         request={"surface": "task_acceptance"},
         actors=[{"signal": "PASS", "slot_id": "s0",
@@ -573,14 +654,22 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     ctx = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
     _seed_acceptance_root(tmp_path, "t", ctx)
     trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    _nominate_acceptance(trace, task_id="t", subject="done")
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     result = _run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
-        llm_trace=trace, drive_root=None, messages=messages, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda _m, *, incident=None: None,
     )
-    assert result is False                                        # nothing to improve -> no extra round
-    assert len(messages) == 2                                     # transcript NOT mutated
+    assert result is True
+    assert len(messages) == 3 and messages[-1]["review_feedback"]
+    assert getattr(ctx, "_task_acceptance_improvement_passes", 0) == 0
     assert trace["review_runs"][0]["aggregate_signal"] == "PASS"  # full verdict recorded (objective axis)
+    expose_acceptance_feedback(trace, messages, "t")
+    assert _run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
+        llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda _m, **_kw: None,
+    ) is False
+    assert len(trace["review_runs"]) == 1 and trace["review_decision"]["panel_reused"]
 
     # (b) blocked_with_evidence -> compact capsule fed back exactly once.
     blocked = rs.ReviewRunResult(
@@ -594,11 +683,12 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     ctx2 = SimpleNamespace(_task_acceptance_reviewed=False, is_direct_chat=False, drive_root=str(tmp_path))
     _seed_acceptance_root(tmp_path, "t-blocked", ctx2)
     trace2 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    _nominate_acceptance(trace2, task_id="t-blocked", subject="done")
     messages2 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     tools2 = SimpleNamespace(_ctx=ctx2)
     result2 = _run_task_acceptance_review_once(
         tools=tools2, content="done", task_id="t-blocked", task_type="task",
-        llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace2, drive_root=tmp_path, messages=messages2, emit_progress=lambda _m, *, incident=None: None,
     )
     assert result2 is True                                        # capsule -> one bounded re-loop
     # The capsule reaches the agent (appended/merged into the trailing user turn).
@@ -616,12 +706,18 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: solved)
     replacement = _run_task_acceptance_review_once(
         tools=tools2, content="revised", task_id="t-blocked", task_type="task",
-        llm_trace=trace2, drive_root=None, messages=messages2, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace2, drive_root=tmp_path, messages=messages2, emit_progress=lambda _m, *, incident=None: None,
     )
-    assert replacement is False
+    assert replacement is True
     assert trace2["review_runs"][0]["superseded_by_revision"] is True
     assert trace2["review_runs"][0]["superseded_reason"] == "atomically_replaced_by_host_root_review"
     assert trace2["review_runs"][1]["authority"] == "host_root"
+    expose_acceptance_feedback(trace2, messages2, "t-blocked")
+    assert _run_task_acceptance_review_once(
+        tools=tools2, content="revised", task_id="t-blocked", task_type="task",
+        llm_trace=trace2, drive_root=tmp_path, messages=messages2, emit_progress=lambda _m, **_kw: None,
+    ) is False
+    assert len(trace2["review_runs"]) == 2
     tools2._ctx._task_acceptance_reviewed = False
 
     # If the revised answer is accepted, the terminal decision overwrites the
@@ -629,11 +725,17 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     trace_ok = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages_ok = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     _seed_acceptance_root(tmp_path, "t-ok", tools2._ctx)
+    _nominate_acceptance(trace_ok, task_id="t-ok", subject="revised")
     result_ok = _run_task_acceptance_review_once(
         tools=tools2, content="revised", task_id="t-ok", task_type="task",
-        llm_trace=trace_ok, drive_root=None, messages=messages_ok, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace_ok, drive_root=tmp_path, messages=messages_ok, emit_progress=lambda _m, *, incident=None: None,
     )
-    assert result_ok is False
+    assert result_ok is True
+    expose_acceptance_feedback(trace_ok, messages_ok, "t-ok")
+    assert _run_task_acceptance_review_once(
+        tools=tools2, content="revised", task_id="t-ok", task_type="task",
+        llm_trace=trace_ok, drive_root=tmp_path, messages=messages_ok, emit_progress=lambda _m, **_kw: None,
+    ) is False
     assert trace_ok["acceptance_decision"]["status"] == "accepted"
     tools2._ctx._task_acceptance_reviewed = False
 
@@ -643,11 +745,12 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
     trace3 = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
     messages3 = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     _seed_acceptance_root(tmp_path, "t-blocked-alt", tools2._ctx)
+    _nominate_acceptance(trace3, task_id="t-blocked-alt", subject="revised again")
     result3 = _run_task_acceptance_review_once(
         # A changed candidate creates a fresh binding; an unchanged candidate
         # must reuse the already-paid host panel under the v6.65 contract.
         tools=tools2, content="revised again", task_id="t-blocked-alt", task_type="task",
-        llm_trace=trace3, drive_root=None, messages=messages3, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace3, drive_root=tmp_path, messages=messages3, emit_progress=lambda _m, *, incident=None: None,
     )
     assert result3 is True  # each new outcome may reach its author, including the last paid cycle
     assert "review_feedback" in messages3[-1]
@@ -682,6 +785,7 @@ def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch,
     _seed_acceptance_root(tmp_path, "t", ctx)
     # A blocked commit attempt: is_error False, but structured status is "blocked".
     trace = {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "status": "blocked"}]}
+    _nominate_acceptance(trace, task_id="t", subject="done")
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
 
     _run_task_acceptance_review_once(
@@ -690,7 +794,7 @@ def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch,
         task_id="t",
         task_type="task",
         llm_trace=trace,
-        drive_root=None,
+        drive_root=tmp_path,
         messages=messages,
         emit_progress=lambda _m, *, incident=None: None,
     )
@@ -700,6 +804,7 @@ def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch,
     # A genuinely landed commit (status "ok") DOES surface the committed HEAD.
     captured.clear()
     trace_ok = {"tool_calls": [{"tool": "commit_reviewed", "is_error": False, "status": "ok"}]}
+    _nominate_acceptance(trace_ok, task_id="t", subject="done")
     ctx._task_acceptance_reviewed = False
     _run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx),
@@ -707,7 +812,7 @@ def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch,
         task_id="t",
         task_type="task",
         llm_trace=trace_ok,
-        drive_root=None,
+        drive_root=tmp_path,
         messages=messages,
         emit_progress=lambda _m, *, incident=None: None,
     )

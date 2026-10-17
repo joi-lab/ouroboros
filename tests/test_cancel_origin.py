@@ -46,7 +46,7 @@ def test_cascade_origin_links_the_child_to_its_cancelled_root(qenv, monkeypatch)
         write_task_result(qenv.drive, task["id"], "scheduled")
     cancel_intents.request_cancel(qenv.drive, "root", source="http_cascade", scope="cascade")
 
-    assert qenv.tl.cancel_task_by_id("root", cascade=True)
+    assert qenv.tl.cancel_task_by_id("root")
 
     root = load_task_result(qenv.drive, "root")
     child = load_task_result(qenv.drive, "child")

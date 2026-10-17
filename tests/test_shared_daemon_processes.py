@@ -484,7 +484,6 @@ def test_launcher_forced_stop_passes_retained_subtree(monkeypatch):
     monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
     monkeypatch.setattr(launcher, "kill_process_tree", lambda proc, **kw: calls.append((proc.pid, kw)))
     monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
-    monkeypatch.setattr(launcher, "_kill_stale_on_port", lambda *a: None)
     launcher.stop_agent()
     assert calls == ["graceful", (9990011, {"exclude_pids": {9990022}})]
 
@@ -495,11 +494,11 @@ def test_recorded_server_cleanup_preserves_daemon_exclusions(tmp_path, monkeypat
     path.write_text(json.dumps({"pid": 9990011, "pgid": 0}))
     calls = []
     monkeypatch.setattr(launcher, "_server_process_record_path", lambda: path)
-    monkeypatch.setattr(launcher, "_server_process_identity_matches", lambda row: True)
+    monkeypatch.setattr(launcher, "_recorded_server_identity", lambda row: "ours")
     monkeypatch.setattr(launcher, "_retained_shared_daemon_pids", lambda: {9990022})
-    monkeypatch.setattr(launcher, "pid_is_alive", lambda pid: True)
+    monkeypatch.setattr(launcher, "pid_provably_gone", lambda pid: bool(calls))  # gone once its tree was killed
     monkeypatch.setattr(launcher, "kill_pid_tree", lambda pid, **kw: calls.append((pid, kw)))
-    launcher._cleanup_recorded_server_process()
+    assert launcher._cleanup_recorded_server_process() == []
     assert calls == [(9990011, {"exclude_pids": {9990022}})]
     assert not path.exists()
 

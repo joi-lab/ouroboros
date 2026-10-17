@@ -13,7 +13,9 @@ def test_schedule_and_integration_describe_the_three_write_surfaces():
     assert "including uncommitted work" in description
     assert "external_workspace write directly to the SHARED" in description
     assert "without reapplying" in description
-    assert "Harness-delegated work uses a private snapshot" in description
+    assert "Acting harness work uses a private snapshot" in description
+    assert "non-acting Agent session keeps configured access" in description
+    assert "do not call integrate_delegated_patch to apply or reject" in description
     assert "the project directory IS the deliverable" in description
     prop = schedule["parameters"]["properties"]["write_surface"]
     assert "native children write shared files directly" in prop["description"]

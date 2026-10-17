@@ -1,4 +1,4 @@
-"""One session-owned historical seal audit after mandatory startup recovery.
+"""Explicit historical seal audit (owner CLI or rebuild job), never automatic at boot.
 
 The audit is diagnostic, O(history), and uses the unchanged monetary/archive
 owners in a separate interpreter. It cannot hold server readiness or the GIL.
@@ -20,6 +20,56 @@ import time
 _REPORT_BYTES = 4096
 
 
+def spawn_maintenance_job(data_root, repo_dir, purpose):
+    """The audit and packer share session custody, a dedicated group and containment env."""
+    from ouroboros.config import SETTINGS_PATH
+    from ouroboros.process_containment import CONTAINMENT_ENV_PREFIX
+    from ouroboros.process_custody import current_custody_session_id, lifeline_parent_env, spawn_supervised
+
+    env = {key: os.environ[key] for key in (
+        "PATH", "HOME", "USERPROFILE", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
+    ) if key in os.environ}
+    # Dropping this token hides the descendant from test/Panic containment reaping.
+    env.update({key: value for key, value in os.environ.items() if key.startswith(CONTAINMENT_ENV_PREFIX)})
+    env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(repo_dir), OUROBOROS_DATA_DIR=str(data_root),
+               OUROBOROS_REPO_DIR=str(repo_dir), OUROBOROS_SETTINGS_PATH=str(SETTINGS_PATH), **lifeline_parent_env())
+    # Never share the server group: custody-publication failure kills this group.
+    return spawn_supervised(
+        [sys.executable, "-m", "ouroboros." + purpose, "--data-root", str(data_root),
+         "--custody-session", current_custody_session_id()],
+        drive_root=data_root, purpose=purpose, scope="session", cwd=str(repo_dir), env=env,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+
+
+def read_job_report(process, signal):
+    """Bounded IPC; overflow signals the captured child and the pipe always closes."""
+    try:
+        raw = process.stdout.read(_REPORT_BYTES + 1)
+        if len(raw) > _REPORT_BYTES:
+            signal(process)
+        return raw, process.wait()
+    finally:
+        process.stdout.close()
+
+
+def finish_maintenance_job(job, process, data_root, started, parse, record):
+    """Publish custody before rechecking Stop; owners retain report schemas and error policy."""
+    with job._lock:
+        job._process = process
+    if job._stopped.is_set():
+        job._signal(process)
+    record(data_root, phase="started", pid=process.pid)
+    raw, exit_code = read_job_report(process, job._signal)
+    fields = parse(raw)
+    phase = ("stopped" if job._stopped.is_set() else "unknown" if not fields
+             else "failed" if exit_code else fields.pop("status", "unknown"))
+    fields.pop("status", None)
+    record(data_root, phase=phase, exit_code=exit_code,
+           duration_seconds=time.monotonic() - started, **fields)
+    return fields
+
+
 class HistoricalAudit:
     def __init__(self):
         self._lock = threading.Lock()
@@ -33,7 +83,7 @@ class HistoricalAudit:
                 return
             self._launched = True
         # No filesystem, spawning or waiting under the state lock. Failure is
-        # terminal for this generation; ordinary next startup owns another pass.
+        # terminal for this invocation; a later explicit invocation may retry.
         try:
             threading.Thread(target=self._run, args=(Path(data_root), Path(repo_dir)),
                              name="startup-historical-audit", daemon=True).start()
@@ -65,56 +115,13 @@ class HistoricalAudit:
         })
 
     def _run(self, data_root, repo_dir):
-        from ouroboros.config import SETTINGS_PATH
-        from ouroboros.process_custody import current_custody_session_id, spawn_supervised
-
         started = time.monotonic()
         try:
             if self._stopped.is_set():
                 self._record(data_root, "stopped")
                 return
-            from ouroboros.process_containment import CONTAINMENT_ENV_PREFIX
-            env = {key: os.environ[key] for key in (
-                "PATH", "HOME", "USERPROFILE", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL",
-            ) if key in os.environ}
-            # Containment membership is an env token every descendant inherits:
-            # a child that drops it is invisible to the container reap that a
-            # test fixture (or Panic) relies on to prove this data root quiet.
-            env.update({key: value for key, value in os.environ.items()
-                        if key.startswith(CONTAINMENT_ENV_PREFIX)})
-            env.update(PYTHONDONTWRITEBYTECODE="1", PYTHONPATH=str(repo_dir),
-                       OUROBOROS_DATA_DIR=str(data_root), OUROBOROS_REPO_DIR=str(repo_dir),
-                       OUROBOROS_SETTINGS_PATH=str(SETTINGS_PATH))
-            # Dedicated group by default: spawn_supervised kills the child's
-            # whole POSIX group when the custody record cannot be written, so
-            # sharing the server's group would let a custody-write failure
-            # SIGKILL the server and every sibling under it.
-            process = spawn_supervised(
-                [sys.executable, "-m", "ouroboros.startup_historical_audit", "--data-root", str(data_root),
-                 "--custody-session", current_custody_session_id()],
-                drive_root=data_root, purpose="startup_historical_audit", scope="session",
-                cwd=str(repo_dir), env=env,
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            )
-            with self._lock:
-                self._process = process
-            if self._stopped.is_set():
-                self._signal(process)
-            self._record(data_root, "started", pid=process.pid)
-            try:
-                raw = process.stdout.read(_REPORT_BYTES + 1)
-                if len(raw) > _REPORT_BYTES:
-                    self._signal(process)
-                exit_code = process.wait()
-            finally:
-                process.stdout.close()
-            fields = _report_fields(raw)
-            phase = ("stopped" if self._stopped.is_set() else
-                     "unknown" if not fields else
-                     "failed" if exit_code else fields.pop("status", "unknown"))
-            fields.pop("status", None)
-            self._record(data_root, phase, exit_code=exit_code,
-                         duration_seconds=time.monotonic() - started, **fields)
+            process = spawn_maintenance_job(data_root, repo_dir, "startup_historical_audit")
+            finish_maintenance_job(self, process, data_root, started, _report_fields, self._record)
         except Exception as exc:
             # Output has a closed, bounded schema. No raw exception, path or
             # archived payload can reach the parent diagnostic record.

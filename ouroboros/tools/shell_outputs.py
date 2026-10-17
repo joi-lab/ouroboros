@@ -43,7 +43,7 @@ from ouroboros.tool_access import (
     user_files_path_block_reason,
 )
 from ouroboros.utils import safe_relpath
-from ouroboros.workspace_executor import executor_ref_from_ctx
+from ouroboros.workspace_executor import BackendPathNoMatch, executor_ref_from_ctx
 from ouroboros.workspace_executor import map_backend_path as executor_map_backend_path
 from ouroboros.workspace_executor import map_backend_path_lexical as executor_map_backend_path_lexical
 
@@ -144,27 +144,22 @@ def _resolve_declared_output(
         return None, "empty output path"
     raw = pathlib.Path(text).expanduser()
     executor_ref = executor_ref_from_ctx(ctx)
-    if executor_ref is not None and is_absolute_path_text(text) and not text.startswith("~"):
-        try:
-            lexical_source = executor_map_backend_path_lexical(executor_ref, text)
-        except ValueError:
-            lexical_source = raw
-    elif is_absolute_path_text(text) or text.startswith("~"):
-        lexical_source = raw
-    else:
-        lexical_source = pathlib.Path(work_dir) / safe_relpath(text)
     # is_absolute_path_text (not Path.is_absolute) so a backend output path like
     # "/workspace/out.txt" maps through the executor on Windows too, where
     # Path.is_absolute() is False for drive-less roots.
     if executor_ref is not None and is_absolute_path_text(text) and not text.startswith("~"):
         try:
+            lexical_source = executor_map_backend_path_lexical(executor_ref, text)
             source = executor_map_backend_path(executor_ref, text)
-        except ValueError:
-            source = raw.resolve(strict=False)
+        except BackendPathNoMatch:  # Only a genuine no-match keeps the host spelling.
+            lexical_source, source = raw, raw.resolve(strict=False)
+        except ValueError as exc:
+            return None, f"declared output is not a usable backend path: {exc}"
     elif is_absolute_path_text(text) or text.startswith("~"):
-        source = raw.resolve(strict=False)
+        lexical_source, source = raw, raw.resolve(strict=False)
     else:
-        source = (pathlib.Path(work_dir) / safe_relpath(text)).resolve(strict=False)
+        lexical_source = pathlib.Path(work_dir) / safe_relpath(text)
+        source = lexical_source.resolve(strict=False)
     changed = changed_paths or set()
 
     # Deliverables may be configured inside the active workspace.  Check that

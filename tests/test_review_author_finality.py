@@ -143,7 +143,8 @@ def test_post_review_finish_handles_revised_answer_without_another_panel(monkeyp
                                drive_root=str(tmp_path), _owner_directives=[])
     _seed_acceptance_root(tmp_path, "author-root", tools_ctx)
     tools = SimpleNamespace(_ctx=tools_ctx)
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}}]}
+    # An observed write (its outcome recorded): Required reviews production, never a bare argument.
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "answer.txt"}, "is_error": False}]}
     messages = [{"role": "user", "content": "Solve the task."}]
     calls = []
     def panel(ctx):

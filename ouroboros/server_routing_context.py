@@ -4,6 +4,13 @@ Projections only: which root tasks a chat can steer, what a project's last
 result says about where its work lives, what the Main lane can see, and how a
 chat maps to a project. Nothing here delivers a message or picks a target —
 that judgment belongs to the decision turn (BIBLE P5).
+
+Main's manifest lists each project's registry ``working_dir`` and the last 20
+chat rows with text from every room (people's words whole, other rows
+truncated). Project rooms and Main read recent root results and live roots as
+bounded typed projections, never raw result text; a project's last result is
+found through the registry row's ``last_task_result_id`` pointer (stamped by
+roots only), with a bounded scan as fallback.
 """
 
 from __future__ import annotations
@@ -41,12 +48,14 @@ def _active_direct_roots(ctx: Any) -> list:
         with lock:
             turn = direct_chat_turn(entry.activity_id)
             if turn is not None:
+                from ouroboros.room_reader import is_reading
+                reader = is_reading(ctx.DRIVE_ROOT, turn["id"], turn, running=True)
                 roots.append({
                     "task_id": turn["id"], "status": "running",
                     "title": _clip_marked(turn.get("title"), 120),
                     "objective": _clip_marked(turn.get("text"), 600),
                     "project_id": turn["project_id"], "chat_id": turn["chat_id"],
-                    "started_at": turn["_started_at"], "steerable": True, "direct_chat": True,
+                    "started_at": turn["_started_at"], "steerable": True, "direct_chat": True, "room_reader": reader,
                 })
     return roots
 
@@ -60,7 +69,7 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
         tid = str(task_id or "").strip()
         if not tid or tid in seen or not isinstance(task_obj, dict):
             return
-        if task_obj.get("_is_direct_chat") or str(task_obj.get("delegation_role") or "") == "subagent":
+        if str(task_obj.get("delegation_role") or "") == "subagent":
             return
         if chat_id is not None and not _task_belongs_to_chat(ctx, tid, task_obj, int(chat_id or 0)):
             return
@@ -72,6 +81,9 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
 
         if (load_task_result(_task_drive_for_task(task_obj, tid), tid) or {}).get("status") in SETTLED_STATUSES:
             return
+        from ouroboros.room_reader import is_reading
+        reader = is_reading(_task_drive_for_task(task_obj, tid), tid, task_obj, running=status == "running",
+                            fences=getattr(ctx, "BUDGET_ROOT_FENCES", None))
         objective = str(
             task_obj.get("objective") or task_obj.get("description") or task_obj.get("text") or ""
         ).strip()
@@ -82,7 +94,7 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             "objective": _clip_marked(objective, 600),
             "project_id": str(task_obj.get("project_id") or ""),
             "started_at": started_at,
-            "steerable": True,
+            "steerable": True, "room_reader": reader,
         })
         seen.add(tid)
 
@@ -95,6 +107,9 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
         if isinstance(pending, dict):
             _add(pending.get("id"), pending, "pending", pending.get("queued_at"))
     for direct in _active_direct_roots(ctx):
+        if direct["task_id"] in seen and direct.get("room_reader"):
+            out[:] = [row for row in out if row["task_id"] != direct["task_id"]]
+            seen.discard(direct["task_id"])
         if direct["task_id"] not in seen and (
             chat_id is None or _task_belongs_to_chat(ctx, direct["task_id"], direct, chat_id)
         ):
@@ -116,7 +131,7 @@ def _clip_marked(value: str, limit: int) -> str:
 def _chat_running_tasks(ctx: Any, chat_id: int) -> list:
     """Structural snapshot of the owner's RUNNING root tasks in THIS chat (id +
     objective + recency). The decision turn reads this from runtime context to
-    pick a steer_task target by its own judgment — code only exposes the state,
+    pick a tell_task target by its own judgment — code only exposes the state,
     it never auto-chooses (BIBLE P5). Direct native roots are included;
     delegated subagents are not owner roots."""
     return [row for row in _addressable_root_tasks(ctx, chat_id) if row.get("status") == "running"]
@@ -159,6 +174,11 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
             "arguments": {"task_id": task_id, "include_authority": True},
         },
     }
+    if isinstance(row.get("promotion_admission"), dict):
+        from ouroboros.promotion_intent import promotion_intent_notice
+        out.update(promotion_admission=dict(row["promotion_admission"]),
+                   promotion_intent_available=bool(row.get("promotion_intent")),
+                   admission_notice=promotion_intent_notice(task_id, row))
     if git:
         out["workspace_git_at_start"] = {
             "head": str(git.get("head") or ""),
@@ -197,35 +217,32 @@ def _recent_root_results(ctx: Any, project_id: str = "") -> tuple:
     offered (owner decision batch 3, answer 6b=A): a swarm wave's children are the
     newest results of ANY kind, so they evicted the owner's own roots from this
     window - which is how a root the same actor had just read stopped being
-    offerable. The facts are already memoized, so both the filter and the count
-    cost no extra read. The count runs over the WHOLE candidate list, not inside
-    the capped loop: children older than the last shown root are skipped just the
-    same, and counting them only until the cap reported zero while folding them
-    into the cap's own number.
+    offerable. The typed columns answer both the filter and the count without a
+    body read. The count runs over the WHOLE candidate list, not inside the capped
+    loop: children older than the last shown root are skipped just the same, and
+    counting them only until the cap reported zero while folding them into the
+    cap's own number.
     """
-    from ouroboros.task_result_facts import raw_result_facts
     from ouroboros.runtime_limits import get_routing_manifest_result_rows
-    from ouroboros.task_results import load_task_result, task_results_dir
+    from ouroboros.store import StoreError
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_store import task_facts
 
     results_error = ""
     try:
-        facts, unreadable = raw_result_facts(task_results_dir(ctx.DRIVE_ROOT, create=False))
-    except OSError as exc:
-        facts, unreadable = {}, ["result_directory_unreadable"]
-        results_error = f"result_directory_unreadable: {exc}"
-    ordered = sorted(
-        facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True,
-    )
-    pool = [name for name in ordered if not project_id or facts[name]["project_id"] == project_id]
-    children = sum(
-        1 for name in pool if not facts[name]["schema_refusal"] and _is_child_result(facts[name])
-    )
+        facts = task_facts(ctx.DRIVE_ROOT, **({"where": "project_id=?", "params": (project_id,)} if project_id else {}))
+        unreadable = False
+    except StoreError as exc:
+        facts, unreadable = {}, True
+        results_error = f"result_store_unreadable: {exc}"
+    pool = sorted(facts, key=lambda task_id: facts[task_id]["ts"] or facts[task_id]["updated_at"], reverse=True)
+    children = sum(1 for task_id in pool if _is_child_result(facts[task_id]))
     cap = get_routing_manifest_result_rows()
     finals: list = []
-    for name in pool:
-        if facts[name]["schema_refusal"] or _is_child_result(facts[name]):
+    for task_id in pool:
+        if _is_child_result(facts[task_id]):
             continue
-        row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
+        row = load_task_result(ctx.DRIVE_ROOT, task_id)
         if row is not None:
             finals.append(_task_result_ground_truth(row))
         if len(finals) == cap:
@@ -258,7 +275,7 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     """The room's bounded HINT for a "continue this work" decision: the project's
     recent ROOT results and the roots still live in it, each with the small typed
     facts that separate the two choices - a settled root is promote's predecessor,
-    a live one is ``steer_task``.
+    a live one is ``tell_task``.
 
     A hint, never the door: promote's predicate admits any settled result, listed
     or not, of any project (ch. 10), so this window may be bounded without
@@ -292,31 +309,19 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
     last-result pointer: the hint offers roots only, ``_is_child_result``) WITHOUT replaying the whole
     store (DEVELOPMENT "Projection over replay"). The registry row's durable
     ``last_task_result_id`` pointer (stamped at project-task finalization) is
-    read FIRST — one direct file fetch, immune to how many newer foreign
-    results exist. Only when the pointer is absent or stale (missing/
-    unparseable/foreign file) does the fallback run: the bounded newest-64
-    mtime scan, then — for pre-pointer projects only — a disclosed full scan
-    of the store (the lazy self-heal for rows finalized before the pointer
-    existed; with zero matching results nothing is written back, so it repeats
-    per lookup until a matching result exists). The order is TOTAL: newest
-    mtime first with the file name as the stable tie-break, and — because
-    results finalized within one clock tick share an mtime — the first match's
-    whole equal-mtime group is read to its end (across the 64-entry window,
-    which bounds the SEARCH, not the group) and the durable ``ts`` decides
-    inside it (``updated_at`` when ``ts`` is absent, the task id last). A file
-    whose stat or JSON could not be read is answered around best-effort for
-    the call but blocks the pointer write-back (it might be the newer result).
-    Only the ABSENT-pointer case
-    writes the pointer back: a non-empty pointer that failed to resolve is
-    usually a split-drive result in flight (finalization stamps the pointer
-    before the canonical copy-back lands), so overwriting it from the scan
-    would permanently regress it to an older result — serve the scan hit and
-    let the pointer resolve itself. The steady state needs no
-    ouroboros/context_budget.py threshold enrollment (that table guards
-    recurring full-store replays)."""
+    read FIRST — one indexed row read, immune to how many newer foreign
+    results exist. Only when the pointer is absent or stale (missing/foreign
+    row) does the fallback run: the project's root rows newest first by the
+    durable ``ts`` (``updated_at`` when ``ts`` is absent, the task id last), read
+    in that order until the first that is not a promote's emitted stub. Only the
+    ABSENT-pointer case writes the pointer back: a non-empty pointer that failed
+    to resolve is usually a split-drive result in flight (finalization stamps
+    the pointer before the canonical copy-back lands), so overwriting it from
+    the scan would permanently regress it to an older result — serve the scan
+    hit and let the pointer resolve itself."""
     from ouroboros.projects_registry import get_project, update_project
-    from ouroboros.task_results import load_task_result, task_results_dir
-    from ouroboros.utils import read_json_dict
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_store import ROOT_RESULT_WHERE, newest_ids
 
     try:
         pointer = str((get_project(ctx.DRIVE_ROOT, project_id) or {}).get(
@@ -334,54 +339,14 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
             "falling back to the bounded scan", project_id, pointer,
         )
 
-    def _stamp(path: Any) -> Optional[float]:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return None  # unreadable stat: ordered last, member of no tie group
-
-    def _order(item: Dict[str, Any]) -> tuple:
-        # Inside an equal-mtime group the DURABLE `ts` decides (`updated_at`
-        # stands in when `ts` is absent); the task id is the deterministic last
-        # resort for equal keys (a stable choice, not a semantic one).
-        return (str(item.get("ts") or item.get("updated_at") or ""), str(item.get("task_id") or item.get("id") or ""))
-
-    stamped = [(_stamp(path), path) for path in task_results_dir(ctx.DRIVE_ROOT, create=False).glob("*.json")]
-    # A file whose stat or JSON cannot be read might be this project's newer
-    # result: the scan still answers best-effort for THIS call, but such
-    # uncertainty must never be frozen into the durable pointer.
-    uncertain = any(mtime is None for mtime, _ in stamped)
-    # Newest first; unreadable last; the name keeps equal mtimes contiguous
-    # and the whole order deterministic.
-    stamped.sort(key=lambda item: (item[0] is None, -(item[0] or 0.0), item[1].name))
     row = None
-    for index, (mtime, path) in enumerate(stamped):
-        if index == 64:
-            log.info(
-                "project last-task-result: %r missed the bounded scan; running the "
-                "full-store self-heal scan (%d files)", project_id, len(stamped),
-            )
-        candidate = read_json_dict(path)
-        if candidate is None:
-            uncertain = True
-            continue
-        if str(candidate.get("project_id") or "") != project_id or _not_a_root_result(candidate):
+    for task_id in newest_ids(ctx.DRIVE_ROOT, where=f"project_id=? AND {ROOT_RESULT_WHERE}", params=(project_id,)):
+        candidate = load_task_result(ctx.DRIVE_ROOT, task_id)
+        if candidate is None or _not_a_root_result(candidate):
             continue
         row = candidate
-        # The match's whole equal-mtime group is read to its end — across the
-        # 64-entry window too, which bounds the SEARCH and never cuts a group
-        # whose order the mtime cannot settle.
-        for tied_mtime, tied in stamped[index + 1:]:
-            if mtime is None or tied_mtime != mtime:
-                break
-            other = read_json_dict(tied)
-            if other is None:
-                uncertain = True
-            elif (str(other.get("project_id") or "") == project_id and not _not_a_root_result(other)
-                  and _order(other) > _order(row)):
-                row = other
         break
-    if row is not None and not pointer and not uncertain:
+    if row is not None and not pointer:
         try:
             update_project(ctx.DRIVE_ROOT, project_id, last_task_result_id=str(
                 row.get("task_id") or row.get("id") or ""))
@@ -391,9 +356,16 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
 
 
 def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
-    """Bounded canonical facts for one Main-chat LLM routing decision."""
+    """Bounded canonical facts for one Main-chat LLM routing decision.
+
+    Its recent dialogue is the last 20 rows with text from every room, each in the
+    one rendering memory gives a chat row (``render_row_text``: a quiz answer is
+    ``chose (N) <label>`` and the owner's comment, never the question framed before
+    them): people's words ride whole, every other row under the disclosed bound."""
+    from ouroboros.dialogue_provenance import render_row_text, row_author
     from ouroboros.gateway._helpers import read_rotated_jsonl_entries
     from ouroboros.projects_registry import list_projects
+    from ouroboros.utils import truncate_within_limit
 
     projects = [{
         "project_id": str(row.get("id") or ""),
@@ -415,13 +387,13 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         max_archives=2, include_gaps=True,
     )
     for row in rows:
-        text = str(row.get("text") or "").strip()
+        text = render_row_text(row).strip() if str(row.get("text") or "").strip() else ""
         if text:
             dialogue_rows.append({
                 "ts": str(row.get("ts") or ""),
                 "direction": str(row.get("direction") or ""),
                 "chat_id": row.get("chat_id", 1),
-                "text": _clip_marked(text, 500),
+                "text": text if row_author(row)["kind"] == "human" else truncate_within_limit(text, 500),
                 "task_id": str(row.get("task_id") or ""),
                 "client_message_id": str(row.get("client_message_id") or ""),
             })
@@ -446,11 +418,17 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
 
 def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task_metadata: Any) -> Any:
     """Enrich a chat turn's metadata with the structural facts the decision turn
-    needs: the RUNNING tasks in THIS chat (so it can steer_task the right one
+    needs: the RUNNING tasks in THIS chat (so it can tell_task the right one
     instead of spawning a duplicate) and the originating message id (for idempotent
     steer delivery). P5-clean: surfaces state only; the agent picks the target by
-    judgment among answer / steer_task / promote_chat_to_task / route_to_project."""
+    judgment among answer / tell_task / start_task / move_to_project."""
     md = dict(task_metadata) if isinstance(task_metadata, dict) else {}
+    try:  # a fact like the manifests below: its failure never holds back the owner's message
+        from ouroboros.live_works import live_works_present
+        md["live_works_present"] = live_works_present(ctx.DRIVE_ROOT)
+    except Exception:
+        log.warning("Unable to build the live-works present", exc_info=True)
+        md["live_works_present"] = {"error": "live_works_present_unavailable"}
     addressable_here = _addressable_root_tasks(ctx, chat_id)
     running_here = [row for row in addressable_here if row.get("status") == "running"]
     project_id = str(md.get("project_id") or "").strip() or _project_id_for_registered_chat(
@@ -471,7 +449,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         log.warning("Unable to build Main routing manifest", exc_info=True)
         main_manifest = {"error": "routing_manifest_unavailable"} if is_main_lane else {}
     if not addressable_here and not client_message_id and not main_manifest:
-        return task_metadata
+        return md
     if addressable_here:
         md["current_chat"] = {
             "chat_id": int(chat_id or 0),
@@ -496,46 +474,13 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
             log.warning("Unable to build the project routing manifest", exc_info=True)
     if client_message_id:
         md["client_message_id"] = client_message_id
-    option_roots = (
-        list(main_manifest.get("root_tasks") or [])
-        if is_main_lane and isinstance(main_manifest, dict)
-        else addressable_here
-    )
-    manual_options = [
-        {
-            "action": "steer_task",
-            "task_id": row["task_id"],
-            "status": row["status"],
-            "title": row.get("title") or row.get("objective"),
-            "project_id": str(row.get("project_id") or ""),
-        }
-        for row in option_roots
-        if isinstance(row, dict) and row.get("task_id")
-    ]
-    if is_main_lane and isinstance(main_manifest, dict):
-        manual_options.extend({
-            "action": "new_task_in_project",
-            "project_id": str(row.get("project_id") or ""),
-            "project_name": str(row.get("name") or row.get("project_id") or "Project"),
-            "label": f"New task in {str(row.get('name') or 'Project')}",
-        } for row in list(main_manifest.get("projects") or []) if isinstance(row, dict))
-    elif project_id:
-        manual_options.append({
-            "action": "new_task_in_project",
-            "project_id": project_id,
-            "label": "New task in Project",
-        })
     routing_contract = {
         "llm_first": True,
         "source_lane": "main" if is_main_lane else "project",
         "valid_actions": [
-            "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project",
-            "needs_manual_target",
+            "answer_inline", "tell_task", "start_task", "move_to_project",
         ],
-        "on_uncertain_or_invalid_target": "needs_manual_target",
-        "manual_options": manual_options,
     }
-    routing_contract["manual_target_tool"] = {"name": "route_to_project", "project_id": ""}
     receipt = _message_routing_receipt(ctx, client_message_id)
     if receipt:
         # DISCLOSURE, not a gate (owner decision B5=A): one owner message became a
@@ -550,7 +495,7 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
             routing_contract["message_routing_acts"] = acts
             routing_contract["message_routing_acts_note"] = (
                 "Recorded routing acts already taken for THIS owner message, oldest first. "
-                "Facts, not a ban: another act stays your choice.")
+                "Each receipt identifies the work and its recorded outcome.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -573,30 +518,21 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
 
     Read from the annotation the routing rail already writes, so no new store and no
     new reader: the decision turn simply sees what was already decided for the same
-    message. Fail-soft - a missing or torn annotations file leaves the turn exactly
-    as it was.
+    message (a promote's or route's status from its admission, as every reader shows
+    it: ``routing_wait.routing_act_fields``). Fail-soft - a missing or torn
+    annotations file leaves the turn exactly as it was.
     """
     if not client_message_id:
         return {}
     try:
         from ouroboros.project_dialogue import latest_chat_annotations
+        from ouroboros.routing_wait import routing_act_fields
 
         row = latest_chat_annotations(ctx.DRIVE_ROOT).get(str(client_message_id)) or {}
+        return routing_act_fields(pathlib.Path(ctx.DRIVE_ROOT), str(client_message_id), row) if row else {}
     except Exception:
         log.debug("message routing receipt lookup failed", exc_info=True)
         return {}
-    return _receipt_fields(row) if row else {}
-
-
-def _receipt_fields(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "action": str(row.get("action") or ""),
-        "target": str(row.get("target") or ""),
-        "target_label": str(row.get("target_label") or ""),
-        "status": str(row.get("status") or ""),
-        "ts": str(row.get("ts") or ""),
-        "project_id": str(row.get("project_id") or ""),
-    }
 
 
 def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
@@ -608,22 +544,24 @@ def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
     """
     try:
         from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+        from ouroboros.routing_wait import routing_act_fields
 
+        root = pathlib.Path(ctx.DRIVE_ROOT)
         rows = [row for (message_id, _token), row in _latest_annotations_by_token(
-            pathlib.Path(ctx.DRIVE_ROOT) / "logs" / _ANNOTATIONS_NAME).items()
-            if message_id == str(client_message_id)]
+            root / "logs" / _ANNOTATIONS_NAME).items() if message_id == str(client_message_id)]
+        return [routing_act_fields(root, str(client_message_id), row)
+                for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
     except Exception:
         log.debug("message routing acts lookup failed", exc_info=True)
         return []
-    return [_receipt_fields(row) for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:
     """Bind a chat frame's task_metadata to the thread's project via chat_id (the
     SSOT). A registered project chat scopes to its OWN project, overriding any
     client-supplied project_id; a non-project chat DROPS an untrusted client
-    project_id (work is scoped to a project only via the promote_chat_to_task tool,
-    never a raw ws frame). Prevents a stale/malformed frame (chat_id A + project_id
+    project_id (work placement uses durable binding, never a raw ws frame).
+    Prevents a stale/malformed frame (chat_id A + project_id
     B) from rendering in A while loading/writing project B's memory."""
     if project_id:
         return {**(task_metadata or {}), "project_id": project_id}

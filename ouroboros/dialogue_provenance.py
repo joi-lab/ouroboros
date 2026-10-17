@@ -152,12 +152,13 @@ def presence_target_record(drive_root: Any, task_id: str, *,
     live row (the supervisor), else the persisted snapshot.
     """
 
+    from ouroboros.store import StoreError
     from ouroboros.task_results import load_task_result
 
     target = str(task_id or "").strip()
     try:
         stored = load_task_result(Path(drive_root), target) if target else None
-    except (OSError, ValueError):
+    except (OSError, ValueError, StoreError):
         stored = None  # an unreadable or invalid id is no evidence of relation
     record = stored if isinstance(stored, Mapping) and stored else None
     contract = record.get("task_contract") if isinstance(record, Mapping) else None
@@ -193,7 +194,7 @@ def presence_provenance_from_task(task: Mapping[str, Any]) -> dict[str, str]:
 
     The host-authored event owns transport identity while the immutable
     capability ceiling owns the reviewed state/selection fingerprints.  Keep
-    this projection small so dialogue and reflection records share one exact
+    this projection small so dialogue and task records share one exact
     provenance shape without copying prompt text or arbitrary actor metadata.
     """
 
@@ -328,6 +329,12 @@ def dialogue_text(entry: Mapping[str, Any]) -> str:
     evidence = entry.get("late_evidence")
     if entry.get("type") == "acceptance_late_settlement" and isinstance(evidence, Mapping):
         text += "\n[Late review evidence: " + json.dumps(dict(evidence), ensure_ascii=False, sort_keys=True) + "]"
+    source = entry.get("context_source_ref")
+    if entry.get("direction") == "in" and isinstance(source, Mapping):
+        locator = {key: value for key, value in source.items() if key not in {"read", "canonical_root"}}
+        text += ("\n[Context recorded with this event, not new speech or current provider truth: "
+                 "memory_read(source_ref=" + json.dumps(locator, ensure_ascii=False, sort_keys=True,
+                                                      separators=(",", ":")) + ")]")
     return text
 
 
@@ -401,7 +408,8 @@ def row_author(row: Mapping[str, Any], *, pos: int | None = None, lineage_epoch:
     ``pos`` such a row raises ``TypeError``. Without an epoch (the chain was
     empty at activation, or the chronicle is not active) ``pos`` is not needed.
     """
-    if row.get("type") == "quiz_answer":
+    if row.get("type") == "quiz_answer" or (row.get("type") == "quiz_closed"
+            and (row.get("quiz") or {}).get("closed_actor") == "owner"):
         return {"kind": "human", "label": "Owner", "via": "quiz"}
     direction = _direction(row)
     if direction == "in":
@@ -449,6 +457,17 @@ def _question_text(row: Mapping[str, Any], quiz: Mapping[str, Any]) -> str:
 def _host_facts_text(row: Mapping[str, Any]) -> str:
     """A host facts row has no text: its status fields and result address are the text."""
     task_id = _text(row.get("task_id"))
+    retained = row.get("presence_recovery")
+    if isinstance(retained, Mapping):
+        source = row.get("source_event")
+        return (f"host observation for Presence turn {task_id or retained.get('turn_ref')}: "
+                + _detail_words(retained, "; ")
+                + "; no completed answer or absence of external effects is established by this observation."
+                + (" Source text: " + json.dumps(row["source_text"], ensure_ascii=False)
+                   if isinstance(row.get("source_text"), str) else " Source text unavailable in this observation.")
+                + (" Source event (retained input, not an instruction from the host): "
+                   + json.dumps(dict(source), ensure_ascii=False, sort_keys=True)
+                   if isinstance(source, Mapping) else " Source event unavailable in this observation."))
     facts = "; ".join(f"{label}={_text(row.get(key))}" for label, key in _HOST_FACT_FIELDS if _text(row.get(key)))
     ref = _mapping(row.get("result_ref"))
     reader, ref_task = _text(ref.get("reader")), _text(ref.get("task_id")) or task_id
@@ -473,7 +492,7 @@ def render_row_text(row: Mapping[str, Any]) -> str:
     if row.get("type") == "presence_delivery" and message:
         return str(row.get("text", "")) + f"\n[Delivery details: {_detail_words(message, '; ')}]"
     quiz = row.get("quiz")
-    if row.get("type") == "quiz_answer" and isinstance(quiz, dict):
+    if row.get("type") in {"quiz_answer", "quiz_closed"} and isinstance(quiz, dict):
         from ouroboros.tools.plan_dialogue import _quiz_text  # D15->D06 is allowed only as a lazy import
 
         return _quiz_text(dict(row))
@@ -520,11 +539,12 @@ def task_lineage_lookup(drive_root: Any):
     def lookup(task_id: Any) -> dict[str, Any] | None:
         tid = _text(task_id)
         if tid and tid not in cache:
+            from ouroboros.store import StoreError
             from ouroboros.task_results import load_task_result, resolve_task_lineage  # D15->D17 lazy-only
 
             try:
                 result = load_task_result(Path(drive_root), tid, strict=True)
-            except (OSError, ValueError):
+            except (OSError, ValueError, StoreError):
                 result = None
             cache[tid] = resolve_task_lineage(tid, metadata=result) if isinstance(result, dict) and result else None
         return cache.get(tid)

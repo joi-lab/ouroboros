@@ -176,6 +176,7 @@ class Memory:
     def __init__(self, drive_root: pathlib.Path, repo_dir: Optional[pathlib.Path] = None):
         self.drive_root = drive_root
         self.repo_dir = repo_dir
+        self._logs: Dict[str, pathlib.Path] = {}
 
     def _memory_path(self, rel: str) -> pathlib.Path:
         return (self.drive_root / "memory" / rel).resolve()
@@ -186,7 +187,8 @@ class Memory:
     def world_path(self) -> pathlib.Path: return self._memory_path("WORLD.md")
     def journal_path(self) -> pathlib.Path: return self._memory_path("scratchpad_journal.jsonl")
     def identity_journal_path(self) -> pathlib.Path: return self._memory_path("identity_journal.jsonl")
-    def logs_path(self, name: str) -> pathlib.Path: return (self.drive_root / "logs" / name).resolve()
+    def logs_path(self, name: str) -> pathlib.Path:  # once per instance: a resolve lstat's every component
+        return self._logs.get(name) or self._logs.setdefault(name, (self.drive_root / "logs" / name).resolve())
 
     @staticmethod
     def scratchpad_journal_source_ref(entry_id: str = "") -> Dict[str, Any]:
@@ -456,7 +458,7 @@ class Memory:
             try:
                 from ouroboros.world_profiler import generate_world_profile
 
-                generate_world_profile(str(self.world_path()))
+                generate_world_profile(str(self.world_path()), str(self.repo_dir or ""), str(self.drive_root))
             except Exception:
                 log.debug("Failed to generate WORLD.md during memory bootstrap", exc_info=True)
         for path in (self.journal_path(), self.identity_journal_path()):
@@ -719,36 +721,18 @@ class Memory:
     def _read_jsonl_entries(
         self,
         log_name: str,
-        max_entries: Optional[int] = None,
         exclude_a2a: bool = False,
     ) -> List[Dict[str, Any]]:
         path = self.logs_path(log_name)
         try:
-            def _rows(source, cap):
-                return [e for e in iter_jsonl_objects(source, max_entries=cap)
-                        if not (exclude_a2a and is_a2a_chat_id(e.get("chat_id")))]
-
-            entries = _rows(path, max_entries)
-            if max_entries is not None and len(entries) < max_entries:
-                # Rotation-aware backfill (CPL4-C2..C4): newest archive segments
-                # top a freshly rotated tail back up; unbounded reads keep
-                # live-file-only semantics (their consumers own their chains).
-                from ouroboros.utils import jsonl_archive_segments
-
-                for segment in reversed(jsonl_archive_segments(path)):
-                    if len(entries) >= max_entries:
-                        break
-                    entries = _rows(segment, max_entries - len(entries)) + entries
-            return entries
+            return [e for e in iter_jsonl_objects(path)
+                    if not (exclude_a2a and is_a2a_chat_id(e.get("chat_id")))]
         except Exception:
             log.warning("Failed to read JSONL entries from %s", log_name, exc_info=True)
             return []
 
-    def read_jsonl_tail(self, log_name: str, max_entries: int = 100) -> List[Dict[str, Any]]:
-        return self._read_jsonl_entries(log_name, max_entries=max_entries)
-
     def read_task_recent(
-        self, log_name: str, task_id: str, want: int, *, iter_objects=None, list_archives=None,
+        self, log_name: str, task_id: str, want: int, *, iter_objects=None, list_archives=None, stat=None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """The newest ``want`` rows of ONE task (or of the log when ``task_id`` is
         empty) through the bounded rotation-aware reader (razzant/ouroboros#131);
@@ -760,8 +744,8 @@ class Memory:
         for its tail. ``coverage`` states what the window was and whether the
         quota went unmet while older archives stayed unopened (BIBLE P1: the
         section discloses it; ``read_file`` on the log pages the rest).
-        ``iter_objects`` and ``list_archives`` are the reader's parser and
-        archive-listing seams, passed through unchanged.
+        ``iter_objects``, ``list_archives`` and ``stat`` are the reader's parser,
+        archive-listing and metadata seams, passed through unchanged.
         """
         from ouroboros.jsonl_tail import read_rotated_jsonl_entries
         from ouroboros.tool_call_log import counts_as_call, logical_calls
@@ -784,7 +768,7 @@ class Memory:
             rows = read_rotated_jsonl_entries(
                 self.logs_path(log_name), self.drive_root / "archive", stem,
                 max(1, int(want)), counts, coverage=coverage,
-                iter_objects=iter_objects, list_archives=list_archives,
+                iter_objects=iter_objects, list_archives=list_archives, stat=stat,
             )
         except Exception:
             log.warning("Failed to read recent %s rows", log_name, exc_info=True)

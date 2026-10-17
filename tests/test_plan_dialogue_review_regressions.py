@@ -1,21 +1,20 @@
-"""Real native preparation and typed replay boundaries found by review."""
+"""Real native preparation of a plan ask, found by review: a native seat's first request
+leaves room for a real inspection, an owner's model choice is resolved before the dialogue
+is fitted, the room snapshot is an observed (never a required) source, and the reply object
+of a plan ask's native participant is read whole, with no extraction send."""
 from __future__ import annotations
 
 from dataclasses import replace
-import json
-from types import SimpleNamespace
 
 import pytest
 
-from tests.test_plan_review_engine import harness as _harness, _call, _state, CLEAN, _finding
-from tests.test_plan_review_reconciliation import _collect, _install_barrier_substrate
+from tests._review_substrate_shared import user_text as _user_text
+from tests.test_plan_task_tool import CLEAN, _write, harness  # noqa: F401 — `harness` is the fixture
 from ouroboros.utils import append_jsonl
-
-harness = _harness
 
 
 @pytest.mark.parametrize('large', [False, True])
-def test_native_first_request_has_room_for_a_real_inspection(harness, monkeypatch, large):
+def test_native_first_request_has_room_for_a_real_inspection(harness, monkeypatch, large):  # noqa: F811
     from ouroboros import reviewer_window
     from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
     from ouroboros.review_execution import ReviewAssignment
@@ -23,12 +22,13 @@ def test_native_first_request_has_room_for_a_real_inspection(harness, monkeypatc
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    harness.state['slots'] = [replace(harness.state['slots'][0], subagent_id='native-reader')]
+    harness.state['slots'] = [replace(harness.state['slots'][0], subagent_id='native-reader',
+                                      native_retrieval_override=True)]
     monkeypatch.setattr(reviewer_window, 'reviewer_context_window', lambda *a, **kw: 200_000)
     append_jsonl(harness.drive / 'logs/chat.jsonl', {'direction': 'out', 'chat_id': 1,
                  'text': 'Discussion and tradeoffs. ' * (50000 if large else 10)})
     substrate = harness.install({'s1': CLEAN})
-    _call(ctx)
+    _write(ctx, ask='council')
     request, slot = substrate.calls[0]['request'], substrate.calls[0]['slots'][0]
     llm = _ScriptedLLM([{'tool_calls': [_tool_call('read_file', {'path': 'notes.md'})]}, {'content': CLEAN}])
     result = NativeToolRoundReviewExecutor(ReviewAssignment(request=request, slot=slot,
@@ -37,9 +37,13 @@ def test_native_first_request_has_room_for_a_real_inspection(harness, monkeypatc
     assert result.usage['native_tool_receipts'][0]['path'] == 'notes.md'
     if large:
         assert 'exact omitted prefix' in request.slot_session_tasks[slot.slot_id]
+    else:
+        assert 'exact omitted prefix' not in request.slot_session_tasks[slot.slot_id]
 
 
-def test_owner_model_override_is_resolved_before_dialogue_fit(harness, monkeypatch):
+def test_owner_model_override_is_resolved_before_dialogue_fit(harness, monkeypatch):  # noqa: F811
+    from types import SimpleNamespace
+
     from ouroboros import model_wait, reviewer_window
     from ouroboros.review_execution import _messages_char_count
 
@@ -53,99 +57,12 @@ def test_owner_model_override_is_resolved_before_dialogue_fit(harness, monkeypat
     append_jsonl(harness.drive / 'logs/chat.jsonl', {'direction': 'out', 'chat_id': 1,
                  'text': 'Earlier explanations. ' * 30000})
     substrate = harness.install({'s1': CLEAN})
-    _call(ctx)
+    _write(ctx, ask='council')
     assert len(substrate.calls) == 1 and substrate.calls[0]['slots'][0].model == 'm/small'
     assert _messages_char_count(substrate.calls[0]['request'].slot_messages['s1']) < 200000
 
 
-def test_missing_historical_policy_is_a_typed_collection_failure(harness, monkeypatch):
-    from ouroboros.task_results import record_plan_review_wave
-    from ouroboros.tools.plan_review_artifacts import persist_wave, read_wave, authority_wave
-
-    calls = []
-    _install_barrier_substrate(monkeypatch, calls)
-    ctx = harness.make_ctx()
-    _call(ctx)
-    first = _state(harness)['waves'][-1]
-    exact = read_wave(harness.drive, ctx.task_id, first['wave_artifact'])
-    exact.pop('request_policy')
-    exact.pop('slot_prompt_chars')
-    hot = {**first, 'wave_artifact': persist_wave(harness.drive, ctx.task_id, exact)}
-    hot.pop('request_policy', None)
-    hot.pop('slot_prompt_chars', None)
-    record_plan_review_wave(harness.drive, ctx.task_id, hot)
-    before = _state(harness)['cycles_paid']
-    text = _collect(ctx, first['request_fingerprint'])
-    assert 'PLAN_REVIEW_SOURCE_UNAVAILABLE' in text
-    assert len(calls) == 1 and _state(harness)['cycles_paid'] == before
-    after = authority_wave(harness.drive, ctx.task_id, _state(harness)['waves'][-1])
-    assert 'request_policy' not in after
-
-
-def test_paid_same_author_retry_discloses_its_recorded_snapshot(harness, monkeypatch):
-    from ouroboros.tools import plan_review
-    from tests.test_plan_review_epoch import _patch_health
-
-    _patch_health(monkeypatch, lambda slots: {})
-    monkeypatch.setattr(plan_review, '_plan_review_slots', lambda default_effort='': [
-        replace(slot, effort=default_effort or slot.effort, declared_effort=default_effort)
-        for slot in harness.state['slots']])
-    substrate = harness.install({'s1': json.dumps([_finding('n', 'blocking', breaks='claim_1')]),
-                                  's2': CLEAN, 's3': CLEAN})
-    ctx = harness.make_ctx()
-    ctx.current_chat_id = 1
-    append_jsonl(harness.drive / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1, 'text': 'First words'})
-    _call(ctx, reviewer_effort='low')
-    first = _state(harness)['waves'][-1]
-    append_jsonl(harness.drive / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1, 'text': 'Later clarification'})
-    output = _call(ctx, reviewer_effort='max')
-    second = _state(harness)['waves'][-1]
-    assert len(substrate.calls) == 2 and _state(harness)['cycles_paid'] == 2
-    assert first['dialogue_source_ref'] == second['dialogue_source_ref']
-    assert 'Later messages are not claimed reviewed' in output
-    assert first['dialogue_source_ref']['sha256'] in output
-
-
-def test_paid_lost_only_wave_at_cap_uses_existing_exhausted_exit(harness, monkeypatch):
-    from ouroboros import review_substrate
-    from ouroboros.task_results import plan_review_gate_projection
-    from tests.test_plan_review_engine import DECK_SPEC
-
-    monkeypatch.setenv('OUROBOROS_REVIEW_MAX_CYCLES', '1')
-    sends = []
-    def missing(request, **kwargs):
-        sends.append(request.reconcile_only)
-        return SimpleNamespace(actors=[])
-    monkeypatch.setattr(review_substrate, 'run_review_request', missing)
-    ctx = harness.make_ctx()
-    _call(ctx)
-    state = _state(harness)
-    assert state['cycles_paid'] == 1 and state['waves'][-1]['custody_pending']
-    result = _call(ctx, spec={**DECK_SPEC, 'in_scope': ['A revised plan']})
-    assert 'PLAN_REVIEW_CYCLES_EXHAUSTED' in result
-    state = _state(harness)
-    assert state['cycles_paid'] == 1 and sends == [False]
-    assert state['waves'][-1]['custody_pending'] is True
-    assert {actor['operation_state'] for actor in state['waves'][-1]['actors']} == {'custody_lost'}
-    gate = plan_review_gate_projection(state, 'blocking')
-    assert gate['allow'] and gate['status'] == 'cycles_exhausted'
-
-
-@pytest.mark.parametrize('paid,cycles,actors', [
-    (False, 0, [{'operation_state': 'custody_lost'}]),
-    (True, 1, []), (True, 1, [{}]), (True, 1, [None]),
-    (True, 1, [{'operation_state': 'custody_lost'}, {'operation_state': 'in_flight'}]),
-    (False, 0, [{'operation_state': 'pending_dispatch'}]),
-])
-def test_uncertain_or_running_panels_keep_committed_capacity(paid, cycles, actors):
-    from ouroboros.tools.plan_review_collect import in_flight_hold
-
-    state = {'cycles_paid': cycles, 'current_attempt': {'fingerprint': 'original'},
-             'waves': [{'request_fingerprint': 'original', 'custody_pending': True, 'paid': paid, 'actors': actors}]}
-    assert in_flight_hold(state, fingerprint='revised', cap=1)
-
-
-def test_native_first_send_carries_no_required_source_manifest_for_the_room(harness):
+def test_native_first_send_carries_no_required_source_manifest_for_the_room(harness):  # noqa: F811
     """The room snapshot is an OBSERVED source for sessions only: a native episode's first
     send names no required-source manifest, so it is never told to read the multi-MB
     snapshot and no capability delta is filed for not doing so."""
@@ -154,13 +71,70 @@ def test_native_first_send_carries_no_required_source_manifest_for_the_room(harn
 
     ctx = harness.make_ctx()
     ctx.current_chat_id = 1
-    harness.state['slots'] = [replace(harness.state['slots'][0], subagent_id='native-reader')]
+    harness.state['slots'] = [replace(harness.state['slots'][0], subagent_id='native-reader',
+                                      native_retrieval_override=True)]
     append_jsonl(harness.drive / 'logs/chat.jsonl', {'direction': 'out', 'chat_id': 1, 'text': 'Discussion and tradeoffs.'})
     substrate = harness.install({'s1': CLEAN})
-    _call(ctx)
+    _write(ctx, ask='council')
     request, slot = substrate.calls[0]['request'], substrate.calls[0]['slots'][0]
     assert request.policy['observed_sources'][0]['root'] == 'artifact_store' and 'native_required_sources' not in request.policy
     executor = NativeToolRoundReviewExecutor(ReviewAssignment(request=request, slot=slot, call_id='native-observed'))
     _registry, _schemas, messages, _size = executor._open_episode(str(harness.workspace), harness.drive)
-    assert 'Required source manifest' not in messages[-1]['content']
-    assert 'Discussion and tradeoffs.' in messages[-1]['content']
+    text = _user_text(messages[-1]['content'])
+    assert 'Required source manifest' not in text
+    assert 'Discussion and tradeoffs.' in text
+
+
+def test_a_native_participants_reply_object_is_read_whole_without_extraction(harness):  # noqa: F811
+    """The real organ request on the real native executor: the participant's reply object
+    reaches the record whole and no third (extraction) send is made — the scripted third
+    entry is what an obedient light model would return for a findings-array contract."""
+    from ouroboros.review_execution import ReviewAssignment
+    from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
+    from ouroboros.tools import plan_ask
+    from tests.test_native_tool_round_executor import _ScriptedLLM, _tool_call
+
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    harness.state['slots'] = [replace(harness.state['slots'][0], subagent_id='native-reader',
+                                      native_retrieval_override=True)]
+    substrate = harness.install({'s1': CLEAN})
+    _write(ctx, ask='council')
+    request, slot = substrate.calls[0]['request'], substrate.calls[0]['slots'][0]
+    llm = _ScriptedLLM([{'tool_calls': [_tool_call('read_file', {'path': 'notes.md'})]}, {'content': CLEAN},
+                        {'content': '[]'}])
+    result = NativeToolRoundReviewExecutor(ReviewAssignment(request=request, slot=slot,
+                        call_id='native-reply-shape'), llm=llm).execute()
+    facts = plan_ask.reply_facts_from_row(plan_ask._actor_row(
+        {'raw_text': result.raw_text, 'status': 'ok', 'usage': result.usage}, slot))
+    assert len(llm.calls) == 2
+    assert facts['status'] == 'answered' and facts['reply']['prose'] == 'Looks sound to me.'
+
+
+def test_an_ask_delivers_the_full_dialogue_and_acceptance_keeps_its_directive_ledger(harness):  # noqa: F811
+    """The complete planning dialogue (no display cap) reaches a packet participant, secrets
+    redacted and a relayed peer named by its provenance; acceptance keeps its own ledger of
+    the owner's directives."""
+    from ouroboros.owner_mailbox import write_task_message
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    ctx = harness.make_ctx()
+    ctx.current_chat_id = 1
+    ctx._owner_directives = [{"source": "initial_user", "content": "Build the deck", "msg_id": "t:1"}]
+    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "in", "chat_id": 1,
+                 "text": "Build the deck; key sk-abcdefghijklmnopqrstuvwxyz1234"})
+    append_jsonl(harness.drive / "logs" / "chat.jsonl", {"direction": "out", "chat_id": 1,
+                 "text": "Option A is faster but less flexible. " + "detail " * 6000})
+    write_task_message(harness.drive, "Proposal from sibling: use a different format", task_id=ctx.task_id,
+                       source_task_id="parent-9", provenance="peer_via_ancestor", relayed_from_task_id="sibling-7")
+    substrate = harness.install({'s1': CLEAN, 's2': CLEAN, 's3': CLEAN})
+    _write(ctx, ask='council')
+    packet = "".join(_user_text(m["content"]) for m in substrate.calls[0]["request"].slot_messages["s1"]
+                     if m.get("role") == "user")
+    assert "## OWNER REQUIREMENTS AND DECISIONS" not in packet
+    assert "Option A is faster but less flexible. " + "detail " * 6000 in packet
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in packet
+    assert "from task sibling-7, relayed by ancestor parent-9" in packet
+    rows = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=harness.drive,
+                                          task_id=ctx.task_id)["owner_requirements_and_decisions"]
+    assert rows[0]["content"] == "Build the deck"

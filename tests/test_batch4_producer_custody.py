@@ -35,6 +35,13 @@ def _registry(tmp_path, monkeypatch, backend=None):
     return registry, queue, workers
 
 
+def _owned(root):
+    """Executor records the ownership set names, as the exit reads them."""
+    from ouroboros import workspace_executor as executor
+
+    return executor._owned_process_records(root, "foreground") + executor._owned_process_records(root, "service")
+
+
 def _consumers(tmp_path, registry, queue, workers, held):
     from ouroboros.model_sleep import cold_blockers, request_sleep
     from ouroboros.owner_pause import read_fence
@@ -109,8 +116,6 @@ def _docker(monkeypatch, *, code=0, backend="completed", no_start=False, timeout
                                            (0, "running"), (7, "completed"), (0, "completed"),
                                            (-9, "completed"), (0, "probe_failed"), (0, "completed\nextra")])
 def test_docker_client_exit_requires_backend_evidence(tmp_path, monkeypatch, code, backend):
-    from ouroboros import workspace_executor as executor
-
     registry, queue, workers = _registry(tmp_path, monkeypatch, "docker_exec")
     calls = _docker(monkeypatch, code=code, backend=backend)
     result = registry.execute_result("run_command", {"cmd": ["backend-writer"]})
@@ -118,7 +123,7 @@ def test_docker_client_exit_requires_backend_evidence(tmp_path, monkeypatch, cod
     assert result.meta["exit_code"] == code
     assert result.meta.get("operation_outcome") == ("unknown" if held else "completed")
     assert [kind for kind, _ in calls] == ["start", "probe"] + ([] if held else ["probe"])
-    records = list(executor._iter_process_records(tmp_path))
+    records = list(_owned(tmp_path))
     assert len(records) == int(held)
     if held:
         assert records[0][1]["container_name"] == "test-container"
@@ -138,17 +143,19 @@ def test_measured_local_nonzero_is_completed(tmp_path, monkeypatch, backend):
 
 @pytest.mark.parametrize("service", [False, True])
 def test_docker_popen_no_start_is_positive_no_effect(tmp_path, monkeypatch, service):
-    from ouroboros import workspace_executor as executor
-
     registry, queue, workers = _registry(tmp_path, monkeypatch, "docker_exec")
     calls = _docker(monkeypatch, no_start=True)
     args = {"cmd": ["backend-writer"]}
     if service:
         args["name"] = "writer"
     result = registry.execute_result("start_service" if service else "run_command", args)
-    assert result.meta.get("operation_outcome") == "completed_no_effect", result
+    if service:
+        assert result.meta["process_not_started"] is True
+        assert "operation_outcome" not in result.meta  # a replacement may have retired its old instance
+    else:
+        assert result.meta.get("operation_outcome") == "completed_no_effect", result
     assert [kind for kind, _ in calls] == ["start"]
-    assert not list(executor._iter_process_records(tmp_path))
+    assert not list(_owned(tmp_path))
     _consumers(tmp_path, registry, queue, workers, False)
 
 
@@ -180,12 +187,12 @@ def test_joined_git_error_does_not_survive_corrected_retry(tmp_path, monkeypatch
     monkeypatch.setattr(git, "run_cmd", unknown)
     result = registry.execute_result("vcs_diff", {"root": "active_workspace"})
     assert result.code == "GIT_ERROR" and not result.meta.get("operation_outcome")
-    claim = load_task_result(tmp_path, "root")["launch_handoffs"]
+    claim = load_task_result(tmp_path, "root").get("launch_handoffs", {})
     assert claim == {}
     monkeypatch.setattr(git, "run_cmd", lambda *_a, **_kw: "")
     registry.execute_result("vcs_diff", {"root": "active_workspace", "head": "HEAD"})
     registry.execute_result("vcs_diff", {"root": "active_workspace"})
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == claim
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == claim
     _consumers(tmp_path, registry, queue, workers, False)
 
 
@@ -226,7 +233,7 @@ def test_docker_timeout_with_unreadable_backend_keeps_launch_custody(tmp_path, m
     assert result.status in {"error", "timeout"}
     assert not result.meta.get("operation_outcome")
     if not service:
-        assert len(executor._iter_process_records(tmp_path)) == 1
+        assert len(_owned(tmp_path)) == 1
     _consumers(tmp_path, registry, queue, workers, True)
 
 
@@ -234,8 +241,6 @@ def test_docker_timeout_with_unreadable_backend_keeps_launch_custody(tmp_path, m
 @pytest.mark.skipif(os.name != "posix", reason="Exercises the POSIX backend wrapper through local sh")
 def test_backend_wrapper_wait_fact_is_read_through_local_shell(tmp_path, monkeypatch, code):
     """Run the real wrapper/probe scripts locally; no daemon or Docker CLI."""
-    from ouroboros import workspace_executor as executor
-
     registry, queue, workers = _registry(tmp_path, monkeypatch, "docker_exec")
     real_popen = subprocess.Popen
     calls = []
@@ -249,7 +254,7 @@ def test_backend_wrapper_wait_fact_is_read_through_local_shell(tmp_path, monkeyp
     assert result.meta.get("operation_outcome") == "completed", result
     assert result.meta["exit_code"] == code and len(calls) == 3
     assert list(tmp_path.glob("owned-*.pid")) == []
-    assert not executor._iter_process_records(tmp_path)
+    assert not _owned(tmp_path)
     _consumers(tmp_path, registry, queue, workers, False)
 
 
@@ -287,7 +292,7 @@ def test_backend_cleanup_requires_receipt_even_with_zero_cli_exit(monkeypatch, r
         subprocess.CompletedProcess(argv, 0, receipt, ""))
     assert executor._cleanup_docker_exec_timeout("simulated", "/tmp/owned.pid") is bool(receipt)
     record = {"container_name": "simulated", "backend_pidfile": "/tmp/owned.pid"}
-    assert executor._dispatch_docker_record_cleanup(record) is bool(receipt)
+    assert executor._kill_docker_record(record) is bool(receipt)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="Exercises backend receipt script through local sh")
@@ -318,7 +323,7 @@ def test_host_join_and_backend_cleanup_settle_timed_out_invocation(tmp_path, mon
     monkeypatch.setattr(executor, "kill_process_tree", lambda _proc: None)
     result = registry.execute_result("run_command", {"cmd": ["backend-writer"]})
     assert result.status == "timeout" and not result.meta.get("operation_outcome")
-    assert not executor._iter_process_records(tmp_path)
+    assert not _owned(tmp_path)
     _consumers(tmp_path, registry, queue, workers, False)
 
 

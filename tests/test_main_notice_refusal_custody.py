@@ -85,8 +85,8 @@ def test_refused_message_does_not_release_an_unrelated_unknown_operation(tmp_pat
         with tool_handoff(ctx, "unknown-external-effect"):
             with operation_start(ctx):
                 raise TimeoutError("a submitted effect has no terminal receipt")
-    before = load_task_result(tmp_path, "root")["launch_handoffs"]
+    before = load_task_result(tmp_path, "root").get("launch_handoffs", {})
     result = registry.execute_result("send_user_message", {"text": "Hello", "destination": "main"})
     assert result.meta["operation_outcome"] == "completed_no_effect"
-    assert load_task_result(tmp_path, "root")["launch_handoffs"] == before
+    assert load_task_result(tmp_path, "root").get("launch_handoffs", {}) == before
     assert any(row["kind"] == "tool_handoff" for row in conflicting_writers(task_queue, "root"))

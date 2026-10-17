@@ -42,7 +42,9 @@ def test_a_mutating_run_asks_for_a_scoped_home_and_a_read_only_one_does_not(tmp_
     # was applied, which only the run's own artifacts can say. Dropping this leaves the
     # nanny with `isolation: live` alone, the exact shape that reads as "confined".
     assert payload["scoped_home_requested"] is True, payload
-    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch)
+    # #1609: technical access alone decides the shape, so the read-only run is the one
+    # whose selected row captured `readonly`.
+    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch, access="readonly")
     assert "execution" not in request
     assert payload["scoped_home_requested"] is False, payload
 
@@ -65,7 +67,7 @@ def test_an_engine_without_the_marker_refuses_the_mutating_lane_and_keeps_the_re
     assert refusal["executor"] == "blocked", refusal
     # Read-only delegation sends no marker, so the same old daemon still serves it.
     request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch,
-                                        engine_version=CLAUDEXOR_MIN_VERSION)
+                                        engine_version=CLAUDEXOR_MIN_VERSION, access="readonly")
     assert payload["status"] == "started" and "execution" not in request
 
 
@@ -148,8 +150,13 @@ def test_the_two_floors_sit_at_the_measured_bands(engine, serves_read_only, admi
     if not admits_mutating:
         assert acting == "engine_rejects_delegated_marker"
     assert subagents.route_health(
-        stub, "some-route", subagents.delegated_run_shape(False))[0] == "", \
+        stub, "some-route", subagents.delegated_run_shape(False, "readonly"))[0] == "", \
         "read-only sends no marker, so no engine that can talk at all may lose the lane"
+    # #1609: a non-acting child that captured WRITABLE access is an evidence-only
+    # investigation, which carries the marker too — so it rides the mutating floor.
+    investigation = subagents.delegated_run_shape(False)
+    assert investigation.delegated and investigation.investigation
+    assert subagents.route_health(stub, "some-route", investigation)[0] == acting
 
 
 def test_asking_for_a_scoped_home_is_not_evidence_that_one_was_applied(tmp_path, monkeypatch):
@@ -245,7 +252,9 @@ def test_absence_of_the_artifact_is_no_evidence_and_a_read_only_run_is_never_fau
 
     cancelled = _isolation_stub(monkeypatch, run_dir=run_dir, effective_access="readonly")
     _write_attempt(run_dir, isolated=False, home_dir=str(home))
-    out = _waiting(tmp_path, monkeypatch, acting=False)
+    # #1609: the read-only run is one GRANTED readonly (a non-acting child that captured
+    # writable access is an investigation, which does ask for a scoped home).
+    out = _waiting(tmp_path, monkeypatch, acting=False, access="readonly")
     assert out["status"] == "progress", out
     assert cancelled == {}
 
@@ -287,7 +296,9 @@ def test_an_attempt_that_recorded_no_home_fact_is_not_a_containment_fault(tmp_pa
     # And a lone failed attempt on a live run is a task failure, not a containment fault.
     cancelled = _isolation_stub(monkeypatch, run_dir=(only := tmp_path / "run-2"))
     _write_failed_attempt(only, attempt="a01")
-    out = _waiting(tmp_path, monkeypatch)
+    live_case = tmp_path / "live-case"
+    live_case.mkdir()
+    out = _waiting(live_case, monkeypatch)
     assert out["status"] == "progress" and cancelled == {}, out
 
 
@@ -331,8 +342,10 @@ def test_the_relayed_result_never_claims_an_isolation_no_artifact_proves(tmp_pat
     claimed = _terminal_payload("run-1", detail, delegated_run_shape(True))["containment"]
     assert claimed["os_boundary"] == "" and claimed["verified"] is False, claimed
 
-    # A read-only run asked for nothing, so it claims nothing.
-    assert "containment" not in _terminal_payload("run-1", detail, delegated_run_shape(False))
+    # A read-only run asked for nothing, so it claims nothing (#1609: explicitly readonly;
+    # a writable investigation carries the marker and is judged like the mutating lane).
+    assert "containment" not in _terminal_payload("run-1", detail, delegated_run_shape(False, "readonly"))
+    assert _terminal_payload("run-1", detail, delegated_run_shape(False))["containment"] == claimed
 
 
 def test_a_run_with_no_os_boundary_is_disclosed_in_three_places_and_still_allowed(
@@ -458,7 +471,9 @@ def test_linux_shaped_run_is_disclosed_unconfined_with_the_engines_reason_not_ca
         unavailable_reason="no_boundary_mechanism_for_host: linux",
     )
     cancelled = _isolation_stub(monkeypatch, run_dir=run_dir)
-    out = _waiting(tmp_path, monkeypatch)
+    live_case = tmp_path / "unconfined-live-case"
+    live_case.mkdir()
+    out = _waiting(live_case, monkeypatch)
     assert out["reason"] == "home_isolation_not_applied", out
     assert cancelled["reason"] == "home_isolation_not_applied"
 
@@ -478,5 +493,6 @@ def test_the_child_is_told_its_boundary_is_a_request_and_not_a_fact(tmp_path, mo
     assert "sandboxed or confined" in instructions, instructions
     assert "Work as if there is no boundary" in instructions, instructions
 
-    request, _ = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch)
+    # #1609: the read-only child is the one whose selected row captured `readonly`.
+    request, _ = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch, access="readonly")
     assert "boundary" not in request["instructions"].lower(), request["instructions"]

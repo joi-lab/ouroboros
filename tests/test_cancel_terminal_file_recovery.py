@@ -1,5 +1,4 @@
 """Cancellation completes interrupted file publication before delivery and cleanup."""
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +6,7 @@ import pytest
 from ouroboros import cancel_intents, headless
 from ouroboros.task_results import load_task_result, write_task_result
 from tests._cancel_intents_shared import qenv, settled_off_loop  # noqa: F401
+from tests._store_shared import read_result, result_signature
 
 
 @pytest.fixture
@@ -83,6 +83,11 @@ def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkey
     with monkeypatch.context() as fault:
         fault.setattr(headless, "write_task_result", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk full")))
         assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_FAILED
+        assert not s.state["alive"], "the worker is already dead while file publication is unresolved"
+        from supervisor.events_runtime_controls import _drive_cancel_task_event
+
+        _drive_cancel_task_event({"task_id": s.task["id"]}, s.ctx)
+        assert s.sent == [], "cancel_task drives its intent without writing a chat notice"
     assert s.child.is_dir() and s.frames == [] and s.task["id"] in s.q.RUNNING
     assert cancel_intents.cancel_pending(s.drive, s.task["id"])
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
@@ -92,19 +97,49 @@ def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkey
     assert settled_off_loop(s.drive, s.task["id"], s.child)
 
 
+@pytest.mark.parametrize("cascade", [False, True])
+def test_owner_http_stop_over_a_dead_worker_retains_pending_intent(split, monkeypatch, cascade):
+    """A dead worker with unresolved file publication keeps its recorded Stop pending."""
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros.gateway.tasks import api_task_cancel
+
+    s = split
+    write_task_result(s.child, s.task["id"], "completed", result="Retained child answer")
+    write_task_result(s.drive, s.task["id"], "running")  # a settled row would be completion-wins
+    app = Starlette(routes=[Route("/api/tasks/{task_id}/cancel", api_task_cancel, methods=["POST"])])
+    app.state.drive_root = s.drive
+    with monkeypatch.context() as fault, TestClient(app) as client:
+        fault.setattr(headless, "write_task_result", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk full")))
+        response = client.post(f"/api/tasks/{s.task['id']}/cancel", json={"cascade": True} if cascade else {})
+    assert not s.state["alive"], "the worker is already dead while file publication is unresolved"
+    assert response.status_code == 202, response.text
+    intent = cancel_intents.active_intent(s.drive, s.task["id"])
+    assert response.json() == {
+        "ok": True, "task_id": s.task["id"], "cancel_state": "pending", "stop_policy": "immediate",
+        "request_id": intent["request_id"], "reason_code": "teardown_unconfirmed",
+        **({"cascade": True} if cascade else {}),
+    }
+    assert cancel_intents.cancel_pending(s.drive, s.task["id"])
+    assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
+    assert load_task_result(s.drive, s.task["id"])["result"] == "Retained child answer"
+
+
 def test_genuinely_ready_current_survives_cancel_byte_identical(split, monkeypatch):
     s = split
     write_task_result(s.child, s.task["id"], "completed", result="Accepted answer",
                       review_projection={"panels": [{"panel_id": "paid-PASS", "actors": []}]})
     assert not headless.prepare_terminal_task_files(s.drive, s.task)["error"]
     headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
-    before = (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes()
+    before = result_signature(s.drive, s.task["id"])
     write_task_result(s.child, s.task["id"], "completed", result="Stale replica")
     monkeypatch.setattr(headless, "prepare_terminal_task_files", lambda *_a: pytest.fail("accepted CURRENT recopied"))
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes() == before
-    assert json.loads(before)["result"] == "Accepted answer" and settled_off_loop(s.drive, s.task["id"], s.child)
+    assert result_signature(s.drive, s.task["id"]) == before
+    assert read_result(s.drive, s.task["id"])["result"] == "Accepted answer" and settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_reconciled_terminal_without_checkpoint_still_needs_real_file_adoption(split):

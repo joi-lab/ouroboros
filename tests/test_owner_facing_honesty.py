@@ -7,7 +7,6 @@ ground-truth probe guidance, and the decision-turn outcome contract."""
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -76,21 +75,8 @@ def test_truncation_floor_skips_marker_longer_than_savings():
     assert cut.startswith("z" * 500) and "OMISSION NOTE" in cut
 
 
-def test_reflection_marker_uses_canonical_format():
-    from ouroboros.reflection import _truncate_with_notice as reflect_cut
-
-    out = reflect_cut("q" * 9000, 100)
-    assert "OMISSION NOTE" in out and "[+" not in out
-
-
 def test_task_contract_preserves_complete_authority_fields():
-    import inspect
-
     from ouroboros.contracts import task_contract
-
-    source = inspect.getsource(task_contract)
-    assert "chars omitted)" not in source  # legacy marker retired
-    assert "OMISSION NOTE" not in source  # no hand-rolled marker copies remain
 
     intent = "intent-" + ("i" * 900) + "-tail"
     claim = "claim-" + ("c" * 700) + "-tail"
@@ -347,33 +333,9 @@ def test_runtime_has_no_disappeared_routing_actor_rules(tmp_path, obsolete_marke
     assert "promoted_task_toolset" not in section
 
 
-
-def test_system_prompt_separates_routing_annotation_from_final_reply():
-    system_prompt = (
-        Path(__file__).resolve().parents[1] / "prompts" / "SYSTEM.md"
-    ).read_text(encoding="utf-8")
-    normalized = " ".join(system_prompt.split())
-    assert "exactly ONE routing decision" in normalized
-    assert "A typed routing annotation is metadata" in normalized
-    assert "one self-contained final response" in normalized
-    assert "Requests to me get exactly ONE routing decision" in normalized
-    assert "host-admitted Presence observation may end silently" in normalized
-    assert "exactly ONE owner-visible outcome" not in normalized
-
-
 # ---------------------------------------------------------------------------
 # Round-1 adversarial-review fixes (v6.70.0)
 # ---------------------------------------------------------------------------
-
-def test_reflection_tiny_identifier_fields_get_hard_slice():
-    """A multi-line omission marker inside a one-line backlog value (kind=40,
-    priority=10) would be worse damage than the cut it discloses."""
-    from ouroboros.reflection import _truncate_with_notice as reflect_cut
-
-    out = reflect_cut("agenda_item_" + "k" * 200, 40)
-    assert out == ("agenda_item_" + "k" * 200)[:40]
-    assert "OMISSION NOTE" not in out
-
 
 def test_response_ref_projection_never_leaks_host_paths(tmp_path):
     """Feed the projection the REAL persist_call() return shape — nested refs
@@ -522,9 +484,9 @@ def test_not_found_error_self_locates_without_ancestor_hint(tmp_path):
     ctx = _ctx(tmp_path)
     out = tools_core._read_file(ctx, path="definitely/missing/file.py", root="system_repo")
     assert "NOT_FOUND" in out
-    # Owner decision 22a: resolved-path hint yes, nearest-ancestor walk no.
-    src = __import__("inspect").getsource(tools_core)
-    assert "nearest existing ancestor" not in src
+    # Owner decision 22a: the error names the resolved path and never walks to an existing ancestor.
+    assert "definitely/missing/file.py" in out.replace("\\", "/")
+    assert "ancestor" not in out.lower()
 
 
 def test_access_blocked_message_has_single_period(tmp_path):
@@ -535,32 +497,34 @@ def test_access_blocked_message_has_single_period(tmp_path):
     assert ".." not in error.replace("…", "")
 
 
-def test_promote_chat_description_carries_ground_truth_probe():
-    from ouroboros.tools.control import _PROMOTE_CHAT_DESCRIPTION
+def test_start_task_description_carries_ground_truth_probe():
+    from ouroboros.tools.control import _START_TASK_DESCRIPTION
 
-    assert "ground-truth its existence with one cheap probe" in _PROMOTE_CHAT_DESCRIPTION
-    assert "memory of past work is not evidence" in _PROMOTE_CHAT_DESCRIPTION
+    assert "ground-truth its existence with one cheap probe" in _START_TASK_DESCRIPTION
+    assert "memory of past work is not evidence" in _START_TASK_DESCRIPTION
 
 
 def test_degraded_owner_line_bounds_each_reason():
-    import inspect
+    from types import SimpleNamespace
 
-    # v7 L-B split: the degraded-owner-line writer lives with the host
-    # acceptance review owner; loop.py re-exports it.
-    from ouroboros import loop_acceptance_review as accept_mod
+    from ouroboros.loop_acceptance_review import _slot_cause_clause
 
-    src = inspect.getsource(accept_mod)
-    assert "more in the task result" in src  # overflow disclosure, not silence
-    # Bounded preview per cause via the shared primitive; full causes live in
-    # the structured decision record.
-    assert "truncate_review_artifact(str(r), limit=300)" in src
+    raw = "r" * 500
+    clause = _slot_cause_clause(SimpleNamespace(degraded_reasons=[raw] * 5))
+    assert clause.startswith(" Causes: ")
+    assert raw not in clause
+    assert clause.count("OMISSION NOTE") == 4
+    assert "(+1 more in the task result)" in clause
+    assert _slot_cause_clause(SimpleNamespace(degraded_reasons=[])) == ""
 
 
 def test_redaction_filter_ssot_is_observability():
+    """process_logging defines no filter of its own; the bootstrap attaches observability's
+    (tests/test_process_logging.py checks the attached class in a fresh interpreter)."""
     from ouroboros import process_logging
-    from ouroboros.observability import SecretRedactingLogFilter
 
-    assert process_logging.SecretRedactingLogFilter is SecretRedactingLogFilter
+    assert not [value for value in vars(process_logging).values()
+                if isinstance(value, type) and issubclass(value, logging.Filter)]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX pgrep/getuid semantics")
@@ -612,7 +576,6 @@ def test_native_chat_lane_has_no_ephemeral_entry_point():
     assert "ephemeral" not in inspect.signature(worker_chat_lane._run_chat_task).parameters
 
 
-
 def test_actor_records_carry_response_ref_end_to_end(tmp_path):
     """The substrate's own persistence path populates response_ref on actor
     records, and the projection surfaces its flat hash anchors."""
@@ -658,11 +621,3 @@ def test_affordance_map_carries_label_path_pairs(tmp_path):
     # The read-only orchestrator root is resolvable when visible to the profile.
     if "subagent_projects" in result.get("readonly_roots", []):
         assert paths.get("subagent_projects")
-
-
-def test_provider_terminal_notice_never_claims_unsupported_reroute():
-    import inspect
-    from ouroboros.loop_transport import provider_terminal_fallback_text
-
-    source = inspect.getsource(provider_terminal_fallback_text)
-    assert "same-model reroute" not in source

@@ -25,6 +25,7 @@ pytestmark = pytest.mark.serial
 def proof_env(monkeypatch):
     monkeypatch.setenv("OUROBOROS_PRE_PUSH_TESTS", "1")
     monkeypatch.setenv("OUROBOROS_PREFLIGHT_TEST_WORKERS", "2")
+    monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "3")  # nested slots: the workers case compares two real workers with three
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_TIMEOUT_SEC", raising=False)
     monkeypatch.delenv("OUROBOROS_PREFLIGHT_SERIAL", raising=False)
 
@@ -86,15 +87,6 @@ def test_env_skip_and_managed_force_share_one_proof_owner(tmp_path, monkeypatch,
     assert _proof_events(ctx.drive_root) == []
 
 
-def test_advisory_failure_does_not_borrow_main_physical_capture(monkeypatch):
-    from ouroboros.tools.preflight_review_run import _advisory_failure
-
-    monkeypatch.setattr("ouroboros.usage_accounting.last_physical_attempt_capture", lambda: SimpleNamespace(state="unresolved", provider_status_code=None))
-    result = _advisory_failure(RuntimeError("critic unavailable"), SimpleNamespace(failure_custody=lambda: {}))
-    assert result.usage["operation_state"] == "settled"
-    assert "physical_attempt_state" not in result.usage
-
-
 @pytest.mark.parametrize("setting", ["0", "1"])
 def test_actual_managed_proof_owner_reruns_after_commit(tmp_path, monkeypatch, setting, physical_passes):
     from tests.test_managed_review_subject import _managed_resolution_repo, _git
@@ -112,9 +104,9 @@ def test_actual_managed_proof_owner_reruns_after_commit(tmp_path, monkeypatch, s
         assert update_merge.record_managed_tests_proof(ctx) == ""
         assert not getattr(ctx, "_preflight_test_proof", None)
     assert git._managed_candidate_needs_proof(ctx)
-    result = git._advisory_and_tests_gate(
+    result = git._preflight_and_tests_gate(
         ctx, "managed candidate", 0,
-        classification_paths=["docs/note.md"], advisory_paths=None,
+        classification_paths=["docs/note.md"],
         skip_advisory_pre_review=True, skip_tests=True,
     )
     assert result is None and len(physical_passes) == 2  # one real parallel+serial suite
@@ -382,6 +374,18 @@ def test_scrubbed_owner_settings_do_not_change_test_workload(candidate, monkeypa
     monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", "low")
     monkeypatch.setenv("OPENAI_COMPATIBLE_BASE_URL", "http://unused.invalid")
     monkeypatch.setenv("PYTEST_ADDOPTS", "-k nothing")
+    assert before.covers(capture_preflight_test_subject(candidate.repo_dir))
+
+
+def test_free_memory_does_not_change_test_workload(candidate, monkeypatch):
+    """Memory admits workers at run time; the workload names the requested count."""
+    from ouroboros import test_parallelism as budget
+
+    gib = 1024 ** 3
+    monkeypatch.setattr(budget, "physical_memory", lambda: budget.MemorySnapshot(64 * gib, 48 * gib))
+    before = capture_preflight_test_subject(candidate.repo_dir)
+    monkeypatch.setattr(budget, "physical_memory", lambda: budget.MemorySnapshot(64 * gib, 7 * gib))
+    assert budget.worker_budget(os.cpu_count()) == 1  # the tight sample really admits fewer workers
     assert before.covers(capture_preflight_test_subject(candidate.repo_dir))
 
 

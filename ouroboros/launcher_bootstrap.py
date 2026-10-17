@@ -37,6 +37,70 @@ class BootstrapContext:
     hidden_run: Callable[..., Any]
     save_settings: Callable[[dict], None]
     log: Any
+    deps_timeout_sec: float = 240.0  # a new runtime venv installs the whole lock at once (runtime_venv)
+
+
+def checkout_sha(repo_dir: pathlib.Path) -> str:
+    """HEAD of the checkout, or "" when Git or the repository is unavailable (never a guess)."""
+    try:
+        shown = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), capture_output=True,
+                               text=True, encoding="utf-8", check=False)
+    except OSError:
+        return ""
+    return shown.stdout.strip() if shown.returncode == 0 else ""
+
+
+_LOADED_CHECKOUT_SHA = ""  # the checkout whose modules the launcher process imported (its first launch)
+
+
+def remember_loaded_checkout(repo_dir: pathlib.Path) -> str:
+    """Record once, at the launcher's first agent start, which commit its own modules came from."""
+    global _LOADED_CHECKOUT_SHA
+    _LOADED_CHECKOUT_SHA = _LOADED_CHECKOUT_SHA or checkout_sha(repo_dir)
+    return _LOADED_CHECKOUT_SHA
+
+
+def launcher_sources_changed(repo_dir: pathlib.Path, loaded_sha: str | None = None, *,
+                             bundle_dir: pathlib.Path | None = None) -> bool:
+    """True when the landed checkout changed a module the launcher process has loaded.
+
+    The launcher imports its helpers once; a body adoption (or any release) that
+    lands another version of them while the agent is down leaves that process
+    serving stale code, so its exit-42 branch re-executes the launcher exactly
+    then (the same move the seed-bundle first run makes). The comparison is the
+    checkout's own history, not the file system: the commit the launcher imported
+    from (``loaded_sha``, "" when unknown: never a relaunch) against the commit
+    that now serves, over the loaded modules' repository paths plus ``launcher.py``.
+    A packaged launcher loaded its modules from ``bundle_dir`` (PyInstaller names
+    them ``<pkg>/<module>.pyc`` or ``.py`` there); they count under their repository
+    paths. A path counts as named or resolved: a macOS app's bundle is
+    ``Contents/Frameworks``, whose ``<pkg>`` links into ``Contents/Resources``, so
+    there only the named path lies inside the bundle.
+    """
+    import sys
+
+    loaded_sha = _LOADED_CHECKOUT_SHA if loaded_sha is None else loaded_sha
+    head = checkout_sha(repo_dir)
+    if not loaded_sha or not head or head == loaded_sha:
+        return False
+    roots = [pathlib.Path(os.path.abspath(root)) for root in (repo_dir, bundle_dir) if root]
+    roots += [root.resolve() for root in roots]
+    loaded = {"launcher.py"}
+    for module in list(sys.modules.values()):
+        source = getattr(module, "__file__", None)
+        if not source:
+            continue
+        try:
+            named = pathlib.Path(os.path.abspath(source))
+            paths = (named, named.resolve())
+        except OSError:
+            continue
+        relative = next((path.relative_to(root) for path in paths for root in roots if path.is_relative_to(root)), None)
+        if relative is not None:
+            loaded.add((relative.with_suffix(".py") if relative.suffix == ".pyc" else relative).as_posix())
+    probe = subprocess.run(["git", "diff", "--quiet", loaded_sha, head, "--", *sorted(loaded)],
+                           cwd=str(repo_dir), capture_output=True, check=False)
+    return probe.returncode == 1
 
 
 def embedded_python_env(data_dir: pathlib.Path, base: dict[str, str] | None = None) -> dict[str, str]:
@@ -375,11 +439,30 @@ def _install_managed_repo(context: BootstrapContext, manifest: dict[str, Any], *
 
 
 def ensure_managed_repo(context: BootstrapContext) -> str:
-    """Ensure REPO_DIR is a managed git clone backed by the embedded bundle."""
+    """Ensure REPO_DIR is a managed git clone backed by the embedded bundle.
+
+    An existing directory without ``.git`` is archived under
+    ``data/archive/managed_repo`` before the first clone. A manifest mismatch on
+    a git checkout only refreshes the managed remote metadata; the checkout stays.
+    """
     manifest = load_bundle_manifest(context)
     if not context.repo_dir.exists():
         return _install_managed_repo(context, manifest, reason="missing")
     if not (context.repo_dir / ".git").exists():
+        from ouroboros.platform_layer import is_mount_point
+
+        try:
+            mounted = is_mount_point(context.repo_dir)
+        except OSError as exc:
+            raise RuntimeError(f"Cannot determine whether {context.repo_dir} is a mount point; "
+                               f"nothing was moved: {exc}") from exc
+        if mounted:
+            # Archiving renames the directory away, which a mount point refuses
+            # halfway through a cross-device copy: refuse before touching it.
+            raise RuntimeError(
+                f"{context.repo_dir} is a mount point without a checkout; nothing was moved. "
+                "Mount the volume at its parent directory so the first bootstrap can create "
+                "the repository inside it (docs/DEPLOYMENT.md).")
         return _install_managed_repo(context, manifest, reason="legacy-no-git")
     if not _repo_manifest_matches(context.repo_dir, manifest):
         _ensure_managed_remote(context, context.repo_dir, manifest)
@@ -430,7 +513,7 @@ def install_deps(context: BootstrapContext) -> bool:
             [context.embedded_python, "-m", "pip", "install",
              *pip_install_target_args(context.embedded_python), "-r", str(requirements)],
             env=embedded_python_env(context.data_dir),
-            timeout=240,
+            timeout=context.deps_timeout_sec,
             capture_output=True,
         )
     except Exception as exc:
@@ -524,7 +607,11 @@ def _per_skill_version_resync(
     *,
     drive_root: pathlib.Path | None = None,
 ) -> int:
-    """Re-seed only marker-owned native skills whose seed version changed."""
+    """Re-seed only marker-owned native skills whose seed version changed.
+
+    Payload drift at an equal manifest version is logged as a warning and the
+    installed files are kept; it never blocks.
+    """
     if not seed_dir.is_dir() or not native_root.is_dir():
         return 0
     upgraded = 0
@@ -601,7 +688,7 @@ def _stamp_native_seed_trust(
 ) -> None:
     """Hash-pin a native-trust review verdict for a launcher-seeded skill.
 
-    The payload bytes shipped through the repo commit gate (triad+scope), so a
+    The payload bytes shipped through the repo commit gate (its review wave), so a
     launcher-written native skill gets ``status=clean`` bound to the payload
     hash computed AFTER seeding (control files excluded from the hash). Any
     later edit flips the verdict stale exactly like an ordinary review.
@@ -1000,15 +1087,17 @@ def bootstrap_repo(context: BootstrapContext) -> bool:
         memory_dir.mkdir(parents=True, exist_ok=True)
         world_path = memory_dir / "WORLD.md"
         if not world_path.exists():
-            env = os.environ.copy()
-            env["PYTHONPATH"] = str(context.repo_dir)
+            # Roots ride the environment and the path argv (a quote in it cannot break the
+            # program text); the one-argument call also suits an older seed's profiler.
+            env = {**os.environ, "PYTHONPATH": str(context.repo_dir),
+                   "OUROBOROS_REPO_DIR": str(context.repo_dir), "OUROBOROS_DATA_DIR": str(context.data_dir)}
             context.hidden_run(
                 [
                     context.embedded_python,
                     "-c",
-                    f"import sys; sys.path.insert(0, '{context.repo_dir}'); "
-                    f"from ouroboros.world_profiler import generate_world_profile; "
-                    f"generate_world_profile('{world_path}')",
+                    "import sys; from ouroboros.world_profiler import generate_world_profile; "
+                    "generate_world_profile(sys.argv[1])",
+                    str(world_path),
                 ],
                 env=embedded_python_env(context.data_dir, env),
                 timeout=30,
@@ -1134,13 +1223,29 @@ def parse_launch_options(argv):
                         help="Automatic boot entry preserves an explicit Panic stop.")
     parser.add_argument("--host-update", type=pathlib.Path,
                         help="External host Python installer; also supports read-only --check.")
-    parser.add_argument("--seed-bundle", type=pathlib.Path, help="Keep immutable seed provenance while running an external host from source.")
+    parser.add_argument("--seed-bundle", type=pathlib.Path, help="Keep immutable seed provenance when relaunching from source; presentation is unchanged.")
+    parser.add_argument("--runtime-venv", type=pathlib.Path,
+                        help="Absolute path of a persistent venv the body and its dependencies run in.")
     # Desktop launchers may supply platform arguments (for example Finder's
     # process serial number). Retain their previously ignored behavior.
     options, _ = parser.parse_known_args(argv)
-    if (options.host_update is not None or options.seed_bundle is not None) and not options.no_ui:
-        parser.error("--host-update and --seed-bundle require --no-ui")
+    if options.host_update is not None and not options.no_ui:
+        parser.error("--host-update requires --no-ui")
     return options
+
+
+def source_handoff_argv(argv) -> list[str]:
+    """The argv a relaunch hands to the checkout's own launcher.
+
+    ``--runtime-venv`` was consumed here: the relaunch interpreter IS that venv, and
+    an older rollback launcher must not receive an option it never knew."""
+    handoff, items = [], iter(argv)
+    for item in items:
+        if item == "--runtime-venv":
+            next(items, None)  # its value
+        elif not str(item).startswith("--runtime-venv="):
+            handoff.append(item)
+    return handoff
 
 
 def automatic_launch_allowed(intent: str, data_dir: pathlib.Path, log: Any) -> bool:

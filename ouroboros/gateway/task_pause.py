@@ -22,7 +22,9 @@ from __future__ import annotations
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-from ouroboros.gateway._helpers import json_error, json_exception, request_json_or, run_sync_to_completion
+from ouroboros.gateway._helpers import (
+    json_error, json_exception, migrating_error, request_drive_root, request_json_or, run_sync_to_completion,
+)
 from ouroboros.task_results import validate_task_id
 
 _REQUEST_ID_MAX = 128
@@ -42,6 +44,8 @@ async def api_task_pause(request: Request) -> JSONResponse:
     if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > _REQUEST_ID_MAX:
         return json_error("request_id is required (a stable client-generated id, reused on retry)",
                           400, task_id=task_id, reason_code="request_id_required")
+    if migrating := await run_sync_to_completion(migrating_error, request_drive_root(request)):
+        return migrating  # P1: the Pause fence is a store row; 503 while the boot import owns the store
     try:
         from supervisor.owner_pause_control import request_owner_pause
 

@@ -3,7 +3,7 @@
 Whether a lost attempt's model/tool work and sends took effect is unproven — absent receipts,
 logs or ledger rows are no proof of no effect — so a retry of an event whose persisted row is
 RUNNING, INTERRUPTED or the reconciler's placeholder fails closed before any agent exists
-(``presence_attempt_outcome_unknown``; the Host answers 409 ``retry``) until a canonical terminal
+(``presence_attempt_outcome_unknown``; the Host answers 409 ``retained``) until a canonical terminal
 replays. An event with no running row of its own (an attempt that died before its running write,
 a turn thread that never started, another event) still runs, and a real terminal still replays.
 """
@@ -48,7 +48,6 @@ from ouroboros.task_results import (
     is_reconciled_presence_placeholder,
     load_task_result,
     reopen_reconciled_presence_placeholder,
-    task_result_path,
     write_task_result,
 )
 from ouroboros.task_status import execution_owner_record, reconcile_orphaned_running_tasks
@@ -56,6 +55,7 @@ from ouroboros.tools.presence import _finish_presence
 from ouroboros.utils import append_jsonl
 from tests.test_host_service_api import _seed_presence_behavior, _seed_token
 from tests.test_presence_runner import _admission, _event
+from tests._store_shared import result_signature
 
 _PRESENCE_METADATA = {"source": "presence", "presence": {"binding_id": "1" * 32, "delivery_reporting_version": 0}}
 _NOW = 1_800_000_000.0  # 2027-01-15T08:00:00Z, the fresh queue snapshot's own time
@@ -130,9 +130,9 @@ def test_reopen_moves_the_host_mark_aside_exactly_once(tmp_path, monkeypatch, st
                     "status_reconciled_from", "canonical_terminal_projection_origin"):
         assert cleared not in reopened
     # A running row is no placeholder: the transition cannot fire twice.
-    before = task_result_path(tmp_path, "orphan-turn").read_bytes()
+    before = result_signature(tmp_path, "orphan-turn")
     assert reopen_reconciled_presence_placeholder(tmp_path, "orphan-turn") is False
-    assert task_result_path(tmp_path, "orphan-turn").read_bytes() == before
+    assert result_signature(tmp_path, "orphan-turn") == before
 
 
 def _outcome_failure(tmp_path, monkeypatch):
@@ -159,9 +159,9 @@ def _non_presence_orphan(tmp_path, monkeypatch):
 @pytest.mark.parametrize("seed", [_outcome_failure, _ordinary_failure, _non_presence_orphan])
 def test_only_the_orphan_placeholder_of_a_presence_turn_reopens(tmp_path, monkeypatch, seed):
     task_id = seed(tmp_path, monkeypatch)
-    before = task_result_path(tmp_path, task_id).read_bytes()
+    before = result_signature(tmp_path, task_id)
     assert reopen_reconciled_presence_placeholder(tmp_path, task_id) is False
-    assert task_result_path(tmp_path, task_id).read_bytes() == before
+    assert result_signature(tmp_path, task_id) == before
     if seed is _ordinary_failure:
         assert _cached_result(tmp_path, task_id) is not None  # the model's own terminal replays
     elif seed is _outcome_failure:
@@ -212,13 +212,45 @@ def _chat_rows(drive_root):
     return [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
 
 
+def _attempt_body(row):
+    # Only the observation append receipt and its write timestamp may change.
+    return {key: value for key, value in (row or {}).items()
+            if key not in {"presence_recovery_recorded", "updated_at"}}
+
+
+def _recovery_rows(drive_root, task_id):
+    rows = [row for row in _chat_rows(drive_root)
+            if row.get("summary_id") == f"presence-retained:{task_id}"]
+    assert len(rows) <= 1
+    if rows:
+        row = rows[0]
+        assert (row["type"], row["summary_kind"], row["direction"], row["text"]) == (
+            "task_summary", "host_task_facts", "system", "")
+        assert row["outcome_final"] is False and row["outcome_authority"] == "retained_presence_observation"
+        facts = row["presence_recovery"]
+        assert facts["code"] == _OUTCOME_UNKNOWN and facts["turn_ref"] == task_id
+        assert row["status"] == facts["recorded_status"]
+        assert not {"outcome", "text", "ok"} & facts.keys()
+        stored = load_task_result(drive_root, task_id)
+        assert stored["presence_recovery_recorded"] == {"summary_id": row["summary_id"], "written_at": row["ts"]}
+        presence = (stored.get("metadata") or {}).get("presence") or {}
+        event = presence.get("event") or {}
+        assert row["source_event"] == event
+        assert facts["source_event_id"] == str(event.get("source_event_id") or "")
+        assert facts["conversation_key"] == str(event.get("conversation_key") or "")
+        if isinstance(presence.get("observed_text"), str):
+            assert row["source_text"] == presence["observed_text"]
+    return rows
+
+
 def _trace(drive_root, task_id, conversation_key=_event().conversation_key):
-    """What a refused retry must leave untouched: the turn's row, the conversation's pointer and dialogue."""
-    row, pointer = task_result_path(drive_root, task_id), _previous_turn_path(drive_root, conversation_key)
+    """Keep execution, pointer and dialogue exact apart from the checked observation receipt."""
+    pointer = _previous_turn_path(drive_root, conversation_key)
     chat_id = _stable_numeric_id("presence-conversation", conversation_key)
+    retained = _recovery_rows(drive_root, task_id)
     dialogue = [item for item in _chat_rows(drive_root)
-                if item.get("task_id") == task_id or item.get("chat_id") == chat_id]
-    return (row.read_bytes() if row.exists() else None, pointer.read_bytes() if pointer.exists() else None, dialogue)
+                if (item.get("task_id") == task_id or item.get("chat_id") == chat_id) and item not in retained]
+    return (_attempt_body(load_task_result(drive_root, task_id)), pointer.read_bytes() if pointer.exists() else None, dialogue)
 
 
 def _retry_kwargs(tmp_path, built, *, version=1, reply="Regenerated answer", **overrides):
@@ -234,15 +266,21 @@ def _retry_kwargs(tmp_path, built, *, version=1, reply="Regenerated answer", **o
 
 
 def _refused(kwargs):
-    """The typed refusal: the event stays with its transport, named by the turn it could not settle."""
+    """Retain unresolved custody by the original turn without another generation."""
+    task_id, root = _task_id(kwargs["admission"], kwargs["event"]), kwargs["drive_root"]
+    existing = load_task_result(root, task_id) or {}
+    signature = result_signature(root, task_id)
     with pytest.raises(PresenceTurnError) as raised:
         run_presence_turn(**kwargs)
-    assert (raised.value.code, raised.value.field, getattr(raised.value, "turn_ref", None)) == (
-        _OUTCOME_UNKNOWN, "source_event_id", _task_id(kwargs["admission"], kwargs["event"]))
+    assert (raised.value.code, raised.value.field, raised.value.turn_ref, raised.value.disposition) == (
+        _OUTCOME_UNKNOWN, "source_event_id", task_id, "retained")
+    assert len(_recovery_rows(root, task_id)) == 1
+    if existing.get("presence_recovery_recorded"):
+        assert result_signature(root, task_id) == signature
 
 
 def _assert_fails_closed(tmp_path, task_id, kwargs, built):
-    """Two retries, each refused before any agent exists, and neither leaves a trace to inherit."""
+    """Two refusals, one factual observation, no agent or inherited execution effects."""
     before = _trace(tmp_path, task_id, kwargs["event"].conversation_key)
     for _second in (False, True):  # a second retry is refused exactly like the first, never promoted
         _refused(kwargs)
@@ -267,7 +305,7 @@ def test_reconciled_turn_fails_closed_and_is_never_regenerated(tmp_path, monkeyp
     built: list = []
     _assert_fails_closed(tmp_path, task_id, _retry_kwargs(tmp_path, built, version=version), built)
     stored = load_task_result(tmp_path, task_id)
-    assert is_reconciled_presence_placeholder(stored) and stored == row  # never reopened, never moved aside
+    assert is_reconciled_presence_placeholder(stored) and _attempt_body(stored) == _attempt_body(row)  # never reopened, never moved aside
     assert "superseded_placeholder" not in stored
 
 
@@ -363,11 +401,12 @@ def _host_refused(response, task_id):
     body = response.json()
     assert response.status_code == 409 and body["ok"] is False and not body.get("text"), body
     assert (body["code"], body["disposition"], body["field"], body["turn_ref"]) == (
-        _OUTCOME_UNKNOWN, "retry", "source_event_id", task_id)
+        _OUTCOME_UNKNOWN, "retained", "source_event_id", task_id)
+    assert "outcome" not in body and body["delivery_reporting_version"] == 1
 
 
 @pytest.mark.parametrize("prior_send", [None, "delivered", "uncertain"])
-def test_host_retry_of_a_lost_turn_is_a_409_retry_never_a_rerun(tmp_path, monkeypatch, prior_send):
+def test_host_replay_of_a_lost_turn_is_retained_never_a_rerun(tmp_path, monkeypatch, prior_send):
     """Through POST /presence/turn: a lost v1 attempt, retries before and after the reconciler, a second
     retry — all refused, whatever the lost attempt's receipts said. Formerly the placeholder re-ran with
     the prior sends as context; a confirmed send, an unconfirmed one or none proves nothing about the rest."""
@@ -586,23 +625,20 @@ def test_a_lost_attempt_blocks_only_its_own_event(tmp_path, monkeypatch):
     """Another event of the same conversation has no running row of its own: it runs as a fresh turn,
     and neither touches the lost row nor unblocks it."""
     lost = _lose_attempt(tmp_path, monkeypatch, STATUS_RUNNING)
-    lost_row = task_result_path(tmp_path, lost["id"]).read_bytes()
+    lost_row = result_signature(tmp_path, lost["id"])
     built: list = []
     fresh_kwargs = _retry_kwargs(tmp_path, built, reply="Fresh answer")
     fresh_kwargs["event"] = replace(fresh_kwargs["event"], source_event_id="telegram:bot-1:43")
     fresh = run_presence_turn(**fresh_kwargs)
     assert fresh.text == "Fresh answer" and fresh.task_id != lost["id"] and len(built) == 1
-    assert task_result_path(tmp_path, lost["id"]).read_bytes() == lost_row
+    assert result_signature(tmp_path, lost["id"]) == lost_row
     built.clear()
     _assert_fails_closed(tmp_path, lost["id"], _retry_kwargs(tmp_path, built), built)
 
 
 @pytest.mark.parametrize("reconciled", [False, True])
-def test_a_refused_retry_asks_the_owner_once_and_never_the_correspondent(tmp_path, monkeypatch, reconciled):
-    """With the installation's bridge bound, the refusal raises one owner-side question: a second retry
-    does not repeat it, the correspondent's conversation never hears it, its once-stamp is the only row
-    change, and an event with no running row of its own asks nothing."""
-    from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
+def test_a_refused_retry_records_once_without_asking_owner_or_correspondent(tmp_path, monkeypatch, reconciled):
+    """Retain one source-backed observation without sending an owner question or correspondent text."""
     from supervisor import message_bus
 
     lost = _lose_attempt(tmp_path, monkeypatch, STATUS_RUNNING)
@@ -617,13 +653,12 @@ def test_a_refused_retry_asks_the_owner_once_and_never_the_correspondent(tmp_pat
     kwargs = _retry_kwargs(tmp_path, built)
     for _second in (False, True):
         _refused(kwargs)
-        assert built == [] and len(notices) == 1 and _trace(tmp_path, lost["id"])[2] == dialogue
-    args, meta = notices[0]
-    assert args[0] == WEB_UI_CHAT_ID != lost["chat_id"] and lost["id"] in args[1]
-    assert meta["system_type"] == "presence_recovery_required"
-    after, stamp = load_task_result(tmp_path, lost["id"]), {"presence_recovery_owner_notified", "updated_at"}
-    assert after["presence_recovery_owner_notified"] and is_reconciled_presence_placeholder(after) is reconciled
-    assert {k: v for k, v in after.items() if k not in stamp} == {k: v for k, v in before.items() if k not in stamp}
+        assert built == [] and notices == [] and _trace(tmp_path, lost["id"])[2] == dialogue
+    after = load_task_result(tmp_path, lost["id"])
+    assert _attempt_body(after) == _attempt_body(before)
+    assert is_reconciled_presence_placeholder(after) is reconciled
+    assert "presence_recovery_owner_notified" not in after
+    assert len(_recovery_rows(tmp_path, lost["id"])) == 1
 
     class Quiet:
         def handle_task(self, task):
@@ -632,7 +667,7 @@ def test_a_refused_retry_asks_the_owner_once_and_never_the_correspondent(tmp_pat
 
     fresh = run_presence_turn(**{**kwargs, "event": replace(kwargs["event"], source_event_id="telegram:bot-1:43"),
                                  "agent_factory": lambda **_kw: Quiet()})
-    assert fresh.outcome == "silent" and len(notices) == 1
+    assert fresh.outcome == "silent" and notices == []
 
 
 def test_rotation_between_the_lost_attempt_and_its_retry_keeps_prior_sends_unknown(tmp_path):
@@ -644,7 +679,7 @@ def test_rotation_between_the_lost_attempt_and_its_retry_keeps_prior_sends_unkno
     chat.rename(tmp_path / "archive" / "chat_20260528T000100.jsonl")  # the live generation rotated
     built: list = []
     _assert_fails_closed(tmp_path, task_id, _retry_kwargs(tmp_path, built), built)
-    assert not chat.exists() and _prior_sends(tmp_path, task_id) == (None, 0)
+    assert len(_recovery_rows(tmp_path, task_id)) == 1 and _prior_sends(tmp_path, task_id) == (None, 0)
 
 
 def test_a_second_refusal_after_the_rotation_keeps_the_count_unknown(tmp_path):
@@ -659,7 +694,7 @@ def test_a_second_refusal_after_the_rotation_keeps_the_count_unknown(tmp_path):
     kwargs = _retry_kwargs(tmp_path, built)
     for _attempt in ("A", "B"):
         _refused(kwargs)
-        assert built == [] and chat.read_bytes() == b"" and _prior_sends(tmp_path, task_id) == (None, 0)
+        assert built == [] and _chat_rows(tmp_path) == _recovery_rows(tmp_path, task_id) and _prior_sends(tmp_path, task_id) == (None, 0)
 
 
 def test_rejected_build_leaves_the_placeholder_and_the_next_retry_still_fails_closed(tmp_path, monkeypatch):
@@ -670,9 +705,9 @@ def test_rejected_build_leaves_the_placeholder_and_the_next_retry_still_fails_cl
     built: list = []
     kwargs = _retry_kwargs(tmp_path, built, version=0)
     _refused({**kwargs, "staged_files": [tmp_path / "missing.png"]})
-    assert load_task_result(tmp_path, task_id) == row and built == []  # still the placeholder
+    assert _attempt_body(load_task_result(tmp_path, task_id)) == _attempt_body(row) and built == []  # still the placeholder
     _assert_fails_closed(tmp_path, task_id, kwargs, built)
-    assert load_task_result(tmp_path, task_id) == row
+    assert _attempt_body(load_task_result(tmp_path, task_id)) == _attempt_body(row)
 
 
 def test_uncertain_receipts_fail_closed_and_stay_a_floor(tmp_path):
@@ -754,17 +789,17 @@ def test_reconciler_skips_a_row_whose_retry_went_live_after_the_decision(tmp_pat
     from ouroboros import presence_runner, task_status
 
     task_id = "presence-raced"
-    real_effective, order = task_status.load_effective_task_result, []
+    real_effective, order = task_status.effective_task_result, []
 
     def effective_then_retry_registers(root, tid, *args, **kwargs):
         effective = real_effective(root, tid, *args, **kwargs)
-        if tid == task_id and not order:  # the retry goes live right after the sweep decided
+        if tid.get("task_id") == task_id and not order:  # the retry goes live right after the sweep decided
             order.append("live")
             with presence_runner._LIVE_LOCK:
                 presence_runner._LIVE_PRESENCE_TASKS.add((str(tmp_path.resolve()), task_id))
         return effective
 
-    monkeypatch.setattr(task_status, "load_effective_task_result", effective_then_retry_registers)
+    monkeypatch.setattr(task_status, "effective_task_result", effective_then_retry_registers)
     try:
         healed, row = _sweep(tmp_path, monkeypatch, task_id)
         assert (healed, row["status"], order) == (0, STATUS_RUNNING, ["live"])  # decision dropped, row untouched
@@ -780,20 +815,20 @@ def test_reconciler_settles_nothing_when_the_row_was_requeued_after_the_decision
     from ouroboros import owner_quiz, task_status
 
     task_id = "presence-requeued"
-    real_effective, cleanups = task_status.load_effective_task_result, []
+    real_effective, cleanups = task_status.effective_task_result, []
 
     def effective_then_requeue(root, tid, *args, **kwargs):
         effective = real_effective(root, tid, *args, **kwargs)
-        if tid == task_id:
+        if tid.get("task_id") == task_id:
             write_task_result(tmp_path, task_id, "scheduled", result="New authority")
         return effective
 
-    monkeypatch.setattr(task_status, "load_effective_task_result", effective_then_requeue)
+    monkeypatch.setattr(task_status, "effective_task_result", effective_then_requeue)
     monkeypatch.setattr(owner_quiz, "reconcile_terminal", lambda root, tid: cleanups.append(tid))
     healed, row = _sweep(tmp_path, monkeypatch, task_id)
     assert (healed, row["status"], row["result"], cleanups) == (0, "scheduled", "New authority", [])
     # The same sweep over a genuine orphan still heals and still runs the terminal cleanup.
-    monkeypatch.setattr(task_status, "load_effective_task_result", real_effective)
+    monkeypatch.setattr(task_status, "effective_task_result", real_effective)
     healed, row = _sweep(tmp_path, monkeypatch, "presence-orphan")
     assert (healed, row["status"], cleanups) == (1, STATUS_FAILED, ["presence-orphan"])
 
@@ -845,7 +880,8 @@ def test_a_refused_retry_after_a_rotation_claims_no_sends_of_its_own(tmp_path):
     kwargs = {**_v1_kwargs(tmp_path, calls), "agent_factory": lambda **_kw: _sending_agent(
         calls, "Real answer", tmp_path, part="Retry part")}
     _refused(kwargs)
-    assert calls == [] and chat.read_bytes() == b"" and _read_previous_turn(tmp_path, _event().conversation_key) is None
+    assert calls == [] and _chat_rows(tmp_path) == _recovery_rows(tmp_path, task_id)
+    assert _read_previous_turn(tmp_path, _event().conversation_key) is None and _prior_sends(tmp_path, task_id) == (None, 0)
 
 
 def test_a_rotation_during_the_turn_leaves_its_sends_unknown(tmp_path):
@@ -866,6 +902,8 @@ def test_a_presence_placeholder_owes_no_terminal_projection_even_when_its_retry_
         reconcile_terminal_projections,
         settle_terminal_projection,
     )
+    from ouroboros.startup_migrations import prepare_startup_state
+    prepare_startup_state(tmp_path)
 
     task_id = _task_id(_admission(), _event())
     _reconciled(tmp_path, monkeypatch, task_id)
@@ -887,7 +925,7 @@ def test_a_presence_placeholder_owes_no_terminal_projection_even_when_its_retry_
     assert is_reconciled_presence_placeholder(stored) and "superseded_placeholder" not in stored
     assert {"canonical_terminal_projection", "canonical_terminal_projection_ready"} <= set(stored)  # not moved aside
     assert reconcile_terminal_projections(tmp_path) == 0
-    assert not [row for row in _chat_rows(tmp_path) if row.get("type") == "task_summary"]
+    assert [row for row in _chat_rows(tmp_path) if row.get("type") == "task_summary"] == _recovery_rows(tmp_path, task_id)
     # An ordinary orphaned root (no presence identity) still gets its failed terminal row.
     _sweep(tmp_path, monkeypatch, "plain-orphan", metadata={"source": "chat"})
     assert reconcile_terminal_projections(tmp_path) == 1

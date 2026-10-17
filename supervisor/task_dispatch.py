@@ -7,6 +7,7 @@ from typing import Any, Dict
 
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.dialogue_provenance import PRESENCE_BINDING_AUTHORITY_KEY, presence_binding_authority_metadata
+from ouroboros.subagents import subagent_intent_fields
 
 
 def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -41,15 +42,21 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     parent_id = fields.get("parent_id")
     # Intent only; dispatch derives every effective lane/executor fact later.
     requested_model_lane = str(fields.get("requested_model_lane") or fields.get("model_lane") or "auto")
-    parent_model_lane = str(fields.get("parent_model_lane") or "")
-    required_model_lane = str(fields.get("required_model_lane") or "")
-    requested_executor = str(fields.get("requested_executor") or "").strip().lower() or "auto"
+    intent = subagent_intent_fields(fields)
+    intent.update(
+        requested_model_lane=requested_model_lane,
+        parent_model_lane=str(fields.get("parent_model_lane") or ""),
+        required_model_lane=str(fields.get("required_model_lane") or ""),
+        requested_executor=str(fields.get("requested_executor") or "").strip().lower() or "auto",
+    )
     task_group_id = str(fields.get("task_group_id") or "")
     task_group = fields.get("task_group") if isinstance(fields.get("task_group"), dict) else {}
     subagent_envelope = fields.get("subagent_envelope") if isinstance(fields.get("subagent_envelope"), dict) else {}
     configured_subagent = fields.get("configured_subagent") if isinstance(fields.get("configured_subagent"), dict) else {}
     parent_cognitive_route = fields.get("parent_cognitive_route") if isinstance(fields.get("parent_cognitive_route"), dict) else {}
-    directory_options = {key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields}
+    # The inherited execution allowance (#939) rides with the other admission-time options.
+    directory_options = {key: fields[key] for key in ("directory_strategy", "scope_paths", "execution_timeout_sec")
+                         if key in fields}
     source_bindings = {key: copy.deepcopy(fields[key]) for key in ("parent_workspace", "workspace_copy")
                        if isinstance(fields.get(key), dict)}
     # A child inherits its tree origin: a consciousness label, category and level, and the owner's words.
@@ -89,10 +96,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "task_contract": task_contract,
         "depth_provenance": depth_provenance,
         "model_lane": requested_model_lane,
-        "requested_model_lane": requested_model_lane,
-        "parent_model_lane": parent_model_lane,
-        "required_model_lane": required_model_lane,
-        "requested_executor": requested_executor,
+        **intent,
         "task_group_id": task_group_id,
         "task_group": task_group,
         "subagent_envelope": subagent_envelope,
@@ -118,9 +122,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             "task_contract": task_contract,
             "depth_provenance": depth_provenance,
             "model_lane": requested_model_lane,
-            "requested_model_lane": requested_model_lane,
-            "parent_model_lane": parent_model_lane,
-            "requested_executor": requested_executor,
+            **intent,
             "task_group_id": task_group_id,
             "task_group": task_group,
             "subagent_envelope": subagent_envelope,

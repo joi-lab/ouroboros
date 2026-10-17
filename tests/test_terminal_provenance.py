@@ -4,6 +4,8 @@ import pathlib
 import queue
 from types import SimpleNamespace
 
+import pytest
+
 
 def test_progress_thought_keeps_full_content_and_existing_authorship():
     from ouroboros.agent import OuroborosAgent
@@ -236,7 +238,7 @@ def test_project_completion_host_salvage_labels_its_bytes_and_points(tmp_path, m
     text = queued[0]["text"]
     assert raw not in text
     # The cause speaks its human sentence (TASK_CAUSE_PHRASES twin), never the raw code.
-    assert (f"The model provider stopped answering, so the task could not finish. "
+    assert (f"The task could not get a usable model answer, so it could not finish. "
             f"{SALVAGE_EXCERPT_LABEL}: RAW PATCH") in text
     assert "provider_unavailable." not in text
     # The excerpt form keeps the pointer too: this writer has no other one.
@@ -250,17 +252,19 @@ def test_provider_death_arms_always_carry_terminal_origin(monkeypatch):
     """Class contract (nanny-leaf sprint S2): every arm of the provider-death
     rail — including no-call early returns (context_overflow salvage,
     transport_unavailable_no_resend, provider_outcome_unknown_no_resend) —
-    stamps a terminal provenance, so host salvage can never publish as a
-    model-authored final. Explicit stamps (retained MODEL_FINAL under the
-    retry wall) stay authoritative via setdefault."""
+    stamps a host-authored terminal provenance, so it can never publish as a
+    model-authored final. Which one is a fact of the returned bytes: the host's
+    own notice (nothing to salvage) is ``host_notice``, retained model output is
+    ``host_salvage`` (12.10 incident: a notice was labelled preserved output)."""
     import pathlib
     from types import SimpleNamespace
 
     import ouroboros.loop as L
 
-    def _ctx(kind):
+    def _ctx(kind, salvage=""):
         return SimpleNamespace(
-            messages=[{"role": "user", "content": "do"}],
+            messages=[{"role": "user", "content": "do"}] + (
+                [{"role": "assistant", "content": salvage}] if salvage else []),
             llm=None, active_model="m", active_effort="low", max_retries=1,
             drive_logs=pathlib.Path("/tmp"), task_id="t-origin", round_idx=1,
             event_queue=None, accumulated_usage={
@@ -276,20 +280,16 @@ def test_provider_death_arms_always_carry_terminal_origin(monkeypatch):
 
     monkeypatch.setattr(L, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
 
-    # provider_outcome_unknown no-resend arm (the incident arm).
-    _t, usage, _tr = L._handle_provider_unavailable(
-        _ctx("provider_outcome_unknown"), error_kind="provider_outcome_unknown")
-    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
-
-    # transport-wait no-resend arm.
-    _t, usage, _tr = L._handle_provider_unavailable(
-        _ctx("transport_unavailable"), wait_cause="transport_unavailable")
-    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
-
-    # context-overflow salvage arm.
-    _t, usage, _tr = L._handle_provider_unavailable(
-        _ctx("context_overflow"), error_kind="context_overflow")
-    assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE
+    arms = (("provider_outcome_unknown", {"error_kind": "provider_outcome_unknown"}),  # the incident arm
+            ("transport_unavailable", {"wait_cause": "transport_unavailable"}),
+            ("context_overflow", {"error_kind": "context_overflow"}))
+    for kind, kwargs in arms:
+        text, usage, _tr = L._handle_provider_unavailable(_ctx(kind), **kwargs)
+        assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_NOTICE, kind
+        assert text.startswith("⚠️"), kind  # the host's own notice, nothing salvaged
+        text, usage, _tr = L._handle_provider_unavailable(_ctx(kind, salvage="Partial model work."), **kwargs)
+        assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE, kind
+        assert text == "Partial model work.", kind
 
 
 def test_deadline_grace_final_is_never_stamped_host_salvage(monkeypatch):
@@ -431,9 +431,9 @@ def test_the_durable_result_carries_the_third_producer_word():
 
 def test_provider_death_arms_are_not_downgraded_by_the_forced_sink(monkeypatch):
     """Regression for the sink's interaction with the provider rail: the sink
-    stamps host_notice FIRST on the three no-call/no-resend provider-death arms,
-    so a plain setdefault in the wrapper would have become a no-op and a
-    provider-death salvage would have published verbatim."""
+    stamps host_notice FIRST on the three no-call/no-resend provider-death arms;
+    the rail still decides by the returned bytes, so a salvage is labelled
+    ``host_salvage`` and the host's own notice stays ``host_notice``."""
     import ouroboros.loop as L
 
     monkeypatch.setattr(L, "call_llm_with_retry", lambda *a, **k: (None, 0.0))
@@ -442,12 +442,14 @@ def test_provider_death_arms_are_not_downgraded_by_the_forced_sink(monkeypatch):
         ("provider_unavailable", "transport_unavailable"),
         ("context_overflow", ""),
     ):
-        ctx = _rail_ctx(task_id=f"t-{kind}")
-        ctx.accumulated_usage = {"terminal_origin": L.TERMINAL_ORIGIN_HOST_NOTICE}
-        _text, usage, _trace = L._handle_provider_unavailable(
-            ctx, error_kind=kind, wait_cause=wait_cause,
-        )
-        assert usage.get("terminal_origin") == L.TERMINAL_ORIGIN_HOST_SALVAGE, kind
+        for salvage, origin in (("", L.TERMINAL_ORIGIN_HOST_NOTICE), ("Kept bytes.", L.TERMINAL_ORIGIN_HOST_SALVAGE)):
+            ctx = _rail_ctx(task_id=f"t-{kind}")
+            ctx.messages += [{"role": "assistant", "content": salvage}] if salvage else []
+            ctx.accumulated_usage = {"terminal_origin": L.TERMINAL_ORIGIN_HOST_NOTICE}
+            _text, usage, _trace = L._handle_provider_unavailable(
+                ctx, error_kind=kind, wait_cause=wait_cause,
+            )
+            assert usage.get("terminal_origin") == origin, (kind, salvage)
 
 
 def test_a_notice_speaks_for_itself_while_a_salvage_is_labelled():
@@ -550,3 +552,30 @@ def test_a_non_provider_rail_without_a_candidate_is_a_host_notice(tmp_path, monk
     _text, usage, _returned_trace = loop._handle_round_limit(limit_ctx)
 
     assert usage["terminal_origin"] == loop.TERMINAL_ORIGIN_HOST_NOTICE
+
+
+@pytest.mark.parametrize("late_case", ["unknown_outcome", "second_directive"])
+def test_a_host_control_notice_on_the_forced_call_stays_host_notice(tmp_path, monkeypatch, late_case):
+    """Triad finding (12.10): owner input that arrives while the provider rail's one
+    forced call runs ends in the host's own control sentence, never model output. It is
+    ``host_notice`` (its words are the row), not a "preserved intermediate output" receipt."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    incoming = queue.Queue()
+    loop, _registry, ctx, _trace = _forced_test_context(tmp_path, incoming=incoming)
+    ctx.accumulated_usage["_last_llm_error_kind"] = "llm_empty_response"
+    calls = []
+
+    def forced_model(*_args, **_kwargs):
+        calls.append(1)
+        incoming.put("Additional owner directive")
+        if late_case == "unknown_outcome":
+            ctx.accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
+            return {"role": "assistant", "content": ""}, 0.0
+        return {"role": "assistant", "content": "Draft superseded by owner input"}, 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", forced_model)
+    text, usage, _trace = loop._handle_provider_unavailable(ctx, error_kind="llm_empty_response")
+    assert text.startswith("⚠️ ") and "Resume the task" in text
+    assert len(calls) == (1 if late_case == "unknown_outcome" else 2)
+    assert usage["terminal_origin"] == "host_notice", (text, usage["terminal_origin"])

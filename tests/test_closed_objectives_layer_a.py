@@ -6,7 +6,7 @@ from ouroboros.post_task_evolution import _DECISION_PROMPT, _closed_objectives_d
 
 def test_decision_prompt_has_closed_and_active_sections_and_formats():
     rendered = _DECISION_PROMPT.format(
-        reflection="r", backlog="b", capability="c",
+        task_facts="f", backlog="b", capability="c",
         closed="- [NO_OP] X", active_objective="Y", force_note="",
     )
     assert "[CLOSED / DROPPED" in rendered

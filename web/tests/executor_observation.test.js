@@ -15,8 +15,13 @@ const event = (revision, extras = {}) => ({
 test('live executor is the typed actor and requested model stays distinct from the coordinating model', () => {
     const view = summarizeChatLiveEvent(event(5));
     assert.equal(view.headline, 'UI reviewer');
-    assert.match(view.executorChip.label, /Cursor.*grok-4.6.*\(requested\).*last update/);
+    // #360 A: the label keeps only the observation word; the requested model and
+    // its source move to the detail sentence the expanded card prints as text.
+    assert.equal(view.executorChip.label, 'Cursor · last update');
+    assert.match(view.executorChip.title, /model cursor-grok-4\.6-xhigh-fast \(requested\)/);
+    assert.match(view.executorChip.title, /progress, not a terminal execution receipt/);
     assert.doesNotMatch(view.executorChip.label, /gpt-6-astra|running|settled/);
+    assert.doesNotMatch(view.executorChip.title, /gpt-6-astra/);
     assert.equal(view.executorChip.hasEvidence, false);
 });
 
@@ -35,7 +40,8 @@ test('root progress and usage retain their own model for the coordinator line', 
 test('absent serving model remains unconfirmed and foreign-task observations are ignored', () => {
     const e = event(5);
     delete e.executor_observation.model;
-    assert.match(executorChip(e).label, /model unconfirmed/);
+    assert.equal(executorChip(e).label, 'Cursor · last update');
+    assert.match(executorChip(e).title, /model unconfirmed/);
     e.executor_observation.task_id = 'sibling';
     assert.equal(executorChip(e), null);
 });

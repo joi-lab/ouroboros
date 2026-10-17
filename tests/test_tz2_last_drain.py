@@ -25,7 +25,7 @@ def test_settled_project_root_does_not_accept_unread_owner_mail(tmp_path, monkey
                       root_phase_checkpoint={"post_task_synthesis": "running"})
     ctx = _ctx(tmp_path, running={task["id"]: {"task": task}})
     monkeypatch.setattr("ouroboros.server_owner_routing._addressable_root_tasks",
-                        lambda *_: [{"task_id": task["id"], "project_id": project["id"]}])
+                        lambda *_: [{"task_id": task["id"], "project_id": project["id"], "room_reader": True}])
 
     routed = _route_project_chat_to_running_task(ctx, chat_id, "late owner clarification", "late-1")
     assert routed == ""  # fall through to a fresh decision turn; no false delivered receipt
@@ -50,7 +50,7 @@ def test_running_project_root_still_receives_owner_mail(tmp_path, monkeypatch):
     write_task_result(tmp_path, task["id"], "running", result="")
     ctx = _ctx(tmp_path, running={task["id"]: {"task": task}})
     monkeypatch.setattr("ouroboros.server_owner_routing._addressable_root_tasks",
-                        lambda *_: [{"task_id": task["id"], "project_id": project["id"]}])
+                        lambda *_: [{"task_id": task["id"], "project_id": project["id"], "room_reader": True}])
     assert _route_project_chat_to_running_task(ctx, chat_id, "continue", "live-1") == task["id"]
     assert [row["text"] for row in drain_owner_entries(tmp_path, task["id"])] == ["continue"]
 
@@ -71,7 +71,7 @@ def test_settled_project_followup_enters_new_decision_turn(tmp_path, monkeypatch
     ctx = _ctx(tmp_path, running={task["id"]: {"task": task}},
                direct=lambda *_a, **_k: calls.append("new_turn"))
     monkeypatch.setattr("ouroboros.server_owner_routing._addressable_root_tasks",
-                        lambda *_: [{"task_id": task["id"], "project_id": project["id"]}])
+                        lambda *_: [{"task_id": task["id"], "project_id": project["id"], "room_reader": True}])
     monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
 
     class Bridge:

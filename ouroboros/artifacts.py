@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
-import mimetypes
 import os
 import stat
 import pathlib
@@ -294,7 +294,8 @@ def stage_task_attachments(
                     manifest.append(_rejected(ordinal, label, "copy_failed"))
                     continue
             measured = stream_artifact_file(dest, expected=source_identity)
-            mime = mimetypes.guess_type(str(dest))[0] or "application/octet-stream"
+            from ouroboros.chat_uploads import file_media
+            mime, kind = file_media(dest)
             manifest.append({
                 **measured,
                 "ordinal": ordinal,
@@ -311,7 +312,7 @@ def stage_task_attachments(
                 # every runtime mode.
                 "abs_path": str(dest),
                 "mime": mime,
-                "is_image": mime.startswith("image/"),
+                "is_image": kind == "image",
             })
         except Exception:
             log.debug("stage_task_attachments: rejected a file on error", exc_info=True)
@@ -698,41 +699,27 @@ def store_actor_source_bytes(
         f"{safe_id}-{digest}.{safe_extension}",
     )
     target = artifact_dir.joinpath(*relative.parts)
-    # WRITE-ONCE. The name carries the digest, so an existing file with exactly
-    # these bytes IS this handle: rewriting it would only republish identical
-    # content while racing another writer for the same path (on Windows an
-    # os.replace over a destination a concurrent reader holds open is a sharing
-    # violation, which is how a second copy-back of the same handle used to fail).
+    # WRITE-ONCE. The name carries the digest, so an existing file (loose or a pack member) with
+    # these bytes IS this handle: rewriting would republish identical content while racing another
+    # writer for the path (a Windows os.replace over a file a reader holds open is a sharing violation).
     try:
         already_stored = not target.is_symlink() and target.read_bytes() == bytes(data)
     except OSError:
-        already_stored = False
+        from ouroboros.evidence_packs import handle_info
+        already_stored = handle_info(drive_root, task_id, relative.as_posix()) is not None
     if not already_stored:
         fence_publication()  # a closed publication generation writes no new source
         write_bytes_atomic(target, bytes(data))
-    return {
-        "kind": "task_source",
-        "root": "artifact_store",
-        "path": relative.as_posix(),
-        "size": len(data),
-        "sha256": digest,
-        "read": {
-            "tool": "read_file",
-            "arguments": {
-                "root": "artifact_store",
-                "path": relative.as_posix(),
-                "start_line": 1,
-                "max_lines": 2000,
-                "start_char": 0,
-            },
-        },
-    }
+    read = {"root": "artifact_store", "path": relative.as_posix(), "start_line": 1, "max_lines": 2000, "start_char": 0}
+    return {"kind": "task_source", "root": "artifact_store", "path": relative.as_posix(), "size": len(data),
+            "sha256": digest, "read": {"tool": "read_file", "arguments": read}}
 
 
 def read_actor_source_bytes(
-    drive_root: Union[pathlib.Path, str], task_id: str, ref: Any,
+    drive_root: Union[pathlib.Path, str], task_id: str, ref: Any, *, retained: bool = True,
 ) -> bytes:
-    """Resolve and verify one task-local actor source ref or raise explicitly."""
+    """Resolve and verify one task-local actor source ref (loose, else this root's evidence pack,
+    else the retained placements unless ``retained`` is off) or raise explicitly."""
 
     if not isinstance(ref, dict) or ref.get("kind") != "task_source":
         raise ValueError("actor source ref has an unexpected kind")
@@ -746,14 +733,19 @@ def read_actor_source_bytes(
     if target.is_symlink():
         raise ValueError("actor source ref may not be a symlink")
     try:
-        target = target.resolve(strict=True)
+        target = target.resolve(strict=False)
         target.relative_to(base)
-    except FileNotFoundError:
-        from ouroboros.source_retention import read_retained_task_source
-        return read_retained_task_source(drive_root, task_id, ref)
     except ValueError as exc:
         raise ValueError("actor source ref escapes its task artifact root") from exc
-    raw = target.read_bytes()
+    from ouroboros.evidence_packs import handle_bytes
+    try:
+        raw = (handle_bytes(drive_root, task_id, rel.as_posix())
+               if rel.parts[:2] == ("source_handles", "context_checkpoints") else target.read_bytes())
+    except FileNotFoundError:
+        if not retained:
+            raise
+        from ouroboros.source_retention import read_retained_task_source
+        return read_retained_task_source(drive_root, task_id, ref)
     try:
         expected_size = int(ref["size"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -944,9 +936,9 @@ def _matching_projection(drive_root: Any, call: Dict[str, Any]) -> Dict[str, Any
     return payload
 
 
-# sanitize_tool_args_for_log's transport markers — the ONE list. The reflection
-# pointer's cut detection reads the same names, so a marker shape added there is
-# never missed here (and the colons keep a literal value like "_truncated" out).
+# sanitize_tool_args_for_log's transport markers — the ONE list, so a marker shape
+# added there is never missed here (the colons keep a literal value like
+# "_truncated" out).
 SANITIZER_OMISSION_MARKERS = (
     "<TRUNCATED:", '"_depth_limit":', '"_truncated":', '"_repr":', '"_error":',
 )
@@ -976,7 +968,7 @@ def materialize_tool_args_source(drive_root: Any, call: Dict[str, Any]) -> tuple
 def materialize_tool_result_source(
     drive_root: Union[pathlib.Path, str], task_id: str, call: Dict[str, Any],
 ) -> tuple[Any, bool, Dict[str, Any]]:
-    """Materialize a result under existing redaction; metadata carries its source or gap."""
+    """Materialize a result under existing redaction; metadata carries its source or gap. A partial result reads its verified actor source, then a matching redacted projection (re-persisted best-effort), else a source_unavailable gap."""
     result = call.get("result")
     legacy_match = (
         _LEGACY_TOOL_RESULT_TRUNCATION_RE.search(result)
@@ -1196,7 +1188,13 @@ def stream_artifact_file(path: Any, sink: Any = None, *, expected: Any = None) -
     def identity(observation: os.stat_result) -> tuple:
         return (observation.st_dev, observation.st_ino, observation.st_size,
                 observation.st_mtime_ns, observation.st_ctime_ns)
-    with source_path.open("rb") if source_path is not None else nullcontext(path) as handle:
+    from ouroboros.store import open_for_read  # a held store file keeps its locks (no new descriptor to close)
+
+    # Reject pipes/devices before opening: the descriptor check alone comes too
+    # late for a FIFO with no writer. Keep the post-open checks for path changes.
+    if source_path is not None and not stat.S_ISREG(source_path.stat().st_mode):
+        raise OSError(f"artifact source is not a regular file: {path}")
+    with open_for_read(source_path) if source_path is not None else nullcontext(path) as handle:
         before = os.fstat(handle.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise OSError(f"artifact source is not a regular file: {path}")
@@ -1259,20 +1257,11 @@ def artifact_record(path: pathlib.Path, *, kind: str = "task_artifact", source_p
 
 
 def store_task_artifact_bytes(
-    drive_root: Union[pathlib.Path, str],
-    task_id: str,
-    name: str,
-    data: bytes,
-    *,
-    kind: str = "task_artifact",
+    drive_root: Union[pathlib.Path, str], task_id: str, name: str, data: bytes,
+    *, kind: str = "task_artifact",
 ) -> Dict[str, Any]:
-    """Persist immutable task-owned bytes and register the actor-readable file.
-
-    This is the byte-oriented twin of ``copy_file_to_task_artifacts`` for
-    producers that already own canonical bytes. Existing-valid-content wins;
-    a name collision with different bytes is refused instead of rewriting a
-    durable authority ref.
-    """
+    """Publish immutable actor-readable bytes; reuse equal bytes, refuse collisions.
+    Byte-oriented twin of ``copy_file_to_task_artifacts`` for canonical bytes."""
     safe_name = pathlib.Path(str(name or "")).name
     if not safe_name or safe_name in {".", ".."} or safe_name != str(name):
         raise ValueError("task artifact name must be one plain filename")
@@ -1280,21 +1269,29 @@ def store_task_artifact_bytes(
         raise ValueError("task artifact name is reserved")
     artifact_dir = task_artifact_dir_path(drive_root, task_id, create=True)
     path = artifact_dir / safe_name
-    if path.exists():
-        existing = path.read_bytes()
-        if existing != data:
-            raise ValueError(f"task artifact collision: {safe_name}")
-    else:
-        write_bytes_atomic(path, data)
+    temporary = path.with_name(f".{uuid.uuid4().hex}.tmp")
+
+    def publish(_current):
+        try:
+            os.link(temporary, path)
+        except OSError as exc:
+            if (exc.errno not in {errno.EEXIST, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EPERM, errno.EXDEV, errno.ENOSYS}
+                    and getattr(exc, "winerror", None) != 50):
+                raise
+            if path.exists():
+                if path.read_bytes() != data:
+                    raise ValueError(f"task artifact collision: {safe_name}")
+            else:
+                temporary.replace(path)
+    try:
+        write_bytes_atomic(temporary, data)
+        update_json_locked(artifact_dir / _ARTIFACT_MANIFEST, publish)
+    finally:
+        temporary.unlink(missing_ok=True)
     record = {**artifact_record(path, kind=kind), "immutable": True}
     _register_task_artifact_records(artifact_dir, [record])
-    return {
-        "root": "artifact_store",
-        "path": safe_name,
-        "sha256": record["sha256"],
-        "bytes": record["size"],
-        "kind": kind,
-    }
+    return {"root": "artifact_store", "path": safe_name, "sha256": record["sha256"],
+            "bytes": record["size"], "kind": kind}
 
 
 def _register_task_artifact_records(artifact_dir: pathlib.Path, records: Iterable[Dict[str, Any]]) -> None:

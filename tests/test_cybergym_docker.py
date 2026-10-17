@@ -36,6 +36,7 @@ from tests.test_cybergym_executor import (
     _requires_posix_mount_paths,
     dataclasses_replace,
 )
+from tests._store_shared import seed_result
 
 
 def test_post_create_timeout_preserves_workspace_custody(tmp_path, monkeypatch):
@@ -449,16 +450,13 @@ def test_reconcile_task_disk_record_supersedes_sparse_cache(tmp_path):
     external = tmp_path / "nvme" / "ouroboros-data"
     records = external / "task_results"
     records.mkdir(parents=True)
-    (records / f"{gateway_id}.json").write_text(
-        json.dumps({
+    seed_result(external, gateway_id, {
             "task_id": gateway_id,
             "status": "completed",
             "cost_usd": 1.25,
             "cost_final": True,
             "unresolved_upper_bound_usd": 0.0,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     config, executor, task_dir, checkpoint = _reconcile_fixture(
         tmp_path,
@@ -486,16 +484,13 @@ def test_reconcile_task_records_sparse_cost_from_isolate_disk(tmp_path):
     external = tmp_path / "nvme" / "ouroboros-data"
     records = external / "task_results"
     records.mkdir(parents=True)
-    (records / f"{gateway_id}.json").write_text(
-        json.dumps({
+    seed_result(external, gateway_id, {
             "task_id": gateway_id,
             "status": "completed",
             "cost_usd": 2.5,
             "cost_final": False,
             "unresolved_upper_bound_usd": 0.4,
-        }),
-        encoding="utf-8",
-    )
+        })
 
     config, executor, task_dir, checkpoint = _reconcile_fixture(
         tmp_path,
@@ -536,10 +531,7 @@ def test_reconcile_task_delivers_terminal_failure_from_isolate_disk(tmp_path):
     external = tmp_path / "nvme" / "ouroboros-data"
     records = external / "task_results"
     records.mkdir(parents=True)
-    (records / f"{gateway_id}.json").write_text(
-        json.dumps({"task_id": gateway_id, "status": "failed", "error": "worker crashed"}),
-        encoding="utf-8",
-    )
+    seed_result(external, gateway_id, {"task_id": gateway_id, "status": "failed", "error": "worker crashed"})
 
     def http(*_args, **_kwargs):
         raise ExecutorFailure("isolate gateway is down")

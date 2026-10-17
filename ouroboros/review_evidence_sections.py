@@ -535,74 +535,43 @@ def _accept_receipt_exhibits(receipts: list) -> list:
 def _accept_effective_claims(
     ctx: Any, contract: Dict[str, Any], drive_root: Any, task_id: str,
 ) -> tuple[list, str, Dict[str, Any]]:
-    """Effective claims + provenance + an open-wave exhibit for the packet.
+    """Effective claims + provenance + the plan-history exhibit for the packet — ONE binder.
 
-    Claims come from the ONE pure seam
-    (contracts.task_contract.effective_acceptance_claims): ingress-contract
-    claims first, the CLOSED plan wave's frozen claims only when ingress is
-    empty. The plan-state lookup mirrors plan_task's own state location
-    (budget_drive_root first). Generic lookup failures remain fail-soft; a
-    recorded full source that cannot be read reaches acceptance's existing
-    infrastructure-failure path instead of discarding known claims.
-
-    A reviewed-and-frozen but never-closed wave binds NOTHING, and until now it
-    was indistinguishable in the packet from a task that never had claims. It is
-    disclosed instead: the claims ride as a non-binding exhibit and the source
-    reads ``none_open_plan_wave``. The exhibit sits in
-    ``DECLARED_INTENT_SECTIONS``, so citing it can never resolve a criterion."""
+    Claims come from the pure seam (``contracts.task_contract.effective_acceptance_claims``)
+    for the ingress contract; otherwise the LATEST plan revision's ``done_when`` binds,
+    open objections or not (``plan_record.acceptance_view``); a task with only a v1/v2
+    record binds the claims the old organ had selected (its closed wave, or an Advisory
+    author selection) with legacy provenance. The exhibit carries the ACTUAL text of every
+    revision's done_when, which revisions the council saw, the objections open now and —
+    when ingress wins — the adopted promises, so acceptance still sees them. It sits in
+    ``DECLARED_INTENT_SECTIONS``, so citing it can never resolve a criterion. Generic
+    lookup failures stay fail-soft; a recorded source that cannot be read reaches
+    acceptance's existing infrastructure-failure path instead of discarding known claims."""
+    from ouroboros import plan_record
     from ouroboros.contracts.task_contract import effective_acceptance_claims
     from ouroboros.tools.plan_review_artifacts import PlanReviewSourceUnavailable
 
     claims, source = effective_acceptance_claims(contract)
-    if claims:
-        return claims, source, {}
     root = getattr(ctx, "budget_drive_root", None) or drive_root
     if not root or not str(task_id or ""):
-        return [], "", {}
+        return claims, source, {}
     try:
-        from ouroboros.task_results import (
-            closed_plan_review_wave,
-            current_plan_review_wave,
-            load_plan_review_state,
-        )
-
-        state = load_plan_review_state(pathlib.Path(str(root)), str(task_id))
-        wave = closed_plan_review_wave(state)
-    except PlanReviewSourceUnavailable:
-        # The recorded claims exist. An unavailable full source must reach the
-        # existing acceptance infrastructure-failure path, never become no claims.
-        raise
+        record = plan_record.load_plan_record(pathlib.Path(str(root)), str(task_id))
+    except plan_record.PlanRecordInvalid as exc:
+        raise PlanReviewSourceUnavailable(f"PLAN_RECORD_UNAVAILABLE: {exc}") from exc
     except Exception:
-        return [], "", {}
-    from ouroboros.config import get_review_enforcement
-    from ouroboros.contracts.task_contract import normalize_acceptance_claims
-    from ouroboros.tools.plan_review_artifacts import current_author_plan
-    from ouroboros.tools.review_helpers import review_enforcement_blocks
-
-    authored = current_author_plan(root, task_id, state)
-    if authored and not review_enforcement_blocks(get_review_enforcement()):
-        author = authored["author_disposition"]
-        if author.get("action", "finish") == "finish" and author.get("enforcement") == "advisory":
-            return normalize_acceptance_claims(authored["spec"].get("acceptance_claims")), "author_plan", {}
-    frozen, frozen_source = effective_acceptance_claims(contract, wave)
-    if frozen:
-        return frozen, frozen_source, {}
-    open_wave = current_plan_review_wave(state)
-    if not isinstance(open_wave, dict) or open_wave.get("closed"):
-        return [], frozen_source, {}
-    open_claims, _ = effective_acceptance_claims(contract, open_wave)
-    if not open_claims:
-        return [], frozen_source, {}
-    return [], "none_open_plan_wave", {
-        "binding": "not bound: wave open",
-        "cycle_index": open_wave.get("cycle_index"),
-        "aggregate": str(open_wave.get("aggregate") or ""),
-        "custody_pending": bool(open_wave.get("custody_pending")),  # true: slots unanswered, the aggregate is no verdict
-        "acceptance_claims": [
-            {key: _accept_redact_cap(value, 600) for key, value in row.items()}
-            for row in open_claims if isinstance(row, dict)
-        ],
-    }
+        return claims, source, {}
+    legacy, legacy_error = plan_record.legacy_facts(pathlib.Path(str(root)), str(task_id))
+    if legacy_error and plan_record.latest_revision(record) is None:
+        # Never judge without the bar: an earlier-schema state (or the author plan it names) that cannot
+        # be read, with no organ revision to bind instead, is acceptance's typed infrastructure failure.
+        raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_STATE_UNAVAILABLE: {legacy_error['source']}: {legacy_error['error']}")
+    if not plan_record.engaged(record) and not legacy.get("engaged"):
+        return claims, source, {}
+    claims, source, exhibit = plan_record.acceptance_view(record, claims, legacy=legacy)
+    if legacy_error:
+        exhibit["legacy_unreadable"] = dict(legacy_error)  # the latest revision binds; the unread earlier state is named
+    return claims, source, exhibit
 
 
 def _accept_claim_support_refs(contract: Dict[str, Any], receipts: list) -> list[Dict[str, Any]]:
@@ -690,6 +659,7 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
     from ouroboros.artifacts import materialize_tool_args_source, materialize_tool_result_source, read_actor_source_bytes
     from ouroboros.review_evidence_refs import trajectory_record_ref
     from ouroboros.tool_capabilities import TOOL_RESULT_LIMITS
+    from ouroboros.tool_result_delivery import compact_verification
     if indices is not None:
         try:
             tool_calls = json.loads(read_actor_source_bytes(drive_root, task_id, source_ref))
@@ -733,6 +703,8 @@ def _accept_trajectory(tool_calls: list, drive_root: Any = None, task_id: str = 
             "tool": tool,
             "status": str(c.get("status") or ("error" if c.get("is_error") else "ok")),
             "is_error": bool(c.get("is_error")),
+            # A completed check call can still fail its criterion; both facts stay (#1585).
+            **({"verification": compact_verification(c["verification"])} if c.get("verification") else {}),
             "args": args if indices is not None else _ev().truncate_review_artifact(args, _ACCEPT_ARGS_CAP),
             "result": result if indices is not None else _accept_redact_cap(result, result_cap, legacy_envelope),
         }

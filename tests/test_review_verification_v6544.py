@@ -175,31 +175,33 @@ def test_time_budget_note_fires_tightest_crossed_milestone():
     note = task_pacing.build_time_budget_note(ctx)
     assert note is not None
     assert note.checkpoint["milestone"] == "10%"
-    # v6.60.0: the flush clause fires, but its FINAL ANSWER phrase is protocol-gated —
-    # this ctx declares no answer_protocol, so the deliverable-save wording stays
-    # while the marker phrase is absent.
-    assert "WRITE your best current deliverable now" in note.text
-    assert "FINAL ANSWER:" not in note.text
+    assert "[TIME BUDGET — 10% remaining crossed]" in note.text
+    assert "Deadline:" in note.text and "Remaining: ~0.8 min" in note.text
+    # The host's own finalization instant is stated as a fact (owner 13 Oct: the
+    # one-time crossing stays, the advice goes) — no save/flush instruction.
+    assert "one tool-less final answer is requested when ~2.0 min remain" in note.text
+    for advice in ("WRITE", "verify_and_record", "planning context", "shortest path", "prefer"):
+        assert advice not in note.text, advice
     # All coarser milestones marked seen — nothing refires.
     assert task_pacing.build_time_budget_note(ctx) is None
 
-    # With the protocol declared, the marker phrase rides the same 10% flush.
+    # The answer protocol no longer adds a FINAL ANSWER instruction here; the facts
+    # line states whether a FINAL ANSWER line is latched.
     proto_ctx = _deadline_ctx(remaining_sec=50.0, total_sec=1000.0)
     proto_ctx.task_contract["answer_protocol"] = "final_answer_line"
     proto_note = task_pacing.build_time_budget_note(proto_ctx)
-    assert proto_note is not None and "FINAL ANSWER:" in proto_note.text
+    assert proto_note is not None and "FINAL ANSWER" not in proto_note.text
 
 
-def test_intrinsic_pacing_note_without_deadline(monkeypatch):
-    monkeypatch.setenv("OUROBOROS_PACING_INTERVAL_SEC", "600")
+def test_no_time_bound_means_no_time_notice(monkeypatch):
+    """The 10-minute intrinsic [PACING] note is gone (#1748): without an explicit
+    deadline or execution budget there is no time axis to cross."""
     now = datetime.now(timezone.utc)
     ctx = SimpleNamespace(
         task_metadata={"created_at": (now - timedelta(seconds=1300)).isoformat()},
         task_contract={},
     )
-    note = task_pacing.build_time_budget_note(ctx, round_idx=7, accumulated_usage={"cost": 1.25})
-    assert note is not None and note.checkpoint["checkpoint_kind"] == "intrinsic_pacing"
-    assert "Rounds so far: 7" in note.text
+    assert task_pacing.build_time_budget_note(ctx) is None
 
 
 def test_budget_snapshot_latches_fallback_created():
@@ -543,7 +545,7 @@ def _acceptance_harness(monkeypatch, tmp_path, review_result, *, enforcement="bl
     if passes_done:
         ctx._task_acceptance_improvement_passes = passes_done
     trace = dict(prior_trace or {})
-    trace.setdefault("tool_calls", [{"tool": "write_file", "args": {"path": "x.py"}}])
+    trace.setdefault("tool_calls", [{"tool": "write_file", "args": {"path": "x.py"}, "is_error": False}])
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     tools = SimpleNamespace(_ctx=ctx)
     out = loop_mod._run_task_acceptance_review_once(
@@ -551,6 +553,20 @@ def _acceptance_harness(monkeypatch, tmp_path, review_result, *, enforcement="bl
         llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda _m, *, incident=None: None,
     )
     return out, ctx, trace, messages
+
+
+def _author_reads_feedback(ctx, trace, messages, tmp_path):
+    """A settled PASS reaches its author before the decision (G1, #1737/#1741):
+    the request that carried it returns, then the same paid panel is reused."""
+    import ouroboros.loop as loop_mod
+    from ouroboros.acceptance_settlement import expose_acceptance_feedback
+
+    assert messages[-1]["review_feedback"]
+    expose_acceptance_feedback(trace, messages, "t")
+    return loop_mod._run_task_acceptance_review_once(
+        tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
+        llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda _m, *, incident=None: None,
+    )
 
 
 def _blocked_result():
@@ -725,10 +741,11 @@ def test_clean_re_review_disposes_open_obligations(monkeypatch, tmp_path):
     prior = {"acceptance_obligations": [
         {"id": "ob-1", "item": "broken", "recommendation": "fix", "status": "open", "disposition": ""},
     ]}
-    out, ctx, trace, _messages = _acceptance_harness(
+    out, ctx, trace, messages = _acceptance_harness(
         monkeypatch, tmp_path, solved, prior_trace=prior,
     )
-    assert out is False
+    assert out is True
+    assert _author_reads_feedback(ctx, trace, messages, tmp_path) is False
     ob = trace["acceptance_obligations"][0]
     assert ob["status"] == "disposed_by_re_review" and ob["disposition"] == "addressed"
     assert trace["acceptance_decision"]["status"] == "accepted"
@@ -761,11 +778,12 @@ def test_clean_pass_with_dissent_bullet_still_disposes_obligations(monkeypatch, 
     prior = {"acceptance_obligations": [
         {"id": "ob-1", "item": "broken", "recommendation": "fix", "status": "open", "disposition": ""},
     ]}
-    out, ctx, trace, _messages = _acceptance_harness(
+    out, ctx, trace, messages = _acceptance_harness(
         monkeypatch, tmp_path, clean_with_dissent, passes_done=1, prior_trace=prior,
         budget_profile={"max_improvement_passes": 1},
     )
-    assert out is False
+    assert out is True
+    assert _author_reads_feedback(ctx, trace, messages, tmp_path) is False
     ob = trace["acceptance_obligations"][0]
     assert ob["status"] == "disposed_by_re_review" and ob["disposition"] == "addressed"
     assert trace["acceptance_decision"]["status"] == "accepted"
@@ -1070,25 +1088,27 @@ def test_web_search_results_carry_answer_type(monkeypatch, tmp_path):
 
 
 def test_time_budget_flush_tree_sentence_workspace_gated():
-    """v6.74.4 time-axis freeze: the 10% flush gains a commit-neutral tree
-    sentence ONLY for workspace deliveries; non-workspace text stays
-    byte-identical (cache/latch semantics untouched)."""
+    """v6.74.4 time-axis freeze, now a fact: the 10% crossing states that the working
+    tree is delivered as it stands ONLY for workspace deliveries; non-workspace text
+    stays byte-identical (cache/latch semantics untouched)."""
+    fact = "the working tree is delivered as it stands"
     base_ctx = _deadline_ctx(remaining_sec=50.0, total_sec=1000.0)
     base_note = task_pacing.build_time_budget_note(base_ctx)
-    assert base_note is not None and "working tree ships as-is" not in base_note.text
+    assert base_note is not None and fact not in base_note.text
 
     ws_ctx = _deadline_ctx(remaining_sec=50.0, total_sec=1000.0)
     ws_ctx.workspace_root = "/tmp/ws"  # fallback attribute path
     ws_note = task_pacing.build_time_budget_note(ws_ctx)
-    assert ws_note is not None and "working tree ships as-is" in ws_note.text
-    # Commit-neutral on purpose: acting self_worktree subagents cannot commit.
-    assert "commit" not in ws_note.text.lower()
+    assert ws_note is not None and fact in ws_note.text
+    # Commit-neutral on purpose: acting self_worktree subagents cannot commit; and
+    # no instruction rides the fact any more.
+    assert "commit" not in ws_note.text.lower() and "revert" not in ws_note.text
     # The canonical authority wins over the raw attribute when present.
     canon_ctx = _deadline_ctx(remaining_sec=50.0, total_sec=1000.0)
     canon_ctx.workspace_root = "/tmp/ws"
     canon_ctx.is_workspace_mode = lambda: False
     canon_note = task_pacing.build_time_budget_note(canon_ctx)
-    assert canon_note is not None and "working tree ships as-is" not in canon_note.text
+    assert canon_note is not None and fact not in canon_note.text
 
 
 def test_time_budget_flush_non_workspace_text_fully_identical(monkeypatch):
@@ -1116,8 +1136,8 @@ def test_time_budget_flush_non_workspace_text_fully_identical(monkeypatch):
 
 
 def test_cost_wrapup_tree_sentence_workspace_gated(monkeypatch):
-    """v6.74.4 (commit triad r1 advisory, sol): the cost wrap-up note — a
-    sibling forced-end channel — carries the same commit-neutral tree sentence
+    """v6.74.4 (commit triad r1 advisory, sol): the ~80% spent crossing — a
+    sibling forced-end channel — carries the same commit-neutral delivery fact
     for workspace deliveries only; non-workspace text stays byte-identical."""
 
     def _note(with_ws):
@@ -1128,16 +1148,14 @@ def test_cost_wrapup_tree_sentence_workspace_gated(monkeypatch):
         )
         if with_ws:
             ctx.workspace_root = "/tmp/ws"
-        return task_pacing.build_cost_budget_note(
-            ctx, start_remaining_usd=None, cost_ceiling_usd=10.0, task_cost=8.5,
-        )
+        return task_pacing.build_cost_budget_note(ctx, cost_ceiling_usd=10.0, task_cost=8.5)
 
     plain = _note(False)
     ws = _note(True)
     assert plain is not None and ws is not None
-    assert "working tree ships as-is" not in plain.text
-    assert "working tree ships as-is" in ws.text
-    assert ws.text.replace(task_pacing._TREE_FLUSH_SENTENCE, "") == plain.text
+    assert "working tree is delivered" not in plain.text
+    assert "working tree is delivered" in ws.text
+    assert ws.text.replace(task_pacing._WORKSPACE_DELIVERY_FACT, "") == plain.text
 
 
 def test_cost_late_first_milestone_carries_tree_sentence_for_workspace():
@@ -1146,21 +1164,18 @@ def test_cost_late_first_milestone_carries_tree_sentence_for_workspace():
     tree sentence (the suppressed wrap-up was its only carrier)."""
     ctx = SimpleNamespace(task_metadata={}, task_contract={},
                           workspace_root="/tmp/ws")
-    note = task_pacing.build_cost_budget_note(
-        ctx, start_remaining_usd=None, cost_ceiling_usd=10.0, task_cost=9.5)
+    note = task_pacing.build_cost_budget_note(ctx, cost_ceiling_usd=10.0, task_cost=9.5)
     assert note is not None
     assert note.checkpoint["checkpoint_kind"] == "cost_budget_milestone"
-    assert "working tree ships as-is" in note.text
-    # Non-workspace late milestone stays byte-identical (no tree sentence).
+    assert "working tree is delivered" in note.text
+    # Non-workspace late milestone stays byte-identical (no delivery fact).
     plain_ctx = SimpleNamespace(task_metadata={}, task_contract={})
-    plain = task_pacing.build_cost_budget_note(
-        plain_ctx, start_remaining_usd=None, cost_ceiling_usd=10.0, task_cost=9.5)
-    assert plain is not None and "working tree ships as-is" not in plain.text
-    assert note.text.replace(task_pacing._TREE_FLUSH_SENTENCE, "") == plain.text
-    # An EARLY milestone (before the wrap-up fraction) is unchanged even for
-    # workspace tasks — the wrap-up note will carry the sentence later.
+    plain = task_pacing.build_cost_budget_note(plain_ctx, cost_ceiling_usd=10.0, task_cost=9.5)
+    assert plain is not None and "working tree is delivered" not in plain.text
+    assert note.text.replace(task_pacing._WORKSPACE_DELIVERY_FACT, "") == plain.text
+    # An EARLY milestone (before the ~80% fraction) is unchanged even for
+    # workspace tasks — the ~80% crossing will carry the fact later.
     early_ctx = SimpleNamespace(task_metadata={}, task_contract={},
                                 workspace_root="/tmp/ws")
-    early = task_pacing.build_cost_budget_note(
-        early_ctx, start_remaining_usd=None, cost_ceiling_usd=10.0, task_cost=6.0)
-    assert early is not None and "working tree ships as-is" not in early.text
+    early = task_pacing.build_cost_budget_note(early_ctx, cost_ceiling_usd=10.0, task_cost=6.0)
+    assert early is not None and "working tree is delivered" not in early.text

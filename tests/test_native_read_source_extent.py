@@ -5,10 +5,11 @@ import json
 
 import pytest
 
+from ouroboros import review_native_episode as native
 from ouroboros.review_execution import ReviewAssignment, ReviewRouteKind
 from ouroboros.review_native_episode import NativeToolRoundReviewExecutor
 from ouroboros.review_substrate import ReviewRequest, ReviewSlot
-from ouroboros.tools.core_file_tools import _read_file
+from ouroboros.tools.core_file_tools import _read_file, delivered_source_prefix
 from ouroboros.tools.registry import ToolContext
 
 
@@ -43,16 +44,16 @@ def test_partial_long_line_receipts_cover_only_the_delivered_normalized_source(t
     assert first["complete_chars"] == len(normalized)
     assert first["range_basis"] == "unicode_text_universal_newlines"
     assert first["source_masked"] is False
-    assert (first["source_start_char"], first["source_end_char"]) == (14, 151)
-    assert first["text_chars"] == 137
-    assert first["text_sha256"] == _sha(normalized[14:151].encode())
+    assert (first["source_start_char"], first["source_end_char"]) == (14, 144)
+    assert first["text_chars"] == 130
+    assert first["text_sha256"] == _sha(normalized[14:144].encode())
     assert first["end_line"] < first["start_line"]  # neither chunk delivered a complete line
-    second_full = _read_file(ctx, "source.md", root="system_repo", start_line=2, max_lines=1, start_char=144)
+    second_full = _read_file(ctx, "source.md", root="system_repo", start_line=2, max_lines=1, start_char=137)
     second = executor._read_extent(second_full, ctx.last_read_view["body_start"] + 137)
     assert second["source_start_char"] == first["source_end_char"]
-    assert second["source_end_char"] == 288
+    assert second["source_end_char"] == 274
     assert second["source_revision"] == first["source_revision"]
-    assert second["text_sha256"] == _sha(normalized[151:288].encode())
+    assert second["text_sha256"] == _sha(normalized[144:274].encode())
     assert second["end_line"] < second["start_line"]
 
 
@@ -116,7 +117,7 @@ def test_readonly_reader_proves_original_source_with_private_key_fixture(tmp_pat
                       task_constraint={"mode": "local_readonly_subagent"})
     full = _read_file(ctx, "source.md", root="system_repo")
     assert ctx.last_read_view["source_masked"] is False
-    assert raw.decode() in full
+    assert delivered_source_prefix(ctx.last_read_view, full, len(full)) == raw.decode()
     executor = _executor(tmp_path)
     executor._inspection_ctx = ctx
     extent = executor._read_extent(full, len(full))
@@ -124,22 +125,23 @@ def test_readonly_reader_proves_original_source_with_private_key_fixture(tmp_pat
     assert extent["text_sha256"] == _sha(raw)
 
 
-def test_result_fitting_receipt_matches_exact_text_returned_to_the_reviewer(tmp_path):
+def test_result_fitting_receipt_matches_exact_text_returned_to_the_reviewer(tmp_path, monkeypatch):
     raw = ('α\\"\t' * 2000 + "\n").encode()
     (tmp_path / "source.md").write_bytes(raw)
     executor = _executor(tmp_path)
     registry, _schemas = executor._inspection_registry(str(tmp_path), tmp_path / "data")
+    monkeypatch.setattr(native, "_EPISODE_TOOL_RESULT_CHAR_CAP", 1500)
     message = executor._execute_inspection_call(registry, {
         "id": "read-1", "function": {"name": "read_file", "arguments": json.dumps({"path": "source.md"})},
-    }, {}, round_idx=1, room=1500)
+    }, {}, round_idx=1)
     receipt = executor._tool_receipts[0]
-    body_start = executor._inspection_ctx.last_read_view["body_start"]
-    delivered = message["content"][body_start:body_start + receipt["text_chars"]]
+    shown = message["content"].index("\n⚠️ RESULT TRUNCATED:")
+    delivered = delivered_source_prefix(executor._inspection_ctx.last_read_view, message["content"], shown)
     assert 0 < receipt["text_chars"] < len(raw.decode())
     assert receipt["source_end_char"] == receipt["text_chars"]
     assert receipt["text_sha256"] == _sha(delivered.encode())
     assert delivered == raw.decode()[:receipt["text_chars"]]
-    assert message["content"][body_start + receipt["text_chars"]:].startswith("\n⚠️ RESULT TRUNCATED:")
+    assert message["content"][shown:].startswith("\n⚠️ RESULT TRUNCATED:")
     assert len(json.dumps(message, ensure_ascii=False)) + 2 <= 1500
 
 
@@ -156,3 +158,67 @@ def test_exact_source_identity_keeps_the_complete_opened_path(tmp_path):
     assert len(relative) > 300
     assert extent["opened_path"] == relative
     assert extent["source_revision"] == _sha(b"source\n")
+
+
+def test_staged_output_is_credited_only_after_native_projected_delivery(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros import delegate_output as output
+    from tests.test_delegated_result_delivery import _staged_for_main
+
+    executor = _executor(tmp_path)
+    registry, schemas = executor._inspection_registry(str(tmp_path), tmp_path / "data")
+    target, entry = _staged_for_main(SimpleNamespace(ctx=executor._inspection_ctx), ("Ж🙂" * 4000 + "\r\n").encode())
+    content = target.read_text(encoding="utf-8")
+    request = {"id": "read-staged", "function": {"name": "read_file", "arguments": json.dumps({
+        "root": "task_drive", "path": entry.output_artifact})}}
+    monkeypatch.setattr(native, "_EPISODE_TOOL_RESULT_CHAR_CAP", 3000)
+    message = executor._execute_inspection_call(registry, request, {}, round_idx=1)
+    assert not entry.output_consumed and not output._READ_COVERAGE
+    end = executor._tool_receipts[-1]["source_end_char"]
+    assert 0 < end < len(content)
+    assert content[:end] in message["content"]
+    executor._observe_sent_view([{"role": "assistant", "tool_calls": [request]}, message], schemas)
+    assert output._READ_COVERAGE[f"{target.resolve()}|{entry.output_sha}"] == [[0, end]]
+    assert not entry.output_consumed
+    request["function"]["arguments"] = json.dumps({"root": "task_drive", "path": entry.output_artifact,
+                                                  "start_char": end})
+    monkeypatch.setattr(native, "_EPISODE_TOOL_RESULT_CHAR_CAP", 100_000)
+    second = executor._execute_inspection_call(registry, request, {}, round_idx=2)
+    assert not entry.output_consumed
+    executor._observe_sent_view([{"role": "assistant", "tool_calls": [request]}, second], schemas)
+    assert entry.output_consumed
+
+
+def test_abandoned_native_reader_cannot_ack_when_its_worker_finishes(tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from ouroboros import delegate_output as output, loop_tool_execution
+    from ouroboros.tools import core_file_tools
+    from tests.test_delegated_result_delivery import _staged_for_main
+
+    executor = _executor(tmp_path)
+    registry, schemas = executor._inspection_registry(str(tmp_path), tmp_path / "data")
+    _, entry = _staged_for_main(SimpleNamespace(ctx=executor._inspection_ctx), b"small full result\n")
+    release, completed = threading.Event(), threading.Event()
+    original = core_file_tools._stamp_read_view
+
+    def held_stamp(*args, **kwargs):
+        release.wait(5)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(core_file_tools, "_stamp_read_view", held_stamp)
+    monkeypatch.setattr(loop_tool_execution, "_get_tool_timeout", lambda *args: 0.05)
+    monkeypatch.setattr(native, "_EPISODE_TOOL_RESULT_CHAR_CAP", 10_000)
+    request = {"id": "late-read", "function": {"name": "read_file", "arguments": json.dumps({
+        "root": "task_drive", "path": entry.output_artifact})}}
+    try:
+        message = executor._execute_inspection_call(registry, request, {}, round_idx=1)
+        assert executor._tool_receipts[-1]["outcome"] == "error"
+    finally:
+        release.set()
+        assert completed.wait(5)
+    executor._observe_sent_view([{"role": "assistant", "tool_calls": [request]}, message], schemas)
+    assert not output._READ_COVERAGE and not entry.output_consumed

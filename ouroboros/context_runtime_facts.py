@@ -6,8 +6,10 @@ the budget rails it runs under, how the run learns the time (its capture instant
 labels the Recent/Drive snapshots), and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
-change what the section MEANS — only what it reports. ``context`` re-exports every
-name, so historical imports and monkeypatch targets keep working unchanged.
+change what the section MEANS — only what it reports. ``context`` re-exports the
+start-of-task builders, so historical imports and monkeypatch targets keep working
+unchanged; ``round_clock_fact`` is the per-round time segment of the facts line
+(``loop_messages``), read from the same clock owners.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
     import datetime
     import math
     import time
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
     from ouroboros.deadline_utils import parse_deadline_ts
     from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
 
@@ -56,7 +58,7 @@ def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
     except (TypeError, ValueError):
         parsed = parse_deadline_ts(raw)
         start = parsed.timestamp() if parsed is not None else 0.0
-    ceiling = get_task_abs_ceiling_sec()
+    ceiling = resolve_task_execution_timeout_sec(task)  # the narrower of explicit budget and global ceiling
     started = datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat() if start > 0 and math.isfinite(start) else None
     projected = None
     if started and ceiling is not None:
@@ -64,10 +66,90 @@ def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
         owner = current_model_wait()
         elapsed = (owner.executed_seconds() if owner is not None and owner.task_id == str(task.get("id") or "")
                    else execution_elapsed_seconds({**task, "started_at": start}, now))
-        projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
-                                                    datetime.timezone.utc).isoformat()
+        try:
+            projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
+                                                        datetime.timezone.utc).isoformat()
+        except (OverflowError, ValueError, OSError):
+            pass  # a finite duration need not fit the platform's calendar range: stays not_set
+    # The same absolute_ceiling rail either way; the basis names which bound it is (#939).
+    bound = "task execution budget" if ceiling is not None and ceiling == explicit_execution_timeout_sec(task) else "global ceiling"
     return {"started_at": started, "absolute_ceiling_at": projected,
-            "absolute_ceiling_at_basis": "current estimate; quota or budget pauses may move it" if projected else "not_set"}
+            "absolute_ceiling_at_basis": (f"current estimate of the {bound}; quota or budget pauses may move it"
+                                          if projected else "not_set")}
+
+
+def _start_epoch(raw: Any) -> Optional[float]:
+    import math
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    return start if start > 0 and math.isfinite(start) else None
+
+
+def round_clock_fact(ctx: Any, now: Optional[float] = None) -> str:
+    """The facts line's time segment, read from the Time clock owners (#1786) per round.
+
+    Calendar time since this task's clock origin and execution time (the carried
+    offset, quota waits, budget pauses and warm sleep excluded) are named apart; the
+    execution limit names its basis; the calendar deadline stays its own axis; the
+    host's local finalization instant exists only for an explicit deadline or
+    execution budget (``loop_round_limits._maybe_deadline_local_finalize``). A
+    missing start is unknown, never zero; every value is as of the one sample
+    instant, with the live wait owner's clock when it owns this task and otherwise
+    the same carriers ``model_wait.execution_window_remaining_for_context`` reads.
+    """
+    import datetime
+    import time
+    from ouroboros.config import explicit_execution_timeout_sec, resolve_task_execution_timeout_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import budget_paused_seconds, current_model_wait, execution_elapsed_seconds
+    from ouroboros.task_pacing import effective_finalization_reserve_sec
+
+    def stamp(epoch: float) -> str:
+        return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    now = time.time() if now is None else float(now)
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    limit = resolve_task_execution_timeout_sec(meta)
+    parts, executed, left = [f"time sampled {stamp(now)}"], None, None
+    owner = getattr(ctx, "model_wait_context", None) or current_model_wait()
+    start = _start_epoch(getattr(ctx, "task_started_at", None) or meta.get("started_at"))
+    if owner is not None and owner.task_id == str(getattr(ctx, "task_id", "") or ""):
+        executed, left = owner.executed_seconds(), owner.execution_window_remaining()
+    elif start is not None:
+        paused = getattr(ctx, "_budget_paused_sec", None)
+        if paused is None:
+            paused = budget_paused_seconds(getattr(ctx, "budget_pause_resume", None) or {})
+        executed = execution_elapsed_seconds({**meta, "started_at": start, "budget_paused_sec": paused}, now)
+        left = None if limit is None else max(0.0, limit - executed)
+    if start is None:
+        parts.append("wall elapsed unknown (no recorded start)")
+    else:
+        parts.append(f"wall {max(0.0, now - start) / 60:.1f} min since start {stamp(start)}")
+    parts.append("execution elapsed unknown" if executed is None
+                 else f"execution {executed / 60:.1f} min (quota waits and pauses excluded)")
+    if limit is None:
+        parts.append("no execution limit")
+    elif left is None:
+        parts.append(f"execution limit {limit / 60:.1f} min, remaining unknown")
+    else:
+        basis = "task execution budget" if limit == explicit_execution_timeout_sec(meta) else "global execution ceiling"
+        parts.append(f"{basis} {limit / 60:.1f} min, {left / 60:.1f} min left")
+    deadline = parse_deadline_ts(meta.get("deadline_at"))
+    bounds = [left] if left is not None and explicit_execution_timeout_sec(meta) is not None else []
+    if deadline is not None:
+        bounds.append(deadline.timestamp() - now)
+        parts.append(f"deadline {stamp(deadline.timestamp())}, {(deadline.timestamp() - now) / 60:.1f} min left")
+    if bounds:
+        grace = effective_finalization_reserve_sec(ctx)
+        parts.append(f"host requests one tool-less final answer at ~{stamp(now + max(0.0, min(bounds) - grace))} "
+                     f"({grace / 60:.1f} min before the nearer explicit bound)")
+    return "; ".join(parts)
 
 
 def _context_clock_note(task: Dict[str, Any]) -> str:
@@ -187,8 +269,8 @@ def _project_room_fact(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dict[str, Any]:
     """Start-of-task budget block: global projection + the STATIC per-task tree cap,
     written once at task start so the cached prefix stays byte-stable (DEVELOPMENT
-    cache_friendliness item 22); live tree spend rides only the cache-breaking
-    surfaces (checkpoint/pacing/milestones)."""
+    cache_friendliness item 24); live wallet and tree spend ride the per-round facts
+    line (``loop_messages.context_facts_line``)."""
     try:
         from ouroboros.usage_accounting import usage_projection
         from ouroboros.settings_setup_contract import resolve_total_budget_usd
@@ -196,10 +278,13 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         total_usd = resolve_total_budget_usd()
         budget_root = pathlib.Path(task.get("budget_drive_root") or env.drive_root)
         projection = usage_projection(budget_root, global_limit_usd=total_usd)
-        spent_usd = float(projection.get("accounted_usd") or 0.0)
+        # Known spend (confirmed + estimated) is what the limit decides on; open
+        # holds ride beside it, never added in (#1487).
+        spent_usd = float(projection.get("settled_usd") or 0.0)
         budget_info = {
             "status": "available" if total_usd is not None else "no_global_limit", "total_usd": total_usd,
-            "spent_usd": spent_usd, "remaining_usd": None if total_usd is None else total_usd - spent_usd,
+            "spent_usd": spent_usd, "spent_basis": "known_settled_incl_estimates",
+            "remaining_usd": None if total_usd is None else max(0.0, total_usd - spent_usd),
             "reserved_usd": float(projection.get("reserved_usd") or 0.0),
             "unresolved_upper_bound_usd": float(projection.get("unresolved_upper_bound_usd") or 0.0),
             "unknown_unmetered": int(projection.get("unknown_unmetered") or 0),
@@ -215,8 +300,13 @@ def _runtime_budget_info(env: Any, task: Dict[str, Any], ctx: Any = None) -> Dic
         budget_info["per_task_tree_cap_usd"] = root_cap
         budget_info["per_task_tree_cap_rule"] = (
             "Hard cap for THIS task's WHOLE tree (own model calls + all subagents), enforced "
-            "by the physical-attempt ledger: dispatches are refused once the tree's accounted "
-            "spend reaches it and the task is force-stopped. Budget checkpoints during the task report the live tree number."
+            "by the physical-attempt ledger: new dispatches are refused once the tree's KNOWN "
+            "spend (confirmed and estimated) reaches it. A task with an exact continuation then "
+            "pauses with its work saved; an actor without one (no continuation owner, task id or "
+            "durable root) ends with a typed budget_exhausted result and no paid recap. "
+            "Open reservations and unresolved charges are not counted as spending, and calls "
+            "in flight or charged late can take the tree past the cap. The facts line of each "
+            "round reports the live tree number."
         )
     if ctx is not None:
         budget_info["in_task_cost_ceiling"] = _in_task_cost_ceiling(ctx, budget_info.get("remaining_usd"))

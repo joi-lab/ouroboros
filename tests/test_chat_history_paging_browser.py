@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._store_shared import seed_result
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
 from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _SETTLE_RESTORE_FRAMES, _emit_ws_frame
 
@@ -59,9 +60,9 @@ def _write(path, rows):
 
 
 def _result(root, task_id, **fields):
-    _write(root / "task_results" / f"{task_id}.json", [{
-        "_schema_version": 1, "task_id": task_id, "status": "completed", **fields,
-    }])
+    # The running server reads task results from its store (#1733); a result file
+    # written after boot is imported only by the next boot.
+    seed_result(root, task_id, {"task_id": task_id, "status": "completed", **fields})
 
 
 def _human(index, chat_id=1, **extra):
@@ -569,17 +570,17 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                     assert page.locator(feed).get_by_text("history-note.txt", exact=True).count() > 0
                     anchor = page.locator(f'{feed} [data-client-message-id="routed-archive"]')
                     assert anchor.locator('.msg-routing-annotation').text_content() == "Routed to project · History detail room"
+                    assert anchor.locator('.msg-routing-annotation').get_by_role("button").count() == 0
                     assert anchor.locator('.msg-routing-actions').count() == 0
                     other = page.locator(f'{feed} [data-client-message-id="routed-other"]')
-                    # The routing receipt's button lives in the shared action row between the note and the
-                    # timestamp (never inside the nowrap note line): DESIGN "Quiz card", ARCHITECTURE 03.
-                    assert other.locator('.msg-routing-actions [data-intent="open-project"]').count() == 1
-                    assert other.locator('.msg-routing-annotation').get_by_role("button").count() == 0
+                    # Words that went to another room end their one receipt line with that room's Project
+                    # reference (DESIGN "Its form follows the surface's job"); no second row, right above the time.
+                    assert other.locator('.msg-routing-annotation [data-intent="open-project"]').count() == 1
+                    assert other.locator('.msg-routing-actions').count() == 0
                     assert other.evaluate("""node => {
-                        const note = node.querySelector('.msg-routing-annotation'), row = node.querySelector('.msg-routing-actions'),
-                            time = node.querySelector('.msg-time');
+                        const note = node.querySelector('.msg-routing-annotation'), time = node.querySelector('.msg-time');
                         const follows = (a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
-                        return Boolean(note && row && time) && follows(note, row) && follows(row, time);
+                        return Boolean(note && time) && follows(note, time);
                     }""")
                     # Live receipt updates use the same room address as retained history.
                     for routed_project in (project, destination):
@@ -587,13 +588,18 @@ def test_history_details_selection_replay_and_project_reopen(direct_server_with_
                             "chat_id": project["chat_id"], "client_message_id": "routed-other",
                             "action": "route_to_project", "status": "delivered", "target_label": routed_project["name"],
                             "project_id": routed_project["id"], "project_chat_id": str(routed_project["chat_id"])})
-                        assert other.locator('.msg-routing-annotation').text_content() == f"Routed to project · {routed_project['name']}"
-                        assert other.locator('.msg-routing-actions').count() == int(routed_project is destination)
+                        reference = other.locator('.msg-routing-annotation [data-intent="open-project"]')
+                        if routed_project is destination:
+                            assert other.locator('.msg-routing-annotation > span').first.text_content() == "Routed to"
+                            assert reference.count() == 1
+                        else:
+                            assert other.locator('.msg-routing-annotation').text_content() == f"Routed to project · {routed_project['name']}"
+                            assert reference.count() == 0
                     anchor.scroll_into_view_if_needed()
                     _screenshot(page, tmp_path, f"archive-features-{browser_engine}-{width}")
                     other.scroll_into_view_if_needed()
                     _screenshot(page, tmp_path, f"routing-other-project-{browser_engine}-{width}")
-                    other.locator('.msg-routing-actions [data-intent="open-project"]').click()
+                    other.locator('.msg-routing-annotation [data-intent="open-project"]').click()
                     destination_feed = f'#pchat-{destination["id"]}-messages'
                     page.locator(destination_feed).wait_for(state="visible", timeout=30_000)
                     _idle(page, destination_feed)

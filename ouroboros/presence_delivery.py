@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ouroboros.utils import iter_jsonl_objects, jsonl_chain_handles, utc_now_iso
+from ouroboros.store import StoreError
 
 DELIVERY_VERSION = 1
 _FIELDS = frozenset({
@@ -95,7 +96,7 @@ def _verified_task(data_dir: Path, skill: str, origin: dict[str, str]) -> tuple[
 
     try:
         task = load_task_result(data_dir, task_id, strict=True) or {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, StoreError):
         return "", {}
     provenance = presence_provenance_from_task(task)
     if provenance.get("transport_skill") != skill:
@@ -109,6 +110,12 @@ class PresenceDeliveryRecorder:
     Only this Host receipt writer owns these keys. Other chat writers and
     rotation do not invalidate its incrementally maintained projection. A new
     Host rebuilds once; an ambiguous required write discards the projection.
+
+    ``record`` reports ``history_coverage``: ``indexed`` (the last rebuild plus this
+    writer's own writes; concurrent chat writers are not re-scanned) or ``gapped``
+    (a retained row was malformed, so ``duplicate=false`` is not proof of absence).
+    A physically unreadable archive raises rather than reading as empty history.
+    Each append starts on a JSONL record boundary, even after a torn tail.
     """
 
     def __init__(self, data_dir: Path) -> None:

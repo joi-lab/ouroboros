@@ -49,12 +49,9 @@ def _task_acceptance_eligible(
 ) -> tuple[bool, str]:
     """Return ``(host_should_review, trigger_reason)``.
 
-    Both modes review observable effects and typed deliverables/criteria.
-    ``auto`` also honors an agent's explicit review-tool request, so read-only
-    research remains reviewable without classifying its prose or tool counts.
-    Queue membership alone qualifies only in ``required``. Child reviews stay
-    advisory, and ``off`` never reviews.
-    Eligibility uses typed contracts and runtime facts, never message content.
+    Auto is the author's typed nomination. Required also reviews observed effects
+    and retained produced material. Requests, inputs and queue labels prove no
+    production; child critics and collection of paid panels have separate owners.
     """
     if mode == "off":
         return False, "off"
@@ -62,25 +59,32 @@ def _task_acceptance_eligible(
         return False, "skipped_child_advisory"
     if mode in {"auto", "required"}:
         prefix = "required" if mode == "required" else "auto"
-        if turn_has_reviewable_effects(llm_trace):
-            return True, f"{prefix}_effect"
-        if mode == "required" and not is_direct_chat:
-            return True, f"{prefix}_nondirect"
-        contract = task_contract if isinstance(task_contract, dict) else {}
-        if (
-            str(contract.get("expected_output") or "").strip()
-            or bool(contract.get("acceptance_criteria"))
-            or bool(contract.get("success_criteria"))
-            or bool(contract.get("acceptance_claims"))
-        ):
-            return True, f"{prefix}_contract"
-        if any(
-            isinstance(call, dict) and call.get("tool") == "task_acceptance_review"
-            for call in (llm_trace.get("tool_calls") or [])
-        ):
+        if recorded_acceptance_nomination(llm_trace):
             return True, f"{prefix}_agent_request"
+        if mode == "required":
+            if turn_has_reviewable_effects(llm_trace, observed_only=True):
+                return True, "required_effect"
+            if (llm_trace.get("acceptance_material") or {}).get("produced") is True:
+                return True, "required_material"
         return False, "skipped_conversation"
     return False, "skipped_unknown_mode"
+
+
+def recorded_acceptance_nomination(llm_trace: Dict[str, Any]) -> bool:
+    """Whether the agent actually NOMINATED its result for host acceptance.
+
+    The nomination is the typed root deferral ``process_tool_results`` recorded
+    (``deferred_to_host_acceptance``, ``authoritative=false``), the same record
+    the host evidence builder reads. The tool NAME is not a nomination: the same
+    tool also acknowledges a finish/stop, amends a historical cap or summarizes a
+    historical panel, and none of those asks for a panel (#1602).
+    """
+    return any(
+        isinstance(call, dict)
+        and str(call.get("status") or "") == "deferred_to_host_acceptance"
+        and call.get("authoritative") is False
+        for call in (llm_trace.get("acceptance_evidence_calls") or [])
+    )
 
 
 from ouroboros.loop_messages import (  # noqa: F401 — shared owner-source surface
@@ -364,10 +368,9 @@ def _supersede_task_acceptance_for_owner_followup(
     )
     ctx._task_acceptance_reviewed = False
     ctx._task_acceptance_fence_generation_mismatch = False
-    # The panel in flight reviewed the answer to the OLD requirements: it stays
-    # custodied and its verdicts still arrive as advice, but the answer Main writes
-    # for the follow-up is not a delivery under it — the ordinary path decides.
-    ctx._task_acceptance_pending = ""
+    # A new message changes delivery premises, not physical review identity or
+    # the author's wait choice. The old verdict can inform the next decision
+    # without authorizing an answer to changed requirements.
     llm_trace.pop("root_phase_checkpoint", None)
     llm_trace["review_decision"] = {**dict(llm_trace.get("review_decision") or {}),
         "eligibility": "pending_owner_followup",
@@ -590,6 +593,10 @@ def _latch_final_answer_marker(
         pass
     answer = extract_final_answer(text)
     if not answer:
+        from ouroboros.outcomes import FINAL_ANSWER_MARKER
+        if any(line.strip().startswith(FINAL_ANSWER_MARKER) for line in text.splitlines()):
+            llm_trace.pop("best_valid_final_answer", None)
+            llm_trace.pop("best_valid_final_answer_tools", None)
         return
     llm_trace["best_valid_final_answer"] = answer
     del current_tool_calls
@@ -715,15 +722,13 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
     action = str(decision.get("author_action") or "finish")
     merged["author_action"] = action
     merged.pop("agent_finish_intent", None)
-    feedback = next((run for run in reversed(trace.get("review_runs") or [])
-                     if isinstance(run, dict) and run.get("authority") == "host_root"
-                     and run.get("feedback_delivered")), None)
-    outcome = trace.get("acceptance_review_outcome") or {}
-    if not feedback and outcome.get("feedback_delivered"):
-        feedback = outcome
+    from ouroboros.loop_delivery import completion_feedback
+
+    feedback = completion_feedback(trace) or None
     if isinstance(observed, dict):
         feedback = observed.get("feedback") or None
-    explicit = ctx is not None and decision.get("explicit_finish") is True and bool(merged["agent_rationale"].strip())
+    explicit = (ctx is not None and decision.get("explicit_finish") is True
+                and (action != "stop" or bool(merged["agent_rationale"].strip())))
     from ouroboros.acceptance_preparation import STATUS_FAILED, preparation_exposed
 
     incident = observed.get("preparation") if isinstance(observed, dict) else trace.get("acceptance_preparation")
@@ -757,10 +762,10 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
             # fresh read, so an unverifiable stance is never honoured as ready.
             "evidence_fingerprint": observed.get("evidence_fingerprint", "") if isinstance(observed, dict) else observed_delivery_evidence(ctx, trace),
         }
-    from ouroboros.review_records import recorded_author_stop
-
-    if merged.get("agent_finish_intent") and recorded_author_stop(previous):
-        ctx._task_acceptance_reviewed = False  # the author's next decision reopens an honoured stop
+    if merged.get("agent_finish_intent") and (action == "stop" or merged.get("status") != ACCEPTANCE_ACCEPTED):
+        # A replay refusal (or stop) is not the author's next informed decision.
+        # Re-enter the ordinary freshness/control gates; clean approval needs no override.
+        ctx._task_acceptance_reviewed = False
     trace["acceptance_decision"] = merged
 
 
@@ -1028,7 +1033,8 @@ def _record_forced_acceptance_bypass(
     a collected one says). Reason tokens stay ledger-only (v6.61.4
     token-parroting class). Never raises."""
     rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
-    if rail_reason is None:
+    if rail_reason is None and reason_code not in {
+            "billing_authority_unreadable", "billing_authority_refused", "control_authority_unreadable"}:
         return
     # A rail that deliberately cleared the failure state (a confirmed swarm routing
     # handoff) terminalized nothing reviewable here — the admitted managed task gets
@@ -1039,6 +1045,22 @@ def _record_forced_acceptance_bypass(
     if tools_ctx is None:
         return
     from ouroboros.acceptance_history import seed_acceptance_history
+    from ouroboros.acceptance_material import retain_acceptance_material
+
+    # Finalization collects paid facts even when a prior decision or Off forbids
+    # fresh review. Collection failure proves no new verdict and permits no resend.
+    try:
+        from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
+        reconcile_pending_acceptance_runs(llm_trace, drive_root=tools_ctx.drive_root, usage_ctx=tools_ctx)
+    except Exception:
+        log.debug("Forced finalization could not collect paid feedback", exc_info=True)
+    # A forced replacement still owns its exact selection. Capture is fallible;
+    # an unavailable reader cannot resurrect the previous answer or abort salvage.
+    try:
+        retain_acceptance_material(tools_ctx, llm_trace)
+    except Exception as exc:
+        llm_trace["acceptance_material"] = {"produced": False, "sources": [], "issues": [
+            {"status": "source_unavailable", "tool": "forced_material", "reason": str(exc)}]}
     # A recorded host decision (canonical status, NOT the status-less agent
     # stance merged on a deferral) wins; the bypass record exists only for the
     # no-host-verdict shape; `_set_acceptance_decision` stamps.
@@ -1048,9 +1070,11 @@ def _record_forced_acceptance_bypass(
         # take the pass it promised, so close it instead of leaving it dangling.
         terminalize_dangling_revision(llm_trace, rail=str(reason_code or ""))
         publish_acceptance_checkpoint(tools_ctx, llm_trace, task_id=ctx.task_id)
-        if decision.get("status") != "accepted":
+        if rail_reason is not None and decision.get("status") != "accepted":
             seed_acceptance_history(tools_ctx, llm_trace, rail_reason)
         return
+    if rail_reason is None:
+        return  # authority interruption closes an existing revision; it invents no panel/bypass verdict
     if getattr(tools_ctx, "_task_acceptance_reviewed", False):
         return
     trigger = f"bypassed_{reason_code}"
@@ -1075,7 +1099,8 @@ def _record_forced_acceptance_bypass(
         log.debug("Forced acceptance-bypass eligibility probe failed", exc_info=True)
         llm_trace["review_decision"] = {"eligibility": "unknown", "trigger": trigger}
         return
-    if not eligible:
+    if not eligible and not any(isinstance(run, dict) and run.get("authority") == "host_root"
+                                for run in llm_trace.get("review_runs") or []):
         # Explicitly "no panel warranted" — now distinguishable from "not evaluated".
         llm_trace["review_decision"] = {"eligibility": "not_eligible", "trigger": probe_trigger}
         return

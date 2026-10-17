@@ -6,10 +6,11 @@ goal reached the run only if the nanny hand-copied it into every prompt, and
 (b) the finalization nudge went permanently silent after the first successful
 delegated run (old loop.py `if evidence.get("delegated_runs_succeeded"): return ""`).
 
-Phase B replaces both: the task contract's objective/expected_output ride
-STRUCTURALLY in the host-authored run `instructions`, and the silence is
-proportional to the measured metered burn since the last delegated-run activity
-(config thresholds; owner decision 2=B — reminders only, never a cap).
+Phase B replaced both: the task contract's objective/expected_output ride
+STRUCTURALLY in the host-authored run `instructions`, and the burn since the last
+delegated-run activity is measured (owner decision 2=B — never a cap). Since #1748
+(owner 11 Oct: facts, no advice) that burn is a fact on every round's facts line with
+its anchors named; the periodic reminder and the metered-overrun one-shot are gone.
 """
 
 import json
@@ -17,7 +18,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.task_pacing import NANNY_FIRST_REMINDER_ROUNDS, NANNY_REMINDER_ROUNDS
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +52,8 @@ def _start_with_contract(
     )
     ctx.task_id = "t-nanny"
     ctx.task_metadata = {"root_task_id": "t-root", "parent_task_id": "t-root"}
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "t-root", "running", root_task_id="t-root")  # the child's real root
     ctx.task_contract = dict(contract)
 
     seen = {}
@@ -86,6 +88,9 @@ def _start_with_contract(
             "credential_profile_id": "",
         },
         "effort": "low",
+        # A READ-ONLY child (local_readonly_subagent): technical access alone decides
+        # the run shape now (#1609), so the selected session states it explicitly.
+        "access": "readonly",
     }
     payload = json.loads(subagent_runtime.exact_start(ctx, prompt, {
         "snapshot": snapshot,
@@ -112,7 +117,7 @@ def test_the_contract_objective_rides_the_run_instructions_structurally(tmp_path
     assert instructions.index("git commit") < instructions.index("HOST TASK CONTRACT AUTHORITY")
 
 
-def test_direct_start_request_carries_complete_normalized_contract_authority(tmp_path, monkeypatch):
+def test_direct_start_carries_assignment_and_a_predecessor_brief(tmp_path, monkeypatch):
     context = " \nAPI_CONTEXT_EXACT\n "
     contract = {
         "objective": "delegate the Cat build",
@@ -124,6 +129,9 @@ def test_direct_start_request_carries_complete_normalized_contract_authority(tmp
         "allowed_resources": {"network": False},
         "predecessor_authority": {
             "source": {"kind": "task_result", "task_id": "cat-old"},
+            "result": "Keep the existing tower",
+            "origin_message_text": "Claudexor only; build three levels",
+            "verification_receipts": [{"evidence": "OLD_RECEIPT_BODY"}],
             "task_contract": {
                 "objective": "CLAUDEXOR_ONLY; L1 MUST ASK L2 TO SPAWN L3",
                 "context": "never use native/API fallback",
@@ -132,7 +140,8 @@ def test_direct_start_request_carries_complete_normalized_contract_authority(tmp
     }
 
     request = _start_with_contract(tmp_path, monkeypatch, contract)
-    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    assert "OLD_RECEIPT_BODY" not in request["instructions"]
+    marker = "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
     payload = request["instructions"].split(marker, 1)[1]
     normalized, end = json.JSONDecoder().raw_decode(payload)
     # The owner's words that caused the work follow the contract.
@@ -143,7 +152,14 @@ def test_direct_start_request_carries_complete_normalized_contract_authority(tmp
     assert normalized["acceptance_claims"][0]["claim"] == "L1 asks L2 to spawn L3"
     assert normalized["delegation_budget"]["intent_note"] == "L1\nL2\nL3"
     assert normalized["allowed_resources"]["network"] is False
-    assert normalized["predecessor_authority"] == contract["predecessor_authority"]
+    brief = normalized["predecessor_authority"]
+    for key in ("source", "result", "origin_message_text", "task_contract"):
+        assert brief[key] == contract["predecessor_authority"][key]
+    assert "verification_receipts" not in brief
+    assert brief["omitted_fields"]["verification_receipts"] > 0
+    assert "OLD_RECEIPT_BODY" in json.dumps(contract)  # the caller is untouched
+    assert "get_task_result" in payload[end:] and "launching task" in payload[end:]
+    assert "delegate_answer" in payload[end:] and "input_required" in payload[end:]
 
 
 def test_a_missing_contract_contributes_nothing(tmp_path, monkeypatch):
@@ -171,7 +187,7 @@ def test_retry_replays_the_stored_wire_body_not_a_rebuilt_one():
     assert 'record["request"]' in inspect.getsource(delegate._resolve_retry_invocation)
 
 
-# -- B1.2/B1.3: proportional reminder ------------------------------------------
+# -- B1.2/B1.3: the measured burn and its anchors -------------------------------
 
 
 def _nanny_ctx(**extra):
@@ -241,349 +257,154 @@ def test_scheduling_a_child_is_a_real_act_of_delegation():
     assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
 
 
-def test_a_non_nanny_task_is_never_tracked_or_reminded():
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_a_non_nanny_task_is_never_tracked_and_has_no_nanny_fact():
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
     ctx = SimpleNamespace(_nanny_route_dispatched=False)
     _note_nanny_delegate_activity(ctx, 5, {"cost": 9.0}, [])
     assert not hasattr(ctx, "_nanny_metered_progress")
-    msgs: list = []
-    tools = SimpleNamespace(_ctx=ctx)
-    assert _maybe_inject_nanny_economics_reminder(5, msgs, tools, lambda *_: None) is False
-    assert msgs == []
+    assert nanny_burn_fact(ctx) == ""
 
 
-def test_the_reminder_fires_proportionally_and_rearms_without_a_cap():
-    """Owner 2=B: no absolute cap — the reminder repeats each threshold-width of
-    metered rounds for as long as the burn continues, and never blocks."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_the_periodic_reminder_and_its_thresholds_are_gone():
+    """#1748 (owner 11 Oct; 12 Aug "2=B" keeps no cap): no reminder producer, no
+    8-round/$2/3-round thresholds, no fire cursor."""
+    from ouroboros import loop, loop_nudges, nanny_pacing, task_pacing
 
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    fired: list = []
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-
-    round_idx = 1
-    for _ in range(3 * NANNY_REMINDER_ROUNDS):
-        round_idx += 1
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.0}, [
-            {"id": "c", "type": "function", "function": {"name": "run_command", "arguments": "{}"}},
-        ])
-        msgs: list = []
-        if _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None):
-            fired.append(round_idx)
-            joined = "\n".join(m.get("content", "") for m in msgs)
-            assert "NANNY ECONOMICS REMINDER" in joined
-            assert "reminder, not a stop" in joined
-    # Fired repeatedly (proportional re-arming), roughly once per threshold width.
-    assert len(fired) == 3
-    assert fired[1] - fired[0] >= NANNY_REMINDER_ROUNDS
+    for module, name in ((loop, "_maybe_inject_nanny_economics_reminder"),
+                         (loop_nudges, "_maybe_inject_nanny_economics_reminder"),
+                         (nanny_pacing, "nanny_reminder_due"), (nanny_pacing, "nanny_burn_phrase"),
+                         (task_pacing, "NANNY_REMINDER_ROUNDS"), (task_pacing, "NANNY_REMINDER_USD"),
+                         (task_pacing, "NANNY_FIRST_REMINDER_ROUNDS")):
+        assert not hasattr(module, name), name
 
 
-def test_the_reminder_never_makes_an_unconditional_zero_cost_claim():
-    """BR1-3 regression pin (owner wording law: typed cost classes, never
-    "free" unqualified): the reminder fires PRE-delegation, when the run's
-    spend may settle billed/estimated/undisclosed — its text must carry the
-    conditional phrasing (known-zero only on a settled $0 spend), never the
-    old unconditional "runs at $0 marginal cost" assertion."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_the_fact_names_both_anchors_as_requests():
+    """Owner R2 correction: the two counters keep their different anchors and are
+    named as what they are — the round anchor moves on any delegate verb CALL, the
+    dollar anchor only on a delegate_start/schedule_subagent CALL; success is not implied."""
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
     ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    round_idx = 1
-    msgs: list = []
-    while not msgs:
-        round_idx += 1
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.0}, [
-            {"id": "c", "type": "function", "function": {"name": "run_command", "arguments": "{}"}},
-        ])
-        _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None)
-    text = "\n".join(m.get("content", "") for m in msgs)
-    assert "NANNY ECONOMICS REMINDER" in text
-    # The conditional, typed form is present...
-    assert "only when its settled spend reports $0" in text
-    assert "estimated or undisclosed spend is never zero" in text
-    # ...and the unconditional claim is gone: every "$0" in the reminder sits
-    # inside the settled-spend conditional, never as a standing property.
-    assert "runs at $0" not in text
-    assert "substrate runs at" not in text
+    _note_nanny_delegate_activity(ctx, 3, {"cost": 1.0}, [_delegate_call()])
+    _note_nanny_delegate_activity(ctx, 6, {"cost": 2.0}, [_delegate_call("delegate_wait")])
+    _note_nanny_delegate_activity(ctx, 9, {"cost": 3.5}, [])
+    fact = nanny_burn_fact(ctx)
+    assert fact == ("nanny: 3 own rounds since the last delegate verb call (round 6); own recorded cost "
+                    "$2.50 since the last delegate_start/schedule_subagent call (round 3); these anchors are "
+                    "requests, not confirmed runs")
+    for advice in ("Consider", "delegate the remaining", "honestly", "reminder", "should"):
+        assert advice not in fact, advice
 
 
-def test_below_threshold_stays_silent():
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_before_any_delegation_the_fact_counts_from_task_start():
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
     ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    _note_nanny_delegate_activity(ctx, 2, {"cost": 0.1}, [])
-    assert _maybe_inject_nanny_economics_reminder(2, [], tools, lambda *_: None) is False
+    for round_idx in (1, 2, 3, 4):
+        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.25 * round_idx}, [])
+    assert nanny_burn_fact(ctx) == ("nanny: no delegate_start/schedule_subagent call yet; since task start "
+                                    "4 own rounds, own recorded cost $1.00")
 
 
-def test_the_cost_axis_alone_can_trigger_the_reminder():
-    """REAL-PATH cost firing (F1): a $2+ burn at round 2 must fire through the
-    production gate — no cursor presets. The old single round-spacing gate
-    (`round_idx - last_fired >= 8`) muted exactly this case, and the old test
-    masked the mute by presetting `_nanny_reminder_round` below zero."""
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_a_wait_without_a_start_keeps_the_dollar_anchor_at_task_start():
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
     ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    # One expensive round: below the round threshold, at the dollar one.
-    _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
-    msgs: list = []
-    assert _maybe_inject_nanny_economics_reminder(2, msgs, tools, lambda *_: None) is True
-    assert any("metered LLM rounds" in m.get("content", "") for m in msgs)
+    _note_nanny_delegate_activity(ctx, 2, {"cost": 0.5}, [_delegate_call("delegate_wait")])
+    _note_nanny_delegate_activity(ctx, 4, {"cost": 1.5}, [])
+    fact = nanny_burn_fact(ctx)
+    assert "2 own rounds since the last delegate verb call (round 2)" in fact
+    assert "own recorded cost $1.50 since task start (no delegate_start/schedule_subagent call yet)" in fact
 
 
-def test_the_reminder_stays_out_of_owner_chat_progress(tmp_path):
-    """Owner decision (2026-08-15): the economics reminder is a model-facing
-    user message plus a typed task_checkpoint event — emit_progress (chat ⚠️
-    lines) stays silent, so the owner chat is not spammed mid-run."""
-    import json
+def test_a_host_started_run_seed_names_its_anchor():
+    from ouroboros.agent import reset_nanny_economics_marks
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
-    msgs: list = []
-    progress: list = []
-    drive_logs = tmp_path / "logs"
-    drive_logs.mkdir()
-    assert _maybe_inject_nanny_economics_reminder(
-        2, msgs, tools, progress.append,
-        event_queue=None, task_id="t", drive_logs=drive_logs,
-    ) is True
-    assert progress == []
-    assert any("NANNY ECONOMICS REMINDER" in m.get("content", "") for m in msgs)
-    events = [json.loads(line) for line in
-              (drive_logs / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert any(e.get("type") == "task_checkpoint"
-               and e.get("checkpoint_kind") == "nanny_economics_reminder"
-               for e in events)
+    ctx = SimpleNamespace()
+    reset_nanny_economics_marks(ctx, route_dispatched=True, delegate_activity_seed=True)
+    _note_nanny_delegate_activity(ctx, 2, {"cost": 0.4}, [])
+    fact = nanny_burn_fact(ctx)
+    assert "2 own rounds since the last delegate verb call (host-started run before round 1)" in fact
+    # the seed anchors rounds only; its dollars are not an invented anchor value
+    assert "own recorded cost $0.40 since task start (the host-started run records no cost anchor)" in fact
 
 
-def test_the_rearm_is_dual_axis_a_continuing_dollar_burn_refires_before_8_rounds():
-    """F1 (five reviewers converged): after a firing, EITHER a further
-    threshold-width of rounds OR a further threshold-width of dollars re-arms.
-    A nanny burning $2 per round must hear the reminder again long before eight
-    more rounds pass."""
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_missing_money_is_unknown_partial_is_a_subtotal_and_only_a_priced_zero_is_zero():
+    """A missing price is never a $0 cost (``llm_pricing.add_usage``: an unpriced call adds
+    no ``cost`` and sets ``cost_final`` False). Four cases, each from the usage carrier:
+    nothing priced (cost absent, with or without cost_final) is unknown; priced plus
+    unpriced is a subtotal that is not final; all priced is known — a confirmed
+    $0.00 included. The progress mark keeps its ``{round, cost}`` shape."""
+    from ouroboros.loop import _nanny_metered_since_delegate_activity, _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(2, [], tools, lambda *_: None) is True
-    # One more round, another threshold-width of dollars: due again on the COST
-    # axis alone (rounds-since-fire is 1, far under the round threshold).
-    _note_nanny_delegate_activity(ctx, 3, {"cost": 2 * NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(3, [], tools, lambda *_: None) is True
-    # ...and with no further burn since that second firing, nothing re-fires.
-    _note_nanny_delegate_activity(ctx, 4, {"cost": 2 * NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(4, [], tools, lambda *_: None) is False
+    def run(steps):
+        usage: dict = {}
+        ctx = _nanny_ctx(_accumulated_usage=usage)
+        for round_idx, update, calls in steps:
+            usage.update(update)
+            _note_nanny_delegate_activity(ctx, round_idx, usage, calls)
+        return ctx, nanny_burn_fact(ctx)
 
-
-def test_only_a_real_act_of_delegation_resets_the_fire_cursor():
-    """F1 (gemini), charter-refined (adversarial ECON-1): a cooldown earned
-    BEFORE a real act of delegation must not mute the reminder for burn AFTER
-    it — delegate_start re-zeroes the baseline AND clears the fire cursor. A
-    supervision verb (delegate_wait) deliberately KEEPS the cursor: the dollar
-    axis never resets across supervision, so clearing the cursor there would
-    re-fire the reminder on every post-threshold supervision round (the
-    reminder storm)."""
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    _note_nanny_delegate_activity(ctx, 2, {"cost": NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(2, [], tools, lambda *_: None) is True
-    assert isinstance(ctx._nanny_reminder_mark, dict)
-    # A supervision verb keeps the cursor — no storm.
-    _note_nanny_delegate_activity(ctx, 3, {"cost": NANNY_REMINDER_USD}, [_delegate_call("delegate_wait")])
-    assert isinstance(ctx._nanny_reminder_mark, dict)
-    # A REAL act of delegation re-zeroes the baseline and clears the cursor,
-    # so the first post-activity threshold crossing fires with no spacing gate.
-    _note_nanny_delegate_activity(ctx, 4, {"cost": NANNY_REMINDER_USD}, [_delegate_call()])
-    assert ctx._nanny_reminder_mark is None
-    _note_nanny_delegate_activity(ctx, 5, {"cost": 2 * NANNY_REMINDER_USD}, [])
-    assert _maybe_inject_nanny_economics_reminder(5, [], tools, lambda *_: None) is True
+    # nothing priced, cost_final missing (no accumulation recorded at all)
+    ctx, fact = run([(1, {}, [_delegate_call()]), (3, {}, [])])
+    assert "own recorded cost unknown (no provider price recorded)" in fact and "$0.00" not in fact
+    assert ctx._nanny_metered_progress == {"round": 3, "cost": None}
+    assert _nanny_metered_since_delegate_activity(ctx) == (2, None)
+    # nothing priced, cost_final False (unpriced calls recorded)
+    _ctx, fact = run([(1, {}, [_delegate_call()]), (3, {"cost_final": False}, [])])
+    assert "own recorded cost unknown (no provider price recorded)" in fact and "$0.00" not in fact
+    # partly priced: a subtotal, not final
+    _ctx, fact = run([(1, {"cost": 0.25}, [_delegate_call()]), (3, {"cost": 1.0, "cost_final": False}, [])])
+    assert "own recorded cost $0.75 subtotal, not final (estimates included; unpriced calls not counted)" in fact
+    # priced before the anchor? none: an anchor without a recorded price subtracts nothing
+    _ctx, fact = run([(1, {}, [_delegate_call()]), (2, {"cost": 0.4}, [])])
+    assert "own recorded cost $0.40 since the last delegate_start" in fact
+    # a confirmed zero (e.g. a local route: cost 0.0, final) is a known $0.00
+    _ctx, fact = run([(1, {"cost": 0.0}, [_delegate_call()]), (2, {"cost": 0.0, "cost_final": True}, [])])
+    assert "own recorded cost $0.00 since" in fact and "unknown" not in fact and "subtotal" not in fact
 
 
-def test_a_ritual_wait_cannot_rebaseline_the_cost_axis():
-    """R2-5 (fullcontext HIGH — the one genuine regression of the batch): the
-    reviewer's probe shape, $0.24/round of co-building with a delegate_wait
-    every 7 rounds, evaded the reminder forever because a wait re-zeroed BOTH
-    baselines. A wait now advances only the ROUND baseline, so the dollar axis
-    keeps accruing and fires at the threshold."""
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
+def test_the_fact_reads_the_real_usage_fold_estimates_counted_unpriced_not():
+    """The carrier is ``llm_pricing.add_usage``'s fold, not a handcrafted total: an
+    estimated call's cost IS summed (and makes the total not final), an unpriced call adds
+    nothing and makes it not final, only provider-priced calls stay final, and a task with
+    nothing costed stays unknown."""
+    from ouroboros.llm_pricing import add_usage
+    from ouroboros.loop import _note_nanny_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 0, {"cost": 0.0}, [_delegate_call()])
-    fired: list = []
-    cost = 0.0
-    for round_idx in range(1, 25):
-        cost += 0.24
-        calls = [_delegate_call("delegate_wait")] if round_idx % 7 == 0 else []
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost}, calls)
-        msgs: list = []
-        if _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None):
-            fired.append(round_idx)
-            joined = "\n".join(m.get("content", "") for m in msgs)
-            assert "since your last act of delegation" in joined
-    assert fired, "the ritual wait must not silence the dollar axis"
-    # $2 threshold crossed at round 9 ($2.16) despite the wait at round 7.
-    assert fired[0] == 9
-    assert NANNY_REMINDER_USD == pytest.approx(2.0)
+    def run(calls):
+        usage: dict = {}
+        ctx = _nanny_ctx(_accumulated_usage=usage)
+        for round_idx, call, tools in calls:
+            add_usage(usage, {"prompt_tokens": 10, "completion_tokens": 5, **call})
+            _note_nanny_delegate_activity(ctx, round_idx, usage, tools)
+        return usage, nanny_burn_fact(ctx)
 
-
-def test_a_genuinely_holding_nanny_stays_quiet():
-    """R2-5, the other direction: waits only, pennies per round — neither axis
-    crosses, and the reminder never fires."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 0, {"cost": 0.0}, [_delegate_call()])
-    cost = 0.0
-    for round_idx in range(1, 31):
-        cost += 0.01
-        calls = [_delegate_call("delegate_wait")] if round_idx % 3 == 0 else []
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost}, calls)
-        assert _maybe_inject_nanny_economics_reminder(
-            round_idx, [], tools, lambda *_: None) is False
-
-
-def test_zero_baseline_reminder_says_since_task_start():
-    """R2-7c: before the first delegate verb there is no 'last delegated-run
-    activity' — the reminder measures from the task's start and says so."""
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    # No delegate verb ever called: the baseline is unset.
-    _note_nanny_delegate_activity(ctx, 1, {"cost": NANNY_REMINDER_USD}, [])
-    msgs: list = []
-    assert _maybe_inject_nanny_economics_reminder(1, msgs, tools, lambda *_: None) is True
-    joined = "\n".join(m.get("content", "") for m in msgs)
-    assert "since this task started" in joined
-    assert "since your last delegated-run activity" not in joined
-    # The switch_model sanction rides the reminder text (R2-7b).
-    assert "switch_model" in joined
-
-
-def test_first_reminder_fires_early_with_zero_delegate_activity():
-    """Owner-approved (2026-08-15): a harness-dispatched nanny that has made NO
-    delegate-verb call hears its FIRST reminder at NANNY_FIRST_REMINDER_ROUNDS
-    regardless of dollars — the live E2E's cheap children finished in 4-8
-    rounds under $0.15 and never heard it."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    fired_at = None
-    for round_idx in range(1, NANNY_REMINDER_ROUNDS + 1):
-        # Pennies per round, never a delegate verb: the dollar axis stays cold.
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": round_idx * 0.01}, [])
-        msgs: list = []
-        if _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None):
-            fired_at = round_idx
-            joined = "\n".join(m.get("content", "") for m in msgs)
-            assert "NANNY ECONOMICS REMINDER" in joined
-            assert "since this task started" in joined
-            break
-    assert fired_at == NANNY_FIRST_REMINDER_ROUNDS
-
-
-def test_no_early_fire_once_a_delegate_verb_happened():
-    """The early first-fire is ONLY for a nanny with zero delegate activity:
-    after any delegate verb the ordinary 8-round/$2 dual-axis thresholds apply
-    unchanged, so round NANNY_FIRST_REMINDER_ROUNDS stays silent."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    fired: list = []
-    for round_idx in range(2, 2 + NANNY_REMINDER_ROUNDS + 1):
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.05}, [])
-        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
-            fired.append(round_idx)
-    # Silent through the early horizon; the first fire needs the full
-    # threshold-width of metered rounds since the delegate activity.
-    assert fired == [1 + NANNY_REMINDER_ROUNDS]
-
-
-def test_rearm_after_the_early_first_fire_uses_the_ordinary_thresholds():
-    """Re-arms after the first firing are unchanged: after the early fire at
-    round NANNY_FIRST_REMINDER_ROUNDS, the next one waits a further FULL
-    threshold-width (8 rounds / $2) — the early constant governs only the
-    first firing of a zero-delegation nanny."""
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-
-    ctx = _nanny_ctx()
-    tools = SimpleNamespace(_ctx=ctx)
-    fired: list = []
-    for round_idx in range(1, 3 * NANNY_REMINDER_ROUNDS):
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": 0.0}, [])
-        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
-            fired.append(round_idx)
-    assert fired[0] == NANNY_FIRST_REMINDER_ROUNDS
-    assert fired[1] - fired[0] == NANNY_REMINDER_ROUNDS
-    assert fired[2] - fired[1] == NANNY_REMINDER_ROUNDS
+    priced, estimated, unpriced = {"cost": 0.25}, {"cost": 0.5, "cost_estimated": True}, {}
+    usage, fact = run([(1, priced, [_delegate_call()]), (2, estimated, []), (3, unpriced, [])])
+    assert usage["cost"] == pytest.approx(0.75) and usage["cost_final"] is False
+    assert ("own recorded cost $0.50 subtotal, not final (estimates included; unpriced calls not counted) "
+            "since the last delegate_start/schedule_subagent call (round 1)") in fact
+    # an estimate alone is a recorded, non-final cost, never unknown and never final
+    _usage, fact = run([(1, {"cost": 0.4, "cost_final": False}, [])])
+    assert "own recorded cost $0.40 subtotal, not final" in fact and "unknown" not in fact
+    # provider-priced only: final, no qualifier
+    usage, fact = run([(1, priced, [_delegate_call()]), (2, priced, [])])
+    assert "cost_final" not in usage
+    assert "own recorded cost $0.25 since the last delegate_start" in fact and "not final" not in fact
+    # unpriced only: no cost to sum, unknown rather than $0.00
+    usage, fact = run([(1, unpriced, [_delegate_call()]), (2, unpriced, [])])
+    assert "cost" not in usage and usage["cost_final"] is False
+    assert "own recorded cost unknown (no provider price recorded)" in fact and "$0.00" not in fact
 
 
 def test_an_expensive_no_tool_round_still_counts(tmp_path):
@@ -609,32 +430,31 @@ def test_an_expensive_no_tool_round_still_counts(tmp_path):
 def test_a_fresh_dispatch_resets_every_economics_mark():
     """F4 (regressions lens): stale marks from a previous task on a reused
     context must not leak into the next dispatch — the reset clears the
-    progress mark, the baseline AND the reminder fire cursor, so the new task
-    starts with zero measured burn and an un-armed reminder."""
+    progress mark and the baseline, so the new task starts with zero measured
+    burn and a facts line counting from task start."""
     from ouroboros.agent import reset_nanny_economics_marks
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _nanny_metered_since_delegate_activity,
-    )
+    from ouroboros.loop import _nanny_metered_since_delegate_activity
+    from ouroboros.nanny_pacing import nanny_burn_fact
 
     ctx = _nanny_ctx(
         _nanny_metered_progress={"round": 30, "cost": 9.0},
         _nanny_delegate_baseline={"round": 5, "cost": 1.0},
-        _nanny_reminder_mark={"round": 30, "cost": 9.0},
         _nanny_finalization_injected=True,
     )
     reset_nanny_economics_marks(ctx, route_dispatched=True)
+    fresh = SimpleNamespace()
+    reset_nanny_economics_marks(fresh, route_dispatched=True)
+    assert not hasattr(fresh, "_nanny_reminder_mark")  # #1748: the reminder and its cursor are gone
     assert ctx._nanny_route_dispatched is True
     assert ctx._nanny_finalization_injected is False
-    assert _nanny_metered_since_delegate_activity(ctx) == (0, 0.0)
-    tools = SimpleNamespace(_ctx=ctx)
-    assert _maybe_inject_nanny_economics_reminder(31, [], tools, lambda *_: None) is False
+    assert _nanny_metered_since_delegate_activity(ctx) == (0, None)  # nothing observed yet: unknown, not $0
+    assert "no delegate_start/schedule_subagent call yet; since task start 0 own rounds" in nanny_burn_fact(ctx)
     # And a non-harness dispatch resets the route latch off.
     reset_nanny_economics_marks(ctx, route_dispatched=False)
     assert ctx._nanny_route_dispatched is False
 
 
-# -- finalization: proportional silence, not permanent silence ------------------
+# -- finalization: a succeeded run buys no round; the forced prompt states the burn
 
 
 def _custody_drive(tmp_path):
@@ -655,7 +475,10 @@ def _succeeded_run(drive, task_id="child-1"):
     })
 
 
-def test_succeeded_run_with_a_big_metered_tail_gets_the_overrun_reminder(tmp_path):
+def test_succeeded_run_with_a_big_metered_tail_buys_no_overrun_round(tmp_path):
+    """#1748: NANNY_METERED_OVERRUN is gone (base witness: the former
+    ``test_succeeded_run_with_a_big_metered_tail_gets_the_overrun_reminder`` re-looped
+    this exact state). The burn is on every round's facts line instead."""
     from ouroboros.loop import _maybe_inject_finalization_nudges
 
     drive = _custody_drive(tmp_path)
@@ -664,30 +487,6 @@ def test_succeeded_run_with_a_big_metered_tail_gets_the_overrun_reminder(tmp_pat
         _nanny_finalization_injected=False,
         _nanny_metered_progress={"round": 30, "cost": 9.0},
         _nanny_delegate_baseline={"round": 5, "cost": 1.0},
-        drive_root=drive,
-    )
-    tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["delegate_start", "delegate_wait"])
-    msgs: list = []
-    assert _maybe_inject_finalization_nudges(
-        tools, drive, "child-1",
-        {"reasoning_notes": [], "tool_calls": []}, "done", msgs, lambda *_: None,
-    ) is True
-    joined = "\n".join(m.get("content", "") for m in msgs)
-    assert "NANNY_METERED_OVERRUN" in joined
-    assert "25 of your own metered LLM rounds" in joined
-    assert "$8.00" in joined
-    assert "NANNY_DID_NOT_DELEGATE" not in joined
-
-
-def test_succeeded_run_with_a_modest_tail_keeps_the_silence(tmp_path):
-    from ouroboros.loop import _maybe_inject_finalization_nudges
-
-    drive = _custody_drive(tmp_path)
-    _succeeded_run(drive)
-    ctx = _nanny_ctx(
-        _nanny_finalization_injected=False,
-        _nanny_metered_progress={"round": 8, "cost": 1.2},
-        _nanny_delegate_baseline={"round": 6, "cost": 1.0},
         drive_root=drive,
     )
     tools = SimpleNamespace(_ctx=ctx, available_tools=lambda: ["delegate_start", "delegate_wait"])
@@ -699,17 +498,13 @@ def test_succeeded_run_with_a_modest_tail_keeps_the_silence(tmp_path):
     assert msgs == []
 
 
-# -- forced finalization: the proportional silence does not extend to forced exits
-
-
 def _forced_ctx(tmp_path, **marks):
     return _nanny_ctx(drive_root=tmp_path, task_id="child-1", **marks)
 
 
-def test_forced_wrapup_over_a_succeeded_run_carries_the_honest_spend_note(tmp_path):
-    """F16 (grok): a forced exit (budget/rounds overrun) may not re-loop, so the
-    honest-spend line rides the ONE forced prompt when the overrun condition
-    holds — succeeded delegated runs used to silence the forced note entirely."""
+def test_forced_wrapup_over_a_succeeded_run_states_the_burn_without_advice(tmp_path):
+    """F16 (grok): a forced exit may not re-loop and carries no facts line, so the
+    burn rides the ONE forced prompt as a fact — no threshold and no advice."""
     from ouroboros.loop import _forced_delegation_note
 
     drive = _custody_drive(tmp_path)
@@ -720,20 +515,25 @@ def test_forced_wrapup_over_a_succeeded_run_carries_the_honest_spend_note(tmp_pa
         _nanny_delegate_baseline={"round": 5, "cost": 1.0},
     )
     note = _forced_delegation_note(ctx, {"tool_calls": []})
-    assert "succeeded" in note
-    assert "25 of your own metered LLM rounds" in note
-    assert "$8.00" in note
-    assert "honestly" in note
+    assert "succeeded" in note and "25 own rounds" in note and "$8.00" in note
+    assert "honestly" not in note and "Account" not in note
+    # Below the old 8-round/$2 threshold the fact is still stated: no threshold remains.
+    small = _forced_ctx(
+        tmp_path,
+        _nanny_metered_progress={"round": 8, "cost": 1.2},
+        _nanny_delegate_baseline={"round": 6, "cost": 1.0},
+    )
+    assert "2 own rounds" in _forced_delegation_note(small, {"tool_calls": []})
 
 
-def test_forced_wrapup_over_a_succeeded_run_stays_silent_below_threshold(tmp_path):
+def test_forced_wrapup_over_a_succeeded_run_with_no_own_burn_is_silent(tmp_path):
     from ouroboros.loop import _forced_delegation_note
 
     drive = _custody_drive(tmp_path)
     _succeeded_run(drive)
     ctx = _forced_ctx(
         tmp_path,
-        _nanny_metered_progress={"round": 8, "cost": 1.2},
+        _nanny_metered_progress={"round": 6, "cost": 1.0},
         _nanny_delegate_baseline={"round": 6, "cost": 1.0},
     )
     assert _forced_delegation_note(ctx, {"tool_calls": []}) == ""
@@ -868,85 +668,3 @@ def test_normalized_contract_rebuild_keeps_workspace_lineage_and_predecessor():
     })
 
     assert build_task_contract({"task_contract": normalized}) == normalized
-
-
-def test_supervision_rounds_do_not_storm_the_reminder(tmp_path):
-    # Adversarial-wave ECON-1: once lifetime metered cost crosses the dollar
-    # threshold, honest supervision (wait/answer/cancel) must NOT wipe the
-    # reminder cursor — otherwise the reminder re-fires on every round after
-    # every supervision verb, bypassing the threshold-width re-arm and
-    # punishing waiting harder than co-building.
-    from types import SimpleNamespace
-
-    from ouroboros.loop import (
-        _maybe_inject_nanny_economics_reminder,
-        _note_nanny_delegate_activity,
-    )
-    from ouroboros.task_pacing import NANNY_REMINDER_USD
-
-    ctx = SimpleNamespace(_nanny_route_dispatched=True)
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    fired = 0
-    for round_idx in range(2, 22):
-        cost = NANNY_REMINDER_USD + 0.05 * round_idx
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost}, [
-            _delegate_call("delegate_wait"),
-        ])
-        if _maybe_inject_nanny_economics_reminder(round_idx, [], tools, lambda *_: None):
-            fired += 1
-    # One threshold crossing plus at most a couple of proportional re-arms —
-    # never one reminder per round (the storm repro measured 14/20).
-    assert fired <= 3, f"reminder stormed: fired {fired} times in 20 supervision rounds"
-
-
-def test_burn_phrase_never_claims_zero_rounds_with_real_dollars():
-    from ouroboros.loop import _nanny_burn_phrase
-
-    assert "0 of your own metered LLM rounds" not in _nanny_burn_phrase(0, 2.45)
-    assert "$2.45" in _nanny_burn_phrase(0, 2.45)
-    assert "3 of your own metered LLM rounds" in _nanny_burn_phrase(3, 2.45)
-
-
-# -- the money sentence follows the round's own cost evidence ------------------
-
-
-def _fire_reminder(cost_per_round, meta, monkeypatch, fallbacks=""):
-    from ouroboros.loop import _maybe_inject_nanny_economics_reminder, _note_nanny_delegate_activity
-
-    monkeypatch.setenv("OUROBOROS_MODEL_FALLBACKS", fallbacks)
-    monkeypatch.delenv("OUROBOROS_MODEL_FALLBACK", raising=False)
-    ctx = _nanny_ctx(_accumulated_usage={"_last_llm_call_meta": meta})
-    tools = SimpleNamespace(_ctx=ctx)
-    _note_nanny_delegate_activity(ctx, 1, {"cost": 0.0}, [_delegate_call()])
-    round_idx, msgs = 1, []
-    while not msgs:
-        round_idx += 1
-        _note_nanny_delegate_activity(ctx, round_idx, {"cost": cost_per_round * round_idx}, [])
-        _maybe_inject_nanny_economics_reminder(round_idx, msgs, tools, lambda *_: None)
-    return "\n".join(m.get("content", "") for m in msgs)
-
-
-def test_an_unpriced_round_is_an_unknown_cash_cost_never_metered_or_zero(monkeypatch):
-    text = _fire_reminder(0.0, {"provider": "claudexor", "model": "codex=gpt"}, monkeypatch)
-    assert "metered API money" not in text and "metered LLM rounds" not in text
-    assert "cash cost unknown, not zero" in text          # burn phrase, cost class 'unpriced'
-    assert "claudexor / codex=gpt" in text                 # the route, named as context only
-    assert "only when its settled spend reports $0" in text  # the pinned conditional stays
-    assert "fallback" not in text                          # no chain configured, no claim
-
-
-def test_a_priced_round_stays_metered_and_names_a_configured_fallback(monkeypatch):
-    text = _fire_reminder(0.05, {"provider": "openrouter", "model": "anthropic/claude"},
-                          monkeypatch, fallbacks="openai/gpt-x, google/gem")
-    assert "metered LLM rounds" in text and "that spend is metered money" in text
-    assert "cash cost unknown" not in text
-    assert "configured fallback (openai/gpt-x, google/gem)" in text
-
-
-def test_the_unpriced_burn_phrase_never_calls_rounds_metered():
-    from ouroboros.loop import _nanny_burn_phrase
-
-    assert _nanny_burn_phrase(4, 0.0) == (
-        "4 of your own LLM rounds (no provider price reported: cash cost unknown, not zero)")
-    assert "4 of your own metered LLM rounds" in _nanny_burn_phrase(4, 0.5)

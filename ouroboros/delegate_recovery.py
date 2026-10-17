@@ -8,10 +8,12 @@ import logging
 import os
 import pathlib
 import uuid
+from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any, Mapping, Optional
 
 from ouroboros import delegate_custody as custody
+from ouroboros.platform_layer import IS_WINDOWS
 from ouroboros.subagent_work_order import work_order_fingerprint
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -25,6 +27,10 @@ NO_RESUME_CAUSES = (
     "deadline", "timeout", "explicit_cancellation", "abrupt_whole_app_loss",
 )
 PLANNED_RESTART_TRANSACTION_ENV = "OUROBOROS_PLANNED_RESTART_TRANSACTION_ID"
+PLANNED_RESTART_PARENT_ENV = "OUROBOROS_PLANNED_RESTART_PARENT_HANDLE"
+PLANNED_RESTART_BINDING_ENV = "OUROBOROS_PLANNED_RESTART_BINDING_HANDLE"
+WINDOWS_PARENT_ACK = "windows_direct_parent_handle"
+_restart_parent: Optional[dict[str, Any]] = None  # this process's one observation of an inherited parent
 
 
 def _canonical_hash(value: Any) -> str:
@@ -103,7 +109,7 @@ def _active_restart_transaction_path(drive_root: Any) -> pathlib.Path:
 
 
 def arm_active_planned_restart_transaction(drive_root: Any) -> str:
-    """Pass a prepared restart transaction to a direct re-exec successor.
+    """Pass a prepared restart transaction to a direct exec/spawn successor.
 
     Launcher-managed exits acknowledge the same durable transaction by waiting
     for exit code 42.  A direct server re-exec has no launcher, so it carries
@@ -179,27 +185,147 @@ def acknowledge_observed_restart_exit(
     return True
 
 
+@contextmanager
+def direct_restart_transaction(drive_root: Any, transaction_id: str):
+    """Serialize spawn publication with the child's first read of this exact handoff."""
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    if not transaction_id:
+        yield {}
+        return
+    path = _restart_transaction_path(drive_root, transaction_id).with_suffix(".lock")
+    fd = acquire_exclusive_file_lock(path, timeout_sec=5.0, owner_aware_stale=True)
+    try:
+        active = _read_restart_transaction(drive_root, "active")
+        row = _read_restart_transaction(drive_root, transaction_id)
+        valid = (fd is not None and row.get("status") == "prepared" and not row.get("returns_restored_at")
+                 and row.get("expected_exit_code") == 42
+                 and all(active.get(key) == row.get(key) for key in
+                         ("transaction_id", "supervisor_pid", "prepared_at"))
+                 and row.get("transaction_id") == transaction_id)
+        yield row if valid else {}
+    finally:
+        release_exclusive_file_lock(path, fd)
+
+
+def direct_spawn_successor_matches(row: Mapping[str, Any]) -> bool:
+    """Only the measured child of this successful supervised spawn may acknowledge it."""
+    from ouroboros.process_custody import _fingerprint_matches
+
+    entry = row.get("direct_spawn_successor")
+    return bool(isinstance(entry, dict) and entry.get("pid") == os.getpid()
+                and entry.get("purpose") == "server_restart_fallback" and entry.get("scope") == "daemon"
+                and _fingerprint_matches(entry, require_measured=True))
+
+
+def spawned_successor_is_current(row: Mapping[str, Any]) -> bool:
+    """A spawn acknowledgement lends its returns only to the exact successor it bound."""
+    if row.get("ack_source") == WINDOWS_PARENT_ACK:
+        from ouroboros.platform_layer import process_start_time
+
+        return (row.get("successor_pid"), row.get("successor_birth")) == (os.getpid(), process_start_time(os.getpid()))
+    return row.get("ack_source") != "direct_spawn_successor" or direct_spawn_successor_matches(row)
+
+
+def bind_restart_successor(drive_root: Any, row: dict[str, Any], proc: Any) -> None:
+    """Inside the held transaction, the spawning parent names its one successor.
+
+    POSIX (exec failed): the exact custodied spawn. Windows: this generation's birth
+    and the successor's PID/birth, which count only after the successor has observed
+    this exact parent's exit 42 through its inherited handle.
+    """
+    if IS_WINDOWS:
+        from ouroboros.platform_layer import process_start_time
+
+        births = process_start_time(os.getpid()), process_start_time(int(proc.pid))
+        if not all(births):
+            raise ValueError(f"restart transaction {row.get('transaction_id')!r} cannot bind its successor")
+        row.update(supervisor_birth=births[0], successor_pid=int(proc.pid), successor_birth=births[1])
+    else:
+        row["direct_spawn_successor"] = proc._ouroboros_custody
+    _write_restart_transaction(drive_root, row)
+
+
+def observe_restart_parent() -> dict[str, Any]:
+    """Wait once for the parent a Windows direct restart passed as an inherited handle.
+
+    Returns its ``pid``, ``birth`` and ``exit_code`` (empty without a handle or an
+    observation); later readers share this one result, and children never inherit it.
+    """
+    global _restart_parent
+    if _restart_parent is None:
+        _restart_parent, handle = {}, os.environ.pop(PLANNED_RESTART_PARENT_ENV, "")
+        binding = os.environ.pop(PLANNED_RESTART_BINDING_ENV, "")
+        if binding:
+            try:
+                from ouroboros.platform_layer import await_restart_binding
+
+                await_restart_binding(int(binding))
+            except Exception as exc:
+                log.warning("The bootstrap restart binding wait failed: %s", exc)
+        if handle:
+            try:
+                from ouroboros.platform_layer import await_process_handle
+
+                _restart_parent = await_process_handle(int(handle))
+            except Exception as exc:
+                log.warning("The restart parent handle could not be observed: %s", exc)
+    return _restart_parent
+
+
+def _windows_successor_problem(row: Mapping[str, Any], parent: Mapping[str, Any]) -> str:
+    from ouroboros.platform_layer import process_start_time
+
+    if not row:
+        return "the transaction is not this restart's active prepared one"
+    if parent.get("exit_code") != 42:
+        return f"parent exit {parent.get('exit_code', 'unobserved')}"
+    if (parent.get("pid"), parent.get("birth")) != (int(row.get("supervisor_pid") or 0), row.get("supervisor_birth")):
+        return "the exited parent is not the prepared generation"
+    if (row.get("successor_pid"), row.get("successor_birth")) != (os.getpid(), process_start_time(os.getpid())):
+        return "this process is not the bound successor"
+    return ""
+
+
+def _transfer_proof(transaction_id: str, row: Mapping[str, Any], parent: Mapping[str, Any]) -> str:
+    """This process's acknowledgement source for a valid prepared row, else ``""``.
+
+    POSIX: same-PID exec, or the exact custodied spawn after a failed exec. Windows
+    accepts neither: only the inherited parent's observed exit 42 and the identities
+    that parent bound, read after that wait.
+    """
+    if IS_WINDOWS:
+        if problem := _windows_successor_problem(row, parent):
+            log.warning("Restart %s continuation unproven, its handoffs are not resumed: %s", transaction_id, problem)
+            return ""
+        return WINDOWS_PARENT_ACK
+    if not row:
+        return ""
+    if "direct_spawn_successor" in row:
+        return "direct_spawn_successor" if direct_spawn_successor_matches(row) else ""
+    return "direct_exec_successor" if int(row.get("supervisor_pid") or 0) == os.getpid() else ""
+
+
 def _ack_direct_exec_successor(drive_root: Any) -> None:
-    """A same-PID successor carrying the one-shot token proves exec succeeded."""
+    """A one-shot token plus this platform's transfer proof acknowledges the restart."""
 
     transaction_id = str(os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, "") or "")
     if not transaction_id:
         return
-    row = _read_restart_transaction(drive_root, transaction_id)
-    if (
-        row.get("status") != "prepared"
-        or int(row.get("supervisor_pid") or 0) != os.getpid()
-    ):
-        return
-    row.update({
-        "status": "normal_exit_acknowledged", "exit_code": 42,
-        "exit_acknowledged_at": utc_now_iso(), "ack_source": "direct_exec_successor",
-    })
-    _write_restart_transaction(drive_root, row)
+    parent = observe_restart_parent() if IS_WINDOWS else {}
+    with direct_restart_transaction(drive_root, transaction_id) as row:
+        ack_source = _transfer_proof(transaction_id, row, parent)
+        if not ack_source:
+            return
+        row.update({
+            "status": "normal_exit_acknowledged", "exit_code": 42,
+            "exit_acknowledged_at": utc_now_iso(), "ack_source": ack_source,
+        })
+        _write_restart_transaction(drive_root, row)
     custody.emit(drive_root, "delegate_restart_transaction_acknowledged", {
         "restart_transaction_id": transaction_id,
-        "supervisor_pid": os.getpid(), "exit_code": 42,
-        "task_ids": list(row.get("task_ids") or []), "ack_source": "direct_exec_successor",
+        "supervisor_pid": row["supervisor_pid"], "exit_code": 42,
+        "task_ids": list(row.get("task_ids") or []), "ack_source": ack_source,
     })
 
 
@@ -210,17 +336,25 @@ def _selected_session(task: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def unsettled_start_ids(
-    drive_root: Any, task_id: str, *, rows: Optional[list[dict[str, Any]]] = None,
+    drive_root: Any, task_id: str, *, rows: Optional[list[dict[str, Any]]] = None, continuing: str = "",
 ) -> dict[str, list[str]]:
     """Durable run/start blockers from one consistent custody-log snapshot.
 
     A review run is the review substrate's obligation, not the actor's
-    delegation slot, so it never blocks the actor's own start.
+    delegation slot, so it never blocks the actor's own start; nor does the
+    undisposed candidate patch of the run a start is ``continuing``. Evidence-only
+    captures owe no apply debt. A readonly continuation leaves a candidate patch
+    waiting for its own disposition; it is not a fresh replacement.
     """
 
     mine = str(task_id or "")
-    snapshot = list(rows) if rows is not None else list(custody.custody_rows(drive_root))
-    runs = custody.replay(drive_root, rows=snapshot)
+    if rows is not None:
+        snapshot: Optional[list[dict[str, Any]]] = list(rows)
+        runs = custody.replay(drive_root, rows=snapshot)
+    else:
+        from ouroboros.delegate_custody_current import runs as current_runs
+
+        snapshot, runs = None, current_runs(drive_root, "task_id=?", (mine,))
     return {
         "open_run_ids": [
             row.run_id for row in runs.values()
@@ -235,7 +369,8 @@ def unsettled_start_ids(
         "undisposed_patch_run_ids": [
             row.run_id for row in runs.values()
             if row.task_id == mine and row.snapshot_id and row.settled
-            and not row.patch_disposed and not row.review_owned
+            and custody.candidate_apply_possible(row)
+            and not row.patch_disposed and not row.review_owned and row.run_id != continuing
         ],
     }
 
@@ -245,9 +380,11 @@ def reconcile_unrecoverable_task(drive_root: Any, task_id: str) -> None:
 
     try:
         from ouroboros import delegate_terminal
+        from ouroboros.delegate_custody_reconcile import attach_only_gateway
 
-        result = delegate_terminal.terminal_reconcile_task(
+        result = delegate_terminal.terminal_reconcile_task(  # a release: attach only, no replay
             drive_root, str(task_id or ""), trigger="unrecoverable_successor",
+            gateway_factory=attach_only_gateway,
         )
         delegate_terminal.record_terminal_reconciliation(
             drive_root, str(task_id or ""), result,
@@ -312,6 +449,14 @@ def _holder_value(holder: Any, name: str, *, pending: bool) -> str:
         str(holder.get(name) or "")
         if pending else str(getattr(holder, name, "") or "")
     )
+
+
+def _attach_only():
+    """The fail-soft settlement after a vetoed or unwritable handoff is a release:
+    it attaches to a serving daemon and never starts one or replays a pending start."""
+    from ouroboros.delegate_custody_reconcile import attach_only_gateway
+
+    return attach_only_gateway
 
 
 def _run_probe_error(run_id: str) -> str:
@@ -753,7 +898,10 @@ def pre_adopt_planned_handoffs(
             mismatch = "restart_transaction_task_mismatch"
         elif task is None:
             mismatch = "startup_restored_task_missing"
-        elif old_pid != os.getpid() and _pid_alive(old_pid):
+        elif (old_pid != os.getpid()
+              # The inherited handle observed this exact generation's exit; its number may be reused.
+              and transaction.get("ack_source") != WINDOWS_PARENT_ACK
+              and _pid_alive(old_pid)):
             mismatch = "previous_supervisor_generation_not_dead"
         elif int(row.get("new_attempt") or 0) != int(task.get("_attempt") or 1):
             mismatch = "startup_attempt_mismatch"
@@ -814,7 +962,7 @@ def pre_adopt_planned_handoffs(
             _write(drive_root, row)
         except Exception:
             try:
-                custody.reconcile_task_runs(drive_root, task_id)
+                custody.reconcile_task_runs(drive_root, task_id, gateway_factory=_attach_only())
             except Exception:
                 pass
             continue
@@ -835,6 +983,34 @@ def pre_adopt_planned_handoffs(
     return adopted
 
 
+def planned_handoff_resume_allowed(drive_root: Any, task: Mapping[str, Any]) -> bool:
+    """Release no-dispatch custody only for this exact, pre-adopted continuation.
+
+    Startup owns pre-adoption and its physical-run checks. Admission only reads
+    that authority; it must neither adopt a run nor authorize ordinary replay.
+    """
+    try:
+        task_id = str(task.get("id") or "")
+        row = _read(drive_root, task_id)
+        if (not task_id or row.get("task_id") != task_id
+                or row.get("cause") != CAUSE_PLANNED_SELF_RESTART or row.get("status") != "pre_adopted"
+                or int(row.get("new_attempt") or 0) != int(task.get("_attempt") or 1)
+                or _successor_binding_mismatch(row, task)):
+            return False
+        if any((pathlib.Path(drive_root) / "state" / name).exists()
+               for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+            return False
+        transaction_id = str(row.get("restart_transaction_id") or "")
+        transaction = _read_restart_transaction(drive_root, transaction_id)
+        return bool(transaction_id and transaction.get("transaction_id") == transaction_id
+                    and transaction.get("status") == "normal_exit_acknowledged"
+                    and int(transaction.get("supervisor_pid") or 0) == int(row.get("supervisor_pid") or 0)
+                    and int(transaction.get("exit_code") or 0) == 42
+                    and task_id in set(transaction.get("task_ids") or []))
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False
+
+
 def veto_handoff(drive_root: Any, task_id: str, reason: str) -> dict[str, Any]:
     row = _read(drive_root, task_id)
     if not row:
@@ -842,7 +1018,7 @@ def veto_handoff(drive_root: Any, task_id: str, reason: str) -> dict[str, Any]:
     row.update({"status": "vetoed", "veto_reason": str(reason or "recovery_mismatch")})
     _write(drive_root, row)
     try:
-        custody.reconcile_task_runs(drive_root, task_id)
+        custody.reconcile_task_runs(drive_root, task_id, gateway_factory=_attach_only())
     except Exception:
         pass
     return row
@@ -1010,7 +1186,7 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         _restore_wait_checkpoint(drive, {**row, "run_id": run_id})
     except Exception:
         try:
-            custody.reconcile_task_runs(drive, task_id)
+            custody.reconcile_task_runs(drive, task_id, gateway_factory=_attach_only())
         except Exception:
             pass
         return {"status": "recovery_required", "reason": "checkpoint_restore_failed"}
@@ -1019,7 +1195,7 @@ def adopt_handoff(ctx: Any, task: Mapping[str, Any]) -> dict[str, Any]:
         _write(drive, row)
     except Exception:
         try:
-            custody.reconcile_task_runs(drive, task_id)
+            custody.reconcile_task_runs(drive, task_id, gateway_factory=_attach_only())
         except Exception:
             pass
         return {"status": "recovery_required", "reason": "adoption_record_unwritable"}
@@ -1041,13 +1217,17 @@ __all__ = [
     "CAUSE_PLANNED_SELF_RESTART",
     "CAUSE_WORKER_CRASH",
     "NO_RESUME_CAUSES",
+    "PLANNED_RESTART_PARENT_ENV",
     "PLANNED_RESTART_TRANSACTION_ENV",
     "arm_active_planned_restart_transaction",
     "acknowledge_observed_restart_exit",
     "adopt_handoff",
     "authority_fingerprint_from_context",
     "authority_fingerprint_from_task",
+    "bind_restart_successor",
     "has_planned_restart_handoffs",
+    "observe_restart_parent",
+    "planned_handoff_resume_allowed",
     "prepare_handoff",
     "prepare_planned_restart_handoffs",
     "prepare_worker_crash_handoff",

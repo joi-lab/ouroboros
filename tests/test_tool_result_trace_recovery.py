@@ -12,12 +12,13 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import artifacts, observability
-from ouroboros.loop_tool_execution import _truncate_tool_result, process_tool_results
+from ouroboros.loop_tool_execution import process_tool_results
 from ouroboros.review_evidence import build_task_acceptance_evidence
 from ouroboros.review_evidence_sections import _accept_enforce_budget
 from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
 from ouroboros.tools.core import _read_file
 from ouroboros.tools.registry import ToolContext
+from tests._tool_result_delivery_shared import measured_fit
 
 pytestmark = pytest.mark.serial
 
@@ -42,6 +43,8 @@ def _record(tmp_path, *, full=FULL, remove_primary=True, keep_raw=False):
           "result_meta": {"status": "error", "execution_status": "failed"}}],
         messages, trace, emit_progress=lambda _text, *, incident=None: None,
         tools=SimpleNamespace(_ctx=ctx),
+        # A measured 4,000-token frame: the 20K-char result is projected head+tail.
+        fit_candidate=measured_fit(window=4_000, reserve=1_000),
     )
     row = trace["tool_calls"][0]
     assert row["result_partial"] is True
@@ -140,7 +143,10 @@ def test_publication_failure_keeps_full_inline_but_refuses_after_recap(tmp_path,
     assert projected["result_source_ref"] == {}
     assert "__unresolved_partial_artifacts__" not in full_packet
     assert _dispatch(ctx, full_packet)[0] == 1
-    packet = _evidence(ctx, row, budget=4_000)
+    # Include the historical-input availability exhibit added to the packet's
+    # fixed core, while keeping this budget far below the 20 KB tool result.
+    # The assertions below still require a recap and a source-unavailable refusal.
+    packet = _evidence(ctx, row, budget=6_000)
     assert "__immutable_core_overflow__" not in packet
     assert packet["tool_trajectory_source_ref"]
     assert packet["tool_trajectory"][0]["result_source_ref"] == {}
@@ -284,7 +290,8 @@ def test_empty_string_projection_is_a_complete_tool_result(tmp_path):
 
 def test_legacy_envelope_recovers_with_matching_projection(tmp_path):
     ctx, row = _record(tmp_path)
-    row["result"] = _truncate_tool_result(FULL, TOOL)
+    # A historical row: head cut at the retired per-name cap, legacy marker, no source.
+    row["result"] = FULL[:15_000] + f"\n... (truncated from {len(FULL)} chars, limit=15000)"
     row.pop("result_partial")
     row.pop("result_source_ref")
     packet = _evidence(ctx, row)
@@ -324,7 +331,9 @@ def test_whole_row_shedding_retains_effective_source_or_unavailability(
     calls = [row] + [{"tool": "later_tool", "result": "later evidence"} for _ in range(20)]
     packet = build_task_acceptance_evidence(
         ctx, llm_trace={"tool_calls": calls}, drive_root=ctx.drive_root,
-        task_id=ctx.task_id, budget_chars=10_000,
+        # Leave room for the historical-input availability exhibit in the
+        # fixed core; the first 20 KB row must still be shed (asserted below).
+        task_id=ctx.task_id, budget_chars=12_000,
     )
     assert "__immutable_core_overflow__" not in packet
     assert len(packet["tool_trajectory"]) == 20

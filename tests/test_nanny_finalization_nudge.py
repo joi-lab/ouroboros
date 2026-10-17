@@ -36,7 +36,6 @@ def test_nanny_nudge_stays_out_of_owner_chat_progress(tmp_path):
     # REMINDER] and the durable trace, but never emit_progress (chat ⚠️ lines).
     # Observability rides a compact typed task_checkpoint on events.jsonl.
     import json
-    import pathlib
 
     drive_logs = tmp_path / "logs"
     drive_logs.mkdir()
@@ -48,7 +47,7 @@ def test_nanny_nudge_stays_out_of_owner_chat_progress(tmp_path):
     progress: list = []
     trace = {"reasoning_notes": [], "tool_calls": []}
     assert _maybe_inject_finalization_nudges(
-        SimpleNamespace(_ctx=ctx), pathlib.Path("."), "t", trace, "done", msgs,
+        SimpleNamespace(_ctx=ctx), tmp_path, "t", trace, "done", msgs,
         progress.append,
     ) is True
     assert progress == []
@@ -402,7 +401,6 @@ def test_actor_first_plain_finalization_requires_typed_zero_run_or_leaf(tmp_path
 
 
 def _forced_run(tmp_path, nanny, tool_calls):
-    import pathlib
     from unittest.mock import patch
 
     from ouroboros.loop import _RoundLimitContext, _forced_final_answer
@@ -417,7 +415,7 @@ def _forced_run(tmp_path, nanny, tool_calls):
     messages: list = []
     ctx = _RoundLimitContext(
         messages=messages, llm=None, active_model="m", active_effort="low",
-        max_retries=0, drive_logs=pathlib.Path("."), task_id="t", round_idx=1,
+        max_retries=0, drive_logs=tmp_path / "logs", task_id="t", round_idx=1,
         event_queue=None, accumulated_usage={}, task_type="task",
         active_use_local=False, max_rounds=1,
     )
@@ -537,14 +535,16 @@ def test_unreadable_custody_surfaces_the_configured_unknown_nudge(tmp_path):
     assert custody.emit(root, custody.STARTED, {
         "run_id": "run-x", "task_id": "child-x", "route": "claude", "max_seconds": 300,
     })
-    log_path = custody.event_log_path(root)
-    os.chmod(log_path, 0)
+    from ouroboros.store import STORE_REL
+
+    store_path = root / STORE_REL  # the custody rows: unreadable is a typed unknown, never zero
+    os.chmod(store_path, 0)
     try:
         message = _nanny_finalization_message(
             _tools(ctx, ["delegate_start", "delegate_wait"]), child, "child-x",
         )
     finally:
-        os.chmod(log_path, 0o600)
+        os.chmod(store_path, 0o600)
     assert "CONFIGURED_ACTOR_UNKNOWN" in message
     assert "UNREADABLE" in message
     # Never a fresh-start recipe over a possibly-live leaf, never an accusation.

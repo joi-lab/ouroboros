@@ -8,22 +8,21 @@ registry, no observation inbox, no pause/resume: the supervisor loop calls ``tic
 per pass and the ``DirectActivityRegistry`` (the census of live direct turns) is the only
 liveness truth. Tick order, each step a typed outcome: disabled → a live wake → a live owner
 turn → not yet due → the rolling-24h allowance (an unreadable ledger is the disclosed skip
-``allowance_unknown``, never a silent block; a remainder at or below the graceful stop's planning
-margin counts as exhausted — less than one planned turn) → an owner chat must be bound → launch.
-What is left of that allowance is the launched tree's graceful ceiling
-(``metadata.root_cost_ceiling_usd``, В26=A): the in-task stop lands the wake a planning margin
-before it, while the ledger fence stays at the owner's per-task cap, so a wake never dies before
-its first call on a nearly spent day. The next
+``allowance_unknown``, never a silent block; known spend at the daily limit is
+``allowance_exhausted``) → an owner chat must be bound → launch.
+What is left of that allowance is the launched tree's producer ceiling
+(``metadata.root_cost_ceiling_usd``, В26=A): the in-task stop pauses the wake when its known
+spend reaches it — no extra planning margin is subtracted or skipped (owner 2026-10-07) — while the
+ledger fence stays at the owner's per-task cap, so a wake never dies before its first call on a
+nearly spent day. The next
 wake is ``last finish + interval``: the MODEL's choice (``set_next_wakeup`` persists
 ``consciousness_next_interval_sec``) or ``WAKE_DEFAULT_SEC``, clamped into the owner's
 [min, max]; a runner failure — or a wake the lane could not admit — doubles it up to max until a
-wake succeeds. ``notify(reason)`` (a root task finished, a project digest, an orphan-heal sweep)
-pulls the next wake to ``max(now, (last wake or boot) + min)`` — arithmetic debounce, one floor
-everywhere, and the boot floor holds against the first post-restart event. An owner message never
-wakes it (nor does the owner's own turn finishing), and a wake's own finish (or that of a task it
-started) never re-arms it. A health
-WARNING/CRITICAL trigger is deliberately NOT implemented: nothing emits a health event
-(``build_health_invariants`` is read-side), so health is visible in the next wake's context.
+wake succeeds. Nothing else moves the alarm (owner 12 Oct, #1603: no accelerated wake, only the
+scheduled time): a task finishing, a project digest or an orphan-heal sweep never pulls the next
+wake earlier — they wait as observed facts for the scheduled wake (``observe_wake``), so every
+wake's reason is the heartbeat. Neither does an owner message, nor a health event (``build_health_invariants``
+is read-side; health is visible in the next wake's context).
 Panic and ``/bg stop`` arrive through ``stop()``, which arms a graceful stop of a live wake
 off-thread. The legacy observation inbox, if present, is moved once to the archive unread.
 What a wake OBSERVES is not this clock's business: it starts after the chat-chain position and
@@ -55,7 +54,6 @@ from ouroboros.consciousness_allowance import STATUS_EXHAUSTED, STATUS_UNKNOWN, 
 from ouroboros.consciousness_authority import is_consciousness_origin
 from ouroboros.consciousness_wake import bind_wake_observation, observe_wake, render_wake_message, wake_task_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
-from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -69,7 +67,7 @@ LEGACY_INBOX_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 ARCHIVED_INBOX_REL = pathlib.Path("archive") / "consciousness_observations.jsonl"
 HEARTBEAT = "heartbeat"
 ALLOWANCE_VIEW_TTL_SEC = 60.0
-SNAPSHOT_KEYS = ("enabled", "level", "next_wake_at", "pending_reason", "last_wake_at", "last_wake_task_id",
+SNAPSHOT_KEYS = ("enabled", "level", "next_wake_at", "last_wake_at", "last_wake_task_id",
                  "last_wake_outcome", "last_error", "spent_24h_usd", "daily_usd", "allowance_resets_at",
                  "tasks_running", "max_tasks", "live_wake_task_id", "unknown_unmetered", "integrity_degraded")
 
@@ -117,7 +115,6 @@ class BackgroundConsciousness:
             persisted = 0.0
         # Boot floor (PLAN 5.13 п.8): an overdue persisted value never wakes in the first second.
         self._next_wake_at = max(persisted, self._booted_at + self.floor)
-        self._pending_reason: Optional[str] = None
         raw_last_wake = state.get(LAST_WAKE_STATE_KEY)
         try:
             persisted_last_wake = float(raw_last_wake or 0.0)
@@ -144,7 +141,6 @@ class BackgroundConsciousness:
         except (TypeError, ValueError):
             bootstrap = persisted_last_wake or self._booted_at
         self._observation_bootstrap_since = bootstrap
-        self._last_skip_at = 0.0  # a skipped wake debounces the next event like a wake does
         self._backoff, self._allowance = 1, (0.0, {})
         self._archive_legacy_inbox()
 
@@ -152,7 +148,6 @@ class BackgroundConsciousness:
     ceiling = property(lambda self: int(get_bg_wakeup_max_sec()))
     enabled = property(lambda self: self._enabled)
     next_wake_at = property(lambda self: self._next_wake_at)
-    pending_reason = property(lambda self: self._pending_reason)
 
     @staticmethod
     def _read_state() -> Dict[str, Any]:
@@ -213,7 +208,7 @@ class BackgroundConsciousness:
         except OSError:
             log.warning("consciousness: legacy observation inbox could not be archived", exc_info=True)
 
-    def live_turns(self) -> Tuple[str, bool]:
+    def live_turns(self, *, queue_blocking: bool = True) -> Tuple[str, bool]:
         """``(live wake task id or "", owner turn live?)`` read off the direct-activity census."""
         from supervisor.active_activity import get_direct_activity_registry
         from supervisor.workers import direct_chat_turn
@@ -226,11 +221,14 @@ class BackgroundConsciousness:
                 wake = activity_id
             else:
                 owner = True
-        return wake, owner
+        from supervisor.consciousness_carriers import queued_wakes
+        pooled = queued_wakes(blocking=queue_blocking)
+        return wake or (pooled[0] if pooled else ""), owner
 
     def tick(self, now: Optional[float] = None) -> str:
         """One supervisor pass; never blocks on a wake. Returns the typed decision."""
         now = time.time() if now is None else float(now)
+        wake, owner_live = self.live_turns()  # never wait for Q while holding the clock lock
         with self._lock:
             from supervisor.state import control_is
 
@@ -240,7 +238,6 @@ class BackgroundConsciousness:
             self._enabled = not self._stopped and control_is(self._read_state(), "bg_consciousness_enabled", True)
             if not self._enabled:
                 return "disabled"
-            wake, owner_live = self.live_turns()
             if wake or owner_live:
                 return "wake_live" if wake else "owner_turn_live"
             if now < self._next_wake_at:
@@ -248,9 +245,9 @@ class BackgroundConsciousness:
             window = self._allowance_view(now, fresh=True)
             if window.get("status") == STATUS_UNKNOWN:
                 return self._skip("allowance_unknown", now + self.floor, now=now, error=str(window.get("error") or ""))
-            # Nothing left — or less than one planned turn (the graceful stop's planning
-            # margin): a wake started there would only be told to land at once.
-            if window.get("status") == STATUS_EXHAUSTED or float(window.get("remaining_usd") or 0.0) <= COST_PLANNING_MARGIN_USD:
+            # Known spend reached the daily allowance (#1487: unresolved bounds are
+            # disclosed exposure, not spending). No extra early margin skips a wake.
+            if window.get("status") == STATUS_EXHAUSTED or float(window.get("remaining_usd") or 0.0) <= 0.0:
                 resets = parse_deadline_ts(str(window.get("resets_at") or ""))
                 return self._skip("allowance_exhausted", max(resets.timestamp() if resets else 0.0, now + self.floor), now=now)
             if not self._owner_chat_id():
@@ -258,7 +255,7 @@ class BackgroundConsciousness:
             return self._launch(now, int(self._owner_chat_id() or 0), window)
 
     def _skip(self, reason: str, next_at: float, *, now: float, error: str = "") -> str:
-        self._last_wake_outcome, self._last_error, self._last_skip_at = f"skipped:{reason}", error, float(now)
+        self._last_wake_outcome, self._last_error = f"skipped:{reason}", error
         self._set_next_wake(next_at)
         self._record("consciousness_wake_skipped", reason=reason, next_wake_at=_iso(next_at), error=error)
         return f"skipped:{reason}"
@@ -266,7 +263,7 @@ class BackgroundConsciousness:
     def _launch(self, now: float, chat_id: int, window: Dict[str, Any]) -> str:
         from supervisor import workers
 
-        reason, self._pending_reason = (self._pending_reason or HEARTBEAT), None  # capture-and-clear
+        reason = HEARTBEAT  # the schedule is the only cause of a wake
         level, remaining = get_consciousness_autonomy(), float(window.get("remaining_usd") or 0.0)
         try:
             per_task_cap = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
@@ -274,13 +271,13 @@ class BackgroundConsciousness:
             per_task_cap = 0.0
         # В26=A: a wake's whole tree may spend at most what is left of the rolling-24h
         # allowance, and never more than the owner's per-task cap (a cap of 0 disables
-        # that half). It travels as the tree's GRACEFUL ceiling (`root_cost_ceiling_usd`,
-        # honored for the root itself by `task_pacing.resolve_cost_ceiling` and inherited
-        # by the members): the in-task stop lands a planning margin early, while the
-        # ledger fence keeps the owner's per-task cap — one Main attempt reserves several
-        # dollars up front, and a fence narrowed below that refused every wake of a
-        # nearly spent day before its first call. The tick never launches with less
-        # than the planning margin left (that window is `allowance_exhausted`).
+        # that half). It travels as the tree's producer ceiling (`root_cost_ceiling_usd`,
+        # honored for the root itself by `task_pacing.resolve_cost_ceiling` and by the
+        # members): the in-task stop pauses the tree when its known spend reaches it, with
+        # no planning margin subtracted (owner 2026-10-07), while the ledger fence keeps the
+        # owner's per-task cap — one Main attempt reserves several dollars up front, and a
+        # fence narrowed below that refused every wake of a nearly spent day before its
+        # first call.
         ceiling = min(per_task_cap, remaining) if per_task_cap > 0 else remaining
         metadata = {**self._routing_facts(chat_id),
                     **wake_task_metadata(level, reason, root_cost_ceiling_usd=ceiling)}
@@ -294,7 +291,7 @@ class BackgroundConsciousness:
         def render(events: str) -> str:
             return render_wake_message(
                 self._repo_dir, reason=reason, last_wake_at=self._last_wake_at, now=now, level=level,
-                disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("accounted_usd"),
+                disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("settled_usd"),
                 spent_is_floor=int(window.get("unknown_unmetered") or 0) > 0,
                 daily_usd=window.get("limit_usd") or 0.0, running=self._running_roots(),
                 max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events)
@@ -307,21 +304,22 @@ class BackgroundConsciousness:
 
         # Check-and-register under the lane's own re-entrant gate lock: atomic with the census.
         with workers._repo_writer_gate_lock:
-            wake, owner_live = self.live_turns()
+            from supervisor.consciousness_carriers import WakeCensusBusy
+            try:
+                wake, owner_live = self.live_turns(queue_blocking=False)
+            except WakeCensusBusy:
+                return "activity_census_busy"
             if wake or owner_live:
-                self._pending_reason = self._pending_reason or reason
                 return "wake_live" if wake else "owner_turn_live"
             receipt = workers.handle_wake_direct(
                 chat_id, render(observation.full_text()), metadata, on_finished=self._wake_finished,
                 bind_input=bind_input)
         if not receipt.get("admitted"):
             why = str(receipt.get("reason") or "refused")
-            self._last_wake_outcome, self._last_skip_at = f"rejected:{why}", now  # an event never undoes this backoff below the floor
+            self._last_wake_outcome = f"rejected:{why}"
             # A wake the lane could not admit already left an error in the chat: back off
             # like a failed wake. A closed door is retried quietly — the repo-writer gate at
-            # the floor, the owner's budget at the interval. The event that asked for this
-            # wake is kept: a refused launch does not consume it.
-            self._pending_reason = self._pending_reason or reason
+            # the floor, the owner's budget at the interval.
             if why == "admission_failed":
                 self._backoff = min(self._backoff * 2, 1024)
             transient = why == "repo_writer_gate_closed"
@@ -351,7 +349,8 @@ class BackgroundConsciousness:
                     outcome = "pausing"
                 elif (owner_pause.get("state") == "paused" or pause.get("state") == "paused"
                       or row and row.get("status") == "scheduled"
-                      and row.get("reason_code") in {"budget_paused", "budget_exhausted", "owner_paused"}):
+                      and row.get("reason_code") in {"budget_paused", "budget_exhausted", "owner_paused",
+                                                     "authority_paused"}):
                     outcome = "paused"
                 elif row:
                     outcome = "done"  # the ordinary successful-turn contract is unchanged
@@ -366,16 +365,7 @@ class BackgroundConsciousness:
             else:
                 self._backoff, self._last_wake_outcome = min(self._backoff * 2, 1024), "failed"
                 self._last_error = f"wake-up {task_id} failed in its runner (see the chat and events.jsonl)"
-            interval = min(self.ceiling, self._interval() * self._backoff)
-            self._set_next_wake(now + (self.floor if self._pending_reason else interval))
-
-    def notify(self, reason: str) -> None:
-        """An event worth waking for: keep the last reason, pull the next wake to the floor."""
-        with self._lock:
-            self._pending_reason = str(reason or "event")
-            target = max(time.time(), max(self._last_wake_at, self._booted_at, self._last_skip_at) + self.floor)
-            if target < self._next_wake_at:
-                self._set_next_wake(target)
+            self._set_next_wake(now + min(self.ceiling, self._interval() * self._backoff))
 
     def start(self) -> str:
         with self._lock:
@@ -393,8 +383,11 @@ class BackgroundConsciousness:
             self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
-        if wake:
-            threading.Thread(target=self._stop_live_wake, args=(wake,), name="wake-stop", daemon=True).start()
+        from supervisor.consciousness_carriers import queued_wakes
+        wakes = list(dict.fromkeys(([wake] if wake else []) + queued_wakes()))
+        if wakes:
+            for task_id in wakes:
+                threading.Thread(target=self._stop_live_wake, args=(task_id,), name="wake-stop", daemon=True).start()
             return f"Background consciousness disabled; wake-up {wake} ends at its next step."
         return "Background consciousness disabled." if was_enabled else "Background consciousness is already disabled."
 
@@ -404,16 +397,21 @@ class BackgroundConsciousness:
 
         try:
             turn = workers.direct_chat_turn(task_id)
-            turn is None or worker_chat_lane.stop_direct_chat_turn(task_id, turn)
+            from supervisor.consciousness_carriers import stop_pooled_wake
+            if turn is not None:
+                worker_chat_lane.stop_direct_chat_turn(task_id, turn)
+            # A handoff can race this read. An intent survives it and the ordinary
+            # sweep routes the stop to whichever carrier owns the id now.
+            stop_pooled_wake(task_id)
         except Exception:
             log.debug("consciousness: graceful stop of wake %s failed", task_id, exc_info=True)
 
     def status_snapshot(self) -> Dict[str, Any]:
         wake, _owner = self.live_turns()
         window = self._allowance_view(time.time())
-        values = (self._enabled, get_consciousness_autonomy(), _iso(self._next_wake_at), self._pending_reason or "",
+        values = (self._enabled, get_consciousness_autonomy(), _iso(self._next_wake_at),
                   _iso(self._last_wake_at), self._last_wake_task_id, self._last_wake_outcome, self._last_error,
-                  window.get("accounted_usd"), window.get("limit_usd"), str(window.get("resets_at") or ""),
+                  window.get("settled_usd"), window.get("limit_usd"), str(window.get("resets_at") or ""),
                   self._running_roots(), int(get_consciousness_max_tasks()), wake,
                   int(window.get("unknown_unmetered") or 0), bool(window.get("integrity_degraded")))
         return dict(zip(SNAPSHOT_KEYS, values))

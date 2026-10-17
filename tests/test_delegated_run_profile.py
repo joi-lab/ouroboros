@@ -16,6 +16,7 @@ from ouroboros.config import CLAUDEXOR_DELEGATED_MARKER_MIN_VERSION
 from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture applies on import)
     _delegating_ctx,
     _owned_gateway_uses_each_test_transport,
+    _select_transport_access,
     _started_request,
 )
 
@@ -47,8 +48,9 @@ def test_a_read_only_child_uses_the_same_transport_with_a_narrower_profile(tmp_p
     # One nanny, one transport: the ONLY difference is the derived profile and the run
     # shape it implies. `execution.isolation='live'` is agent-only in Claudexor — a
     # non-agent run carrying it is refused at the boundary — and a read-only child has
-    # nothing to write back anyway.
-    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch)
+    # nothing to write back anyway. #1609: technical access alone decides the shape, so
+    # the read-only child is the one whose selected row captured `readonly`.
+    request, payload = _started_request(tmp_path, acting=False, monkeypatch=monkeypatch, access="readonly")
     assert request["access"] == "readonly"
     assert request["mode"] == "ask"
     assert "execution" not in request
@@ -75,11 +77,19 @@ def test_naming_the_documented_default_starts_exactly_like_omitting_it(
     roots = [tmp_path / "omit", tmp_path / "named"]
     for root in roots:
         root.mkdir()
-    omitted, _ = _started_request(roots[0], acting=False, monkeypatch=monkeypatch)
+    # #1609: the read-only child is the one whose selected row captured `readonly`.
+    omitted, _ = _started_request(roots[0], acting=False, monkeypatch=monkeypatch, access="readonly")
     explicit, payload = _started_request(
-        roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default)
+        roots[1], acting=False, monkeypatch=monkeypatch, start_kwargs=named_default, access="readonly")
     assert "execution" not in explicit
     assert payload["access"] == "readonly"
+    # These requests use different repositories. Keep the honest missing-DESIGN
+    # disclosure and normalize only its exact source address before comparison.
+    for request, root in ((omitted, roots[0]), (explicit, roots[1])):
+        source = str(root / "repo/docs/DESIGN.md")
+        assert source in request["instructions"]
+        assert "No DESIGN content or navigation delivered" in request["instructions"]
+        request["instructions"] = request["instructions"].replace(source, "<selected-repo>/docs/DESIGN.md")
     assert {key: value for key, value in explicit.items() if key != "scope"} == {
         key: value for key, value in omitted.items() if key != "scope"}
 
@@ -115,6 +125,7 @@ def test_real_geometry_on_a_read_only_child_refuses_before_the_daemon(
 
     monkeypatch.setattr(_gw, "ClaudexorGateway", lambda *a, **k: _NeverReached())
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
+    _select_transport_access(monkeypatch, "readonly")  # #1609: the read-only child says so
     ctx = _delegating_ctx(tmp_path, acting=False, task_id="t-geometry")
     refused = json.loads(delegate._delegate_start(ctx, "audit the folder", **geometry).text)
     assert refused["status"] == "refused"
@@ -142,22 +153,38 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
     entry = next(e for e in delegate.get_tools() if e.name == "delegate_start")
     properties = set(entry.schema["parameters"]["properties"])
     # `retry_of` names an INVOCATION, not authority (ownership-checked replay);
-    # `continue_from` names this task's OWN settled run (custody-checked, same
-    # executor and authority, #1196); root/bucket/skill_name are a SELECTOR
-    # resolved through the same ResolvedResourceBinding authorizer as ordinary
-    # writes (R1 item 9).
+    # `continue_from` names a settled run of this task's line (custody-checked; access
+    # never wider) and `continue_carrier` only how the engine re-briefs it;
+    # root/bucket/skill_name are a SELECTOR resolved through the same
+    # ResolvedResourceBinding authorizer as ordinary writes (R1 item 9); `effort` is reasoning
+    # depth inside the owner's effort range (a pin or a level in the model name keeps its own).
     assert properties == {
-        "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "root", "bucket",
-        "skill_name", "directory_strategy", "scope_paths", "access",
+        "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "continue_carrier", "root",
+        "bucket", "skill_name", "directory_strategy", "scope_paths", "access", "effort",
     }
+    from ouroboros.settings_scales import EFFORT_SCALE
+    assert entry.schema["parameters"]["properties"]["effort"]["enum"] == ["auto", *EFFORT_SCALE]
+    assert entry.schema["parameters"]["properties"]["continue_carrier"]["enum"] == ["auto", "packet"]
     assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "skill_payload"]
     assert entry.schema["parameters"]["properties"]["access"]["enum"] == ["readonly", "workspace_write"]
     assert not properties & {"mode", "isolation", "scope", "write_surface", "cwd"}
 
 
-def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
+def test_a_task_without_write_authority_gets_an_evidence_only_investigation_never_a_writer(tmp_path):
+    """#1609 (owner-approved): TECHNICAL access alone decides the run shape.
+
+    A task with no write authority used to be forced read-only whatever its selected
+    row captured. Now the captured writable access runs, but only as an evidence-only
+    ``investigation``: its private copy's authority source is the investigation one,
+    its capture is evidence, and nothing it produces can ever be integrated. Write
+    authority still decides PURPOSE, so none of these constraints becomes a writer;
+    an explicit ``readonly`` lowering still yields the old read-only Ask shape.
+    """
     from ouroboros.contracts.task_constraint import TaskConstraint
+    from ouroboros.delegate_registration_policy import INVESTIGATION_AUTHORITY, candidate_apply_possible
+    from ouroboros.subagents import DelegatedRunShape
     from ouroboros.tools.delegate import _derive_authority
+    from ouroboros.tools.delegate_integration import _mutation_authority
     from ouroboros.tools.registry import ToolContext
 
     for constraint in (
@@ -168,9 +195,19 @@ def test_a_read_only_task_cannot_obtain_workspace_write(tmp_path):
     ):
         ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_constraint=constraint)
         ctx.task_metadata = {"parent_task_id": "p"}
-        authority = _derive_authority(ctx)
-        assert authority.access == "readonly", constraint
-        assert authority.mode == "ask" and authority.isolation == ""
+        for kwargs, access in (({}, "workspace_write"), ({"access": "workspace_write"}, "workspace_write"),
+                               ({"access": "full"}, "full")):
+            authority = _derive_authority(ctx, **kwargs)
+            assert authority == DelegatedRunShape(access, "agent", "live", True, investigation=True), constraint
+            record, refusal = _mutation_authority(ctx, authority)
+            assert refusal is None, constraint
+            assert record["source"] == INVESTIGATION_AUTHORITY and record["capture_mode"] == "evidence"
+            assert candidate_apply_possible({"authority_source": record["source"]}) is False, constraint
+        lowered = _derive_authority(ctx, "readonly")
+        assert lowered == DelegatedRunShape("readonly", "ask"), constraint
+        assert lowered.mode == "ask" and lowered.isolation == "" and not lowered.investigation
+        record, refusal = _mutation_authority(ctx, lowered)
+        assert refusal is None and record["source"] == "readonly" and record["capture_mode"] == "none"
 
 
 @pytest.mark.parametrize("effective,entitled,widened", [
@@ -245,16 +282,19 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _terminal_payload
 
+    # The read-only lane is an explicitly readonly run (#1609: a non-acting child that
+    # captured writable access is an investigation, not this lane).
+    readonly_lane = delegated_run_shape(False, "readonly")
     # A succeeded run with NO disclosed profile: unverified, and it says why.
     silent = {"lastSeq": 40, "summary": {"state": "succeeded"}}
-    evidence = _terminal_payload("run-1", silent, delegated_run_shape(False))["access_evidence"]
+    evidence = _terminal_payload("run-1", silent, readonly_lane)["access_evidence"]
     assert evidence["verified"] is False and evidence["effective"] == ""
     assert evidence["requested"] == "readonly" and evidence["state"] == "succeeded"
     assert "SUCCEEDED without ever disclosing" in evidence["note"]
 
     # A succeeded run that DID disclose one is verified, with no note.
     proven = {"lastSeq": 40, "summary": {"state": "succeeded", "effectiveAccess": "readonly"}}
-    evidence = _terminal_payload("run-1", proven, delegated_run_shape(False))["access_evidence"]
+    evidence = _terminal_payload("run-1", proven, readonly_lane)["access_evidence"]
     assert evidence == {"requested": "readonly", "effective": "readonly",
                         "verified": True, "state": "succeeded"}
 
@@ -262,7 +302,7 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     # profile at all, so this is absence of evidence rather than a missing proof.
     for state in ("failed", "cancelled", "interrupted"):
         detail = {"lastSeq": 40, "summary": {"state": state}}
-        evidence = _terminal_payload("run-1", detail, delegated_run_shape(False))["access_evidence"]
+        evidence = _terminal_payload("run-1", detail, readonly_lane)["access_evidence"]
         assert evidence["verified"] is False, state
         assert "absence of evidence, not a breach" in evidence["note"], state
 
@@ -270,7 +310,7 @@ def test_a_succeeded_run_that_never_proved_its_profile_says_so_in_its_result():
     # `effectiveAccess ?? our own request`, so a payload carrying only the echo must
     # still read unverified.
     echo = {"lastSeq": 40, "summary": {"state": "succeeded", "access": "readonly"}}
-    assert _terminal_payload("run-1", echo, delegated_run_shape(False))[
+    assert _terminal_payload("run-1", echo, readonly_lane)[
         "access_evidence"]["verified"] is False
 
     # The mutating lane carries BOTH halves, and neither displaces the other.

@@ -80,23 +80,25 @@ def segment_summary(path: Any, stat: os.stat_result) -> Optional[SegmentSummary]
 
 
 def room_segment_lens(thread_id: int, project_chat_ids: set, source_refs: list,
-                      bindings_by_task: Dict[str, int]) -> Optional[Callable[[SegmentSummary], bool]]:
+                      rooms: Any) -> Optional[Callable[[SegmentSummary], bool]]:
     """``may_hold(summary)`` for a Project room; None (read everything) for any other room.
 
     Mirrors ``room_membership``'s three Project admissions: the room's own chat,
-    a task bound to it (by task, parent or root id), or the owner row a binding
-    names. Main and the rooms that share its lens hold rows in nearly every archive.
+    a task the room rule (``rooms``, the request's ``projects_registry.RoomResolver``)
+    puts in it by any id the archive names, or the owner row a binding names. Main
+    and the rooms that share its lens hold rows in nearly every archive.
     """
     if thread_id not in project_chat_ids:
         return None
     from ouroboros.project_dialogue import _source_ref_identity  # lazy: gateway -> dialogue
 
-    bound = frozenset(task for task, chat in bindings_by_task.items() if chat == thread_id)
     origins = frozenset((key[0], key[3]) for ref in source_refs if isinstance(ref, dict)
                         if (key := _source_ref_identity(ref)) is not None)
 
     def may_hold(summary: SegmentSummary) -> bool:
-        return (thread_id in summary.chat_ids or not bound.isdisjoint(summary.task_ids)
-                or not origins.isdisjoint(summary.owner_rows))
+        if thread_id in summary.chat_ids or not origins.isdisjoint(summary.owner_rows):
+            return True
+        rooms.warm(summary.task_ids)  # one read for the archive's unseen ids, then dict answers
+        return any(rooms(task) == thread_id for task in summary.task_ids)
 
     return may_hold

@@ -167,9 +167,9 @@ def test_startup_recovery_reuses_pending_root_result_checkpoint(tmp_path, monkey
     )
     calls = []
 
-    def fake_run(env, task, usage, trace, evidence, drive_logs, *, blocking=False,
-                 sealed_final=None):
-        calls.append((env.drive_root, task, usage, trace, evidence, drive_logs, blocking))
+    def fake_run(env, task, usage, trace, drive_logs, *, blocking=False,
+                 sealed_final=None, **_recovery):
+        calls.append((env.drive_root, task, usage, trace, drive_logs, blocking))
         pipeline._set_root_post_task_checkpoint(env, task, "completed")
 
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", fake_run)
@@ -268,17 +268,9 @@ def test_root_synthesis_uses_one_shared_nonfinal_subtree_cost_snapshot(tmp_path,
             order.append("facts"), snapshots.append(usage)
         ),
     )
-    monkeypatch.setattr(
-        pipeline,
-        "_run_reflection",
-        lambda _env, _llm, _task, usage, *_args, **_kwargs: (
-            order.append("reflection"), snapshots.append(usage)
-        ),
-    )
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(post_task_evolution, "maybe_promote", lambda *args, **kwargs: None)
-    monkeypatch.setattr(pipeline, "_set_root_post_task_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(post_task_evolution, "maybe_promote", lambda *args, **kwargs: order.append("promotion"))
+    monkeypatch.setattr(pipeline, "_set_root_post_task_checkpoint",
+                        lambda _env, _task, status, **kwargs: {"root_phase_checkpoint": {"post_task_synthesis": status}})
 
     env = SimpleNamespace(
         repo_dir=tmp_path,
@@ -294,14 +286,13 @@ def test_root_synthesis_uses_one_shared_nonfinal_subtree_cost_snapshot(tmp_path,
         },
         {"rounds": 8, "cost": 1.25},
         {"tool_calls": [], "reasoning_notes": []},
-        {},
         tmp_path / "logs",
         blocking=True,
     )
 
     assert reads == [(tmp_path, "root-synthesis", "")]
-    assert order[:5] == ["snapshot", "facts", "memory_fallback_draft", "scratchpad_consolidation", "reflection"]
-    assert len(snapshots) == 2 and snapshots[0] is snapshots[1]
+    assert order == ["snapshot", "facts", "memory_fallback_draft", "scratchpad_consolidation", "promotion"]
+    assert len(snapshots) == 1
     snapshot = snapshots[0]
     assert snapshot["accounted_upper_bound_usd_with_children"] == 4.75
     assert snapshot["reserved_usd"] == 1.5
@@ -329,7 +320,8 @@ def test_nonblocking_post_task_snapshot_precedes_worker_dispatch(tmp_path, monke
             "integrity_degraded": False,
         },
     )
-    monkeypatch.setattr(pipeline, "_set_root_post_task_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pipeline, "_set_root_post_task_checkpoint",
+                        lambda _env, _task, status, **kwargs: {"root_phase_checkpoint": {"post_task_synthesis": status}})
 
     class DeferredThread:
         def __init__(self, *, target, args=(), daemon):
@@ -355,7 +347,6 @@ def test_nonblocking_post_task_snapshot_precedes_worker_dispatch(tmp_path, monke
             "budget_drive_root": str(tmp_path),
         },
         {"cost": 0.5},
-        {},
         {},
         tmp_path / "logs",
     )
@@ -388,29 +379,11 @@ def test_pre_synthesis_cost_failure_is_unavailable_not_zero(tmp_path, monkeypatc
     assert snapshot["unresolved_upper_bound_usd"] is None
     assert snapshot["unknown_unmetered"] is None
     assert snapshot["ledger_integrity"] == "unavailable"
-    assert pipeline._synthesis_cost_text(snapshot) == "cost unavailable (non-final)"
+    assert pipeline._summary_row_cost_fields(snapshot)["accounted_upper_bound_usd_with_children"] is None
 
 
-def _capture_facts_row_and_reflection_prompt(
-    tmp_path, monkeypatch, usage, *, task_overrides=None,
-):
-    """The shared snapshot reaches the free facts row's flat fields and the one paid prompt."""
-    import ouroboros.consolidator as consolidator
-
-    monkeypatch.setattr(
-        consolidator,
-        "_consolidation_route",
-        lambda: ("test/synthesis-model", False),
-    )
-
-    class CapturingLlm:
-        def __init__(self):
-            self.prompts = []
-
-        def chat(self, *, messages, **_kwargs):
-            self.prompts.append(messages[0]["content"])
-            return {"content": "captured synthesis"}, {}
-
+def _capture_facts_row(tmp_path, usage, *, task_overrides=None):
+    """The shared snapshot reaches the free facts row's flat fields."""
     drive_logs = tmp_path / "logs"
     drive_logs.mkdir(parents=True, exist_ok=True)
     task = {
@@ -426,7 +399,7 @@ def _capture_facts_row_and_reflection_prompt(
             "tool": "run_command",
             "status": "error",
             "is_error": True,
-            "result": "TOOL_ERROR: synthetic prompt-capture trigger",
+            "result": "TOOL_ERROR: synthetic facts-row trigger",
         }],
         "reasoning_notes": [],
     }
@@ -439,23 +412,10 @@ def _capture_facts_row_and_reflection_prompt(
         drive_logs=drive_logs,
     )
     [row] = [json.loads(line) for line in (drive_logs / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
-
-    reflection_llm = CapturingLlm()
-    entry = pipeline._run_reflection(
-        SimpleNamespace(drive_root=tmp_path),
-        reflection_llm,
-        task,
-        usage,
-        trace,
-        {},
-    )
-
-    assert entry is not None
-    assert len(reflection_llm.prompts) == 1
-    return row, reflection_llm.prompts[0]
+    return row
 
 
-def test_shared_cost_snapshot_reaches_facts_row_and_reflection_prompt(tmp_path, monkeypatch):
+def test_shared_cost_snapshot_reaches_the_facts_row(tmp_path):
     snapshot = {
         "rounds": 8,
         "cost": 1.25,
@@ -476,39 +436,15 @@ def test_shared_cost_snapshot_reaches_facts_row_and_reflection_prompt(tmp_path, 
         },
     }
 
-    row, prompt = _capture_facts_row_and_reflection_prompt(
-        tmp_path, monkeypatch, snapshot,
-    )
+    row = _capture_facts_row(tmp_path, snapshot)
     for key in ("accounted_upper_bound_usd_with_children", "reserved_usd", "unresolved_upper_bound_usd",
                 "unknown_unmetered", "cost_final", "cost_with_children_partial", "cost_accounting_status"):
         assert row[key] == snapshot[key], key
     assert row["reason_code"] == "child_results_deferred"
     assert row["outcome_axes"]["execution"]["status"] == "degraded"
-    snapshot_text = pipeline._synthesis_usage_snapshot_text(snapshot)
-    expected_fragments = (
-        '"accounted_upper_bound_usd_with_children": 4.75',
-        '"reserved_usd": 1.5',
-        '"unresolved_upper_bound_usd": 0.75',
-        '"unknown_unmetered": 2',
-        '"ledger_integrity": "ok"',
-        '"cost_snapshot_at": "2026-07-15T12:34:56+00:00"',
-        '"cost_final": false',
-        '"cost_with_children_partial": true',
-        '"cost_accounting_status": "available"',
-        '"reason_code": "child_results_deferred"',
-        '"status": "best_effort"',
-    )
-    assert snapshot_text in prompt
-    assert "accounted subtree cost only" in prompt
-    assert "separate non-final exposure fields" in prompt
-    assert "including the reserved" not in prompt
-    assert "outcome_axes` is canonical task truth" in prompt
-    assert '"review": {' in prompt
-    for fragment in expected_fragments:
-        assert fragment in prompt
 
 
-def test_unavailable_cost_snapshot_is_null_not_zero_in_facts_row_and_prompt(tmp_path, monkeypatch):
+def test_unavailable_cost_snapshot_is_null_not_zero_in_the_facts_row(tmp_path):
     snapshot = {
         "rounds": 8,
         "cost": 1.25,
@@ -523,34 +459,20 @@ def test_unavailable_cost_snapshot_is_null_not_zero_in_facts_row_and_prompt(tmp_
         "cost_accounting_status": "unavailable",
     }
 
-    row, prompt = _capture_facts_row_and_reflection_prompt(
-        tmp_path, monkeypatch, snapshot,
-    )
-    snapshot_text = pipeline._synthesis_usage_snapshot_text(snapshot)
-    null_fields = (
+    row = _capture_facts_row(tmp_path, snapshot)
+    for field in (
         "accounted_upper_bound_usd_with_children",
         "reserved_usd",
         "unresolved_upper_bound_usd",
         "unknown_unmetered",
-    )
-    for field in null_fields:
+    ):
         assert row[field] is None, field
     assert row["cost_accounting_status"] == "unavailable"
-    assert snapshot_text in prompt
-    for field in null_fields:
-        assert f'"{field}": null' in prompt
-    assert '"ledger_integrity": "unavailable"' in prompt
-    assert '"cost_snapshot_at": "2026-07-15T12:35:00+00:00"' in prompt
-    assert '"cost_final": false' in prompt
-    assert '"cost_with_children_partial": true' in prompt
-    assert '"cost_accounting_status": "unavailable"' in prompt
-    assert "$0" not in prompt
 
 
-def test_child_legacy_usage_does_not_claim_a_subtree_snapshot(tmp_path, monkeypatch):
-    row, prompt = _capture_facts_row_and_reflection_prompt(
+def test_child_legacy_usage_does_not_claim_a_subtree_snapshot(tmp_path):
+    row = _capture_facts_row(
         tmp_path,
-        monkeypatch,
         {"rounds": 8, "cost": 1.25},
         task_overrides={
             "id": "child-synthesis-prompt",
@@ -560,16 +482,13 @@ def test_child_legacy_usage_does_not_claim_a_subtree_snapshot(tmp_path, monkeypa
         },
     )
 
-    assert "Shared pre-synthesis cost snapshot" not in prompt
-    assert "accounted_upper_bound_usd_with_children" not in prompt
-    assert "cost_snapshot_at" not in prompt
     assert "accounted_upper_bound_usd_with_children" not in row and "cost_snapshot_at" not in row
 
 
 # --- the retired dialogue writer: a root's post-phase buys no dialogue Light call ---------------
 
 class _RecordingLight:
-    """Every Light send of the post-task phase: scratchpad upkeep answers JSON, reflection prose."""
+    """Every Light send of the post-task phase: scratchpad upkeep answers JSON, any other send prose."""
 
     prompts: list = []
 
@@ -581,9 +500,8 @@ class _RecordingLight:
         type(self).prompts.append(prompt)
         usage = {"prompt_tokens": 3, "completion_tokens": 2, "cost": 0.0}
         if "scratchpad working memory" in prompt:
-            return {"content": json.dumps({"knowledge_entries": [],
-                                           "compressed_block": "COMPRESSED scratchpad memory."})}, usage
-        return {"content": "I understand this run.\nMEMORY_ACTIONS_JSON: []"}, usage
+            return {"content": json.dumps({"compressed_block": "COMPRESSED scratchpad memory."})}, usage
+        return {"content": "I understand this run."}, usage
 
 
 def _frozen_dialogue_install(root):
@@ -613,8 +531,9 @@ def _frozen_dialogue_install(root):
 def test_root_post_phase_keeps_frozen_dialogue_memory_and_buys_no_dialogue_light_call(tmp_path, monkeypatch):
     """After N root tasks the frozen ``dialogue_blocks.json``/``dialogue_meta.json`` are byte-identical
     and no Light send carries the dialogue (the guard: the writer and its stage are gone), while the
-    reflection of every root and the scratchpad upkeep still run (what stays). The install's chronicle is
-    not active, so the fallback draft has nothing to read; its conditional sides are pinned below."""
+    scratchpad upkeep still runs (what stays). An errored root buys no reflection and no Pattern Register
+    rewrite any more. The install's chronicle is not active, so the fallback draft has nothing to read;
+    its conditional sides are pinned below."""
     import ouroboros.llm as llm_mod
     import ouroboros.post_task_evolution as post_task_evolution
 
@@ -634,13 +553,13 @@ def test_root_post_phase_keeps_frozen_dialogue_memory_and_buys_no_dialogue_light
     scratch_before = memory.load_scratchpad_blocks()
     env = SimpleNamespace(repo_dir=tmp_path, drive_root=tmp_path, drive_path=lambda rel: tmp_path / rel)
     trace = {"tool_calls": [{"tool": "run_command", "status": "error", "is_error": True,
-                             "result": "TOOL_ERROR: a failure worth reflecting on"}], "reasoning_notes": []}
+                             "result": "TOOL_ERROR: a failure the old reflection admitted"}], "reasoning_notes": []}
     roots = [f"root-{index}" for index in range(3)]
     for task_id in roots:
         task = {"id": task_id, "root_task_id": task_id, "type": "task", "chat_id": 1,
                 "text": f"Finish the work of {task_id}", "drive_root": str(tmp_path)}
         pipeline._store_task_result(env, task, "Done.", {"rounds": 3, "cost": 0.0}, trace)
-        pipeline._run_post_task_processing_async(env, task, {"rounds": 3, "cost": 0.0}, trace, {},
+        pipeline._run_post_task_processing_async(env, task, {"rounds": 3, "cost": 0.0}, trace,
                                                  tmp_path / "logs", blocking=True)
 
     # The guard: nothing of the dialogue was sent to Light, and the frozen files never changed.
@@ -650,13 +569,10 @@ def test_root_post_phase_keeps_frozen_dialogue_memory_and_buys_no_dialogue_light
     assert {name: (tmp_path / "memory" / name).read_bytes() for name in frozen} == frozen
     events = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert not [row for row in events if row.get("type") in {"chat_block_consolidation", "consolidation_skipped_locked"}]
-    # What stays: every root reflected (and its error evidence reached the Pattern Register),
-    # the scratchpad was consolidated, every phase completed. No other Light send exists.
+    # What stays: the scratchpad was consolidated and every phase completed. No other Light
+    # send exists: no reflection, no Pattern Register rewrite, whatever the trace's errors.
     scratchpad = [prompt for prompt in prompts if "scratchpad working memory" in prompt]
-    reflections = [prompt for prompt in prompts if "MEMORY_ACTIONS_JSON and BACKLOG_CANDIDATES_JSON" in prompt]
-    patterns = [prompt for prompt in prompts if "You maintain a Pattern Register" in prompt]
-    assert len(scratchpad) == 1 and len(reflections) == len(patterns) == len(roots)
-    assert len(prompts) == len(scratchpad) + len(reflections) + len(patterns)
+    assert len(scratchpad) == 1 and prompts == scratchpad
     assert memory.load_scratchpad_blocks() != scratch_before
     assert memory.load_scratchpad_blocks()[0]["content"] == "COMPRESSED scratchpad memory."
     for task_id in roots:
@@ -707,7 +623,7 @@ def test_the_one_memory_light_call_of_a_root_is_the_fallback_draft_and_only_whil
     task = {"id": "root-queued", "root_task_id": "root-queued", "type": "task", "chat_id": 1,
             "text": "Finish the queued work", "drive_root": str(tmp_path)}
     pipeline._store_task_result(env, task, "Done.", {"rounds": 3, "cost": 0.0}, trace)
-    pipeline._run_post_task_processing_async(env, task, {"rounds": 3, "cost": 0.0}, trace, {},
+    pipeline._run_post_task_processing_async(env, task, {"rounds": 3, "cost": 0.0}, trace,
                                              tmp_path / "logs", blocking=True)
 
     drafts = [record for record in ChronicleStore(tmp_path).records(kinds=("page", "part"))

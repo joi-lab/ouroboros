@@ -406,6 +406,8 @@ def test_auto_low_source_inventory_has_no_true_writer_or_ghost_reader():
         "ouroboros/config.py",
         "ouroboros/settings_defaults.py",
         "ouroboros/context_mode_compat.py",
+        "ouroboros/composer_cognition.py",
+        "ouroboros/settings_integrity.py",
         "ouroboros/gateway/owner_settings.py",
         "ouroboros/gateway/settings.py",
         "devtools/benchmarks/common/server_runner.py",
@@ -417,6 +419,7 @@ def test_auto_low_source_inventory_has_no_true_writer_or_ghost_reader():
         if "context_mode_auto_low" in text
     }
     assert response_paths == {
+        "ouroboros/settings_integrity.py",  # captured legacy provenance, not a derived UI mode
         "ouroboros/gateway/contracts.py",
         "ouroboros/gateway/state.py",
         "web/modules/api_types.js",

@@ -2,9 +2,12 @@ import { acceptanceGroupWithIncident, acceptanceIncidentFromTaskDetail } from '.
 export { acceptanceIncidentFromTaskDetail } from './acceptance_incident_presentation.js';
 import { setInertCardPresentation } from './task_phase_chip.js';
 import { escapeHtmlAttr, sinceLocalTime } from './utils.js';
-import { taskSourceDownloadUrl } from './api_client.js';
+import { isStoreMigrating, taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { reconcileReviewMarkup } from './review_dom_patch.js';
+import { actorAwaiting, actorUnresolved, formatReviewProjection } from './review_record_card.js';
+import { planRecordEngaged, planRecordGroup } from './plan_record_presentation.js';
+export { formatReviewProjection } from './review_record_card.js';
 
 const escapeHtmlText = escapeHtmlAttr;
 
@@ -12,6 +15,7 @@ const SURFACE_ORDER = new Map([
     ['skill', 0],
     ['plan', 1],
     ['task_acceptance', 2],
+    ['review_record', 3],
 ]);
 
 const ACTIVE_STATES = new Set(['queued', 'running', 'open', 'working', 'pending']);
@@ -42,10 +46,6 @@ const finiteCount = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
 };
-// A reviewer answer that has not arrived is a gap, not a verdict: the host
-// types a planned wait as `pending_dispatch` and an exceptional one otherwise.
-const actorAwaiting = (actor) => text(actor?.operation_state) === 'pending_dispatch' && text(actor?.transport_status) !== 'success';
-const actorUnresolved = (actor) => ['in_flight', 'custody_lost'].includes(text(actor?.operation_state));
 // A roster with an unanswered slot reports how far it got, never a bare verdict;
 // a slot that is neither answered nor awaited keeps the warning tone.
 const heldProgress = (lead, roster, answered) => {
@@ -112,12 +112,12 @@ function reviewTone(state, verdict, lifecycleStatus = '') {
         : statusTone(state, verdict);
 }
 
-function lifecycleMeta(status) {
+export function lifecycleMeta(status) {
     const token = text(status).toLowerCase();
     return lifecycleFailure(token) ? `lifecycle ${token}` : '';
 }
 
-function hasSemanticVerdict(verdict) {
+export function hasSemanticVerdict(verdict) {
     const token = text(verdict).toLowerCase();
     return Boolean(token)
         && !ACTIVE_STATES.has(token)
@@ -666,6 +666,7 @@ function legacyPlanReviewGroup(owner, stateRecord) {
 
 export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     const owner = text(ownerTaskId || detail?.task_id);
+    if (owner && planRecordEngaged(detail?.plan_record)) return planRecordGroup(owner, detail.plan_record, detail);
     const stateRecord = detail?.plan_review_state;
     if (!owner || !stateRecord || typeof stateRecord !== 'object') return null;
     if (stateRecord.schema_version === 1) return legacyPlanReviewGroup(owner, stateRecord);
@@ -770,78 +771,6 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
     };
 }
 
-function compactCoverage(coverage) {
-    if (!coverage || typeof coverage !== 'object') return '';
-    return Object.entries(coverage)
-        .filter(([, value]) => value !== '' && value !== null && value !== undefined)
-        .map(([key, value]) => `${key}=${String(value)}`)
-        .join(', ');
-}
-
-export function formatReviewProjection(projection) {
-    const panels = Array.isArray(projection?.panels) ? projection.panels : [];
-    const lines = [];
-    panels.forEach((panel, panelIndex) => {
-        if (!panel || typeof panel !== 'object') return;
-        const quorum = panel.quorum && typeof panel.quorum === 'object' ? panel.quorum : {};
-        const panelId = String(panel.panel_id || `panel-${panelIndex + 1}`);
-        const awaiting = (Array.isArray(panel.actors) ? panel.actors : []).filter(actorAwaiting).length;
-        const signal = String(panel.aggregate_signal || 'UNKNOWN');
-        // While a slot is awaited the aggregate is not final; DEGRADED is only the host's placeholder.
-        const verdictText = !awaiting ? signal : (signal === 'DEGRADED' ? `none (${awaiting} awaiting; held as DEGRADED)` : `${signal} (${awaiting} awaiting)`);
-        lines.push(
-            `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${verdictText} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
-        );
-        if (panel.reason) lines.push(`Panel reason: ${String(panel.reason)}`);
-        const coverage = compactCoverage(panel.coverage);
-        if (coverage) lines.push(`Panel coverage: ${coverage}`);
-        const binding = [
-            panel.candidate_hash ? `candidate_hash=${String(panel.candidate_hash)}` : '',
-            panel.evidence_revision ? `evidence_revision=${String(panel.evidence_revision)}` : '',
-            panel.fence_hash ? `fence_hash=${String(panel.fence_hash)}` : '',
-            panel.binding_hash ? `binding_hash=${String(panel.binding_hash)}` : '',
-        ].filter(Boolean);
-        if (binding.length) lines.push(`Panel binding: ${binding.join(' · ')}`);
-        (Array.isArray(panel.actors) ? panel.actors : []).forEach((actor) => {
-            if (!actor || typeof actor !== 'object') return;
-            const slotId = String(actor.slot_id || '?');
-            lines.push(
-                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
-            );
-            const actorCoverage = compactCoverage(actor.coverage);
-            if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);
-            if (actor.reason) lines.push(`Reviewer ${slotId} reason: ${String(actor.reason)}`);
-            if (Array.isArray(actor.findings)) {
-                for (const finding of actor.findings) {
-                    if (!finding || typeof finding !== 'object') continue;
-                    const label = [text(finding.severity), text(finding.verdict)]
-                        .filter(Boolean).join(' ') || 'finding';
-                    const title = text(finding.item) || text(finding.summary) || '(no item)';
-                    const summaryText = text(finding.summary);
-                    const body = [
-                        `[${label}]${text(finding.id) ? ` ${text(finding.id)}` : ''} ${title}`,
-                        summaryText && summaryText !== title ? `summary: ${summaryText}` : '',
-                        text(finding.reason) ? `reason: ${text(finding.reason)}` : '',
-                        text(finding.evidence) ? `evidence: ${text(finding.evidence)}` : '',
-                        text(finding.recommendation) ? `fix: ${text(finding.recommendation)}` : '',
-                    ].filter(Boolean).join(' — ');
-                    lines.push(`Reviewer ${slotId} finding: ${body}`);
-                }
-                const omitted = finiteCount(actor.findings_omitted);
-                if (omitted) lines.push(`Reviewer ${slotId} findings omitted: ${omitted}`);
-            }
-            // P1: name the durable full copy unconditionally — bounded rows,
-            // per-string truncation markers and pre-findings-era projections
-            // all resolve through the same observability call.
-            const callId = text(actor.response_ref?.call_id);
-            if (callId) {
-                lines.push(`Reviewer ${slotId} full response: observability call ${callId}`);
-            }
-        });
-    });
-    return lines.join('\n');
-}
-
 function authorDispositionText(author, label = '') {
     if (!author || typeof author !== 'object' || (!text(author.disposition) && !text(author.action))) return '';
     const actionLabel = label || `Author ${author.action === 'stop' ? 'stop' : 'finish'}`;
@@ -919,10 +848,40 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
     return acceptanceGroupWithIncident({ owner, attempts, incident, authorDecisionText, statusTone });
 }
 
+/** The task's own review-ledger records (panels carrying `record_id`), one attempt per record, oldest first. */
+export function reviewRecordGroupFromTaskDetail(detail, ownerTaskId = '') {
+    const owner = text(ownerTaskId || detail?.task_id);
+    const projection = detail?.review_projection;
+    const panels = (Array.isArray(projection?.panels) ? projection.panels : []).filter((panel) => text(panel?.record_id));
+    if (!owner || !panels.length) return null;
+    const attempts = panels.map((panel, index) => {
+        const verdict = text(panel.aggregate_signal) || 'UNKNOWN';
+        return {
+            id: `record:${text(panel.record_id)}`, surface: 'review_record', state: 'terminal', progress: '',
+            // NOT_PERFORMED, QUORUM_FAILED and NOT_DISPATCHED reached no verdict: a warning, never a quiet neutral.
+            tone: { PASS: 'done', FAIL: 'error' }[verdict] || 'warn', verdict, timestamp: text(panel.ts), ordinal: index,
+            label: `${text(panel.surface) || 'review'} record ${text(panel.record_id)}`, summary: text(panel.reason),
+            superseded: false, replayed: false, revised: false, initiatorTaskId: owner, executions: [], execution: null,
+            detailRef: null,
+            detailText: [formatReviewProjection({ panels: [panel] }), text(panel.source_ref?.path) ? `Full record: ${text(panel.source_ref.path)}` : ''].filter(Boolean).join('\n'),
+        };
+    });
+    const latest = attempts.at(-1);
+    return {
+        id: `review_record:${owner}`, surface: 'review_record', label: 'Review records', subject: '',
+        presentationOwnerTaskId: owner, subjectTaskId: owner, initiatorTaskId: owner,
+        state: 'terminal', progress: '', tone: latest.tone, verdict: latest.verdict, summary: latest.summary,
+        warning: '', authorDecisionText: '', activeCount: 0, attemptCount: attempts.length,
+        // Older records stay in the ledger: the count is exact only when the projection says none exist.
+        countIsAuthoritative: projection.review_records_omitted === 0, attempts,
+    };
+}
+
 export function reviewGroupsFromTaskDetail(detail, ownerTaskId = '') {
     return [
         planReviewGroupFromTaskDetail(detail, ownerTaskId),
         taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId),
+        reviewRecordGroupFromTaskDetail(detail, ownerTaskId),
     ].filter(Boolean);
 }
 
@@ -1157,10 +1116,40 @@ function reviewRevision(value) {
     return /^[0-9a-f]{64}$/.test(revision) ? revision : null;
 }
 
+// One queue for every card's review detail on the page (issue #1771): a room with
+// many review owners otherwise opened one GET per owner at once and starved the
+// browser's few connections per host (WebKit: 6), videos included. Newest request
+// first: a room opens at its newest cards, and an expansion is the latest ask. A
+// read keeps its slot until it settles; one whose response never comes is aborted
+// at the slot's bound and fails like any lost read (its card offers Retry), so a dead
+// connection neither stalls every card's details nor stays open beside the next
+// reads. A closed owner's queued reads never start.
+export const REVIEW_DETAIL_READS = 2;
+export const REVIEW_DETAIL_SLOT_MS = 30000;
+const detailQueue = [];
+let detailReads = 0;
+function drainDetailReads() {
+    while (detailReads < REVIEW_DETAIL_READS && detailQueue.length) {
+        const job = detailQueue.pop();
+        detailReads += 1;
+        const abort = new AbortController();
+        const lost = new Promise((_resolve, reject) => abort.signal.addEventListener('abort',
+            () => reject(new Error('review detail read lost its connection')), { once: true }));
+        const timer = setTimeout(() => abort.abort(), REVIEW_DETAIL_SLOT_MS);
+        Promise.race([new Promise(resolve => resolve(job.read(abort.signal))), lost]).then(job.resolve, job.reject)
+            .finally(() => { clearTimeout(timer); detailReads -= 1; drainDetailReads(); });
+    }
+}
+const queueDetailRead = (owner, read) => new Promise((resolve, reject) => {
+    detailQueue.push({ owner, read, resolve, reject });
+    drainDetailReads();
+});
+
 // Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
 export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
     const states = new Map();
     const start = (taskId, state, revision, onDomWrite) => {
+        clearTimeout(state.migrationTimer); state.migrationTimer = null;
         const generation = ++state.generation;
         state.inFlightRevision = revision;
         const write = typeof onDomWrite === 'function' ? onDomWrite : (mutate) => mutate();
@@ -1172,7 +1161,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         const request = Promise.resolve()
             .then(() => {
                 if (!state.everApplied || state.lastStatus === 'error') notify('loading');
-                return fetchDetail(taskId);
+                return queueDetailRead(states, (signal) => fetchDetail(taskId, { signal }));
             })
             .then((detail) => {
                 // The strict seam rejects failures; null means genuinely absent (404).
@@ -1185,7 +1174,13 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 notify('idle');
                 return applied;
             })
-            .catch(() => {
+            .catch(error => {
+                if (states.get(taskId) !== state) return false;
+                if (isStoreMigrating(error)) {
+                    notify('loading');
+                    state.migrationTimer = setTimeout(() => start(taskId, state, revision, onDomWrite), 700);
+                    return false;
+                }
                 notify('error');
                 return false;
             })
@@ -1208,7 +1203,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
         // Saved Review: errors await Retry; a successful empty/404 permits fallback.
         ready(taskId) {
             const state = states.get(taskId);
-            return !state || (!state.inFlight && state.lastStatus !== 'error');
+            return !state || (!state.inFlight && !state.migrationTimer && state.lastStatus !== 'error');
         },
         hydrate(taskIdValue, revisionValue = null, { onDomWrite = null } = {}) {
             const taskId = text(taskIdValue);
@@ -1253,7 +1248,11 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
             for (const state of states.values()) state.appliedRevision = null;
         },
         clear() {
+            for (const state of states.values()) clearTimeout(state.migrationTimer);
             states.clear();
+            for (const [index, job] of [...detailQueue.entries()].reverse()) {
+                if (job.owner === states) detailQueue.splice(index, 1)[0].reject(new Error('review detail read cancelled'));
+            }
         },
     };
 }

@@ -2,9 +2,12 @@ import json
 import pathlib
 import types
 
+import pytest
+
 import ouroboros.agent_startup_checks as startup_mod
 import ouroboros.world_profiler as world_profiler
 from ouroboros.memory import Memory
+from ouroboros import usage_store
 
 
 def test_check_version_sync_ignores_non_release_tag(tmp_path, monkeypatch):
@@ -96,8 +99,8 @@ def test_check_version_sync_flags_malformed_rc_badge_url(tmp_path, monkeypatch):
 def test_memory_ensure_files_generates_world_profile(tmp_path, monkeypatch):
     calls = []
 
-    def fake_generate(output_path: str):
-        calls.append(output_path)
+    def fake_generate(output_path: str, repo_dir: str = "", data_dir: str = ""):
+        calls.append((output_path, repo_dir, data_dir))
         pathlib.Path(output_path).write_text("# WORLD\n", encoding="utf-8")
 
     monkeypatch.setattr(world_profiler, "generate_world_profile", fake_generate)
@@ -106,7 +109,7 @@ def test_memory_ensure_files_generates_world_profile(tmp_path, monkeypatch):
     memory.ensure_files()
     memory.ensure_files()
 
-    assert calls == [str(memory.world_path())]
+    assert calls == [(str(memory.world_path()), str(tmp_path), str(tmp_path))]  # the roots in use
     assert memory.world_path().read_text(encoding="utf-8") == "# WORLD\n"
 
 
@@ -120,7 +123,7 @@ def test_check_uncommitted_changes_never_commits_outside_launcher(monkeypatch, t
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        if cmd[:3] == ["git", "status", "--porcelain"]:
+        if cmd == ["git", "--no-optional-locks", "status", "--porcelain"]:
             return types.SimpleNamespace(returncode=0, stdout=" M server.py\n")
         raise AssertionError(f"Unexpected subprocess call: {cmd}")
 
@@ -133,7 +136,7 @@ def test_check_uncommitted_changes_never_commits_outside_launcher(monkeypatch, t
     assert result["status"] == "warning"
     assert result["auto_committed"] is False
     assert result["auto_rescue_skipped"] == "supervisor_side_rescue_owns_this"
-    assert calls == [["git", "status", "--porcelain"]]
+    assert calls == [["git", "--no-optional-locks", "status", "--porcelain"]]
 
 
 def test_check_budget_reports_corrupt_state_json(tmp_path, monkeypatch):
@@ -172,7 +175,9 @@ def test_check_budget_explicit_zero_remains_unconfigured(tmp_path, monkeypatch):
     assert startup_mod.check_budget(env) == ({"status": "unconfigured"}, 0)
 
 
-def test_check_budget_uses_unresolved_ledger_upper_bound(tmp_path, monkeypatch):
+def test_check_budget_decides_on_known_spend_and_discloses_the_unresolved_bound(tmp_path, monkeypatch):
+    """#1487: the startup budget health is the admission rule's own number (room above
+    known spend); the $1 unresolved upper bound is disclosed beside it, not spent."""
     from ouroboros import usage_accounting as ua
 
     (tmp_path / "state").mkdir(parents=True)
@@ -182,7 +187,7 @@ def test_check_budget_uses_unresolved_ledger_upper_bound(tmp_path, monkeypatch):
     )
     (tmp_path / "settings.json").write_text("{}\n", encoding="utf-8")
     (tmp_path / "logs" / "events.jsonl").write_text("", encoding="utf-8")
-    ua.ensure_legacy_imported(tmp_path)
+    usage_store.migrate_from_journal(tmp_path)
     reservation = ua.reserve_attempt(ua.AttemptRequest(
         model="openai/gpt-5.5",
         provider="openrouter",
@@ -198,9 +203,9 @@ def test_check_budget_uses_unresolved_ledger_upper_bound(tmp_path, monkeypatch):
     result, issues = startup_mod.check_budget(env)
 
     assert issues == 1
-    assert result["status"] == "emergency"
-    assert result["spent_usd"] == 1.0
-    assert result["remaining_usd"] == 0.25
+    assert result["status"] == "critical"  # $1.25 of known room: below $2, above the $0.50 emergency
+    assert result["spent_usd"] == 0.0
+    assert result["remaining_usd"] == 1.25
     assert result["unresolved_upper_bound_usd"] == 1.0
     assert result["accounting_authority"] == "physical_attempt_ledger"
     assert result["cost_final"] is False
@@ -217,7 +222,7 @@ def test_check_budget_uses_canonical_root_for_split_worker(tmp_path, monkeypatch
         (root / "state" / "state.json").write_text("{}\n", encoding="utf-8")
         (root / "settings.json").write_text("{}\n", encoding="utf-8")
         (root / "logs" / "events.jsonl").write_text("", encoding="utf-8")
-    ua.ensure_legacy_imported(canonical)
+    usage_store.migrate_from_journal(canonical)
     reservation = ua.reserve_attempt(ua.AttemptRequest(
         model="openai/gpt-5.5", provider="openrouter", reservation_usd=4.0,
         drive_root=canonical, global_limit_usd=10.0,
@@ -269,32 +274,43 @@ def _known_evolution_controls(tmp_path):
                       "evolution_owner_stopped": False})
 
 
-def test_verify_restart_closes_promoted_backlog_only_on_absorb(tmp_path):
-    import ouroboros.improvement_backlog as ib
+@pytest.mark.parametrize("path", ["restart_verified", "boot_reconcile"])
+def test_verify_restart_absorb_keeps_the_authored_backlog_and_its_ledger_link(tmp_path, monkeypatch, path):
+    """Absorption closes nothing in the authored backlog note on either absorbing boot
+    path; the chooser's named entry rides into the cycle-outcome ledger row as evidence."""
+    from ouroboros.knowledge import resolve_knowledge_address, write_knowledge_note
 
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
     _known_evolution_controls(tmp_path)
-    ib.append_backlog_items(tmp_path, [{
-        "summary": "promoted fix", "category": "c", "source": "post_task",
-        "evidence": "e", "fingerprint": "fp-x", "id": "ibl-x",
-    }])
-    (tmp_path / "state" / "pending_restart_verify.json").write_text(
-        json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
+    backlog = resolve_knowledge_address(tmp_path, "improvement-backlog", "global")
+    assert write_knowledge_note(backlog, "## promoted fix\nStill its author's to revise or keep.").ok
+    before = backlog.path.read_bytes()
+    tx = {"transaction_id": "tx1", "task_id": "t1", "commit_sha": "goodsha"}
+    if path == "restart_verified":
+        (tmp_path / "state" / "pending_restart_verify.json").write_text(
+            json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
+        observed = "goodsha"
+    else:
+        tx.update(restart_required=True, restart_verified=False)
+        monkeypatch.setattr(startup_mod.subprocess, "run",
+                            lambda *_a, **_k: types.SimpleNamespace(returncode=0, stdout="", stderr=""))
+        observed = "headsha"
     (tmp_path / "state" / "evolution_campaign.json").write_text(json.dumps({
-        "status": "active",
-        "post_task_backlog_id": "ibl-x",
-        "active_transaction": {"transaction_id": "tx1", "task_id": "t1", "commit_sha": "goodsha"},
+        "status": "active", "post_task_backlog_id": "ibl-x", "active_transaction": tx,
     }), encoding="utf-8")
-    env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel, drive_root=tmp_path)
+    env = types.SimpleNamespace(drive_path=lambda rel: tmp_path / rel, drive_root=tmp_path, repo_dir=tmp_path)
 
-    startup_mod.verify_restart(env, "goodsha")  # sha matches -> absorbed
+    startup_mod.verify_restart(env, observed)
 
-    by_id = {i["id"]: i for i in ib.load_backlog_items(tmp_path)}
-    assert by_id["ibl-x"]["status"] == "done"  # closed only after absorb
+    assert backlog.path.read_bytes() == before
     camp = json.loads((tmp_path / "state" / "evolution_campaign.json").read_text(encoding="utf-8"))
     assert "post_task_backlog_id" not in camp
     assert int(camp.get("absorbed_cycles_done") or 0) == 1
+    checkpoints = [json.loads(line) for line in
+                   (tmp_path / "state" / "evolution_checkpoints.jsonl").read_text(encoding="utf-8").splitlines()]
+    [tag] = [row for row in checkpoints if row.get("kind") == "cycle_outcome"]
+    assert (tag["source"], tag["cycle_outcome"], tag["backlog_id"]) == (path, "absorbed", "ibl-x")
 
 
 def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path):
@@ -509,7 +525,7 @@ def test_check_uncommitted_changes_never_commits_even_when_launcher_managed(monk
 
     def fake_run(cmd, **kwargs):
         calls.append(cmd)
-        if cmd[:3] == ["git", "status", "--porcelain"]:
+        if cmd == ["git", "--no-optional-locks", "status", "--porcelain"]:
             return types.SimpleNamespace(returncode=0, stdout=" M server.py\n")
         raise AssertionError(
             f"Unexpected subprocess call {cmd}: worker-side check_uncommitted_changes "
@@ -525,4 +541,4 @@ def test_check_uncommitted_changes_never_commits_even_when_launcher_managed(monk
     assert result["status"] == "warning"
     assert result["auto_committed"] is False
     assert result["auto_rescue_skipped"] == "supervisor_side_rescue_owns_this"
-    assert calls == [["git", "status", "--porcelain"]]
+    assert calls == [["git", "--no-optional-locks", "status", "--porcelain"]]

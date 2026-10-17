@@ -23,19 +23,20 @@ from ouroboros.tools import skill_exec
 from ouroboros.tools.registry import ToolContext
 from ouroboros.usage_accounting import UsageScope, usage_scope
 from tests.test_skill_exec import _build_skill, _make_ctx, _mark_reviewed_and_enabled
+from tests._usage_store_testing import ledger_rows
 
 
 def _external_rows(drive_root: pathlib.Path) -> list[dict]:
-    path = drive_root / "state" / "usage_attempts.jsonl"
-    if not path.exists():
-        return []
-    return [
-        row
-        for raw in path.read_text(encoding="utf-8").splitlines()
-        if raw.strip()
-        for row in [json.loads(raw)]
-        if row.get("kind") == "external_unmetered"
-    ]
+    return [row for row in ledger_rows(drive_root) if row.get("kind") == "external_unmetered"]
+
+
+def _lineage(budget_root: pathlib.Path, root_task_id: str) -> None:
+    """A task-bound disclosure needs a real root: its whole-work bucket is read, never guessed."""
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(budget_root, root_task_id, "running", billing_group={
+        "billing_group_id": root_task_id, "billing_group_limit_usd": 20.0,
+        "billing_group_limit_source": "initial_task_admission", "billing_group_limit_revision": "r1"})
 
 
 def _prepare_script_skill(
@@ -94,6 +95,7 @@ def test_skill_exec_discloses_once_with_canonical_lineage(tmp_path, monkeypatch)
     )
     ctx.task_id = "child-task"
     ctx.budget_drive_root = str(budget_root)
+    _lineage(budget_root, "root-task")
     ctx.task_metadata = {
         "budget_drive_root": str(budget_root),
         "root_task_id": "root-task",
@@ -233,6 +235,7 @@ def test_skill_exec_uses_bound_lineage_when_tool_context_is_sparse(tmp_path):
     budget_root = tmp_path / "budget"
     budget_root.mkdir()
     ctx = ToolContext(repo_dir=tmp_path, drive_root=child_drive, task_id="bound-child")
+    _lineage(budget_root, "bound-root")
     scope = UsageScope(
         drive_root=budget_root,
         task_id="bound-child",
@@ -293,6 +296,7 @@ def test_extension_dispatch_surfaces_disclose_once(kind, tmp_path, monkeypatch):
     if kind == "tool":
         budget_root = tmp_path / "budget"
         budget_root.mkdir()
+        _lineage(budget_root, "root-task")
         ctx = ToolContext(
             repo_dir=repo_dir,
             drive_root=drive_root,
@@ -817,6 +821,7 @@ def test_reconcile_reports_retained_auto_restart_not_already_running(tmp_path, m
 
 
 def test_extension_dispatch_inherits_bound_lineage_without_tool_context(tmp_path):
+    _lineage(tmp_path, "bound-root")
     scope = UsageScope(
         drive_root=tmp_path,
         task_id="bound-child",
@@ -932,3 +937,51 @@ def test_extension_child_timeout_keeps_one_post_spawn_disclosure(tmp_path, monke
         )
 
     assert len(_external_rows(drive_root)) == 1
+
+
+def test_a_host_dispatch_is_its_own_group_and_a_task_dispatch_without_lineage_is_refused(tmp_path):
+    """An explicit host call site binds no task lineage (never a stand-in group); a
+    task-bound dispatch whose lineage is missing refuses typed before its spawn."""
+    from ouroboros.usage_accounting import BillingAuthorityUnavailable
+
+    extension_runner._record_extension_dispatch(
+        dispatch_id="host-dispatch", drive_root=tmp_path, skill_name="alpha", surface_kind="route", surface="/r")
+    rows = _external_rows(tmp_path)
+    assert [(row["root_task_id"], row["billing_group_id"]) for row in rows] == [("extension:alpha", "extension:alpha")]
+    with usage_scope(UsageScope(drive_root=tmp_path, task_id="child", root_task_id="gone-root")):
+        with pytest.raises(BillingAuthorityUnavailable) as refused:
+            extension_runner._record_extension_dispatch(
+                dispatch_id="task-dispatch", drive_root=tmp_path, skill_name="alpha", surface_kind="route", surface="/r")
+    assert refused.value.kind == "refused" and len(_external_rows(tmp_path)) == 1
+
+
+@pytest.mark.parametrize("identity", ["host", "context", "scope", "parent", "prefix"])
+def test_script_receipt_declares_host_role_only_without_bound_task_identity(tmp_path, identity):
+    from ouroboros.usage_accounting import BillingAuthorityUnavailable
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    scope = UsageScope(drive_root=tmp_path)
+    if identity == "context":
+        ctx.task_id, ctx.root_task_id = "child", "missing-root"
+    elif identity == "scope":
+        scope = UsageScope(drive_root=tmp_path, task_id="child", root_task_id="missing-root")
+    elif identity == "parent":
+        ctx.parent_task_id = "missing-parent"
+    elif identity == "prefix":
+        ctx.task_id = "skill_exec:alpha"  # A name is not authority to declare a host operation.
+    def disclose():
+        return skill_exec._record_skill_exec_dispatch(
+            ctx, dispatch_id="script-receipt", skill_name="alpha", script_rel="scripts/run.py")
+    with usage_scope(scope):
+        if identity == "host":
+            assert disclose() == disclose()
+        else:
+            with pytest.raises(BillingAuthorityUnavailable):
+                disclose()
+    rows = _external_rows(tmp_path)
+    if identity == "host":
+        assert len(rows) == 1
+        assert rows[0]["root_task_id"] == rows[0]["billing_group_id"] == "skill_exec:alpha"
+        assert rows[0]["cost_usd"] is None and rows[0]["cost_final"] is False
+    else:
+        assert rows == []

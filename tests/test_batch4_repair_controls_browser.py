@@ -271,7 +271,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
                     before_posts = len(requests)
                     for kind, phrase in [('budget', 'budget'), ('expired', 'deadline')]:
                         card = cards[kind]
-                        reason = card.locator(':scope > .chat-live-actions > [data-continue-refusal]')
+                        reason = card.locator(':scope > .chat-live-foot > .chat-live-foot-end > .chat-live-actions > [data-continue-refusal]')
                         expect(reason).to_be_visible()
                         expect(reason).to_contain_text('Continue unavailable.')
                         expect(reason).to_contain_text(phrase)
@@ -281,7 +281,7 @@ def test_hard_bound_continue_reason_on_real_collapsed_chat_cards(tmp_path, monke
                         expect(card.locator('[data-continue-task]')).to_have_count(0)
                         expect(card.locator('[data-live-phase]')).to_have_text('Failed')
                         assert card.evaluate('el => el.scrollWidth <= el.clientWidth + 1')
-                    expect(cards['expired'].locator('[data-live-activity]')).to_contain_text('provider')
+                    expect(cards['expired'].locator('[data-live-activity]')).to_contain_text('could not get a usable model answer')
                     page.evaluate('window.savedRefusal=document.querySelector("[data-continue-refusal]")')
                     page.evaluate('window.replay()')
                     assert page.evaluate('window.savedRefusal===document.querySelector("[data-continue-refusal]")')

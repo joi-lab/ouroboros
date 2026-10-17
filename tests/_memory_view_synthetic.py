@@ -46,7 +46,7 @@ def pointers(count: int = 377, rooms: int = 78) -> List[Dict[str, Any]]:
 def pages(count: int, chars: int, room: str = "1") -> List[Dict[str, Any]]:
     return [{"kind": "page", "id": f"page-{i:03d}", "room_id": room, "label": "Main",
              "period": f"{mv._minute(_ts(40 + i))} → {mv._minute(_ts(40 + i, 600))}", "text": f"Page {i}. " + "w" * chars,
-             "status": "", "revision": "", "stamp": "", "fixes": []} for i in range(count)]
+             "status": "", "stamp": "", "fixes": []} for i in range(count)]
 
 
 def marks(count: int = 12) -> List[Dict[str, Any]]:
@@ -66,10 +66,17 @@ def live_room(i: int, *, notes: int = 0, words: int = 0, word_chars: int = 300) 
                        "address": _address(room, ts, i * 100 + n), "ts": ts, "chars": word_chars,
                        "pos": 20_000 + i * 100 + n})
     return {"room_id": room, "label": f"Project room {i} [chat_id={room}]", "key": 20_000 + i * 100,
-            "first": mv._minute(first), "last": mv._minute(last), "people": words or 1, "rows": 3, "mine": 1,
-            "facts": 1, "words": spoken,
+            "facts": facts(rows=3, people=words or 1, mine=1, first=first, last=last, notes=notes), "words": spoken,
             "notes": [{"id": f"note-{i}-{n}", "date": "2026-09-01", "role": "root", "text": "What this project is."}
                       for n in range(notes)]}
+
+
+def facts(*, rows: int = 3, people: int = 1, mine: int = 1, chars: int = 2_400, first: str = "", last: str = "",
+          notes: int = 0, pages: int = 0, last_covered: str = "") -> Dict[str, Any]:
+    """A room's standing facts in the shape ``memory_inventory.room_facts`` returns (times ISO, as captured)."""
+    return {"rows": rows, "people": people, "mine": mine, "task_facts": rows - people - mine, "chars": chars,
+            "earliest": first or _ts(60), "latest": last or _ts(60, 300), "notes": notes, "pages": pages,
+            "last_covered": last_covered}
 
 
 def spoken(i: int, kind: str, chars: int, room: str = "1") -> Dict[str, Any]:
@@ -91,6 +98,8 @@ def room(room_id: str = "1", *, label: str = "Main", legacy: int = 0, legacy_cha
          origins: int = 0, lane1: Optional[List[Dict[str, Any]]] = None, lane2: int = 0,
          notes: int = 0) -> Dict[str, Any]:
     return {"room_id": room_id, "label": label, "head": 7,
+            "facts": facts(rows=len(lane1 or []) + 2 * lane2, people=sum(item["kind"] == "human" for item in lane1 or []),
+                           mine=sum(item["kind"] == "ouroboros" for item in lane1 or []), notes=notes),
             "legacy": [{"id": f"legacy-b{b:02d}-r{room_id}", "period": f"{mv._minute(_ts(b + 1))} → "
                         f"{mv._minute(_ts(b + 1, 600))}", "text": f"Retold {b}. " + "r" * legacy_chars}
                        for b in range(legacy)],
@@ -104,11 +113,13 @@ def room(room_id: str = "1", *, label: str = "Main", legacy: int = 0, legacy_cha
 
 
 def snapshot(*, role: str = "integrator", room_facts: Optional[Dict[str, Any]] = None, story: Any = (),
-             live: Any = (), mark_count: int = 0, owner_words: str = "", live_rooms: str = "lines") -> mv.MemoryViewSnapshot:
-    spec = dataclasses.replace(mv.ROLE_DEFAULTS[role], live_rooms=live_rooms,
+             live: Any = (), mark_count: int = 0, owner_words: str = "",
+             live_rooms: Optional[str] = None) -> mv.MemoryViewSnapshot:
+    """A snapshot of ``role``'s default spec (``live_rooms`` overrides it) over synthetic facts."""
+    spec = dataclasses.replace(mv.ROLE_DEFAULTS[role], live_rooms=live_rooms or mv.ROLE_DEFAULTS[role].live_rooms,
                                room_id=room_facts["room_id"] if room_facts else None)
-    status = {"folded": 0, "total": 23, "pages_by_me": 0, "open_records": 377, "open_rows": 9_422,
-              "open_chars": 2_001_746, "helper_route": "light"} if spec.story else {}
+    status = {"folded": 0, "total": 23, "pages_by_me": 0, "latest_by_me": "", "helper_pages": 0, "parts": 0,
+              "open_records": 377, "open_rows": 9_422, "open_chars": 2_001_746, "helper_route": "light"} if spec.story else {}
     return mv.MemoryViewSnapshot(spec=spec, store_status={"state": "active"}, frontier={"status": "exact", "pos": 12_400},
                                  story=tuple(story) if spec.story else (), room=room_facts, live_rooms=tuple(live),
                                  marks=tuple(marks(mark_count)), legacy_blocks=status, owner_words=owner_words)
@@ -123,15 +134,16 @@ def actor(name: str) -> mv.MemoryViewSnapshot:
                  spoken(3, "ouroboros", 1_200)]
     project_lane = [spoken(i, "human" if i % 2 else "ouroboros", 1_100) for i in range(5)]
     live12 = [live_room(i) for i in range(12)]
+    main_room = room("1", legacy=23, legacy_chars=8_400, lane1=main_lane, lane2=19)
     if name == "main":
-        return snapshot(room_facts=room("1", legacy=23, legacy_chars=8_400, lane1=main_lane, lane2=19),
-                        story=pointers(), live=live12, mark_count=12)
+        return snapshot(room_facts=main_room, story=pointers(), live=live12, mark_count=12)
     if name == "project":
         return snapshot(room_facts=room("257912875", label="Project X [chat_id=257912875]", legacy=8,
                                         legacy_chars=4_900, origins=1, lane1=project_lane, lane2=2),
                         story=pointers(), live=live12, mark_count=12)
-    if name == "consciousness":
-        return snapshot(role="consciousness", story=pointers(), live=[live_room(i) for i in range(13)], mark_count=12)
+    if name == "consciousness":  # Main's own view, and the words of people in the other live rooms
+        return snapshot(role="consciousness", room_facts=main_room, story=pointers(),
+                        live=[live_room(i, words=2, word_chars=1_100) for i in range(12)], mark_count=12)
     if name in ("child_project", "nanny"):
         return snapshot(role="child" if name == "child_project" else "nanny", story=pointers(),
                         room_facts=room("257912875", label="Project X [chat_id=257912875]", legacy=8,

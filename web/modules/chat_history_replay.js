@@ -29,6 +29,10 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         || String(summary.dedupeKey || '').startsWith('cardrow|');
     const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
+    // Speech keeps its live occurrence alias beside the physical history identity:
+    // history may precede live delivery, or adopt a line before it is redelivered.
+    const occurrence = String(summary.dedupeKey || '').startsWith('subagent-line:')
+        ? { occurrenceKey: summary.dedupeKey } : {};
     const source = { sourceHistoryId: identity, sourceHistoryRevision: summary.cardRowRevision,
         historyPosition: row.history_position };
     let item = record.items.find((entry) => entry.dedupeKey === key);
@@ -65,6 +69,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         item.historyId = identity;
         item.historyPosition = row.history_position;
         item.dedupeKey = key;
+        Object.assign(item, occurrence);
         item.count = 1;
         if (summary.evidenceRef && !item.evidenceRef) item.evidenceRef = summary.evidenceRef;
     } else {
@@ -75,7 +80,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
             evidenceRef: summary.evidenceRef || null,
-            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity,
+            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity, ...occurrence,
             ...(evolving ? source : { historyId: identity, historyPosition: row.history_position }),
             lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
                 : `history-${identity.replace(/[^A-Za-z0-9_-]/g, '-')}`,

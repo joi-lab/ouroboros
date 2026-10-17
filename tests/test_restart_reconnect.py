@@ -58,7 +58,7 @@ def test_chat_resyncs_history_after_reconnect():
     assert not any(quota in history for quota in ("n_human", "n_progress", "limit"))
     assert "limit=1000" not in source
     assert "cache: 'no-store'" in history
-    assert "syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })" in source
+    assert "isReconnect ? syncHistory({ fromReconnect: true })" in source
     assert "const expectedDisconnect = socketState !== WebSocket.OPEN" in source
     assert "if (expectedDisconnect && err instanceof TypeError)" in source
 
@@ -69,7 +69,7 @@ def test_final_answer_marker_uses_ordinary_message_presentation():
 
     assert "renderAssistantWithAnswerChip" not in source
     assert "final-answer-chip" not in css
-    assert ": renderChatMarkdown(text);" in source
+    assert ": renderChatMarkdown(painted);" in source
     # Both live and history assistant/system paths feed the same addMessage renderer;
     # reconnect notices do too, so marker-shaped text never gets a separate capsule.
     assert "addMessage(msg.content, msg.role" in source
@@ -342,7 +342,8 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
     assert "ensureLiveCardVisible(record, { reorderExisting: true });" in source, \
         "A mounted task card must be re-sorted if a later event lowers its anchor"
     assert "record._anchorOrderDirty = true;" in source
-    assert "reorderDirtyCardIfNeeded(rec);" in source, \
+    assert "if (rec?._anchorOrderDirty && !rec.isSubagent && rec.root?.isConnected) {" in source
+    assert "mountReplayedCard(record);" in source, \
         "Pass 2 must re-sort connected cards dirtied by routine history sync"
     assert "const parent = liveCardRecords.get(record.parentGroupId);" in source
     assert "seen.has(record.groupId)" in source, \
@@ -436,10 +437,9 @@ def test_owner_restart_cleanup_disables_second_custody_reconcile(monkeypatch):
     owner, restart = threading.Event(), threading.Event()
     monkeypatch.setattr(server, "_owner_restart_requested", owner)
     monkeypatch.setattr(server, "_restart_requested", restart)
-    monkeypatch.setattr(server._historical_audit, "stop", lambda: None)
     monkeypatch.setattr(server, "_managed_update_pending_kwargs", lambda: {})
     monkeypatch.setattr(server, "_stop_owned_daemon_for_new_pin", lambda: None)
-    monkeypatch.setattr(server, "_stop_owned_local_processes", lambda *a, **k: None)
+    monkeypatch.setattr(server, "stop_owned_work", lambda *a, **k: None)
     monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda: None)
     calls = []
@@ -449,8 +449,8 @@ def test_owner_restart_cleanup_disables_second_custody_reconcile(monkeypatch):
         for restarting in (False, True):
             restart.set() if restarting else restart.clear()
             calls.clear()
-            server._emergency_process_cleanup(port_sweep=False)
-            expected = {"force": True, "archive_service_logs": False}
+            server._emergency_process_cleanup()
+            expected = {"force": True, "archive_service_logs": False, "retain_saved_work": True}  # #1563
             if owner_requested:
                 expected["reconcile_delegate_custody"] = False
             if restarting:
@@ -552,21 +552,25 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
 
 def test_ws_sha_reload_decision_is_single_sourced():
     """Both the post-open refresh and the recovery probe must route through the
-    one exported SHA decision helper (keep / reload_changed / reload_unknown).
+    one exported page decision (keep / reload_changed / reload_unknown /
+    reload_source), which applies the SHA decision exactly where the core owns
+    the page or predates the interface choice.
 
     The behavioral contract — same/changed/missing/empty/malformed SHA, the
-    first-ever connection, the probe-vs-open race bail, the healthy-probe fuse,
-    and outbound-queue survival — is executable in
-    web/tests/ws_recovery.test.js (node --test). These are wiring pins only.
+    first-ever connection, page ownership under old and new cores, the
+    probe-vs-open race bail, the healthy-probe fuse, signed-out handoff and
+    outbound-queue survival — is executable in web/tests/ws_recovery.test.js
+    (node --test). These are wiring pins only.
     """
     source = _read("web/modules/ws.js")
     assert "export function decide(" in source
+    assert "export function decideServedPage(" in source
     assert "RECOVERY_HEALTHY_PROBE_LIMIT = 4" in source
     recovery_body = source.split("_scheduleUiRecovery(reason, delay = 15000) {", 1)[1].split(
         "_startWatchdog(socket) {", 1
     )[0]
-    assert "_applyShaDecision(servedSha, this._wasConnected, false)" in recovery_body, (
-        "the recovery probe must consult the shared SHA decision WITHOUT "
+    assert "_applyServedDecision(served, this._wasConnected, false)" in recovery_body, (
+        "the recovery probe must consult the shared decision WITHOUT "
         "remembering the served SHA (a pre-connect probe adopting a restarted "
         "server's SHA would leave stale assets unhealed)"
     )
@@ -577,15 +581,19 @@ def test_ws_sha_reload_decision_is_single_sourced():
     refresh_body = source.split("\n    _refreshStateAfterOpen(", 1)[1].split(
         "_flushPendingMessages() {", 1
     )[0]
-    assert "_applyShaDecision(servedSha, previouslyConnected, true)" in refresh_body, (
-        "the post-open refresh must consult the shared SHA decision and is the "
+    assert "_applyServedDecision(served, previouslyConnected, true)" in refresh_body, (
+        "the post-open refresh must consult the shared decision and is the "
         "ONLY path that remembers the served SHA"
     )
     apply_body = source.split(
-        "_applyShaDecision(servedSha, previouslyConnected, storeServedSha) {", 1
-    )[1].split("_reloadForShaDecision(decision) {", 1)[0]
-    assert "decide(this._lastSha, servedSha, previouslyConnected)" in apply_body, (
-        "the shared applier must delegate to the exported SSOT decide()"
+        "_applyServedDecision(state, previouslyConnected, storeServedSha) {", 1
+    )[1].split("_reloadForDecision(decision) {", 1)[0]
+    assert "decideServedPage(this._lastSha, state, previouslyConnected, pageOwnedByCore())" in apply_body, (
+        "the shared applier must delegate to the exported decision"
+    )
+    page_body = source.split("export function decideServedPage(", 1)[1].split("\n}\n", 1)[0]
+    assert page_body.count("decide(prevSha,") == 2, (
+        "an old core and the core's own built-in page both keep the exact SSOT decide()"
     )
 
 
@@ -659,3 +667,55 @@ def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path,
     finally:
         server._owner_restart_requested.clear()
         server._restart_requested.clear()
+
+
+def _owner_restart_world(tmp_path, monkeypatch, stop):
+    from types import SimpleNamespace
+
+    import ouroboros.server_restart as server_restart
+    from supervisor import queue
+
+    exits, notices = [], []
+    monkeypatch.setattr(queue, "RETURNS_NAMED", {})
+    monkeypatch.setattr(server_restart, "_LAST_RETURNING", set())
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "_safe_restart_serialized", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(server_restart, "_stop_owned_work", stop)
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner=False: exits.append(owner))
+    run = lambda: server_restart._perform_owner_restart(SimpleNamespace(safe_restart=None),
+                                                        lambda text, _suffix: notices.append(text))
+    return SimpleNamespace(run=run, exits=exits, notices=notices, queue=queue,
+                           flag=tmp_path / "state" / "owner_restart_no_resume.flag")
+
+
+def test_a_raised_owner_stop_still_restarts_so_its_durable_flags_stay_true(tmp_path, monkeypatch):
+    """W05-2 (PROV_W05_POOL): a stop that raised left this generation running with automatic
+    admission closed. Reopening it instead would keep the generation running under the durable
+    no-resume flags just written, which review operations and budget pauses read as a stop and
+    follow-ups as a restart in progress. The stop may not veto: the restart follows."""
+    from supervisor import queue
+
+    def broken(_ctx):
+        queue.name_queue_returns([], "owner_restart")  # what the real stop names first
+        raise OSError("owned-work stop raised")
+
+    world = _owner_restart_world(tmp_path, monkeypatch, broken)
+    assert world.run() == (True, "")
+    assert world.exits == [True], "the owner's restart follows"
+    assert world.flag.read_text(encoding="utf-8") == "owner_restart", "the flag describes the restart that happens"
+    assert world.notices == ["New settings apply to the next message."], "no stopped task is claimed"
+
+
+def test_an_interrupted_owner_stop_reopens_admission_without_an_exit(tmp_path, monkeypatch):
+    """A BaseException (an interrupt) propagates; if this generation survives it, it keeps admitting."""
+    import pytest
+    from supervisor import queue
+
+    def interrupted(_ctx):
+        queue.name_queue_returns([], "owner_restart")
+        raise KeyboardInterrupt
+
+    world = _owner_restart_world(tmp_path, monkeypatch, interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        world.run()
+    assert world.queue.RETURNS_NAMED == {} and world.exits == []

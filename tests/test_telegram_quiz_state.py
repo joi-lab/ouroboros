@@ -184,6 +184,76 @@ def test_answered_card_is_never_rolled_back(card, later):
     assert edit[2].endswith("\nAnswered: 2. postgres")
 
 
+def test_closed_question_states_its_closure_and_reason_without_controls_or_an_answer(card):
+    card.send(wait_for_answer=True)
+    closure = {"closed_reason": "The migration was cancelled.", "closed_actor": "model",
+               "question_delivery": {"kind": "closure", "state": "owed"}}
+    # A closure is never an answer: stray answer fields on the fact are not shown.
+    (edit,) = card.apply("closed", answered_index=0, comment="yes", **closure)
+    assert edit == (42, 555, "Question: Which db?\n1. sqlite\n2. postgres"
+                             "\nQuestion closed.\nThe migration was cancelled.", [])
+    assert card.record()["state"] == "closed"
+    # Later or out-of-order facts never reopen, expire, replace or answer it.
+    for later in ({"state": "open", "wait_for_answer": False}, {"state": "expired_terminal"},
+                  {"state": "superseded"}, {"state": "answered", "answered_index": 1}):
+        fields = dict(later)
+        assert card.apply(fields.pop("state"), **fields) == []
+    assert card.record()["state"] == "closed"
+    # The discharged closure is re-published: the same edit, idempotent.
+    closure["question_delivery"] = {"kind": "closure", "state": "delivered"}
+    assert card.apply("closed", **closure) == [edit]
+    assert card.api.logs == []
+
+
+def test_an_answered_card_is_never_closed(card):
+    card.send()
+    card.apply("answered", answered_index=1)
+    assert card.apply("closed", closed_reason="Not needed any more.") == []
+    assert card.record()["state"] == "answered"
+
+
+@pytest.mark.parametrize("path", ["callback", "reply"])
+def test_a_telegram_answer_refused_as_closed_says_so_and_settles_the_card(card, path):
+    card.send()
+    client = Client("token")
+
+    async def post(_api, _path, body):
+        return 409, {"ok": False, "error": "quiz_closed", "state": "closed", "decision_id": body["decision_id"],
+                     "closed_reason": "Answered in the Project instead.", "closed_actor": "owner"}
+
+    if path == "callback":
+        asyncio.run(card.plugin.telegram_quiz.answer_from_callback(
+            card.api, client, f"qz:{card.token}:0", cb_id="cb", update_id=8, lang="en", post=post))
+        assert client.toasts == [("cb", "Question closed.")]
+    else:
+        asyncio.run(card.plugin.telegram_quiz.answer_from_reply(
+            card.api, client, card.record(), "sqlite", chat_id=42, update_id=8, lang="en", post=post))
+        assert client.sent == [(42, "Question closed.")]
+    assert client.edits == [(42, 555, "Question: Which db?\n1. sqlite\n2. postgres"
+                             "\nContinuing meanwhile: sqlite meanwhile"
+                             "\nQuestion closed.\nAnswered in the Project instead.", [])]
+    assert card.record()["state"] == "closed"
+
+
+@pytest.mark.parametrize("state,fields,tail,buttons", [
+    ("closed", {"closed_reason": "Superseded by the new plan."}, "\nQuestion closed.\nSuperseded by the new plan.", False),
+    ("answered", {"answered_index": 0}, "\nAnswered: 1. sqlite", False),
+    ("expired_terminal", {}, "\nThe task finished; a late answer is accepted as your message."
+                             "\nTap an option, or reply to this message with your own answer.", True),
+])
+def test_a_queued_ask_published_after_its_question_settled_shows_that_state(card, state, fields, tail, buttons):
+    """A queued ask can reach Telegram after the question was answered or closed: the
+    publication carries the canonical state, so the new card settles on it at once."""
+    card.send(state=state, **fields)
+    (edit,) = _all_edits()
+    assert edit[2] == "Question: Which db?\n1. sqlite\n2. postgres\nContinuing meanwhile: sqlite meanwhile" + tail
+    assert bool(edit[3]) is buttons
+    assert card.record()["state"] == state
+    Client.instances.clear()
+    card.send(quiz_id="q2")  # an open publication is sent as it is, with no edit
+    assert _all_edits() == []
+
+
 def test_an_answer_given_in_telegram_also_blocks_a_later_rollback(card):
     card.send(wait_for_answer=True)
     client = Client("token")
@@ -258,6 +328,10 @@ def test_the_manifest_declares_every_topic_register_subscribes(tmp_path):
     ("expired_terminal", {"state": "open", "wait_for_answer": False}, None),
     ("answered", {"state": "superseded"}, None),
     (None, {"state": "unknown"}, None),
+    (None, {"state": "closed", "answered_index": 0, "comment": "yes"}, ("Q\nQuestion closed.", [])),
+    ("expired_terminal", {"state": "closed", "closed_reason": "x" * 300}, ("Q\nQuestion closed.\n" + "x" * 200 + "…", [])),
+    ("closed", {"state": "answered", "answered_index": 0}, None),
+    ("answered", {"state": "closed", "closed_reason": "late"}, None),
 ])
 def test_lifecycle_edit_is_a_pure_forward_only_decision(record_state, event, expected):
     """The decision needs no Telegram client: text and keyboard from the card and the fact."""

@@ -20,8 +20,22 @@ from ouroboros.route_spec import (
 
 SUBAGENTS_SETTING = "OUROBOROS_SUBAGENTS"
 SUBAGENTS_RECEIPT_KEY = "OUROBOROS_SUBAGENT_PRESET_RECEIPT"
-MAX_CONFIGURED_SUBAGENTS = 10
-SESSION_ACCESS_PROFILES = ("workspace_write", "full")
+# The one ceiling of the catalog AND of a review wave (the review pool IS the
+# marked part of this catalog, so the former per-lane caps fold into it).
+MAX_CONFIGURED_SUBAGENTS = 26
+# Delivery of an ``api_model`` row when it reviews: ``native`` reads the subject
+# with its own tool rounds, ``packet`` receives the assembled pack. A session row
+# always retrieves, so the field is meaningless (and refused) there.
+REVIEW_DELIVERY_NATIVE = "native"
+REVIEW_DELIVERY_PACKET = "packet"
+REVIEW_DELIVERIES = (REVIEW_DELIVERY_NATIVE, REVIEW_DELIVERY_PACKET)
+# Provenance of a row the runtime minted rather than the owner authored: from
+# a former review lane (the one-time migration) or from the factory panel.
+MINTED_FROM_REVIEW_LANE = "review_lane"
+MINTED_FROM_FACTORY_DEFAULT = "factory_default"
+MINTED_FROM_VALUES = (MINTED_FROM_REVIEW_LANE, MINTED_FROM_FACTORY_DEFAULT)
+SESSION_ACCESS_PROFILES = ("workspace_write", "full")  # profiles with technical write access
+SESSION_ACCESS_CHOICES = ("readonly", *SESSION_ACCESS_PROFILES)
 SESSION_ACCESS_LOWERING = ("readonly", "workspace_write")
 # Removal marker, not a runtime gate: the singleton/Heavy reader is intentionally
 # one compatibility window rather than a permanent second configuration system.
@@ -35,7 +49,12 @@ SOURCE_INVALID = "invalid"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _TOP_KEYS = frozenset({"enabled", "items"})
-_ROW_KEYS = frozenset({"subagent_id", "name", "recommended_use", "route", "effort", "processing_preference", "access", "enabled"})
+_ROW_KEYS = frozenset({
+    "subagent_id", "name", "recommended_use", "route", "effort", "processing_preference", "access", "enabled",
+    "review_eligible", "delivery", "minted_from",
+    # `coupling_focus` (a row's standing coupling brief) is NOT a key yet: step R
+    # decides whether it exists; the parser must refuse it until then.
+})
 _ROUTE_ALIASES = {
     ROUTE_KIND_API_MODEL: ROUTE_KIND_API_MODEL,
     ROUTE_KIND_AGENT_SESSION: ROUTE_KIND_AGENT_SESSION,
@@ -82,6 +101,16 @@ class ConfiguredSubagent:
     # stays editable, but no NEW use (delegation or reviewer reference) may
     # select it. Absent in older saved bytes, which means enabled.
     enabled: bool = True
+    # The owner's review mark: an enabled, marked row is a seat of the review
+    # pool (every review surface reads the pool; nothing else configures a
+    # reviewer). Absent in older saved bytes, which means unmarked.
+    review_eligible: bool = False
+    # ``native``/``packet`` on an api_model row (see REVIEW_DELIVERIES); "" on a
+    # session row, which always retrieves. Absent in saved bytes means native.
+    delivery: str = ""
+    # ``review_lane``/``factory_default`` when the runtime minted the row; "" for
+    # an owner-authored row. Round-trips as saved.
+    minted_from: str = ""
 
 
 @dataclass(frozen=True)
@@ -153,7 +182,12 @@ def _parse_payload(raw: Any) -> Mapping[str, Any]:
 
 
 def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
-    """Strict parser for stored JSON strings and owner-supplied JSON objects."""
+    """Strict parser for stored JSON strings and owner-supplied JSON objects.
+
+    The list-level and per-row ``enabled`` must be booleans (a row omitting it is
+    enabled). A session row's ``access`` defaults to ``full``; an API row has none
+    and refuses the key.
+    """
     from ouroboros.model_slots import normalize_processing_preference
 
     payload = _parse_payload(raw)
@@ -206,14 +240,17 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
         )
         _validate_session_target(route, where)
         access = row.get("access", "full") if route.is_session else ""
-        if route.is_session and (not isinstance(access, str) or access not in SESSION_ACCESS_PROFILES):
-            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.access must be workspace_write or full")
+        if route.is_session and (not isinstance(access, str) or access not in SESSION_ACCESS_CHOICES):
+            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.access must be readonly, workspace_write or full")
         if "access" in row and not route.is_session:
             raise ValueError(f"{SUBAGENTS_SETTING}: {where}.access is meaningful only for agent_session")
         effort = _effort(row.get("effort"), where)
         validate_compound_session_effort(
             route, effort, setting=SUBAGENTS_SETTING, where=where,
         )
+        review_eligible = row.get("review_eligible", False)
+        if not isinstance(review_eligible, bool):
+            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.review_eligible must be a boolean")
         items.append(
             ConfiguredSubagent(
                 subagent_id=row_id,
@@ -223,9 +260,34 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
                 processing_preference=normalize_processing_preference(row.get("processing_preference")),
                 access=access,
                 enabled=row_enabled,
+                review_eligible=review_eligible,
+                delivery=_delivery(row, route, where),
+                minted_from=_minted_from(row.get("minted_from", ""), where),
             )
         )
     return ConfiguredSubagents(enabled=payload["enabled"], items=tuple(items))
+
+
+def _delivery(row: Mapping[str, Any], route: RouteSpec, where: str) -> str:
+    """``native``/``packet`` for an api row (absent = native); refused on a session row."""
+    if route.is_session:
+        if "delivery" in row:
+            raise ValueError(
+                f"{SUBAGENTS_SETTING}: {where}.delivery is meaningful only for api_model (a session row always retrieves)"
+            )
+        return ""
+    raw = row.get("delivery", REVIEW_DELIVERY_NATIVE)
+    if not isinstance(raw, str) or raw.strip().lower() not in REVIEW_DELIVERIES:
+        raise ValueError(f"{SUBAGENTS_SETTING}: {where}.delivery must be native or packet")
+    return raw.strip().lower()
+
+
+def _minted_from(raw: Any, where: str) -> str:
+    if raw is None or raw == "":
+        return ""
+    if not isinstance(raw, str) or raw.strip() not in MINTED_FROM_VALUES:
+        raise ValueError(f"{SUBAGENTS_SETTING}: {where}.minted_from must be review_lane or factory_default")
+    return raw.strip()
 
 
 def configured_subagents_dict(config: ConfiguredSubagents) -> dict[str, Any]:
@@ -253,6 +315,15 @@ def configured_subagents_dict(config: ConfiguredSubagents) -> dict[str, Any]:
         # fingerprint is the honest consequence of a changed configuration.
         if not row.enabled:
             payload["enabled"] = False
+        # The review fields follow the same rule: defaults (unmarked, native,
+        # owner-authored) are not written, so a document saved before they
+        # existed serializes to the same bytes.
+        if row.review_eligible:
+            payload["review_eligible"] = True
+        if row.delivery == REVIEW_DELIVERY_PACKET:
+            payload["delivery"] = REVIEW_DELIVERY_PACKET
+        if row.minted_from:
+            payload["minted_from"] = row.minted_from
         items.append(payload)
     return {"enabled": config.enabled, "items": items}
 
@@ -269,6 +340,14 @@ def serialize_configured_subagents(config: ConfiguredSubagents) -> str:
 def normalize_configured_subagents(raw: Any) -> tuple[ConfiguredSubagents, str]:
     config = parse_configured_subagents(raw)
     return config, serialize_configured_subagents(config)
+
+
+def canonical_subagents(raw: Any) -> str:
+    """A catalog's canonical text, posted object and stored text alike; ``""`` when nothing valid is there."""
+    try:
+        return normalize_configured_subagents(raw)[1]
+    except ValueError:
+        return ""
 
 
 def configured_subagents_fingerprint(config: ConfiguredSubagents) -> str:
@@ -369,17 +448,30 @@ def validate_unique_engines(config: ConfiguredSubagents, settings: Mapping[str, 
 
     The handle IS the engine with baselines folded, so an unset row and an
     explicit row with the same effective value are one engine, and no two saved
-    rows can carry the same name.
+    rows the OWNER authored can carry the same name. Two deliberate exceptions,
+    both about the review pool (THESIS: a reviewer's two seats are the owner's
+    honest choice): the twins are BOTH marked review-eligible (the same engine
+    judging twice, e.g. once by packet and once natively), or at least one of
+    them is a row the runtime minted (``minted_from``) — the migration kept
+    what a lane ran beside the owner's own row of that engine, or beside its
+    own reviewer row (a former direct advisory or deep-review seat that
+    coincided with a direct triad seat: one marked reviewer, one unmarked
+    helper, both minted). Such a pair must survive an ordinary description edit
+    without deleting a row or changing an engine; twins share a handle as
+    ``<handle>~<id>``.
     """
-    seen: dict[tuple[str, str], int] = {}
+    seen: dict[tuple[str, str], tuple[int, ConfiguredSubagent]] = {}
     for index, row in enumerate(config.items):
         key = (row.route.kind, subagent_handle(row, settings))
         if key in seen:
+            first_index, first = seen[key]
+            if (row.review_eligible and first.review_eligible) or row.minted_from or first.minted_from:
+                continue
             raise ValueError(
-                f"{SUBAGENTS_SETTING}: items[{index}] runs the same engine as items[{seen[key]}] "
+                f"{SUBAGENTS_SETTING}: items[{index}] runs the same engine as items[{first_index}] "
                 f"({key[1]}); change its model, effort, access, account or processing, or remove it"
             )
-        seen[key] = index
+        seen[key] = (index, row)
 
 
 def roster_save_error(raw: Any, stored_settings: Mapping[str, Any], body: Mapping[str, Any]) -> str:
@@ -394,12 +486,8 @@ def roster_save_error(raw: Any, stored_settings: Mapping[str, Any], body: Mappin
         return ""
     try:
         config = parse_configured_subagents(raw)
-        try:
-            stored = serialize_configured_subagents(
-                parse_configured_subagents(stored_settings.get(SUBAGENTS_SETTING)))
-        except ValueError:
-            stored = ""  # nothing valid is stored: this save authors the roster
-        if serialize_configured_subagents(config) != stored:
+        # Nothing valid stored ("") means this save authors the roster.
+        if serialize_configured_subagents(config) != canonical_subagents(stored_settings.get(SUBAGENTS_SETTING)):
             validate_unique_engines(config, {**stored_settings, **body})
     except ValueError as exc:
         return str(exc)
@@ -554,7 +642,8 @@ def resolve_configured_subagents(
     _append_legacy_model_rows(items, settings, include_ids={"legacy-heavy"})
     if default_candidate is not None:
         _append_candidate_rows(items, default_candidate.items)
-    _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
+    if items:  # the Light stand-in joins another actor, never in place of a Main without access
+        _append_legacy_model_rows(items, settings, include_ids={"fast-scout"})
     if items:
         return ConfiguredSubagentsResolution(
             make_configured_subagents(
@@ -574,7 +663,7 @@ def resolve_settings_subagent_candidate(
 
     This is presentation-time candidate construction, not runtime enablement:
     ``SOURCE_UNDECIDED`` remains unsaved and invisible to new-ID dispatch until
-    an explicit Settings save or onboarding completion materializes it.
+    an Agents edit saved in Settings or onboarding completion materializes it.
     """
     default_candidate = None
     diagnostics: list[dict[str, Any]] = []
@@ -624,20 +713,22 @@ def _append_legacy_model_rows(
 ) -> None:
     from ouroboros.provider_models import model_has_credentials_in_settings
 
-    seen = {(row.route.kind, row.route.target_id, row.route.credential_profile_id) for row in items}
+    # A legacy row is an unpinned stand-in for its model: a row already running that model,
+    # in whatever binding (a compiled role row carries its role's pin), covers it.
+    seen = {(row.route.kind, row.route.target_id) for row in items}
     heavy = _legacy_model_target(settings, "HEAVY", "OUROBOROS_MODEL_HEAVY")
     light_key = "OUROBOROS_MODEL_LIGHT"
     light_slot = "LIGHT"
     if not str(settings.get(light_key) or "").strip():
         light_key, light_slot = "OUROBOROS_MODEL", "MAIN"
     light = _legacy_model_target(settings, light_slot, light_key)
-    for row_id, recommendation, model, effort in (
+    for row_id, recommendation, model, effort in (  # Auto rows: the owner's effort range decides
         ("legacy-heavy", PRIMARY_RECOMMENDATION, heavy, ""),
-        ("fast-scout", SCOUT_RECOMMENDATION, light, "low"),
+        ("fast-scout", SCOUT_RECOMMENDATION, light, ""),
     ):
         if include_ids is not None and row_id not in include_ids:
             continue
-        identity = (ROUTE_KIND_API_MODEL, model, "")
+        identity = (ROUTE_KIND_API_MODEL, model)
         if (
             not model
             or identity in seen
@@ -665,16 +756,13 @@ def _append_candidate_rows(
     items: list[ConfiguredSubagent],
     candidates: Sequence[ConfiguredSubagent],
 ) -> None:
-    """Merge compiler defaults after preserved legacy intent, by route identity."""
-    seen = {(row.route.kind, row.route.target_id, row.route.credential_profile_id) for row in items}
+    """Merge compiler defaults after preserved legacy intent, each as compiled (its whole
+    binding; the compiler already made them distinct). A model a preserved legacy row runs
+    stays that row's, as for ``_append_legacy_model_rows``."""
+    legacy = {(row.route.kind, row.route.target_id) for row in items}
     used_ids = {row.subagent_id for row in items}
     for candidate in candidates:
-        identity = (
-            candidate.route.kind,
-            candidate.route.target_id,
-            candidate.route.credential_profile_id,
-        )
-        if identity in seen:
+        if (candidate.route.kind, candidate.route.target_id) in legacy:
             continue
         row_id = candidate.subagent_id
         suffix = 2
@@ -687,11 +775,11 @@ def _append_candidate_rows(
                 recommended_use=candidate.recommended_use,
                 route=candidate.route,
                 effort=candidate.effort,
+                processing_preference=candidate.processing_preference,
                 access=candidate.access,
                 enabled=candidate.enabled,
             )
         )
-        seen.add(identity)
         used_ids.add(row_id)
 
 
@@ -723,9 +811,15 @@ __all__ = [
     "INDEPENDENT_RECOMMENDATION",
     "LEGACY_SUBAGENT_COMPATIBILITY",
     "MAX_CONFIGURED_SUBAGENTS",
+    "MINTED_FROM_FACTORY_DEFAULT",
+    "MINTED_FROM_REVIEW_LANE",
+    "MINTED_FROM_VALUES",
     "PRIMARY_RECOMMENDATION",
+    "REVIEW_DELIVERIES",
+    "REVIEW_DELIVERY_NATIVE",
+    "REVIEW_DELIVERY_PACKET",
     "SCOUT_RECOMMENDATION",
-    "SESSION_ACCESS_PROFILES",
+    "SESSION_ACCESS_PROFILES", "SESSION_ACCESS_CHOICES",
     "SESSION_ACCESS_LOWERING",
     "SOURCE_CONFIGURED",
     "SOURCE_INVALID",
@@ -734,6 +828,7 @@ __all__ = [
     "SOURCE_UNDECIDED",
     "SUBAGENTS_RECEIPT_KEY",
     "SUBAGENTS_SETTING",
+    "canonical_subagents",
     "configured_subagents_dict",
     "configured_subagents_fingerprint",
     "engine_handle",

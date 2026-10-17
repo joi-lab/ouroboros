@@ -11,6 +11,7 @@ reader are both here.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import datetime
 import json
 import logging
@@ -19,7 +20,7 @@ import pathlib
 import threading
 import time
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
 from ouroboros.dialogue_provenance import presence_metadata_binding
@@ -64,6 +65,7 @@ _SKILL_SCHEDULE_SYNC_INTERVAL_SEC: float = 60.0
 # path. Thread-local, so it needs no mutex of its own; the cross-thread ordering
 # is the queue lock the transaction takes first.
 _SCHEDULE_TX_STATE = threading.local()
+_AUTOMATIC = contextvars.ContextVar("schedule_automatic_acquisitions", default=False)
 _SCHEDULE_LOCK_SUFFIX = ".lock"
 _SCHEDULE_LOCK_TIMEOUT_SEC = 8.0
 _SCHEDULE_LOCK_STALE_SEC = 30.0
@@ -115,8 +117,13 @@ class ScheduleLockTimeout(ScheduleStoreUnreadable, TimeoutError):
 
     Typed on both axes: a ``TimeoutError`` for the callers that already treat a
     missed lock as one, a ``ScheduleStoreUnreadable`` for the owner surfaces
-    whose contract is "the state is unknown, the write was refused".
+    whose contract is "the state is unknown, the write was refused". ``reason``
+    keeps the acquisition outcome: only ``contention`` is a temporary gap.
     """
+
+    def __init__(self, message: str, *, reason: str = "unknown") -> None:
+        super().__init__(message)
+        self.reason = str(reason)
 
 
 class ScheduleRefused(RuntimeError):
@@ -138,6 +145,24 @@ def _schedule_lock_key(lock_path: pathlib.Path) -> str:
 
 
 @contextlib.contextmanager
+def automatic_acquisitions():
+    """An automatic caller's Q-held schedule work: the off-loop scan/admission and the
+    worker launch's final start. Under it every ``schedule_transaction`` tries the table
+    once and runs its body under ``store.acquisition_budget(0)``, and ``control_guard``
+    tries the origin's cancellation and launch locks once: confirmed contention defers
+    that caller instead of every queue reader. Work between transactions keeps waits."""
+    token = _AUTOMATIC.set(True)
+    try:
+        yield
+    finally:
+        _AUTOMATIC.reset(token)
+
+
+def automatic() -> bool:
+    return _AUTOMATIC.get()
+
+
+@contextlib.contextmanager
 def schedule_transaction(drive_root: pathlib.Path | None = None):
     """Serialize a whole schedule read/modify/write across threads and processes.
 
@@ -154,6 +179,8 @@ def schedule_transaction(drive_root: pathlib.Path | None = None):
     different drive root still takes its own — a depth-only guard would let the
     second root's write run unserialized behind the first root's lock.
     """
+    from ouroboros.store import acquisition_budget
+
     root = pathlib.Path(drive_root or _queue().DRIVE_ROOT)
     lock_path = _scheduled_tasks_path(root).with_name(
         _scheduled_tasks_path(root).name + _SCHEDULE_LOCK_SUFFIX)
@@ -171,14 +198,18 @@ def schedule_transaction(drive_root: pathlib.Path | None = None):
         return
     with _queue()._queue_lock:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
+        outcome: Dict[str, Any] = {}
+        timeout = 0.0 if automatic() else _SCHEDULE_LOCK_TIMEOUT_SEC
         fd = acquire_exclusive_file_lock(
-            lock_path, timeout_sec=_SCHEDULE_LOCK_TIMEOUT_SEC, stale_sec=_SCHEDULE_LOCK_STALE_SEC,
-            owner_aware_stale=True)
+            lock_path, timeout_sec=timeout, stale_sec=_SCHEDULE_LOCK_STALE_SEC,
+            owner_aware_stale=True, outcome=outcome)
         if fd is None:
-            raise ScheduleLockTimeout(f"Could not acquire schedule lock {lock_path} within {_SCHEDULE_LOCK_TIMEOUT_SEC:g}s")
+            raise ScheduleLockTimeout(f"Could not acquire schedule lock {lock_path} within {timeout:g}s",
+                                      reason=outcome.get("reason", "unknown"))
         held[key] = 1
         try:
-            yield
+            with acquisition_budget(0) if automatic() else contextlib.nullcontext():
+                yield
         finally:
             held.pop(key, None)
             release_exclusive_file_lock(lock_path, fd)
@@ -513,8 +544,25 @@ def _audit_schedule_mutation(*, drive_root: pathlib.Path, operation_id: str, pha
         return False
 
 
+def _skill_schedule_ready(skill: Any, drive_root: pathlib.Path | None) -> bool:
+    """Schedule readiness plus the supervised_task permission (read before the table locks)."""
+    try:
+        from ouroboros.skill_readiness import skill_readiness_for_execution
+        ready = skill_readiness_for_execution(pathlib.Path(drive_root or _queue().DRIVE_ROOT), skill).ready
+    except Exception:
+        log.debug("skill schedule readiness probe failed for %s", getattr(skill, "name", ""), exc_info=True)
+        ready = False
+    return ready and "supervised_task" in set(getattr(getattr(skill, "manifest", None), "permissions", []) or [])
+
+
 def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
-    """Sync reviewed skill manifest scheduled_tasks into the core schedule table."""
+    """Sync reviewed skill manifest scheduled_tasks into the core schedule table.
+
+    Readiness reads skill state and discovers its peers, so it is computed per
+    skill before Q and the table lock are taken; only the row merge holds them."""
+    readiness = {id(skill): _skill_schedule_ready(skill, drive_root) for skill in skills
+                 if not bool(getattr(skill, "identity_collision", False))
+                 and getattr(getattr(skill, "manifest", None), "scheduled_tasks", None)}
     with schedule_transaction(drive_root):
         data = load_schedule_store(drive_root)
         by_id = {str(item.get("id") or ""): dict(item) for item in data.get("tasks") or []}
@@ -538,16 +586,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                     continue
                 schedule_id = schedule_slug("skill", str(getattr(skill, "name", "")), name)
                 touched.append(schedule_id)
-                # Schedule readiness plus the supervised_task permission.
-                try:
-                    from ouroboros.skill_readiness import skill_readiness_for_execution
-                    schedule_ready = skill_readiness_for_execution(pathlib.Path(drive_root or _queue().DRIVE_ROOT), skill).ready
-                except Exception:
-                    log.debug("skill schedule readiness probe failed for %s", getattr(skill, "name", ""), exc_info=True)
-                    schedule_ready = False
-                schedule_ready = schedule_ready and "supervised_task" in set(
-                    getattr(manifest, "permissions", []) or []
-                )
+                schedule_ready = readiness[id(skill)]
                 record = by_id.get(schedule_id, {})
                 from supervisor.schedule_occurrence import remember_claim_basis
 
@@ -656,8 +695,9 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
     if not in_worker_process():
         return (_rows_hold_schedule(_queue().PENDING, schedule_id, task_id)
                 or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id, task_id))
-    snapshot = read_json_dict(pathlib.Path(drive_root or _queue().DRIVE_ROOT)
-                              / "state" / "queue_snapshot.json")
+    from ouroboros.queue_observation import load_queue_document
+    from ouroboros.task_status import queue_snapshot_observation
+    snapshot = load_queue_document(drive_root or _queue().DRIVE_ROOT)
     if not isinstance(snapshot, dict):
         return None
     # ``read_json_dict`` intentionally returns ``{}``/None for malformed or
@@ -682,18 +722,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
             and not isinstance(task.get("metadata"), dict)
         ):
             return None
-    stamp = snapshot.get("ts")
-    try:
-        parsed = datetime.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-        # A slightly future stamp can come from clock skew between supervisor
-        # and worker; it is still a fresh write.  Only an old stamp is evidence
-        # that this snapshot can no longer prove the absence of a live run.
-        age = time.time() - parsed.timestamp()
-        if age > _QUEUE_SNAPSHOT_MAX_AGE_SEC:
-            return None
-    except (TypeError, ValueError, OverflowError):
+    observation = queue_snapshot_observation(snapshot)
+    if observation["age_sec"] is None or observation["age_sec"] > _QUEUE_SNAPSHOT_MAX_AGE_SEC:
         return None
     return (_rows_hold_schedule(snapshot.get("pending"), schedule_id, task_id)
             or _rows_hold_schedule(snapshot.get("running"), schedule_id, task_id))
@@ -735,6 +765,11 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
     for key in ("attachments", "context", "expected_output", "constraints", "deadline_at", "project_id"):
         if key in template:
             task[key] = template[key]
+    from ouroboros.settings_scales import EFFORT_SCALE
+
+    # The explicit start the upsert checked; a hand-edited unknown tier keeps the default.
+    if template.get("reasoning_effort") in EFFORT_SCALE:
+        task["reasoning_effort"] = template["reasoning_effort"]
     allowed_resources = normalize_allowed_resources(template.get("allowed_resources") or metadata.get("allowed_resources") or {})
     if allowed_resources:
         task["allowed_resources"] = allowed_resources
@@ -765,55 +800,85 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
     return task
 
 
-def check_scheduled_tasks() -> None:
+def _skill_collisions(root: pathlib.Path, now: datetime.datetime) -> frozenset[str] | None:
+    """The identity-collision inventory, read before the locks only when a skill row could be due."""
+    for row in list_scheduled_tasks(root).get("tasks") or []:
+        if not (isinstance(row, dict) and row.get("source") == "skill_manifest" and row.get("enabled", True)):
+            continue
+        due = _parse_schedule_time(row.get("next_run_at"), _timezone_for_schedule(row))
+        if due is None or due <= now:
+            return skill_identity_collision_names(root)
+    return None
+
+
+def check_scheduled_tasks(*, stop: Callable[[], bool] | None = None) -> None:
     """Admit due cron/once schedules through the occurrence protocol.
 
     Claims and reconciliation run under the queue+table locks; every expensive
-    step (resource intent, folder checks, memory fork, the allowance read) runs
-    without them; admission rechecks and commits under them again
+    step (skill discovery and readiness, the collision inventory, resource intent,
+    folder checks, memory fork, root billing, the allowance read) runs without
+    them; admission rechecks and commits under them again
     (``supervisor/schedule_occurrence.py``). A due ``kind: "notify"`` row is a
     note: consumed in this pass's one table write, shown after the locks are
-    released (``supervisor/schedule_notes.py``), never a task."""
+    released (``supervisor/schedule_notes.py``), never a task.
+
+    The supervisor runs it off the loop under ``automatic_acquisitions`` with its
+    generation's ``stop`` (``server_maintenance``): confirmed contention under Q
+    defers that row, or the pass, writing no hold, audit or claim, while
+    unreadable, corrupt or foreign records keep their typed holds."""
     global _last_skill_schedule_sync
     from supervisor import schedule_notes as notes, schedule_occurrence as occurrences
 
+    if stop is not None and stop():
+        return
+    root = _queue().DRIVE_ROOT
+    now_monotonic = time.monotonic()
+    if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
+        _last_skill_schedule_sync = now_monotonic
+        try:
+            resync_skill_schedules(root)
+        except Exception:
+            log.debug("Failed to sync skill schedules during scheduler tick", exc_info=True)
+    collision_names = _skill_collisions(root, datetime.datetime.now(datetime.timezone.utc))
     claims: List[Dict[str, Any]] = []
     due_notes: List[Dict[str, Any]] = []
-    with schedule_transaction(_queue().DRIVE_ROOT):
-        now_monotonic = time.monotonic()
-        if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
-            _last_skill_schedule_sync = now_monotonic
-            try:
-                resync_skill_schedules(_queue().DRIVE_ROOT)
-            except Exception:
-                log.debug("Failed to sync skill schedules during scheduler tick", exc_info=True)
+    with schedule_transaction(root):
+        if stop is not None and stop():
+            return
         try:
-            data = load_schedule_store(_queue().DRIVE_ROOT)
+            data = load_schedule_store(root)
         except ScheduleStoreUnreadable:
             # The pass writes the table back at its end; on unreadable bytes that
             # would replace every row with an empty document. Skip instead.
             log.error("Scheduled task store is unreadable; skipping this scheduler pass")
             return
         changed = False
-        collision_names = None
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         for record in list(data.get("tasks") or []):
             if not isinstance(record, dict):
                 continue
             from supervisor.followup_policy import control_guard, refresh_policy
             try:
-                with control_guard(_queue().DRIVE_ROOT, record):
+                with control_guard(root, record):
                     occurrences.repair_followup_binding(record)
-                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
-            except Exception:
-                log.exception("Follow-up policy persistence unavailable")
+                    view = refresh_policy(root, data, record)
+            except Exception as exc:
+                if not occurrences.contention(exc):  # contention: this row waits a pass
+                    log.exception("Follow-up policy persistence unavailable")
+                continue
+            if view.get("busy"):
                 continue
             if isinstance(record.get("occurrence"), dict):
                 # An occurrence in flight is decided from durable facts first — even on a
                 # disabled row: admission already happened, later changes are future-only.
                 if occurrences.holding(record, now_utc):
                     continue
-                verdict, stored = occurrences.reconcile(record)
+                try:
+                    verdict, stored = occurrences.reconcile(record)
+                except Exception as exc:
+                    if occurrences.contention(exc):
+                        continue
+                    raise
                 changed = changed or verdict != "live"
                 if verdict == "reconsider":
                     # Unstarted work follows the current authored timing/control.
@@ -842,7 +907,7 @@ def check_scheduled_tasks() -> None:
                 changed = True
             trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
             trigger_type = str(trigger.get("type") or "cron").strip().lower()
-            if _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT) is not False:
+            if _schedule_running_or_queued(schedule_id, root) is not False:
                 # Unknown reads as "still in flight": re-dispatching a schedule
                 # whose previous run may be alive is worse than waiting a pass.
                 continue
@@ -881,11 +946,9 @@ def check_scheduled_tasks() -> None:
                 if next_run > now:
                     continue
                 due_at = next_run.isoformat()
-            if str(record.get("source") or "") == "skill_manifest":
-                if collision_names is None:
-                    collision_names = skill_identity_collision_names(_queue().DRIVE_ROOT)
-                if str(record.get("skill") or "") in collision_names:
-                    continue
+            if str(record.get("source") or "") == "skill_manifest" and (
+                    collision_names is None or str(record.get("skill") or "") in collision_names):
+                continue  # an unread inventory (the row became due since) waits a pass
             if view.get("hold") or view["wait"] or record.get("followup_hold"):
                 continue
             if notes.is_note(record):
@@ -907,6 +970,12 @@ def check_scheduled_tasks() -> None:
             if _write_scheduled_tasks(data) is False:
                 return
             _queue().persist_queue_snapshot(reason="scheduled_tasks")
-    notes.deliver(due_notes, _queue().DRIVE_ROOT)
-    if claims:
-        occurrences.admit([occurrences.prepare(claimed) for claimed in claims])
+    notes.deliver(due_notes, root)
+    occurrences.retain_deferred(data.get("tasks") or [])
+    prepared = []
+    for claimed in claims:
+        if stop is not None and stop():
+            return  # the claims stay durable: a later generation prepares the same identities
+        prepared.append(occurrences.prepare(claimed))
+    if prepared:
+        occurrences.admit(prepared, stop=stop)

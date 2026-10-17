@@ -390,7 +390,7 @@ def test_registry_uses_typed_required_root_not_note_or_tool_name(tmp_path, monke
             "CORE_PROTECTION_BLOCKED",
             "⚠️ CORE_PROTECTION_BLOCKED: runtime_mode='advanced' refuses to run tool "
             "'write_file' against protected safety-critical path: BIBLE.md. Switch to "
-            "runtime_mode='pro' and let the normal triad + scope review cover the protected "
+            "runtime_mode='pro' and let the normal review panel cover the protected "
             "core/contract/release change before commit.",
             "protected_blocked",
         ),
@@ -506,8 +506,8 @@ def test_stable_host_predispatch_denials_are_native_and_keep_legacy_projection(
     (
         ("read_file", {"path": "x"}, "profile=acting cannot read active_workspace.", "blocked", "ACCESS_BLOCKED", "⚠️ TOOL_ACCESS_BLOCKED: profile=acting cannot read active_workspace.", "blocked", True, 0),
         ("query_code", {"op": "digest"}, "binding failed", "error", "TOOL_ARG_ERROR", "⚠️ TOOL_ARG_ERROR (query_code): RuntimeError: binding failed", "argument_error", True, 0),
-        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
-        ("edit_batch", {"edits": [{"path": "x", "old_str": "a", "new_str": "b", "count": 1}]}, "binding failed", "error", "TOOL_ERROR", "⚠️ TOOL_ERROR: RuntimeError: binding failed", "error", True, 0),
+        ("apply_patch", {"patch": "*** Begin Patch\n*** End Patch"}, "binding failed", "blocked", "EDIT_OPS_BLOCKED", "⚠️ APPLY_PATCH_ERROR: RuntimeError: binding failed", "edit_ops_blocked", True, 1),
+        ("edit_batch", {"edits": [{"path": "x", "old_str": "a", "new_str": "b", "count": 1}]}, "binding failed", "blocked", "EDIT_OPS_BLOCKED", "⚠️ EDIT_BATCH_ERROR: RuntimeError: binding failed", "edit_ops_blocked", True, 1),
         ("vcs_status", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
         ("vcs_diff", {}, "binding failed", "ok", "GIT_ERROR", "⚠️ GIT_ERROR: RuntimeError: binding failed", "git_error", False, 0),
         ("read_file", {"path": "x"}, "binding failed", "error", "LEGACY_TOOL_ERROR", "⚠️ READ_FILE_ERROR: RuntimeError: binding failed", "error", True, 1),
@@ -650,11 +650,11 @@ def test_light_binding_root_redirect_is_native_without_invented_metadata(
     # the refusal echoes the posix spelling; feed it in that spelling so the
     # expected repr matches on Windows too (POSIX: identical to str()).
     target = (home / "Desktop" / "report.html").as_posix()
-    args = {"path": target, "content": "<html></html>"}
+    args = {"root": "active_workspace", "path": target, "content": "<html></html>"}
     text = (
         "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-        f"({target!r}) was given but root defaulted to 'active_workspace'. "
-        "Pass root='user_files' to write under the owner's home, e.g. "
+        f"({target!r}) is outside root='active_workspace'. "
+        "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
         "write_file(root='user_files', path='Desktop/file.html', content=...)."
     )
     expected = ToolResult(status="blocked", code="ROOT_REQUIRED_USER_FILES", text=text)
@@ -764,11 +764,11 @@ def test_light_actionable_redirects_keep_legacy_mapping_without_light_remap(
         # as_posix() for the same reason as in
         # test_light_binding_root_redirect_is_native_without_invented_metadata.
         target = (home / "Desktop" / "report.html").as_posix()
-        args = {"path": target, "content": "<html></html>"}
+        args = {"root": "active_workspace", "path": target, "content": "<html></html>"}
         expected_text = (
             "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path "
-            f"({target!r}) was given but root defaulted to 'active_workspace'. "
-            "Pass root='user_files' to write under the owner's home, e.g. "
+            f"({target!r}) is outside root='active_workspace'. "
+            "Pass root='user_files' (or omit root) to write under the owner's home, e.g. "
             "write_file(root='user_files', path='Desktop/file.html', content=...)."
         )
 

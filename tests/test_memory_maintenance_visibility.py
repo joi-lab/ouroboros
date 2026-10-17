@@ -1,30 +1,25 @@
 """Nothing in memory maintenance leaves silently (TZ-3 PR-1, invariant I4).
 
 Every host decision that used to vanish is a typed fact, each proven in both
-directions: a scratchpad pass and its outcome, a reflection lesson the host
-declined, and the ``writer``/``route``/``writer_input_ref``/``old_chars``/
-``new_chars`` stamp on every ``source_capture`` history row. The reader-less
-``knowledge_journal.jsonl`` writer is gone, and so is the old dialogue writer
-whose lock skips and withheld eras this file used to pin.
+directions: a scratchpad pass and its outcome, and the ``writer``/``route``/
+``writer_input_ref``/``old_chars``/``new_chars`` stamp on every ``source_capture``
+history row. The reader-less ``knowledge_journal.jsonl`` writer is gone, and so are
+the old dialogue writer and the automatic reflection and scratchpad knowledge
+writers whose skips and stamps this file used to pin: a scratchpad answer that
+still nominates notes writes none.
 """
 
 from __future__ import annotations
 
-import inspect
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from ouroboros import consolidator as c
 from ouroboros import knowledge as store
-from ouroboros import reflection
 from ouroboros.memory import Memory
 from ouroboros.tools import knowledge as knowledge_tools
 from ouroboros.tools.registry import ToolContext
-from tests import test_consolidator_context_fit as fit_helpers
-
-fit = fit_helpers.fit
 
 
 def _events(root, kind):
@@ -61,8 +56,7 @@ def _scratchpad(tmp_path, count=4):
 
 def test_a_scratchpad_replacement_reports_its_counts_and_source(tmp_path):
     memory = _scratchpad(tmp_path)
-    c.consolidate_scratchpad(memory, tmp_path / "memory" / "knowledge",
-                             _Scratch(json.dumps({"knowledge_entries": [], "compressed_block": "compressed"})))
+    c.consolidate_scratchpad(memory, _Scratch(json.dumps({"compressed_block": "compressed"})))
     events = _events(tmp_path, "scratchpad_consolidation")
     assert len(events) == 1
     event = events[0]
@@ -70,18 +64,18 @@ def test_a_scratchpad_replacement_reports_its_counts_and_source(tmp_path):
     assert (event["blocks_before"], event["compressed_blocks"], event["blocks_after"]) == (4, 2, 3)
     assert event["chars_before"] > event["chars_after"] > 0
     assert event["source_entry_id"] == memory.load_scratchpad_blocks()[0]["metadata"]["source_ref"]["entry_id"]
-    assert event["knowledge_writes"] == {"ok": 0, "failed": 0}
+    assert "knowledge_writes" not in event
     assert event["last_error_kind"] is None and event["accounted_upper_bound_usd"] == 0.02
 
 
 @pytest.mark.parametrize("content, outcome", [
     ("not the requested JSON", "failed"),
-    (json.dumps({"knowledge_entries": [], "compressed_block": "   "}), "empty_block"),
+    (json.dumps({"compressed_block": "   "}), "empty_block"),
 ])
 def test_a_refused_scratchpad_pass_names_why_and_keeps_the_blocks(tmp_path, content, outcome):
     memory = _scratchpad(tmp_path)
     before = memory.load_scratchpad_blocks()
-    c.consolidate_scratchpad(memory, tmp_path / "memory" / "knowledge", _Scratch(content))
+    c.consolidate_scratchpad(memory, _Scratch(content))
     assert memory.load_scratchpad_blocks() == before
     events = _events(tmp_path, "scratchpad_consolidation")
     assert len(events) == 1 and events[0]["outcome"] == outcome
@@ -92,108 +86,8 @@ def test_a_refused_scratchpad_pass_names_why_and_keeps_the_blocks(tmp_path, cont
 def test_no_scratchpad_pass_means_no_event(tmp_path):
     memory = Memory(tmp_path)
     memory.append_scratchpad_block("small", source="task")
-    assert c.consolidate_scratchpad(memory, tmp_path / "memory" / "knowledge", _Scratch("unused")) is None
+    assert c.consolidate_scratchpad(memory, _Scratch("unused")) is None
     assert _events(tmp_path, "scratchpad_consolidation") == []
-
-
-# --- a declined reflection lesson is a fact --------------------------------------------
-
-
-def test_project_scoped_reflection_skips_are_typed_events(tmp_path):
-    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
-    applied = reflection.apply_memory_actions(env, [
-        {"type": "scratchpad_append", "content": "a lesson", "task_id": "t1"},
-        {"type": "identity_update_candidate", "content": "a trait", "task_id": "t1"},
-        {"type": "knowledge_write", "content": "topic-less", "task_id": "t1"},
-    ], project_id="proj_x")
-    assert applied == 0
-    events = _events(tmp_path, "reflection_memory_action_skipped")
-    assert [(e["action_type"], e["reason"]) for e in events] == [
-        ("scratchpad_append", "project_scoped_task"), ("identity_update_candidate", "project_scoped_task"),
-        ("knowledge_write", "missing_topic")]
-    assert all(e["project_id"] == "proj_x" and e["task_id"] == "t1" and e["content_chars"] > 0 for e in events)
-    assert events[0]["input_ref"] == {"status": "source_unavailable", "project_id": "proj_x"}
-    assert not (tmp_path / "memory" / "scratchpad_blocks.json").exists()
-
-
-def _reflect(tmp_path, llm, task_id="t-skip", project_id="proj_x"):
-    return reflection.generate_reflection(
-        {"id": task_id, "text": "the episode", "drive_root": str(tmp_path), "project_id": project_id},
-        {}, "trace", llm, {"rounds": 1, "cost": 0.1})
-
-
-_REJECTED_RAW = [
-    {"type": "knowledge_write", "topic": "people/alex", "content": "   "},
-    {"type": "knowledge_write", "content": "topic-less"},
-    {"type": "delete_everything", "content": "nope"},
-    {"type": "scratchpad_append", "content": "a kept lesson"},
-]
-
-
-def test_rejected_raw_reflection_actions_are_typed_events_on_the_real_path(tmp_path, fit):
-    # Round 2 (critical 3): production drops empty and topic-less actions in the
-    # validator, before apply_memory_actions ever runs; the event must fire there.
-    from tests.test_knowledge_consolidation import MemoryLLM
-
-    entry = _reflect(tmp_path, MemoryLLM("Reflection.\nMEMORY_ACTIONS_JSON: " + json.dumps(_REJECTED_RAW)))
-    assert entry["reflection"] == "Reflection." and [a["type"] for a in entry["memory_actions"]] == ["scratchpad_append"]
-    events = _events(tmp_path, "reflection_memory_action_skipped")
-    assert [(e["action_type"], e["reason"], e["content_chars"]) for e in events] == [
-        ("knowledge_write", "empty_content", 3), ("knowledge_write", "missing_topic", len("topic-less")),
-        ("delete_everything", "unsupported_type", len("nope"))]
-    assert all((e["task_id"], e["project_id"]) == ("t-skip", "proj_x") for e in events)
-    # The retained exact task input the model answered is what the validator seam
-    # kept; the rejected reflection text itself is not retained.
-    assert entry["source_ref"]["kind"] == "task_source"
-    assert all(e["input_ref"] == entry["source_ref"] for e in events)
-
-
-def test_a_failed_validator_skip_event_cannot_abort_the_reflection(tmp_path, fit, monkeypatch, caplog):
-    from tests.test_knowledge_consolidation import MemoryLLM
-
-    original = reflection.append_jsonl
-
-    def broken_event(path, row, **kwargs):
-        if row.get("type") == "reflection_memory_action_skipped":
-            raise OSError("event store unavailable")
-        return original(path, row, **kwargs)
-
-    monkeypatch.setattr(reflection, "append_jsonl", broken_event)
-    entry = _reflect(tmp_path, MemoryLLM("Reflection.\nMEMORY_ACTIONS_JSON: " + json.dumps(_REJECTED_RAW)))
-    assert entry["reflection"] == "Reflection."  # not "(reflection generation failed ...)"
-    assert [a["content"] for a in entry["memory_actions"]] == ["a kept lesson"]
-    assert caplog.text.count("Reflection memory skip event could not be written") == 3
-    assert _events(tmp_path, "reflection_memory_action_skipped") == []
-
-
-def test_failed_skip_event_cannot_discard_later_reflection_lessons(tmp_path, monkeypatch, caplog):
-    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
-    original = reflection.append_jsonl
-
-    def broken_event(path, row, **kwargs):
-        if row.get("type") == "reflection_memory_action_skipped":
-            raise OSError("event store unavailable")
-        return original(path, row, **kwargs)
-
-    monkeypatch.setattr(reflection, "append_jsonl", broken_event)
-    assert reflection.apply_memory_actions(env, [
-        {"type": "knowledge_write", "content": "topic-less", "task_id": "t1"},
-        {"type": "scratchpad_append", "content": "a real lesson", "task_id": "t1"},
-    ], project_id="") == 1
-    assert "Reflection memory skip event could not be written" in caplog.text
-    assert "a real lesson" in Memory(tmp_path).load_scratchpad()
-
-
-def test_applied_reflection_actions_emit_no_skip(tmp_path):
-    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
-    assert reflection.apply_memory_actions(env, [
-        {"type": "scratchpad_append", "content": "a lesson", "task_id": "t1"},
-        {"type": "identity_update_candidate", "content": "a trait", "task_id": "t1"},
-        {"type": "scratchpad_append", "content": "   ", "task_id": "t1"},
-    ]) == 2
-    events = _events(tmp_path, "reflection_memory_action_skipped")
-    assert [(e["action_type"], e["reason"], e["project_id"]) for e in events] == [
-        ("scratchpad_append", "empty_content", "")]
 
 
 # --- the host stamp on every source_capture row --------------------------------------
@@ -291,78 +185,28 @@ def test_a_direct_turn_stamps_itself_and_its_observed_route_when_the_loop_record
     assert second["writer"] == "turn" and second["route"] == {"provider": "openrouter", "model": "openai/gpt-x"}
 
 
-def test_scratchpad_consolidation_stamps_its_journal_source(tmp_path):
-    memory = _scratchpad(tmp_path)
-    c.consolidate_scratchpad(memory, tmp_path / "memory" / "knowledge", _Scratch(json.dumps({
-        "knowledge_entries": [{"topic": "lessons/one", "content": "A durable lesson."}],
-        "compressed_block": "compressed"})))
-    capture = next(row for row in _history(tmp_path) if row.get("publication") == "source_capture")
-    assert capture["writer"] == "scratchpad_consolidation"
-    assert capture["route"] == {"provider": "openrouter", "model": "light/served"}
-    assert capture["writer_input_ref"] == memory.load_scratchpad_blocks()[0]["metadata"]["source_ref"]
-    assert _events(tmp_path, "scratchpad_consolidation")[0]["knowledge_writes"] == {"ok": 1, "failed": 0}
-
-
 _FORGED = {"provider": "forged", "model": "forged/model", "account": "forged-acct"}
 
 
-def test_a_model_supplied_nomination_route_never_reaches_history_from_scratchpad(tmp_path):
-    # Round 2 (critical 1): the scratchpad producer binds every key the model wrote
-    # before the writer ran; a forged host stamp must be dropped at that binding.
+def test_a_scratchpad_answer_that_still_nominates_notes_writes_none(tmp_path):
+    """The older prompt asked for knowledge_entries beside the block; an answer of that
+    shape, forged host keys included, compresses the blocks and writes no note."""
     memory = _scratchpad(tmp_path)
-    c.consolidate_scratchpad(memory, tmp_path / "memory" / "knowledge", _Scratch(json.dumps({
+    c.consolidate_scratchpad(memory, _Scratch(json.dumps({
         "knowledge_entries": [{"topic": "lessons/one", "content": "A durable lesson.", "_nomination_route": _FORGED,
                                "_expected_revision": "forged", "_task_id": "forged"}],
         "compressed_block": "compressed"})))
-    capture = next(row for row in _history(tmp_path) if row.get("publication") == "source_capture")
-    assert capture["topic"] == "lessons/one" and capture["writer"] == "scratchpad_consolidation"
-    assert capture["route"] == {"provider": "openrouter", "model": "light/served"}  # the host's observed stamp
-    assert _events(tmp_path, "scratchpad_consolidation")[0]["knowledge_writes"] == {"ok": 1, "failed": 0}
+    [event] = _events(tmp_path, "scratchpad_consolidation")
+    assert event["outcome"] == "replaced" and "knowledge_writes" not in event
+    assert not (tmp_path / "memory" / "knowledge").exists()
+    assert not (tmp_path / "memory" / "knowledge_history.jsonl").exists()
     journal = [json.loads(line) for line in memory.journal_path().read_text(encoding="utf-8").splitlines() if line.strip()]
-    (bound,) = next(row for row in journal if row.get("type") == "blocks_consolidated")["knowledge_entries"]
-    assert not [key for key in bound if key.startswith("_")]  # nothing model-written survives as a host key
-
-
-def test_bind_entries_keeps_model_fields_and_drops_every_host_key(tmp_path):
-    reads = c.KnowledgeReadContext(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="op-1"))
-    (bound,) = reads.bind_entries([{"topic": "people/alex", "content": "Observed.", "scope": "global",
-                                    "_nomination_route": _FORGED, "_anything": 1, "extra": "kept"}])
-    assert bound == {"topic": "people/alex", "content": "Observed.", "scope": "global", "extra": "kept",
-                     "expected_revision": None, "canonical_root": str(tmp_path), "task_id": "op-1"}
-
-
-def test_project_reflection_action_uses_actor_readable_exact_source(tmp_path):
-    from ouroboros.artifacts import read_actor_source_bytes
-    env = SimpleNamespace(drive_root=tmp_path, budget_drive_root=tmp_path, repo_dir=tmp_path)
-    entry = {"task_id": "t3", "ts": "2026-01-01T00:00:00Z", "route": {"provider": "claudexor", "model": "claude-fable"},
-             "memory_actions": [
-                 {"type": "knowledge_write", "topic": "lessons/project", "content": "Grounded.", "task_id": "t3"}]}
-    reflection.append_reflection_routed(env, {"id": "t3", "project_id": "proj_x",
-                                              "budget_drive_root": str(tmp_path)}, entry)
-    action = entry["memory_actions"][0]
-    source = action["_reflection_source_ref"]
-    assert source["kind"] == "task_source"
-    assert json.loads(read_actor_source_bytes(tmp_path, "t3", source))["memory_actions"][0]["content"] == "Grounded."
-    assert reflection.apply_memory_actions(env, entry["memory_actions"], project_id="proj_x") == 1
-    history = tmp_path / "projects" / "proj_x" / "knowledge_history.jsonl"
-    row = json.loads(history.read_text(encoding="utf-8").splitlines()[-1])
-    assert row["writer_input_ref"]["sha256"] == source["sha256"]
-    assert row["writer_input_ref"]["task_id"] == "t3"
-    assert row["route"] == {"provider": "claudexor", "model": "claude-fable"}  # the reflection's answering route
-
-
-def test_reflection_stamps_the_reflection_row_it_came_from(tmp_path):
-    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
-    assert reflection.apply_memory_actions(env, [
-        {"type": "knowledge_write", "topic": "lessons/two", "content": "Reusable fact.", "task_id": "t9"}]) == 1
-    capture = next(row for row in _history(tmp_path) if row.get("publication") == "source_capture")
-    assert capture["writer"] == "reflection" and capture["route"] == store.UNKNOWN_STAMP
-    assert capture["writer_input_ref"]["task_id"] == "t9"
-    assert capture["writer_input_ref"]["read"]["arguments"]["path"] == "logs/task_reflections.jsonl"
+    [row] = [row for row in journal if row.get("type") == "blocks_consolidated"]
+    assert "knowledge_entries" not in row
+    assert memory.load_scratchpad_blocks()[0]["metadata"] == {"source_ref": row["source_ref"]}
 
 
 def test_the_reader_less_knowledge_journal_is_no_longer_written(tmp_path):
     assert store.write_knowledge_note(_address(tmp_path), "# Alex\n\nFirst.").ok
     assert not (tmp_path / "memory" / "knowledge_journal.jsonl").exists()
     assert (tmp_path / "memory" / "knowledge_history.jsonl").exists()
-    assert "knowledge_journal" not in inspect.getsource(store)

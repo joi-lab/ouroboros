@@ -17,6 +17,7 @@ import pytest
 from ouroboros import merge_receipts
 from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, load_task_result, write_task_result
 from ouroboros.tools import github
+from tests._cancel_intents_shared import DeliveryBus
 
 HEAD = "a" * 40
 BASE = "b" * 40
@@ -108,13 +109,15 @@ def test_a_reviewed_merge_records_intent_first_and_publishes_one_receipt(world):
     (receipt,) = _receipts(world)
     assert receipt["outcome"] == {**receipt["outcome"], "status": "merged", "merge_sha": MERGE, "merge_tree": TREE,
                                   "merge_parents": [BASE, HEAD], "attribution": "this_call"}
-    assert receipt["coverage"]["status"] == "covers_head" and receipt["coverage"]["gaps"] == []
+    # A declaration beside a completed named task is the author's statement, not observed coverage.
+    assert receipt["coverage"]["status"] == "unknown"
+    assert receipt["coverage"]["gaps"] == ["no_host_observed_review_record"]
     assert receipt["review"]["host_observed"][0]["status"] == "completed"
     assert receipt["publication"]["body"] == {"status": "published"}
     assert receipt["publication"]["card"]["status"] == "owed"
     assert world.ctx.pending_events[0]["progress_meta"]["card_row_id"] == f"merge-receipt:{receipt['receipt_id']}"
     assert world.rows == []  # callback return has no delivery authority
-    assert out.startswith("✅ PR #7 merge: merged")
+    assert out.startswith("⚠️ PR #7 merge: merged")
     body = world.gh.pr["body"]
     assert body.startswith("Summary of the change.\n\nOwner notes stay here.")  # unrelated text kept
     assert "review-1" not in body and str(world.root) not in body and "merge-task" not in body
@@ -307,7 +310,8 @@ def test_base_and_tree_gaps_prevent_green_without_vetoing_merge(world, monkeypat
     r = _receipts(world)[0]
     assert r["outcome"]["status"] == "merged"
     assert r["coverage"]["status"] == "unknown"
-    assert set(r["coverage"]["gaps"]) == {"base_changed_since_review", "merged_tree_differs_from_reviewed_head"}
+    assert set(r["coverage"]["gaps"]) == {"base_changed_since_review", "merged_tree_differs_from_reviewed_head",
+                                          "no_host_observed_review_record"}
 
 
 def test_parallel_callers_share_one_atomic_intent(world, monkeypatch):
@@ -439,15 +443,15 @@ def test_retry_enriches_merge_readback_without_erasing_attribution(world, monkey
     monkeypatch.setattr(github, "_gh_run", unavailable_commit)
     _merge(world, review_task_ids=["review-1"], reviewed_head_sha=HEAD, reviewed_base_sha=BASE)
     initial = _receipts(world)[0]
-    assert initial["coverage"]["status"] == "unknown"
+    assert initial["coverage"]["status"] == "unknown" and "tree_comparison_unavailable" in initial["coverage"]["gaps"]
     monkeypatch.setattr(github, "_gh_run", gh)
-    assert _merge(world).startswith("✅")
+    assert _merge(world).startswith("⚠️ PR #7 merge: merged")  # a declaration never reads green
     (stored,) = _receipts(world)
     assert stored["receipt_id"] == initial["receipt_id"]
     assert stored["outcome"]["attribution"] == "this_call"
     assert stored["outcome"]["merge_tree"] == TREE
-    assert stored["coverage"]["status"] == "covers_head"
-    assert stored["coverage"]["gaps"] == []
+    assert stored["coverage"]["status"] == "unknown"
+    assert stored["coverage"]["gaps"] == ["no_host_observed_review_record"]  # the tree gap was enriched away
     assert merge_receipts.public_block(stored) in world.gh.pr["body"]
     assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
 
@@ -466,7 +470,6 @@ def test_unsettled_and_merged_receipts_survive_disposable_history_eviction(world
 
 
 def test_card_outbox_survives_worker_exit_and_confirms_delivery_separately(world, monkeypatch):
-    from queue import Queue
     from supervisor import terminal_delivery as td
 
     _merge(world)
@@ -474,7 +477,7 @@ def test_card_outbox_survives_worker_exit_and_confirms_delivery_separately(world
     did = receipt["publication"]["card"]["delivery_id"]
     world.ctx.pending_events.clear()  # the worker died before draining its buffer
     monkeypatch.setattr(td, "_REPLAY_MIN_AGE_SEC", 0)
-    queue = Queue()
+    queue = DeliveryBus()  # replay admits a copy only through the bus's membership
     assert td.replay_pending_deliveries(world.root, event_queue=queue) == [did]
     event = queue.get_nowait()
     assert event["progress_meta"]["card_row_id"] == f"merge-receipt:{receipt['receipt_id']}"

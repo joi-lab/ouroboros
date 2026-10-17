@@ -39,6 +39,21 @@ function extraWarnings(data) {
         .filter((w) => !STATE_WARNINGS.has(String(w).split(':', 1)[0]) && !STATE_WARNINGS.has(w));
 }
 
+const LOCAL_CHANGES = { absent: 'none', present: 'present', unknown: 'unknown' };
+
+// Why an available update is a caution: content of the checkout's own, an
+// unknown comparison, or uncommitted work (stashed and restored around the update).
+function unsafeUpdateHint(data) {
+    const parts = [];
+    if (data.local_changes === 'present') {
+        parts.push('This checkout changed since its last shared commit with the official line; applying merges those changes.');
+    } else if (data.local_changes !== 'absent') {
+        parts.push('Could not compare this checkout with the official line; applying merges any local changes.');
+    }
+    if (data.dirty) parts.push('Uncommitted changes are stashed and restored around the update.');
+    return parts.join(' ');
+}
+
 function statusReadFailed(data) {
     return Array.isArray(data?.warnings)
         && data.warnings.some((warning) => String(warning).startsWith('status_error:'));
@@ -69,7 +84,7 @@ function progressVerdict(data, base) {
     }
     if (progress.result === 'restart_required') {
         return { ...base, state: 'restart_required', tone: 'warn',
-            headline: 'The update landed, but the automatic restart failed.',
+            headline: 'The update needs a restart that could not be requested automatically.',
             hint: progress.error || 'Restart Ouroboros to finish.',
             action: { id: 'restart', label: 'Restart now' } };
     }
@@ -89,7 +104,7 @@ export function applyFailureText(err) {
     if (Array.isArray(body.blockers) && body.blockers.length) {
         parts.push(`blocked by: ${body.blockers.slice(0, 5).join(', ')}`);
     }
-    if (body.rolled_back) parts.push('the checkout was rolled back');
+    if (body.rolled_back) parts.push('the update was rolled back');
     if (body.smoke) parts.push('the post-update smoke check failed');
     if (typeof body.estimated_wave_usd === 'number') {
         parts.push(`assisted review needs ~$${body.estimated_wave_usd}` + (
@@ -112,11 +127,17 @@ export function updateVerdict(data = {}, phase = '') {
     if (data.official_repo_url) chips.push({ label: 'Official repo', value: repoSlug(data.official_repo_url) });
     if (data.target_ref) chips.push({ label: 'Target', value: data.target_ref });
     if (data.update_channel) chips.push({ label: 'Channel', value: data.update_channel, link: 'settings-advanced' });
-    const divergence = [];
-    if (data.behind) divergence.push(`${data.behind} incoming`);
-    if (data.ahead) divergence.push(`${data.ahead} local`);
-    if (data.dirty_count) divergence.push(`${data.dirty_count} dirty`);
-    if (divergence.length) chips.push({ label: 'Divergence', value: divergence.join(' / ') });
+    // Commit counts are history (the updater's own merges count too); whether the
+    // checkout holds content of its own is the server's `local_changes` fact.
+    const commits = [];
+    if (data.behind) commits.push(`${data.behind} incoming`);
+    if (data.ahead) commits.push(`${data.ahead} local`);
+    if (commits.length) chips.push({ label: 'Commits', value: commits.join(' / ') });
+    if (LOCAL_CHANGES[data.local_changes]) {
+        chips.push({ label: 'Local changes', value: data.local_changes === 'present'
+            ? `present since ${String(data.local_changes_base || '').slice(0, 8)}` : LOCAL_CHANGES[data.local_changes] });
+    }
+    if (data.dirty_count) chips.push({ label: 'Uncommitted', value: `${data.dirty_count} file(s)` });
 
     const warnings = extraWarnings(data);
     const base = { chips, warnings, checkedAgo };
@@ -144,10 +165,11 @@ export function updateVerdict(data = {}, phase = '') {
     if (phase === 'preflighting') return { ...base, state: 'preflighting', tone: 'neutral', headline: 'Preparing the update…', hint: '', action: { id: 'update', label: 'Preparing…', disabled: true } };
     if (phase === 'updating') return { ...base, state: 'updating', tone: 'neutral', headline: 'Applying the update…', hint: '', action: { id: 'update', label: 'Updating…', disabled: true } };
     if (phase === 'restarting') return { ...base, state: 'restarting', tone: 'ok', headline: 'Restarting the server…', hint: 'This page updates itself when the server is back.', action: { id: 'restart', label: 'Restarting…', disabled: true } };
-    if (phase === 'restart_required') return { ...base, state: 'restart_required', tone: 'warn', headline: 'The update landed, but the automatic restart failed.', hint: 'Restart Ouroboros to finish.', action: { id: 'restart', label: 'Restart now' } };
-    // Distinct from restart_required ("the update landed"): the operation did
-    // NOT land — the runtime just cannot continue without a restart (failed
-    // writer fence, failed rollback, rollback landed without its restart).
+    if (phase === 'restart_required') return { ...base, state: 'restart_required', tone: 'warn', headline: 'The update needs a restart that could not be requested automatically.', hint: 'Restart Ouroboros to finish.', action: { id: 'restart', label: 'Restart now' } };
+    // Distinct from restart_required (the update is applied, or recorded for the restart exit when
+    // its target lacks the store, and only its restart is missing): here the operation did NOT
+    // complete — the runtime just cannot continue without a restart (failed writer fence, failed
+    // rollback, rollback landed without its restart).
     if (phase === 'restart_needed') return { ...base, state: 'restart_needed', tone: 'warn', headline: 'Ouroboros needs a restart before updates can continue.', hint: 'The last operation could not complete cleanly; restart, then retry.', action: { id: 'restart', label: 'Restart now' } };
 
     const unmanaged = data.managed === false
@@ -182,18 +204,20 @@ export function updateVerdict(data = {}, phase = '') {
             return {
                 ...base,
                 state: 'resolving', tone: 'warn',
-                headline: 'An update landed and is waiting for a restart to finish.',
+                headline: 'An update is waiting for a restart to finish.',
                 hint: 'Restart Ouroboros to run the post-update checks and complete it.',
                 action: { id: 'restart', label: 'Restart now' },
             };
         }
         if (txPhase === 'gate_blocked' || txPhase === 'marker_cleanup_retry') {
+            // The in-app restart defers in these phases (server_restart._safe_restart_serialized),
+            // so only a new process reaches boot recovery: offer no Restart control.
             return {
                 ...base,
                 state: 'resolving', tone: 'error',
                 headline: 'An update attempt stopped mid-flight and needs recovery.',
-                hint: `Phase: ${txPhase}. Restart Ouroboros — boot recovery retries the rollback/cleanup.`,
-                action: { id: 'restart', label: 'Restart now' },
+                hint: `Phase: ${txPhase}. Quit and reopen the desktop app, or restart the server process for a web deployment: boot recovery retries the rollback/cleanup. The in-app Restart is deferred in this phase.`,
+                action: { id: 'check', label: 'Check again' },
             };
         }
         if (txPhase.includes('assisted')) {
@@ -245,7 +269,7 @@ export function updateVerdict(data = {}, phase = '') {
             state: unsafe ? 'available_unsafe' : 'available',
             tone: unsafe ? 'warn' : 'ok',
             headline: `Update available: ${currentVersion} (${currentSha}) -> ${latestVersion} (${latestSha})`,
-            hint: unsafe ? 'Local commits or uncommitted changes diverge from the official line; applying merges them.' : '',
+            hint: unsafe ? unsafeUpdateHint(data) : '',
             action: { id: 'update', label: `Update to ${latestVersion}` },
         };
     }
@@ -860,12 +884,12 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             });
             const data = await resp.json();
             if (data.status === 'ok') {
-                showToast(`Rollback successful: ${data.message}. Server is restarting...`, 'success');
+                showToast(`Rollback ${data.switch_deferred ? 'requested' : 'successful'}: ${data.message}. Server is restarting...`, 'success');
                 enterRestarting();
             } else if (data.status === 'restart_required') {
-                // A ROLLBACK landed, not an update: the update-specific
-                // restart_required headline would lie here.
-                showToast(`Rollback completed: ${data.message}. Restart Ouroboros to finish.`, 'error');
+                // A ROLLBACK, not an update: the update-specific restart_required headline
+                // would lie here. A store-less target moves only at the restart exit.
+                showToast(`Rollback ${data.switch_deferred ? 'recorded' : 'completed'}: ${data.message}. Restart Ouroboros to finish.`, 'error');
                 restartNeeded = true;
                 setPhase('restart_needed');
             } else {
@@ -896,7 +920,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
                 title: `Update ${String(plan.base_sha).slice(0, 8)} -> ${String(plan.target_sha).slice(0, 8)}`,
                 body: assisted
                     ? `${conflictCount} conflict(s) need resolution. Ouroboros will resolve the merge as a reviewed task (model spend applies); progress lands in chat, and the server restarts after the reviewed commit.`
-                    : `Git applies this update directly (${plan.local_dirty_count || 0} local change(s) are stashed and restored). The server restarts when it lands.`,
+                    : `Git applies this update directly (${plan.local_dirty_count || 0} uncommitted file(s) are stashed and restored). The server restarts when it lands.`,
                 confirmLabel: assisted ? 'Start reviewed resolution' : 'Update now',
             });
             if (!proceed) {
@@ -953,10 +977,12 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
             }
             const data = await apiClient.updateApply('replace', plan, { confirmRecovery: true });
             if (data.status === 'restart_required') {
-                showToast('Recovery landed, but automatic restart failed. Restart Ouroboros to finish.', 'error');
+                showToast('Recovery needs a restart that could not be requested. Restart Ouroboros to finish.', 'error');
                 setPhase('restart_required');
             } else {
-                showToast('Official version restored. Server is restarting.', 'success');
+                // Neither outcome claims the version landed: a store-less target is checked out only
+                // at the restart exit, and boot smoke may still roll it back.
+                showToast('Restart requested to finish recovery with the official version.', 'success');
                 enterRestarting();
             }
         } catch (err) {

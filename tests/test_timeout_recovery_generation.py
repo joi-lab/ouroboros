@@ -162,12 +162,12 @@ def test_captured_timeout_job_closes_only_its_dead_local_invocation(timed_out, m
         t.q.RUNNING["old-task"] = {"task": {"id": "old-task", "_attempt": 2},
                                     "worker_id": 7, "attempt": 2}
         task_reaper.reap_timed_out_task(t.job)
-        assert load_task_result(t.root, "old-task")["launch_handoffs"] == {"op": claim}
+        assert load_task_result(t.root, "old-task").get("launch_handoffs", {}) == {"op": claim}
         assert t.workers.WORKERS[7] is new and new.busy_task_id == "old-task"
     else:
         with pytest.raises(StopAfterRetirement):
             task_reaper.reap_timed_out_task(t.job)
         row = load_task_result(t.root, "old-task")
-        assert not row["launch_handoffs"], row
+        assert not row.get("launch_handoffs", {}), row
         assert row["retired_tool_invocations"]["op"]["effect_outcome"] == "unknown"
         assert row["retired_tool_invocations"]["op"]["replay_authorized"] is False

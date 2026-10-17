@@ -93,7 +93,7 @@ def test_run_chat_task_tracks_direct_turn_for_its_duration(tmp_path, monkeypatch
     assert turn["chat_id"] == 7
     assert turn["client_message_id"] == "cmid-42"
     assert turn["kind"] == "direct_chat"
-    assert turn["phase"] == "thinking"
+    assert turn["phase"] == "preparing"
     # Cleared once the turn concluded.
     assert get_direct_activity_registry().snapshot() == []
     # The authoritative start is announced immediately (2A): the client's

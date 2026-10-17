@@ -27,7 +27,7 @@ PRESENCE = {"presence": {"binding_id": "b1", "event": {"provider": "telegram", "
 def test_role_defaults_are_the_table_of_the_spec():
     table = {  # story, room_page, room_lanes, origin_words, live_rooms, marks, knowledge, owner_words
         "integrator": (True, True, True, True, "lines", "all", True, False),
-        "consciousness": (True, False, False, False, "lines", "all", True, False),
+        "consciousness": (True, True, True, True, "lines_with_words", "all", True, False),  # Main's view + people's words
         "presence": (True, True, True, False, "none", "room_and_global", True, False),
         "child": (True, True, False, True, "none", "room_and_global", False, True),
         "nanny": (False, True, False, True, "none", "room_and_global", False, True),
@@ -88,8 +88,9 @@ def test_the_view_room_is_the_task_own_room_and_main_outside_the_projects(tmp_pa
         assert mv.view_spec_for_task(task, tmp_path).room_id == room, name
     presence = mv.view_spec_for_task({"id": "tp", "chat_id": 555, "metadata": PRESENCE}, tmp_path)
     assert (presence.role, presence.room_id) == ("presence", "555")  # Presence keeps its own conversation
-    wake = mv.view_spec_for_task({"id": "w", "chat_id": 1, "metadata": {"usage_category": "consciousness"}}, tmp_path)
-    assert wake.room_id is None
+    for chat in (1, 0, None):  # a wake has no chat of its own: its room is Main whatever chat id it carries
+        wake = mv.view_spec_for_task({"id": "w", "chat_id": chat, "metadata": {"usage_category": "consciousness"}}, tmp_path)
+        assert (wake.role, wake.room_id) == ("consciousness", "1"), chat
 
 
 def test_the_view_room_matches_own_room_chat_inside_projects(tmp_path):
@@ -366,8 +367,8 @@ def test_a_page_seals_rows_only_in_its_room_and_a_row_in_two_rooms_stays_open_in
     assert lane1.startswith("### Open conversation since 2026-09-05 10:03")
     assert _addr(rows[18]) in lane1  # sealed in the transport room, still open in Main
     wake, wake_text = _view(tmp_path, {"id": "w1", "chat_id": 1, "metadata": {"usage_category": "consciousness"}})
-    transport = next(room for room in wake.live_rooms if room["room_id"] == "777")
-    assert (transport["rows"], transport["people"]) == (1, 0)
+    transport = next(room for room in wake.live_rooms if room["room_id"] == "777")["facts"]
+    assert (transport["rows"], transport["people"], transport["pages"]) == (1, 0, 1)
 
 
 def test_live_rooms_are_rooms_with_open_rows_or_open_notes_and_carry_no_words_by_default(tmp_path):
@@ -396,7 +397,63 @@ def test_live_rooms_are_rooms_with_open_rows_or_open_notes_and_carry_no_words_by
     assert f"chat_id={beta}]" not in sealed and "Beta waits for the owner." not in sealed  # nothing open: not live
     store.write_note(room_id=beta, task_id="tb1", text="One more thought on beta.", author=shared.MIND)
     _snap, again = _view(tmp_path, MAIN_TASK)
-    assert f"### Project Beta [chat_id={beta}] — no open rows; my notes not yet sealed: 1" in again
+    assert (f"### Project Beta [chat_id={beta}] — no open rows; my notes not yet sealed: 1; pages of this room: 2, "
+            f"last covered row 2026-09-05 10:16\nmemory_read(room_id='{beta}')\nnote ") in again  # no rows: the page reads
+
+
+def test_a_rooms_standing_facts_are_the_inventorys_in_its_header_its_live_line_and_the_floors_summed_line(tmp_path):
+    """One count (``memory_inventory.room_facts``) wherever a room is named: the current room's header, a live
+    room's line and the line the floor folds quiet rooms into (their sum). The numbers fall when a page seals
+    rows. A page over the middle of the conversation leaves the first row open: the facts show the earliest
+    open row before the last covered one and no sealing frontier is claimed."""
+    from ouroboros import memory_inventory as mi
+    from ouroboros.chronicle_import import row_lineage
+    from ouroboros.tools.chronicle import page_covers
+
+    rooms, rows = _install(tmp_path)
+    beta = str(rooms["beta"])
+    store = ChronicleStore(tmp_path)
+    snapshot, text = _view(tmp_path, MAIN_TASK)
+    facts = snapshot.room["facts"]
+    assert facts == mi.room_facts(store, "1", mi.open_room_rows(tmp_path, "1"), row_lineage(tmp_path), 0)
+    chars = sum(len(row["text"]) for row in rows if row["chat_id"] in (1, 777))  # the transport's rows are Main's too
+    assert facts == {"rows": 22, "people": 4, "mine": 4, "task_facts": 14, "chars": chars, "earliest": _ts(2),
+                     "latest": _ts(27), "notes": 0, "pages": 0, "last_covered": ""}
+    head = f"## This room (Main) — head {store.room_head('1')}; open 2026-09-05 10:02 → 2026-09-05 10:27; people 4, mine 4, "
+    assert f"{head}task facts 14, ~{chars} chars; my notes not yet sealed: 0; no page of this room yet\n" in text
+    live = _section(text, "## Live rooms")
+    assert (f"### Project Beta [chat_id={beta}] — open 2026-09-05 10:15 → 2026-09-05 10:16; people 1, mine 1, task facts 0, "
+            f"~20 chars; my notes not yet sealed: 0; no page of this room yet\nmemory_read(room_id='{beta}', rows=true)") in live
+    quiet = [room for room in snapshot.live_rooms if not room["notes"] and not room["words"]]
+    assert [room["room_id"] for room in quiet] == [str(rooms["alpha"]), beta, "777"]
+    assert mv._rooms_line(quiet) == (
+        "3 more open rooms without notes; open 2026-09-05 10:13 → 2026-09-05 10:20; people 3, mine 2, task facts 1, "
+        f"~{sum(room['facts']['chars'] for room in quiet)} chars; no page of these rooms yet; "
+        f"memory_read(room_id=<id>, rows=true) reads each: {rooms['alpha']}, {beta}, 777")
+    # A page over rows 10:05-10:10 of Main; a note in Main; the transport's one spoken row sealed.
+    covers = page_covers(tmp_path, "1", from_addr=_addr(rows[3]), to_addr=_addr(rows[8]))["covers"]
+    assert store.publish_page(room_id="1", text="The middle of the morning.", covers=covers, author=shared.MIND).ok
+    store.write_note(room_id="1", task_id="root2", text="Main waits.", author=shared.MIND)
+    spoken = page_covers(tmp_path, "777", from_addr=_addr(rows[18]), to_addr=_addr(rows[18]))["covers"]
+    assert store.publish_page(room_id="777", text="Ann wrote.", covers=spoken, author=shared.MIND).ok
+    snapshot, text = _view(tmp_path, MAIN_TASK)
+    facts = snapshot.room["facts"]
+    assert facts == mi.room_facts(store, "1", mi.open_room_rows(tmp_path, "1"), row_lineage(tmp_path), 1)
+    sealed = sum(len(rows[i]["text"]) for i in range(3, 9))
+    assert facts == {"rows": 16, "people": 4, "mine": 2, "task_facts": 10, "chars": chars - sealed, "earliest": _ts(2),
+                     "latest": _ts(27), "notes": 1, "pages": 1, "last_covered": _ts(10)}
+    head = f"## This room (Main) — head {store.room_head('1')}; open 2026-09-05 10:02 → 2026-09-05 10:27; people 4, mine 2, "
+    assert (f"{head}task facts 10, ~{chars - sealed} chars; my notes not yet sealed: 1; pages of this room: 1, "
+            "last covered row 2026-09-05 10:10\n") in text
+    assert "sealed up to" not in text and "sealed through" not in text and "frontier" not in text
+    quiet = [room for room in snapshot.live_rooms if not room["notes"] and not room["words"]]
+    assert mv._rooms_line(quiet).startswith(
+        "3 more open rooms without notes; open 2026-09-05 10:13 → 2026-09-05 10:17; people 2, mine 2, task facts 1, ")
+    assert "; pages of these rooms: 1, last covered row 2026-09-05 10:20; memory_read(" in mv._rooms_line(quiet)
+    # A child of a Main task counts the same room the same way, whatever its view prints of the rows.
+    child, _text = _view(tmp_path, {"id": "kid", "chat_id": 1, "delegation_role": "subagent", "parent_task_id": "root2",
+                                    "root_task_id": "root2"})
+    assert child.spec.room_lanes is False and child.room["facts"] == facts
 
 
 def test_this_room_has_its_head_retold_records_origin_words_and_notes(tmp_path):
@@ -428,11 +485,12 @@ def test_this_room_has_its_head_retold_records_origin_words_and_notes(tmp_path):
     assert f"note {note.record['id']} by root on " in _section(noted, "### My notes not yet sealed")
 
 
-def test_main_room_page_shows_the_room_less_retellings_whole_to_its_integrator_and_a_pointer_elsewhere(tmp_path):
-    """The flat summary and a room-less era predate rooms and were Main's memory: whole in
-    Main's room page, under their own label, for Main's integrator and for a child that starts with the top
-    level of the life account; a pointer in the story, and nothing more, for another room or consciousness;
-    nothing at all for a nanny in Main, which carries no story."""
+def test_main_room_page_shows_the_room_less_retellings_whole_to_a_nanny_and_the_story_to_everyone_else(tmp_path):
+    """The flat summary and a room-less era predate rooms and were Main's memory: whole in the story of every
+    focus that carries one (Main's integrator, a root bound elsewhere, a wake, a child), under their own label,
+    and never repeated on Main's room page; a nanny in Main carries no life account, so it gets neither their
+    text nor a pointer, while Main's own retold records stand on its room page, where the floor (F4) addresses
+    one by what it holds."""
     import json
 
     rooms = shared.world(tmp_path, flat="The retired flat summary of everything.", activate=False)
@@ -442,38 +500,35 @@ def test_main_room_page_shows_the_room_less_retellings_whole_to_its_integrator_a
                     encoding="utf-8")
     assert ChronicleStore(tmp_path).ensure_activated()["kind"] == "activation"
     main = mv.capture_memory_view(tmp_path, MAIN_TASK, mv.view_spec_for_task(MAIN_TASK, tmp_path))
-    retold = _section(mv.render_room(main), "### Retold before the update (helper retelling, not lived)")
-    for words in ("  The retired flat summary of everything.", "  A room-less era."):
-        assert retold.index(words) < retold.index("  Main was quiet.")  # older than the rooms: first
-    era = "#### legacy-b02-rlegacy — period known from the retelling text only — Unknown provenance [legacy mixed record]"
-    assert era + "\n  A room-less era." in retold
-    assert "#### legacy-b01-r1 — 2026-09-02 00:00 → 2026-09-02 00:03 (block period)\n" in retold  # Main's own: no label
-    assert "Main talk." not in retold  # the first block is whole in the story, not repeated here
-    # By address (F4) the line says what it holds.
-    short = mv.render_room(main, mv.FloorLevel(addressed=(("F4", ("legacy-b02-rlegacy",)),)))
-    assert era + " — 16 chars — memory_read(node_id='legacy-b02-rlegacy')" in short and "  A room-less era." not in short
     story = mv.render_story(main)
-    assert "The retired flat summary" not in story and "memory_read(node_id='legacy-flat-" in story
-    assert "memory_read(node_id='legacy-b02-rlegacy')" in story and "A room-less era." not in story
-    others = {"bound": {"id": "bound", "chat_id": 1},  # bound to alpha
-              "nanny": {"id": "n1", "chat_id": 1, "delegation_role": "subagent", "root_task_id": "root1", **NANNY_ROUTE},
-              "wake": {"id": "w1", "chat_id": 1, "metadata": {"usage_category": "consciousness"}}}
-    for name, task in others.items():
-        snapshot = mv.capture_memory_view(tmp_path, task, mv.view_spec_for_task(task, tmp_path))
-        room = mv.render_room(snapshot)
-        assert "A room-less era." not in room and "The retired flat summary" not in room, name
-        story = mv.render_story(snapshot)
-        if name == "nanny":  # a nanny carries no story at all, so not even the pointer
-            assert story == "" and "legacy-b02-rlegacy" not in room, name
-        else:
-            assert "memory_read(node_id='legacy-b02-rlegacy')" in story, name
-        assert snapshot.spec.room_id == {"bound": str(rooms["alpha"]), "nanny": "1", "wake": None}[name]
-    # A child starts with the top level of the life account, so Main's room-less retellings stand whole on its page.
+    era = "#### legacy-b02-rlegacy — period known from the retelling text only — Unknown provenance [legacy mixed record]"
+    assert era + " — no row of this room in that period; retold in 16 chars\n  A room-less era." in story
+    assert "  The retired flat summary of everything." in story and "  Main talk." in story and "  Main was quiet." in story
+    assert "### Retold before the update" not in mv.render_room(main)  # nothing to repeat: the story shows it all
+    nanny_task = {"id": "n1", "chat_id": 1, "delegation_role": "subagent", "root_task_id": "root1", **NANNY_ROUTE}
+    nanny = mv.capture_memory_view(tmp_path, nanny_task, mv.view_spec_for_task(nanny_task, tmp_path))
+    assert mv.render_story(nanny) == "" and nanny.spec.room_id == "1"
+    retold = _section(mv.render_room(nanny), "### Retold before the update (helper retelling, not lived)")
+    assert "A room-less era." not in retold and "The retired flat summary" not in retold and "legacy-b02-rlegacy" not in retold
+    assert "#### legacy-b00-r1 — 2026-09-01 00:00 → 2026-09-01 00:05\n  Main talk." in retold
+    assert "#### legacy-b01-r1 — 2026-09-02 00:00 → 2026-09-02 00:03 (block period)\n  Main was quiet." in retold  # Main's own: no label
+    # By address (F4) the line says what it holds.
+    short = mv.render_room(nanny, mv.FloorLevel(addressed=(("F4", ("legacy-b01-r1",)),)))
+    assert ("#### legacy-b01-r1 — 2026-09-02 00:00 → 2026-09-02 00:03 (block period) — 15 chars — "
+            "memory_read(node_id='legacy-b01-r1')") in short and "  Main was quiet." not in short
+    bound_task = {"id": "bound", "chat_id": 1}  # bound to alpha
+    bound = mv.capture_memory_view(tmp_path, bound_task, mv.view_spec_for_task(bound_task, tmp_path))
+    assert bound.spec.room_id == str(rooms["alpha"]) and mv.render_story(bound) == story
+    assert "A room-less era." not in mv.render_room(bound) and "The retired flat summary" not in mv.render_room(bound)
+    wake_task = {"id": "w1", "chat_id": 1, "metadata": {"usage_category": "consciousness"}}
+    wake = mv.capture_memory_view(tmp_path, wake_task, mv.view_spec_for_task(wake_task, tmp_path))
+    assert wake.spec.room_id == "1" and wake.room == main.room  # the wake's Main is Main's integrator's
+    assert mv.render_story(wake) == story
+    # A child starts with the top level of the life account: the same story, and a room page that repeats none of it.
     kid = {"id": "kid1", "chat_id": 1, "delegation_role": "subagent", "root_task_id": "root1"}
     child = mv.capture_memory_view(tmp_path, kid, mv.view_spec_for_task(kid, tmp_path))
-    room = mv.render_room(child)
-    assert "## This room (Main)" in room and "  Main talk." in room
-    assert "  A room-less era." in room and "  The retired flat summary of everything." in room
+    assert mv.render_story(child) == story and "## This room (Main)" in mv.render_room(child)
+    assert "Main talk." not in mv.render_room(child) and "A room-less era." not in mv.render_room(child)
 
 
 def test_each_role_sees_its_parts_of_the_live_view(tmp_path):
@@ -486,14 +541,21 @@ def test_each_role_sees_its_parts_of_the_live_view(tmp_path):
     main, main_text = _view(tmp_path, MAIN_TASK)
     assert [mark["text"] for mark in main.marks] == ["Watch root1", "Watch alpha", "For everyone"]
     wake, wake_text = _view(tmp_path, {"id": "w1", "chat_id": 1, "metadata": {"usage_category": "consciousness"}})
-    assert "## This room" not in wake_text and "- [global; Main] For everyone" in wake_text
-    assert "### Main — open 2026-09-05 10:02 → 2026-09-05 10:27; people " in wake_text  # Main is one line
-    assert "please look at X" not in wake_text and "transport words" not in wake_text  # no people's words
+    assert "- [global; Main] For everyone" in wake_text and "Watch alpha" in wake_text  # all marks, as Main's turn
+    assert _section(wake_text, "## This room (Main)") == _section(main_text, "## This room (Main)")  # byte for byte
+    assert "please look at X" in _section(wake_text, "### Open conversation since")
+    assert "### Main — " not in wake_text  # Main is this room, not a live-room line
+    live = _section(wake_text, "## Live rooms")
+    assert "alpha words" in live and "beta words" in live and "transport words" in live  # people's words, verbatim
+    assert "alpha reply" not in wake_text and "beta reply" not in wake_text  # my replies there: one read by address
+    assert f"memory_read(room_id='{rooms['alpha']}', rows=true)" in live
+    assert "alpha words" not in main_text and "beta words" not in main_text  # the Main turn keeps its one line per room
     child_task = {"id": "kid9", "chat_id": 1, "delegation_role": "subagent", "root_task_id": "root1",
                   "metadata": words}
     child, child_text = _view(tmp_path, child_task)
     assert mv.render_story(child).startswith("## My story\n") and "## This room (Main) — head " in child_text
-    assert "### Retold before the update" in child_text and "### Open conversation" not in child_text
+    assert "  Old Main talk." in mv.render_story(child)  # the retold record is in its story, whole, as in Main's
+    assert "### Retold before the update" not in child_text and "### Open conversation" not in child_text
     assert "## Live rooms" not in child_text and "Watch alpha" not in child_text and "Watch root1" in child_text
     assert child_text.startswith("## Words of my human that caused this work (verbatim)\n")
     assert "Find the cause" in child_text and "Find the cause" not in main_text

@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros import loop, model_wait, usage_accounting as ua
+from ouroboros.context_budget import HOST_CONTEXT_KIND_KEY
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_claudexor import cache_key_for_model
 from ouroboros.loop_model_call import _reprepare_waiting_main
@@ -18,6 +19,7 @@ from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from tests.test_context_fit_integration import _plan
 from tests.test_llm_claudexor import MODEL, ROUTE, result, ledger, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
+from tests._usage_store_testing import dispatched_attempts
 
 setup = gateway_fixture
 live_wait = wait_fixture
@@ -64,6 +66,22 @@ def main_call(live_wait, monkeypatch):
     return ctx, gateway, controller, events, decide, observations
 
 
+def _without_context_facts(messages, *, physical=False):
+    """Compare protocol/source bytes independently of the required, validated facts tail."""
+    from ouroboros.loop_messages import CONTEXT_FACTS_HEADER, CONTEXT_FACTS_NAME
+
+    facts = ([row for row in messages if row.get("role") == "user" and isinstance(row.get("content"), str)
+              and row["content"].startswith(CONTEXT_FACTS_HEADER + " ")] if physical else
+             [row for row in messages if row.get(HOST_CONTEXT_KIND_KEY) == CONTEXT_FACTS_NAME])
+    assert facts, "Main dispatch/reprepare must include its own context facts"
+    assert all(row["role"] == "user" and isinstance(row["content"], str)
+               and row["content"].startswith(CONTEXT_FACTS_HEADER + " ") for row in facts)
+    assert all("name" not in row for row in facts)
+    if physical:
+        assert all(HOST_CONTEXT_KIND_KEY not in row for row in facts)
+    return [row for row in messages if row not in facts]
+
+
 def _failed(code, route=ROUTE):
     return result(outcome="failed", route=route, problem={"code": code, "message": code})
 
@@ -86,15 +104,16 @@ def test_native_account_repair_rebinds_real_physical_candidate_before_send(main_
     else:
         answer, _cost, _mode = _dispatch(ctx)
         assert answer["content"] == result()["message"]["content"]
-    rows = ledger(ctx.drive_root)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
-    dispatched = [row for row in rows if row["state"] == "dispatched"]
+    rows = ledger(ctx.drive_root)  # one current row per attempt: the released send, then the answered one
+    assert [(row["state"], row["revision"]) for row in rows] == [("released", 4), ("settled", 3)]
+    assert rows[0]["physical_failure"]["stage"] == "raised_exception"
+    dispatched = dispatched_attempts(ctx.drive_root)
     assert dispatched[0]["physical_context"]["route_fp"] == "capacity-account-a"
     assert dispatched[1]["physical_context"]["route_fp"] == "capacity-account-b"
     assert dispatched[1]["physical_context"]["capacity_total_tokens"] == 240_000
     assert observations[0]["model_route"] == ROUTE_B
     assert len(gateway.accepted_operations) == 2 and gateway.creates[0] != gateway.creates[1]
-    resent = gateway.uploads[1][0]["messages"]
+    resent = _without_context_facts(gateway.uploads[1][0]["messages"], physical=True)
     assert "nativeContinuation" not in resent[2]
     # A Main round's repaired send is a new host preparation: canonical rows, then its own
     # clock line. The bare async driver binds no Main clock.
@@ -146,11 +165,13 @@ def test_wait_reprepares_vision_from_canonical_images(main_call, monkeypatch, im
     assert answer and len(gateway.accepted_operations) == 2
     # The consumed clock line of the answered send now closes the canonical transcript.
     assert ctx.messages[-1]["content"] == gateway.uploads[1][0]["messages"][-1]["content"]
-    assert ctx.messages[-2]["content"] == original[-1]["content"]
-    sent = [item[0]["messages"][-2]["content"] for item in gateway.uploads]
+    canonical = _without_context_facts(ctx.messages)
+    assert canonical[:-1] == original  # only the consumed clock may follow the exact source rows
+    assert canonical[-2]["content"] == original[-1]["content"]
+    sent = [_without_context_facts(item[0]["messages"], physical=True)[-2]["content"] for item in gateway.uploads]
     assert sent[0] == sent[1] and "image_url" not in str(sent)
     assert len(captions) == (1 if image_mode == "caption" else 0)
-    assert ctx.messages[-3]["content"] == "verified read A"
+    assert canonical[-3]["content"] == "verified read A"
 
 
 def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, monkeypatch, tmp_path):
@@ -223,9 +244,10 @@ def test_reprepare_selected_vision_route_preserves_source_and_accounts_caption(m
     with ua.bind_physical_attempt_context(physical):
         prepared = _reprepare_waiting_main(ctx, {"messages": sent, "model": "openai::vision-route",
                                                 "model_role": "main", "tools": []})
-    assert (prepared.kwargs["messages"][-1]["content"] == [image]) is not inline_first
-    assert "image caption" in str(prepared.kwargs["messages"][-1]["content"] if inline_first else sent[-1]["content"])
-    assert ctx.messages[-1]["content"] == [image] and captions == [True]
+    prepared_source = _without_context_facts(prepared.kwargs["messages"])
+    assert (prepared_source[-1]["content"] == [image]) is not inline_first
+    assert "image caption" in str(prepared_source[-1]["content"] if inline_first else sent[-1]["content"])
+    assert _without_context_facts(ctx.messages)[-1]["content"] == [image] and captions == [True]
     assert ctx.accumulated_usage["cost"] == 0.01
 
 
@@ -321,7 +343,8 @@ def test_manual_switch_updates_only_waiting_role_and_continues_current_main_call
     assert controller.overrides == {"main": {"model": destination, "use_local": use_local, "model_account_override": pin}}
     assert json.loads(__import__("os").environ[MODEL_ACCOUNTS_KEY])["light"] == "light-account"
     assert cost == (None if destination == MODEL else 0 if use_local else 0.2)
-    rows = [row for row in ctx.messages if not str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX)]
+    rows = [row for row in _without_context_facts(ctx.messages)
+            if not str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX)]
     assert rows[-2]["content"] == "verified read A" and rows[-1]["content"] == "completed review B"
     # Only a real stamping lane seals — and so replays — a clock line; this fixture's direct lane does not.
     assert str(ctx.messages[-1]["content"]).startswith(CLOCK_NOTE_PREFIX) is (destination == MODEL)
@@ -333,7 +356,7 @@ def test_manual_switch_updates_only_waiting_role_and_continues_current_main_call
 def test_main_control_interrupt_is_typed_no_retry_and_keeps_operation_custody(main_call, monkeypatch):
     ctx, gateway, controller, _events, _decide, _observations = main_call
     gateway.pending = True
-    monkeypatch.setattr(controller, "control_reason", lambda: "cancelled" if gateway.accepted_operations else None)
+    monkeypatch.setattr(controller, "control_reason", lambda **_kw: "cancelled" if gateway.accepted_operations else None)
     with pytest.raises(model_wait.ModelWaitInterrupted) as raised:
         _dispatch(ctx)
     error = raised.value
@@ -346,7 +369,7 @@ def test_main_control_interrupt_is_typed_no_retry_and_keeps_operation_custody(ma
 
 def test_cancel_after_result_keeps_settled_usage_and_exact_result(main_call, monkeypatch):
     ctx, gateway, controller, _events, _decide, _observations = main_call
-    monkeypatch.setattr(controller, "control_reason", lambda: "cancelled" if gateway.acks else None)
+    monkeypatch.setattr(controller, "control_reason", lambda **_kw: "cancelled" if gateway.acks else None)
     with pytest.raises(model_wait.ModelWaitInterrupted) as raised:
         _dispatch(ctx)
     assert raised.value.model_result == result()
@@ -411,8 +434,8 @@ def test_same_round_delivery_uses_the_route_changed_inside_model_call(tmp_path, 
         call.active_model, call.active_use_local = "local-destination", True
         return {"role": "assistant", "content": "finished"}, 0, "max"
 
-    def final(_content, limit, trace, tools, *_args, explicit_candidate=False):
-        assert not explicit_candidate  # This fixture's first ordinary reply stays plain.
+    def final(_content, limit, trace, tools, *_args, explicit_candidate=False, resume_candidate=False):
+        assert not explicit_candidate and not resume_candidate  # This fixture's first ordinary reply stays plain.
         assert limit.active_model == tools._ctx.active_model == "local-destination"
         assert limit.active_use_local is tools._ctx.active_use_local is True
         return "finished", limit.accumulated_usage, trace
@@ -510,7 +533,8 @@ def _run_loop(tmp_path, monkeypatch, rounds, registry=None):
         reply = next(replies)
         return reply(call) if callable(reply) else reply
 
-    def tools_then_steering(calls, _tools, _logs, _task, _executor, messages, *_args):
+    def tools_then_steering(calls, _tools, _logs, _task, _executor, messages, *_args,
+                            fit_candidate=None, tool_schemas=None):
         messages.append({"role": "tool", "tool_call_id": calls[0]["id"], "content": "done"})
         # Owner steering and host notices arrive as user turns INSIDE one loop;
         # they must never be read as the start of a new transport turn (P5).
@@ -518,7 +542,8 @@ def _run_loop(tmp_path, monkeypatch, rounds, registry=None):
 
     monkeypatch.setattr(loop, "_call_round_model", call_round)
     monkeypatch.setattr(loop, "_no_tool_final_answer",
-                        lambda _content, limit, trace, *_args, explicit_candidate=False: ("finished", limit.accumulated_usage, trace))
+                        lambda _content, limit, trace, *_args, explicit_candidate=False, resume_candidate=False:
+                        ("finished", limit.accumulated_usage, trace))
     monkeypatch.setattr(loop, "handle_tool_calls", tools_then_steering)
     registry = registry if registry is not None else ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
     loop.run_llm_loop(

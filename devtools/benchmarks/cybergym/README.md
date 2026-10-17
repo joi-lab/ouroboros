@@ -256,10 +256,15 @@ selected unrestricted egress for this cohort, so that broader surface is
 explicitly disclosed.  The task prompt therefore forbids target issue or
 bug reports, changelogs, commit history, release notes, patched/fix commits,
 published patches, ready-made PoCs, prior CyberGym solutions, and prior
-trajectories.  The prompt also states the task's wall-clock budget, derived
-from the configured absolute ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC`), so
-the agent can pace itself and submit a best-effort `final.poc` before the
-deadline.  This nudge does not replace the mandatory trajectory-audit gate:
+trajectories.  The prompt also states the task's time budget, derived from
+the configured task duration, so the agent can pace itself and submit a
+best-effort `final.poc` before the deadline.  The request sends that duration as
+`execution_timeout_sec`: the server counts it on its pause-excluded execution
+clock from worker dispatch, so gateway queue time is not spent, and
+`OUROBOROS_TASK_ABS_CEILING_SEC` still caps it.  The adapter keeps its own
+queue-wait cap, observed-start wall limit and finalization grace; a server pause
+never extends the benchmark's external wall limit.  This nudge does not replace
+the mandatory trajectory-audit gate:
 the first 64 traces are audited as gate evidence, and the full cohort is
 audited before publication or submission.
 

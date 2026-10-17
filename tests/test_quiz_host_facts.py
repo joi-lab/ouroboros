@@ -150,6 +150,9 @@ def test_send_quiz_carries_host_facts_and_names_the_project_on_the_event_only(tm
 
 
 def test_send_quiz_without_host_facts_or_project_adds_neither(tmp_path, monkeypatch):
+    from ouroboros.owner_quiz import record_asked
+
+    record_asked(tmp_path, "task-2", quiz_id="q-2", question="Which storage?", options=[option["label"] for option in _OPTIONS], assumption="Local")
     bridge, frames, events = _bridge(tmp_path, monkeypatch)
     assert bridge.send_quiz(1, quiz_id="q-2", question="Which storage?", options=_OPTIONS,
                             assumption="Local", task_id="task-2")[0]
@@ -178,7 +181,11 @@ def test_history_replays_the_block_sentence_for_a_row_logged_without_it(tmp_path
     assert "host_facts" not in rows["q-4"]
 
 
-def test_the_supervisor_event_handler_forwards_host_facts_to_send_quiz():
+def test_the_supervisor_event_handler_forwards_host_facts_to_send_quiz(tmp_path):
+    from ouroboros.owner_quiz import record_asked
+
+    for qid in ("q-5", "q-6"):
+        record_asked(tmp_path, "t-5", quiz_id=qid, question="Q?", options=["A"], assumption="a")
     from types import SimpleNamespace
 
     from supervisor.events_chat_delivery import _handle_send_quiz
@@ -190,10 +197,10 @@ def test_the_supervisor_event_handler_forwards_host_facts_to_send_quiz():
             sent.append((chat_id, kwargs))
             return True, "ok"
 
-    ctx = SimpleNamespace(bridge=Bridge())
+    ctx = SimpleNamespace(bridge=Bridge(), DRIVE_ROOT=tmp_path, append_jsonl=lambda *a, **kw: None)
     evt = {"type": "send_quiz", "chat_id": 1, "quiz_id": "q-5", "question": "Q?", "options": _OPTIONS,
            "assumption": "a", "task_id": "t-5", "host_facts": "Asked by task t-5, origin unknown."}
     _handle_send_quiz(evt, ctx)
-    _handle_send_quiz({**evt, "host_facts": ""}, ctx)
+    _handle_send_quiz({**evt, "quiz_id": "q-6", "host_facts": ""}, ctx)
     assert sent[0][1]["host_facts"] == "Asked by task t-5, origin unknown."
     assert sent[1][1]["host_facts"] == ""

@@ -1,6 +1,6 @@
 """The local llama.cpp lane and its context budget.
 
-A local model has no vision, a small window, and no cost. Fitting a transcript
+Our local lane carries no images, has a small window, and costs nothing. Fitting a transcript
 into that window is a policy decision — compact the sections a local run can
 lose, keep the ones it cannot, and refuse rather than silently truncate — so the
 compaction rules live beside the send that depends on them.
@@ -25,7 +25,8 @@ from ouroboros.llm_attempt import (
     _finalized_physical_candidate,
     _is_structured_context_overflow_exception,
 )
-from ouroboros.usage_accounting import PhysicalAttemptCapture, UsageAccountingError, current_physical_attempt_context
+from ouroboros.usage_accounting import UsageAccountingError, current_physical_attempt_context
+from ouroboros.transport_custody import outcome_unknown_on_chain
 
 # The moved warnings keep the logger identity they were emitted under.
 log = logging.getLogger("ouroboros.llm")
@@ -99,6 +100,7 @@ _LOCAL_COMPACTION_MODES = {
         {
             "Shared understanding",
             "Words of my human that caused this work",
+            "Late review feedback",
             "Marks I keep in view",
             "This room",
             "Scratchpad",
@@ -122,6 +124,24 @@ _LOCAL_COMPACTION_MODES = {
         "Non-core sections were compacted for local execution.",
     ),
 }
+# Titles only the identity/story block carries (its semi-stable set minus what C keeps too).
+_STORY_TITLES = _LOCAL_COMPACTION_MODES["semi_stable"][0] - _LOCAL_COMPACTION_MODES["dynamic"][0]
+
+
+def _local_block_mode(text: str, idx: int, count: int) -> str:
+    """The compaction profile of system block ``idx`` of ``count``, chosen by role.
+
+    The first block is governance and the last the changing block C. In Max the
+    optional handbook D stands between governance and the identity/story block B
+    (``context_fit._system_blocks``), so B is the middle block carrying my identity or
+    story, not the second one; every other middle block is a book, compacted as static.
+    """
+    if idx == 0:
+        return "static"
+    if idx == count - 1:
+        return "dynamic"
+    titles = {title.split("(")[0].strip() for title, _section in _split_markdown_sections(text)[1]}
+    return "semi_stable" if titles & _STORY_TITLES else "static"
 
 
 def _compact_local_text(text: str, mode: str) -> str:
@@ -170,12 +190,7 @@ class _LocalLaneMixin:
                     if not isinstance(block, dict) or block.get("type") != "text":
                         continue
                     block_text = str(block.get("text", ""))
-                    if idx == 0:
-                        block["text"] = _compact_local_text(block_text, "static")
-                    elif idx == 1:
-                        block["text"] = _compact_local_text(block_text, "semi_stable")
-                    else:
-                        block["text"] = _compact_local_text(block_text, "dynamic")
+                    block["text"] = _compact_local_text(block_text, _local_block_mode(block_text, idx, len(content)))
             elif isinstance(content, str):
                 msg["content"] = _compact_local_text(content, "system")
             break
@@ -205,14 +220,9 @@ class _LocalLaneMixin:
                 messages, allow_message_cache_control=False, flatten_tool_content_blocks=True,
             )
         )
-        # Local llama.cpp has no vision; avoid flattening base64 into the prompt.
-        for msg in clean_messages:
-            content = msg.get("content")
-            if not isinstance(content, list):
-                continue
-            for idx, block in enumerate(content):
-                if isinstance(block, dict) and str(block.get("type") or "") in ("image_url", "image"):
-                    content[idx] = {"type": "text", "text": "[image omitted: model has no vision]"}
+        # Our llama.cpp lane is launched without a vision handler: keep base64 out
+        # of the text prompt and name the lane, never the model.
+        clean_messages = self._replace_image_blocks_with_placeholder(clean_messages, "local llama.cpp")
         ctx_len, local_max = local_context_limits(max_tokens)
         if ctx_len > 0 and compact:
             clean_messages = self._prepare_messages_for_local_context(clean_messages, ctx_len, local_max)
@@ -350,8 +360,7 @@ class _LocalLaneMixin:
                     or context_overflow_message(err)):
                 raise LocalContextTooLargeError(err) from exc
             # Exception-owned capture proves this attempt; prior ContextVar may be unrelated.
-            capture = getattr(exc, "physical_attempt_capture", None)
-            if isinstance(capture, PhysicalAttemptCapture) and capture.state in {"dispatched", "unresolved"}:
+            if outcome_unknown_on_chain(exc):
                 raise  # Outer custody owns an unknown physical outcome.
             log.warning("Local model request failed: %s", exc)
             raise

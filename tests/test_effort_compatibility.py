@@ -1,7 +1,6 @@
 """Effort constraints and evidence through the existing physical send drivers."""
 import asyncio
 import copy
-import json
 
 import pytest
 
@@ -24,6 +23,7 @@ from tests.test_request_wire_recovery_phase2b import (
 from tests.test_request_wire_recovery_phase2b import (
     evidence_root as _evidence_root,
 )
+from tests._usage_store_testing import ledger_rows
 
 evidence_root = _evidence_root
 
@@ -148,7 +148,7 @@ def test_enum_without_scalar_echo_reaches_driver_and_learns_only_after_success(
     assert usage["effort"]["sent"] == {"extra_body.reasoning": {"effort": applied, "exclude": False}}
     assert usage["effort"]["reported"] is None
     assert usage["request_wire"]["applied_effort_source"] == "sent_candidate"
-    rows = [json.loads(line) for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     assert rows[-1]["state"] == "settled"
     assert rows[-1]["effort"] == usage["effort"]
     assert "effort_resolution" not in rows[-1] and "effort_resolution" not in usage
@@ -548,10 +548,8 @@ def test_original_preference_survives_native_mapping_in_usage_and_ledger(evidenc
         attach_processing_receipt(target, usage)
     assert usage["effort"]["requested"] == requested
     assert usage["effort"]["reported"] is None
-    rows = [json.loads(line) for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()]
-    reserved = next(row for row in rows if row["state"] == "reserved")
-    assert reserved["effort"] == usage["effort"]
-    assert rows[-1]["state"] == "settled"
+    rows = ledger_rows(tmp_path)  # one row per attempt: the settled row carries the candidate effort
+    assert [row["state"] for row in rows] == ["settled"]
     assert rows[-1]["effort"] == usage["effort"]
 
 
@@ -562,6 +560,7 @@ def test_switch_model_next_round_keeps_preference_after_native_projection(tmp_pa
 
     ctx = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)._ctx
     monkeypatch.setattr(LLMClient, "available_models", lambda *_: ["zai::future", "openai::future"])
+    monkeypatch.setattr("ouroboros.config._BOOT_RUNTIME_MODE", "cyber_pro")  # Main applies a switch here only
     assert "next round" in _switch_model(ctx, model="zai::future", effort="ultra")
     model, local, effort = _apply_runtime_overrides(ctx, "openai::future", False, "medium")
     assert (model, local, effort) == ("zai::future", False, "ultra")
@@ -590,7 +589,7 @@ def test_native_omission_is_recorded_without_inventing_provider_effort(tmp_path,
         "requested": "ultra", "sent": {}, "sent_state": "omitted", "sent_source": "host_candidate",
         "reported": None, "report_source": None,
     }
-    rows = [json.loads(line) for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     assert rows[-1]["state"] == "settled"
     assert rows[-1]["effort"] == usage["effort"]
 
@@ -616,7 +615,7 @@ def test_local_driver_retains_known_intent_with_omitted_effort(tmp_path, monkeyp
         "requested": "ultra", "sent": {}, "sent_state": "omitted", "sent_source": "host_candidate",
         "reported": None, "report_source": None,
     }
-    rows = [json.loads(line) for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()]
+    rows = ledger_rows(tmp_path)
     assert rows[-1]["state"] == "settled" and rows[-1]["effort"] == usage["effort"]
 
 
@@ -642,9 +641,155 @@ def test_late_receipt_keeps_candidate_effort_without_inheriting_an_older_report(
         # A historical administrative row may contain an older observation.
         ua._transition(reservation, "settled", settle_reason="abandoned", cost_usd=None, cost_final=False,
                        effort={**request.effort, "reported": "high", "report_source": "provider_response"})
+        assert ledger_rows(tmp_path)[-1]["effort"]["reported"] == "high"
         ua.settle_attempt(reservation, {}, cost_usd=0.25, cost_final=True)
-    rows = [json.loads(line) for line in (tmp_path / ua.LEDGER_REL).read_text().splitlines()]
-    assert rows[-2]["effort"]["reported"] == "high"
+    rows = ledger_rows(tmp_path)
     assert rows[-1]["effort"] == request.effort
     assert rows[-1]["settle_reason"] == "late_receipt"
     assert rows[-1]["cost_usd"] == 0.25 and rows[-1]["cost_final"] is True
+
+
+def _remember_wire_repairs(target, source, surface, errors):
+    from ouroboros.request_wire_recovery import finalize_wire_response, note_wire_send_succeeded
+
+    with request_wire_call_scope():
+        sent = prepare_wire_payload_for_send(target, source, api_surface=surface)
+        for error in errors:
+            sent = plan_next_wire_retry(sent, error=_exception(error), target=target)
+            assert sent is not None
+        note_wire_send_succeeded(_capture(sent, target))
+        finalize_wire_response({"role": "assistant", "content": "ok"}, {})
+
+
+@pytest.mark.parametrize("carrier", ["nested", "top", "anthropic"])
+@pytest.mark.parametrize("remaining", [("temperature", "top_p"), ("top_p",), ()])
+def test_learned_drop_applicability_preserves_other_actions(evidence_root, carrier, remaining):
+    from ouroboros.request_wire_recovery import current_wire_candidate
+
+    provider = {"nested": "openrouter", "top": "openai", "anthropic": "anthropic"}[carrier]
+    field = {"nested": "reasoning.effort", "top": "reasoning_effort", "anthropic": "output_config.effort"}[carrier]
+    target = {**_target(provider), "requested_reasoning_effort": "ultra"}
+    surface = "messages" if carrier == "anthropic" else "chat.completions"
+    source = {**_value_payload(carrier, target, "ultra"), "top_p": 0.8}
+    _remember_wire_repairs(target, source, surface, [
+        _error("Invalid option", param=field, allowed_values=["high", "max"]),
+        _error("Unsupported parameters: temperature, top_p"),
+    ])
+    before = _store(evidence_root)
+    source = {key: value for key, value in source.items()
+              if key not in {"temperature", "top_p"} or key in remaining}
+    original = copy.deepcopy(source)
+    with request_wire_call_scope():
+        sent = prepare_wire_payload_for_send(target, source, api_surface=surface)
+        candidate = current_wire_candidate()
+        assert candidate is not None
+        assert payload_effort(sent) == "max"
+        expected = set() if len(remaining) == 2 else set(remaining)
+        assert {key for key in ("temperature", "top_p") if key in sent} == expected
+        drops = [item for item in candidate.applied_actions if item.action["kind"] == "drop_field"]
+        assert len(drops) == (1 if len(remaining) == 2 else 0)
+        if remaining == ("top_p",):
+            retry = plan_next_wire_retry(sent, error=_exception(_error("top_p is unsupported")))
+            assert retry is not None and "top_p" not in retry
+            assert payload_effort(retry) == "max"
+    assert source == original
+    assert _store(evidence_root) == before  # Preparation and refusal never rewrite learned evidence.
+    if remaining == ("top_p",):
+        _remember_wire_repairs(target, source, surface, [_error("top_p is unsupported")])
+        with request_wire_call_scope():
+            # The grouped and single-field records now overlap. Applying either
+            # must leave the other inapplicable without losing the candidate.
+            restored = {**source, "temperature": 0.4}
+            sent = prepare_wire_payload_for_send(target, restored, api_surface=surface)
+            assert current_wire_candidate() is not None
+            assert payload_effort(sent) == "max"
+            assert "temperature" not in sent and "top_p" not in sent
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("body_error", [False, True])
+@pytest.mark.parametrize("carrier", ["nested", "top"])
+def test_chat_driver_recovers_after_inapplicable_learned_drop(
+    evidence_root, tmp_path, asynchronous, body_error, carrier,
+):
+    target = {**_target("openrouter" if carrier == "nested" else "openai"),
+              "requested_reasoning_effort": "ultra"}
+    source = _value_payload(carrier, target, "ultra")
+    _remember_wire_repairs(target, source, "chat.completions", [_error("temperature is unsupported")])
+    source.pop("temperature")
+    original, before, sent = copy.deepcopy(source), _store(evidence_root), []
+    field = "reasoning.effort" if carrier == "nested" else "reasoning_effort"
+    rejection = _error("Invalid option", param=field, allowed_values=["high", "max"])
+
+    def send(**candidate):
+        sent.append(copy.deepcopy(candidate))
+        assert _store(evidence_root) == before
+        if len(sent) == 1:
+            if body_error:
+                return _Response({"error": rejection, "choices": [], "usage": {}})
+            raise _exception(rejection)
+        return _Response({"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                          "usage": {"cost": 0.125}})
+
+    async def send_async(**candidate):
+        return send(**candidate)
+
+    client = LLMClient(api_key="unused")
+
+    async def call_async():
+        response = await client._create_chat_completion_with_retries_async(send_async, source, target)
+        return client._normalize_remote_response(response.model_dump(), target, skip_cost_fetch=True)
+
+    with request_wire_call_scope(), ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="learned-drop")):
+        if asynchronous:
+            _, usage = asyncio.run(call_async())
+        else:
+            response = client._create_chat_completion_with_retries(send, source, target)
+            _, usage = client._normalize_remote_response(response.model_dump(), target, skip_cost_fetch=True)
+    assert source == original
+    assert [payload_effort(candidate) for candidate in sent] == ["ultra", "max"]
+    assert all("temperature" not in candidate for candidate in sent)
+    assert usage["effort"]["requested"] == "ultra" and usage["effort"]["reported"] is None
+    assert usage["request_wire"]["applied_effort"] == "max"
+    assert all(item["action"]["kind"] != "drop_field" for item in usage["request_wire"]["applied_actions"])
+    assert ledger_rows(tmp_path)[-1]["effort"] == usage["effort"]
+    with request_wire_call_scope():
+        assert payload_effort(prepare_wire_payload_for_send(target, source, api_surface="chat.completions")) == "max"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_messages_recovers_after_inapplicable_learned_drop(evidence_root, tmp_path, monkeypatch, asynchronous):
+    import json
+    import requests
+
+    target = {**_target("anthropic"), "requested_reasoning_effort": "ultra"}
+    client = LLMClient(api_key="unused")
+    messages = [{"role": "user", "content": "probe"}]
+    source = client._build_remote_candidate(target, messages, "ultra", 32, "auto", 0.4, None)
+    _remember_wire_repairs(target, source, "messages", [_error("temperature is unsupported")])
+    before, sent = _store(evidence_root), []
+
+    def post(url, **kwargs):
+        sent.append(copy.deepcopy(kwargs["json"]))
+        assert _store(evidence_root) == before
+        response = requests.Response()
+        response.url = url
+        response.status_code = 400 if len(sent) == 1 else 200
+        response.reason = "Bad Request" if len(sent) == 1 else "OK"
+        body = ({"error": {"type": "invalid_request_error", "message":
+                          'output_config.effort: expected one of "high"|"max"'}} if len(sent) == 1 else
+                {"content": [{"type": "text", "text": "ok"}], "stop_reason": "end_turn", "usage": {}})
+        response._content = json.dumps(body).encode("utf-8")
+        return response
+
+    monkeypatch.setattr(requests, "post", post)
+    with ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="native-learned-drop")):
+        args = (target, messages, None, "ultra", 32, "auto")
+        message, usage = (asyncio.run(client._chat_anthropic_async(*args)) if asynchronous
+                          else client._chat_anthropic(*args))
+    assert message["content"] == "ok"
+    assert [payload_effort(candidate) for candidate in sent] == ["ultra", "max"]
+    assert all("temperature" not in candidate for candidate in sent)
+    assert usage["effort"]["requested"] == "ultra" and usage["effort"]["reported"] is None
+    assert usage["request_wire"]["applied_effort"] == "max"
+    assert ledger_rows(tmp_path)[-1]["effort"] == usage["effort"]

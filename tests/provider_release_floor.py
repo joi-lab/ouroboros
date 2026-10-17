@@ -56,7 +56,8 @@ def _report(states: dict[str, str] | None, enforce: bool) -> tuple[str, list[str
         verdict = f"The release is blocked{named}." if offenders else "The release floor is met."
         return f"{counted} Enforced on this ref. {verdict}", offenders
     would = f"be blocked{named}" if offenders else "pass"
-    return f"{counted} Not enforced on this ref; a release tag at this commit would {would}.", offenders
+    return (f"{counted} Not enforced on this ref; the required-provider floor would {would}. "
+            "This does not establish whole-job success or release approval."), offenders
 
 
 def main(argv: list[str] | None = None) -> int:

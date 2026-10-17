@@ -133,11 +133,11 @@ def test_saved_secret_show_preserves_settings_and_drafts(direct_server_with_data
 
             page.click('[data-settings-tab="advanced"]')
             mcp = page.locator("[data-mcp-card]").first
-            mcp.locator("[data-mcp-token-toggle]").click()
+            mcp.locator("[data-mcp-header-toggle]").click()
             expect(mcp.locator(".settings-secret-value")).to_have_text(MCP)
             assert reveals[-1] == {"mcp_server_id": "saved_mcp"}
             mcp.locator('[data-mcp-field="id"]').fill("renamed-mcp")
-            mcp.locator("[data-mcp-token-toggle]").click()
+            mcp.locator("[data-mcp-header-toggle]").click()
             expect(mcp.locator(".settings-secret-value")).to_have_text(MCP)
             expect(mcp.locator(".settings-secret-source")).to_have_text("Saved value for saved_mcp")
             assert reveals[-1] == {"mcp_server_id": "saved_mcp"}

@@ -167,24 +167,22 @@ def test_grant_without_a_new_attempt_is_not_a_phantom_repeat(tmp_path):
         ("continued", "continuation_outcome_unknown", 1)]
 
 
-def test_unknown_policy_admits_direct_turns_but_not_presence_or_a_readable_operation(tmp_path):
-    """Owner decision 1A: a direct turn's eligible unknown outcome enters the same wait and
-    continuation as a queued one, inside its interactive bound. Inline Presence keeps its own
-    no-resend terminal, and an accepted operation whose read failed is only rejoined."""
+@pytest.mark.parametrize("presence", [{}, {"current_task_type": "presence"},
+                                     {"task_metadata": {"presence": {"binding": "b"}}}])
+def test_unknown_policy_admits_direct_turns_but_not_a_readable_operation(tmp_path, presence):
+    """Direct turns, including Presence, share bounded recovery; accepted operations only rejoin."""
     notes = []
-    direct = SimpleNamespace(task_id="t", is_direct_chat=True, _accumulated_usage={})
+    direct = SimpleNamespace(task_id="t", is_direct_chat=True, _accumulated_usage={}, **presence)
     episode = transport.reconcile_transport_wait(None, direct, msg_present=False,
         error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
         emit_progress=lambda text, **_kw: notes.append(text))
     assert episode is not None and episode.interactive and episode.wait_cause == "provider_outcome_unknown"
     assert episode.wait_bound_sec is not None and notes and "Stop cancels" not in notes[0]
     readable = {"_pending_transport_outcome": {"physical_attempt_id": "a", "same_operation_recoverable": True}}
-    for ctx in (SimpleNamespace(task_id="t", is_direct_chat=True, current_task_type="presence", _accumulated_usage={}),
-                SimpleNamespace(task_id="t", _accumulated_usage=readable),
-                SimpleNamespace(task_id="t", task_metadata={"presence": {"binding": "b"}}, _accumulated_usage={})):
-        assert transport.reconcile_transport_wait(None, ctx, msg_present=False,
-            error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
-            emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
+    direct._accumulated_usage = readable
+    assert transport.reconcile_transport_wait(None, direct, msg_present=False,
+        error_kind="provider_outcome_unknown", drive_logs=tmp_path, task_id="t", model="m",
+        emit_progress=lambda *a, **kw: pytest.fail("unexpected automatic continuation")) is None
 
 
 def test_deadline_closes_unknown_wait_without_a_probe_or_send(tmp_path, monkeypatch):
@@ -287,8 +285,9 @@ def test_managed_continuation_keeps_old_money_and_mints_one_new_attempt(tmp_path
         text, usage, _ = run_llm_loop(**ledger_kwargs(tmp_path, llm, []))
     assert text == "done" and llm.calls == 2 and observations == [1]
     rows = _ledger(tmp_path)
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved", "reserved", "dispatched", "settled"]
-    old, new = rows[0]["attempt_id"], rows[3]["attempt_id"]
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4), ("settled", 3)]
+    assert rows[0]["physical_failure"]
+    old, new = rows[0]["attempt_id"], rows[1]["attempt_id"]
     assert old != new
     assert usage["transport_recovery"]["previous_attempt"]["physical_attempt_id"] == old
     assert ua.usage_projection(tmp_path)["unresolved_upper_bound_usd"] == 1.0
@@ -296,18 +295,23 @@ def test_managed_continuation_keeps_old_money_and_mints_one_new_attempt(tmp_path
 
 @pytest.mark.parametrize("reported_model", ["absent", None, "test"])
 @pytest.mark.parametrize("axis", ["matching", "empty", "before_wait", "source", "profile", "fingerprint", "model", "local"])
-def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis, reported_model):
+@pytest.mark.parametrize("advisory", [False, True])
+def test_catalog_reachability_binds_effective_account_and_wait_start(monkeypatch, axis, reported_model, advisory):
     import time
     from ouroboros import llm_claudexor
     started = time.time() - 10
     catalog = dict(source="codex", credentialProfileId="effective-profile", accountFingerprint="account-a",
                    observedAt=datetime.fromtimestamp(started + 1, timezone.utc).isoformat(),
                    provenance="provider_http", models=[{"id": "test"}])
+    if advisory:
+        catalog.update(models=[], admission={"requestedModel": "test", "inventoryAbsence": "advisory"})
     if axis == "before_wait": catalog["observedAt"] = datetime.fromtimestamp(started - 1, timezone.utc).isoformat()
     if axis == "source": catalog["source"] = "foreign"
     if axis == "profile": catalog["credentialProfileId"] = "foreign"
     if axis == "fingerprint": catalog["accountFingerprint"] = "foreign"
-    if axis == "model": catalog["models"] = [{"id": "foreign"}]
+    if axis == "model":
+        catalog["models"] = [{"id": "foreign"}]
+        if advisory: catalog["admission"]["requestedModel"] = "foreign"
     if axis == "local": catalog["provenance"] = "local_cache"
     if axis == "empty": catalog = {}
     route = {"source": "codex", "credentialProfileId": "effective-profile", "accountFingerprint": "account-a"}

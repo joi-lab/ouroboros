@@ -119,7 +119,10 @@ def test_continue_of_a_converted_task_admits_its_new_root_in_the_converted_room(
     worker_task = _start(host, chat_id=raw_chat, project_id=raw_project)
     project = _convert(host)
     pid, chat = project["id"], project["chat_id"]
-    assert host.workers.RUNNING["pred-1"]["task"]["project_id"] == pid, "the conversion moved the live lane"
+    # Placement is the durable binding; the executing lane keeps its lease until its next
+    # execution boundary (D5: no relabelling of an executing lease).
+    assert project_binding_for_task(host.root, "pred-1")["project_id"] == pid
+    assert host.workers.RUNNING["pred-1"]["task"]["project_id"] == raw_project, "the conversion relabelled the live lane"
     # The room's folder may be (re)attached later; Continue keeps the prepared one.
     elsewhere = host.root / "room-folder"
     elsewhere.mkdir()
@@ -196,10 +199,13 @@ def test_main_and_native_project_continue_keep_their_own_room(host, case):
     assert (bound or {}).get("project_id") == (pid if case == "native-bound" else None)
     rooms = _room_of(host, successor, row)
     assert rooms["live"] == chat
-    if case == "native-bound":
-        assert rooms == {"live": chat, "late": chat, "child": chat, "tree": chat, "delivery": chat}
+    if case == "main":
+        assert rooms["tree"] == 0, "Main work gains no Project room"
+    elif case == "native":  # a room-born root is addressed to its room unbound (the one room rule);
+        # an id the store never admitted ("helper-1") has no room of its own yet: the caller keeps its address
+        assert {key: rooms[key] for key in ("live", "late", "tree", "child")} == {"live": chat, "late": chat, "tree": chat, "child": None}
     else:
-        assert rooms["tree"] == 0, "unbound work gains no binding"
+        assert rooms == {"live": chat, "late": chat, "child": chat, "tree": chat, "delivery": chat}
 
 
 def test_a_claim_frozen_before_a_later_conversion_keeps_its_destination(host, monkeypatch):

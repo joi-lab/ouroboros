@@ -75,7 +75,8 @@ def test_deadline_crossing_before_queue_wait_preserves_late_result(tmp_path, mon
 def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     tmp_path, monkeypatch,
 ):
-    import time
+    import ouroboros.review_custody as custody
+    from time import monotonic
     from types import SimpleNamespace
 
     import ouroboros.config as config
@@ -87,6 +88,13 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     from ouroboros.usage_accounting import UsageScope
 
     monkeypatch.setattr(config, "NESTED_SETTLEMENT_MARGIN_SEC", 0.2)
+    safety_deadline = monotonic() + 60  # Bound a lost worker; never measure product speed.
+
+    def clock(_slot):
+        assert monotonic() < safety_deadline, "review settlement stopped making progress"
+        return 100.0
+
+    monkeypatch.setattr(custody, "monotonic_now", clock)
     attempt = SimpleNamespace(triad_raw_results=[{
         "slot_id": "slot-1", "model_id": "cursor/test", "status": "error",
         "operation_id": "op-existing", "operation_state": "in_flight",
@@ -106,7 +114,7 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
     calls = []
 
     def recover(_slot, operation_id, retry_state, deadline, _checkpoint):
-        calls.append((operation_id, dict(retry_state), deadline - time.monotonic()))
+        calls.append((operation_id, dict(retry_state), deadline - custody.monotonic_now(_slot.slot_id)))
         return ReviewActorRecord(slot_id="slot-1", model="cursor/test", status="ok")
 
     [actor] = run_custodied_review_slots(
@@ -119,18 +127,17 @@ def test_spent_deadline_restart_reconciliation_gets_only_a_settlement_window(
             drive_root=tmp_path, task_id="task-spent-restart",
         ),
         run_slot=recover,
-        error_actor=lambda *_args, **_kwargs: None,
+        error_actor=lambda slot, error, operation_id="", operation_state="settled": ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+            operation_id=operation_id, operation_state=operation_state),
     )
 
     assert len(calls) == 1
     operation_id, retry_state, remaining = calls[0]
     assert operation_id == "op-existing"
     assert retry_state == {"pending_invocation_id": "inv-existing"}
-    # The deadline is monotonic_now + 0.2 and ``remaining`` re-reads the same
-    # clock, so it can only shrink — but on Windows the coarse monotonic clock
-    # returns the identical reading twice, leaving pure float rounding noise
-    # above 0.2 (observed +4.5e-13 on the CI shard). Tolerate one epsilon.
-    assert 0 < remaining <= 0.2 + 1e-9
+    assert remaining == pytest.approx(0.2, rel=0, abs=1e-9)
+    assert actor.status == "ok"
     assert paid == []
     assert actor.operation_id == "op-existing"
     assert actor.operation_state == "settled"
@@ -236,7 +243,6 @@ def test_failed_commit_roster_stamp_drops_unsent_process_local_reservation(
                 "models": ["test/model"], "routes": ["api_chat"],
                 "efforts": ["high"], "slot_ids": ["slot-1"],
             }},
-            [],
         )
 
     assert getattr(ctx, "_review_reserved_roster", None) is None
@@ -266,7 +272,6 @@ def test_spent_owner_window_does_not_stamp_zero_dispatch_commit_roster(
             "models": ["test/model"], "routes": ["api_chat"],
             "efforts": ["high"], "slot_ids": ["slot-1"],
         }},
-        [],
     )
 
     assert stamp_calls == []
@@ -368,80 +373,71 @@ def test_restart_reconciliation_requires_complete_exact_identity(
     assert ctx._review_custody_lost is True
 
 
-def test_logical_timeout_actor_carries_live_delegated_restart_token(tmp_path):
+def test_logical_timeout_actor_carries_live_delegated_restart_token(tmp_path, monkeypatch):
     import threading
-    import time
     from types import SimpleNamespace
 
-    from ouroboros.review_custody import run_custodied_review_slots
+    import ouroboros.review_custody as custody
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
     from ouroboros.usage_accounting import UsageScope
 
-    release = threading.Event()
-    request = ReviewRequest(
-        surface="multi_model_review", goal="review", task_id="task-timeout-token",
-        retry_key="commit_review:token",
-    )
-    slot = ReviewSlot(
-        slot_id="slot-1", model="cursor/test", route=ReviewRouteKind.AGENT_SESSION,
-        timeout_sec=0.1,
-    )
-    calls = []
+    entered, release, settled = threading.Event(), threading.Event(), threading.Event()
+    ticks = iter((100.0,))
 
-    def still_running(_slot, _operation_id, retry_state, _deadline, _checkpoint):
-        calls.append(_operation_id)
-        retry_state["pending_invocation_id"] = "inv-live"
-        retry_state["delegated_run_id"] = "run-live"
-        release.wait(0.4)
-        return ReviewActorRecord(slot_id="slot-1", model="cursor/test", status="ok")
+    def clock(_slot):
+        first = next(ticks, None)
+        if first is not None:
+            return first
+        assert entered.wait(10), "review worker never entered before logical expiry"
+        return 101.0  # Cross the 100.1 deadline only after the invocation token exists.
+
+    monkeypatch.setattr(custody, "monotonic_now", clock)
+    request = ReviewRequest(surface="multi_model_review", goal="review",
+                            task_id="task-timeout-token", retry_key="commit_review:token")
+    slot = ReviewSlot(slot_id="slot-1", model="cursor/test",
+                      route=ReviewRouteKind.AGENT_SESSION, timeout_sec=0.1)
+    calls, workers = [], []
+
+    def still_running(_slot, operation_id, retry_state, _deadline, _checkpoint):
+        workers.append(threading.current_thread())
+        calls.append(operation_id)
+        retry_state.update(pending_invocation_id="inv-live", delegated_run_id="run-live")
+        entered.set()
+        try:
+            assert release.wait(10), "test did not release the review worker"
+            return ReviewActorRecord(slot_id="slot-1", model="cursor/test", status="ok")
+        finally:
+            settled.set()
 
     def error_actor(_slot, error, operation_id="", operation_state="settled"):
         return ReviewActorRecord(
             slot_id="slot-1", model="cursor/test", status="error", error=error,
             operation_id=operation_id, operation_state=operation_state,
-            late_result_pending=operation_state == "in_flight",
-        )
+            late_result_pending=operation_state == "in_flight")
 
-    started = time.monotonic()
-    ctx = SimpleNamespace()
-    [actor] = run_custodied_review_slots(
-        request=request,
-        slots=[slot],
-        usage_ctx=ctx,
-        task_id="task-timeout-token",
-        usage_meta={},
-        review_usage_scope=UsageScope(drive_root=tmp_path, task_id="task-timeout-token"),
-        run_slot=still_running,
-        error_actor=error_actor,
-    )
-    [joined] = run_custodied_review_slots(
-        request=ReviewRequest(
-            surface="multi_model_review", goal="review",
-            task_id="task-timeout-token", retry_key="commit_review:token",
-            reconcile_only=True, deadline_at="2000-01-01T00:00:00Z",
-        ),
-        slots=[slot],
-        usage_ctx=ctx,
-        task_id="task-timeout-token",
-        usage_meta={"deadline_at": "2000-01-01T00:00:00Z"},
-        review_usage_scope=UsageScope(
-            drive_root=tmp_path, task_id="task-timeout-token",
-        ),
-        run_slot=still_running,
-        error_actor=error_actor,
-    )
-    release.set()
-
-    assert time.monotonic() - started < 0.3
-    assert len(calls) == 1
-    assert actor.operation_state == "in_flight"
-    assert actor.usage["pending_invocation_id"] == "inv-live"
-    assert actor.usage["delegated_run_id"] == "run-live"
-    assert joined.operation_id == actor.operation_id
-    assert joined.operation_state == "in_flight"
-    assert joined.usage["pending_invocation_id"] == "inv-live"
-    assert joined.usage["delegated_run_id"] == "run-live"
+    kwargs = dict(slots=[slot], usage_ctx=SimpleNamespace(), task_id=request.task_id,
+                  review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+                  run_slot=still_running, error_actor=error_actor)
+    try:
+        [actor] = custody.run_custodied_review_slots(request=request, usage_meta={}, **kwargs)
+        [joined] = custody.run_custodied_review_slots(request=ReviewRequest(
+            surface=request.surface, goal="review", task_id=request.task_id, retry_key=request.retry_key,
+            reconcile_only=True, deadline_at="2000-01-01T00:00:00Z"),
+            usage_meta={"deadline_at": "2000-01-01T00:00:00Z"}, **kwargs)
+        assert not settled.is_set()  # Both answers returned while physical work is still held.
+        assert len(calls) == 1
+        assert joined.operation_id == actor.operation_id
+        for row in (actor, joined):
+            assert row.operation_state == "in_flight"
+            assert row.usage["pending_invocation_id"] == "inv-live"
+            assert row.usage["delegated_run_id"] == "run-live"
+    finally:
+        release.set()
+        assert settled.wait(10), "review worker did not settle"
+        for worker in workers:
+            worker.join(10)
+            assert not worker.is_alive()
 
 
 def test_coordinator_keeps_fresh_empty_session_custody_cell_shared(
@@ -678,32 +674,28 @@ def test_coordinator_rejoins_exact_recovery_after_spent_owner_deadline(
     assert row.get("pending_invocation_id", "") == ""
 
 
-def test_durable_triad_and_scope_rows_carry_delegated_restart_identity():
+def test_durable_rows_carry_delegated_restart_identity():
+    """One wave, one row shape: every seat's actor record — a packet seat's and a
+    retrieving seat's alike — carries the delegated restart identity."""
     from ouroboros.tools.review import _parse_model_response
-    from ouroboros.tools.review_helpers import build_scope_actor_record
-    from ouroboros.tools.scope_review import ScopeReviewResult
-    from ouroboros.triad_review import parse_model_review_results
+    from ouroboros.triad_review import parse_seat_answers
 
-    envelope = _parse_model_response("cursor/test", {
-        "choices": [{"message": {"content": "[]"}}], "slot_id": "slot_1",
-        "operation_id": "op-1", "operation_state": "in_flight",
-        "late_result_pending": True,
-        "usage": {
-            "pending_invocation_id": "inv-1", "delegated_run_id": "run-1",
-        },
-    }, None)
-    triad = parse_model_review_results({"results": [envelope]})
-    triad_row = triad.actor_records[0].to_dict()
-    assert triad_row["pending_invocation_id"] == "inv-1"
-    assert triad_row["delegated_run_id"] == "run-1"
+    def _envelope(slot_id, op, inv, run):
+        return _parse_model_response("cursor/test", {
+            "choices": [{"message": {"content": "[]"}}], "slot_id": slot_id,
+            "operation_id": op, "operation_state": "in_flight",
+            "late_result_pending": True,
+            "usage": {"pending_invocation_id": inv, "delegated_run_id": run},
+        }, None)
 
-    scope_row = build_scope_actor_record(ScopeReviewResult(
-        model_id="cursor/test", operation_id="op-2", operation_state="in_flight",
-        late_result_pending=True, pending_invocation_id="inv-2",
-        delegated_run_id="run-2",
-    ), slot_id="scope_slot_1")
-    assert scope_row["pending_invocation_id"] == "inv-2"
-    assert scope_row["delegated_run_id"] == "run-2"
+    parsed = parse_seat_answers(
+        {"results": [_envelope("slot_1", "op-1", "inv-1", "run-1"), _envelope("slot_2", "op-2", "inv-2", "run-2")]},
+        {"slot_1": ("change",), "slot_2": ("change", "coupling")})
+    rows = {record.slot_id: record.to_dict() for record in parsed.actor_records}
+    assert rows["slot_1"]["pending_invocation_id"] == "inv-1"
+    assert rows["slot_1"]["delegated_run_id"] == "run-1"
+    assert rows["slot_2"]["pending_invocation_id"] == "inv-2"
+    assert rows["slot_2"]["delegated_run_id"] == "run-2"
 
 
 def test_review_does_not_retry_an_unknown_dispatched_api_attempt(tmp_path):
@@ -867,35 +859,48 @@ def test_review_retry_rail_honors_logical_root_cancel_from_physical_retry_leaf(
     assert result.actors[0]["raw_text"] == raw_text
 
 
-def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_path):
+def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_path, monkeypatch):
     """Fix cycle 4, J2: a $0 collection (drain window 0, reconcile_only) while released
     slots are still running re-registers the released wave. The outcomes already recorded
     for that wave must survive the re-registration: otherwise the roster shrinks to the
-    still-pending slots and the final settled-wave frame under-counts, while the frame
-    promises fewer than the roster size only when a slot timed out before the release.
-    One frame is still written for the wave, once every roster slot has an outcome."""
+    still-pending slots and the settled wave the last settlement hands the plan ask's hook
+    under-counts. One frame is still written for the ask, once every roster slot has an
+    outcome."""
     import threading
     import time
     from types import SimpleNamespace
 
     import ouroboros.review_custody as custody
     from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools import plan_ask
     from tests.test_plan_review_event_route import (
+        _TASK,
         _custody_kwargs,
         _held_worker,
         _mailbox_entries,
+        _plant_ask,
     )
 
     slots = [ReviewSlot(slot_id=f"s{index}", model=f"m/{index}", timeout_sec=30.0)
              for index in (1, 2, 3)]
+    _plant_ask(tmp_path, slots)
+    settled_waves = []
+    real_hook = plan_ask.settle_released_reply
+
+    def hook(*args, **kwargs):
+        if kwargs.get("settled_wave"):
+            settled_waves.append((dict(kwargs["settled_wave"]), kwargs.get("roster_size")))
+        return real_hook(*args, **kwargs)
+
+    monkeypatch.setattr(plan_ask, "settle_released_reply", hook)
     release = {slot.slot_id: threading.Event() for slot in slots}
     entered = {slot.slot_id: threading.Event() for slot in slots}
     _calls, run_slot = _held_worker(slots, {}, release, entered)
     progress = []
     ctx = SimpleNamespace(drive_root=tmp_path, emit_progress_fn=progress.append)
     request, kwargs = _custody_kwargs(
-        tmp_path, surface="plan_review", retry_key="plan_review:" + "e" * 64 + ":1",
-        slots=slots, run_slot=run_slot, ctx=ctx)
+        tmp_path, surface="plan_review", retry_key=f"plan_ask:{_TASK}:a1",
+        slots=slots, run_slot=run_slot, ctx=ctx, plan_ask_id="a1")
     request.drain_deadline = time.monotonic()
     deadline = time.time() + 10
     try:
@@ -924,5 +929,62 @@ def test_a_collection_while_a_released_slot_runs_keeps_the_settled_roster(tmp_pa
             event.set()
     frames = _mailbox_entries(tmp_path, request.task_id)
     assert len(frames) == 1, [frame["text"] for frame in frames]
-    assert "3 of 3 reviewer slot(s) settled (3 ok, 0 failed)" in frames[0]["text"]
+    assert frames[0]["text"].startswith("Plan ask a1: every participant settled — 3 answered")
+    assert settled_waves == [({"s1": "ok", "s2": "ok", "s3": "ok"}, 3)]
     assert not custody._RELEASED_WAVES
+
+
+def test_poll_blind_spot_on_a_started_run_projects_in_flight_never_settled_or_retried():
+    """#1547 link 2, the classifier table: a typed observation blind spot on a
+    STARTED delegated run is ``in_flight`` — not the settled failure a started
+    run's other exceptions become, and never a $0 retry."""
+    from ouroboros.review_custody import _worker_exception_operation_state as state_of
+    from ouroboros.review_execution import ReviewPollUnavailable
+
+    blind = ReviewPollUnavailable("blind on both reads", run_id="run-9")
+    assert state_of(blind, {}) == "in_flight"
+    assert state_of(blind, {"pending_invocation_id": "inv-9"}) == "in_flight"
+    assert state_of(TimeoutError("slot budget exceeded"), {"pending_invocation_id": "inv-9"}) == "settled"
+
+
+def test_an_unobservable_live_session_stays_pending_for_an_attach_only_rejoin(tmp_path):
+    """#1547 link 2 at the custody seam: the worker that could not observe its
+    live run ends ``in_flight`` with its pending invocation re-registered, the
+    row is a typed delivery failure (not a settled terminal, no replay cache),
+    and the next collect rejoins the SAME operation with that token instead of
+    dispatching a second paid run."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_custody import _attempt_key, run_custodied_review_slots
+    from ouroboros.review_execution import ReviewPollUnavailable, ReviewRouteKind
+    from ouroboros.review_substrate import ReviewActorRecord, ReviewRequest, ReviewSlot
+    from ouroboros.usage_accounting import UsageScope
+
+    calls, ctx = [], SimpleNamespace(drive_root=tmp_path, task_id="blind-1547")
+    request = ReviewRequest(surface="plan_review", goal="review", task_id="blind-1547",
+                            retry_key="plan_review:blind-1547")
+    slot = ReviewSlot(slot_id="seat", model="cursor/test", route=ReviewRouteKind.AGENT_SESSION, timeout_sec=10.0)
+
+    def run_slot(slot, operation_id, retry_state, _deadline, _checkpoint):
+        calls.append((operation_id, dict(retry_state)))
+        if len(calls) == 1:
+            retry_state["pending_invocation_id"], retry_state["delegated_run_id"] = "inv-b", "run-b"
+            raise ReviewPollUnavailable("blind on both reads", run_id="run-b")
+        return ReviewActorRecord(slot_id=slot.slot_id, model=slot.model, status="ok", raw_text="[]")
+
+    def error_actor(slot, error, operation_id="", operation_state="settled"):
+        return ReviewActorRecord(slot_id=slot.slot_id, model=slot.model, status="error", error=error,
+                                 operation_id=operation_id, operation_state=operation_state,
+                                 late_result_pending=operation_state == "in_flight")
+
+    args = dict(request=request, slots=[slot], usage_ctx=ctx, task_id=request.task_id, usage_meta={},
+                review_usage_scope=UsageScope(drive_root=tmp_path, task_id=request.task_id),
+                run_slot=run_slot, error_actor=error_actor)
+    [first] = run_custodied_review_slots(**args)
+    assert first.operation_state == "in_flight" and first.late_result_pending is True
+    assert first.failure_code == "review_poll_unavailable" and first.usage["pending_invocation_id"] == "inv-b"
+    assert ctx._review_pending_invocations[_attempt_key(request, slot)]["pending_invocation_id"] == "inv-b"
+    assert not getattr(ctx, "_review_settled_attempts", {})
+    [second] = run_custodied_review_slots(**args)
+    assert second.status == "ok" and second.operation_id == first.operation_id
+    assert calls[1] == (first.operation_id, {"pending_invocation_id": "inv-b"})

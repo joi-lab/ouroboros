@@ -1,7 +1,16 @@
 """Delivery candidates and delivery control: child-result dispositions, the
 delivery evidence state, acceptance bindings, candidate publish/replace/degrade,
 the delivery-control prompt cycle, the subagent handoff and the no-tool final
-answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name."""
+answer. Extracted from loop.py (v7 L-B split); loop.py re-exports every name.
+
+Completion is an author act: ``finish_task`` (``presence_finish`` for presence
+tasks) selects ``action=finish|stop`` with complete ``answer`` bytes or an
+``answer_sha256`` naming the retained candidate or the latest whole held
+response. Every held no-tool round appends the assistant row and a host row to
+the transcript, where held bytes resolve from. A lineage that has not seen a
+host control episode (``control_episode_seen``) stays a plain final. Facts Main
+observed are frozen before its batch executes; only feedback positively exposed
+in a returned request counts as seen."""
 
 from __future__ import annotations
 
@@ -13,7 +22,9 @@ import queue
 
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from ouroboros import working_checkpoint
 from ouroboros.config import get_context_mode
+from ouroboros.observability import timed_phase
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_FINALIZED_UNACCEPTED, reviewable_effect_projection
 from ouroboros.task_finalization import set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
@@ -64,6 +75,7 @@ class DeliveryCandidate:
     effective_criteria: Any = None
     material_tool_indices: tuple[int, ...] = ()
     owner_source_sha256: str = ""
+    quiet: bool = False  # bytes of a wake's silent selection: replaced, never published, by other prose
 
 
 # Host continuations retain the answer and require an explicit next selection.
@@ -176,6 +188,7 @@ def delivery_subject_projection(
     text = full_answer if full_answer is not None else getattr(candidate, "full_text", "")
     return {
         "candidate_sha256": hashlib.sha256(str(text).encode("utf-8")).hexdigest(),
+        "produced_sources": (llm_trace.get("acceptance_material") or {}).get("sources", []),
         "effective_criteria": _effective_delivery_criteria(tool_ctx),
         "material_evidence_fingerprint": delivery_evidence_fingerprint(tool_ctx, llm_trace),
     }
@@ -278,17 +291,14 @@ def delivery_evidence_fingerprint(
             if isinstance(call, dict) and index in getattr(tool_ctx, "_delivery_material_tool_indices", ())
         ],
         "tool_effects": reviewable_effect_projection(llm_trace),
-        # The typed plan-review control is not a filesystem effect, but it
+        # A plan_task call is not a filesystem effect, but what it wrote and asked
         # changes whether a pre-plan answer is grounded.
         "plan_review_receipts": [
-            {
-                "index": index,
-                "outcome": call.get("plan_review_outcome"),
-                "closed": call.get("plan_review_closed"),
-                "result": call.get("result"),
-            }
+            {"index": index, "result": call.get("result"),
+             **{key.removeprefix("plan_"): call.get(key) for key in (
+                 "plan_effect", "plan_revision", "plan_open_objections", "plan_holding", "plan_pending_asks")}}
             for index, call in enumerate(llm_trace.get("tool_calls") or [])
-            if isinstance(call, dict) and call.get("plan_review_outcome")
+            if isinstance(call, dict) and call.get("plan_effect")
         ],
         "children": children,
         "verification_receipts": read_context_verification_receipts(
@@ -320,7 +330,7 @@ def observed_delivery_evidence(tool_ctx: Any, llm_trace: Dict[str, Any], **bound
 
 def _delivery_evidence_state(tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> tuple[int, str]:
     """Track the shared answer-invalidating evidence fingerprint (every retention,
-    nomination, post-tool, control, publication and delivery path). UNKNOWN (#1224)
+    nomination, post-tool, control, publication, delivery and forced-exit path). UNKNOWN (#1224)
     bumps no revision, keeps the last KNOWN fingerprint and supersedes no binding —
     missing evidence is not a change; a KNOWN candidate compared against it is
     re-retained explicitly by its caller, its unverifiable approval superseded."""
@@ -490,7 +500,7 @@ def _replace_delivery_candidate(
         if full_text != retained.full_text:
             retained.full_text, retained.model_text = full_text, model_text
             retained.content_sha256 = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
-            retained.revision += 1
+            retained.revision, retained.quiet = retained.revision + 1, False  # new bytes are new words
             retained.acceptance_binding = _unaccepted_delivery_binding(tools, retained.content_sha256)
         tools._ctx._delivery_control_required = False
         _loop()._publish_delivery_candidate(tools, retained, llm_trace)
@@ -772,7 +782,7 @@ def selected_completion_text(request: dict, candidate: Any, messages: list,
 def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, content: Any = None) -> bool:
     """Resolve one staged author act after the full batch, using its original observation."""
     from ouroboros.tool_capabilities import completion_observation_calls
-    from ouroboros.loop_messages import owner_source_sha256
+    from ouroboros.loop_messages import owner_reply_owed, owner_source_sha256
     tool_ctx = tools._ctx
     request = getattr(tool_ctx, "_completion_request", None)
     if not isinstance(request, dict):
@@ -784,6 +794,8 @@ def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, conte
     observation = request.get("observation") or {}
     candidate = getattr(tool_ctx, "_delivery_candidate", None)
     text, error = selected_completion_text(request, candidate, ctx.messages, getattr(tool_ctx, "_completion_held_sha256", ""))
+    if request.get("wake_silent") and owner_reply_owed(tool_ctx):
+        error = "owner_reply_owed: your human wrote after your last live message; answer before finishing silently"
     if getattr(tool_ctx, "_completion_conflict", False):
         error = "contradictory_completion_requests: select again after reading the completed batch"
     if observation.get("owner_source_sha256") != owner_source_sha256(tool_ctx):
@@ -813,7 +825,8 @@ def consume_completion_request(tools: ToolRegistry, ctx: Any, trace: dict, conte
         merge_agent_acceptance_stance(trace, author_decision, tool_ctx)
     if text is not None and not error:
         candidate = _loop()._replace_delivery_candidate(tools, ctx, trace, text, control="selected")
-        _loop()._latch_final_answer_marker(trace, text)
+        candidate.quiet = bool(request.get("wake_silent"))
+        _loop()._latch_final_answer_marker(trace, "" if candidate.quiet else text)  # quiet words latch no fallback
     if not error and request["action"] == "finish" and unseen:
         error = "unobserved_tool_results: read the completed results before finishing: " + ", ".join(str(c.get("tool")) for c in unseen)
     tool_ctx._completion_request = None
@@ -1131,6 +1144,7 @@ def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
     return isinstance(plan_gate, dict) and plan_gate.get("review_only_awaited") is True
 
 
+@timed_phase("admission_seal")
 def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_trace: Dict[str, Any]) -> bool:
     """Seal root admission once more right before delivery; False arms the owner-revision round.
 
@@ -1189,6 +1203,38 @@ def _void_presence_completion(tool_ctx: Any, messages: list) -> None:
         tool_ctx._presence_completion, tool_ctx._presence_completion_accepted = None, False
 
 
+def resume_delivery_candidate(tools: ToolRegistry, working: dict, schemas: list) -> bool:
+    """Restore completion tools and identify an interrupted finalization boundary."""
+    if getattr(tools._ctx, "_delivery_control_required", False):
+        completion_schema(tools, schemas)
+    return bool(working and (working.get("working") or {}).get("boundary") == "candidate"
+                and getattr(tools._ctx, "_delivery_candidate", None) is not None)
+
+
+def _prepare_delivery_candidate(content: Any, tools: ToolRegistry, limit_ctx: Any, llm_trace: dict,
+                                *, explicit: bool, resumed: bool) -> tuple[bool, Any]:
+    """Select/save prose before gates; recovery retains its old evidence binding."""
+    if resumed or explicit:
+        control, content = ("retained" if resumed else "fresh"), content
+    else:
+        control, content = _loop()._resolve_delivery_control(content, tools, limit_ctx, llm_trace)
+    if control == "retry":
+        return False, content
+    _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
+    held = getattr(tools._ctx, "_delivery_candidate", None)
+    quiet_held = not explicit and getattr(held, "quiet", False)  # replaced even by empty prose, never published
+    if resumed and quiet_held:
+        return False, content  # a quiet selection lost with its execution id is chosen again
+    fresh = control == "fresh" and (explicit or str(content or "").strip() or quiet_held)
+    candidate = _loop()._replace_delivery_candidate(tools, limit_ctx, llm_trace, str(content or ""), control="candidate") if fresh else held
+    if isinstance(candidate, DeliveryCandidate):
+        candidate.quiet = explicit and bool((getattr(tools._ctx, "_completion_selected", None) or {}).get("wake_silent"))
+        content = candidate.full_text
+    if fresh or resumed:
+        working_checkpoint.save_or_log(limit_ctx, "candidate")  # this attempt survives another interruption
+    return True, content
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -1197,7 +1243,7 @@ def _no_tool_final_answer(
     incoming_messages: queue.Queue,
     owner_msg_seen: set,
     emit_progress: Callable[[str], None],
-    *, review_only: bool = False, explicit_candidate: bool = False,
+    *, review_only: bool = False, explicit_candidate: bool = False, resume_candidate: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Run the no-tool finalization gates; ``None`` requests another model round."""
     messages = limit_ctx.messages
@@ -1208,22 +1254,10 @@ def _no_tool_final_answer(
         if transcript_growth_signature(messages) != before:
             _void_presence_completion(tools._ctx, messages)
         return None
-    control_state, controlled_content = ("fresh", content) if explicit_candidate else _loop()._resolve_delivery_control(
-        content, tools, limit_ctx, llm_trace,
-    )
-    if control_state == "retry":
+    ready, content = _prepare_delivery_candidate(content, tools, limit_ctx, llm_trace,
+                                                 explicit=explicit_candidate, resumed=resume_candidate)
+    if not ready:
         return held()
-    content = controlled_content
-    _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
-    if control_state == "fresh" and (explicit_candidate or str(content or "").strip()):
-        candidate = _loop()._replace_delivery_candidate(
-            tools, limit_ctx, llm_trace, str(content or ""), control="candidate",
-        )
-        content = candidate.full_text
-    else:
-        candidate = getattr(tools._ctx, "_delivery_candidate", None)
-        if isinstance(candidate, _loop().DeliveryCandidate):
-            content = candidate.full_text
 
     stopping = (getattr(tools._ctx, "_completion_selected", None) or {}).get("action") == "stop"
     if not stopping:
@@ -1304,6 +1338,7 @@ def _no_tool_final_answer(
             llm_trace["reasoning_notes"].append(
                 "Task services were finalized before acceptance; the complete answer must bind the resulting evidence."
             )
+            _loop()._disclose_service_finalization(limit_ctx, llm_trace)
             _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
             return held()
 
@@ -1376,12 +1411,14 @@ def _no_tool_final_answer(
         provisional_assistant = {"role": "assistant", "content": content} if content else None
         if provisional_assistant is not None:
             messages.append(provisional_assistant)
-        with admission_lock:
-            admission_agent._accepting_owner_messages = False
-            post_controls = _loop()._drain_incoming_messages(
-                messages, incoming_messages, limit_ctx.drive_root, limit_ctx.task_id,
-                limit_ctx.event_queue, owner_msg_seen, owner_ctx=tools._ctx,
-            )
+        with timed_phase("admission_wait") as acquired, admission_lock:
+            acquired()
+            with timed_phase("admission_close"):
+                admission_agent._accepting_owner_messages = False
+                post_controls = _loop()._drain_incoming_messages(
+                    messages, incoming_messages, limit_ctx.drive_root, limit_ctx.task_id,
+                    limit_ctx.event_queue, owner_msg_seen, owner_ctx=tools._ctx, defer_content_ack=True,
+                )
         if len(getattr(tools._ctx, "_owner_directives", []) or []) > before_directives:
             with admission_lock:
                 if acceptance_was_terminal:
@@ -1481,11 +1518,9 @@ def _no_tool_final_answer(
         tools._ctx._presence_completion_accepted = True
         limit_ctx.accumulated_usage["presence_completion_outcome"] = tools._ctx._presence_completion["outcome"]
         limit_ctx.accumulated_usage["terminal_origin"] = _loop().TERMINAL_ORIGIN_MODEL_FINAL
-    return _loop()._handle_text_response(
-        str(content or ""),
-        llm_trace,
-        limit_ctx.accumulated_usage,
-    )
+    if getattr(candidate, "quiet", False):  # only this exit accepts a wake's silent finish
+        limit_ctx.accumulated_usage.update(wake_silent=True, terminal_origin=_loop().TERMINAL_ORIGIN_MODEL_FINAL)
+    return _loop()._handle_text_response(str(content or ""), llm_trace, limit_ctx.accumulated_usage)
 
 
 def finish_completed_stop(tools: ToolRegistry, ctx: Any, emit_progress: Any,
@@ -1497,7 +1532,7 @@ def finish_completed_stop(tools: ToolRegistry, ctx: Any, emit_progress: Any,
     if request.get("action") != "stop":
         return None
     controls = _loop()._drain_incoming_messages(ctx.messages, ctx.incoming_messages, ctx.drive_root,
-        ctx.task_id, ctx.event_queue, ctx.owner_msg_seen, owner_ctx=tools._ctx)
+        ctx.task_id, ctx.event_queue, ctx.owner_msg_seen, owner_ctx=tools._ctx, defer_content_ack=True)
     from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.deadline_utils import dispatch_window_remaining_sec
     if request["observation"].get("owner_source_sha256") != owner_source_sha256(tools._ctx):
@@ -1533,16 +1568,14 @@ def finish_completed_stop(tools: ToolRegistry, ctx: Any, emit_progress: Any,
 
 def record_stopped_completion(tools: ToolRegistry, ctx: Any, trace: dict, request: dict,
                               candidate: DeliveryCandidate) -> None:
-    """A local stop is truthful for every task; eligible roots retain author-stop review semantics."""
+    """A local stop is truthful for every task; roots retain its author disposition."""
     trace["task_completion"] = {"action": "stop", "rationale": request["rationale"],
         "answer_sha256": candidate.content_sha256, "source": request.get("source", "finish_task")}
     from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
     from ouroboros.review_records import build_author_disposition
-    eligible, _ = _loop()._task_acceptance_eligible(_loop().get_task_review_mode(), trace,
-        bool(getattr(tools._ctx, "is_direct_chat", False)),
-        is_root_task=_resolve_ctx_lineage(tools._ctx, ctx.task_id)["is_root_task"],
-        task_contract=getattr(tools._ctx, "task_contract", {}))
-    if not eligible:
+    # Stop grants no approval and buys no panel. Preserve it even when Auto has
+    # no nomination, Required has no production, or new reviews are Off.
+    if not _resolve_ctx_lineage(tools._ctx, ctx.task_id)["is_root_task"]:
         return
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
     from ouroboros.task_results import project_task_acceptance_review_capacity

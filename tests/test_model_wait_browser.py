@@ -387,7 +387,7 @@ def test_wait_reconnect_preserves_unsubmitted_form_without_context_or_animation(
     document_id = page.evaluate("window.waitDocumentId = crypto.randomUUID()")
     with page.expect_response('**/api/chat/history*'):
         ui["sockets"][-1].close()
-    page.get_by_text("♻️ Reconnected", exact=True).wait_for()
+    page.get_by_text("Reconnected", exact=True).wait_for()
     assert page.evaluate("window.waitDocumentId") == document_id
     assert field.input_value() == 'unfinished-owner-model'
     assert field.evaluate("el => document.activeElement === el")
@@ -495,3 +495,137 @@ def test_paid_review_controls_survive_author_terminal_and_reload(waiting_ui, tmp
     ui['emit']({**row, 'revision': 99, 'state': 'waiting'})
     assert waiter.count() == 0, 'resolved operation cannot be revived by a stale waiting row'
     assert card.get_attribute('data-finished') == '1'
+
+
+def test_a_checked_role_save_that_did_not_land_is_told_once_its_wait_settles(waiting_ui):
+    """"Also save this role in Settings" is a separate fact from the task change. While the row
+    waits, the card says it inline; once the row leaves because it resolved, one toast tells a
+    save that did not land (a failure carrying the applied receipt, an unknown save whose row
+    already resolved, a same-request duplicate). A card closed without resolution says nothing."""
+    ui, page = waiting_ui, waiting_ui['page']
+    page.evaluate("""() => { window.__toasts = [];
+        new MutationObserver((records) => { for (const record of records) for (const node of record.addedNodes)
+            if (node.classList?.contains('toast')) window.__toasts.push(node.textContent); })
+            .observe(document.body, { childList: true, subtree: true }); }""")
+    toasts = lambda: page.evaluate('window.__toasts')  # noqa: E731
+    answers, held = {}, []
+
+    def decide(route):
+        body = route.request.post_data_json
+        ui['controls'].append(body)
+        answer = answers[body['decision_id'].rsplit(':', 1)[1]].pop(0)
+        if answer is None:
+            held.append(route)  # answered later, after its row already resolved
+            return
+        code, payload = answer(body)
+        route.fulfill(status=code, content_type='application/json', body=json.dumps(payload))
+
+    page.route('**/api/decisions', decide)
+
+    def resolved(key, request_id):
+        row = ui['rows'][key]
+        row.pop('pending_action', None)
+        row.update(revision=row['revision'] + 1, state='resolved', resolution='model_switched',
+                   applied_request_id=request_id)
+        return copy.deepcopy(row)
+
+    def pending(key, body):
+        return {**copy.deepcopy(ui['rows'][key]),
+                'pending_action': {k: v for k, v in body.items() if k != 'decision_id'}}
+
+    def choose(key, model):
+        view = page.locator(f'[data-wait-id="{key}"]')
+        view.locator('[data-wait-change]').click()
+        view.locator('[data-model-role-source]').select_option(API_LANE)
+        view.locator('[data-model-role-model]').fill(model)
+        view.locator('[data-wait-persist]').check()
+        view.locator('[data-wait-apply]').click()
+        return view
+
+    # A failure that carries the applied receipt: the switch ran, the Settings save did not.
+    answers['main-wait'] = [lambda body: (503, {
+        'ok': False, 'reason_code': 'model_wait_decision_failed',
+        'error': 'another settings write is still in progress after 1s; nothing was written — try again',
+        'applied': True, 'saved': False, 'wait': resolved('main-wait', body['request_id'])})]
+    choose('main-wait', 'busy-model').wait_for(state='detached')
+    page.wait_for_function('() => window.__toasts.length === 1')
+    assert toasts() == ['Main: model change applied; it was not saved in Settings.']
+    assert ui['controls'][-1]['persist_role'] is True
+    capture(page, 'role-save-applied-not-saved-toast')
+
+    # The row resolves (the controller applied it) before the save answers; the save is unknown.
+    answers['light-wait'] = [None]
+    light = choose('light-wait', 'slow-model')
+    for _ in range(500):
+        if held:
+            break
+        page.wait_for_timeout(20)
+    assert held, 'the request reached the host'
+    ui['emit'](resolved('light-wait', ui['controls'][-1]['request_id']))
+    light.wait_for(state='detached')
+    assert len(toasts()) == 1, 'nothing is told before the Settings outcome is known'
+    held.pop().fulfill(status=503, content_type='application/json', body=json.dumps({
+        'ok': False, 'code': 'settings_save_timeout', 'saved': None,
+        'error': 'the settings save is still running in the server and was left to finish on its own'}))
+    page.wait_for_function('() => window.__toasts.length === 2')
+    assert toasts()[1] == 'Light: model change applied; whether it was saved in Settings is unconfirmed.'
+    capture(page, 'role-save-unconfirmed-after-resolution')
+
+    # A same-request duplicate: still pending, the card says it inline; resolution tells it once.
+    repeat = {**copy.deepcopy(ui['rows']['main-wait']), 'wait_id': 'repeat-wait', 'revision': 1, 'state': 'waiting'}
+    for key in ('applied_request_id', 'resolution'):
+        repeat.pop(key, None)
+    ui['rows']['repeat-wait'] = repeat
+    ui['emit'](repeat)
+    answers['repeat-wait'] = [
+        lambda body: (503, {'ok': False, 'reason_code': 'model_wait_decision_failed',
+                            'error': 'Settings could not be read; nothing was written',
+                            'applied': False, 'saved': False, 'wait': pending('repeat-wait', body)}),
+        lambda body: (200, {'ok': True, 'decision_id': body['decision_id'], 'request_id': body['request_id'],
+                            'state': 'waiting', 'duplicate': True, 'applied': False, 'saved': False,
+                            'wait': pending('repeat-wait', body)})]
+    view = choose('repeat-wait', 'repeat-model')
+    view.locator('[data-wait-repeat]').wait_for(state='visible')
+    first = copy.deepcopy(ui['controls'][-1])
+    view.locator('[data-wait-repeat]').click()
+    view.locator('[data-wait-notice]').filter(
+        has_text='Settings were not saved. Request accepted; waiting for the task to apply it.').wait_for()
+    assert ui['controls'][-1] == first, 'the same request, never a new one'
+    capture(page, 'role-save-not-saved-pending-duplicate')
+    assert len(toasts()) == 2
+    ui['emit'](resolved('repeat-wait', first['request_id']))
+    view.wait_for(state='detached')
+    page.wait_for_function('() => window.__toasts.length === 3')
+    assert toasts()[2] == 'Main: model change applied; it was not saved in Settings.'
+    ui['emit'](ui['rows']['repeat-wait'])  # the same resolved frame again
+    page.wait_for_timeout(300)
+    assert len(toasts()) == 3, 'told once'
+
+    # A card closed without resolution: the change was never applied, so nothing is told.
+    task = 'closing-task'
+
+    def frame(data):
+        before = page.evaluate('window.waitFrames')
+        ui['sockets'][-1].send(json.dumps(data))
+        page.wait_for_function('before => window.waitFrames > before', arg=before)
+
+    progress = {'type': 'chat', 'role': 'assistant', 'chat_id': 1, 'task_id': task, 'is_progress': True,
+                'content': 'Checking the request', 'ts': '2026-09-06T22:03:00Z'}
+    frame(progress)
+    closing = {**copy.deepcopy(repeat), 'wait_id': 'closing-wait', 'role': 'light', 'revision': 1, 'state': 'waiting'}
+    for key in ('applied_request_id', 'resolution'):
+        closing.pop(key, None)
+    ui['rows']['closing-wait'] = closing
+    frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_model_wait', 'task_id': task, 'chat_id': 1,
+                                                 'ts': '2026-09-06T22:03:01Z', **closing}})
+    answers['closing-wait'] = [lambda body: (202, {
+        'ok': True, 'decision_id': body['decision_id'], 'request_id': body['request_id'], 'state': 'waiting',
+        'duplicate': False, 'applied': False, 'saved': False, 'wait': pending('closing-wait', body)})]
+    closing_view = choose('closing-wait', 'closing-model')
+    closing_view.locator('[data-wait-notice]').filter(has_text='Settings were not saved.').wait_for()
+    frame({'type': 'log', 'chat_id': 1, 'data': {'type': 'task_done', 'task_id': task, 'status': 'completed',
+                                                 'ts': '2026-09-06T22:03:02Z'}})
+    closing_view.wait_for(state='detached')
+    page.wait_for_timeout(300)
+    assert len(toasts()) == 3, 'a card closed without resolution tells no Settings outcome'
+    capture(page, 'role-save-closed-without-resolution')

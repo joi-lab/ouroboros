@@ -3,7 +3,7 @@
 ``advanced`` is allowed to evolve the application layer, but must not casually
 rewrite the core contracts, safety files, or release/managed-repo invariants.
 ``pro`` may touch those paths, but commits still flow through the normal
-triad + scope review gate.
+review gate.
 """
 
 from __future__ import annotations
@@ -29,6 +29,17 @@ def runtime_mode_at_least(runtime_mode: str, minimum: str) -> bool:
     mode_rank = runtime_mode_rank(runtime_mode)
     minimum_rank = runtime_mode_rank(minimum)
     return mode_rank >= 0 and minimum_rank >= 0 and mode_rank >= minimum_rank
+
+
+def effort_range_binds(task_metadata=None) -> bool:
+    """Whether the owner's effort range bounds Ouroboros's own requests: everywhere but
+    Cyber Pro. Reads the effective runtime mode (a consciousness-origin task's cap included
+    when its metadata is given); the mode is restart-bound, so a task keeps one answer."""
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.consciousness_authority import effective_runtime_mode
+
+    mode = effective_runtime_mode(get_runtime_mode(), task_metadata) if task_metadata else get_runtime_mode()
+    return not runtime_mode_at_least(mode, "cyber_pro")
 
 
 def mode_has_unrestricted_agency(runtime_mode: str) -> bool:
@@ -158,12 +169,16 @@ SAFETY_CRITICAL_PATHS = frozenset({
     # the git_ops family).
     "ouroboros/tools/registry_guard_process.py",
     "ouroboros/tools/registry_guards.py",
-    # F3.1 typed-organ leaves: the registry class body and the typed result
-    # vocabulary re-homed out of the protected registry — same label parity.
+    # F3.1 typed-organ leaves: the registry class body and argument/target
+    # resolution re-homed out of the protected registry — same label parity.
     "ouroboros/tools/registry_core.py",
+    "ouroboros/tools/tool_resolution.py",
+    # The tool ABI in its own right: the descriptor every built-in instantiates
+    # (and declares its safety policy on) with the catalog that keeps extension
+    # and MCP names from shadowing it, the context every handler receives and
+    # the typed result contract shared by tools, the loop and the UI.
     "ouroboros/tools/tool_catalog.py",
     "ouroboros/tools/tool_context.py",
-    "ouroboros/tools/tool_resolution.py",
     "ouroboros/tools/tool_result.py",
     "prompts/SAFETY.md",
 })
@@ -175,12 +190,11 @@ FROZEN_CONTRACT_PATH_PREFIXES = (
 FROZEN_CONTRACT_PATHS = frozenset({
     "tests/test_contracts.py",
     "docs/CHECKLISTS.md",
-    # The standing-disclosure archive is the same binding reviewer contract as
-    # its parent — extracted for pack size, not demoted (#447 stage 3).
-    "docs/CHECKLISTS_ARCHIVE.md",
     "ouroboros/gateway/contracts.py",
-    "ouroboros/size_ratchet_manifest.py",
 })
+# Deliberately unlisted: the generated size manifest is a record its validator
+# (ouroboros/review.py) only lets shrink and official CI enforces, and the
+# checklist archive is an append-only record whose additions pass commit review.
 
 # The whole git_ops family as ONE derived constant (owner decision, batch 5
 # item 15): the facade plus its G1 leaves. Every protection inventory that
@@ -191,14 +205,9 @@ GIT_OPS_FAMILY_PATHS = frozenset(
 )
 
 RELEASE_INVARIANT_PATHS = frozenset({
+    # ci.yml decides which jobs release-preflight requires; the paid
+    # provider-canary workflows it calls reach no install and stay unlisted.
     ".github/workflows/ci.yml",
-    # The provider-canary job `release-preflight` requires keeps its body in a
-    # reusable workflow and its branch-push trigger in a wrapper — both outside
-    # the protected ci.yml, neither moving any of the risk — so every inventory
-    # that protects the parent must cover them (label parity — same rule as
-    # the G1 block below).
-    ".github/workflows/provider-canary.yml",
-    ".github/workflows/provider-canary-push.yml",
     "Ouroboros.spec",
     "build.sh",
     "build_linux.sh",
@@ -337,7 +346,7 @@ def protected_write_block_message(
     return (
         f"⚠️ CORE_PROTECTION_BLOCKED: runtime_mode={runtime_mode!r} refuses "
         f"to {action} protected {category or 'core'} path: {norm}. "
-        f"Switch to {target_modes} and let the normal triad + scope review "
+        f"Switch to {target_modes} and let the normal review panel "
         "cover the protected core/contract/release change before commit."
     )
 
@@ -355,5 +364,5 @@ def core_patch_notice(paths: Iterable[ProtectedPath | str]) -> str:
         "⚠️ CORE_PATCH_NOTICE: runtime_mode='pro' or 'cyber_pro' is editing protected "
         "Ouroboros core/contract/release surface(s): "
         f"{format_protected_paths(paths)}. These changes can be committed only "
-        "through the normal triad + scope review pipeline."
+        "through the normal review gate."
     )

@@ -289,8 +289,10 @@ def test_a_full_ratio_without_reset_does_not_refuse_the_engine_attempt():
             return {"harnesses": [{"id": "some-route", "enabled": True, "status": "ok",
                                    "accessProfilesSupported": ["readonly"]}]}
 
+    # A READ-ONLY run (the gateway serves readonly only): technical access alone
+    # decides the shape now (#1609), so the read-only premise is passed explicitly.
     unavailable, reset_at = route_health(
-        _Gateway([undated]), "some-route", delegated_run_shape(False))
+        _Gateway([undated]), "some-route", delegated_run_shape(False, "readonly"))
     assert (unavailable, reset_at) == ("", "")
 
 

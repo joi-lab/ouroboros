@@ -1,0 +1,104 @@
+/**
+ * The failed-check row of a task card (owner decision 13.10, #1585).
+ *
+ * A `verify_and_record` call can complete normally while the criterion it checks is
+ * not met. The call stays one ordinary call in the folded evidence row (no error, no
+ * task status change); the recorded verdict gets its own expandable diagnostic row,
+ * live and on replay, keyed beside the call so a later settlement never retires it
+ * and a later passing check never erases it. Every word comes from typed facts: the
+ * producer's `verification` object (live frames carry it directly, the settled row
+ * inside `tool_result_meta`) and the process facts beside it — never the result text.
+ * `placeReplayedEvidence` is the replay side: it draws the evidence row and these rows from
+ * the host's replayed observations, under the keys the live frames used.
+ */
+import { replayedEvidenceTs, updateLiveTimelineItem, upsertToolFoldRow } from './chat_render_batch.js';
+import { fmt, tr } from './i18n.js';
+
+const MISSED_MATCH = {
+    substring: ['task.check.text_not_found', 'expected text not found'],
+    exact: ['task.check.output_not_exact', 'output did not match exactly'],
+    exact_line: ['task.check.line_not_exact', 'no output line matched exactly'],
+    json_equals: ['task.check.json_not_equal', 'JSON output not equal'],
+};
+
+const oneLine = (text, max) => {
+    const s = String(text || '').replace(/\s+/g, ' ').trim();
+    return s.length > max ? `${s.slice(0, max - 3)}...` : s;
+};
+
+/** What the check's own process did, said first so a failed criterion never reads as a
+ *  failed command: a completed check whose criterion missed, a check that exited
+ *  non-zero, or one the host stopped or a signal killed (process facts, not text). Exit 0
+ *  says "not met" only where a comparison ran and missed (`matched` is false); a comparison
+ *  that reached no verdict (a bytes_equal operand missing or refused) is not confirmed. */
+export function checkProcessSentence(evt, check = {}) {
+    if (evt.timed_out === true) return tr('task.check.process_timed_out', 'The host stopped the check at its time limit; no comparison ran.');
+    if (evt.signal) return fmt('The check process was killed by {signal}.', { signal: evt.signal });
+    if (Number.isInteger(evt.exit_code) && evt.exit_code !== 0) return fmt('The check ran and exited with code {code}.', { code: evt.exit_code });
+    if (evt.exit_code !== 0) return '';
+    return check.matched === false
+        ? tr('task.check.process_completed', 'The check ran successfully (exit 0); its criterion was not met.')
+        : tr('task.check.process_unconfirmed', 'The check ran successfully (exit 0); its comparison reached no verdict, so the criterion is not confirmed.');
+}
+
+/** Why the check did not pass, in the order the facts establish it: a host kill or a
+ *  failing exit says the comparison is not the verdict; otherwise the mode's miss.
+ *  A bytes_equal detail is the producer's own sentence and may name a refused operand,
+ *  a missing file or a comparison failure (then no `matched`), so it is shown as recorded.
+ *  Without a recorded miss the criterion is unconfirmed, never asserted unmet. */
+export function checkFailureCause(evt, check) {
+    if (evt.timed_out === true) return tr('task.check.timed_out', 'timed out');
+    if (evt.signal) return fmt('killed by {signal}', { signal: evt.signal });
+    if (Number.isInteger(evt.exit_code) && evt.exit_code !== 0) return fmt('exit code {code}', { code: evt.exit_code });
+    if (check.expected_match === 'bytes_equal') {
+        return String(check.detail || '').split('\n')[0].trim()
+            || (check.matched === false ? tr('task.check.bytes_not_equal', 'files not byte-equal') : tr('task.check.comparison_unconfirmed', 'comparison not confirmed'));
+    }
+    if (check.matched === false) return tr(...(MISSED_MATCH[check.expected_match] || MISSED_MATCH.substring));
+    return tr('task.check.not_confirmed', 'criterion not confirmed');
+}
+
+/** The diagnostic row for one failed check, or null. `callKey` is the call's own
+ *  timeline key; a failed CALL (is_error) keeps its existing error row instead. */
+export function checkFailureView(evt, callKey) {
+    const check = evt?.verification || evt?.tool_result_meta?.verification;
+    if (!callKey || evt.is_error || check?.status !== 'fail') return null;
+    const process = checkProcessSentence(evt, check);
+    const subject = [
+        check.check ? fmt('Check: {check}', { check: check.check }) : '',
+        check.criterion_id ? fmt('Criterion: {criterion}', { criterion: check.criterion_id }) : '',
+    ].filter(Boolean).join(' · ');
+    const preview = String(evt.result_preview || '').trim();
+    return {
+        phase: 'warn',
+        headline: fmt('Check did not pass: {cause}', { cause: checkFailureCause(evt, check) }),
+        body: oneLine([process, subject].filter(Boolean).join(' '), 220),
+        fullBody: [process, subject, preview || check.detail || ''].filter(Boolean).join('\n\n'),
+        visible: true,
+        dedupeKey: `${callKey}:check`,
+        sourceTs: String(evt.ts || ''),
+    };
+}
+
+/** Upsert one failed-check row in place by its key; true when the timeline changed.
+ *  Used for a live frame that lands after the task's terminal row as well, so the
+ *  arrival order of terminal and check never decides whether the row exists. */
+export function placeCheckRow(record, view, ts, rawTs = view.sourceTs) {
+    const { timelineUpdate } = updateLiveTimelineItem(record, view,
+        { ts, rawTs, syntheticKey: view.dedupeKey, headline: view.headline, inPlaceByKey: true });
+    return !['none', 'duplicate-skip'].includes(timelineUpdate);
+}
+
+/** Replayed host evidence (`tool_call_log.replay_evidence`) draws the rows the live frames drew:
+ *  the folded evidence row (`fold`, its view) at its first call's time, then each failed check's
+ *  row under its live key. `carrierTs` is the history row that delivered the evidence and
+ *  `formatTs` the card's timestamp formatter. True when the timeline changed. */
+export function placeReplayedEvidence(record, fold, evidence, carrierTs, formatTs) {
+    const at = replayedEvidenceTs(evidence, carrierTs);
+    let changed = !['none', 'duplicate-skip'].includes(upsertToolFoldRow(record, fold, formatTs(at), at).timelineUpdate);
+    for (const seen of evidence?.observations || []) {
+        const view = checkFailureView(seen, seen.key);
+        if (view) changed = placeCheckRow(record, view, formatTs(view.sourceTs)) || changed;
+    }
+    return changed;
+}

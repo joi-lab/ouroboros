@@ -6,10 +6,13 @@ returned path through Ouroboros's protected/secret gates before surfacing it.
 
 from __future__ import annotations
 
+import base64
+import bisect
 import fnmatch
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import subprocess
@@ -28,6 +31,14 @@ MAX_SEARCH_FILES_SCANNED = 50000
 # rg command line stays well under the OS limit — Windows' CreateProcess caps at
 # ~32767 chars, far below POSIX ARG_MAX — so many long paths cannot WinError-206.
 _ARGV_CHAR_BUDGET = 28000
+# A matched line longer than this is shown as a window around its first match,
+# with that window's read_file range, instead of whole: one long line (JSON,
+# minified code) could otherwise push the match past a reader's delivery cut.
+MATCH_WINDOW_CHARS = 240
+_MATCH_WINDOW_LEAD = 60
+NOT_UTF8_GAP = "the file is not valid UTF-8, which read_file cannot decode"
+# read_file's line ends on raw UTF-8 bytes: universal newlines, then str.splitlines.
+_READ_LINE_ENDS = re.compile(rb"\r\n|[\n\r\x0b\x0c\x1c\x1d\x1e]|\xc2\x85|\xe2\x80[\xa8\xa9]")
 
 
 def _search_wall_clock_sec() -> float:
@@ -107,6 +118,97 @@ def search_skip_reason(path: pathlib.Path) -> str:
 def is_search_skippable(path: pathlib.Path) -> bool:
     """Boolean projection of :func:`search_skip_reason` for gate call sites."""
     return bool(search_skip_reason(path))
+
+
+def search_text(raw: bytes) -> tuple[str, bool]:
+    """Universal-newline text to scan, and whether read_file can decode the bytes.
+
+    Undecodable bytes are still replaced for display, as before; the flag only
+    says that no read_file range exists for them.
+    """
+    try:
+        text, decodable = raw.decode("utf-8"), True
+    except UnicodeDecodeError:
+        text, decodable = raw.decode("utf-8", "replace"), False
+    return text.replace("\r\n", "\n").replace("\r", "\n"), decodable
+
+
+def match_window(line: str, start: int, end: int, *, count: int = 1, read_line: int = 0,
+                 gap: str = NOT_UTF8_GAP) -> str:
+    """A long matched line as a literal window around its first match.
+
+    ``start``/``end`` count code points of ``line``. With ``read_line`` set,
+    ``line`` is read_file's own line there (universal newlines, ``splitlines``),
+    so the suffix names the exact read_file range of the shown window; without
+    it, ``gap`` says why no range is offered instead of inventing one. An empty
+    read_file line (rg's LF line can hold another read_file line end right at the
+    match) has no positive ``max_chars``: it is addressed whole, only its line end.
+    """
+    begin = max(0, start - _MATCH_WINDOW_LEAD)
+    stop = min(len(line), begin + MATCH_WINDOW_CHARS)
+    shown = ("…" if begin else "") + line[begin:stop] + ("…" if stop < len(line) else "")
+    which = f"first of {count} matches" if count > 1 else "match"
+    window = f"start_char={begin}, max_lines=1, max_chars={stop - begin}" if stop > begin else "max_lines=1"
+    address = f"read_file(start_line={read_line}, {window})" if read_line else f"no read_file range: {gap}"
+    return f"{shown} [{len(line)}-char line; {which} at char {start} ({end - start} chars); {address}]"
+
+
+def _rg_windows(path: pathlib.Path, data: dict, files: dict) -> list[tuple[int, str]]:
+    """Long rg matches grouped in read_file's text model from the file bytes.
+
+    rg reports LF-only line numbers and byte offsets (after a UTF-8 BOM); read_file
+    counts code points between universal-newline/``splitlines`` ends, wherever
+    those occur earlier in the file. One LF event may hold several matched
+    read_file lines; each gets its own row. No rows without a match position.
+    """
+    lines, subs, offset = data.get("lines") or {}, data.get("submatches") or [], data.get("absolute_offset")
+    if not subs or type(offset) is not int:
+        return []
+    reported = lines["text"].encode("utf-8") if "text" in lines else base64.b64decode(lines.get("bytes") or "")
+    start, end = int(subs[0].get("start") or 0), int(subs[0].get("end") or 0)
+    if path not in files:
+        files.clear()  # rg groups each file's matches: holding only the current file bounds memory
+        try:
+            raw = path.read_bytes()
+            raw.decode("utf-8")
+            ends = [(m.start(), m.end()) for m in _READ_LINE_ENDS.finditer(raw)]
+            files[path] = (raw, [s for s, _ in ends], [e for _, e in ends], "")
+        except UnicodeDecodeError:
+            files[path] = (b"", [], [], NOT_UTF8_GAP)
+        except OSError as exc:
+            files[path] = (b"", [], [], f"the file could not be re-read ({type(exc).__name__})")
+    raw, starts, stops, gap = files[path]
+    base = next((skip for skip in (0, 3) if (skip == 0 or raw.startswith(b"\xef\xbb\xbf"))
+                 and raw[skip + offset:skip + offset + len(reported)] == reported), None)
+    gap = gap or ("" if base is not None else "the file no longer holds the bytes rg reported")
+    if not gap:
+        try:
+            groups = {}
+            for sub in subs:
+                begin, finish = int(sub.get("start") or 0), int(sub.get("end") or 0)
+                at = base + offset + begin
+                if raw[at - 1:at] == b"\r" and raw[at:at + 1] == b"\n":
+                    at -= 1  # read_file sees one LF for the CRLF pair
+                index = bisect.bisect_right(stops, at)
+                if index not in groups:
+                    width = len(reported[begin:finish].decode("utf-8"))
+                    groups[index] = [at, width, 0]
+                groups[index][2] += 1
+            rows = []
+            for index, (at, width, count) in groups.items():
+                first = stops[index - 1] if index else 0
+                last = starts[index] if index < len(starts) else len(raw)
+                line, column = raw[first:last].decode("utf-8"), len(raw[first:at].decode("utf-8"))
+                rows.append((index + 1, match_window(line, column, column + width,
+                                                    count=count, read_line=index + 1)))
+            return rows
+        except UnicodeDecodeError:
+            gap = "rg reported a match offset inside a character"
+    text = reported.decode("utf-8", "replace").rstrip("\r\n")
+    column = len(reported[:start].decode("utf-8", "replace"))
+    width = len(reported[start:end].decode("utf-8", "replace"))
+    return [(int(data.get("line_number") or 0),
+             match_window(text, column, column + width, count=len(subs), gap=gap))]
 
 
 @dataclass(frozen=True)
@@ -225,6 +327,7 @@ def search_with_rg(
         batches.append(cur)
 
     matches: list[RgMatch] = []
+    files: dict = {}  # the current file's bytes, re-read once for long-line read_file ranges
     result_truncated = False  # hit the max_results cap (distinct from file-scan cap)
     for batch in batches:
         if len(matches) >= max_results:
@@ -237,11 +340,13 @@ def search_with_rg(
         cmd = base_cmd + ["--", query] + [str(p) for p in batch]
         # Bound each rg call by the REMAINING wall-clock budget (<=60s) so the total
         # search cannot run 60s-per-batch unbounded.
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=min(60.0, max(1.0, remaining)))
+        proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                              timeout=min(60.0, max(1.0, remaining)))
         if proc.returncode not in (0, 1):
             detail = (proc.stderr or proc.stdout or "").strip()[:500]
             raise RuntimeError(detail or f"rg exited {proc.returncode}")
-        for raw in proc.stdout.splitlines():
+        # rg emits LF-delimited JSON; Unicode separators inside strings are data.
+        for raw in proc.stdout.split("\n"):
             try:
                 event = json.loads(raw)
             except json.JSONDecodeError:
@@ -256,12 +361,18 @@ def search_with_rg(
             if path_allowed is not None and not path_allowed(path):
                 continue
             lines = data.get("lines") or {}
-            text = str(lines.get("text") or "").rstrip("\n")
+            # rg sends a non-UTF-8 line as base64 bytes: show it replaced, as the fallback does.
+            text = (str(lines.get("text") or "") if "bytes" not in lines else
+                    base64.b64decode(lines["bytes"]).decode("utf-8", "replace")).rstrip("\n")
             line = int(data.get("line_number") or 0)
-            if len(matches) >= max_results:
-                result_truncated = True
+            rows = _rg_windows(path, data, files) if len(text) > MATCH_WINDOW_CHARS else []
+            for line, text in rows or [(line, text)]:
+                if len(matches) >= max_results:
+                    result_truncated = True
+                    break
+                matches.append(RgMatch(path=path, line=line, text=text.rstrip()))
+            if result_truncated:
                 break
-            matches.append(RgMatch(path=path, line=line, text=text.rstrip()))
         if result_truncated:
             break
     # Return result-cap, file-scan-cap, and deadline SEPARATELY so the caller can tell

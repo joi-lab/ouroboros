@@ -63,23 +63,28 @@ def test_plugin_api_impl_matches_protocol():
 
 
 def test_plugin_api_runtime_info_uses_port_file(tmp_path, monkeypatch):
-    """server_port must reflect the actual bound server port written by
-    server.py/launcher, not the static AGENT_SERVER_PORT fallback."""
-    from ouroboros import config as cfg
-
-    port_file = tmp_path / "state" / "server_port"
-    port_file.parent.mkdir()
-    port_file.write_text("9012\n", encoding="utf-8")
-    monkeypatch.setattr(cfg, "PORT_FILE", port_file)
+    """server_port must reflect the actual bound server port written by the server
+    hosting this extension, not the static AGENT_SERVER_PORT fallback — including a
+    port file relocated by that server's ``OUROBOROS_PORT_FILE``."""
+    drive = tmp_path / "data"
+    (drive / "state").mkdir(parents=True)
+    (drive / "state" / "server_port").write_text("9012\n", encoding="utf-8")
+    monkeypatch.delenv("OUROBOROS_PORT_FILE", raising=False)
     impl = extension_loader.PluginAPIImpl(extension_loader._PluginAPIConfig(
         skill_name="x",
         permissions=(),
         env_allowlist=(),
-        state_dir=tmp_path / "state",
+        state_dir=drive / "state" / "skills" / "x",
         settings_reader=lambda: {},
+        drive_root=drive,
     ))
 
     assert impl.get_runtime_info()["server_port"] == 9012
+    relocated = tmp_path / "elsewhere" / "port"
+    relocated.parent.mkdir()
+    relocated.write_text("9013", encoding="utf-8")
+    monkeypatch.setenv("OUROBOROS_PORT_FILE", str(relocated))
+    assert impl.get_runtime_info()["server_port"] == 9013
 
 
 def test_register_settings_section_lifecycle(tmp_path):

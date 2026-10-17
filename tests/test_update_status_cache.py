@@ -1,5 +1,7 @@
 """Target-bound passive managed-update cache regressions."""
 
+import pytest
+
 import ouroboros.gateway.control as control
 import supervisor.git_ops as git_ops
 
@@ -292,6 +294,25 @@ def test_fetching_payload_writes_the_letter_through_the_one_seam(monkeypatch):
 
     assert calls and calls[0]["fetched"] is True
     assert payload["letter"] is None and payload["latest_version"] == "6.87.5"
+
+
+@pytest.mark.parametrize("fetch", [False, True])
+@pytest.mark.parametrize("facts", [
+    {},  # unchecked/consumed: absence is not an invented "no local changes"
+    {"local_changes": "absent", "local_changes_base": CURRENT},
+    {"local_changes": "present", "local_changes_base": CURRENT},
+    {"local_changes": "unknown", "local_changes_base": "", "local_changes_reason": "several_bases"},
+])
+def test_gateway_preserves_optional_local_content_facts(monkeypatch, fetch, facts):
+    import ouroboros.update_letter as update_letter
+
+    _wire(monkeypatch)
+    status = {"current_sha": CURRENT, "latest_sha": LATEST, **facts}
+    monkeypatch.setattr(git_ops, "compute_managed_update_status", lambda fetch: dict(status))
+    monkeypatch.setattr(update_letter, "refresh_after_check", lambda *_a, **_k: None)
+    monkeypatch.setattr(update_letter, "read_record", lambda drive_root=None: None)
+    payload = control._managed_update_payload(fetch=fetch, include_tags=False)
+    assert {key: value for key, value in payload.items() if key.startswith("local_changes")} == facts
 
 
 def test_pending_local_work_is_projected_without_exposing_raw_transaction(monkeypatch):

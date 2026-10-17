@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
@@ -186,12 +187,30 @@ def _resolve_prompt(args: argparse.Namespace) -> str:
     return positional
 
 
+def _effort_field(args: argparse.Namespace) -> Dict[str, str]:
+    """``--reasoning-effort`` as a body field: absent = the Task default; a supplied
+    value is checked against the effort scale before any client or server contact."""
+    raw = getattr(args, "reasoning_effort", None)
+    if raw is None:
+        return {}
+    from ouroboros.settings_scales import requested_effort
+
+    try:
+        return {"reasoning_effort": requested_effort(raw)}
+    except ValueError as exc:
+        raise CLIError(f"--reasoning-effort: {exc}")
+
+
 def _run_command(args: argparse.Namespace) -> int:
     prompt = _resolve_prompt(args)
     if not prompt:
         raise CLIError("run requires a prompt")
     if str(args.delegation_role or "root").strip().lower() != "root":
         raise CLIError("delegation_role=subagent is only allowed through the internal schedule_subagent tool")
+    effort = _effort_field(args)
+    execution_timeout = float(getattr(args, "execution_timeout", 0) or 0)
+    if not math.isfinite(execution_timeout) or execution_timeout < 0:
+        raise CLIError("--execution-timeout must be finite and non-negative (0 adds no limit)")
     user_metadata: Dict[str, Any] = {}
     raw_metadata = str(getattr(args, "task_metadata_json", "") or "").strip()
     if raw_metadata:
@@ -220,11 +239,14 @@ def _run_command(args: argparse.Namespace) -> int:
         # never forge delegation_role/source (subagent forgery stays blocked).
         "metadata": {**user_metadata, "delegation_role": args.delegation_role, "source": "cli"},
         "source": "cli",
+        **effort,
     }
     if disabled_tools:
         body["disabled_tools"] = list(dict.fromkeys(disabled_tools))
     if float(args.timeout or 0) > 0:
         body["timeout_sec"] = float(args.timeout or 0)
+    if execution_timeout > 0:
+        body["execution_timeout_sec"] = execution_timeout
     created = client.request("POST", "/api/tasks", body)
     task_id = str(created.get("task_id") or "")
     if not task_id:
@@ -381,6 +403,7 @@ def _evolve_command(args: argparse.Namespace) -> int:
 
 
 def _schedule_command(args: argparse.Namespace) -> int:
+    effort = _effort_field(args)  # only `add` has the flag; checked before the client exists
     client = _client(args)
     if args.schedule_command == "list":
         _print_json(client.request("GET", "/api/schedules"))
@@ -392,7 +415,7 @@ def _schedule_command(args: argparse.Namespace) -> int:
             "description": prompt,
             "timezone": args.timezone or "",
             "trigger": {"type": "cron", "expr": args.cron},
-            "task": {"type": "task", "text": prompt, "description": prompt},
+            "task": {"type": "task", "text": prompt, "description": prompt, **effort},
         }
         _print_json(client.request("POST", "/api/schedules", body))
         return 0
@@ -525,7 +548,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--quiet", action="store_true")
     run.add_argument("--no-stream", action="store_true")
     run.add_argument("--detach", action="store_true", help="create the task and print its task id without waiting")
-    run.add_argument("--timeout", type=float, default=0.0, help="maximum seconds to wait for task completion (0 = no limit)")
+    run.add_argument("--timeout", type=float, default=0.0,
+                     help="calendar seconds from submission, queue included; also bounds this wait (0 = no limit)")
+    run.add_argument("--execution-timeout", type=float, default=0.0,
+                     help="execution seconds excluding queue and confirmed quota/Pause/sleep; tools count (0 = no limit)")
     run.add_argument("--patch", action="store_true", help="print workspace patch instead of final answer")
     run.add_argument("--patch-out", default="", help="write workspace patch to this path")
     run.add_argument("--result-json-out", default="", help="write final task result JSON to this path")
@@ -535,6 +561,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="JSON object merged into the task metadata (e.g. budget_profile); "
         "host-owned keys delegation_role/source cannot be overridden")
     run.add_argument("--actor-id", default="cli")
+    run.add_argument(
+        "--reasoning-effort", default=None,
+        help="explicit reasoning effort this root task starts on (a tier of the effort scale); "
+        "omitted = the configured Task default")
     run.add_argument("--delegation-role", default="root")
     run.add_argument(
         "--prompt-file", default="",
@@ -604,6 +634,8 @@ def build_parser() -> argparse.ArgumentParser:
     schedule_add.add_argument("--name", required=True)
     schedule_add.add_argument("--cron", required=True, help="5-field cron expression")
     schedule_add.add_argument("--timezone", default="", help="Optional IANA timezone")
+    schedule_add.add_argument("--reasoning-effort", default=None,
+                              help="explicit starting effort of each fired task; omitted = the Task default")
     schedule_add.add_argument("prompt", nargs="*", help="Task prompt to enqueue")
     schedule_add.set_defaults(func=_schedule_command)
     schedule_remove = schedule_sub.add_parser("remove")
@@ -733,9 +765,9 @@ def _default_base_url() -> str:
         return env_url
     port = DEFAULT_PORT
     try:
-        from ouroboros.config import DATA_DIR
+        from ouroboros.config import resolve_port_file
 
-        port_text = (pathlib.Path(DATA_DIR) / "state" / "server_port").read_text(encoding="utf-8").strip()
+        port_text = resolve_port_file().read_text(encoding="utf-8").strip()
         if port_text:
             port = int(port_text)
     except Exception:
@@ -777,6 +809,12 @@ def _watch_task(
     quiet: bool,
     timeout_sec: float,
 ) -> None:
+    """Follow a task's event stream until its terminal result.
+
+    Streams with POST v2 (resumable cursor); falls back to GET with a sequence
+    number only when the first connection, before any event, fails with HTTP 405.
+    Replays are deduplicated by log identity over the most recent 4096 identities.
+    """
     cursor: Optional[dict] = None
     legacy_seq = 0
     legacy = False

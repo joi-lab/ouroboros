@@ -113,7 +113,15 @@ def test_chat_activities_snapshot_projects_queue_roots_with_phases(tmp_path, mon
         "client_message_id": "",
         "kind": "managed_task",
         "phase": "queued",
+        "can_resume": False,
+        "cancelable": True,
         "task_attempt": 1,
+        # K8: no narration, no calls, not detached, no registered room for "proj-a" yet.
+        "last_line": "",
+        "last_line_at": "",
+        "tool_calls": 0,
+        "detached": False,
+        "project_name": "",
     }
     assert rows["running-root"]["phase"] == "working"
     assert rows["running-root"]["started_at"] == 111.0
@@ -154,8 +162,11 @@ def test_snapshot_rehomes_activity_without_changing_sources(tmp_path, monkeypatc
         "activity_id": "root", "chat_id": 1, "project_id": "",
         "kind": "managed_task", "phase": "working", "started_at": 9.0,
         "client_message_id": "", "task_attempt": 1,
+        "can_resume": False, "cancelable": True,
     }
-    assert rows == [{**expected, **bindings.get("root", {})}]
+    # K8: the census row's own facts (no narration, no calls, not detached, no registered room).
+    k8 = {"last_line": "", "last_line_at": "", "tool_calls": 0, "detached": False, "project_name": ""}
+    assert rows == [{**expected, **k8, **bindings.get("root", {})}]
     assert direct_rows == original_direct
     assert registry.snapshot() == original_direct
     assert running == original_running
@@ -253,18 +264,25 @@ def test_active_chat_activity_contract_mirrors_direct_turn_shape():
     import pathlib
 
     fields = ActiveChatActivity.__annotations__
-    managed_keys = {"required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait"}
-    assert {key: value for key, value in fields.items() if key not in managed_keys} == ActiveDirectTurn.__annotations__
-    assert set(fields) - set(ActiveDirectTurn.__annotations__) == managed_keys
+    additional_keys = {
+        "required_question", "required_question_unavailable", "project_admission_hold", "pause_cause", "owner_wait",
+        "status", "outcome_axes", "reason_code", "root_phase_checkpoint", "timeout_retry_from", "original_task_id",
+        "finishing_reviews", "late_work", "can_resume", "cancelable",
+        # K8 census facts for every chat (project_id is already a direct-turn field).
+        "last_line", "last_line_at", "tool_calls", "detached", "project_name",
+    }
+    assert {key: value for key, value in fields.items() if key not in additional_keys} == ActiveDirectTurn.__annotations__
+    assert set(fields) - set(ActiveDirectTurn.__annotations__) == additional_keys
     from typing import get_type_hints
     hints = get_type_hints(ActiveChatActivity, include_extras=True)
-    for key in managed_keys:
+    for key in additional_keys:
         assert "NotRequired" in str(hints[key])
     assert "active_chat_activities" in StateResponse.__annotations__
     api_types = (
         pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "api_types.js"
     ).read_text(encoding="utf-8")
-    for needle in ("ActiveChatActivity", "active_chat_activities", "task_phase", "project_admission_hold", "owner_wait"):
+    api_types += (pathlib.Path(__file__).resolve().parents[1] / "web" / "modules" / "task_activity_types.js").read_text(encoding="utf-8")
+    for needle in ("ActiveChatActivity", "active_chat_activities", "task_phase", *additional_keys):
         assert needle in api_types, f"api_types.js mirror is missing {needle!r}"
 
 
@@ -625,13 +643,15 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
 
     project = create_project(tmp_path, "racer")
     chat_id = int(project["chat_id"])
-    pending = [{
-        "id": "pending-root",
+    # The room's sole reader is a live executor (D6); a queued root no longer
+    # consumes ordinary room input (tests/test_room_reader.py pins that half).
+    running = {"running-root": {"task": {
+        "id": "running-root",
         "chat_id": chat_id,
-        "root_task_id": "pending-root",
+        "root_task_id": "running-root",
         "delegation_role": "root",
         "drive_root": str(tmp_path),
-    }]
+    }}}
     acks = []
 
     class Bridge:
@@ -659,8 +679,8 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
 
     ctx = types.SimpleNamespace(
         DRIVE_ROOT=tmp_path,
-        PENDING=pending,
-        RUNNING={},
+        PENDING=[],
+        RUNNING=running,
         load_state=lambda: {"owner_id": 1, "owner_chat_id": 1, "session_id": "s-1"},
         update_state=lambda fn: fn({"owner_id": 1, "owner_chat_id": 1}),
         consciousness=_Consciousness(),
@@ -689,7 +709,7 @@ def test_owner_project_message_survives_into_history_with_annotation(tmp_path, m
     assert row["text"] == "please also fix the failing test"
     assert row["chat_annotation"] == {
         "action": "mailbox_delivery",
-        "target": "pending-root",
+        "target": "running-root",
         "target_label": "Task",
         "status": "delivered",
         "attachment_manifest": [],

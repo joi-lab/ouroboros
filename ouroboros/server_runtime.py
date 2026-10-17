@@ -3,23 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Awaitable, Callable
 
 from ouroboros.provider_models import (
     DIRECT_PROVIDER_DEFAULTS,
-    DIRECT_PROVIDER_SCOPE_DEFAULTS,
     compute_direct_review_models_fallback,
     migrate_model_value,
 )
-from ouroboros.config import OPENROUTER_DEFAULTS, SETTINGS_DEFAULTS, _DIRECT_PROVIDER_REVIEW_RUNS, _parse_model_list
+from ouroboros.config import SETTINGS_DEFAULTS, _parse_model_list
 from ouroboros.utils import utc_now_iso
 
 
+# The deep-review model key is a RETIRED setting (PR-3): the read seam migrates a
+# stored value into a catalog row, so no provider default is applied to it here.
 _MODEL_ROLE_SETTING_KEYS = {
     "main": "OUROBOROS_MODEL",
     "light": "OUROBOROS_MODEL_LIGHT",
     "fallback": "OUROBOROS_MODEL_FALLBACKS",
-    "deep_self_review": "OUROBOROS_MODEL_DEEP_SELF_REVIEW",
 }
 _DIRECT_PROVIDER_AUTO_DEFAULTS = {
     provider: {
@@ -29,127 +30,28 @@ _DIRECT_PROVIDER_AUTO_DEFAULTS = {
     }
     for provider, defaults in DIRECT_PROVIDER_DEFAULTS.items()
 }
-# Legacy values that should be auto-replaced with a provider's direct defaults.
-# Cloud.ru, GigaChat, MiniMax, and DeepSeek intentionally have NO entry: such a provider-only user's
-# main/code/light slots match the shipped SETTINGS_DEFAULTS or the shared
-# _PRIOR_SHIPPED_SLOT_DEFAULTS below (google/gemini era) and migrate via the
-# `current in {"", default, *legacy}` check, and the review/scope slots are
-# rebuilt from the provider-prefixed main by _normalize_direct_review_models
-# — so no per-provider legacy set is needed (verified by
-# test_apply_runtime_provider_defaults_cloudru_*).
-_DIRECT_PROVIDER_LEGACY_DEFAULTS = {
-    "openai": {
-        # v6.82.0: the outgoing v6.81 OpenAI slot defaults (gpt-5.5 main/heavy,
-        # gpt-5.4-mini light/fallback, both spellings) migrate to the new gpt-5.6
-        # slot defaults; all four models stay LIVE (no retirement remap).
-        "OUROBOROS_MODEL": {
-            "anthropic/claude-opus-4.6", "openai/gpt-5.5", "openai::gpt-5.5",
-        },
-        "OUROBOROS_MODEL_HEAVY": {
-            "anthropic/claude-opus-4.6", "openai/gpt-5.5", "openai::gpt-5.5",
-        },
-        "OUROBOROS_MODEL_LIGHT": {
-            "anthropic/claude-sonnet-4.6", "openai/gpt-5.4-mini", "openai::gpt-5.4-mini",
-        },
-        "OUROBOROS_MODEL_FALLBACKS": {
-            "anthropic/claude-sonnet-4.6", "openai/gpt-5.4-mini", "openai::gpt-5.4-mini",
-        },
-        # Prior shipped OpenRouter deep defaults and their migrated direct spellings
-        # all name router slugs that do not exist on api.openai.com (404) — a direct
-        # install must land on the real model, not on a -pro id.
-        "OUROBOROS_MODEL_DEEP_SELF_REVIEW": {
-            "openai/gpt-5.6-sol-pro", "openai::gpt-5.6-sol-pro",
-            "openai/gpt-5.5-pro", "openai::gpt-5.5-pro",
-        },
-    },
-    "anthropic": {
-        # Both spellings of each previous Anthropic default (opus-4.6 -> opus-4.8 in
-        # v6.8x, opus-4.8/sonnet-4.6 -> sonnet-5/opus-5 in v6.82.0) so existing
-        # Anthropic-only users on any prior shipped default migrate to the current
-        # slot defaults, whether stored in dot/slash or dash/colon form.
-        "OUROBOROS_MODEL": {
-            "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-6",
-            "anthropic/claude-opus-4.8", "anthropic::claude-opus-4-8",
-        },
-        "OUROBOROS_MODEL_HEAVY": {
-            "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-6",
-            "anthropic/claude-opus-4.8", "anthropic::claude-opus-4-8",
-        },
-        "OUROBOROS_MODEL_LIGHT": {
-            "anthropic/claude-sonnet-4.6", "anthropic::claude-sonnet-4-6",
-        },
-        "OUROBOROS_MODEL_FALLBACKS": {
-            "anthropic/claude-sonnet-4.6", "anthropic::claude-sonnet-4-6",
-        },
-    },
-}
-_DIRECT_PROVIDER_LEGACY_DEFAULTS["openai"]["OUROBOROS_MODEL_LIGHT"].add("openai::gpt-4.1")
-_DIRECT_PROVIDER_LEGACY_DEFAULTS["openai"]["OUROBOROS_MODEL_FALLBACKS"].add("openai::gpt-4.1")
-_LEGACY_GEMINI_31_FLASH_LITE = "google/gemini-" + "3.1-flash-lite"
-_LEGACY_GEMINI_31_PRO_PREVIEW = "google/gemini-" + "3.1-pro-preview"
-_LEGACY_GEMINI_3_FLASH_PREVIEW = "google/gemini-" + "3-flash-preview"
-for _legacy_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values():
-    for _slot in ("OUROBOROS_MODEL", "OUROBOROS_MODEL_HEAVY", "OUROBOROS_MODEL_LIGHT"):
-        _legacy_defaults[_slot].add(_LEGACY_GEMINI_31_FLASH_LITE)
-# Outgoing SHIPPED OpenRouter defaults, applied for EVERY
-# exclusive-direct provider (incl. cloudru/gigachat/minimax/deepseek, which have no per-provider
-# legacy table): before each defaults refresh a stored copy of the shipped default matched the
-# `current in {"", default}` check because SETTINGS_DEFAULTS still carried it;
-# after the defaults refresh these stored copies are still "the old DEFAULT, not
-# an explicit choice" and must keep migrating to the provider slots. All models
-# here stay LIVE (no retirement remap).
-_PRIOR_SHIPPED_SLOT_DEFAULTS = {
-    "OUROBOROS_MODEL": {
-        "google/gemini-3.5-flash",
-        "google/gemini-3.7-flash",
-        "x-ai/grok-4.5",
-    },
-    "OUROBOROS_MODEL_HEAVY": {"google/gemini-3.5-flash"},
-    "OUROBOROS_MODEL_LIGHT": {
-        "google/gemini-3.5-flash",
-        "google/gemini-3.6-flash",
-    },
-    "OUROBOROS_MODEL_FALLBACKS": {"anthropic/claude-sonnet-4.6"},
-    # Prior shipped deep-review values (v6.81's gpt-5.5-pro, then the gpt-5.6-sol-pro
-    # routing slug): an upgraded direct-provider install still carries one, and each
-    # is just as unreachable without an OpenRouter credential.
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": {
-        OPENROUTER_DEFAULTS["deep_self_review"],
-        "openai/gpt-5.5-pro", "openai::gpt-5.5-pro",
-        "openai/gpt-5.6-sol-pro", "openai::gpt-5.6-sol-pro",
-    },
-}
 # Heavy is no longer an active role, but its bounded migration reader still
 # needs to distinguish an owner's custom value from values Ouroboros itself
-# shipped as defaults.  Equality has always been the provider-default
-# migration authority for these slots.  Keeping the classification here lets
-# active consumers ignore Heavy without laundering an old default into a new
-# explicit API actor.
-_RETIRED_SHIPPED_HEAVY_DEFAULTS = frozenset({
-    # Pre-Heavy CODE defaults that were migrated into the Heavy key on upgrade.
-    "anthropic/claude-opus-4.7",
-    "anthropic::claude-opus-4-7",
-    # Provider defaults retired in the same change that removed active Heavy.
-    "openai::gpt-5.6-sol",
-    "anthropic::claude-opus-5",
-    # Prior GigaChat default replaced before Heavy retirement.
-    "gigachat::GigaChat-3-Ultra",
-})
+# shipped as Heavy/Code defaults (both spellings, every release that shipped
+# one, plus each provider's current Heavy default), so an old default is not
+# laundered into a new explicit API actor. This retired key is the only place
+# equality with a former default still classifies a value: active model slots
+# keep whatever was saved (``provider_slot_proposals`` fills only absent ones).
 _SHIPPED_LEGACY_HEAVY_DEFAULTS = frozenset({
-    *_PRIOR_SHIPPED_SLOT_DEFAULTS.get("OUROBOROS_MODEL_HEAVY", set()),
-    *(
-        value
-        for provider_defaults in _DIRECT_PROVIDER_LEGACY_DEFAULTS.values()
-        for value in provider_defaults.get("OUROBOROS_MODEL_HEAVY", set())
-    ),
+    "google/gemini-" + "3.1-flash-lite", "google/gemini-3.5-flash",
+    "anthropic/claude-opus-4.6", "anthropic::claude-opus-4-6",
+    "anthropic/claude-opus-4.7", "anthropic::claude-opus-4-7",
+    "anthropic/claude-opus-4.8", "anthropic::claude-opus-4-8",
+    "openai/gpt-5.5", "openai::gpt-5.5", "openai::gpt-" + "5.4",
+    "openai::gpt-5.6-sol", "anthropic::claude-opus-5", "gigachat::GigaChat-3-Ultra",
     *(
         str(provider_defaults.get("heavy", "") or "").strip()
         for provider_defaults in DIRECT_PROVIDER_DEFAULTS.values()
         if str(provider_defaults.get("heavy", "") or "").strip()
     ),
-    *_RETIRED_SHIPPED_HEAVY_DEFAULTS,
 })
-_ALL_MODEL_SLOT_KEYS = tuple(_MODEL_ROLE_SETTING_KEYS.values())
+# The slots that take a provider proposal while nobody authored them.
+MODEL_SLOT_KEYS = _ALL_MODEL_SLOT_KEYS = tuple(_MODEL_ROLE_SETTING_KEYS.values())
 _SCOPE_REVIEW_LEGACY_DEFAULTS = frozenset({
     "",
     "anthropic/claude-opus-4.6",
@@ -180,18 +82,10 @@ _SCOPE_REVIEW_PRIOR_DEFAULTS = frozenset({
     "openai/gpt-5.5", "openai::gpt-5.5",
     "anthropic/claude-fable-5", "anthropic::claude-fable-5",
 })
-_RETIRED_MODEL_DEFAULT_REPLACEMENTS = {
-    "openai/gpt-" + "5.4": "openai/gpt-5.5",
-    "openai::gpt-" + "5.4": "openai::gpt-5.5",
-    "openai/gpt-" + "5.4-pro": "openai/gpt-5.5-pro",
-    "openai::gpt-" + "5.4-pro": "openai::gpt-5.5-pro",
-    # NB: gpt-5.4-mini is intentionally absent — it is a LIVE model (the 5.5 family
-    # shipped without a mini lane), so it must pass through unchanged. A prior mapping
-    # here rewrote it to a non-existent "gpt-5.5-mini" and broke every call on that slot.
-    _LEGACY_GEMINI_31_FLASH_LITE: "google/gemini-3.5-flash",
-    _LEGACY_GEMINI_31_PRO_PREVIEW: "google/gemini-3.5-flash",
-    _LEGACY_GEMINI_3_FLASH_PREVIEW: "google/gemini-3.5-flash",
-}
+# No table here declares an external model "retired": a saved model id is the owner's
+# choice and stays as written, and a model a provider really withdrew answers with that
+# provider's own error. Only equality with one of OUR former shipped defaults migrates
+# (the sets above), because only then is the value ours rather than the owner's.
 
 
 def _truthy_setting(value) -> bool:
@@ -208,52 +102,6 @@ def _serialize_model_list(models: list[str]) -> str:
 
 def _unique_changed_keys(keys: list[str]) -> list[str]:
     return list(dict.fromkeys(keys))
-
-
-def _refresh_retired_model_defaults(settings: dict) -> tuple[dict, list[str]]:
-    normalized = dict(settings)
-    changed: list[str] = []
-    keys = [
-        "OUROBOROS_MODEL",
-        "OUROBOROS_MODEL_HEAVY",
-        "OUROBOROS_MODEL_LIGHT",
-        "OUROBOROS_MODEL_FALLBACKS",
-        "OUROBOROS_SCOPE_REVIEW_MODEL",
-    ]
-    for key in keys:
-        # A local Heavy value is explicit owner routing intent.  Preserve its
-        # exact model string even when it happens to match a globally retired
-        # cloud identifier; the local runtime may intentionally serve that ID.
-        if key == "OUROBOROS_MODEL_HEAVY" and _truthy_setting(
-            normalized.get("USE_LOCAL_HEAVY")
-        ):
-            continue
-        value = _setting_text(normalized, key)
-        replacement = _RETIRED_MODEL_DEFAULT_REPLACEMENTS.get(value)
-        if replacement:
-            normalized[key] = replacement
-            changed.append(key)
-    review_value = _setting_text(normalized, "OUROBOROS_REVIEW_MODELS")
-    if review_value:
-        models = [
-            _RETIRED_MODEL_DEFAULT_REPLACEMENTS.get(item, item)
-            for item in _parse_model_list(review_value)
-        ]
-        serialized = _serialize_model_list(models)
-        if serialized != review_value:
-            normalized["OUROBOROS_REVIEW_MODELS"] = serialized
-            changed.append("OUROBOROS_REVIEW_MODELS")
-    scope_review_value = _setting_text(normalized, "OUROBOROS_SCOPE_REVIEW_MODELS")
-    if scope_review_value:
-        models = [
-            _RETIRED_MODEL_DEFAULT_REPLACEMENTS.get(item, item)
-            for item in _parse_model_list(scope_review_value)
-        ]
-        serialized = _serialize_model_list(models)
-        if serialized != scope_review_value:
-            normalized["OUROBOROS_SCOPE_REVIEW_MODELS"] = serialized
-            changed.append("OUROBOROS_SCOPE_REVIEW_MODELS")
-    return normalized, _unique_changed_keys(changed)
 
 
 def _migrate_scope_review_prior_default(settings: dict) -> tuple[dict, list[str]]:
@@ -323,12 +171,7 @@ def _normalize_direct_review_models(settings: dict, provider: str) -> str:
     # single slot); expand to the stochastic fallback only when empty/foreign.
     if not migrated_models or has_foreign_models:
         user_light_raw = _setting_text(settings, "OUROBOROS_MODEL_LIGHT")
-        fallback = compute_direct_review_models_fallback(
-            provider,
-            main_model,
-            user_light_raw,
-            review_runs=_DIRECT_PROVIDER_REVIEW_RUNS,
-        )
+        fallback = compute_direct_review_models_fallback(provider, main_model, user_light_raw)
         return _serialize_model_list(fallback)
     return _serialize_model_list(migrated_models)
 
@@ -339,8 +182,10 @@ def _normalize_direct_scope_review_model(settings: dict, provider: str) -> str:
     current = migrate_model_value(provider, current_raw) if current_raw else ""
     default = migrate_model_value(provider, default_raw) if default_raw else ""
     provider_prefix = _provider_prefix(provider)
+    # The scope lane's per-provider default was the provider's Main (the former
+    # ``DIRECT_PROVIDER_SCOPE_DEFAULTS``, retired with the lane).
     auto_value = migrate_model_value(
-        provider, DIRECT_PROVIDER_SCOPE_DEFAULTS.get(provider, ""),
+        provider, DIRECT_PROVIDER_DEFAULTS.get(provider, {}).get("main", ""),
     )
     legacy_defaults = {
         migrate_model_value(provider, item) for item in _SCOPE_REVIEW_LEGACY_DEFAULTS
@@ -485,37 +330,112 @@ _LOCAL_LANE_FLAG_FOR_SLOT = {
 }
 
 
-def _clear_shipped_defaults_for_local_only(settings: dict) -> list[str]:
-    """Keep a LOCAL-ONLY install self-sufficient (DEVELOPMENT: Provider Independence).
+def authored_model_slots(document) -> set[str]:
+    """The active model slots ``document`` carries as a choice: any saved value, blank included
+    (blank Light follows Main, blank Fallbacks means no cross-model fallback, a blank Main runs
+    as ``model_slots._main_model`` reads it). Only an absent slot takes a proposal."""
+    return {key for key in _ALL_MODEL_SLOT_KEYS if key in document}
 
-    Light and Fallback ship real remote defaults since v6.82.0. With no remote
-    credential at all, an UNTOUCHED shipped default in those slots would send the
-    Light lane (safety, summaries, deep subagents) to a provider the install cannot
-    reach; an empty slot inherits Main, which is the local route. Only values still
-    equal to the shipped default are cleared — an explicit choice is never touched.
+
+def provider_slot_proposals(settings: dict) -> dict:
+    """What an UNAUTHORED Main/Light/Fallbacks slot takes, from the configured access.
+
+    One exclusive direct provider: its own defaults. A local-only install: blank Light (it
+    follows Main) and blank Fallbacks (no chain onto the same runtime) — the setup contract's
+    ``local`` profile proposes the same — except a lane routed local while Main is not, whose
+    shipped id is then a route the install runs (for Fallbacks the only chain entry). Otherwise
+    the shipped defaults. A proposal never replaces a saved value (DEVELOPMENT: Provider Independence).
     """
-    # Only a genuine LOCAL-routing install: an empty/unconfigured settings dict (a
-    # pre-onboarding first run) must keep the shipped defaults it is about to be
-    # offered, and a remote install is untouched.
-    if has_remote_provider(settings) or not _setting_text(settings, "LOCAL_MODEL_SOURCE"):
-        return []
-    changed: list[str] = []
-    for key in ("OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"):
-        # A slot the owner explicitly routed to LOCAL is reachable: the flag sends
-        # that lane to the local endpoint whatever the model string says, and for
-        # Fallbacks the string is the only chain entry — clearing it would not
-        # inherit Main (an empty Fallbacks slot means "no cross-model fallback"),
-        # it would silently delete the lane the owner asked for.
-        if _truthy_setting(settings.get(_LOCAL_LANE_FLAG_FOR_SLOT[key])):
-            continue
-        current = _setting_text(settings, key)
-        # An UPGRADED local-only install still carries the PRIOR shipped defaults, which
-        # are just as unreachable — treat them exactly like the current ones.
-        shipped = {_setting_text(SETTINGS_DEFAULTS, key), *_PRIOR_SHIPPED_SLOT_DEFAULTS.get(key, set())}
-        if current and current in shipped:
-            settings[key] = ""
-            changed.append(key)
-    return changed
+    provider = _exclusive_direct_remote_provider(settings)
+    if provider:
+        return dict(_DIRECT_PROVIDER_AUTO_DEFAULTS[provider])
+    proposals = {key: _setting_text(SETTINGS_DEFAULTS, key) for key in _ALL_MODEL_SLOT_KEYS}
+    if not has_remote_provider(settings) and _setting_text(settings, "LOCAL_MODEL_SOURCE"):
+        local_main = _truthy_setting(settings.get("USE_LOCAL_MAIN"))
+        proposals.update({key: "" for key, flag in _LOCAL_LANE_FLAG_FOR_SLOT.items()
+                          if local_main or not _truthy_setting(settings.get(flag))})
+    return proposals
+
+
+def propose_unauthored_model_slots(settings: dict, authored) -> dict:
+    """``settings`` with every slot outside ``authored`` set to its proposal (in place)."""
+    proposals = provider_slot_proposals(settings)
+    settings.update({key: proposals[key] for key in _ALL_MODEL_SLOT_KEYS if key not in authored})
+    return settings
+
+
+def repropose_unedited_slots(settings: dict, document, written, shown) -> set[str]:
+    """The Settings save's rule: the ``unedited_unauthored_slots`` are re-proposed in ``settings``
+    for the access the save now carries, and returned so the caller does not persist them. One an
+    operator's variable sets (``settings_integrity.operator_variables``) keeps that value, as the
+    next read takes it: in this process, its children and the next task."""
+    from ouroboros.settings_integrity import operator_variables
+
+    unauthored = unedited_unauthored_slots(document, written, shown)
+    operator = operator_variables(os.environ, unauthored)
+    propose_unauthored_model_slots(settings, set(_ALL_MODEL_SLOT_KEYS) - (unauthored - set(operator)))
+    settings.update(operator)
+    return unauthored
+
+
+def unedited_unauthored_slots(document, written, shown) -> set[str]:
+    """The slots a write leaves unauthored: absent from the ``document`` on disk and either not
+    ``written`` or written exactly as the writer read them (``shown``; for the Settings save, what
+    GET showed, respelled onto the exclusive provider: an operator's ``openai/x`` reads ``openai::x``).
+    Settings posts every model role and an owner endpoint writes back the whole document, so posting
+    a proposal back unchanged is not a choice; the key stays absent and keeps following the configured access."""
+    return {key for key in _ALL_MODEL_SLOT_KEYS if key not in authored_model_slots(document)
+            and (key not in written or str(written[key]) == str(shown.get(key)))}
+
+
+def settings_read_catalog(settings: dict):
+    """The subagent catalog a Settings read of the loaded ``settings`` shows: the one in force, else the
+    unsaved candidate offered in its place (``resolve_settings_subagent_candidate``), else ``None``."""
+    from ouroboros.configured_subagents import (
+        SUBAGENTS_SETTING,
+        configured_subagents_dict,
+        resolve_settings_subagent_candidate,
+    )
+
+    shown = settings.get(SUBAGENTS_SETTING)
+    if shown in (None, ""):
+        config = resolve_settings_subagent_candidate(apply_runtime_provider_defaults(dict(settings))[0])[0].config
+        shown = configured_subagents_dict(config) if config is not None else None
+    return shown
+
+
+def repropose_unedited_catalog(settings: dict, document, written, shown) -> set[str]:
+    """The Settings save's rule for the subagent catalog (owner decision: an Agents edit or onboarding completion
+    authors one, an unrelated save does not). A never-configured ``document`` (``review_pool_migration.
+    migration_trigger``) authors none: the read shows its factory rows, an operator's environment catalog or the
+    unsaved candidate. A write leaving that catalog as ``shown`` (not ``written``, or equal once canonical: Settings
+    posts the loaded catalog with every save) keeps it unauthored; ``settings`` then carries what the next read
+    takes for the access the write carries. Returns the key the caller does not persist."""
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING, canonical_subagents
+    from ouroboros.review_pool_migration import TRIGGER_NEVER_CONFIGURED, apply_at_read_seam, migration_trigger
+    from ouroboros.settings_integrity import operator_variables
+
+    posted = written.get(SUBAGENTS_SETTING)
+    if migration_trigger(document) != TRIGGER_NEVER_CONFIGURED or (
+            posted not in (None, "") and canonical_subagents(posted) != canonical_subagents(settings_read_catalog(shown))):
+        return set()
+    if automatic_catalog(document):  # our own projection is no operator catalog: the factory rows follow the access
+        settings[SUBAGENTS_SETTING] = ""
+        apply_at_read_seam(settings, merged=True)
+    else:  # an operator's catalog keeps standing in, byte for byte
+        settings.update(operator_variables(os.environ, (SUBAGENTS_SETTING,)))
+    return {SUBAGENTS_SETTING}
+
+
+def automatic_catalog(document) -> bool:
+    """Whether the catalog a read shows for ``document`` is the read's own, following Main and access (Settings →
+    Agents says Automatic): the document authors none (never-configured) and no operator's variable stands in."""
+    from ouroboros.configured_subagents import SUBAGENTS_SETTING
+    from ouroboros.review_pool_migration import TRIGGER_NEVER_CONFIGURED, migration_trigger
+    from ouroboros.settings_integrity import operator_variables
+
+    return (migration_trigger(document) == TRIGGER_NEVER_CONFIGURED
+            and not operator_variables(os.environ, (SUBAGENTS_SETTING,)))
 
 
 def _clear_shipped_legacy_heavy(settings: dict) -> list[str]:
@@ -536,73 +456,33 @@ def _clear_shipped_legacy_heavy(settings: dict) -> list[str]:
 
 
 def apply_runtime_provider_defaults(settings: dict) -> tuple[dict, bool, list[str]]:
-    """Auto-fill safe runtime defaults for the agreed provider cases."""
-    normalized, retired_changed = _refresh_retired_model_defaults(settings)
-    legacy_heavy_changed = _clear_shipped_legacy_heavy(normalized)
+    """Every route consumer's normalization of a loaded mapping; it never replaces a model value.
+
+    The retired Heavy key's shipped defaults are cleared, and with exactly one direct
+    provider a saved id is respelled onto that provider's prefix (``migrate_model_value``:
+    the same model, ``openai/x`` -> ``openai::x``). Unauthored slots already hold their
+    ``provider_slot_proposals`` (the loader); a saved value — blank, former default or a
+    route without access — stays as written, honestly unavailable when unreachable."""
+    normalized = dict(settings)
+    changed_keys = _clear_shipped_legacy_heavy(normalized)
     provider = _exclusive_direct_remote_provider(normalized)
 
     if not provider:
         normalized, scope_changed = _migrate_scope_review_prior_default(normalized)
-        local_changed = _clear_shipped_defaults_for_local_only(normalized)
-        changed_keys = _unique_changed_keys(
-            retired_changed + legacy_heavy_changed + scope_changed + local_changed
-        )
+        changed_keys = _unique_changed_keys(changed_keys + scope_changed)
         return normalized, bool(changed_keys), changed_keys
 
-    changed_keys: list[str] = [*retired_changed, *legacy_heavy_changed]
-    provider_defaults = _DIRECT_PROVIDER_AUTO_DEFAULTS[provider]
-    main_shipped_default = _setting_text(SETTINGS_DEFAULTS, "OUROBOROS_MODEL")
     for key in _ALL_MODEL_SLOT_KEYS:
-        if key not in provider_defaults:
-            # This provider has NO reachable value for that slot (deep review needs
-            # the >=1M window Cloud.ru/GigaChat/MiniMax do not guarantee). Leaving a
-            # SHIPPED default in place would keep an unreachable OpenRouter-form
-            # route, so clear it — the review is then honestly unavailable. An
-            # explicit owner value is never touched.
-            current_shipped = _setting_text(normalized, key)
-            shipped_values = {
-                _setting_text(SETTINGS_DEFAULTS, key),
-                *_PRIOR_SHIPPED_SLOT_DEFAULTS.get(key, set()),
-            }
-            if current_shipped and current_shipped in shipped_values:
-                normalized[key] = ""
-                changed_keys.append(key)
-            continue
         raw_current = _setting_text(normalized, key)
         current = migrate_model_value(provider, raw_current)
-        default = _setting_text(SETTINGS_DEFAULTS, key)
-        migrated_default = migrate_model_value(provider, default)
-        auto_value = provider_defaults[key]
-        legacy_defaults = (
-            _DIRECT_PROVIDER_LEGACY_DEFAULTS.get(provider, {}).get(key, set())
-            | _PRIOR_SHIPPED_SLOT_DEFAULTS.get(key, set())
-        )
-        # Light default EMPTY -> Main (role-model, v6.39). Its pre-role-model
-        # default was the shared Main default, so a stored value equal to it is the old
-        # "follow Main" default and migrates to the provider slot exactly like "".
-        extra_default = (
-            main_shipped_default
-            if key == "OUROBOROS_MODEL_LIGHT"
-            else ""
-        )
-        migrated_extra_default = migrate_model_value(provider, extra_default)
-        next_value = (
-            auto_value
-            if current in {
-                "", default, migrated_default, extra_default,
-                migrated_extra_default, *legacy_defaults,
-            }
-            else current
-        )
-        if next_value != raw_current:
-            normalized[key] = next_value
+        if current != raw_current:
+            normalized[key] = current
             changed_keys.append(key)
 
     # ABI 7.0 (ABI-10): the comma keys are RETIRED settings. A ghost value fed
     # directly still normalizes (owner-value preservation on a stale dict), but
-    # an absent key is never INTRODUCED — the read-time getters
-    # (`get_review_models`/`get_scope_review_models`) perform this same
-    # direct-provider adaptation on the derived env plane.
+    # an absent key is never INTRODUCED. Live reviews read marked catalog rows;
+    # this tolerance for stale dicts does not configure the review pool.
     if _setting_text(normalized, "OUROBOROS_REVIEW_MODELS"):
         review_models = _normalize_direct_review_models(normalized, provider)
         if review_models != _setting_text(normalized, "OUROBOROS_REVIEW_MODELS"):

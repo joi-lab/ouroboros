@@ -868,7 +868,7 @@ class _LifecycleMixin:
                 "workspace_host_path": str(workspace_root),
                 "workspace_backend_path": "/workspace",
             },
-            "timeout_sec": int(self.config.task_timeout_sec),
+            "execution_timeout_sec": int(self.config.task_timeout_sec),  # #939: queue time is not solve time
             "actor_id": "cybergym",
             "source": "cybergym",
             "metadata": {

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.gateway import history
+from ouroboros.gateway.state import _chat_activities_snapshot_safe as _real_census  # before the autouse stub
+from ouroboros.store_import import ensure_current_store
 from ouroboros.tool_call_log import replay_evidence_for_tasks
 
 pytestmark = pytest.mark.serial
@@ -37,7 +39,7 @@ def _room_read(root, chat_id):
 
 @pytest.fixture(autouse=True)
 def _no_live_activity(monkeypatch):
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [])
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [])
 
 
 @pytest.mark.parametrize("role", ["in", "out"])
@@ -46,6 +48,7 @@ def test_plain_speech_and_user_rows_keep_authorship_beside_host_evidence(tmp_pat
                                            "text": "Actual words", "chat_id": 1}])
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": "completed"}])
+    ensure_current_store(tmp_path)  # Boot publishes legacy facts; display reads never import.
     result = _read(tmp_path)
     speech, carrier = result["messages"]
     assert speech["text"] == "Actual words" and speech["role"] == ("user" if role == "in" else "assistant")
@@ -64,6 +67,7 @@ def test_child_only_window_recovers_parent_tools_without_parent_speech(tmp_path)
         "ts": TS, "content": "The child finished", "chat_id": 1}])
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": "completed", "chat_id": 1}])
+    ensure_current_store(tmp_path)
     carriers = [row for row in _read(tmp_path)["messages"] if row.get("system_type") == "task_evidence"]
     assert [row["task_id"] for row in carriers] == ["root"]
     assert carriers[0]["task_terminal_status"] == "completed"
@@ -75,7 +79,7 @@ def test_speechless_current_root_is_addressed_without_importing_other_rooms(tmp_
     project = create_project(tmp_path, "other", name="Other room")
     rows = [{"activity_id": task, "chat_id": chat, "kind": "direct_chat", "phase": "thinking"}
             for task, chat in (("root", 1), ("foreign", project["chat_id"]), ("hidden", 0))]
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: rows)
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: rows)
     _write(tmp_path / "logs/tools.jsonl", [_tool(row["activity_id"]) for row in rows])
     assert [row["task_id"] for row in _read(tmp_path)["messages"]] == ["root"]
 
@@ -85,7 +89,7 @@ def test_current_root_with_original_zero_address_follows_its_project_binding(tmp
 
     project = create_project(tmp_path, "bound", name="Bound room")
     bind_task_to_project(tmp_path, "root", project["id"], origin={"absent": "system"})
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
         {"activity_id": "root", "chat_id": 0, "kind": "direct_chat", "phase": "thinking"}])
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     [carrier] = _room_read(tmp_path, project["chat_id"])["messages"]
@@ -110,6 +114,7 @@ def test_child_cannot_address_parent_tool_evidence_to_its_own_room(tmp_path, mon
     if route != "unknown":
         result["chat_id"] = (foreign if route in {"stored_foreign", "bound_same"} else current)["chat_id"]
     _write(tmp_path / "task_results/parent.json", [result])
+    ensure_current_store(tmp_path)
     _write(tmp_path / "logs/progress.jsonl", [{"task_id": "child", "parent_task_id": "parent",
         "root_task_id": "parent", "delegation_role": "subagent", "subagent_event": "completed",
         "content": "Child complete", "chat_id": current["chat_id"], "ts": TS}])
@@ -133,7 +138,7 @@ def test_child_cannot_address_parent_tool_evidence_to_its_own_room(tmp_path, mon
 
 
 def test_current_root_narration_outside_page_keeps_evidence_without_fake_cursor(tmp_path, monkeypatch):
-    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_: [
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
         {"activity_id": "root", "chat_id": 1, "phase": "working", "kind": "managed_task"}])
     _write(tmp_path / "logs/chat.jsonl", [
         {"direction": "out", "task_id": "root", "text": "Earlier speech", "ts": TS, "chat_id": 1},
@@ -158,6 +163,7 @@ def test_empty_known_missing_replay_is_carried_as_incomplete(tmp_path, witness):
         fields = {"tool_calls": 1} if witness == "result" else {
             "completion_observations": {"delivery_counts": {"send_message": {"calls": 1}}}}
         _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": "completed", "chat_id": 1, **fields}])
+        ensure_current_store(tmp_path)
         if witness == "parent_delivery":
             _write(tmp_path / "logs/chat.jsonl", [])
             _write(tmp_path / "logs/progress.jsonl", [{"task_id": "child", "parent_task_id": "root",
@@ -204,15 +210,16 @@ def test_shared_noisy_log_windows_are_decoded_once_per_request(tmp_path, monkeyp
     parser = utils.iter_jsonl_objects
     decoded = []
 
-    def observed(source, *, tail_bytes=None, gap_reasons=None):
-        decoded.append((source, tail_bytes))
-        yield from parser(source, tail_bytes=tail_bytes, gap_reasons=gap_reasons)
+    def observed(source, **kwargs):
+        # The replay hands each window over as one read (no buffered 4 KiB line walk).
+        decoded.append((source, kwargs["_handle"].getbuffer().nbytes))
+        yield from parser(source, **kwargs)
 
     monkeypatch.setattr(utils, "iter_jsonl_objects", observed)
     result = replay_evidence_for_tasks(tmp_path, ["root", "second"])
     assert all(len(evidence["observations"]) == 1 for evidence in result.values())
     assert len(decoded) == len(set(decoded)), "selected tasks share the same physical parse"
-    assert sum(min(path.stat().st_size, window or path.stat().st_size) for _, window in decoded) < 3 * path.stat().st_size
+    assert sum(window for _, window in decoded) < 3 * path.stat().st_size
     before = len(decoded)
     replay_evidence_for_tasks(tmp_path, ["root"])
     assert len(decoded) > before, "no cross-request memo can hide new settlements"
@@ -290,6 +297,7 @@ def test_shared_archive_listing_keeps_the_history_body_byte_identical(tmp_path, 
 
     _archived_tools_for(tmp_path, ["a", "b", "c"])
     _write(tmp_path / "task_results/a.json", [{"_schema_version": 1, "task_id": "a", "status": "completed", "chat_id": 1}])
+    ensure_current_store(tmp_path)
     shared = history._assemble_history_response(tmp_path, 1, 10, 10, None)
     # The per-task reader: every task lists and parses on its own (the pre-sharing shape).
     monkeypatch.setattr(tool_call_log, "replay_evidence_for_tasks", lambda root, task_ids: {
@@ -326,6 +334,7 @@ def test_a_carrier_that_is_the_tasks_only_terminal_row_keeps_the_whole_terminal_
     _write(tmp_path / "logs/tools.jsonl", [_tool("bare"), _tool("summarized")])
     for task in ("bare", "summarized"):
         _write(tmp_path / f"task_results/{task}.json", [{**truth, "task_id": task}])
+    ensure_current_store(tmp_path)
     rows = {row["task_id"]: row for row in _read_wide(tmp_path)["messages"]
             if row.get("system_type") in {"task_evidence", "task_summary"}}
     carrier, summary = rows["bare"], rows["summarized"]
@@ -349,6 +358,7 @@ def test_a_row_main_pins_for_a_project_task_does_not_mint_its_card_in_main(tmp_p
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": "completed",
                                                   "chat_id": project["chat_id"]}])
+    ensure_current_store(tmp_path)
     main = _room_read(tmp_path, 1)["messages"]
     assert [(row["task_id"], row["system_type"]) for row in main] == [("root", row_type)], main
     room = _room_read(tmp_path, project["chat_id"])["messages"]
@@ -363,3 +373,162 @@ def test_a_main_rooted_tasks_own_main_notice_still_carries_its_tools(tmp_path):
     _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
     rows = _room_read(tmp_path, 1)["messages"]
     assert [(row["task_id"], row["system_type"]) for row in rows] == [("root", "main_notice"), ("root", "task_evidence")]
+
+
+# --- A4 read seam and A5 G2: the room rule in history, and the in-room parent's carrier ------------
+
+def _converted_root_with_child(root, *, child_status="cancelled", parent_status="completed", row_chat=1, lineage=False):
+    """A root converted by «Turn into project», its child, and the child's progress row as the
+    supervisor recorded it (Main, task id only) unless ``lineage``/``row_chat`` say otherwise."""
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from ouroboros.task_results import write_task_result
+
+    project = create_project(root, "room", name="Project room")
+    write_task_result(root, "par", parent_status, root_task_id="par", chat_id=1)
+    bind_task_to_project(root, "par", project["id"], origin={"absent": "system"})
+    write_task_result(root, "kid", child_status, delegation_role="subagent", parent_task_id="par",
+                      root_task_id="par", chat_id=1)
+    row = {"ts": "2026-10-14T12:10:20Z", "type": "send_message", "task_id": "kid", "is_progress": True,
+           "direction": "out", "chat_id": row_chat, "text": "Stopped", "content": "Stopped", "role": "system",
+           "system_type": "subagent_terminal_notice", "subagent_event": child_status, "narration": False,
+           **({"delegation_role": "subagent", "parent_task_id": "par", "root_task_id": "par"} if lineage else {})}
+    _write(root / "logs/progress.jsonl", [row])
+    return project
+
+
+def test_a_recorded_phantom_row_leaves_main_and_appears_in_its_project(tmp_path):
+    project = _converted_root_with_child(tmp_path)
+    assert [row["task_id"] for row in _room_read(tmp_path, 1)["messages"]] == [], "Main keeps no Project child"
+    rows = _room_read(tmp_path, project["chat_id"])["messages"]
+    child = next(row for row in rows if row["task_id"] == "kid")
+    assert (child["parent_task_id"], child["delegation_role"]) == ("par", "subagent"), "replay recovers the lineage"
+
+
+@pytest.mark.parametrize("parent_status, terminal", [("completed", "completed"), ("cancelled", "cancelled"), ("scheduled", None)])
+def test_a_zero_tool_in_room_parent_is_carried_at_its_childs_row_with_only_a_real_terminal(tmp_path, parent_status, terminal):
+    project = _converted_root_with_child(tmp_path, parent_status=parent_status)
+    rows = _room_read(tmp_path, project["chat_id"])["messages"]
+    [carrier] = [row for row in rows if row["task_id"] == "par"]
+    assert carrier["system_type"] == "task_evidence" and carrier["ts"] == "2026-10-14T12:10:20Z"
+    assert carrier["tool_evidence"]["observations"] == [] and "tool_calls" not in carrier
+    assert carrier.get("task_terminal_status") == terminal, "a scheduled parent is never finished as Done"
+    if terminal:
+        assert carrier["outcome_phase"] == ("cancelled" if terminal == "cancelled" else "done")
+    else:
+        assert carrier["task_phase"] == "unfinished"
+
+
+def test_a_main_parent_with_zero_tools_is_carried_for_its_child_in_main(tmp_path):
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, "mpar", "completed", root_task_id="mpar", chat_id=1)
+    write_task_result(tmp_path, "mkid", "completed", delegation_role="subagent", parent_task_id="mpar",
+                      root_task_id="mpar", chat_id=1)
+    _write(tmp_path / "logs/progress.jsonl", [{"ts": TS, "type": "send_message", "task_id": "mkid", "is_progress": True,
+        "chat_id": 1, "content": "Child finished", "role": "system", "system_type": "subagent_terminal_notice",
+        "subagent_event": "completed", "delegation_role": "subagent", "parent_task_id": "mpar", "root_task_id": "mpar"}])
+    [carrier] = [row for row in _room_read(tmp_path, 1)["messages"] if row["task_id"] == "mpar"]
+    assert (carrier["system_type"], carrier["ts"], carrier["task_terminal_status"]) == ("task_evidence", TS, "completed")
+
+
+def test_a_notice_naming_a_child_anchors_no_parent(tmp_path):
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, "npar", "completed", root_task_id="npar", chat_id=1)
+    write_task_result(tmp_path, "nkid", "running", delegation_role="subagent", parent_task_id="npar",
+                      root_task_id="npar", chat_id=1)
+    _write(tmp_path / "logs/chat.jsonl", [{"direction": "system", "type": "steer_not_delivered", "task_id": "nkid",
+                                           "text": "Not delivered", "ts": TS, "chat_id": 1}])
+    assert [row["task_id"] for row in _room_read(tmp_path, 1)["messages"]] == ["nkid"]
+
+
+def test_an_empty_ts_census_anchor_with_zero_tools_gets_no_carrier(tmp_path, monkeypatch):
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, "live", "running", root_task_id="live", chat_id=1)
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: [
+        {"activity_id": "live", "chat_id": 1, "kind": "managed_task", "phase": "working"}])
+    _write(tmp_path / "logs/chat.jsonl", [{"direction": "in", "text": "Latest question", "ts": TS, "chat_id": 1}])
+    assert [row["text"] for row in _read(tmp_path)["messages"]] == ["Latest question"]
+
+
+def test_the_history_cursor_survives_child_admission_and_changes_on_conversion(tmp_path):
+    from ouroboros.gateway.history_paging import room_view_fingerprint
+    from ouroboros.projects_registry import all_task_bindings, bind_task_to_project, create_project
+    from ouroboros.task_results import write_task_result
+
+    project = create_project(tmp_path, "room", name="Project room")
+    write_task_result(tmp_path, "root", "running", root_task_id="root", chat_id=1)
+    bind_task_to_project(tmp_path, "root", project["id"], origin={"absent": "system"})
+    view = lambda: room_view_fingerprint(1, {project["chat_id"]}, [], all_task_bindings(tmp_path))  # noqa: E731
+    before = view()
+    write_task_result(tmp_path, "kid", "running", delegation_role="subagent", parent_task_id="root",
+                      root_task_id="root", chat_id=1)
+    assert view() == before, "a child's admission keeps every open Main cursor"
+    other = create_project(tmp_path, "other", name="Other room")
+    bind_task_to_project(tmp_path, "kid", other["id"], origin={"absent": "system"})
+    assert view() != before, "a conversion changes what Main shows"
+
+
+def test_a_project_rooms_cursor_changes_when_a_conversion_moves_its_rows_away(tmp_path):
+    """A task's resolved room outranks the room its rows were written to, so binding a
+    task of room A to room B changes what A shows: A's open cursor must not survive."""
+    from ouroboros.gateway.history_paging import room_view_fingerprint
+    from ouroboros.projects_registry import all_task_bindings, bind_task_to_project, create_project
+    from ouroboros.task_results import write_task_result
+
+    room_a = create_project(tmp_path, "room-a", name="Room A")
+    write_task_result(tmp_path, "root-a", "running", root_task_id="root-a", chat_id=room_a["chat_id"])
+    write_task_result(tmp_path, "kid-a", "running", delegation_role="subagent", parent_task_id="root-a",
+                      root_task_id="root-a", chat_id=room_a["chat_id"])
+    view = lambda: room_view_fingerprint(  # noqa: E731
+        room_a["chat_id"], {room_a["chat_id"]}, [], all_task_bindings(tmp_path))
+    before = view()
+    write_task_result(tmp_path, "kid-a2", "running", delegation_role="subagent", parent_task_id="root-a",
+                      root_task_id="root-a", chat_id=room_a["chat_id"])
+    assert view() == before, "a child's admission keeps room A's open cursor"
+    room_b = create_project(tmp_path, "room-b", name="Room B")
+    bind_task_to_project(tmp_path, "kid-a", room_b["id"], origin={"absent": "system"})
+    assert view() != before, "moving kid-a's rows to room B changes what room A shows"
+
+
+def test_census_rows_carry_started_at_and_never_ts(tmp_path, monkeypatch):
+    """The carrier rule tells a parent anchor (its child's ts) from a census anchor by the ts alone:
+    the real census producer stamps ``started_at`` on every row and never a ``ts``."""
+    from supervisor import queue
+
+    monkeypatch.setattr(queue, "PENDING", [{"id": "queued-root", "chat_id": 1, "root_task_id": "queued-root",
+                                            "ts": TS, "queued_at": TS}])
+    monkeypatch.setattr(queue, "RUNNING", {"running-root": {"task": {"id": "running-root", "chat_id": 1,
+                                                                     "root_task_id": "running-root", "ts": TS},
+                                                            "started_at": 1_700_000_000.0}})
+    rows = _real_census(tmp_path, {}, direct_turns=[])
+    assert {row["activity_id"] for row in rows} == {"queued-root", "running-root"}
+    assert all("ts" not in row and "started_at" in row for row in rows), rows
+
+
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_answered_root_with_a_paused_late_phase_is_not_readdressed_at_the_page_end(tmp_path, monkeypatch, status):
+    # D10: the answer was delivered; only its post-task work waits under the owner's Pause.
+    # Its own rows left the page, so a census anchor would mint a timestamp-free card below
+    # the newest message (14.10 phantom "Done/Failed · Paused · owner pause" cards).
+    _write(tmp_path / "task_results/root.json", [{"_schema_version": 1, "task_id": "root", "status": status,
+        "chat_id": 1, "_is_direct_chat": True, "root_phase_checkpoint": {"post_task_synthesis": "paused"},
+        "completion_observations": {"delivery_counts": {"send_user_message": {"calls": 2}}}}])
+    ensure_current_store(tmp_path)
+    _write(tmp_path / "logs/chat.jsonl", [{"direction": "in", "text": "Latest question", "ts": TS, "chat_id": 1}])
+    paused = {"activity_id": "root", "chat_id": 1, "kind": "direct_chat", "phase": "budget_paused", "pause_cause": "owner",
+              "status": status, "root_phase_checkpoint": {"post_task_synthesis": "paused"}}
+    census = [paused]
+    monkeypatch.setattr("ouroboros.gateway.state._chat_activities_snapshot_safe", lambda *_, **__: census)
+    assert [row["text"] for row in _read(tmp_path)["messages"]] == ["Latest question"]
+    # Positive control: unanswered current work of the room keeps its evidence at the page end,
+    # including a turn whose checkpoint holds only the pre-answer cost "refresh" pseudo-status.
+    # The answered test reads the task's own stored checkpoint, never a census display copy.
+    from ouroboros.store import update_task
+
+    update_task(tmp_path, "root", lambda doc: {**doc, "root_phase_checkpoint": {"post_task_synthesis": "refresh"}})
+    census[:] = [{"activity_id": "root", "chat_id": 1, "kind": "direct_chat", "phase": "working"}]
+    _write(tmp_path / "logs/tools.jsonl", [_tool("root")])
+    carrier = _read(tmp_path)["messages"][-1]
+    assert carrier["system_type"] == "task_evidence" and carrier["task_id"] == "root" and carrier["ts"] == ""

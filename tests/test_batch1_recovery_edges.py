@@ -212,7 +212,9 @@ def test_registry_rebind_between_prepare_and_admission_is_fenced(q, monkeypatch,
     assert task["workspace_root"] == str(new)
 
 
-def test_dispatch_source_and_append_failures_disclose_loss_without_veto(tmp_path, monkeypatch):
+@pytest.mark.parametrize("bound", [False, True], ids=["unbound-logs-only", "bound-authority"])
+def test_dispatch_source_and_append_failures_disclose_loss_without_veto(tmp_path, monkeypatch, bound):
+    from ouroboros import budget_pause
     from ouroboros.tools.tool_result import ToolResult
 
     called = []
@@ -224,11 +226,22 @@ def test_dispatch_source_and_append_failures_disclose_loss_without_veto(tmp_path
             raise OSError(5, "canonical unavailable")
         return resolve(path, *args, **kwargs)
     monkeypatch.setattr(pathlib.Path, "resolve", unavailable)
+    if bound:
+        registry._ctx.task_id = "task-1"
+        with pytest.raises(OSError, match="canonical unavailable"):
+            _call(registry, tmp_path)
+        assert not called, "unreadable required task identity must still prevent submission"
+        return
     result, logs = _call(registry, tmp_path)
     assert called and result["result"] == "done"
     [start, settled] = tool_rows(logs / "tools.jsonl")
     assert start["args_source_status"] == "unavailable:OSError"
     assert settled["start_log"]["canonical"] is False
+    assert budget_pause.tool_scope_key(registry._ctx) == ""
+    assert "" not in budget_pause._TOOL_FUTURES
+    budget_pause.hold_tool_settlement(registry._ctx, start["invocation_id"])()
+    budget_pause.forget_tool_scope(registry._ctx)
+    assert budget_pause.drain_local_tool_futures(registry._ctx, timeout_sec=0)["drained"]
 
 
 def test_zero_timeout_file_lock_attempts_once_without_wait(tmp_path, monkeypatch):

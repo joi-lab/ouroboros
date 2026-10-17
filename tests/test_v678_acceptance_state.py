@@ -50,12 +50,12 @@ def _actor(slot_id, signal, parsed):
 
 
 def _result(*, aggregate, actors, findings=(), degraded=False, degraded_reasons=(), quorum=1,
-            policy=None):
+            policy=None, feedback_read=False):
     import ouroboros.review_substrate as rs
 
     base_policy = {"min_successful_slots": quorum}
     base_policy.update(policy or {})
-    return rs.ReviewRunResult(
+    result = rs.ReviewRunResult(
         request={"surface": "task_acceptance", "policy": base_policy},
         actors=list(actors),
         parsed_findings=list(findings),
@@ -63,6 +63,11 @@ def _result(*, aggregate, actors, findings=(), degraded=False, degraded_reasons=
         degraded=degraded,
         degraded_reasons=list(degraded_reasons),
     )
+    if feedback_read:
+        # G1 (#1737/#1741): a clean PASS decides only after its settled feedback
+        # reached the author; the reused run record carries this receipt.
+        result.settled_feedback_delivered = True
+    return result
 
 
 def _apply_ctx(tmp_path, *, prior_trace=None, passes_done=0, budget_profile=None, fence_ok=True):
@@ -115,6 +120,7 @@ _CLEAN_PASS = dict(
         }],
     })],
 )
+_READ_CLEAN_PASS = dict(_CLEAN_PASS, feedback_read=True)
 # A PASS whose `solved` claim lacks supported criterion evidence: NOT clean, yet the
 # capsule has nothing actionable (no findings, no dissent, solved tier) — the A14 branch.
 _NON_CLEAN_PASS_NO_CAPSULE = dict(
@@ -168,9 +174,9 @@ _DIALOGUE_TERMINAL = dict(
 @pytest.mark.parametrize(
     "label,result_kwargs,kwargs,expected",
     [
-        ("clean_pass", _CLEAN_PASS, {}, (ACCEPTANCE_ACCEPTED, "clean_pass")),
+        ("clean_pass", _READ_CLEAN_PASS, {}, (ACCEPTANCE_ACCEPTED, "clean_pass")),
         (
-            "clean_pass_obligations_closed", _CLEAN_PASS,
+            "clean_pass_obligations_closed", _READ_CLEAN_PASS,
             {"prior_trace": {"acceptance_obligations": [dict(_OPEN_OBLIGATION)]}},
             (ACCEPTANCE_ACCEPTED, "clean_pass_obligations_closed"),
         ),
@@ -287,7 +293,10 @@ def test_clean_acceptance_still_authorises_accepted(monkeypatch, tmp_path):
     from ouroboros.review_substrate import task_acceptance_is_clean
 
     monkeypatch.setattr(loop_mod, "get_review_enforcement", lambda: "blocking")
-    result = _result(**_CLEAN_PASS)
+    unread = _apply_ctx(tmp_path)
+    assert _apply_task_acceptance_result(unread, _result(**_CLEAN_PASS), record_run=False) is True
+    assert "acceptance_decision" not in unread.llm_trace  # its author reads the PASS first
+    result = _result(**_READ_CLEAN_PASS)
     assert task_acceptance_is_clean(result)
     for prior in ({}, {"acceptance_obligations": [dict(_OPEN_OBLIGATION)]}):
         ctx = _apply_ctx(tmp_path, prior_trace=dict(prior))
@@ -457,8 +466,10 @@ def test_forced_rail_axes_are_the_production_shape(tmp_path, monkeypatch):
     the pair-keyed degrade never decides. The owner-visible "a panel was owed and
     did not run" fact rides the REVIEW axis, which is the claim that must hold."""
     from tests.test_delivery_forced_finalization import _forced_test_context
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
 
-    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    loop, _registry, limit_ctx, nominated = _forced_test_context(tmp_path)
+    _nominate_acceptance(nominated, task_id="parent1", subject="Nominated draft.")
     monkeypatch.setattr(
         loop, "call_llm_with_retry",
         lambda *_args, **_kwargs: (
@@ -491,7 +502,9 @@ def test_round_one_budget_rejection_is_also_a_covered_forced_sink(tmp_path):
     of going through `_forced_final_answer`, so it used to reach the ledger with
     NO bypass record at all: `eligibility=not_evaluated / run_count=0` — exactly
     the "indistinguishable from no panel warranted" shape the typed bypass closes.
-    Nothing was produced, so the record is the whole remedy: one ledger write."""
+    Nothing was produced, so the record is the whole remedy: one ledger write.
+    Before any work nothing is nominated or produced, and a declared deliverable
+    is intent, not production (#1731): the record says no panel was owed."""
     from tests.test_delivery_forced_finalization import _forced_test_context
 
     loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
@@ -504,16 +517,15 @@ def test_round_one_budget_rejection_is_also_a_covered_forced_sink(tmp_path):
     assert text.startswith("🚫 Task rejected.")
     assert usage["reason_code"] == "budget_exhausted"
     assert trace["review_decision"] == {
-        "eligibility": "eligible", "trigger": "bypassed_budget_exhausted",
+        "eligibility": "not_eligible", "trigger": "skipped_conversation",
     }
-    assert trace["acceptance_decision"]["reason"] == "acceptance_bypassed_budget_exhausted"
-    assert trace["acceptance_decision"]["source"] == "forced_finalization"
+    assert "acceptance_decision" not in trace  # no bypass is stamped for a panel nobody owed
     # No candidate existed — the record says so instead of inventing one.
     assert trace["forced_finalization"]["candidate_sha256"] == ""
     assert trace["forced_finalization"]["source"] == "host_budget_rejection_before_work"
 
     axes = derive_loop_outcome(text, usage, trace)["outcome_axes"]
-    assert axes["review"]["eligibility"] == "eligible"
+    assert axes["review"]["eligibility"] == "not_eligible"
     assert axes["review"]["run_count"] == 0
 
 
@@ -811,7 +823,7 @@ def test_deadline_reserve_writer_and_reader_move_together(monkeypatch, tmp_path)
         },
         task_contract={},
     )
-    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}}]}
+    trace = {"tool_calls": [{"tool": "write_file", "args": {"path": "x.py"}, "is_error": False}]}
     assert loop_mod._run_task_acceptance_review_once(
         tools=SimpleNamespace(_ctx=ctx), content="done", task_id="t", task_type="task",
         llm_trace=trace, drive_root=None,

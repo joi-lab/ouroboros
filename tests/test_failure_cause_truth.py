@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+from tests.test_plan_task_tool import harness  # noqa: F401 — the planning organ's fixture
+
 WORDS = "Selected model is at capacity. Please try a different model."
 INCIDENT_FAILURE = {
     "phase": "harness", "category": "harness_error", "code": None,
@@ -146,33 +148,54 @@ def test_the_last_execution_projection_keeps_the_cause_only_when_one_was_reporte
 
 
 def test_the_mind_reads_typed_facts_and_never_the_engines_retry_coach():
-    """What the model reads for a wave with a dead reviewer: the typed facts (code, reset,
-    model) and the engine's reported sentence — never its ``nextActions`` retry coach. The
-    stored wave is untouched (its ``reasons`` keep the raw prose); a row that reported no
-    words renders exactly today's bytes."""
+    """What the model reads about a dead participant in ``plan_task``'s read view: the typed
+    facts (code, reset, the engine's reported sentence) — never its ``nextActions`` retry
+    coach. The stored participant row is untouched (it keeps the raw prose); a seat that
+    reported no words renders a bounded first line of the error and no "reported cause"."""
     import copy
 
-    from ouroboros.tools.plan_render import _render_wave
+    from ouroboros import plan_record
+    from ouroboros.tools.plan_review import render_record
 
     prose = "delegated review session run-e23 ended failed: " + json.dumps(INCIDENT_FAILURE, ensure_ascii=False)
 
-    def _wave(actor):
-        return {"cycle_index": 1, "request_fingerprint": "f" * 64, "aggregate": "DEGRADED", "closed": False,
-                "custody_pending": False, "findings": [], "actors": [actor, {"slot_id": "s2", "model": "m", "ok": True}],
-                "counts": {"configured": 2, "parseable": 1, "quorum": 2, "blocking": 0, "note": 0, "need_evidence": 0},
-                "reasons": [f"slot_unparseable:s1:{prose}", "parseable_slots_below_quorum:1/2"]}
+    def _record(seat):
+        record = plan_record.empty_record()
+        record["revisions"].append({"n": 1, "ts": "t", "goal": "ship", "plan": "p", "done_when": [], "affected_paths": [],
+                                    "body": False, "content_sha256": "0" * 64})
+        record["asks"].append({"ask_id": "a1", "ts": "t", "revision": 1, "message": "", "participants": [
+            seat, {"seat_id": "s2", "model": "m", "owner_marked": True, "dispatched": True, "status": "answered",
+                   "reply": {"prose": "fine", "objections": [], "withdrawn": []}}]})
+        return record
 
-    dead = {"slot_id": "s1", "model": "codex=gpt-6-astra", "route": "agent_session", "ok": False,
+    dead = {"seat_id": "s1", "model": "codex=gpt-6-astra", "owner_marked": True, "dispatched": True, "status": "failed",
             "failure_code": "run_failed", "error": prose, "reported_cause": WORDS, "operation_state": "late_settled"}
-    wave = _wave(dead)
-    before = copy.deepcopy(wave)
-    text = _render_wave(wave, cap=3, cycles_paid=1, enforcement="advisory")
-    assert wave == before and "nextActions" in wave["reasons"][0], "a display substitution never rewrites the stored wave"
-    assert f'· FAILED[run_failed] — model=codex=gpt-6-astra; reported cause: "{WORDS}"' in text
-    assert f"Reasons: slot_unparseable:s1:{WORDS}, parseable_slots_below_quorum:1/2." in text
+    record = _record(dead)
+    before = copy.deepcopy(record)
+    decision = plan_record.gate_projection(record, enforcement="advisory", cyber_pro=False, hurry=False, force_plan=False)
+    text = render_record(record, decision)
+    assert record == before and "nextActions" in record["asks"][0]["participants"][0]["error"], "a display substitution never rewrites the stored row"
+    assert f'- ask a1 on revision 1: s1 (codex=gpt-6-astra): failed[run_failed] — reported cause: "{WORDS}"; s2 (m): answered' in text
     for coach in ("nextActions", "Retry the run", "Inspect the run", "safeMessage", "harness_error"):
         assert coach not in text, coach
-    # Other direction: a row that reported no words renders today's bytes, prose included.
-    wordless = _render_wave(_wave({**dead, "reported_cause": ""}), cap=3, cycles_paid=1, enforcement="advisory")
-    assert f"· FAILED[run_failed]: {prose}" in wordless and f"Reasons: slot_unparseable:s1:{prose}," in wordless
-    assert "reported cause" not in wordless
+    # Other direction: a row that reported no words renders a bounded first line of the prose, no "reported cause".
+    wordless = render_record(_record({**dead, "reported_cause": ""}), decision)
+    assert "s1 (codex=gpt-6-astra): failed[run_failed] — delegated review session run-e23 ended failed:" in wordless
+    assert "reported cause" not in wordless and "Retry the run" not in wordless
+
+
+def test_a_dead_participants_typed_facts_reach_the_record_and_its_read_view_end_to_end(harness):  # noqa: F811
+    """End to end through ``plan_task``: a substrate row's typed failure facts reach the plan
+    record and its read view (code and the engine's reported sentence), never the engine's
+    ``nextActions`` retry coach."""
+    from tests.test_plan_task_tool import _call, _write
+
+    prose = "delegated review session run-e23 ended failed: " + json.dumps(INCIDENT_FAILURE, ensure_ascii=False)
+    harness.install({"s2": {"status": "error", "raw_text": "", "error": prose, "failure_code": "run_failed",
+                            "reported_cause": WORDS}})
+    ctx = harness.make_ctx()
+    _write(ctx, ask="council")
+    text, _result = _call(ctx)
+    assert "run_failed" in text and WORDS in text
+    for coach in ("nextActions", "Retry the run", "Inspect the run", "safeMessage", "harness_error"):
+        assert coach not in text, coach

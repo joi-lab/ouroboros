@@ -131,11 +131,12 @@ def test_ui_smoke_chat_inflight_indicator_lifecycle(direct_server_with_data, req
                 }""")
                 evidence.checkpoint("typing_emit_returned")
 
-                # In-flight state: reached through the receipt's own census read.
+                # In-flight state: reached through the receipt's own census read. The header
+                # names the census phase in the task-phase words (#1740: 'Thinking', no dots).
                 page.wait_for_function(
                     """() => {
                         const el = document.querySelector('#chat-status');
-                        return el && el.textContent.trim() === 'Thinking...';
+                        return el && el.textContent.trim() === 'Thinking';
                     }""",
                     timeout=5_000,
                 )

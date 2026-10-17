@@ -66,12 +66,58 @@ def qenv(tmp_path, monkeypatch):
     monkeypatch.setattr(task_lifecycle, "_ACTIVE_CASCADE_FENCES", {}, raising=False)
     return types.SimpleNamespace(q=q, tl=task_lifecycle, workers=workers, drive=tmp_path)
 
-class _CaptureQueue:
+class _DeliveryMembership:
+    """The delivery membership the real bus exposes (INTERFACES I1): every ``send_message``
+    put with a delivery id is outstanding from the put until the consumer released it
+    (``release_delivery``, the handler's ``finally``); ``put_unless_outstanding`` admits a
+    replay copy only when no copy of that id is outstanding. Tests release explicitly."""
+
+    def _count(self, evt) -> None:
+        did = str(evt.get("delivery_id") or "") if isinstance(evt, dict) else ""
+        if did and evt.get("type") == "send_message":
+            self.outstanding[did] = self.outstanding.get(did, 0) + 1
+
+    def put_unless_outstanding(self, evt) -> bool:
+        did = str(evt.get("delivery_id") or "") if isinstance(evt, dict) else ""
+        if did and self.outstanding.get(did):
+            return False
+        self.put(evt)
+        return True
+
+    def release_delivery(self, did) -> None:
+        did = str(did or "")
+        if self.outstanding.get(did):
+            self.outstanding[did] -= 1
+            if not self.outstanding[did]:
+                del self.outstanding[did]
+
+    def delivery_outstanding(self, did) -> bool:
+        return bool(self.outstanding.get(str(did or "")))
+
+    def release_all(self) -> None:
+        self.outstanding.clear()
+
+
+class _CaptureQueue(_DeliveryMembership):
     def __init__(self):
         self.events = []
+        self.outstanding: dict = {}
 
     def put(self, evt):
         self.events.append(evt)
+        self._count(evt)
+
+
+class DeliveryBus(_DeliveryMembership, __import__("queue").Queue):
+    """A real FIFO (``get_nowait`` drains) with the same delivery membership."""
+
+    def __init__(self):
+        super().__init__()
+        self.outstanding: dict = {}
+
+    def put(self, item, block=True, timeout=None):
+        super().put(item, block, timeout)
+        self._count(item)
 
 class _LiveProc:
     """A REAL OS process behind the worker-proc surface custody expects.
@@ -94,6 +140,14 @@ class _LiveProc:
 
     def is_alive(self) -> bool:
         return self._proc.poll() is None
+
+    @property
+    def exitcode(self):
+        """Mirror `multiprocessing.Process.exitcode`: None while alive, the code (negative signal) after.
+
+        The pool's birth-gated death proof reads it, as real worker processes always have it.
+        """
+        return self._proc.poll()
 
     def join(self, timeout=None):
         try:

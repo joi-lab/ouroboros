@@ -1,4 +1,11 @@
-"""Post-execution custody audit helpers for shell tools."""
+"""Post-execution custody audit helpers for shell tools.
+
+The audit is observational and syntactic: it reads literal write targets from the
+argv, with no replay, rollback, interpreter or attribution proof; computed targets
+(variables, expansions) are not resolved. Path-like prose that is not a valid path
+yields no finding. A failed audit adds a bounded diagnostic and leaves the completed
+process outcome unchanged.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +46,7 @@ from ouroboros.tools.tool_result import (
 )
 from ouroboros.tools.verify import check_exit_masking
 from ouroboros.workspace_executor import (
+    BackendPathNoMatch,
     executor_ref_from_ctx,
     map_backend_path,
     map_backend_path_lexical,
@@ -258,7 +266,7 @@ def _mentioned_user_file_outputs_without_declaration(
                     try:
                         path = map_backend_path(executor_ref, candidate_text)
                         lexical_path = map_backend_path_lexical(executor_ref, candidate_text)
-                    except ValueError:
+                    except BackendPathNoMatch:  # A matched invalid spelling is no finding.
                         path = raw_candidate.resolve(strict=False)
                         lexical_path = raw_candidate
                 elif raw_candidate.is_absolute() or candidate_text.startswith("~"):
@@ -339,7 +347,12 @@ def _mentioned_user_file_outputs_without_declaration(
 
 
 def _disclose_output_audit_failure(ctx: ToolContext, result: str, error_name: str) -> str:
-    """Keep the completed process authoritative when its optional audit failed."""
+    """Keep the completed process authoritative when its optional audit failed.
+
+    Appends ARTIFACT_AUDIT_GAP naming the exception class; a typed result also
+    records that class in ``meta["output_audit_unavailable"]``. The rest of the
+    result is carried through unchanged.
+    """
     if not error_name:
         return result
     base = _published_tool_result(ctx, None)

@@ -10,7 +10,6 @@ registration only its canonical sharer retires.
 from __future__ import annotations
 
 import json
-import pathlib
 import httpx
 import pytest
 from ouroboros import subagents
@@ -25,8 +24,10 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
     _event_types,
     _nanny_ctx,
     _owned_gateway_uses_each_test_transport,
+    _select_transport_access,
     _transport_snapshot,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 def test_custody_survives_the_worker_that_started_the_run(tmp_path, monkeypatch):
@@ -40,6 +41,10 @@ def test_custody_survives_the_worker_that_started_the_run(tmp_path, monkeypatch)
     from ouroboros.gateways import claudexor as gw
 
     stub = _LiveRunStub()
+    # A READ-ONLY reviewing child: technical access alone decides the run shape now
+    # (#1609), so the read-only premise this custody test is about is stated, not
+    # inferred from the non-acting ctx.
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
     delegate._CUSTODY.clear()
@@ -105,6 +110,7 @@ def test_the_invocation_id_is_reused_on_retry_and_fresh_per_intended_start(
                                        headers=dict(gateway._client.headers))
         return gateway
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
     delegate._CUSTODY.clear()
@@ -253,6 +259,7 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
         return ctx
 
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     delegate._CUSTODY.clear()
 
     # 1. The intended start: route-a=model-old:low at root-a. It registers and OWNS
@@ -339,7 +346,8 @@ def test_a_retry_testifies_about_the_stored_invocation_not_the_current_config(
     script[:] = ["transport_error", "definite_refusal"]
     lost2 = json.loads(delegate.exact_start(
         _ctx(root_c), "other work",
-        {"snapshot": _transport_snapshot(subagents.parse_subagent_harness("route-a=model-old:low"))},
+        {"snapshot": _transport_snapshot(subagents.parse_subagent_harness("route-a=model-old:low"),
+                                         access="readonly")},
     ).text)
     assert lost2["reason"] == "daemon_unreachable"
     prj_c = projects[str(root_c)]
@@ -364,6 +372,7 @@ def test_custody_rows_outlive_the_child_drive_they_were_written_from(tmp_path, m
 
     canonical, child = tmp_path / "canonical", tmp_path / "child"
     child.mkdir(parents=True)
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _LiveRunStub())
     delegate._CUSTODY.clear()
@@ -408,6 +417,7 @@ def test_delegated_spend_settles_into_the_canonical_budget_ledger(tmp_path, monk
                                               "effectiveAccess": "readonly",
                                               "inputTokens": 10, "outputTokens": 5}}
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Terminal())
     delegate._CUSTODY.clear()
@@ -420,16 +430,12 @@ def test_delegated_spend_settles_into_the_canonical_budget_ledger(tmp_path, monk
     assert done["settlement"]["settled"] is True
     assert done["settlement"]["ledger_recorded"] is True
 
-    ledger = pathlib.Path("state") / "usage_attempts.jsonl"
-    assert (canonical / ledger).exists(), \
-        "delegated spend must land in the canonical budget ledger"
-    assert not (child / ledger).exists(), \
-        "never on the child drive that headless pruning deletes"
-    rows = [json.loads(line) for line in (canonical / ledger).read_text().splitlines()
-            if '"subscription_session"' in line]
+    assert ledger_rows(canonical), "delegated spend must land in the canonical budget ledger"
+    assert not ledger_rows(child), "never on the child drive that headless pruning deletes"
+    rows = [row for row in ledger_rows(canonical) if row.get("kind") == "subscription_session"]
     assert rows and rows[-1]["cost_usd"] == 1.25 and rows[-1]["cost_final"] is True
     started = [json.loads(line) for line
-               in (canonical / "logs" / "events.jsonl").read_text().splitlines()
+               in (canonical / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
                if '"delegate_run_started"' in line][-1]
     assert started["ledger_root"] == str(dc.custody_root(ctx)), \
         "the durable row must name the canonical root, not the disposable child drive"
@@ -471,26 +477,23 @@ def test_durable_truncation_is_disclosed_never_a_bare_slice(tmp_path):
 
 
 def test_an_unresolved_containment_fault_cannot_age_out_of_the_health_view(tmp_path):
-    """P34R.3: `open_containment_faults` scanned only the last 4 MB of the canonical
-    event log, so an UNRESOLVED containment fault — an overpowered run that may still
-    be live — silently vanished from the health invariants once later unrelated
-    traffic buried its row, despite the stated contract that it stays CRITICAL until
-    a terminal receipt resolves it. Incidents now live in their own compact durable
-    projection that is read WHOLE; the event-log tail remains as the fallback surface
-    for a fault whose compact write failed."""
+    """P34R.3 (store era): an UNRESOLVED containment fault — an overpowered run that may
+    still be live — is a fact on its held run's row in the store, so no amount of later
+    unrelated chain traffic can bury it: the health view reads rows, not a log tail. A
+    resolution clears the row fact durably; the chain remains the forensic record."""
     import ouroboros.delegate_custody as dc
 
     entry = dc.RunCustody(run_id="run-fault", task_id="t-a", route_id="r")
     dc.record_containment_fault(tmp_path, entry, "cancel_unverified", "engine went dark")
 
-    # Bury the fault under MORE than the tail window of later unrelated custody rows.
+    # Bury the fault under megabytes of later unrelated custody rows in the chain.
     noise = json.dumps({"type": "delegate_run_reconciled", "run_id": "run-noise",
                         "task_id": "t-b", "pad": "x" * 1500})
     events = dc.event_log_path(tmp_path)
     with events.open("a", encoding="utf-8") as fh:
         for _ in range(3000):
             fh.write(noise + "\n")
-    assert events.stat().st_size > dc._FAULT_SCAN_TAIL_BYTES, "the fault is outside the tail"
+    assert events.stat().st_size > 4_000_000, "the fault is far outside any tail window"
 
     open_faults = dc.open_containment_faults(tmp_path)
     assert [f["run_id"] for f in open_faults] == ["run-fault"], \
@@ -504,14 +507,8 @@ def test_an_unresolved_containment_fault_cannot_age_out_of_the_health_view(tmp_p
         for _ in range(200):
             fh.write(noise + "\n")
     assert dc.open_containment_faults(tmp_path) == []
-
-    # Fallback surface: a fault whose COMPACT write failed is still visible through
-    # the event-log tail — either landing alone keeps the incident visible.
-    other = tmp_path / "other-drive"
-    (other / "logs").mkdir(parents=True)
-    dc._faults_path(other).mkdir()          # the compact append will fail loudly
-    dc.record_containment_fault(other, entry, "cancel_unreachable", "")
-    assert [f["run_id"] for f in dc.open_containment_faults(other)] == ["run-fault"]
+    # No separate projection file exists any more: the row IS the projection.
+    assert not (tmp_path / "logs" / "containment_faults.jsonl").exists()
 
 
 def test_every_pre_custody_exit_names_the_registration_it_created(tmp_path, monkeypatch):
@@ -540,6 +537,7 @@ def test_every_pre_custody_exit_names_the_registration_it_created(tmp_path, monk
             raise MemoryError("an untyped failure between register_project and custody")
 
     stub = _Untyped()
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: stub)
     delegate._CUSTODY.clear()
@@ -548,7 +546,7 @@ def test_every_pre_custody_exit_names_the_registration_it_created(tmp_path, monk
         delegate._delegate_start(_nanny_ctx(tmp_path), "work")
 
     rows = [json.loads(l) for l in
-            (tmp_path / "logs" / "events.jsonl").read_text().splitlines() if l.strip()]
+            (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
     failed = [r for r in rows if r.get("type") == dc.START_FAILED]
     assert [r["project_id"] for r in failed] == ["prj-owned"]
     assert failed[0]["reason"] == "pre_custody_exit_MemoryError"
@@ -615,6 +613,7 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
                                        headers=dict(gateway._client.headers))
         return gateway
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", _fresh)
     delegate._CUSTODY.clear()
@@ -648,20 +647,22 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
         def remove_project(self, pid): _TerminalRecovery.removed.append(pid)
         def close(self): pass
 
-    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery())
+    outcomes = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery(),
+                                          replay_pending=lambda: True)  # the admitted sweep's shape
     assert [o["action"] for o in outcomes] == ["settle_attempted"] and outcomes[0]["settled"] is True
     key, body = posted[-1]
     assert key == token, "recovery must present the invocation's own wire key"
     assert body == posted[0][1], "recovery must replay the RECORDED canonical body"
     started = [json.loads(line) for line
-               in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()
+               in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
                if '"delegate_run_started"' in line][-1]
     assert started["run_id"] == "run-recovered"
     assert started["recovered_from_pending_invocation"] is True
     assert started["route"] == "some-route" and started["model"] == "weak-model"
     assert started["idempotency_key"], "the stored lookup key rides the recovered row"
     assert dc.pending_invocations(tmp_path) == [], "a recovered invocation is bound, not pending"
-    again = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery())
+    again = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _TerminalRecovery(),
+                                       replay_pending=lambda: True)
     assert again == [], "a settled recovery does not repeat"
 
     # 3. A DEFINITE refusal at recovery retires the invocation and the registration
@@ -680,17 +681,22 @@ def test_reconciliation_recovers_a_pending_invocation_whose_worker_died(tmp_path
         def close(self): pass
 
     class _Unreachable:
+        def __init__(self, status): self.status = status
         def handshake(self, **_kw): return {}
         def start_run(self, request, *, idempotency_key=""):
-            raise ClaudexorUnavailable("daemon_unreachable", "down", status_code=0)
+            code = "daemon_busy" if self.status else "daemon_unreachable"
+            raise ClaudexorUnavailable(code, "RPC timeout", status_code=self.status)
         def close(self): pass
 
-    down = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _Unreachable())
-    assert [o["action"] for o in down] == ["recovery_unreachable"]
-    assert [r["invocation_id"] for r in dc.pending_invocations(tmp_path)] == [token2], \
-        "an unknown outcome never destroys the invocation"
+    for status in (0, 503):  # a dead socket and a busy engine are both unknown outcomes
+        down = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: _Unreachable(status),
+                                          replay_pending=lambda: True)
+        assert [o["action"] for o in down] == ["recovery_unreachable"]
+        assert [r["invocation_id"] for r in dc.pending_invocations(tmp_path)] == [token2], \
+            "an unknown outcome never destroys the invocation"
     refusing = _Refusing()
-    gone = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: refusing)
+    gone = dc.reconcile_orphaned_runs(tmp_path, set(), gateway_factory=lambda: refusing,
+                                      replay_pending=lambda: True)
     assert [o["action"] for o in gone] == ["invocation_retired"]
     assert refusing.removed == ["prj-owned"], "the ORIGINAL attempt's owned registration is discharged"
     assert dc.pending_invocations(tmp_path) == []
@@ -708,16 +714,18 @@ def test_a_start_whose_custody_row_did_not_land_does_not_claim_to_be_custodied(t
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _LiveRunStub())
-    real_append = dc.append_jsonl
+    from ouroboros import delegate_custody_current as current
+    real_publish = current.publish
 
-    def _started_row_lost(path, obj):
-        if obj.get("type") in ("delegate_run_started", "delegate_run_settled"):
-            return False
-        return real_append(path, obj)
+    def _started_row_lost(root, event, **kwargs):
+        if event.get("type") in ("delegate_run_started", "delegate_run_settled"):
+            return False  # the store refused the reducing transaction: the row never landed
+        return real_publish(root, event, **kwargs)
 
-    monkeypatch.setattr(dc, "append_jsonl", _started_row_lost)
+    monkeypatch.setattr(current, "publish", _started_row_lost)
     delegate._CUSTODY.clear()
     out = json.loads(delegate._delegate_start(_nanny_ctx(tmp_path), "review the diff").text)
     delegate._CUSTODY.clear()
@@ -752,6 +760,7 @@ def test_a_failed_start_does_not_leave_the_registration_it_created(
     """The project is registered BEFORE `start_run`. A start failure used to leave that
     registration behind with nothing anywhere naming its id — and the id must be durably
     named whether or not the registration can be safely retired."""
+    from ouroboros import delegate_custody as dc
     import ouroboros.tools.delegate as delegate
     from ouroboros.gateways import claudexor as gw
 
@@ -766,19 +775,26 @@ def test_a_failed_start_does_not_leave_the_registration_it_created(
                 raise gw.ClaudexorUnavailable("project_not_found", "gone", status_code=404)
             live.discard(pid)
         def start_run(self, request, *, idempotency_key=""):
-            raise gw.ClaudexorUnavailable("run_start_failed", "no run", status_code=status_code)
+            raise gw.ClaudexorUnavailable("daemon_busy" if status_code == 503 else "run_start_failed",
+                                          "start outcome", status_code=status_code)
 
+    _select_transport_access(monkeypatch, "readonly")
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
     out = json.loads(delegate._delegate_start(_nanny_ctx(tmp_path), "x").text)
     delegate._CUSTODY.clear()
-    assert out["status"] == "refused" and out["reason"] == "run_start_failed"
+    assert out["status"] == "refused"
+    assert out["reason"] == ("daemon_busy" if status_code == 503 else "run_start_failed")
     assert out["project_retired"] is retired, out
     assert (live == set()) is retired, "only a definite refusal may retire the registration"
     if not retired:
         assert out["project_retention_reason"] == "start_outcome_unknown_run_may_exist"
-    rows = [json.loads(l) for l in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+        assert [r["invocation_id"] for r in dc.pending_invocations(tmp_path)] == [out["pending_invocation_id"]]
+    else:
+        assert "pending_invocation_id" not in out
+        assert dc.pending_invocations(tmp_path) == []
+    rows = [json.loads(l) for l in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     named = [r for r in rows if r.get("type") == "delegate_run_start_failed"]
     assert named and named[0]["project_id"] == "prj-new", "the id must be durably named"
 
@@ -799,6 +815,7 @@ def test_a_queued_handle_with_no_run_id_names_its_registration_like_its_twin(tmp
         def remove_project(self, pid): live.discard(pid)
         def start_run(self, request, *, idempotency_key=""): return {"status": "queued"}
 
+    _select_transport_access(monkeypatch, "readonly")   # a read-only child (#1609)
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "some-route=weak-model:low")
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
@@ -809,7 +826,7 @@ def test_a_queued_handle_with_no_run_id_names_its_registration_like_its_twin(tmp
     assert out["project_retired"] is False and live == {"prj-new"}, (
         "an accepted POST is never grounds to destroy the registration a run may use")
     assert out["project_retention_reason"] == "start_outcome_unknown_run_may_exist"
-    rows = [json.loads(l) for l in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    rows = [json.loads(l) for l in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     named = [r for r in rows if r.get("type") == "delegate_run_start_failed"]
     assert named and named[0]["project_id"] == "prj-new", "the id must be durably named"
     assert named[0]["reason"] == "queued_without_run_id"
@@ -836,7 +853,7 @@ def test_shared_project_retirement_defers_quietly_for_non_canonical_sharers(tmp_
     gateway = _RefusingGateway()
     for rid, tid in (("run-aa", "t-1"), ("run-bb", "t-2")):
         dc.record_started(tmp_path, dc.RunCustody(
-            run_id=rid, task_id=tid, route_id="r", model="m",
+            run_id=rid, task_id=tid, route_id="r", model="m", source="review_substrate",
             project_id="prj-shared", project_owned=True, ledger_root=str(tmp_path)))
     dc._CUSTODY.clear()
 
@@ -887,9 +904,7 @@ def _settled_session_row(root, reported, run_id="run-counters"):
                           project_id="p", project_owned=False, ledger_root=str(root))
     dc.settle_run(root, _LiveRunStub(), entry,
                   {"summary": summary if reported is _ABSENT else {**summary, "inputTokenUsage": reported}})
-    rows = [json.loads(line) for line
-            in (root / "state" / "usage_attempts.jsonl").read_text().splitlines()
-            if '"subscription_session"' in line]
+    rows = [row for row in ledger_rows(root) if row.get("kind") == "subscription_session"]
     assert rows
     return rows[-1]
 
@@ -921,6 +936,5 @@ def test_a_newly_reported_split_never_rewrites_an_already_settled_session(tmp_pa
     first = _settled_session_row(tmp_path, _ABSENT)
     again = _settled_session_row(tmp_path, _COMPLETE_COUNTERS)
     assert "input_token_usage" not in first and again == first
-    rows = [line for line in (tmp_path / "state" / "usage_attempts.jsonl").read_text().splitlines()
-            if '"subscription_session"' in line]
+    rows = [row for row in ledger_rows(tmp_path) if row.get("kind") == "subscription_session"]
     assert len(rows) == 1, "an optional statistic must not duplicate a settled paid run"

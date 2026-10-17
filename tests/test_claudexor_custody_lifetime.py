@@ -292,7 +292,7 @@ def test_every_supervisor_worker_tree_kill_is_the_shared_one():
         ("worker_pool_lifecycle", "kill_workers_for_update", False),
         ("worker_pool_lifecycle", "_replace_unready_slot", False),
         ("worker_pool_lifecycle", "_spawn_worker_slot", False),
-        ("worker_owner_wait", "_retire_idle", True),
+        ("worker_pool_lifecycle", "reap_idle_worker", True),  # quiescent idle retirement
         ("task_reaper", "_kill_and_confirm_worker_dead", True),
         ("task_lifecycle", "_finish_captured_running", True),
     ):

@@ -25,11 +25,23 @@ _AT_REST = """feed => new Promise((done, fail) => {
     requestAnimationFrame(tick);
 })"""
 
+# While End or PageDown still animates: a late image load (the feed reflows in its next
+# frame) and a typing receipt's state snapshot (app.js fans /api/state to every open room,
+# which rewrites the feed through its reading anchor). Neither moves the feed's content.
+_RELAYOUT = """([feed, cid, delay]) => document.addEventListener('keydown', ({key}) => {
+    if (key !== 'End' && key !== 'PageDown') return;
+    setTimeout(() => {
+        const image = new Image();
+        image.style.cssText = 'position:absolute;width:1px;height:1px';
+        image.src = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jWQAAAABJRU5ErkJggg==';
+        document.querySelector(`${feed} [data-client-message-id="key-30"] .message`).append(image);
+        window.__testSockets[0].dispatchEvent(new MessageEvent('message', {data: JSON.stringify(
+            {type: 'typing', chat_id: cid, client_message_id: `relayout-${key}-${performance.now()}`})}));
+    }, delay);
+}, true)"""
 
-@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
-def test_keys_that_read_to_the_live_edge_follow_new_replies(direct_server_with_data, browser_engine, tmp_path):
-    """#1347 A: End or PageDown that the engine animates to the bottom leads to the present,
-    though WebKit ends every step of an animated page; an upward key stops following."""
+
+def _read_by_keys(direct_server_with_data, browser_engine, tmp_path, relayout_ms=None):
     from playwright.sync_api import sync_playwright
 
     from ouroboros.projects_registry import create_project
@@ -41,6 +53,7 @@ def test_keys_that_read_to_the_live_edge_follow_new_replies(direct_server_with_d
     _write(root / 'logs/chat.jsonl', [
         {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
          'client_message_id': f'key-{index}', 'text': f'Keyboard context {index:02d}'} for index in range(60)])
+    name = browser_engine if relayout_ms is None else f'{browser_engine}-relayout-{relayout_ms}'
     with sync_playwright() as pw:
         browser = getattr(pw, browser_engine).launch(headless=True)
         try:
@@ -50,6 +63,8 @@ def test_keys_that_read_to_the_live_edge_follow_new_replies(direct_server_with_d
             root_feed = page.locator(feed)
             remaining = 'n => n.scrollHeight - n.scrollTop - n.clientHeight'
             steps = {}
+            if relayout_ms is not None:
+                page.evaluate(_RELAYOUT, [feed, cid, relayout_ms])
 
             def press(key):
                 before = root_feed.evaluate('n => n.scrollTop')
@@ -80,14 +95,31 @@ def test_keys_that_read_to_the_live_edge_follow_new_replies(direct_server_with_d
             steps['page-down'] = press('PageDown')
             assert steps['page-up'] > 48 >= steps['page-down'], steps
             steps['page-down-reply'] = reply('key-page-down')
-            _screenshot(page, tmp_path, f'keys-follow-{browser_engine}')
+            _screenshot(page, tmp_path, f'keys-follow-{name}')
             assert steps['page-down-reply']['gap'] <= 2, ('an animated PageDown to the bottom follows', steps)
             steps['page-up-again'] = press('PageUp')
             steps['away-reply'] = reply('key-away')
-            _screenshot(page, tmp_path, f'keys-away-{browser_engine}')
-            (tmp_path / f'keys-follow-{browser_engine}.json').write_text(json.dumps(steps))
+            _screenshot(page, tmp_path, f'keys-away-{name}')
+            (tmp_path / f'keys-follow-{name}.json').write_text(json.dumps(steps))
             assert steps['away-reply']['gap'] > 20 and abs(steps['away-reply']['moved']) <= 2, (
                 'an upward key stops following', steps)
             assert page.evaluate('() => window.__historyReads.every(read => !read.cursor)'), 'keys at the edge page nothing'
         finally:
             browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_keys_that_read_to_the_live_edge_follow_new_replies(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: End or PageDown that the engine animates to the bottom leads to the present,
+    though WebKit ends every step of an animated page; an upward key stops following."""
+    _read_by_keys(direct_server_with_data, browser_engine, tmp_path)
+
+
+@pytest.mark.parametrize('relayout_ms', [20, 60])
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_a_relayout_while_a_key_still_scrolls_neither_stops_it_nor_ends_its_follow(
+        direct_server_with_data, browser_engine, relayout_ms, tmp_path):
+    """A re-layout landing while End or PageDown still animates is no reader gesture: it neither
+    writes the feed under the animation (WebKit stops it at any write, even of the same scrollTop)
+    nor ends what the key's own scrolls decide, so the key still reaches the live edge and follows."""
+    _read_by_keys(direct_server_with_data, browser_engine, tmp_path, relayout_ms)

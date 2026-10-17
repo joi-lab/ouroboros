@@ -2,7 +2,7 @@
 
 The unit cutover can be green while an assembled packet is still wrong: a prompt
 builder that received a membership page produces a packet that looks complete
-and carries none of the book. The constitutional plan packet is the surface
+and carries none of the book. A body plan's packet is the surface
 where that would ship — it is the one review packet that inlines a whole
 reference book — and it is asserted against the actual chapters in this
 repository rather than a synthetic corpus, because the synthetic corpora are
@@ -29,45 +29,27 @@ def _chapter_tails() -> dict[str, str]:
     return tails
 
 
-def test_a_constitutional_plan_packet_inlines_the_chapters_not_the_membership():
-    from ouroboros.tools.plan_packet import PlanPacketError, build_plan_review_system_prompt
-    from ouroboros.tools.plan_review_runtime import _governance_text
+def test_a_body_plan_packet_inlines_the_chapters_not_the_membership():
+    from ouroboros.tools import plan_ask, plan_packet
 
-    architecture = _governance_text(REPO, "docs/ARCHITECTURE.md")
-    bible = _governance_text(REPO, "BIBLE.md")
-    prompt = build_plan_review_system_prompt(
-        checklist_section="## Plan Review Checklist\n\nx",
-        constitutional=True,
-        bible_text=bible,
-        architecture_text=architecture,
-        cycle_index=1,
-        enforcement="blocking",
-    )
-    assert "inline, in full, for a self-modification" in prompt
+    prompt = plan_ask.stable_prompt(None, body=True, system_root=REPO, enforcement="blocking", by_retrieval=False)
+    assert "inline, in full, for a plan that changes Ouroboros's own body" in prompt
     for path, tail in _chapter_tails().items():
         if path.startswith("docs/architecture/"):
             assert prompt.count(tail) == 1, path
 
-    # The claim and the bytes are one fact: a constitutional packet that has
-    # only the membership page must not be assemblable at all.
-    with pytest.raises(PlanPacketError):
-        build_plan_review_system_prompt(
-            checklist_section="x", constitutional=True, bible_text=bible,
-            architecture_text="", cycle_index=1, enforcement="blocking",
+    # The claim and the bytes are one fact: a body packet that has only the
+    # membership page must not be assemblable at all.
+    with pytest.raises(plan_packet.PlanPacketError):
+        plan_packet.build_stable_prompt(
+            checklist_section="x", body=True, enforcement="blocking",
+            bible_text=plan_ask._governance_text(REPO, "BIBLE.md"), architecture_text="",
         )
 
 
-def test_a_non_constitutional_plan_packet_points_at_chapters_by_path():
-    from ouroboros.tools.plan_packet import build_plan_review_system_prompt
-    from ouroboros.tools.plan_review_runtime import _architecture_navigation, _governance_text
+def test_an_ordinary_plan_packet_inlines_no_chapter():
+    from ouroboros.tools import plan_ask
 
-    architecture = _governance_text(REPO, "docs/ARCHITECTURE.md")
-    prompt = build_plan_review_system_prompt(
-        checklist_section="x", constitutional=False, bible_text=None, cycle_index=1,
-        enforcement="advisory",
-        architecture_nav_map=_architecture_navigation(REPO, architecture),
-        bible_nav_map="## BIBLE.md (navigation map)\n\n- P0 — lines 1-9",
-    )
-    assert "Source: `docs/architecture/06-agent-core.md`" in prompt
+    prompt = plan_ask.stable_prompt(None, body=False, system_root=REPO, enforcement="advisory", by_retrieval=False)
     for path, tail in _chapter_tails().items():
-        assert tail not in prompt, f"a pointer view must not inline {path}"
+        assert tail not in prompt, f"an ordinary plan's packet must not inline {path}"

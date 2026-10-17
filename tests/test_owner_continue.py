@@ -13,6 +13,7 @@ from __future__ import annotations
 import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
+from tests._store_shared import delete_result, seed_result
 
 NONCE = "press-0001-abcdef"
 
@@ -53,7 +54,9 @@ def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_fore
     from supervisor.continuation_admission import admit_continuation
 
     queue, _state, workers = _install_queue(tmp_path, monkeypatch)
-    _interrupted(tmp_path)
+    returns = {"relay-1": {"relay_id": "relay-1", "source": {"chat_id": 1, "address": "held-row"}}}
+    held = {"held-row": {"direction": "in", "chat_id": 1, "text": "quoted words"}}
+    _interrupted(tmp_path, open_relays=returns, held_owner_messages=held)
     _owner_mail(tmp_path)
 
     first = admit_continuation("pred-1", action_nonce=NONCE)
@@ -65,6 +68,8 @@ def test_continue_admits_a_new_root_with_exact_owner_sources_and_replays_it_fore
     assert row["chat_id"] == 7 and row["root_task_id"] == successor and row["deadline_at"].startswith("2099")
     assert row["predecessor_task_id"] == "pred-1"
     meta = row["metadata"]
+    assert meta["continuation"]["owner_sources"]["open_relays"] == returns
+    assert meta["continuation"]["owner_sources"]["held_owner_messages"] == held
     assert meta["objective_author"]["kind"] == "continuation"
     corpus = [(r["source"], r["content"]) for r in meta["owner_corpus"]]
     assert corpus == [("origin_message", "Write the Friday report"),
@@ -160,7 +165,7 @@ def test_crash_after_the_claim_or_after_the_snapshot_converges_on_one_identity(t
 
     # Queue row present, result row lost: recovered as the SAME admission.
     successor = retried["successor_task_id"]
-    (tmp_path / "task_results" / f"{successor}.json").unlink()
+    delete_result(tmp_path, successor)
     recovered = admit_continuation("pred-1", action_nonce=NONCE)
     assert recovered["replay"] is True and recovered.get("recovered") is True
     assert [task["id"] for task in workers.PENDING].count(successor) == 1
@@ -573,8 +578,7 @@ def test_history_replays_the_offer_so_a_collapsed_card_needs_no_opening(tmp_path
     ("mailrows", 7, "retained_mailbox_malformed"),
 ])
 def test_malformed_owner_source_containers_refuse_without_claim(tmp_path, monkeypatch, field, value, gap):
-    from ouroboros.task_results import load_task_result, task_result_path
-    import json
+    from ouroboros.task_results import load_task_result
     from supervisor.continuation_admission import admit_continuation
 
     _, _, workers = _install_queue(tmp_path, monkeypatch)
@@ -592,7 +596,7 @@ def test_malformed_owner_source_containers_refuse_without_claim(tmp_path, monkey
             chain[field] = value
         row["metadata"] = {"continuation": value if field == "continuation" else {
             "owner_sources": value if field == "sources" else chain}}
-    task_result_path(tmp_path, "pred-1").write_text(json.dumps(row), encoding="utf-8")
+    seed_result(tmp_path, "pred-1", row)
     result = admit_continuation("pred-1", action_nonce=NONCE)
     assert result["error"] == "owner_source_missing" and gap in result["gaps"]
     assert workers.PENDING == [] and "continued_by" not in load_task_result(tmp_path, "pred-1")

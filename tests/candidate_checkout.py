@@ -18,7 +18,7 @@ keeps the tree in place and marks it for every enclosing cleanup layer.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -28,6 +28,7 @@ import secrets
 import stat
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 from ouroboros.test_environment import retain_tree, retention_markers
@@ -108,15 +109,25 @@ def assert_served_candidate(url, checkout, data_dir, pid, candidate):
       `ouroboros` package was loaded from this directory.
     """
     from ouroboros.server_process import read_service_bindings
+    from ouroboros.server_web import UI_OWNER_MARKER
 
     binding = read_service_bindings(data_dir)["main"]
-    require_running_supervisor(json.loads(_fetch(url + "/api/state")))
+    state = json.loads(_fetch(url + "/api/state"))
+    require_running_supervisor(state)
     assert binding["pid"] == pid, "health answered by a different server process"
     assert url == f"http://127.0.0.1:{binding['port']}"
-    for relative, route in (("web/index.html", "/"),
-                            ("web/modules/api_client.js", "/static/modules/api_client.js")):
-        assert _fetch(url + route) == candidate.state.files[relative][0], relative
-    assert _fetch(url + SENTINEL_ROUTE) == candidate.sentinel_bytes, (
+    # The selected interface owns / and /static (OUROBOROS_UI_DIR); the core's own builtin tree is
+    # always /onboarding/static. A core that reports no served_ui predates that split.
+    served = state.get("served_ui")
+    tree = "/static" if served is None else "/onboarding/static"
+    if served is None or served.get("source") == "builtin":
+        # The builtin index response adds only its core-ownership marker to the checkout's bytes.
+        index = candidate.state.files["web/index.html"][0]
+        expected = index if served is None else index.replace(b"<head>", b"<head>" + UI_OWNER_MARKER.encode(), 1)
+        assert _fetch(url + "/") == expected, "web/index.html"
+    assert _fetch(url + tree + "/modules/api_client.js") == candidate.state.files["web/modules/api_client.js"][0], (
+        "web/modules/api_client.js")
+    assert _fetch(url + tree + SENTINEL_ROUTE.removeprefix("/static")) == candidate.sentinel_bytes, (
         "the static tree served is not this candidate checkout")
     health = json.loads(_fetch(url + "/api/health"))
     assert health["runtime_version"] == candidate.version_text, (
@@ -127,10 +138,16 @@ def assert_served_candidate(url, checkout, data_dir, pid, candidate):
 def _git(repo: Path, *args: str, data=None) -> bytes:
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env.update(GIT_OPTIONAL_LOCKS="0", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-    result = subprocess.run(
-        ["git", "-c", "core.fsmonitor=false", *args], cwd=repo, env=env,
-        input=data, capture_output=True, timeout=120,
-    )
+    # File-backed input removes the observed parent/Git mutual pipe-write wait.
+    # Keep temporary bytes outside either observed checkout, including on Windows.
+    with tempfile.TemporaryFile() if data is not None else nullcontext() as stdin:
+        if stdin is not None:
+            stdin.write(data)
+            stdin.seek(0)
+        result = subprocess.run(
+            ["git", "-c", "core.fsmonitor=false", *args], cwd=repo, env=env,
+            stdin=stdin, capture_output=True, timeout=120,
+        )
     if result.returncode:
         raise CandidateError(f"CANDIDATE_GIT_FAILED {args[0]}: {os.fsdecode(result.stderr)}")
     return result.stdout

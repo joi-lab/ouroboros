@@ -9,12 +9,22 @@ from ouroboros import context_compaction as compaction
 from ouroboros.artifacts import collect_task_artifact_records
 from ouroboros.context_budget import ContextReclaimRequest
 from ouroboros.consolidator import consolidate_scratchpad
-from ouroboros.loop_tool_execution import _truncate_tool_result, process_tool_results
+from ouroboros.loop_tool_execution import process_tool_results
 from ouroboros.memory import Memory
 from ouroboros.review_evidence import build_task_acceptance_evidence
 from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
 from ouroboros.tools.core import _read_file
+from ouroboros.tools.core_file_tools import delivered_source_prefix
 from ouroboros.tools.registry import ToolContext
+from tests._tool_result_delivery_shared import measured_fit
+
+
+def _legacy_actor_view(full: str, limit: int = 80_000) -> str:
+    """A pre-source-handle actor view: head cut at the retired per-name cap, the
+    legacy marker, no source. Only historical trace rows still carry this shape."""
+    return (full[:limit] + f"\n... (truncated from {len(full)} chars, limit={limit})"
+            + "\nFULL_RESULT_SOURCE_UNAVAILABLE=true"
+            + "\nDo not treat this partial result as complete; exact source persistence failed.")
 
 
 def _tool_ctx(tmp_path, *, task_id: str = "source-handles") -> ToolContext:
@@ -34,7 +44,8 @@ def _read_source(ctx: ToolContext, ref: dict, *, start_char: int = 0) -> str:
     assert read["tool"] == "read_file"
     args = dict(read["arguments"])
     args["start_char"] = start_char
-    return _read_file(ctx, **args)
+    display = _read_file(ctx, **args)
+    return delivered_source_prefix(ctx.last_read_view, display, len(display)) if ctx.last_read_view else display
 
 
 def test_fifo_eviction_keeps_exact_block_and_current_scratchpad_names_reader(tmp_path):
@@ -46,12 +57,9 @@ def test_fifo_eviction_keeps_exact_block_and_current_scratchpad_names_reader(tmp
     current = memory.load_scratchpad()
     assert "read_file(root='runtime_data', path='memory/scratchpad_journal.jsonl'" in current
 
-    journal = _read_file(
-        _tool_ctx(tmp_path),
-        root="runtime_data",
-        path="memory/scratchpad_journal.jsonl",
-    )
-    rows = [json.loads(line) for line in journal.splitlines()[1:] if line.startswith("{")]
+    journal = _read_source(_tool_ctx(tmp_path), {"read": {"tool": "read_file", "arguments": {
+        "root": "runtime_data", "path": "memory/scratchpad_journal.jsonl"}}})
+    rows = [json.loads(line) for line in journal.splitlines() if line.startswith("{")]
     evicted = [row for row in rows if row.get("type") == "block_evicted"]
     assert [row["evicted_block_content"] for row in evicted] == [contents[0]]
 
@@ -60,7 +68,6 @@ class _ConsolidationLLM:
     def chat(self, **_kwargs):
         return {
             "content": json.dumps({
-                "knowledge_entries": [],
                 "compressed_block": "compressed working memory",
             })
         }, {"prompt_tokens": 10, "completion_tokens": 5}
@@ -75,7 +82,6 @@ def test_scratchpad_consolidation_journals_exact_replaced_blocks_and_ref(tmp_pat
 
     usage = consolidate_scratchpad(
         memory,
-        tmp_path / "memory" / "knowledge",
         _ConsolidationLLM(),
     )
     assert usage["prompt_tokens"] == 10
@@ -95,19 +101,20 @@ def test_scratchpad_consolidation_journals_exact_replaced_blocks_and_ref(tmp_pat
     }
     assert source_ref["entry_id"]
 
-    journal = _read_file(
-        _tool_ctx(tmp_path),
-        root="runtime_data",
-        path="memory/scratchpad_journal.jsonl",
-    )
-    rows = [json.loads(line) for line in journal.splitlines()[1:] if line.startswith("{")]
+    journal = _read_source(_tool_ctx(tmp_path), {"read": {"tool": "read_file", "arguments": {
+        "root": "runtime_data", "path": "memory/scratchpad_journal.jsonl"}}})
+    rows = [json.loads(line) for line in journal.splitlines() if line.startswith("{")]
     entry = next(row for row in rows if row.get("entry_id") == source_ref["entry_id"])
     assert entry["type"] == "blocks_consolidated"
     assert entry["source_blocks"] == original[:2]
     assert source_ref["entry_id"] in memory.load_scratchpad()
 
 
-def _project_large_result(tmp_path, *, tool_name: str, call_id: str, result: str):
+def _project_large_result(tmp_path, *, tool_name: str, call_id: str, result: str,
+                          window_tokens: int = 4_000):
+    """Deliver one result under a MEASURED frame: a 4,000-token route window with a
+    1,000-token reply reserve, so a result of a few thousand tokens cannot be shown
+    whole and is projected head+tail with its exact source."""
     ctx = _tool_ctx(tmp_path, task_id="large-result")
     messages: list[dict] = []
     trace = {"tool_calls": []}
@@ -127,6 +134,7 @@ def _project_large_result(tmp_path, *, tool_name: str, call_id: str, result: str
         trace,
         emit_progress=lambda _message, *, incident=None: None,
         tools=tools,
+        fit_candidate=measured_fit(window=window_tokens, reserve=1_000),
     )
     return ctx, messages[0]["content"], trace["tool_calls"][0]
 
@@ -141,7 +149,10 @@ def test_100k_non_idempotent_command_has_exact_actor_read_handle(tmp_path):
         result=full,
     )
 
-    assert decisive_suffix not in visible
+    # Head+tail: the decisive suffix is in the delivered tail, the bulk is omitted
+    # by exact range, and the complete result is one exact read away.
+    assert decisive_suffix in visible
+    assert "x" * 50_000 not in visible
     assert "Do not rerun this tool to recover omitted output." in visible
     ref = _source_ref_from_visible_result(visible)
     assert trace_row["result_partial"] is True
@@ -164,7 +175,7 @@ def test_large_extension_result_uses_same_exact_actor_read_handle(tmp_path):
         result=full,
     )
 
-    assert decisive_suffix not in visible
+    assert "y" * 10_000 not in visible
     ref = _source_ref_from_visible_result(visible)
     assert trace_row["result_partial"] is True
     assert trace_row["result_source_ref"] == ref
@@ -244,7 +255,7 @@ def test_context_capsule_checkpoint_is_actor_readable_and_dangling_is_explicit(
     assert ref["root"] == "artifact_store"
     ctx = _tool_ctx(tmp_path, task_id="checkpoint-task")
     recovered = _read_source(ctx, ref)
-    checkpoint = json.loads(recovered.split("\n", 1)[1])
+    checkpoint = json.loads(recovered)
     assert checkpoint["messages"] == messages
 
     source_path = tmp_path / "task_results" / "artifacts" / "checkpoint-task" / ref["path"]
@@ -262,7 +273,7 @@ class _MustNotReviewPartial:
 
 
 def test_metadata_less_actor_truncation_envelope_abstains_before_review(tmp_path):
-    actor_view = _truncate_tool_result("legacy" * 100_000, "run_command")
+    actor_view = _legacy_actor_view("legacy" * 100_000)
     assert "truncated from 600000" in actor_view
     ctx = _tool_ctx(tmp_path, task_id="legacy-partial")
     evidence = build_task_acceptance_evidence(
@@ -314,7 +325,7 @@ def test_explicit_complete_row_is_not_reclassified_from_envelope_text(tmp_path):
 def test_budget_recap_preserves_every_legacy_actor_envelope(tmp_path):
     calls = []
     for index in range(3):
-        actor_view = _truncate_tool_result(str(index) * 500_000, "run_command")
+        actor_view = _legacy_actor_view(str(index) * 500_000)
         assert "truncated from 500000" in actor_view
         calls.append({"tool": "run_command", "status": "ok", "result": actor_view})
 
@@ -335,7 +346,7 @@ def test_budget_recap_preserves_every_legacy_actor_envelope(tmp_path):
 def test_redaction_expansion_preserves_legacy_actor_envelope(tmp_path):
     credential_url = "https://alice:phase3b-secret@example.invalid/private?"
     full = (credential_url * 3_000) + ("Z" * 400_000)
-    actor_view = _truncate_tool_result(full, "run_command")
+    actor_view = _legacy_actor_view(full)
     marker = f"truncated from {len(full)}"
     assert marker in actor_view
 

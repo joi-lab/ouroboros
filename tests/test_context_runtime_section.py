@@ -9,7 +9,6 @@ block.
 
 from __future__ import annotations
 
-import inspect
 import json
 
 import pytest
@@ -17,18 +16,6 @@ import pytest
 from ouroboros.context import build_runtime_section, build_user_content
 
 from tests._context_shared import _make_health_env
-
-def test_build_llm_messages_has_no_recorder_only_soft_cap_chain():
-    from ouroboros import context as context_module
-    from ouroboros.context import build_llm_messages
-
-    assert "soft_cap_tokens" not in inspect.signature(build_llm_messages).parameters
-    assert not hasattr(context_module, "apply_message_token_soft_cap")
-    source = inspect.getsource(build_llm_messages)
-    assert "estimated_tokens_before" not in source
-    assert "trimmed_sections" not in source
-    assert "context_fit" in source
-
 
 @pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
 def test_force_plan_metadata_adds_structured_notice_without_rewriting_user_text(
@@ -345,13 +332,13 @@ def test_improvement_backlog_digest_is_actor_scoped(tmp_path):
         messages, _ = build_llm_messages(
             env=FakeEnv(), memory=Memory(drive_root=tmp_path), task=task,
         )
-        assert "## Improvement Backlog" not in messages[0]["content"][2]["text"]
+        assert "## Improvement Backlog" not in messages[0]["content"][-1]["text"]
 
     for task_type in ("evolution", "deep_self_review"):
         messages, _ = build_llm_messages(
             env=FakeEnv(), memory=Memory(drive_root=tmp_path),
             task={"id": task_type, "type": task_type, "text": "improve"})
-        dynamic_text = messages[0]["content"][2]["text"]
+        dynamic_text = messages[0]["content"][-1]["text"]
         assert "## Improvement Backlog" in dynamic_text
         assert "Reduce recurring task friction around REVIEW_BLOCKED" in dynamic_text
 
@@ -620,7 +607,7 @@ def test_captured_recent_and_drive_sections_carry_one_capture_label(tmp_path, mo
         encoding="utf-8")
     messages, _info = build_llm_messages(env=env, memory=memory, task={
         "id": "t-labels", "type": "task", "text": "hi", "_is_direct_chat": True, "chat_id": 1, "metadata": {}})
-    dynamic = messages[0]["content"][2]["text"]
+    dynamic = messages[0]["content"][-1]["text"]
     label = "_Snapshot captured at 2027-01-15T12:00:00+00:00 when this context was built; not refreshed during this run._"
     assert "## Drive state\n" + label in dynamic
     # The chat row is the memory view's (the open conversation): no capture-labelled chat tail.

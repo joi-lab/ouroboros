@@ -10,6 +10,23 @@ from ouroboros import delegate_custody as custody
 
 
 _PAYLOAD_CLAIM_LOCK = threading.Lock()
+PAYLOAD_CUSTODY_UNREADABLE = "custody_log_unreadable"
+
+
+def payload_busy_detail(holder: str) -> str:
+    """Explain the same payload refusal at the early check and either claim check."""
+    if holder == PAYLOAD_CUSTODY_UNREADABLE:
+        return (
+            "Custody for the selected payload could not be read. No holder or free "
+            "payload is established; nothing was started. Retry when custody is readable."
+        )
+    return (
+        "Another delegated run holds this exact payload open: its custody is "
+        "not yet settled AND disposed, and its owner task is still live (or its "
+        "terminality cannot be proven from task results). Wait for that task to "
+        "finish, or pick another skill: a non-owner can neither delegate_wait "
+        "that run nor integrate its capture."
+    )
 
 
 def claimed_start_request(
@@ -18,8 +35,34 @@ def claimed_start_request(
     actor_ctx: Any = None, enforce_actor_idle: bool = False,
     **request_row: Any,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """Atomically claim a fresh actor start and optional payload target."""
+    """Atomically claim a fresh actor start and optional payload target.
 
+    A start that continues IN a predecessor's snapshot (``capture_id``) claims
+    under that snapshot's one disposition lock, so no apply/reject of the
+    predecessor can interleave with its hand-over (``delegate_continuation``).
+    """
+    from ouroboros.usage_ledger import BillingAuthorityUnavailable
+
+    try:
+        if request_row.get("capture_id") and request_row.get("continuation_of"):
+            from ouroboros.delegate_continuation import snapshot_handover
+
+            with snapshot_handover(drive, request_row) as refusal:
+                if refusal:
+                    return False, refusal
+                return _claimed(drive, claim_target, payload_busy, actor_ctx, enforce_actor_idle, request_row)
+        return _claimed(drive, claim_target, payload_busy, actor_ctx, enforce_actor_idle, request_row)
+    except BillingAuthorityUnavailable as exc:
+        # Refused before any START row or POST; not a budget limit.
+        return False, {"reason": "billing_authority_unavailable", "billing_authority": exc.kind, "detail": (
+            f"{exc}. No delegated session was started. "
+            + ("This task's billing lineage is missing or not its own; neither waiting nor a budget change repairs it."
+               if exc.kind == "refused" else
+               "The authority could not be read; a later start rereads it once the cause is fixed."))}
+
+
+def _claimed(drive: pathlib.Path, claim_target: str, payload_busy: Callable[[pathlib.Path, pathlib.Path], str],
+             actor_ctx: Any, enforce_actor_idle: bool, request_row: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     from ouroboros.platform_layer import (
         acquire_exclusive_file_lock,
         release_exclusive_file_lock,
@@ -45,10 +88,7 @@ def claimed_start_request(
                 if holder:
                     return False, {
                         "reason": "payload_delegation_busy", "holder": holder,
-                        "detail": (
-                            "Another delegated run claimed this exact payload first. "
-                            "Finish it before starting another assignment against the skill."
-                        ),
+                        "detail": payload_busy_detail(holder),
                     }
                 return custody.record_start_requested(drive, **request_row), {}
             finally:
@@ -67,7 +107,8 @@ def claimed_start_request(
                 }
             from ouroboros.delegate_recovery import unsettled_start_ids
 
-            blockers = unsettled_start_ids(drive, task_id)
+            blockers = unsettled_start_ids(drive, task_id, continuing=str(
+                request_row.get("continuation_of") or ""))
             if any(blockers.values()):
                 if claim_target:
                     holder = payload_busy(drive, pathlib.Path(claim_target))
@@ -75,10 +116,7 @@ def claimed_start_request(
                         return False, {
                             "reason": "payload_delegation_busy",
                             "holder": holder,
-                            "detail": (
-                                "Another delegated run claimed this exact payload first. "
-                                "Finish it before starting another assignment against the skill."
-                            ),
+                            "detail": payload_busy_detail(holder),
                         }
                 live_ids = [
                     str(v) for key in (

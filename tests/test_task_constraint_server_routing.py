@@ -1,6 +1,5 @@
 from types import SimpleNamespace
 import asyncio
-from pathlib import Path
 
 import server
 from ouroboros.gateway import control as gateway_control
@@ -72,9 +71,9 @@ def test_constrained_repair_promotes_managed_task_before_busy_direct_lane(monkey
     # The skill card issued this promote: the handler's publication boundary
     # owns any refusal notice, so the event says so.
     assert event["host_initiated"] is True
-    assert len(calls["sent"]) == 1
-    assert calls["sent"][0][0] == 1
-    assert "accepted and durably scheduled" in calls["sent"][0][1]
+    # A landed repair publishes no row: the card's own "Repair task queued" receipt
+    # and the task's card carry it (a refusal still gets its typed row, below).
+    assert calls["sent"] == []
 
 
 _REPAIR_INCOMING = {
@@ -134,16 +133,6 @@ def test_constrained_repair_outer_failure_sends_one_typed_not_started_row(monkey
     assert text == "repair skill · Not started: the skill repair request could not be started"
     assert kwargs["role"] == "system" and kwargs["system_type"] == "task_not_started"
     assert kwargs["task_id"]
-
-
-def test_repair_ui_copy_does_not_promise_a_removed_decision_round():
-    repo = Path(__file__).resolve().parent.parent
-    for path in (repo / "web/modules/skills.js", repo / "web/modules/marketplace.js"):
-        text = path.read_text(encoding="utf-8")
-        assert "Ouroboros will decide" not in text
-        assert "If the task cannot start, chat will show why" in text
-        assert "confirmLabel: 'Repair and run'" in text
-        assert "visible_text:" not in text
 
 
 def test_ordinary_busy_message_uses_native_lane(monkeypatch):

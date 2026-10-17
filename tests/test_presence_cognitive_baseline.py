@@ -54,7 +54,7 @@ def _ceiling(*selections):
     )
 
 
-_OWN_WORK = {"get_task_result", "recent_tasks", "steer_task"}
+_OWN_WORK = {"get_task_result", "recent_tasks", "tell_task"}
 
 
 def test_profile_without_tool_selections_still_carries_its_own_memory():

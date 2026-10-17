@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from ouroboros.chronicle_store import ChronicleStore, PublishResult
+from ouroboros.chronicle_store import ChronicleStore, PublishResult, correction_line
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 MIND = {"kind": "mind", "task_id": "t1", "focus": {"role": "root", "task_id": "t1"}}
@@ -243,7 +243,8 @@ def test_room_records_are_story_records_paged_by_sequence(tmp_path):
     assert store.decide(draft["id"], False, MIND, "Not what happened").ok
     first = store.room_records("1")
     assert [r["id"] for r in first] == [r["id"] for r in notes]
-    assert first[0]["text"] == "Meaning 0" and first[0]["current_text"] == "Meaning 0, corrected"
+    assert first[0]["text"] == "Meaning 0" and first[0]["current_text"].startswith("Meaning 0\n\n[correction ")
+    assert first[0]["current_text"].endswith("]\nMeaning 0, corrected")
     second = store.room_records("1", after_seq=first[1]["sequence"])
     assert [r["id"] for r in second] == [notes[2]["id"]]
 
@@ -261,14 +262,22 @@ def test_correction_is_the_minds_and_keeps_the_original(tmp_path):
     fixed = store.correct(original["id"], "The mind chose Y", MIND)
     assert fixed.ok and fixed.current_revision == fixed.record["id"]
     row = store.room_records("r")[0]
-    assert (row["text"], row["current_text"], row["current_author"]) == ("I chose X", "The mind chose Y", MIND)
-    assert row["revision"] == fixed.record["id"]
+    # The acting text is the original with the signed correction under it; the author stays the record's.
+    line = correction_line(fixed.record)
+    assert line == f"[correction {fixed.record['id']} by mind (root, task t1), {fixed.record['ts'][:10]}]"
+    assert (row["text"], row["current_text"], row["author"]) == ("I chose X", f"I chose X\n\n{line}\nThe mind chose Y", MIND)
+    assert row["revision"] == fixed.record["id"] and "current_author" not in row
+    assert row["corrections"] == [{"id": fixed.record["id"], "author": MIND, "ts": fixed.record["ts"]}]
     assert store.get(original["id"])["text"] == "I chose X"
     # A helper is refused as such, not asked for a revision; the raw publish path keeps the same rule.
     assert store.correct(original["id"], "Light's view", LIGHT).reason == "invalid"
     raw = store.publish([{"kind": "correction", "room_id": "r", "target_id": original["id"], "text": "Light's view",
                           "author": LIGHT}])
-    assert raw.reason == "invalid" and store.room_records("r")[0]["current_text"] == "The mind chose Y"
+    assert raw.reason == "invalid" and store.room_records("r")[0]["current_text"] == row["current_text"]
+    # A record nobody corrected acts as its own words alone, nothing added.
+    plain = note(store, "untouched")
+    acting = next(r for r in store.room_records("r") if r["id"] == plain["id"])
+    assert acting["current_text"] == "untouched" and acting["revision"] == plain["id"] and acting["corrections"] == []
 
 
 def test_rejected_light_draft_stops_acting_and_reopens_its_rows(tmp_path):
@@ -307,8 +316,14 @@ def test_corrections_need_the_current_revision_and_refusals_carry_no_text(tmp_pa
     stale = store.correct(base["id"], "correction 2", MIND, expected_revision=base["id"])
     assert (stale.reason, stale.current_revision) == ("revision_conflict", first.record["id"])
     assert "correction 1" not in repr(stale)
-    assert store.correct(base["id"], "correction 2", MIND, expected_revision=first.record["id"]).ok
-    assert store.room_records("r")[0]["current_text"] == "correction 2"
+    second = store.correct(base["id"], "correction 2", MIND, expected_revision=first.record["id"])
+    assert second.ok
+    acting = store.room_records("r")[0]
+    # The second correction does not hide the first: both stand under the original, in order, each signed.
+    assert acting["current_text"] == (f"original\n\n{correction_line(first.record)}\ncorrection 1\n\n"
+                                      f"{correction_line(second.record)}\ncorrection 2")
+    assert acting["revision"] == second.record["id"]
+    assert [fix["id"] for fix in acting["corrections"]] == [first.record["id"], second.record["id"]]
     assert store.correct("no-such-record", "x", MIND).reason == "target_missing"
 
 
@@ -664,6 +679,63 @@ def test_repeated_activation_returns_the_existing_receipt(tmp_path):
     assert store.activation()["id"] == "legacy-import-1"
     assert store.scan_state() == {"legacy_frontier": {"pos": 1}}
     assert store.room_head("") == 0
+
+
+def test_an_account_freezes_source_versions_folds_nothing_and_a_selection_chooses_the_view(tmp_path):
+    """An account over records of two rooms names the revision it read; that basis never changes while the
+    sources go on being corrected, folded and decided locally; a later selection chooses the common view and
+    the latest one per account acts. All of it replays from the journal alone."""
+    from ouroboros.chronicle_store import body_sha256
+
+    store = ChronicleStore(tmp_path)
+    a1 = page(store, "a1", room="a", at=0).record
+    a2 = page(store, "a2", room="a", at=1).record
+    b1 = page(store, "b1", room="b", at=5).record
+    fix = store.correct(a1["id"], "a1, corrected once", MIND)
+    assert fix.ok
+    # The revision read: the correction's; unnamed, the current one; a foreign one is refused with the current.
+    g = store.publish_account(room_id="1", text="Across a and b.", sources=[{"id": a1["id"], "revision": fix.record["id"]},
+                                                                         b1["id"]], author=MIND)
+    assert g.ok and g.current_head is None and store.room_head("a") == fix.record["sequence"]
+    assert g.record["sources"] == [
+        {"id": a1["id"], "kind": "page", "room_id": "a", "revision": fix.record["id"], "sha256": body_sha256(store.get(a1["id"])),
+         "status": "final"},
+        {"id": b1["id"], "kind": "page", "room_id": "b", "revision": b1["id"], "sha256": body_sha256(store.get(b1["id"])),
+         "status": "final"}]
+    stale = store.publish_account(room_id="1", text="x", sources=[{"id": a1["id"], "revision": b1["id"]}], author=MIND)
+    assert (stale.reason, stale.current_revision, stale.conflict_ids) == ("revision_conflict", fix.record["id"], (a1["id"],))
+    # Provenance, not ownership: a1 is still unfolded, a local fold over a1+a2 passes, and a second account cites a1.
+    assert store.get(a1["id"]) and all(r["folded_into"] is None for r in store.pages_of_room("a"))
+    local = store.publish_part(room_id="a", text="a, told once", member_ids=[a1["id"], a2["id"]], author=MIND,
+                               expected_sequence=store.room_head("a"))
+    assert local.ok, local
+    g2 = store.publish_account(room_id="1", text="a again.", sources=[a1["id"]], author=MIND)
+    assert g2.ok and g2.record["sources"][0]["revision"] == fix.record["id"]
+    again = store.correct(a1["id"], "a1, corrected twice", MIND, expected_revision=fix.record["id"])
+    assert again.ok
+    interpreted = {record["id"]: record for record in store.accounts()}
+    first = interpreted[g.record["id"]]["sources"][0]
+    assert (first["revision"], first["current_revision"], first["later_corrections"], first["folded_into"]) == (
+        fix.record["id"], again.record["id"], [again.record["id"]], local.record["id"])
+    assert first["revision_known"] is True and first["missing"] is False and first["status_now"] == "final"
+    assert store.get(g.record["id"])["sources"][0]["revision"] == fix.record["id"]  # the journal's basis, unchanged
+    assert interpreted[g.record["id"]]["selection"] is None
+    # Selection: the latest acts; replaces names records of this chronicle; a withdrawal is one too.
+    assert store.select_account(g.record["id"], replaces=[a1["id"]], author=MIND, reason="through it").ok
+    later = store.select_account(g.record["id"], replaces=[local.record["id"], b1["id"]], author=MIND, reason="told once")
+    assert later.ok and later.current_head is None
+    chosen = {record["id"]: record["selection"] for record in store.accounts()}
+    assert chosen[g.record["id"]]["id"] == later.record["id"] and chosen[g.record["id"]]["shown"] is True
+    assert chosen[g.record["id"]]["replaces"] == [local.record["id"], b1["id"]] and chosen[g2.record["id"]] is None
+    assert store.select_account(g.record["id"], replaces=[], author=MIND, reason="not now", shown=False).ok
+    assert {r["id"]: r["selection"]["shown"] for r in store.accounts() if r["selection"]} == {g.record["id"]: False}
+    # The journal alone rebuilds it all; the account lists in its room's records and corrects like any record.
+    before = (store.accounts(), store.room_records("1"), store.room_head("a"), store.sealed_row_refs("a"))
+    store.index_path.unlink()
+    assert (store.accounts(), store.room_records("1"), store.room_head("a"), store.sealed_row_refs("a")) == before
+    assert [r["kind"] for r in store.room_records("1")] == ["account", "account"]
+    assert store.correct(g.record["id"], "Across a and b, said better.", MIND).ok
+    assert store.accounts()[0]["current_text"].startswith("Across a and b.\n\n[correction ")
 
 
 def test_store_imports_no_writer_view_or_model_code():

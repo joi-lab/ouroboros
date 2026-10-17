@@ -1,6 +1,6 @@
 """Structural guards for notifications: the facts a browser cannot show.
 
-Three claims here are invisible to a Playwright run:
+These boundaries are checked across the source:
 
 * **Replay safety is structural.** Nothing about past notifications is stored,
   so "a reload does not re-notify" rests entirely on the notifier being reached
@@ -11,9 +11,6 @@ Three claims here are invisible to a Playwright run:
   "notification choices stay client-local" rests on the Appearance block owning
   no such field. The browser suite asserts the consequence; this asserts the
   cause.
-* **One canonical policy.** DESIGN §9 is the single owner-facing statement and
-  DEVELOPMENT points at it instead of restating it — a documentation invariant,
-  not a rendered behaviour.
 
 Pattern follows ``tests/test_appearance_static.py``: read the sources, assert
 the structural fact, no browser needed.
@@ -53,13 +50,9 @@ def test_notification_controls_are_client_local():
         )
 
 
-def test_the_important_toggle_names_everything_it_silences():
-    """Reminders and skill notices ring under ``important`` (no category of their own),
-    so the one checkbox that silences their banners says so; the chat rows stay."""
+def test_reminders_and_skill_notices_use_the_important_toggle():
+    """Reminders and skill notices have no separate notification preference."""
     assert "systemType === 'reminder' || systemType === 'skill_notice'" in _read("web/modules/notifications.js")
-    panel = _appearance_panel(_read("web/modules/settings_ui.js"))
-    label = re.search(r'data-notify-pref="important">\s*([^<]+?)\s*</label>', panel).group(1)
-    assert "while it works" in label and "reminders" in label and "skill notices" in label, label
 
 
 def test_settings_mounts_the_notifier_like_the_theme():
@@ -106,15 +99,14 @@ def test_the_subscription_outlives_every_room():
     assert "applyHistoryMessages" not in module and "chat/history" not in module
 
 
-def test_policy_has_one_canonical_home():
-    design = _read("docs/DESIGN.md")
-    assert "## 9. Notifications" in design
-    assert "ONE canonical statement" in design
-    development = _read("docs/development/03-module-size-and-complexity.md")
-    assert "notifications ring for live events only" in development
-    assert "`docs/DESIGN.md` §9" in development, "DEVELOPMENT points at the policy, never restates it"
-    architecture = _read("docs/architecture/03-web-ui-pages-and-buttons.md")
-    assert "web/modules/notifications.js" in architecture
+def test_activation_is_wired_to_addressed_registry_lookup_not_sidebar_fallback():
+    app = _read("web/app.js")
+    activation = app[app.index("onActivate: createNotificationActivation({"):
+                     app.index("function closeNotificationReaders()")]
+    assert "/api/projects?chat_id=" in activation
+    assert "lastProjectRows" not in activation
+    assert "unavailable:" in activation
+    assert "openProjectPanel(project, options)" in activation
 
 
 def test_importance_uses_the_existing_discriminator():

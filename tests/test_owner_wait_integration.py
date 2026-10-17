@@ -24,11 +24,13 @@ from tests.system_e2e.harness import (
     ModelGate,
     ScriptedStubModel,
     body_text,
+    message_text,
     keyless_settings,
     start_server,
     wait_durable_result,
     wait_until,
 )
+from tests._usage_store_testing import ledger_rows
 
 
 pytestmark = [pytest.mark.serial, pytest.mark.browser]
@@ -123,10 +125,30 @@ def _running(oracle, task_id):
                  if row.get("id") == task_id), {})
 
 
+def _actor(body):
+    """The task's own first user message, never the peer-root catalogue."""
+    first = next((message_text(message) for message in body.get("messages", [])
+                  if message.get("role") == "user"), "")
+    matches = [tag for tag in (_FORM_TASK, _OTHER_TASK) if first.startswith(f"[{tag}]")]
+    assert len(matches) == 1, "scripted request lacks its current task identity"
+    return matches[0]
+
+
+@pytest.mark.parametrize("own,peer", [(_FORM_TASK, _OTHER_TASK), (_OTHER_TASK, _FORM_TASK)])
+def test_peer_catalogue_cannot_retarget_current_task(own, peer):
+    body = {"tools": [{}], "messages": [
+        {"role": "system", "content": f"[INDEPENDENT_ROOTS] [{peer}]"},
+        {"role": "user", "content": f"[{own}] Execute this task. Peer: [{peer}]"},
+        {"role": "user", "content": f"[{peer}] Later peer context."}]}
+    assert _actor(body) == own
+    with pytest.raises(AssertionError):
+        _actor({"messages": [{"role": "user", "content": f"Unknown task mentions [{own}]"}]})
+
+
 def _rounds(stub, marker):
     with stub._lock:
         return [body for _, body in stub.calls
-                if body.get("tools") and marker in body_text(body)]
+                if body.get("tools") and _actor(body) == marker]
 
 
 def _tool_messages(body):
@@ -139,7 +161,7 @@ def test_owner_wait_preserves_form_and_lends_one_worker(wait_clone, local_form, 
     # B owns a SECOND real browser and is held only after its navigation completed.
     # This gives Stop a concrete worker/browser tree to tear down while A is parked.
     gate = ModelGate(lambda body: bool(body.get("tools"))
-                     and _OTHER_TASK in body_text(body)
+                     and _actor(body) == _OTHER_TASK
                      and any("Independent browser ready" in str(row.get("content"))
                              for row in _tool_messages(body)), timeout=180)
     steps = [
@@ -159,7 +181,7 @@ def test_owner_wait_preserves_form_and_lends_one_worker(wait_clone, local_form, 
     indices = {_FORM_TASK: 0, _OTHER_TASK: 0}
 
     def next_step(body):
-        actor = _OTHER_TASK if _OTHER_TASK in body_text(body) else _FORM_TASK
+        actor = _actor(body)
         index = indices[actor]
         indices[actor] += 1
         if actor == _OTHER_TASK:
@@ -226,14 +248,11 @@ def test_owner_wait_preserves_form_and_lends_one_worker(wait_clone, local_form, 
             assert len(oracle.task_drive(task_a).events("task_received")) == 1
             assert wait_until(lambda: task_a not in oracle.running_ids(), 30)
             assert gate.timed_out is False
-            usage = [row for row in oracle._jsonl("state/usage_attempts.jsonl")
+            usage = [row for row in ledger_rows(server.data_root)
                      if row.get("task_id") == task_a and row.get("category") == "task"]
-            identities = []
-            for state in ("reserved", "dispatched", "settled"):
-                attempts = [row["attempt_id"] for row in usage if row.get("state") == state]
-                assert len(attempts) == len(set(attempts)) == len(steps)
-                identities.append(set(attempts))
-            assert identities[0] == identities[1] == identities[2]
+            # One current row per attempt: every step's attempt went the whole way.
+            attempts = [row["attempt_id"] for row in usage if row.get("state") == "settled"]
+            assert len(attempts) == len(set(attempts)) == len(steps) == len(usage)
             if output := os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT"):
                 destination = Path(output) / answer_path
                 destination.mkdir(parents=True, exist_ok=True)

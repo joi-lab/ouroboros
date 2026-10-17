@@ -36,7 +36,9 @@ def acting(setup, monkeypatch):
     gateway.results *= 4
     gateway.dispatch *= 4
     monkeypatch.setenv(MODEL_ACCOUNTS_KEY, json.dumps({"main": "main-only", "fallback": ["fallback-only"]}))
-    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "inline")
+    # Auto is the mode that asks the route's catalog (Inline sends without asking),
+    # so these sends show which account binding that read used.
+    monkeypatch.setenv("OUROBOROS_IMAGE_INPUT_MODE", "auto")
     catalogs = []
 
     def catalog(source, profile=None, *, requested_model=None):
@@ -225,7 +227,10 @@ def test_task_binding_priority_is_role_then_plan_then_frozen_actor(acting):
 
 
 @pytest.mark.parametrize("fallback", [False, True])
-def test_browser_attachment_uses_live_binding_before_main_send(acting, fallback):
+def test_browser_attachment_is_canonical_and_asks_no_catalog(acting, fallback):
+    """The screenshot joins the canonical turn on any binding; which account's catalog
+    decides what a route receives is the send's question (pinned by the ordinary
+    and prospective sends above), never the attach step's."""
     from ouroboros.tools.browser import _inject_native_screenshot
 
     ctx = acting.tools._ctx
@@ -240,7 +245,7 @@ def test_browser_attachment_uses_live_binding_before_main_send(acting, fallback)
                 "model": MODEL, "use_local": False, "model_account_override": "temporary-actor"}
         _inject_native_screenshot(ctx, "QUFBQQ==")
     assert ctx.messages and ctx.messages[-1]["content"][-1]["type"] == "image_url"
-    assert acting.catalogs[-1][1] == ("fallback-only" if fallback else "temporary-actor")
+    assert acting.catalogs == []
 
 
 @pytest.mark.parametrize("fallback", [False, True])
@@ -257,7 +262,9 @@ def test_ordinary_round_uses_the_same_actor_or_active_plan_binding(acting, fallb
     assert message["content"] == "Ответ 🐍"
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == {"mode": "pin", "profileId": "fallback-only" if fallback else "actor-only"}
-    assert _unclocked(payload["messages"]) == acting.messages
+    from tests.test_subscription_main_wait import _without_context_facts
+
+    assert _without_context_facts(_unclocked(payload["messages"]), physical=True) == acting.messages
 
 
 TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "the-running-turn"}}
@@ -339,7 +346,7 @@ def test_the_budget_soft_landing_wraps_up_with_the_model_not_the_host_text(actin
     acting.ctx.messages = [{"role": "user", "content": "Please finish"}]
     acting.ctx.llm_trace = {}
     acting.tools._ctx.model_turn_state = ModelTurnState(deepcopy(TURN))
-    ceiling = task_pacing.resolve_cost_ceiling(100.0, normalize_budget_profile(None), root_cap_usd=0.5)
+    ceiling = task_pacing.resolve_cost_ceiling(100.0, normalize_budget_profile({"cost_hard_stop_pct": 50}), root_cap_usd=0.5)
     text, _usage, _trace = loop_module._soft_land_exhausted_ceiling(acting.ctx, ceiling)
     assert "Ответ 🐍" in text and "no working room" not in text
     assert acting.gateway.uploads[0][0]["nativeContinuation"] == TURN

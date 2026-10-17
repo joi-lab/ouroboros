@@ -8,6 +8,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+from tests.worker_pool_support import affirm_ready
+
 import pytest
 
 from ouroboros import agent as agent_module, context, model_wait, owner_wait, task_pacing
@@ -127,8 +129,8 @@ def test_actual_assignment_and_later_quota_publication_keep_one_clock(saved_wait
     monkeypatch.setattr(workers, "repo_writer_task_allowed", lambda task: True)
     monkeypatch.setattr(state, "budget_remaining", lambda *a, **kw: 100)
     monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
-    worker = SimpleNamespace(wid=0, busy_task_id=None, reaping=False, active_capacity=True,
-                             in_q=stdqueue.Queue(), proc=None)
+    worker = affirm_ready(SimpleNamespace(wid=0, busy_task_id=None, reaping=False, active_capacity=True,
+                             in_q=stdqueue.Queue()))
     monkeypatch.setattr(workers, "WORKERS", {0: worker})
     workers.assign_tasks()
     meta = running["t-wait"]

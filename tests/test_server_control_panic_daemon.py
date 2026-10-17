@@ -21,7 +21,7 @@ class _ExitCalled(RuntimeError):
 
 
 def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagnostics=None,
-               worker_stop=None, children=()):
+               worker_stop=None, children=(), configure=None, ingress=False):
     """Neutralize destructive owners; keep request and settlement separate.
 
     Legacy diagnostics pass the actual isolated manager.stop as daemon_stop.
@@ -30,9 +30,11 @@ def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagno
     their writes cannot escape into another fixture; production does not join.
     """
     from ouroboros import server_control
+    from ouroboros.evidence_packer import packer
     from ouroboros.startup_historical_audit import audit
 
     monkeypatch.setattr(audit, "stop", lambda: None)
+    monkeypatch.setattr(packer, "stop", lambda: None)
     monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda **kw: [])
     monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground", lambda *a, **kw: [])
     monkeypatch.setattr("ouroboros.tools.services.kill_all_services", lambda *a, **kw: [])
@@ -48,6 +50,8 @@ def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagno
         stop_outcome=daemon_stop))
     monkeypatch.setattr(server_control.os, "_exit", lambda code: (_ for _ in ()).throw(_ExitCalled(code)))
 
+    if configure is not None:
+        configure()
     worker_calls = []
     before = set(threading.enumerate())
 
@@ -58,16 +62,22 @@ def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagno
 
     def report(message, *args):
         if diagnostics is not None:
-            diagnostics.append({"requests": copy.deepcopy(args[0]), "settlements": copy.deepcopy(args[1])})
+            diagnostics.append({"requests": copy.deepcopy(args[0]), "settlements": copy.deepcopy(args[1]),
+                                "flag_written": args[2], "controls_written": args[3]})
         logging.getLogger(__name__).critical(message, *args)
 
     try:
         with pytest.raises(_ExitCalled) as exit_info:
-            server_control.execute_panic_stop(
-                consciousness=SimpleNamespace(stop=lambda: None), kill_workers_fn=workers,
-                data_dir=tmp_path, panic_exit_code=120, log=SimpleNamespace(critical=report),
-            )
-        assert exit_info.value.args == (120,)
+            def stop():
+                server_control.execute_panic_stop(
+                    consciousness=SimpleNamespace(stop=lambda: None), kill_workers_fn=workers,
+                    data_dir=tmp_path, panic_exit_code=99, log=SimpleNamespace(critical=report),
+                )
+            if ingress:
+                server_control.PanicIngress(stop).request("/panic")
+            else:
+                stop()
+        assert exit_info.value.args == (99,)
     finally:
         for thread in set(threading.enumerate()) - before:
             if thread.name.startswith("panic-"):
@@ -119,3 +129,127 @@ def test_panic_requests_daemon_before_worker_owned_requests(monkeypatch, tmp_pat
                daemon_stop=lambda: order.append("daemon_settlement") or True,
                children=(child,))
     assert order == ["daemon_request", "worker_request", "daemon_settlement"]
+
+
+def test_panic_requests_the_held_restart_successor_in_its_request_phase(monkeypatch, tmp_path):
+    """A successor this generation spawned is stopped by Panic, never waited for or left serving."""
+    from ouroboros import platform_layer, server_control
+
+    successor = SimpleNamespace(pid=4242)
+    monkeypatch.setattr(server_control, "_restart_successors", [successor])
+    monkeypatch.setattr(server_control, "_restart_stop_requested", False)
+    monkeypatch.setattr(platform_layer, "request_process_tree_kill",
+                        lambda proc: {"pid": proc.pid, "requested": True, "scope": "process"})
+    diagnostics = []
+    _run_panic(monkeypatch, tmp_path, daemon_stop=lambda: True, diagnostics=diagnostics)
+    assert diagnostics[0]["requests"]["restart-successor"] == [{"pid": 4242, "requested": True, "scope": "process"}]
+    assert server_control._restart_stop_requested is True  # a spawn still publishing meets this intent
+
+
+@pytest.mark.parametrize("fault", [
+    "audit", "packer", "model", "daemon", "executor-import", "request-thread", "bounded-first",
+    "bounded-all", "diagnostic", "ingress-start", "ingress-construction",
+])
+def test_accepted_panic_completes_despite_early_failure(monkeypatch, tmp_path, fault):
+    """An accepted Panic keeps termination, independent requests and bounded writes.
+
+    The failed ingress races the restart watcher before invoking the real executor;
+    OS stops are test-owned doubles, while the flag write and completion path are real.
+    """
+    import builtins
+    from ouroboros import server_control
+    from ouroboros.evidence_packer import packer
+    from ouroboros.startup_historical_audit import audit
+
+    calls, diagnostics = [], []
+    child = SimpleNamespace(pid=123)
+    real_start, real_thread = threading.Thread.start, threading.Thread
+    real_import = builtins.__import__
+    failed_writes, created_threads = [], []
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("injected " + fault)
+
+    def racing_restart():
+        assert server_control._restart_stop_requested
+        with monkeypatch.context() as patch:
+            patch.setattr(threading, "Event", lambda: SimpleNamespace(wait=lambda: calls.append("watcher-parked")))
+            server_control.exit_after_restart(42)
+        fail()
+
+    def start(thread):
+        if thread.name == "panic-ingress" and fault == "ingress-start":
+            racing_restart()
+        if thread.name == "panic-bounded-write" and (fault == "bounded-all" or
+                                                     fault == "bounded-first" and not failed_writes):
+            failed_writes.append(thread.name)
+            fail()
+        return real_start(thread)
+
+    def thread(*args, **kwargs):
+        created_threads.append(kwargs.get("name"))
+        if kwargs.get("name") == "panic-ingress" and fault == "ingress-construction":
+            racing_restart()
+        if kwargs.get("name") == "panic-commands" and fault == "request-thread":
+            fail()
+        return real_thread(*args, **kwargs)
+
+    def importing(name, *args, **kwargs):
+        if name == "multiprocessing":
+            fail()
+        return real_import(name, *args, **kwargs)
+
+    def configure():
+        monkeypatch.setattr(server_control, "_restart_stop_requested", False)
+        monkeypatch.setattr(server_control, "stop_restart_successor", lambda: calls.append("successor") or [])
+        monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
+                            lambda *_a, **_k: calls.append("child") or {"requested": True})
+        monkeypatch.setattr(server_control, "_persist_panic_controls", lambda _: calls.append("controls"))
+        monkeypatch.setattr(threading.Thread, "start", start)
+        monkeypatch.setattr(threading, "Thread", thread)
+        if fault == "audit":
+            monkeypatch.setattr(audit, "stop", fail)
+        else:
+            monkeypatch.setattr(audit, "stop", lambda: calls.append("audit-stop"))
+        monkeypatch.setattr(packer, "stop", fail if fault == "packer" else lambda: calls.append("packer-stop"))
+        if fault == "model":
+            monkeypatch.setattr("ouroboros.local_model.get_manager", fail)
+        elif fault == "daemon":
+            monkeypatch.setattr("ouroboros.claudexor_daemon.get_owned_daemon", fail)
+        elif fault == "executor-import":
+            monkeypatch.setattr(builtins, "__import__", importing)
+        elif fault == "diagnostic":
+            monkeypatch.setattr(logging.Logger, "critical", fail)
+
+    _run_panic(monkeypatch, tmp_path, daemon_stop=lambda: True, diagnostics=diagnostics,
+               children=(child,), configure=configure, ingress=fault.startswith("ingress-"))
+    assert server_control._restart_stop_requested is True
+    assert not {"panic-startup-audit", "panic-evidence-packer"} & set(created_threads)
+    # Both maintenance stops run synchronously first; one failing never skips the other.
+    first = 1 if fault.startswith("ingress-") else 0
+    head = [name for name, broken in (("audit-stop", fault == "audit"), ("packer-stop", fault == "packer"))
+            if not broken]
+    assert calls[first:first + len(head)] == head
+    if fault != "executor-import":
+        assert "successor" in calls and "child" in calls
+        if fault != "bounded-all":
+            assert calls.index("child") < calls.index("controls")
+    assert (tmp_path / "state/panic_stop.flag").exists() == (fault not in {"bounded-first", "bounded-all"})
+    assert ("controls" in calls) == (fault != "bounded-all")
+    if fault.startswith("ingress-"):
+        assert calls[0] == "watcher-parked"
+    if fault != "bounded-all":
+        assert diagnostics[0]["flag_written"] is (fault != "bounded-first")
+        assert diagnostics[0]["controls_written"] is True
+        if fault != "executor-import":
+            assert set(diagnostics[0]["requests"]) == {
+                "local-model", "daemon", "commands", "executors", "services", "companions",
+                "restart-successor", "scope-census", "child-123", "startup-audit", "evidence-packer",
+            }
+            # The installation-scope census is one more independent request; this root planted no marker.
+            assert diagnostics[0]["requests"]["scope-census"] == {"requested": False, "reason": "no installation marker planted"}
+    if fault in {"audit", "packer", "model", "daemon", "request-thread"}:
+        owner = {"audit": "startup-audit", "packer": "evidence-packer", "model": "local-model",
+                 "daemon": "daemon", "request-thread": "commands"}[fault]
+        assert diagnostics[0]["requests"][owner]["requested"] is False
+        assert "injected " + fault in diagnostics[0]["requests"][owner]["error"]

@@ -32,10 +32,7 @@ body {
   display: flex;
   flex-direction: column;
   gap: 10px;
-  background:
-    radial-gradient(circle at top left, rgba(201, 53, 69, 0.12), transparent 35%),
-    radial-gradient(circle at top right, rgba(232, 121, 249, 0.12), transparent 30%),
-    var(--bg);
+  background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -269,6 +266,8 @@ textarea::placeholder {
   font-size: var(--type-meta);
   line-height: var(--line-meta);
 }
+
+.wizard-inline-note[data-tone="warn"] { color: var(--status-warn-fg); }
 
 .wizard-inline-note code,
 .field-note code {
@@ -802,9 +801,6 @@ textarea::placeholder {
   line-height: var(--line-body);
   margin-block: var(--space-2);
 }
-.wizard-content .reviewer-slots-group { margin-block: var(--space-3); }
-.wizard-content .reviewer-slot-controls > input,
-.wizard-content .reviewer-slot-controls > select { min-width: 0; }
 .subscription-quota-row {
   display: flex;
   flex-wrap: wrap;
@@ -831,9 +827,9 @@ textarea::placeholder {
   margin-top: 10px;
 }
 
-/* Mirror of the settings.css compact card (docs/DESIGN.md §6 row anatomy):
-   the wizard loads only this sheet. Same rhythm tokens, the wizard's own
-   surface tokens. */
+/* Mirror of the settings.css open card (docs/DESIGN.md §6 row anatomy): the
+   wizard loads only this sheet. Same anatomy and rhythm tokens, the wizard's
+   own surface tokens. */
 .available-subagents-editor {
   display: flex;
   flex-direction: column;
@@ -842,7 +838,6 @@ textarea::placeholder {
 }
 
 .available-subagents-toolbar,
-.available-subagent-head,
 .available-subagent-actions {
   display: flex;
   flex-wrap: wrap;
@@ -852,6 +847,8 @@ textarea::placeholder {
 
 .available-subagents-toolbar .btn-default,
 .available-subagent-actions { margin-left: auto; }
+
+.available-subagents-intent { min-width: 8rem; }
 
 .available-subagents-count,
 .available-subagents-source,
@@ -875,12 +872,15 @@ textarea::placeholder {
 .available-subagent-row {
   display: flex;
   flex-direction: column;
-  gap: var(--space-1);
+  gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--panel-3);
+  container: subagentcard / inline-size;
 }
+
+.available-subagent-row [hidden] { display: none; }
 
 /* An entry the owner tried to finish with an error is emphasised, not dimmed. */
 .available-subagent-row[data-invalid] {
@@ -888,12 +888,40 @@ textarea::placeholder {
   background: var(--status-error-bg);
 }
 
+/* The Reviewer mark and the actions keep the end slot; the head wraps by card width only. */
+.available-subagent-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.available-subagent-title {
+  display: flex;
+  flex: 1 1 16rem;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+  min-width: 0;
+  min-height: 34px;
+}
+
+/* Source beside a wide Model, then Account / Effort / Access; the card's own width picks the columns. */
 .available-subagent-route {
   display: grid;
-  /* A track minimum yields to the container: the viewport query does not know
-     the wizard column width, so the floor is capped at 100% of the row. */
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: var(--space-2);
+}
+
+.available-subagent-field-model { grid-column: span 2; }
+
+@container subagentcard (max-width: 34rem) {
+  .available-subagent-route { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .available-subagent-field-model { grid-column: 1 / -1; }
+}
+
+@container subagentcard (max-width: 22rem) {
+  .available-subagent-route { grid-template-columns: minmax(0, 1fr); }
 }
 
 .available-subagent-heading {
@@ -973,20 +1001,69 @@ textarea::placeholder {
   resize: vertical;
 }
 
-.available-subagent-meta {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
+.available-subagent-meta { overflow-wrap: anywhere; }
 
-.available-subagent-meta[data-run-history] {
-  white-space: normal;
+/* A current exception in words: the status title needs a hover a phone lacks. */
+.available-subagent-status-reason {
+  color: var(--status-warn-fg);
+  font-size: var(--type-meta);
+  line-height: var(--line-body);
   overflow-wrap: anywhere;
 }
 
 .available-subagent-actions .btn-default {
   min-height: 34px;
   padding: 0 11px;
+}
+
+.available-subagent-reviewer {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  color: var(--text);
+  font-size: var(--type-body);
+  cursor: pointer;
+}
+
+.available-subagent-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0;
+}
+
+.available-subagent-facts > div {
+  display: grid;
+  grid-template-columns: minmax(0, 8rem) minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.available-subagent-facts dt {
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  font-weight: 600;
+}
+
+.available-subagent-facts dd {
+  margin: 0;
+  color: var(--text-meta);
+  font-size: var(--type-meta);
+  overflow-wrap: anywhere;
+}
+
+@container subagentcard (max-width: 28rem) {
+  .available-subagent-facts > div { grid-template-columns: minmax(0, 1fr); gap: 0; }
+}
+
+.available-subagents-review-empty,
+.available-subagents-review-copies {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--status-warn-fg);
+  font-size: var(--type-meta);
 }
 
 /* The shared login card (harness_login_cards.js) renders the same markup here
@@ -1204,10 +1281,6 @@ textarea::placeholder {
     margin-top: 8px;
   }
 
-  .available-subagent-route {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
   .harness-login-card p {
     display: block;
   }
@@ -1278,10 +1351,6 @@ textarea::placeholder {
     grid-template-columns: 1fr;
   }
 
-  .available-subagent-route {
-    grid-template-columns: 1fr;
-  }
-
   .available-subagents-toolbar .btn-default {
     margin-left: 0;
   }
@@ -1324,3 +1393,63 @@ textarea:not(.ui-control):not(.ui-checkbox):focus {
   box-shadow: 0 0 0 3px var(--focus-accent-ring);
 }
 /* track-migration:end */
+
+/* ---- Airy dopamine (DESIGN.md design bible) -------------------------------------------------------------------
+   The setup page maps onto the bible's roles in both themes: the shell is the plain room (no wash, no outline, no
+   heavy shadow); the step's body is the object on the rest shadow; cards, the collapse and the summary inside it are
+   trays, and a tray inside a tray drops its fill; the step rail is trays with the chosen step in the crimson tone and
+   a done step's chip in green; choices and pills are neutral capsules standing on the rest shadow, the chosen one
+   crimson and still standing. Fields keep their hairline. States change colour, never height. */
+:root[data-theme] .wizard-shell {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+:root[data-theme] .wizard-content {
+  border-color: transparent;
+  border-radius: var(--radius-object);
+  background: var(--surface-object);
+  box-shadow: var(--elev-rest);
+}
+:root[data-theme] :is(.panel-card, .summary-card, .wizard-collapse, .wizard-runtime-strip) {
+  border-color: transparent;
+  border-radius: var(--radius-inner);
+  background: var(--surface-tray);
+}
+:root[data-theme] :is(.panel-card, .summary-card, .wizard-collapse) :is(.agent-family-row, .panel-card, .summary-card) {
+  border-color: transparent;
+  background: transparent;
+}
+:root[data-theme] .wizard-step {
+  border-color: transparent;
+  border-radius: var(--radius-inner);
+  background: var(--surface-tray);
+  box-shadow: none;
+}
+:root[data-theme] .wizard-step.active { background: var(--tone-crimson); }
+:root[data-theme] .wizard-step.done { border-color: transparent; }
+:root[data-theme] .wizard-step.active .wizard-step-index { background: transparent; color: var(--tone-crimson-ink); }
+:root[data-theme] .wizard-step.done .wizard-step-index { background: var(--tone-green); color: var(--status-ok-fg); }
+:root[data-theme] .wizard-badge { border-color: transparent; }
+:root[data-theme] :is(.wizard-choice, .selection-pill) {
+  border-color: transparent;
+  background: var(--surface-capsule);
+  box-shadow: var(--elev-rest);
+  transition: var(--motion-tone);
+}
+:root[data-theme] .wizard-choice { border-radius: var(--radius-inner); }
+:root[data-theme] :is(.wizard-choice, .selection-pill):hover {
+  border-color: transparent;
+  background: var(--surface-capsule-hover);
+  box-shadow: var(--elev-rest);
+  transform: none;
+}
+:root[data-theme] :is(.wizard-choice, .selection-pill).active {
+  border-color: transparent;
+  background: var(--tone-crimson);
+  color: var(--tone-crimson-ink);
+  box-shadow: var(--elev-rest);
+}
+:root[data-theme] :is(.wizard-choice, .selection-pill):active { transform: none; filter: var(--press); }

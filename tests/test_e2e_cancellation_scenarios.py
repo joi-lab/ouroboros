@@ -5,7 +5,7 @@ never exercised is the whole thing running as ONE system: a real ``server.py`` p
 real supervisor with real workers, real HTTP ingress over the SAME surface the web UI
 posts to, and the durable artifacts the owner and the watchdog actually read back
 (``state/cancel_intents.json``, the ``cancel_intent`` forensics in
-``logs/supervisor.jsonl``, ``task_results/<id>.json``, ``state/queue_snapshot.json``,
+``logs/supervisor.jsonl``, the task store, ``state/queue_snapshot.json``,
 ``state/terminal_deliveries.json``, the ``owner_hurry`` projection). Every scenario asserts
 those artifacts — never an HTTP 200 on its own, and never a harness exit code (AGENTS.md:
 the exit code is not the run status).
@@ -91,7 +91,7 @@ from tests.fixtures_e2e_cancellation import (
     start_server,
     submit_running,
     task_result,
-    task_result_bytes,
+    task_result_signature,
     wait_until,
     write_settings_file,
 )
@@ -553,21 +553,21 @@ def test_e6_cancel_after_settlement_is_a_404_and_preserves_the_result(mock_stack
         180,
     ), "the completed task never released its worker"
 
-    def _settled_bytes():
-        first = task_result_bytes(data_root, task_id)
+    def _settled_signature():
+        first = task_result_signature(data_root, task_id)
         time.sleep(2)
-        return first if first == task_result_bytes(data_root, task_id) else None
+        return first if first == task_result_signature(data_root, task_id) else None
 
     # Snapshot only once the terminal writers have finished: an unrelated post-terminal
     # projection landing between the two reads would be misread as the cancel rewriting
     # the result.
-    before = wait_until(_settled_bytes, 60)
+    before = wait_until(_settled_signature, 60)
     assert before, "the stored result never stopped changing"
 
     answer = server.cancel_task(task_id)
     assert answer["status"] == 404
     assert answer["body"].get("error") == "task not found or not active"
-    assert task_result_bytes(data_root, task_id) == before, \
+    assert task_result_signature(data_root, task_id) == before, \
         "a cancel rewrote a settled task's result"
     assert task_id not in intents(data_root)
 
@@ -625,12 +625,14 @@ def test_e9_boot_migration_adopts_a_legacy_cancel_requested_latch(e2e_clone, tmp
     data_root = root_dir / "data"
     (data_root / "task_results").mkdir(parents=True, exist_ok=True)
     legacy_id = uuid.uuid4().hex[:16]
+    # This is an importer input: seed_result would finish the empty migration first.
     (data_root / "task_results" / f"{legacy_id}.json").write_text(json.dumps({
         "task_id": legacy_id,
         "status": "cancel_requested",
         "description": "a task wedged in the pre-redesign cancel latch",
         "created_at": "2020-01-01T00:00:00+00:00",
     }), encoding="utf-8")
+    assert not (data_root / "state" / "current.sqlite").exists()
 
     def _migrations():
         return [row for row in forensics(data_root, task_id=legacy_id, event="requested")
@@ -718,7 +720,7 @@ def test_e11_stop_now_hardens_the_same_intent_without_minting_a_second(e2e_clone
             first = dict(intents(data_root).get(task_id) or {})
             assert first.get("request_id"), intents(data_root)
 
-            server.cancel_task(task_id)  # Stop-now: 200 while live, 404 if it just settled
+            server.cancel_task(task_id)  # Stop-now: 200 once torn down, 202 while still stopping, 404 if it just settled
             hardened = wait_until(
                 lambda: forensics(data_root, task_id=task_id, event="stop_policy_hardened"), 60,
             )

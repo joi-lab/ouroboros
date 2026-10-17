@@ -8,11 +8,11 @@ falls back to the shipped value instead of disabling a rail.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 from ouroboros.settings_defaults import (
     FINALIZATION_GRACE_DEFAULT_SEC,
-    PACING_INTERVAL_DEFAULT_SEC,
     SETTINGS_DEFAULTS,
     SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
 )
@@ -39,6 +39,9 @@ EXTENSION_CHILD_CLEANUP_GRACE_SEC = 2
 # budget, not two knobs: raise the drain only with the launcher wait (which ships with a release).
 LAUNCHER_STOP_GRACE_SEC = 10.0
 SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 3.0
+# A direct Restart's spawned successor (Windows, POSIX exec fallback) starts while its parent still
+# holds the data root: admission waits the same handoff the old port gets (find_free_port), no longer.
+SERVER_ADMISSION_WAIT_SEC = 10.0
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
 # Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
 NETWORK_WAIT_NOTE_INTERVAL_SEC = 300
@@ -78,6 +81,9 @@ WORKER_READY_CEILING_SEC = 300.0
 # turn and a turn that hit its bound skips the idle sleep, so a backlog still drains at full speed.
 SUPERVISOR_EVENT_BATCH_MAX_EVENTS = 100
 SUPERVISOR_EVENT_BATCH_MAX_SEC = 2.0
+# Existing body bookkeeping cadence; unchanged technical debt waits for the next
+# pass while current observation and explicit requests remain independent.
+BODY_MAINTENANCE_INTERVAL_SEC = 20.0
 # After a compatibility budget-projection write returned False or raised (unknown or stale ledger
 # marker, corrupt ledger), the loop keeps the projection dirty and retries no more often than this,
 # so a frozen-marker install cannot render the ledger every turn forever.
@@ -140,6 +146,34 @@ def get_task_abs_ceiling_sec() -> Optional[int]:
     and a productively-waiting orchestrator is never killed by a flat wall-clock timer. A set
     value is floored at 300 s so a typo cannot end every task at birth."""
     return _optional_bound_setting("OUROBOROS_TASK_ABS_CEILING_SEC", low=300)
+
+
+_CURRENT_TASK_CEILING = object()
+
+
+def explicit_execution_timeout_sec(task: dict) -> Optional[float]:
+    """A task's additive API/CLI execution budget; absent, zero or invalid adds no bound."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    raw = task.get("execution_timeout_sec")
+    if raw is None:
+        raw = metadata.get("execution_timeout_sec")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if not isinstance(raw, bool) and math.isfinite(value) and value > 0 else None
+
+
+def resolve_task_execution_timeout_sec(task: dict, *, global_ceiling=_CURRENT_TASK_CEILING) -> Optional[float]:
+    """One pause-excluded execution bound: the narrower of the task budget and the global ceiling.
+
+    Calendar ``deadline_at`` and the submit-relative ``timeout_sec`` stay separate axes.
+    A caller holding a settings snapshot passes its ceiling instead of rereading it.
+    """
+    if global_ceiling is _CURRENT_TASK_CEILING:
+        global_ceiling = get_task_abs_ceiling_sec()
+    bounds = [float(value) for value in (explicit_execution_timeout_sec(task), global_ceiling) if value is not None]
+    return min(bounds) if bounds else None
 
 
 # The finite window ONE physical operation that inherits the task lifetime keeps when the task
@@ -282,18 +316,6 @@ def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 
 
-def get_pacing_interval_sec(settings: Optional[dict] = None) -> int:
-    """Intrinsic self-pacing checkpoint cadence in seconds (0 disables)."""
-    raw = runtime_setting("OUROBOROS_PACING_INTERVAL_SEC")
-    if raw is None and isinstance(settings, dict):
-        raw = settings.get("OUROBOROS_PACING_INTERVAL_SEC")
-    try:
-        parsed = int(raw)
-    except (TypeError, ValueError):
-        parsed = int(PACING_INTERVAL_DEFAULT_SEC)
-    return max(0, parsed)
-
-
 def get_supervisor_liveness_deadline_sec(settings: Optional[dict] = None) -> int:
     """Supervisor-loop stall deadline in seconds (0 disables the watchdog)."""
     raw = runtime_setting("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC")
@@ -371,22 +393,12 @@ def get_delegate_wait_sec() -> int:
 # for the alarm; ``consciousness.py`` adopts these readers in P2.
 WAKE_DEFAULT_SEC = 3300
 CONSCIOUSNESS_AUTONOMY_LEVELS = ("observe", "act", "full")
-# The usage ledger keeps every attempt younger than this UNFOLDED (``usage_compaction``
-# ``_foldable_attempt_ids``): a folded group row is stamped with the compaction instant,
-# so only unfolded rows keep the true spend time the rolling consciousness allowance
-# (``consciousness_allowance``, a 24 h window) reads. Twice the window, so a root that
-# spent inside the window is still attributable when the window closes.
-USAGE_LEDGER_FOLD_MIN_AGE_SEC = 48 * 3600
-# A DISPLAY reader of the usage ledger (heartbeat cost fields, the ``llm_usage`` budget
+# A DISPLAY reader of the usage store (heartbeat cost fields, the ``llm_usage`` budget
 # refresh, loop-thread budget pre-checks, ``/api/state``, the cost views) waits at most
-# this long for the monetary lock, then serves the last validated snapshot: a 45 s wait on
-# the supervisor loop or a gateway thread starves every worker behind it. Money never
+# this long for the store, then reports the fact unavailable: a 45 s wait on the
+# supervisor loop or a gateway thread starves every worker behind it. Money never
 # reads through this bound — ``reserve_attempt`` keeps the full monetary timeout.
 USAGE_DISPLAY_LOCK_TIMEOUT_SEC = 0.25
-# After one contended display read, further display reads of that ledger serve the
-# snapshot without touching the lock for this long, so a sustained write convoy costs a
-# display thread about one bounded attempt per second instead of one per read.
-USAGE_DISPLAY_REVALIDATE_AFTER_SEC = 1.0
 
 
 def get_consciousness_autonomy() -> str:

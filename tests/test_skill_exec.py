@@ -482,7 +482,8 @@ def test_skill_exec_refuses_non_pass_review(tmp_path, monkeypatch):
     assert "'blockers'" in result
 
 
-def test_skill_exec_refuses_stale_review(tmp_path, monkeypatch):
+@pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
+def test_skill_exec_refuses_stale_review(tmp_path, monkeypatch, enforcement):
     skills_root = tmp_path / "skills"
     skill_dir = _build_skill(skills_root, "hello")
     ctx = _make_ctx(tmp_path)
@@ -496,11 +497,14 @@ def test_skill_exec_refuses_stale_review(tmp_path, monkeypatch):
     (skill_dir / "scripts" / "hello.py").write_text("print('edited')\n", encoding="utf-8")
     monkeypatch.setenv("OUROBOROS_SKILLS_REPO_PATH", str(skills_root))
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
     result = skill_exec_mod._handle_skill_exec(
         ctx, skill="hello", script="scripts/hello.py"
     )
     assert "SKILL_EXEC_BLOCKED" in result
     assert "edited since the last review" in result
+    assert "current executable reviewer verdict" in result
+    assert ("qualified Advisory author acceptance" in result) is (enforcement == "advisory")
 
 
 def test_skill_exec_refuses_extension_skill_in_phase3(tmp_path, monkeypatch):
@@ -1599,7 +1603,10 @@ def test_toggle_skill_rejects_stale_pass_review(tmp_path, monkeypatch):
 
     resp = skill_exec_mod._handle_toggle_skill(ctx, skill="alpha", enabled=True)
     assert "SKILL_TOGGLE_ERROR" in resp
-    assert "fresh executable review" in resp
+    # Default Advisory: the stale verdict no longer counts; the gate names both authorities it admits.
+    assert ("cannot enable until the review gate permits the current bytes: a current executable reviewer "
+            "verdict or a qualified Advisory author acceptance of these exact bytes") in resp
+    assert '"blocking_reason": "review_stale"' in resp
 
 
 def test_skill_exec_rejects_misserialized_args(tmp_path, monkeypatch):

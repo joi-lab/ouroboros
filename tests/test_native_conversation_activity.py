@@ -24,7 +24,7 @@ def _lane(monkeypatch, tmp_path):
 
 def test_two_native_turns_are_independently_addressable_and_drainable(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from ouroboros.server_routing_context import _addressable_root_tasks
     from supervisor.steering import _handle_steer_task
 
@@ -69,12 +69,14 @@ def test_two_native_turns_are_independently_addressable_and_drainable(monkeypatc
         armed = workers.arm_direct_chat_turn(second.task["id"], lambda turn: "control-second")
         assert armed["stop_control_msg_id"] == "control-second"
         assert "stop_control_msg_id" not in workers.direct_chat_turn(first.task["id"])
+        from tests.test_steer_relay import held_quote
         _handle_steer_task({
+            "quotes": held_quote(tmp_path, "Use the blue variant", second.task["chat_id"]),
             "target_task_id": second.task["id"], "chat_id": second.task["chat_id"],
             "message": "Use the blue variant", "client_message_id": "owner-blue",
         }, ctx)
-        assert drain_owner_messages(tmp_path, second.task["id"]) == ["Use the blue variant"]
-        assert drain_owner_messages(tmp_path, first.task["id"]) == []
+        assert [e["text"] for e in drain_owner_entries(tmp_path, second.task["id"])] == ["Use the blue variant"]
+        assert drain_owner_entries(tmp_path, first.task["id"]) == []
         assert second._owner_message_generation == 1
         workers.close_repo_writer_admission("test-update")
         assert set(workers.drain_repo_writers(timeout=0.01)) == ids
@@ -193,11 +195,7 @@ def test_native_post_task_retains_activity_and_delivers_answer_early(monkeypatch
         assert release.wait(10)
 
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", consolidate)
-    for name in (
-        "_record_task_facts", "_run_reflection",
-        "_update_improvement_backlog", "_apply_reflection_memory_actions",
-    ):
-        monkeypatch.setattr(pipeline, name, lambda *a, **kw: None)
+    monkeypatch.setattr(pipeline, "_record_task_facts", lambda *a, **kw: None)
     monkeypatch.setattr(post_task_evolution, "maybe_promote", lambda *a, **kw: None)
     env = SimpleNamespace(repo_dir=tmp_path / "repo", drive_root=tmp_path)
     mind = _mind()
@@ -210,7 +208,7 @@ def test_native_post_task_retains_activity_and_delivers_answer_early(monkeypatch
                 {"type": "task_done", "task_id": task["id"], "chat_id": task["chat_id"]},
             ]
             pipeline._dispatch_root_post_task(
-                env, task, "done", self._event_queue, pending, {}, {}, {}, tmp_path / "logs",
+                env, task, "done", self._event_queue, pending, {}, {}, tmp_path / "logs",
                 budget_drive_root="", split_drive=False,
                 project_scoped=bool(task.get("project_id")), project_task=False,
                 parent_env=None, parent_task=None,

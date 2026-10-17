@@ -800,7 +800,7 @@ def get_tools() -> list[ToolEntry]:
     return [
         ToolEntry("resume_child_task", {
             "name": "resume_child_task",
-            "description": "After the owner resumes your root from a budget pause, select ONE paused task: "
+            "description": "After the owner resumes your root from a pause or saved application-stop hold, select ONE held task: "
                            "a root may select any of its descendants; an intermediate parent may select its "
                            "own direct children. Continuation keeps the same task id. "
                            "Nothing resumes automatically and no fan-out happens: you name each child you still "

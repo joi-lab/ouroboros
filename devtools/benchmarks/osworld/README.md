@@ -6,6 +6,15 @@ still requires a runnable OSWorld checkout plus VM/desktop control
 infrastructure; public verified leaderboard claims require the official
 verification path (the OSWorld 2.0 maintainers run agent code on their side).
 
+Result review uses Required in the template. Both launchers check the executing
+server through `/api/settings`; a local setting cannot configure a remote server.
+The whole-task computer-use bridge produces GUI-input receipts during the task;
+those can qualify review without certifying goal success. `finish_task` stays
+available to select a result after feedback. The step agent predicts an action
+before the external runner executes it: its inner result review cannot judge
+that future GUI effect. Synthetic adapter tests do not establish live deployment
+or historical score parity.
+
 Aligned upstream (pinned; see `ALIGNED_UPSTREAM` in `run_step_agent.py` and
 `METHODOLOGY.md` §0): OSWorld 2.0,
 <https://github.com/xlang-ai/OSWorld-V2> @

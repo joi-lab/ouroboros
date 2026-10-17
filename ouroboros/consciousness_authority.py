@@ -65,7 +65,7 @@ OBSERVE_DISABLED: tuple[str, ...] = ACT_DISABLED + tuple(sorted(
     - OBSERVE_ARGUMENT_NARROWED
 ))
 # The nanny verb of a running campaign is never withheld (owner decision В12 A).
-NEVER_DISABLED: frozenset[str] = frozenset({"steer_task"})
+NEVER_DISABLED: frozenset[str] = frozenset({"tell_task"})
 # The only file roots Observe may write: its own task drive and artifact store.
 # Both are already confined by the file tools; this is what it is ALLOWED to
 # choose, not a new path authority.

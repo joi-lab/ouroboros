@@ -22,7 +22,8 @@ from types import SimpleNamespace
 import pytest
 
 from tests._budget_pause_exact_helpers import (
-    _controls, _fast_hold, _install_queue, _loop_ctx, _pause, _quiet_external, _running_row, _supervisor_ctx,
+    _controls, _fast_hold, _install_queue, _loop_ctx, _mock_pause_observation, _pause, _quiet_external,
+    _running_row, _supervisor_ctx,
 )
 
 
@@ -185,13 +186,13 @@ def test_storage_failure_keeps_a_fenced_nonterminal_hold_and_buys_no_model_call(
     """A write that fails is a RETAINED hold, never a claimed pause and never
     the old paid terminal rail: the fence stays closed and the task keeps its
     worker until its own control ends the hold."""
-    from ouroboros import budget_pause, utils
+    from ouroboros import budget_pause, store
     from ouroboros.model_wait import ModelWaitInterrupted
 
     _running_row(tmp_path, "hold-store")
     ctx, limit_ctx = _loop_ctx(tmp_path, "hold-store")
-    monkeypatch.setattr(utils, "update_json_locked",
-                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("read-only file system")))
+    monkeypatch.setattr(store, "update_task",
+                        lambda *_a, **_k: (_ for _ in ()).throw(store.StoreError("read-only file system")))
     published = []
     monkeypatch.setattr(budget_pause, "_publish_hold", lambda _c, row: published.append(row))
     monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
@@ -474,8 +475,10 @@ def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monk
     observed = raised.value.pause["external_runs"]
     assert observed["custody_read"] == "failed" and observed["runs"] == []
     assert "boom" in observed["error"]
-    # The supervisor-side twin shares the body: a replay that fails is the same typed fact.
-    monkeypatch.setattr(custody, "replay", lambda _r, rows=None: (_ for _ in ()).throw(OSError("rows torn")))
+    # The supervisor-side twin shares the body: a store read that fails is the same typed fact.
+    from ouroboros import delegate_custody_current as current
+
+    monkeypatch.setattr(current, "task_snapshot", lambda _r, _t: (_ for _ in ()).throw(OSError("rows torn")))
     grant_side = budget_pause.observe_task_runs(tmp_path, ctx.task_id)
     assert grant_side["custody_read"] == "failed" and "rows torn" in grant_side["error"]
 
@@ -551,3 +554,27 @@ def test_local_review_drain_lists_unsettled_attempts_without_settling_them():
         with rc._ACTIVE_LOCK:
             for key in ("k1", "k2", "k3"):
                 rc._ACTIVE.pop(key, None)
+
+
+def test_the_round_start_stamp_stays_out_of_the_stored_continuation(tmp_path, monkeypatch):
+    """A paused round resumes on the same round id; a carried monotonic start would stretch
+    its llm_round duration over the whole pause, so the stored usage drops it and keeps the rest."""
+    from ouroboros import budget_pause
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.loop_llm_call import ROUND_STARTED_KEY
+
+    _running_row(tmp_path, "stamp-task")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "stamp-task")
+    limit_ctx.accumulated_usage[ROUND_STARTED_KEY] = {"round_id": "e:round:4", "at": 1.0}
+    _fast_hold(monkeypatch, budget_pause)
+    _mock_pause_observation(monkeypatch, budget_pause, [
+        {"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}])
+    try:
+        with pytest.raises(budget_pause.BudgetPauseRequested):
+            budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED, scope="global",
+                                       reason_text="money gone", root_task_id="stamp-task")
+        row = budget_pause.budget_pause_row(tmp_path, ctx.task_id)
+        state = json.loads(read_actor_source_bytes(tmp_path, ctx.task_id, row["source_ref"]))
+        assert ROUND_STARTED_KEY not in state["usage"] and state["usage"]["cost"] == 1.25
+    finally:
+        budget_pause.end_dispatch_fence(ctx.task_id)

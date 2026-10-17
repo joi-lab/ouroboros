@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.delegate_shared import delegate_result
+from tests._store_shared import read_result, seed_result
 
 
 def _settings(*rows):
@@ -161,9 +162,7 @@ def test_uncredentialed_api_actor_stops_before_the_llm_loop(monkeypatch, tmp_pat
     })
 
     assert calls == []
-    result = json.loads(
-        (drive / "task_results" / "api-child.json").read_text(encoding="utf-8")
-    )
+    result = read_result(drive, "api-child")
     assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
     assert result["reason_code"] == "subagent_executor_unavailable"
     assert result["subagent_availability"]["host_fallback"] is False
@@ -205,9 +204,7 @@ def test_unreadable_named_owner_source_refuses_before_model_or_tool_work(monkeyp
 
     assert model_calls == []
     assert tool_context_calls == []
-    result = json.loads(
-        (drive / "task_results" / "missing-authority.json").read_text(encoding="utf-8")
-    )
+    result = read_result(drive, "missing-authority")
     assert result["reason_code"] == "authority_source_unavailable"
     assert result["outcome_axes"]["execution"]["status"] == "infra_failed"
     assert result["trace_summary"].count("authority_source_unavailable") == 1
@@ -222,9 +219,9 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
     repo, drive = tmp_path / "repo", tmp_path / "drive"
     repo.mkdir()
     (drive / "task_results").mkdir(parents=True)
-    (drive / "task_results" / "old-root.json").write_text(json.dumps({
+    seed_result(drive, "old-root", {
         "task_id": "old-root", "status": "completed", "objective": "old authority",
-    }), encoding="utf-8")
+    })
     monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
     model_calls, tool_context_calls = [], []
     monkeypatch.setattr(
@@ -250,9 +247,7 @@ def test_malformed_named_authority_shapes_refuse_before_model_or_tool_work(monke
 
     for task in tasks:
         events = agent._handle_task_scoped(task)
-        result = json.loads(
-            (drive / "task_results" / f"{task['id']}.json").read_text(encoding="utf-8")
-        )
+        result = read_result(drive, task['id'])
         assert result["reason_code"] == "authority_source_unavailable"
         assert any(event.get("type") == "task_done" for event in events)
     assert model_calls == []

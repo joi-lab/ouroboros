@@ -207,6 +207,15 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             assert card["phaseScroll"] <= card["phaseClient"] + 1, geometry
             assert card["titleScroll"] <= card["titleClient"] + 1, geometry
 
+    def room_status(page, status_selector):
+        # A room says its status once, in its bar's one status control right after
+        # the title (DESIGN "Room work status"), in Main and a Project alike. The
+        # cards stay in the chat column; the word is never read from two places.
+        status = page.locator(status_selector)
+        assert status.count() == 1, status_selector
+        assert status.evaluate("n => n.closest('.rw-trigger') !== null"), status_selector
+        return status
+
     def run_thread_flow(
         page,
         scope,
@@ -283,11 +292,11 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert "error" not in child.get_attribute("class").split()
 
         page.wait_for_function(
-            "selector => document.querySelector(selector)?.textContent === 'Working...'",
-            arg=f"{scope_selector} {status_selector}",
+            "selector => document.querySelector(selector)?.textContent === 'Working'",
+            arg=status_selector,
             timeout=30_000,
         )
-        assert "Attention" not in scope.locator(status_selector).inner_text()
+        assert "Attention" not in room_status(page, status_selector).inner_text()
         assert page.locator("#toast-stack .toast").count() == 0
         assert page.locator('[data-nav-page="chat"] .unread-badge').count() == 0
 
@@ -320,7 +329,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         assert_phase_accessibility(child, "Subagent", "Failed")
         page.wait_for_function(
             "selector => document.querySelector(selector)?.textContent === 'Online'",
-            arg=f"{scope_selector} {status_selector}",
+            arg=status_selector,
             timeout=30_000,
         )
 
@@ -343,10 +352,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
             ":scope > [data-live-summary-button] [data-live-title]"
         ).inner_text()
 
-        status = scope.locator(status_selector)
+        status = room_status(page, status_selector)
         page.wait_for_function(
             "selector => document.querySelector(selector)?.textContent === 'Online'",
-            arg=f"{scope_selector} {status_selector}",
+            arg=status_selector,
             timeout=30_000,
         )
         assert status.inner_text() == "Online"
@@ -405,7 +414,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page,
                     page.locator("#page-chat"),
                     "#page-chat",
-                    "#chat-status",
+                    "#page-chat .chat-page-header .rw-trigger #chat-status",
                     1,
                     "main",
                 )
@@ -446,7 +455,7 @@ def test_task_status_stays_factual_in_main_and_project_chat(
                     page,
                     project_scope,
                     "#project-panel .chat-instance-panel",
-                    f"#pchat-{project['id']}-status",
+                    f"#project-panel .project-panel-bar .rw-trigger #pchat-{project['id']}-status",
                     project_chat_id,
                     "project",
                 )

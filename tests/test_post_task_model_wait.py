@@ -52,18 +52,16 @@ def phase(tmp_path, monkeypatch):
     stages = []
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *a: stages.append("scratch"))
     monkeypatch.setattr(pipeline, "_record_task_facts", lambda *a, **k: stages.append("facts"))
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", lambda *a: stages.append("backlog"))
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *a, **k: None)
     from ouroboros import post_task_evolution
     real_promote = post_task_evolution.maybe_promote
-    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: None)
 
-    def reflect(_env, llm, *args, **kwargs):
-        stages.append("reflection")
-        llm.chat([{"role": "user", "content": "reflect once after completed prior stages"}], MODEL, model_role="light")
-        return {"reflection": "settled"}
+    def promote(_env, _task, _sealed, llm):
+        # The late phase's last paid stage, buying one model call after the completed prior stages.
+        stages.append("promotion")
+        llm.chat([{"role": "user", "content": "choose once after completed prior stages"}], MODEL, model_role="light")
+        return None
 
-    monkeypatch.setattr(pipeline, "_run_reflection", reflect)
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", promote)
     original = pipeline._set_root_post_task_checkpoint
 
     def checkpoint(*args, **kwargs):
@@ -82,7 +80,7 @@ def phase(tmp_path, monkeypatch):
 
 
 def launch(f):
-    return pipeline._run_post_task_processing_async(f.env, f.task, {"rounds": 3}, {}, {}, f.root / "logs", event_queue=f.events)
+    return pipeline._run_post_task_processing_async(f.env, f.task, {"rounds": 3}, {}, f.root / "logs", event_queue=f.events)
 
 
 def active(f):
@@ -121,13 +119,13 @@ def test_detached_parent_returns_and_post_wait_keeps_override_and_prior_stages(p
     until(lambda: active(f))
     owner = active(f)
     assert owner is not parent and not owner.closed and owner.worker_slot_held is False
-    assert f.stages == ["facts", "scratch", "reflection"] and not f.done.is_set()
+    assert f.stages == ["facts", "scratch", "promotion"] and not f.done.is_set()
     assert load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]["post_task_synthesis"] == "running"
     assert f.engine.uploads[0][0]["account"] == {"mode": "pin", "profileId": "original-choice"}
     f.ready.set()
     assert f.done.wait(5)
     until(lambda: post_task_model_wait(f.root, f.task["id"]) is None)
-    assert f.stages == ["facts", "scratch", "reflection", "backlog"]
+    assert f.stages == ["facts", "scratch", "promotion"]
     assert len(f.engine.creates) == 2 and f.engine.uploads[0][0]["messages"] == f.engine.uploads[1][0]["messages"]
     until(lambda: owner.closed)
     assert load_task_result(f.root, f.task["id"])["status"] == main_status
@@ -184,19 +182,19 @@ def test_paid_stage_interruption_closes_checkpoint_without_buying_following_stag
         f.stages.append("scratch")
         raise failures[cause]
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", scratch)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: f.stages.append("reflection") or None)
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: f.stages.append("promotion"))
     launch(f)
     assert f.done.wait(5)
     stored = load_task_result(f.root, f.task["id"])
     checkpoint = stored["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
     if cause == "ordinary":
-        assert f.stages == ["facts", "scratch", "reflection", "backlog"]
+        assert f.stages == ["facts", "scratch", "promotion"]
     else:
         assert f.stages == ["facts", "scratch"]
         assert checkpoint["post_task_stop_reason"].startswith({
             "budget": "budget_exhausted", "deadline": "deadline", "unknown": "provider_outcome_unknown"}[cause])
-        assert checkpoint["post_task_stop_reason"].endswith("skipped=reflection,promotion")
+        assert checkpoint["post_task_stop_reason"].endswith("skipped=promotion")
     assert not f.engine.creates  # no provider send after the first interrupted stage
 
 
@@ -227,13 +225,12 @@ def test_real_consolidation_error_controls_remaining_post_task_stages(
 
     monkeypatch.setattr("ouroboros.llm.LLMClient", FailingLight)
     monkeypatch.setattr(consolidator, "should_consolidate_scratchpad", lambda *_args: True)
-    monkeypatch.setattr(consolidator, "consolidate_scratchpad", lambda memory, knowledge_dir, llm, identity:
+    monkeypatch.setattr(consolidator, "consolidate_scratchpad", lambda memory, llm, identity:
                         consolidator._call_consolidation_llm(
                             llm, "captured scratchpad", "Post-task scratchpad consolidation",
                         )[1])
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", post_task_synthesis._run_scratchpad_consolidation)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *_args, **_kwargs:
-                        f.stages.append("reflection") or None)
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *_args: f.stages.append("promotion"))
 
     launch(f)
     assert f.done.wait(5)
@@ -244,19 +241,19 @@ def test_real_consolidation_error_controls_remaining_post_task_stages(
         # degraded, never completed, and nothing was skipped.
         assert checkpoint["post_task_synthesis"] == "degraded"
         assert not checkpoint.get("post_task_stop_reason")
-        assert f.stages == ["facts", "scratch-model", "reflection", "backlog"]
+        assert f.stages == ["facts", "scratch-model", "promotion"]
     else:
         assert checkpoint["post_task_synthesis"] == "degraded"
         assert checkpoint["post_task_stop_reason"].startswith(
             "budget_exhausted:" if cause == "budget" else "provider_outcome_unknown:")
         assert f.stages == ["facts", "scratch-model"]
-        assert checkpoint["post_task_stop_reason"].endswith("skipped=reflection,promotion")
+        assert checkpoint["post_task_stop_reason"].endswith("skipped=promotion")
 
 
 def test_budget_refusal_inside_promotion_is_never_swallowed_into_completed(phase, monkeypatch):
     """TZ-2 C3: `propagate_model_error` re-raises only control/unknown facts, so a
-    `BudgetExceeded` raised inside a stage adapter's own catch (promotion, backlog,
-    consolidation setup, reflection) used to be logged and the checkpoint written
+    `BudgetExceeded` raised inside a stage adapter's own catch (promotion,
+    consolidation setup) used to be logged and the checkpoint written
     `completed`. The shared `propagate_paid_interruption` lets the wallet stop the
     remaining paid post-work like the other two interruptions."""
     from ouroboros.usage_accounting import BudgetExceeded
@@ -274,51 +271,26 @@ def test_budget_refusal_inside_promotion_is_never_swallowed_into_completed(phase
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
     assert checkpoint["post_task_stop_reason"] == "budget_exhausted:skipped="
-    assert f.stages[-2:] == ["backlog", "promotion-model"]
+    assert f.stages[-2:] == ["scratch", "promotion-model"]
 
 
-@pytest.mark.parametrize("stage", ["scratchpad", "reflection"])
-def test_returned_paid_error_stops_post_task_after_its_own_stage(phase, monkeypatch, stage):
-    """Returned typed failures from later memory stages also stop subsequent paid stages."""
+def test_returned_paid_error_stops_post_task_after_its_own_stage(phase, monkeypatch):
+    """A returned typed failure from scratchpad compression also stops the later paid stage."""
     from ouroboros import consolidator, post_task_synthesis
 
     f = phase
     error = {"kind": "provider_outcome_unknown"}
-    if stage == "scratchpad":
-        monkeypatch.setattr(consolidator, "should_consolidate_scratchpad", lambda *_: True)
-        monkeypatch.setattr(consolidator, "consolidate_scratchpad", lambda *_: {
-            "_consolidation_errors": [error]})
-        monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation",
-                            post_task_synthesis._run_scratchpad_consolidation)
-    else:
-        monkeypatch.setattr(pipeline, "_run_reflection", lambda *_args, **_kwargs: {
-            "reflection": "(model call interrupted)", "memory_operation_errors": [error]})
+    monkeypatch.setattr(consolidator, "should_consolidate_scratchpad", lambda *_: True)
+    monkeypatch.setattr(consolidator, "consolidate_scratchpad", lambda *_: {
+        "_consolidation_errors": [error]})
+    monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation",
+                        post_task_synthesis._run_scratchpad_consolidation)
     launch(f)
     assert f.done.wait(5)
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
-    assert checkpoint["post_task_stop_reason"].startswith("provider_outcome_unknown:skipped=")
-    assert "backlog" not in f.stages
-    if stage == "scratchpad":
-        assert "reflection,promotion" in checkpoint["post_task_stop_reason"]
-    else:
-        assert checkpoint["post_task_stop_reason"].endswith("skipped=promotion")
-
-
-def test_completed_reflection_actions_survive_a_later_paid_stage_interruption(phase, monkeypatch):
-    f = phase
-    applied = []
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: {"memory_actions": [{"type": "knowledge_write"}]})
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *a, **k: applied.append(1))
-    def stop_promotion(*_args):
-        raise model_wait.ModelWaitInterrupted("deadline")
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", stop_promotion)
-    launch(f)
-    assert f.done.wait(5)
-    assert applied == [1]
-    checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
-    assert checkpoint["post_task_synthesis"] == "degraded"
-    assert checkpoint["post_task_stop_reason"].startswith("deadline:")
+    assert checkpoint["post_task_stop_reason"] == "provider_outcome_unknown:skipped=promotion"
+    assert "promotion" not in f.stages
 
 
 @pytest.mark.parametrize("unknown", [False, True])
@@ -333,14 +305,14 @@ def test_stop_or_unknown_never_marks_post_work_completed(phase, unknown):
         f.task["_skip_post_task_synthesis"] = True
     assert f.done.wait(5)
     assert load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]["post_task_synthesis"] == "degraded"
-    assert len(f.engine.creates) == 1 and "backlog" not in f.stages
+    assert len(f.engine.creates) == 1 and f.stages == ["facts", "scratch", "promotion"]
     assert ledger(f.root)[-1]["state"] == ("unresolved" if unknown else "released")
 
 
 def test_blocking_post_work_exempts_solve_ceiling_only_within_its_scope(phase, monkeypatch):
     f = phase
     monkeypatch.setattr(config, "get_task_abs_ceiling_sec", lambda: 1)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: None)
     observed = []
     def check(*_args):
         observed.append(model_wait.current_model_wait().control_reason())
@@ -349,7 +321,7 @@ def test_blocking_post_work_exempts_solve_ceiling_only_within_its_scope(phase, m
                                           worker_slot_held=True) as owner:
         monkeypatch.setattr(owner, "executed_seconds", lambda **_kwargs: 100)
         assert owner.control_reason() == "absolute_ceiling"
-        pipeline._run_post_task_processing_async(f.env, f.task, {}, {}, {}, f.root / "logs", blocking=True)
+        pipeline._run_post_task_processing_async(f.env, f.task, {}, {}, f.root / "logs", blocking=True)
         assert owner.control_reason() == "absolute_ceiling"  # restored for the solve owner
     assert observed == [None]
     assert load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]["post_task_synthesis"] == "completed"
@@ -369,7 +341,7 @@ def test_pooled_post_work_holds_return_but_delivers_answer_early_once(phase, mon
         with model_wait.task_model_wait_scope(task=f.task, drive_root=f.root, event_queue=f.events,
                                               worker_slot_held=True):
             pipeline._dispatch_root_post_task(f.env, f.task, "Already answered", f.events, pending,
-                {"rounds": 3}, {}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
+                {"rounds": 3}, {}, f.root / "logs", budget_drive_root="", split_drive=False,
                 project_scoped=False, project_task=False, parent_env=None, parent_task=None)
         returned.set()
 
@@ -387,9 +359,8 @@ def test_pooled_post_work_holds_return_but_delivers_answer_early_once(phase, mon
     assert returned.is_set() and not thread.is_alive() and len(f.engine.creates) == 2
 
 
-@pytest.mark.parametrize("stage", ["scratch", "reflection", "backlog"])
-def test_outer_paid_stage_cannot_swallow_typed_unknown(tmp_path, monkeypatch, stage):
-    from ouroboros import post_task_synthesis as synthesis, consolidator, reflection, improvement_backlog
+def test_outer_paid_stage_cannot_swallow_typed_unknown(tmp_path, monkeypatch):
+    from ouroboros import post_task_synthesis as synthesis, consolidator
 
     error = transport.ClaudexorModelError({"code": "unknown", "message": "paid outcome unknown"}, unknown=True)
     def fail(*args, **kwargs):
@@ -398,15 +369,8 @@ def test_outer_paid_stage_cannot_swallow_typed_unknown(tmp_path, monkeypatch, st
     memory = SimpleNamespace(load_identity=lambda: "identity")
     monkeypatch.setattr(consolidator, "should_consolidate_scratchpad", lambda *a: True)
     monkeypatch.setattr(consolidator, "consolidate_scratchpad", fail)
-    monkeypatch.setattr(reflection, "should_generate_reflection", lambda *a, **k: True)
-    monkeypatch.setattr(reflection, "generate_reflection", fail)
-    monkeypatch.setattr(improvement_backlog, "append_backlog_items", lambda *a: 1)
-    monkeypatch.setattr(improvement_backlog, "groom_backlog", fail)
-    calls = {"scratch": lambda: synthesis._run_scratchpad_consolidation(env, memory, None),
-             "reflection": lambda: synthesis._run_reflection(env, None, {"id": "t"}, {}, {}, {}),
-             "backlog": lambda: synthesis._update_improvement_backlog(env, {"backlog_candidates": [{}]})}
     with pytest.raises(transport.ClaudexorModelError) as raised:
-        calls[stage]()
+        synthesis._run_scratchpad_consolidation(env, memory, None)
     assert raised.value is error
 
 
@@ -443,9 +407,9 @@ def _controlled_worker(input_queue, output_queue, data_root, repo_root, resume):
     env = SimpleNamespace(drive_root=root, repo_dir=Path(repo_root), drive_path=lambda rel: root / rel)
     engine = Gateway([result(outcome="failed", problem={"code": "subscription_window_exhausted", "message": "fixture"}), result()],
                      ["not_started", "response_received"])
-    def reflect(_env, client, *args, **kwargs):
-        output_queue.put({"type": "fixture_reflection_started"})
-        client.chat([{"role": "user", "content": "one reflection"}], MODEL, model_role="light")
+    def promote(_env, _task, _sealed, client):
+        output_queue.put({"type": "fixture_promotion_started"})
+        client.chat([{"role": "user", "content": "one chooser call"}], MODEL, model_role="light")
         return None
     class Agent:
         def handle_task(self, task):
@@ -458,7 +422,7 @@ def _controlled_worker(input_queue, output_queue, data_root, repo_root, resume):
                        {"type": "task_done", "task_id": task["id"], "status": "completed"}]
             with usage_scope(UsageScope(drive_root=root, task_id=task["id"], root_task_id=task["id"])), model_wait.task_model_wait_scope(
                     task=task, drive_root=root, event_queue=output_queue, worker_slot_held=True):
-                pipeline._dispatch_root_post_task(env, task, "answer", output_queue, pending, {"rounds": 3}, {}, {}, root / "logs",
+                pipeline._dispatch_root_post_task(env, task, "answer", output_queue, pending, {"rounds": 3}, {}, root / "logs",
                     budget_drive_root="", split_drive=False, project_scoped=False, project_task=False, parent_env=None, parent_task=None)
             output_queue.put({"type": "fixture_generation_count", "count": len(engine.creates)})
             return pending
@@ -474,10 +438,7 @@ def _controlled_worker(input_queue, output_queue, data_root, repo_root, resume):
                 "source": source, "credentialProfileId": account or "account-a", "models": [{"id": "exact-model"}] if resume.is_set() else []},
             "ouroboros.agent_task_pipeline._run_scratchpad_consolidation": lambda *_: None,
             "ouroboros.agent_task_pipeline._record_task_facts": lambda *args, **kwargs: None,
-            "ouroboros.agent_task_pipeline._run_reflection": reflect,
-            "ouroboros.agent_task_pipeline._update_improvement_backlog": lambda *_: None,
-            "ouroboros.agent_task_pipeline._apply_reflection_memory_actions": lambda *args, **kwargs: None,
-            "ouroboros.post_task_evolution.maybe_promote": lambda *_: None,
+            "ouroboros.post_task_evolution.maybe_promote": promote,
         }
         for name, value in replacements.items():
             stack.enter_context(patch(name, value))
@@ -520,7 +481,7 @@ def test_real_pooled_process_does_not_dequeue_next_task_during_post_wait(tmp_pat
         assert load_task_result(root, "first")["root_phase_checkpoint"]["post_task_synthesis"] == "running"
         resume.set()
         receive_until(lambda event: event.get("type") == "fixture_task_started" and event.get("task_id") == "second")
-        assert sum(event.get("type") == "fixture_reflection_started" for event in events) == 1
+        assert sum(event.get("type") == "fixture_promotion_started" for event in events) == 1
         assert [event["count"] for event in events if event.get("type") == "fixture_generation_count"] == [2]
         assert any(event.get("type") == "task_done" and event.get("task_id") == "first" for event in events)
         answers = [event for event in events if event.get("type") == "send_message"]
@@ -598,63 +559,28 @@ def test_budget_refusal_inside_the_promotion_chooser_degrades_the_checkpoint(pha
     callbacks = []
     f.ready.set()
     pipeline._run_post_task_processing_async(
-        f.env, f.task, {"rounds": 3}, {}, {}, f.root / "logs", event_queue=f.events,
+        f.env, f.task, {"rounds": 3}, {}, f.root / "logs", event_queue=f.events,
         on_reflection=lambda *args: callbacks.append(args))
     assert f.done.wait(5)
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
     assert checkpoint["post_task_stop_reason"] == "budget_exhausted:skipped="
-    assert f.stages[-2:] == ["backlog", "chooser"] and callbacks == []
+    assert f.stages[-2:] == ["scratch", "chooser"] and callbacks == []
 
 
-@pytest.mark.parametrize("seam", ["groom_backlog", "global_promotion"])
-def test_budget_refusal_below_the_backlog_adapters_is_re_raised(tmp_path, monkeypatch, seam):
-    """Finding 2: the grooming call and the split-root global promotion-only path
-    caught BudgetExceeded with `propagate_model_error` too."""
-    from ouroboros import improvement_backlog, llm_observability
+def test_budget_refusal_below_the_global_promotion_adapter_is_re_raised(tmp_path, monkeypatch):
+    """Finding 2: the split-root global promotion-only path caught BudgetExceeded
+    with `propagate_model_error` too."""
     from ouroboros.usage_accounting import BudgetExceeded
 
     def refuse(*_args, **_kwargs):
         raise BudgetExceeded("root wallet spent")
 
-    if seam == "groom_backlog":
-        assert improvement_backlog.append_backlog_items(tmp_path, [
-            {"summary": "one auto item", "category": "process", "source": "execution_reflection"}]) == 1
-        monkeypatch.setattr(llm_observability, "chat_observed", refuse)
-        with pytest.raises(BudgetExceeded):
-            improvement_backlog.groom_backlog(tmp_path, cap=0)
-    else:
-        monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", refuse)
-        with pytest.raises(BudgetExceeded):
-            pipeline._run_global_backlog_promotion_only(
-                SimpleNamespace(drive_root=tmp_path), {"id": "t"},
-                {"backlog_candidates": [{"summary": "s", "category": "process"}]}, None)
-
-
-@pytest.mark.parametrize("outcome", ["failure", "no_op"])
-def test_ordinary_reflection_failure_degrades_the_checkpoint_and_keeps_later_stages(phase, monkeypatch, outcome):
-    """Finding 6: `_run_reflection` logged an ordinary failure and returned None —
-    the same None a genuine "nothing to reflect on" returns — so the coordinator
-    kept stage_errors=False and wrote `completed`. Through the REAL adapter the
-    failure reaches the stage-level catch: degraded, no skipped list, promotion
-    still runs. A genuine no-op still completes."""
-    from ouroboros import post_task_synthesis, reflection
-
-    f = phase
-    monkeypatch.setattr(pipeline, "_run_reflection", post_task_synthesis._run_reflection)
-    monkeypatch.setattr(reflection, "should_generate_reflection", lambda *a, **k: outcome == "failure")
-
-    def fail(*_args, **_kwargs):
-        f.stages.append("reflection-model")
-        raise RuntimeError("reflection provider failed")
-
-    monkeypatch.setattr(reflection, "generate_reflection", fail)
-    launch(f)
-    assert f.done.wait(5)
-    checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
-    assert checkpoint["post_task_synthesis"] == ("degraded" if outcome == "failure" else "completed")
-    assert not checkpoint.get("post_task_stop_reason")
-    assert f.stages == ["facts", "scratch"] + (["reflection-model"] if outcome == "failure" else []) + ["backlog"]
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", refuse)
+    with pytest.raises(BudgetExceeded):
+        pipeline._run_global_backlog_promotion_only(
+            SimpleNamespace(drive_root=tmp_path), {"id": "t"},
+            {"backlog_candidates": [{"summary": "s", "category": "process"}]}, None)
 
 
 def test_ordinary_promotion_failure_degrades_the_checkpoint_but_keeps_the_global_callback(phase, monkeypatch):
@@ -671,13 +597,13 @@ def test_ordinary_promotion_failure_degrades_the_checkpoint_but_keeps_the_global
     callbacks = []
     f.ready.set()
     pipeline._run_post_task_processing_async(
-        f.env, f.task, {"rounds": 3}, {}, {}, f.root / "logs", event_queue=f.events,
+        f.env, f.task, {"rounds": 3}, {}, f.root / "logs", event_queue=f.events,
         on_reflection=lambda *args: callbacks.append(args))
     assert f.done.wait(5)
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
     assert not checkpoint.get("post_task_stop_reason")
-    assert f.stages[-2:] == ["backlog", "promotion-model"] and len(callbacks) == 1
+    assert f.stages[-2:] == ["scratch", "promotion-model"] and len(callbacks) == 1
 
 
 def _generic_unknown(carrier):
@@ -706,15 +632,13 @@ def _real_promotion_chooser(monkeypatch, f):
 
 
 @pytest.mark.parametrize("carrier", ["direct", "cause"])
-@pytest.mark.parametrize("seam", ["groom", "chooser"])
-def test_generic_unknown_outcome_in_a_real_adapter_stops_every_later_paid_call(phase, monkeypatch, seam, carrier):
+def test_generic_unknown_outcome_in_a_real_adapter_stops_every_later_paid_call(phase, monkeypatch, carrier):
     """F1: only the typed Claudexor error and ``BudgetExceeded`` were interruptions,
-    so a generic API exception carrying an unresolved attempt was swallowed by
-    ``groom_backlog`` and the promotion stage then bought the chooser and the global
-    callback. The consolidator's chain classifier now reads it provider-independently
-    in the REAL grooming and chooser adapters: nothing paid runs after it."""
-    import functools
-    from ouroboros import improvement_backlog, llm_observability, post_task_synthesis
+    so a generic API exception carrying an unresolved attempt was swallowed and the
+    promotion stage then bought the global callback. The consolidator's chain
+    classifier now reads it provider-independently in the REAL chooser adapter:
+    nothing paid runs after it."""
+    from ouroboros import llm_observability
 
     f = phase
     error = _generic_unknown(carrier)
@@ -724,99 +648,17 @@ def test_generic_unknown_outcome_in_a_real_adapter_stops_every_later_paid_call(p
         raise error
 
     monkeypatch.setattr(llm_observability, "chat_observed", dispatch)
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", post_task_synthesis._update_improvement_backlog)
-    if seam == "groom":
-        monkeypatch.setattr(improvement_backlog, "groom_backlog",
-                            functools.partial(improvement_backlog.groom_backlog, cap=0))
-        monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: f.stages.append("chooser"))
-    else:
-        _real_promotion_chooser(monkeypatch, f)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: f.stages.append("reflection") or {
-        "backlog_candidates": [{"summary": "one auto item", "category": "process", "source": "execution_reflection"}],
-        "memory_actions": [{"type": "knowledge_write"}]})
-    applied, callbacks = [], []
-    monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *a, **k: applied.append(1))
+    _real_promotion_chooser(monkeypatch, f)
+    callbacks = []
     pipeline._run_post_task_processing_async(
-        f.env, f.task, {"rounds": 3}, {}, {}, f.root / "logs", event_queue=f.events,
+        f.env, f.task, {"rounds": 3}, {}, f.root / "logs", event_queue=f.events,
         on_reflection=lambda *args: callbacks.append(args))
     assert f.done.wait(5)
     checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
     assert checkpoint["post_task_synthesis"] == "degraded"
     assert checkpoint["post_task_stop_reason"] == "provider_outcome_unknown:skipped="
-    paid = "backlog_groom" if seam == "groom" else "post_task_evolution_decision"
-    assert f.stages == ["facts", "scratch", "reflection", paid], "no paid call after an unknown outcome"
+    assert f.stages == ["facts", "scratch", "post_task_evolution_decision"], "no paid call after an unknown outcome"
     assert callbacks == [] and not f.engine.creates
-    assert applied == [1], "the completed reflection's free actions are kept, applied once"
-
-
-@pytest.mark.parametrize("outcome", ["failure", "no_op"])
-def test_ordinary_grooming_failure_degrades_the_checkpoint_and_keeps_the_chooser(phase, monkeypatch, outcome):
-    """F3: ``groom_backlog`` turned a confirmed ordinary provider failure into 0, the
-    backlog adapter returned added-or-0 and the promotion stage ignored it, so a stage
-    that lost its grooming wrote ``completed``. Through the REAL adapters the failure
-    reaches the stage: degraded, nothing skipped, the chooser and the global callback
-    still run. A genuine no-op (the backlog is below the grooming trigger) completes."""
-    import functools
-    from ouroboros import improvement_backlog, llm_observability, post_task_synthesis
-
-    f = phase
-
-    def dispatch(*_args, **_kwargs):
-        f.stages.append("groom-model")
-        raise RuntimeError("grooming provider failed")
-
-    monkeypatch.setattr(llm_observability, "chat_observed", dispatch)
-    if outcome == "failure":
-        monkeypatch.setattr(improvement_backlog, "groom_backlog",
-                            functools.partial(improvement_backlog.groom_backlog, cap=0))
-    monkeypatch.setattr(pipeline, "_update_improvement_backlog", post_task_synthesis._update_improvement_backlog)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: f.stages.append("reflection") or {
-        "backlog_candidates": [{"summary": "one auto item", "category": "process", "source": "execution_reflection"}]})
-    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: f.stages.append("chooser"))
-    callbacks = []
-    pipeline._run_post_task_processing_async(
-        f.env, f.task, {"rounds": 3}, {}, {}, f.root / "logs", event_queue=f.events,
-        on_reflection=lambda *args: callbacks.append(args))
-    assert f.done.wait(5)
-    checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
-    assert checkpoint["post_task_synthesis"] == ("degraded" if outcome == "failure" else "completed")
-    assert not checkpoint.get("post_task_stop_reason")
-    assert f.stages == (["facts", "scratch", "reflection"]
-                        + (["groom-model"] if outcome == "failure" else []) + ["chooser"])
-    assert len(callbacks) == 1
-    assert improvement_backlog.load_backlog_items(f.root), "the appended candidate survives a failed grooming"
-
-
-def test_reflection_preparation_failure_degrades_the_checkpoint_with_a_typed_row(phase, monkeypatch):
-    """F3: ``generate_reflection``'s own catch returned a placeholder WITHOUT
-    ``memory_operation_errors``, so the coordinator read a clean reflection and wrote
-    ``completed`` over a stage that lost its work. Through the REAL adapters (no stub
-    of ``generate_reflection``) the placeholder carries a typed row: degraded, nothing
-    skipped, no reflection call bought, and the promotion stage still runs."""
-    from ouroboros import chat_chain, post_task_synthesis, reflection
-
-    f = phase
-    monkeypatch.setattr(pipeline, "_run_reflection", post_task_synthesis._run_reflection)
-    monkeypatch.setattr(reflection, "should_generate_reflection", lambda *a, **k: True)
-
-    def unwritable(*_args, **_kwargs):
-        f.stages.append("retain")
-        raise RuntimeError("retention store unwritable")
-
-    monkeypatch.setattr(chat_chain, "retain_memory_source", unwritable)
-    entries = []
-    monkeypatch.setattr(reflection, "append_reflection_routed", lambda _env, _task, entry: entries.append(entry))
-    launch(f)
-    assert f.done.wait(5)
-    checkpoint = load_task_result(f.root, f.task["id"])["root_phase_checkpoint"]
-    assert checkpoint["post_task_synthesis"] == "degraded"
-    assert not checkpoint.get("post_task_stop_reason")
-    assert f.stages == ["facts", "scratch", "retain", "backlog"]
-    assert not f.engine.creates, "a failed preparation buys no reflection call"
-    [entry] = entries
-    assert entry["reflection"].startswith("(reflection generation failed")
-    assert [row["kind"] for row in entry["memory_operation_errors"]] == ["reflection_failed"]
-    assert "retention store unwritable" in entry["memory_operation_errors"][0]["message"]
 
 
 def test_split_root_facts_row_counts_the_actor_store_when_synthesis_runs_canonically(phase, monkeypatch):
@@ -834,12 +676,12 @@ def test_split_root_facts_row_counts_the_actor_store_when_synthesis_runs_canonic
     child.mkdir()
     (task_artifacts_dir(child, f.task["id"]) / "report.md").write_text("r", encoding="utf-8")
     monkeypatch.setattr(pipeline, "_record_task_facts", post_task_synthesis._record_task_facts)
-    monkeypatch.setattr(pipeline, "_run_reflection", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.post_task_evolution.maybe_promote", lambda *a: None)
     child_env = SimpleNamespace(drive_root=child, repo_dir=f.root.parent, drive_path=lambda rel: child / rel)
     child_task = {**f.task, "budget_drive_root": str(f.root), "drive_root": str(child)}
     parent_task = {**child_task, "drive_root": str(f.root), "child_drive_root": str(child)}
     pipeline._dispatch_root_post_task(
-        child_env, child_task, "Already answered", None, [], {"rounds": 3}, {}, {}, child / "logs",
+        child_env, child_task, "Already answered", None, [], {"rounds": 3}, {}, child / "logs",
         budget_drive_root=str(f.root), split_drive=True, project_scoped=False, project_task=False,
         parent_env=f.env, parent_task=parent_task)
     assert f.done.wait(5)

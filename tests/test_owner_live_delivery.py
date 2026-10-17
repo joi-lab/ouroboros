@@ -132,9 +132,10 @@ class TestSendToolsLiveIntegration:
 
         q = _Queue()
         ctx = _ctx(event_queue=q)
-        assert "sent to owner chat" in _send_video(ctx, file_path=str(vid))
-        assert "sent to owner chat" in _send_file(ctx, file_path=str(doc))
-        assert "sent to owner chat" in _send_links(
+        # A live put is acceptance by the bus, not a confirmed send (#1789): the receipt says so.
+        assert "accepted for delivery to owner chat" in _send_video(ctx, file_path=str(vid))
+        assert "accepted for delivery to owner chat" in _send_file(ctx, file_path=str(doc))
+        assert "accepted for delivery to owner chat" in _send_links(
             ctx, links=[{"label": "Docs", "url": "https://example.com/d"}])
         assert [e["type"] for e in q.items] == ["send_video", "send_document", "send_links"]
         assert ctx.pending_events == []  # live XOR deferred: never both

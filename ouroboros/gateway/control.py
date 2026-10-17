@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -179,6 +180,8 @@ async def api_command(request: Request) -> JSONResponse:
     try:
         body = await request.json()
         cmd = body.get("cmd", "")
+        if not isinstance(body.get("reply_to", ""), str):
+            return json_error("reply_to must be an address string", 400)
         if cmd:
             from supervisor.message_bus import get_bridge, log_chat
 
@@ -206,7 +209,7 @@ async def api_command(request: Request) -> JSONResponse:
             # SPA heal/repair posts) would otherwise masquerade as ordinary web
             # frames. The honest stamp names the ENDPOINT — the host cannot know
             # the true caller here (disclosed non-goal).
-            send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
+            send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}, "reply_to": body.get("reply_to", "")}
             # Publication precedes readiness. Bind the independent owner, keeping
             # this transport's metadata if the supervisor becomes ready meanwhile.
             if bridge is None or str(cmd).strip().lower() == "/restart":
@@ -273,40 +276,63 @@ async def api_git_log(_request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
+_ROLLBACK_REASONS = {"ui_rollback": "ui_rollback", "vcs_rollback": "agent_rollback_tool"}
+
+
+def rollback_through_door(target: str, *, door: str, request_restart: Callable[[], bool]) -> tuple[int, dict]:
+    """The one Rollback procedure (the UI button; the agent's ``vcs_rollback``, P4-S): lock,
+    resolve, stop every writer (other tasks are interrupted at once), then either record the
+    authority switch for the restart exit (a target without the store) or restore the
+    checkout now; the restart follows either way, unless Git refused the restore's reset at its
+    index lock (409 ``restore_not_applied``: no restart; the aborted-update path decides readmission).
+    Returns the HTTP status and payload."""
+    from supervisor.git_ops import DRIVE_ROOT, REPO_DIR, git_capture, rollback_to_version
+    from supervisor.git_ops_reset import IndexLockRefusal, refusal_parts
+    from ouroboros.store_switch import switch_or_reset
+
+    reason = _ROLLBACK_REASONS[door]
+    lock_fh, lock_error = _acquire_repo_mutation_lock()
+    if lock_error is not None:
+        return lock_error.status_code, json.loads(lock_error.body)
+    try:
+        rc, target_sha, error = git_capture(["git", "rev-parse", "--verify", f"{target}^{{commit}}"])
+        if rc != 0:
+            return 400, {"error": error or f"cannot resolve {target}"}
+        blockers = _quiesce_repo_writers("manual_rollback")
+        if blockers:
+            fence = _fence_failure(blockers)
+            return fence.status_code, json.loads(fence.body)
+        try:
+            ok, msg, deferred = switch_or_reset(
+                DRIVE_ROOT, REPO_DIR, target_sha=target_sha.strip(), target_ref=target, reason=reason, door=door,
+                reset=lambda: rollback_to_version(target_sha, reason=reason))
+        except IndexLockRefusal as exc:
+            if not exc.before_tree_effects:
+                raise
+            # Git refused the restore's only tree command at the held lock, so that reset changed nothing
+            # (the keep branch and rescue made before it stay). No restart the same lock would refuse: the
+            # aborted-update readmission runs, keeping the gate shut while its own guards still hold.
+            _respawn_workers_after_failed_update()
+            return 409, {"error": f"the restore was not applied: Git refused its reset: {refusal_parts(exc)[1]}",
+                         "reason": "restore_not_applied"}
+        if not ok:
+            return 500, {"error": msg, "restart_required": True}
+        try:
+            restarting = request_restart()
+        except Exception:
+            log.warning("rollback restart request failed", exc_info=True)
+            restarting = False
+        return 200, {"status": "ok" if restarting else "restart_required", "message": msg,
+                     "restarting": restarting, "switch_deferred": deferred}
+    finally:
+        _release_repo_mutation_lock(lock_fh)
+
+
 def _git_rollback_fenced(request: Request, target: str) -> JSONResponse:
     """Run the complete restore transaction off the gateway event loop."""
     try:
-        from supervisor.git_ops import git_capture, rollback_to_version
-
-        lock_fh, lock_error = _acquire_repo_mutation_lock()
-        if lock_error is not None:
-            return lock_error
-        try:
-            rc, target_sha, error = git_capture(
-                ["git", "rev-parse", "--verify", f"{target}^{{commit}}"]
-            )
-            if rc != 0:
-                return json_error(error or f"cannot resolve {target}", 400)
-            blockers = _quiesce_repo_writers("manual_rollback")
-            if blockers:
-                return _fence_failure(blockers)
-            ok, msg = rollback_to_version(target_sha, reason="ui_rollback")
-            if not ok:
-                return JSONResponse(
-                    {"error": msg, "restart_required": True}, status_code=500
-                )
-            try:
-                restarting = _request_restart(request)
-            except Exception:
-                log.warning("manual rollback landed but restart request failed", exc_info=True)
-                restarting = False
-            return JSONResponse({
-                "status": "ok" if restarting else "restart_required",
-                "message": msg,
-                "restarting": restarting,
-            })
-        finally:
-            _release_repo_mutation_lock(lock_fh)
+        status, payload = rollback_through_door(target, door="ui_rollback", request_restart=lambda: _request_restart(request))
+        return JSONResponse(payload, status_code=status)
     except Exception as exc:
         return json_exception(exc)
 
@@ -378,10 +404,10 @@ async def api_update_check(_request: Request) -> JSONResponse:
 def _respawn_workers_after_failed_update() -> None:
     """Revive workers when an update aborts after they were stopped (no restart follows)."""
     try:
-        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission
+        from supervisor.workers import ensure_worker_pool_started, open_repo_writer_admission_after_update_abort
 
-        open_repo_writer_admission()
-        ensure_worker_pool_started(allow_disabled_restart=True)
+        if open_repo_writer_admission_after_update_abort():
+            ensure_worker_pool_started(allow_disabled_restart=True)
     except Exception:
         log.warning("update_apply: failed to respawn workers after aborted update", exc_info=True)
 
@@ -440,14 +466,23 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
     if blocked:
         open_repo_writer_admission()
         return [f"active:{label}" for label in blocked]
+    from supervisor import workers as worker_state
+    from supervisor.restart_retention import capture_update_returns
+
+    try:
+        with worker_state._queue_lock:
+            update_returns = capture_update_returns(DRIVE_ROOT, worker_state.RUNNING, worker_state.WORKERS,
+                                                   return_ids=())
+    except Exception as exc:
+        return [f"saved_work_handoff:{type(exc).__name__}: {exc}"]
     preserve_running_task_ids: set[str] = set()
+    return_ids: set[str] = set()
     if reason != "manual_rollback":
         try:
             import uuid
 
             from ouroboros.delegate_recovery import prepare_planned_restart_handoffs
             from ouroboros.owner_wait import prepare_owner_wait_handoffs
-            from supervisor import workers as worker_state
 
             restart_transaction_id = uuid.uuid4().hex
             owner_wait_ids = prepare_owner_wait_handoffs(
@@ -459,10 +494,20 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
                 restart_transaction_id=restart_transaction_id,
                 additional_task_ids=owner_wait_ids,
             )
+            from supervisor.restart_retention import prepare_restart_returns
+
+            # The update's restart returns active work and the runnable queue (#1563).
+            return_ids = prepare_restart_returns(DRIVE_ROOT, worker_state.RUNNING, list(worker_state.PENDING),
+                                                transaction_id=restart_transaction_id,
+                                                direct=worker_state.direct_chat_turns(),
+                                                owner_wait_ids=preserve_running_task_ids)
         except Exception as exc:
             open_repo_writer_admission()
             log.warning("Managed update owner-wait handoff preparation failed", exc_info=True)
             return [f"owner_wait_handoff:{type(exc).__name__}: {exc}"]
+    with worker_state._queue_lock:
+        for task_id, captured in update_returns["rows"].items():
+            captured["returning"] = task_id in return_ids
     update_progress.advance("stopping_workers")
     survivors = kill_workers_for_update(
         result_reason="Task interrupted by an owner-requested managed update.",
@@ -492,7 +537,9 @@ def _quiesce_repo_writers(reason: str) -> list[str]:
         _custody_ok, custody_blockers = quiesce_custodied_services(DRIVE_ROOT)
     except Exception as exc:
         custody_blockers = [f"custody_ledger:{type(exc).__name__}: {exc}"]
-    return [f"service:{label}" for label in failed] + custody_blockers
+    blockers = [f"service:{label}" for label in failed] + custody_blockers
+    update_returns["quiesced"] = not blockers
+    return blockers
 
 
 def _fence_failure(blockers: list[str], stash_note: str = "") -> JSONResponse:
@@ -538,11 +585,36 @@ def _rollback_fenced_update(reason: str, error: str, **extra: Any) -> JSONRespon
     )
 
 
+def _abandon_replace_refused_before_tree(tx: Dict[str, Any], exc: BaseException) -> Dict[str, Any] | None:
+    """Abandon this replace as unapplied, as boot does, when Git refused its FIRST tree step for
+    the held index lock; ``None`` leaves the fenced rollback in charge of anything else.
+
+    Both facts are ``IndexLockRefusal.before_tree_effects`` (Git's own refusal on every attempt,
+    no earlier tree step); the live tx must still be this attempt and HEAD its base. The rescue
+    snapshot and keep branch made before the checkout stay and are reported by the caller.
+    """
+    from supervisor.git_ops import git_capture
+    from supervisor.git_ops_reset import IndexLockRefusal, refusal_parts
+    from supervisor.update_merge import abandon_unapplied_replace, read_update_tx_strict
+
+    if not isinstance(exc, IndexLockRefusal) or not exc.before_tree_effects:
+        return None
+    status, live = read_update_tx_strict()
+    if status != "valid" or live.get("phase") != "applying_replace" or live.get("attempt_id") != tx.get("attempt_id"):
+        return None
+    rc_h, head, _error = git_capture(["git", "rev-parse", "--verify", "HEAD"])
+    if rc_h != 0 or not head or head != str(live.get("pre_update_sha") or ""):
+        return None
+    cmd, detail = refusal_parts(exc)
+    return abandon_unapplied_replace(head, cause="index_lock_refused", attempt_id=str(live["attempt_id"]),
+                                     cmd=cmd, stderr=detail)
+
+
 def _restart_response(request: Request, *, strategy: str, plan: dict) -> JSONResponse:
     try:
         restarting = _request_restart(request)
     except Exception as exc:
-        log.warning("managed update landed but restart request failed", exc_info=True)
+        log.warning("managed update restart request failed", exc_info=True)
         restarting = False
         restart_error = f"{type(exc).__name__}: {exc}"
     else:
@@ -723,125 +795,29 @@ def _start_assisted_merge_fenced(plan: dict, tx: dict) -> JSONResponse:
              **({"stash_note": note} if note else {})},
             status_code=409,
         )
-    # Affordability floor: a resolution that cannot buy even ONE full triad+scope
-    # review wave would mutate the live tree into a conflicted merge and then
-    # stall mid-review. "One full wave" is priced HONESTLY at the review packs'
-    # own worst-case caps — the shared 920K-token input SSOT per API row, the
-    # triad's default output reserve, and the scope reviewer's 100K output
-    # reserve — with the shared reservation math (agent-session rows ride
-    # subscriptions, not USD budget); fail-open on estimator errors, mirroring
-    # review_wave_admission's own contract.
-    admission = {"fits": True}
+    # Money admission is the known-spend rule every reviewer seat's reservation
+    # applies (#1487), checked just above: known spend below TOTAL_BUDGET admits
+    # the update, and a review that later reaches the limit pauses on its own
+    # fences. One commit-gate wave over the review pool's paid seats is still
+    # priced at the review packs' own worst-case caps by the one explicit
+    # estimator (``review_admission.managed_update_wave_estimate``), but as
+    # DISCLOSURE, never a second, earlier refusal: a prospective wave larger
+    # than the remainder used to refuse an update the owner's limit still
+    # allowed. Agent-session rows ride subscriptions, not USD budget; an
+    # estimator error is recorded, never a zero, and a broken import is not
+    # swallowed.
+    from ouroboros.tools.review_admission import managed_update_wave_estimate
+
+    estimate_event = managed_update_wave_estimate(float(remaining))
     try:
-        from ouroboros.reviewer_slot_config import commit_scope_rows, commit_triad_rows
-        from ouroboros.tools.review_helpers import REVIEW_PROMPT_TOKEN_BUDGET
-        from ouroboros.usage_admission import review_wave_admission
+        from supervisor.git_ops import DRIVE_ROOT as _dr
+        from ouroboros.utils import append_jsonl as _aj, utc_now_iso as _n
 
-        # Native-retrieving actor rows (subagent_id + api route) are priced at
-        # the SAME one-pack-call convention as packet rows: their true worst
-        # case is bounded by the episode's own rails (round cap x transcript
-        # cap) and can exceed this estimate, but the typical episode is
-        # pack-sized or smaller, and this floor is an explicitly fail-open
-        # affordability heuristic — over-refusing assisted updates on a
-        # theoretical ceiling would cost more than it protects.
-        triad_models = [
-            row.target_id for row in commit_triad_rows()
-            if not row.is_session and row.target_id
-        ]
-        scope_models = [
-            row.target_id for row in commit_scope_rows()
-            if not row.is_session and row.target_id
-        ]
-        prompt_chars_cap = int(REVIEW_PROMPT_TOKEN_BUDGET) * 4
-        estimated_total = 0.0
-        any_estimate = False
-        unpriced_total = 0
-        for models, max_out in ((triad_models, 65_536), (scope_models, 100_000)):
-            if not models:
-                continue
-            part = review_wave_admission(
-                root_task_id="managed-update-admission",
-                models=models,
-                prompt_chars=prompt_chars_cap,
-                max_completion_tokens=max_out,
-                remaining_usd_override=float(remaining),
-            )
-            part_estimate = part.get("estimated_wave_usd")
-            unpriced_total += int(part.get("unpriced_slots") or 0)
-            if part_estimate is not None:
-                estimated_total += float(part_estimate)
-                any_estimate = True
-            else:
-                # The estimator failed open for this whole surface: every one of
-                # its slots is unknown, not silently zero.
-                unpriced_total += len(models)
-        session_slots = sum(
-            1 for row in (*commit_triad_rows(), *commit_scope_rows()) if row.is_session
-        )
-        if any_estimate:
-            admission = {
-                "fits": estimated_total <= float(remaining) + 1e-9,
-                "estimated_wave_usd": round(estimated_total, 6),
-                "remaining_usd": float(remaining),
-                "unpriced_slots": unpriced_total,
-                "session_slots": session_slots,
-            }
-        if admission.get("fits", True) and (unpriced_total or (session_slots and not any_estimate)):
-            # An ADMITTED wave with unknowable parts must not read as a fully
-            # priced estimate later (P1: represent the gap) — one durable line.
-            try:
-                from supervisor.git_ops import DRIVE_ROOT as _dr
-                from ouroboros.utils import append_jsonl as _aj, utc_now_iso as _n
-
-                _aj(_dr / "logs" / "supervisor.jsonl", {
-                    "ts": _n(), "type": "managed_update_wave_floor_partial_unknown",
-                    "estimated_wave_usd": admission.get("estimated_wave_usd"),
-                    "unpriced_slots": unpriced_total, "session_slots": session_slots,
-                    "remaining_usd": float(remaining),
-                })
-            except Exception:
-                log.debug("wave-floor partial-unknown event write failed", exc_info=True)
+        # One durable disclosure of the wave estimate beside the known room;
+        # unknowable parts are counted, never filled in (P1).
+        _aj(_dr / "logs" / "supervisor.jsonl", {"ts": _n(), **estimate_event})
     except Exception:
-        log.debug("assisted admission wave estimate failed open", exc_info=True)
-        admission = {"fits": True}
-        try:
-            from supervisor.git_ops import DRIVE_ROOT as _dr2
-            from ouroboros.utils import append_jsonl as _aj2, utc_now_iso as _n2
-
-            _aj2(_dr2 / "logs" / "supervisor.jsonl", {
-                "ts": _n2(), "type": "managed_update_wave_floor_estimator_failed",
-                "remaining_usd": float(remaining),
-            })
-        except Exception:
-            log.debug("estimator-failure event write failed", exc_info=True)
-    if not admission.get("fits", True):
-        note = _unwind_stashed_update(tx, "assisted_admission_failed")
-        _respawn_workers_after_failed_update()
-        estimated = admission.get("estimated_wave_usd")
-        try:
-            from supervisor.git_ops import DRIVE_ROOT
-            from ouroboros.utils import append_jsonl, utc_now_iso as _now
-
-            append_jsonl(DRIVE_ROOT / "logs" / "supervisor.jsonl", {
-                "ts": _now(), "type": "managed_update_wave_floor_refused",
-                "estimated_wave_usd": estimated, "remaining_usd": admission.get("remaining_usd"),
-            })
-        except Exception:
-            log.debug("wave-floor refusal event write failed", exc_info=True)
-        return JSONResponse(
-            {"error": (
-                "Assisted update needs enough model budget for at least one full "
-                f"review wave ({'at least ' if admission.get('unpriced_slots') else ''}≈${estimated} "
-                "estimated at the review packs' worst-case caps for the configured reviewer panel"
-                + (f"; {admission['unpriced_slots']} slot(s) unpriced" if admission.get("unpriced_slots") else "")
-                + f", ${round(float(remaining), 2)} remaining); nothing was changed."
-            ),
-             "estimated_wave_usd": estimated,
-             "remaining_usd": admission.get("remaining_usd"),
-             "unpriced_slots": admission.get("unpriced_slots", 0),
-             **({"stash_note": note} if note else {})},
-            status_code=409,
-        )
+        log.debug("wave estimate event write failed", exc_info=True)
 
     _create_rescue_snapshot(
         branch, "ui_update_assisted_merge", _collect_repo_sync_state(),
@@ -1150,8 +1126,11 @@ def _apply_replace_recovery_fenced(
 ) -> JSONResponse:
     import uuid
 
+    from ouroboros.store_switch import switch_or_reset
     from supervisor.git_ops import (
         BRANCH_DEV,
+        DRIVE_ROOT,
+        REPO_DIR,
         _write_update_intent,
         checkout_and_reset,
         prepare_managed_update,
@@ -1224,29 +1203,43 @@ def _apply_replace_recovery_fenced(
         _write_update_intent(dict(payload["update_intent"]))
         try:
             update_progress.advance("applying")
-            checkout_ok, checkout_msg = checkout_and_reset(
-                BRANCH_DEV,
-                reason="ui_update_apply",
-                unsynced_policy="rescue_and_reset",
-            )
+            # A target without the store: the switch intent, the checkout moves at the restart exit
+            # (store_switch); its smoke is the post-boot one the pending transaction already runs.
+            checkout_ok, checkout_msg, deferred = switch_or_reset(
+                DRIVE_ROOT, REPO_DIR, target_sha=expected_target_sha, target_ref=str(tx["target_ref"]),
+                reason="ui_update_apply", door="update_replace",
+                reset=lambda: checkout_and_reset(BRANCH_DEV, reason="ui_update_apply", unsynced_policy="rescue_and_reset"))
         except Exception as exc:
-            return _rollback_fenced_update(
-                "replace_checkout_exception", f"recovery checkout failed: {exc}", **payload
-            )
+            from supervisor.git_ops_reset import refusal_parts, refusal_text
+
+            abandoned = _abandon_replace_refused_before_tree(tx, exc)
+            if abandoned is None:
+                return _rollback_fenced_update(
+                    "replace_checkout_exception", f"recovery checkout failed: {refusal_text(exc)}", **payload
+                )
+            if not abandoned.get("abandoned"):  # its cleanup failed: the tx holds, as at boot
+                return JSONResponse({"error": abandoned.get("reason"), "rolled_back": False,
+                                     "restart_required": True, **payload}, status_code=500)
+            _respawn_workers_after_failed_update()
+            return JSONResponse({
+                "error": f"the update was not applied: Git refused its first checkout step: {refusal_parts(exc)[1]}",
+                "reason": "replace_not_applied", "abandoned": True, "rolled_back": False, **payload,
+            }, status_code=409)
         if not checkout_ok:
             return _rollback_fenced_update(
                 "replace_checkout_failed", f"recovery checkout failed: {checkout_msg}", **payload
             )
         tx["phase"] = "pending_boot_smoke"
         write_update_tx(tx)
-        update_progress.advance("checking")
-        smoke = update_restart_smoke()
-        if not smoke.get("ok"):
-            return _rollback_fenced_update(
-                "replace_pre_restart_smoke_failed", "pre-restart smoke failed", smoke=smoke
-            )
-        tx["pre_restart_smoke"] = "passed"
-        write_update_tx(tx)
+        if not deferred:
+            update_progress.advance("checking")
+            smoke = update_restart_smoke()
+            if not smoke.get("ok"):
+                return _rollback_fenced_update(
+                    "replace_pre_restart_smoke_failed", "pre-restart smoke failed", smoke=smoke
+                )
+            tx["pre_restart_smoke"] = "passed"
+            write_update_tx(tx)
         return _restart_response(request, strategy="replace", plan=plan2)
     except Exception as exc:
         log.error("managed replace recovery failed after writer fence", exc_info=True)

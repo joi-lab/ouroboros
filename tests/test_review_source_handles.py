@@ -48,6 +48,8 @@ def test_failed_completion_promotion_retains_child_until_retry(tmp_path, monkeyp
                                              source_id="completion", data=raw, extension="json")
     write_task_result(child, "source", "completed", **_field(ref, "completion"))
     with monkeypatch.context() as patch:
+        # A failed placement must defeat both the hardlink and its copy fallback.
+        patch.setattr("ouroboros.source_retention.os.link", lambda *_a, **_k: (_ for _ in ()).throw(OSError("link unavailable")))
         patch.setattr(artifacts, "store_actor_source_bytes", lambda *_a, **_k: (_ for _ in ()).throw(OSError("copy failed")))
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
         copied = retry_child_task_refs(parent, child, "source")
@@ -169,6 +171,7 @@ def test_nested_copy_failure_holds_child_and_rechecks_existing_checkpoint(tmp_pa
         return store(*args, **kwargs)
 
     with monkeypatch.context() as patch:
+        patch.setattr("ouroboros.source_retention.os.link", lambda *_a, **_k: (_ for _ in ()).throw(OSError("link unavailable")))
         patch.setattr(artifacts, "store_actor_source_bytes", fail_output)
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
         copied = retry_child_task_refs(parent, child, "source")
@@ -236,6 +239,7 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
             return store(*args, **kwargs)
 
         with monkeypatch.context() as patch:
+            patch.setattr("ouroboros.source_retention.os.link", lambda *_a, **_k: (_ for _ in ()).throw(OSError("link unavailable")))
             patch.setattr(artifacts, "store_actor_source_bytes", fail_corpus)
             copied = copy_child_task_result(parent, task)
             copied = retry_child_task_refs(parent, child, task["id"])
@@ -495,11 +499,42 @@ def test_plan_dialogue_promotion_never_reads_a_foreign_source(tmp_path, monkeypa
     opened = _record_path_reads(monkeypatch, foreign)
     copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
     copied = retry_child_task_refs(parent, child, 'source')
-    assert copied['plan_review_state']['waves'][0]['dialogue_source_ref']['availability'] == 'unavailable'
-    assert copied['child_ref_promotion']['unavailable_refs']
+    # The carrier keeps its own reference; the refusal is a promotion fact.
+    assert copied['plan_review_state']['waves'][0]['dialogue_source_ref'] == ref
+    assert [(row['path'], row['reason']) for row in copied['child_ref_promotion']['unavailable_refs']] == [
+        (ref['path'], 'invalid_scope' if link else 'invalid_ref')]
     assert not (artifacts.task_artifact_dir_path(parent, 'sibling') / ref['path']).exists()
     assert foreign not in opened
     # Positive control: the same guard intercepts the source reader on this very file.
     with pytest.raises(AssertionError, match='foreign bytes'):
         artifacts.read_actor_source_bytes(child, 'sibling', sibling_ref)
     assert opened[-1] == foreign
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_submitted_plan_source_survives_promotion_and_gates_child_cleanup(tmp_path, missing):
+    from ouroboros.task_results import load_plan_review_state
+    from ouroboros.tools.plan_author_history import current_submitted_plan
+    from tests import _legacy_plan_shared as legacy
+    parent = tmp_path / "canonical"
+    child = prepare_task_drive(parent, "submitted", "empty")
+    proposed = {"spec": {"goal": "Keep exact submitted material"}, "plan_prose": "Current unreviewed proposal"}
+    state = legacy.seed_submitted_subject(child, "submitted", fingerprint="b" * 64, **proposed)
+    ref = state["current_attempt"]["submitted_subject"]
+    path = artifacts.task_artifact_dir_path(child, "submitted") / ref["path"]
+    raw = path.read_bytes()
+    write_task_result(child, "submitted", "completed", result="No reviewer was dispatched")
+    if missing:
+        path.unlink()
+        copy_child_task_result(parent, {"id": "submitted", "drive_root": str(child)})
+        assert not remove_subagent_task_drive(parent, "submitted", live=lambda _: False)
+        assert child.exists()
+        path.write_bytes(raw)
+    copy_child_task_result(parent, {"id": "submitted", "drive_root": str(child)})
+    promoted = retry_child_task_refs(parent, child, "submitted")
+    assert promoted["child_ref_promotion"]["status"] == "complete"
+    assert remove_subagent_task_drive(parent, "submitted", live=lambda _: False)
+    assert not child.exists()
+    assert artifacts.read_actor_source_bytes(parent, "submitted", ref) == raw
+    current = current_submitted_plan(parent, "submitted", load_plan_review_state(parent, "submitted"))
+    assert current["spec"] == proposed["spec"] and current["plan_prose"] == proposed["plan_prose"]

@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 from ouroboros.task_results import write_task_result
 from ouroboros.task_status import find_child_tasks, load_effective_task_result
+from tests._store_shared import read_result
 
 
 def _seed_child_drive_scenario(tmp_path):
@@ -252,13 +253,13 @@ def _spy_effective_reads(monkeypatch) -> list:
     from ouroboros import task_status
 
     flags: list = []
-    real = task_status.load_effective_task_result
+    real = task_status.effective_task_result
 
-    def _spy(drive_root, tid, materialize_artifacts=True):
+    def _spy(drive_root, tid, materialize_artifacts=True, _boot=False):
         flags.append(bool(materialize_artifacts))
-        return real(drive_root, tid, materialize_artifacts=materialize_artifacts)
+        return real(drive_root, tid, materialize_artifacts=materialize_artifacts, _boot=_boot)
 
-    monkeypatch.setattr(task_status, "load_effective_task_result", _spy)
+    monkeypatch.setattr(task_status, "effective_task_result", _spy)
     return flags
 
 
@@ -310,7 +311,7 @@ def test_reconcile_skips_a_live_running_child_without_materializing(tmp_path, mo
     assert copies == {"copy": 0}
     assert not (data / "task_results" / "artifacts" / tid).exists()
     assert child_manifest.read_bytes() == manifest_before
-    assert json.loads((data / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))["status"] == "running"
+    assert read_result(data, tid)["status"] == "running"
 
 
 def test_reconcile_heals_a_genuine_orphan_and_settlement_publishes_its_files(tmp_path, monkeypatch):
@@ -354,7 +355,7 @@ def test_reconcile_heals_a_genuine_orphan_and_settlement_publishes_its_files(tmp
 
     assert flags == [False]
     assert copies == {"copy": 0}
-    on_disk = json.loads((data / "task_results" / f"{tid}.json").read_text(encoding="utf-8"))
+    on_disk = read_result(data, tid)
     assert on_disk["status"] in SETTLED_STATUSES
     promoted = data / "task_results" / "artifacts" / tid / "report.html"
     assert not promoted.exists()

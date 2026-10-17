@@ -28,6 +28,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
 from ouroboros.tools.registry import ToolContext
+from ouroboros.store import StoreError
 from ouroboros.tools.tool_result import (
     TOOL_CODE_SPECS,
     ToolResult,
@@ -42,7 +43,7 @@ log = logging.getLogger(__name__)
 # refusal — the daemon, the engine, custody or the run itself said no — is
 # recorded and never degrading (`_outcome_tool_errors._POLICY_DENIAL_STATUSES`
 # holds `tool_reported_failure`). An AGENT fault — the call itself was
-# malformed or self-contradictory — degrades and feeds reflection. Neither is
+# malformed or self-contradictory — degrades the execution axis. Neither is
 # `TOOL_TIMEOUT` (nothing here timed out) nor `TOOL_ERROR` (which would hide
 # which of the two this was).
 SUBSTRATE_REFUSAL_CODE = "TOOL_REPORTED_FAILURE"
@@ -158,8 +159,8 @@ def lock_busy_facts(exc: BaseException) -> Dict[str, Any]:
                           "lock; wait for it (see holder) and retry delegate_start."}
 
 
-def _emit(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> None:
-    custody.emit(custody.custody_root(ctx), kind, {
+def _emit(ctx: ToolContext, kind: str, payload: Dict[str, Any]) -> bool:
+    return custody.emit(custody.custody_root(ctx), kind, {
         "task_id": str(getattr(ctx, "task_id", "") or ""), **payload,
     })
 
@@ -215,6 +216,10 @@ def _confirmed_retry_chain(drive: Any, starter: str, reader: str) -> Tuple[str, 
     nor a task-authored predecessor is an edge. Read the whole root chain so a
     run started by an intermediate attempt has the same custody as the first.
     Queue-local supervisor globals are not available authority in a worker.
+
+    Returns the chain's task ids, or ``()`` unless every link is recorded and the
+    reader is the chain's leaf and its only pending/running attempt in a fresh
+    queue snapshot; stale, unreadable or ambiguous evidence grants nothing.
     """
     from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES
     from ouroboros.task_status import _load_queue_snapshot, queue_snapshot_observation
@@ -276,7 +281,7 @@ def _confirmed_retry_chain(drive: Any, starter: str, reader: str) -> Tuple[str, 
                       and live["delegation_role"] != "subagent"):
                     return ()  # ambiguous live attempt outside the chain
         return tuple(chain) if active == [reader] else ()
-    except (OSError, ValueError, TypeError, KeyError):
+    except (OSError, ValueError, TypeError, KeyError, StoreError):
         return ()
 
 
@@ -290,10 +295,12 @@ def retry_result_status(ctx: ToolContext, drive: Any, run_id: str, *,
     a failed/cancelled terminal result does.
     Existing tool/file profile guards and materializer target guards still apply.
     """
+    from ouroboros.delegate_custody_current import run
+
     reader = str(getattr(ctx, "task_id", "") or "")
     if custody.custody_log_unreadable(drive):
         return custody.UNKNOWN, None, ""
-    entry = (state if state is not None else custody.replay(drive)).get(str(run_id or ""))
+    entry = state.get(str(run_id or "")) if state is not None else run(drive, str(run_id or ""))
     if entry is None:
         return custody.UNKNOWN, None, ""
     if reader and reader == entry.task_id:
@@ -333,7 +340,10 @@ def orphan_disposition_status(
     if custody.custody_log_unreadable(drive):
         return custody.UNKNOWN, None, ""
     if state is None:
-        state = custody.replay(drive)
+        from ouroboros.delegate_custody_current import run
+
+        found = run(drive, str(run_id or ""))  # the one row this call names, as a state mapping
+        state = {} if found is None else {str(run_id or ""): found}
     durable = state.get(str(run_id or ""))
     if durable is not None:
         custody._CUSTODY[str(run_id)] = durable
@@ -351,7 +361,7 @@ def orphan_disposition_status(
                 if all(nxt.get(key) == reader for key in (
                         "supersedes_task_id", "original_task_id", "timeout_retry_from")):
                     return custody.FOREIGN, entry, ""
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, StoreError):
             return custody.UNKNOWN, entry, ""
     if status == custody.FOREIGN:
         retry_status, retry_entry, predecessor = retry_result_status(ctx, drive, run_id, state=state)
@@ -417,9 +427,9 @@ def orphan_capture_read_target(
     Resolution is by PATH SHAPE first: a candidate must sit under
     ``<canonical data root>/task_results/artifacts/<owner_tid>/delegated_runs/
     <capture>/``. Everything else returns before custody is touched, so a plain
-    refusal never pays for an event-log replay. The custody row is read from a
-    SHARED ``delegate_terminal.custody_audit_snapshot`` when the caller has one,
-    and only without one does this replay -- exactly once.
+    refusal never pays for a custody read. Candidate rows come from a SHARED
+    ``delegate_terminal.custody_audit_snapshot``, or one owner-task selection.
+    The later ownership lookup still refreshes the matching named row.
     """
     from ouroboros.artifacts import DELEGATED_CAPTURE_PREFIX
     from ouroboros.headless import ARTIFACTS_DIR
@@ -441,20 +451,21 @@ def orphan_capture_read_target(
     # Successor evidence remains readable after disposition; the ordinary
     # orphan door still requires an undisposed patch through its own predicate.
     if state is None:
-        state = custody.replay(drive)
+        from ouroboros.delegate_custody_current import runs as current_runs
+
+        state = current_runs(drive, "task_id=?", (owner_tid,))
     rows = state.values()
     for row in rows:
         if str(row.task_id or "") != owner_tid:
             continue
-        cap_dir = custody.delegated_capture_dir(drive, row.task_id, row.snapshot_id or row.run_id)
+        cap_dir = custody.delegated_capture_dir(drive, row.task_id, custody.capture_key(row))
         if cap_dir.name != capture_name or not path_is_relative_to(resolved, cap_dir):
             continue
         retry_status, _entry, predecessor = retry_result_status(ctx, drive, str(row.run_id), state=state)
         if retry_status == custody.OWNED and predecessor:
             return resolved
-        # The rows we just read ARE the durable authority; seeding the memo the
-        # ownership lookup consults keeps this read at the traversal budget
-        # above instead of replaying the same log a second time.
+        # Keep the established memo seed; lookup still gives a fresh durable
+        # row priority. Passing state avoids another owner-wide selection.
         custody._CUSTODY.setdefault(str(row.run_id), row)
         status, _entry, orphan_of = orphan_disposition_status(ctx, drive, str(row.run_id), state=state)
         if status == custody.OWNED and orphan_of:

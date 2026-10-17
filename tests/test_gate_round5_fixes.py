@@ -196,7 +196,7 @@ def test_gr5_2_reap_reconciles_delegated_runs_and_discloses(qenv, monkeypatch):
     from supervisor import task_reaper, workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(task_reaper, "send_with_budget", lambda *a, **kw: None)
     calls = _patch_open_delegated_run(monkeypatch, "rp5")
     disclosure_writes: list = []
@@ -256,7 +256,7 @@ def test_gr5_3_already_settled_fast_path_discloses_open_delegated_runs(qenv, mon
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     _patch_open_delegated_run(monkeypatch, "fs5")
     write_task_result(qenv.drive, "fs5", STATUS_RUNNING, chat_id=4, result="working")
     ci.request_cancel(qenv.drive, "fs5", reason="stop")
@@ -283,7 +283,7 @@ def test_gr5_3_finalize_on_miss_discloses_open_delegated_runs(qenv, monkeypatch)
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *a, **kw: None)
     _patch_open_delegated_run(monkeypatch, "ml5")
     write_task_result(qenv.drive, "ml5", STATUS_RUNNING, chat_id=5, result="was working")
@@ -312,7 +312,7 @@ def test_gr5_4_replay_digest_lists_children_from_the_durable_tree(tmp_path, monk
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     write_task_result(tmp_path, "r5", STATUS_CANCELLED, chat_id=9, result="root down")
     write_task_result(
         tmp_path, "c5a", STATUS_CANCELLED, result="child down",
@@ -344,7 +344,7 @@ def test_gr5_4_sweep_outcome_still_wins_for_a_child_with_no_durable_row(tmp_path
     from supervisor import workers
 
     queue = _CaptureQueue()
-    monkeypatch.setattr(workers, "get_event_q", lambda: queue, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda *, create=True: queue, raising=False)
     write_task_result(tmp_path, "r5w", STATUS_CANCELLED, chat_id=9, result="root down")
 
     owed = td.deliver_cascade_summary(

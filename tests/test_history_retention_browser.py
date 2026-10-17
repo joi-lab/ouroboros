@@ -79,6 +79,7 @@ def test_retention_details_and_problem_only_card(engine, width):
                 card = page.locator('.chat-live-card[data-task-id="history-task"]')
                 card.wait_for()
                 toggle = card.locator('[data-live-summary-button]')
+                meta = card.locator(':scope > .chat-live-foot > [data-live-meta]')
                 if card.get_attribute('data-expanded') == '1':
                     toggle.click()
                 page.evaluate("""() => emit('log',{chat_id:1,data:{type:'history_retention',task_id:'history-task',
@@ -106,14 +107,16 @@ def test_retention_details_and_problem_only_card(engine, width):
                         problem_reasons:status==='problem'?[{reason:'OSError: disk full',count:2}]:[],
                         diagnostics:status==='problem'?{pending_refs:[{path:'retained-source',reason:'OSError: disk full'}]}:{}}})""", status)
                     if status == "problem":
-                        playwright.expect(toggle).to_contain_text('History storage problem')
+                        # The problem is a fact of the card's footer meta line, not of the summary button.
+                        playwright.expect(meta).to_contain_text('History storage problem')
+                        assert 'history storage problem' not in toggle.inner_text().lower()
                         capture("collapsed-problem")
                         toggle.click()
                         playwright.expect(history).to_contain_text('2 × OSError: disk full')
                         capture("details-problem")
                         toggle.click()
                     else:
-                        playwright.expect(toggle).not_to_contain_text('History storage problem')
+                        playwright.expect(meta).not_to_contain_text('History storage problem')
                     playwright.expect(card.locator('[data-live-phase]')).to_have_text('Done')
                     assert card.evaluate('(node) => node.scrollWidth <= node.clientWidth + 1')
                 page.evaluate('showLogs()')

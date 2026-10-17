@@ -82,6 +82,21 @@ def local_zoneinfo():
     return datetime.datetime.now().astimezone().tzinfo or datetime.timezone.utc
 
 
+def is_mount_point(path: pathlib.Path | str) -> bool:
+    """Include Linux same-device bind/volume mounts that stat-based ismount misses.
+
+    Linux's mountinfo names mounts in this process's namespace. An unreadable
+    table raises OSError: callers about to move a directory must not guess."""
+    target = pathlib.Path(path).resolve()
+    if os.path.ismount(target):
+        return True
+    if not IS_LINUX:
+        return False
+    with open("/proc/self/mountinfo", encoding="utf-8", errors="surrogateescape") as mounts:
+        return any(len(fields) >= 6 and re.sub(r"\\([0-7]{3})", lambda m: chr(int(m[1], 8)), fields[4]) == str(target)
+                   for fields in map(str.split, mounts))
+
+
 def is_container_env() -> bool:
     """Return whether explicit env or Docker sentinel indicates a container."""
     # /.dockerenv is Docker's Linux sentinel.
@@ -200,11 +215,9 @@ def request_native_attention(
 
 
 def scrub_repo_from_pythonpath(env: dict[str, str], repo_dir: "str | pathlib.Path | None") -> dict[str, str]:
-    """Copy of *env* without ``PYTHONPATH`` entries resolving to the system repo.
-
-    An EXTERNAL-workspace command inheriting that entry resolves its own
-    ``import web``/``server``/``ouroboros`` to OUROBOROS's modules; dropping
-    ONLY the repo entry isolates the target (no-op without one)."""
+    """Copy of *env* without ``PYTHONPATH`` entries resolving to the system repo. An EXTERNAL-workspace command
+    inheriting that entry resolves its own ``import web``/``server``/``ouroboros`` to OUROBOROS's modules;
+    dropping ONLY the repo entry isolates the target (no-op without one)."""
     out = dict(env)
     raw = out.get("PYTHONPATH", "")
     if not raw or not repo_dir:
@@ -422,10 +435,8 @@ def refresh_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int])
 
 
 def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
-    """Unlink only the held identity (None means unconditional path-only cleanup).
-
-    Retry transient Windows sharing refusal within the bounded release window;
-    leave a replaced path alone. See ARCHITECTURE §1 "Platform substrate"."""
+    """Unlink only the held identity (None means unconditional path-only cleanup). Retry transient Windows sharing
+    refusal within the bounded release window; leave a replaced path alone. See ARCHITECTURE §1 "Platform substrate"."""
     deadline = time.monotonic() + 2.0
     while True:
         try:
@@ -445,10 +456,8 @@ def _unlink_lock_path(lock_path: pathlib.Path, held: Optional[tuple]) -> None:
 
 
 def release_exclusive_file_lock(lock_path: pathlib.Path, lock_fd: Optional[int]) -> None:
-    """Release only this descriptor's lock path, never a successor's.
-
-    POSIX unlinks under the hold; Windows unlocks/closes before identity-checked
-    unlink. See ARCHITECTURE §1 "Platform substrate" for the sharing gap."""
+    """Release only this descriptor's lock path, never a successor's. POSIX unlinks under the hold; Windows
+    unlocks/closes before identity-checked unlink. See ARCHITECTURE §1 "Platform substrate" for the sharing gap."""
     lock_path = pathlib.Path(lock_path)
     if lock_fd is None:
         return
@@ -572,29 +581,25 @@ def pid_lock_release(path: str) -> None:
 
 def file_lock_exclusive(fd: int) -> None:
     """Acquire an exclusive (write) lock on a file descriptor. Blocks."""
-    if IS_WINDOWS:
-        _win32_lock(fd, exclusive=True, blocking=True)
-    else:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX)
+    _file_lock(fd, exclusive=True, blocking=True)
 
 
 def file_lock_shared(fd: int) -> None:
     """Acquire a shared (read) lock on a file descriptor. Blocks."""
-    if IS_WINDOWS:
-        _win32_lock(fd, exclusive=False, blocking=True)
-    else:
-        import fcntl
-        fcntl.flock(fd, fcntl.LOCK_SH)
+    _file_lock(fd, exclusive=False, blocking=True)
 
 
 def file_lock_exclusive_nb(fd: int) -> None:
     """Try to acquire an exclusive lock, non-blocking. Raises OSError on failure."""
+    _file_lock(fd, exclusive=True, blocking=False)
+
+
+def _file_lock(fd: int, *, exclusive: bool, blocking: bool) -> None:
     if IS_WINDOWS:
-        _win32_lock(fd, exclusive=True, blocking=False)
+        _win32_lock(fd, exclusive=exclusive, blocking=blocking)
     else:
         import fcntl
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | (0 if blocking else fcntl.LOCK_NB))
 
 
 def file_unlock(fd: int) -> None:
@@ -607,34 +612,14 @@ def file_unlock(fd: int) -> None:
 
 
 def pid_is_alive(pid: int) -> bool:
-    """Observe process presence; access denial remains alive, not signal authority.
-
-    Windows probes OpenProcess/GetExitCodeProcess, never os.kill(pid, 0): there
-    signal 0 is CTRL_C_EVENT, delivered to the pid's whole console group."""
+    """Observe process presence; access denial remains alive, not signal authority. Windows probes
+    OpenProcess/GetExitCodeProcess, never os.kill(pid, 0): there signal 0 is CTRL_C_EVENT, delivered to the pid's
+    whole console group. An unexplained Windows open failure reads as dead here, never as provably gone."""
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        _STILL_ACTIVE = 259
-        _ERROR_ACCESS_DENIED = 5
-        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-        if not handle:
-            # A live but access-protected process reads as alive; anything else (invalid parameter -> no such pid) reads as dead.
-            return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
-        try:
-            code = ctypes.wintypes.DWORD()
-            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return True  # opened but unreadable -> fail SAFE toward alive
-            return int(code.value) == _STILL_ACTIVE
-        finally:
-            _kernel32.CloseHandle(handle)
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except OSError:  # EPERM: it exists and refuses us; anything else undeterminable reads as present
-        pass
-    return True
+        return _windows_process_state(pid) in {"running", "denied", "unreadable"}
+    return not pid_provably_gone(pid)  # EPERM: it exists and refuses us
 
 
 def signal_pid(pid: int, signum: int = 0) -> bool:
@@ -647,17 +632,43 @@ def signal_pid(pid: int, signum: int = 0) -> bool:
 
 
 def pid_is_signalable(pid: int) -> bool:
-    """Whether this caller can signal a PID: POSIX signal-zero, Windows presence.
+    """Whether this caller can signal a PID (POSIX signal-zero, Windows presence); not identity/ownership."""
+    return pid > 0 and (pid_is_alive(pid) if IS_WINDOWS else signal_pid(pid))
 
-    This is distinct from identity/ownership and from an access-denied live PID."""
-    if pid <= 0:
-        return False
-    return pid_is_alive(pid) if IS_WINDOWS else signal_pid(pid)
+
+# Typed ``deliver_signal`` outcomes: delivery proves no identity and no exit; only ``absent`` (ESRCH) means gone.
+SIGNAL_SENT, SIGNAL_ABSENT, SIGNAL_DENIED = "sent", "absent", "denied"
+SIGNAL_FAILED, SIGNAL_UNSUPPORTED = "failed", "unsupported"
+
+
+def deliver_signal(pid: int, *, graceful: bool) -> str:
+    """Send TERM (``graceful``) or KILL to ONE POSIX pid, never to a group; the typed outcome is evidence about
+    the SIGNAL alone: ``denied`` (EPERM: it exists and refuses us) and ``failed`` (any other OSError) are unknowns
+    the scope reaper discloses, never counts as ended; it re-measures the pid's birth before calling. Windows:
+    ``unsupported`` — its Job/TerminateProcess paths stay the truth."""
+    if IS_WINDOWS:
+        return SIGNAL_UNSUPPORTED
+    if pid <= 1 or pid == os.getpid():
+        return SIGNAL_FAILED
+    try:
+        os.kill(int(pid), signal.SIGTERM if graceful else signal.SIGKILL)
+    except OSError as exc:
+        return {errno.ESRCH: SIGNAL_ABSENT, errno.EPERM: SIGNAL_DENIED}.get(exc.errno, SIGNAL_FAILED)
+    return SIGNAL_SENT
 
 
 def pid_provably_gone(pid: int) -> bool:
-    """Positive absence from the platform presence reader; denial is not death."""
-    return not pid_is_alive(pid)
+    """Positive absence only (#1554): POSIX ESRCH; Windows no such pid (ERROR_INVALID_PARAMETER) or a readable
+    exit code. Access denial, EPERM and every unexplained error are not death; a zombie is the caller's question."""
+    if pid <= 0:
+        return True
+    if IS_WINDOWS:
+        return _windows_process_state(pid) in {"no_such_pid", "exited"}
+    try:
+        os.kill(pid, 0)
+        return False
+    except OSError as exc:
+        return isinstance(exc, ProcessLookupError)
 
 
 # Windows locking via LockFileEx: unlike msvcrt.locking(), works on empty files.
@@ -713,12 +724,9 @@ def _win32_unlock(fd: int) -> None:
 # Process management.
 
 def capture_process_stop_target(pid: int) -> dict:
-    """Pin an already authorized process for a later wait-free stop request.
-
-    The caller proves custody before AND after capture; a PID is not authority.
-    Handles own their lifetime; Darwin's exit watch rejects a departed target.
-    No attached-daemon Job is created: ordinary client close must preserve it.
-    """
+    """Pin an already authorized process for a later wait-free stop request. The caller proves custody before
+    AND after capture; a PID is not authority. Handles own their lifetime; Darwin's exit watch rejects a departed
+    target. No attached-daemon Job is created: ordinary client close must preserve it."""
     if pid <= 0 or pid == os.getpid():
         raise ValueError("invalid stop target")
     if IS_WINDOWS:
@@ -737,12 +745,9 @@ def capture_process_stop_target(pid: int) -> dict:
 
 
 def request_process_tree_kill(proc, *, job_handle=None) -> dict:
-    """Issue native termination now; never wait, scan descendants or touch disk.
-
-    Accept a live owner Popen or a previously custody-validated OS target. The
-    receipt proves a request only. A Job/group covers its members; escaped
-    descendants and a process-only Windows request still require settlement.
-    """
+    """Issue native termination now; never wait, scan descendants or touch disk. Accept a live owner Popen or
+    a previously custody-validated OS target; the receipt proves a request only. A Job/group covers its
+    members; escaped descendants and a process-only Windows request still require settlement."""
     pinned = isinstance(proc, dict)
     pid = int(proc["pid"] if pinned else proc.pid)
     result = {"pid": pid, "requested": False, "scope": "process"}
@@ -795,22 +800,19 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
 
 def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Gracefully terminate a Unix process group by id."""
-    if IS_WINDOWS or _group_has_spared_process(pgid, exclude_pids):
-        return
-    try:
-        os.killpg(int(pgid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError, OSError, ValueError):
-        pass
+    _signal_process_group(pgid, "SIGTERM", exclude_pids)
 
 
 def kill_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a Unix process group by id."""
+    _signal_process_group(pgid, "SIGKILL", exclude_pids)
+
+
+def _signal_process_group(pgid: int, signal_name: str, exclude_pids: "set[int] | None") -> None:
     if IS_WINDOWS or _group_has_spared_process(pgid, exclude_pids):
         return
-    try:
-        os.killpg(int(pgid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError, ValueError):
-        pass
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError, ValueError):
+        os.killpg(int(pgid), getattr(signal, signal_name))  # by name: Windows has no SIGKILL
 
 
 def process_group_id(pid: int) -> int:
@@ -857,10 +859,8 @@ _BOOT_ID = ""  # full hex of the /proc boot id; empty until a successful read, t
 
 
 def process_start_time(pid: int) -> str:
-    """Stable birth token: Linux boot-qualified ticks, legacy fallback, or Windows FILETIME.
-
-    Mint order, cross-boot limits and downgrade-compatible ledger fields:
-    ARCHITECTURE §1 "Platform substrate"."""
+    """Stable birth token: Linux boot-qualified ticks, legacy fallback, or Windows FILETIME. Mint order,
+    cross-boot limits and downgrade-compatible ledger fields: ARCHITECTURE §1 "Platform substrate"."""
     global _BOOT_ID
     if pid <= 0:
         return ""
@@ -1030,14 +1030,12 @@ def collect_descendant_pids(pid: int, *, exclude_pids: "set[int] | None" = None)
     if exclude_pids:
         targets, _ = _tree_kill_targets(int(pid), exclude_pids)
         return [target for target in targets if target != int(pid)]
-    if IS_WINDOWS:
-        return _snapshot_descendants(int(pid), _process_children())
-    result: List[int] = []
     try:
-        result = _snapshot_descendants(int(pid), _process_children())
+        return _snapshot_descendants(int(pid), _process_children())
     except (TypeError, ValueError):
-        pass
-    return result
+        if IS_WINDOWS:
+            raise
+        return []
 
 
 def tcp_keepalive_socket_options() -> List[tuple]:
@@ -1126,11 +1124,8 @@ def pip_install_target_args(interpreter: str) -> List[str]:
 
 
 def project_venv_python(project_root: pathlib.Path) -> str:
-    """Return the executable for a valid project ``.venv`` on this platform.
-
-    Keep the lexical venv path (rather than resolving its symlink) so Python
-    discovers the adjacent ``pyvenv.cfg`` and activates the environment.
-    """
+    """Return the executable for a valid project ``.venv`` on this platform. Keep the lexical venv path (rather
+    than resolving its symlink) so Python discovers the adjacent ``pyvenv.cfg`` and activates the environment."""
     env_root = pathlib.Path(project_root) / ".venv"
     if not (env_root / "pyvenv.cfg").is_file():
         return ""
@@ -1258,22 +1253,20 @@ def get_system_memory() -> str:
             mem_bytes = int(subprocess.check_output(["sysctl", "-n", "hw.memsize"]).strip())
             return f"{mem_bytes / (1024**3):.1f} GB"
         elif os_name == "Linux":
-            out = subprocess.check_output(
-                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"],
-            ).strip().decode()
-            return out
+            return subprocess.check_output(
+                ["awk", '/MemTotal/ {print $2/1024/1024 " GB"}', "/proc/meminfo"]).strip().decode()
         elif os_name == "Windows":
-            out = _hidden_run(
-                ["wmic", "ComputerSystem", "get", "TotalPhysicalMemory", "/value"],
-                capture_output=True, text=True, timeout=10, check=True,
-            ).stdout.strip()
-            for line in out.splitlines():
-                if "=" in line:
-                    mem_bytes = int(line.split("=")[1])
-                    return f"{mem_bytes / (1024**3):.1f} GB"
+            mem_bytes = int(_wmic_value_line("ComputerSystem", "get", "TotalPhysicalMemory").split("=")[1])
+            return f"{mem_bytes / (1024**3):.1f} GB"
     except Exception:
         pass
     return "Unknown"
+
+
+def _wmic_value_line(*query: str) -> str:
+    """First ``key=value`` line of a Windows ``wmic ... /value`` query, or ''."""
+    out = _hidden_run(["wmic", *query, "/value"], capture_output=True, text=True, timeout=10, check=True).stdout
+    return next((line for line in out.strip().splitlines() if "=" in line), "")
 
 
 def get_cpu_info() -> str:
@@ -1284,14 +1277,8 @@ def get_cpu_info() -> str:
             return subprocess.check_output(
                 ["sysctl", "-n", "machdep.cpu.brand_string"],
             ).strip().decode()
-        elif os_name == "Windows":
-            out = _hidden_run(
-                ["wmic", "cpu", "get", "Name", "/value"],
-                capture_output=True, text=True, timeout=10, check=True,
-            ).stdout.strip()
-            for line in out.splitlines():
-                if "=" in line:
-                    return line.split("=", 1)[1].strip()
+        elif os_name == "Windows" and (line := _wmic_value_line("cpu", "get", "Name")):
+            return line.split("=", 1)[1].strip()
     except Exception:
         pass
     return platform.processor()
@@ -1359,103 +1346,116 @@ if IS_WINDOWS:
     import ctypes
     import ctypes.wintypes
 
-    # Snapshot the actual call error; declare full-width HANDLE ABI (ARCHITECTURE §1).
-    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    from ouroboros.platform_win32_abi import (  # noqa: F401 — preserve native symbol exports
+        _kernel32,
+        _OVERLAPPED,
+        _INVALID_HANDLE_VALUE,
+        _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        _JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+        _JOBOBJECTINFOCLASS_EXTENDED,
+        _PROCESS_SET_QUOTA,
+        _PROCESS_TERMINATE,
+        _PROCESS_SUSPEND_RESUME,
+        _CREATE_SUSPENDED,
+        _JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        _IO_COUNTERS,
+        _ExtendedLimitInfo,
+    )
 
-    class _OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.c_void_p),
-            ("InternalHigh", ctypes.c_void_p),
-            ("Offset", ctypes.wintypes.DWORD),
-            ("OffsetHigh", ctypes.wintypes.DWORD),
-            ("hEvent", ctypes.wintypes.HANDLE),
-        ]
 
-    # One complete ABI table for process presence, locks and Job ownership.
-    for _api_name, _result_type, _argument_types in (
-        ("CreateJobObjectW", ctypes.wintypes.HANDLE, (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)),
-        ("SetInformationJobObject", ctypes.wintypes.BOOL,
-         (ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD)),
-        ("OpenProcess", ctypes.wintypes.HANDLE, (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)),
-        ("GetExitCodeProcess", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.DWORD))),
-        ("GetProcessTimes", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, *(ctypes.POINTER(ctypes.wintypes.FILETIME),) * 4)),
-        ("GetCurrentProcess", ctypes.wintypes.HANDLE, ()),
-        ("IsProcessInJob", ctypes.wintypes.BOOL,
-         (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.BOOL))),
-        ("QueryInformationJobObject", ctypes.wintypes.BOOL,
-         (ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD))),
-        ("AssignProcessToJobObject", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)),
-        ("TerminateJobObject", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)),
-        ("CloseHandle", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE,)),
-        ("LockFileEx", ctypes.wintypes.BOOL,
-         (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
-          ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.POINTER(_OVERLAPPED))),
-        ("UnlockFileEx", ctypes.wintypes.BOOL,
-         (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
-          ctypes.wintypes.DWORD, ctypes.POINTER(_OVERLAPPED))),
-    ):
-        _api = getattr(_kernel32, _api_name)
-        _api.restype, _api.argtypes = _result_type, _argument_types
+def _windows_query(pid: int, read: Callable[[Any], Any]) -> tuple:
+    """``(open_error, read(handle))`` under one limited-query handle; error 0 when opened."""
+    if not (handle := _kernel32.OpenProcess(0x1000, False, int(pid))):  # PROCESS_QUERY_LIMITED_INFORMATION
+        return ctypes.get_last_error() or -1, None
+    try:
+        return 0, read(handle)
+    finally:
+        _kernel32.CloseHandle(handle)
 
-    # .value, not the HANDLE instance: with restype=HANDLE the calls return plain
-    # ints (or None for NULL), and an int never equals a ctypes instance.
-    _INVALID_HANDLE_VALUE = ctypes.wintypes.HANDLE(-1).value
-    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
-    _JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x800
-    _JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK = 0x1000
-    _JOBOBJECTINFOCLASS_EXTENDED = 9
-    _PROCESS_SET_QUOTA = 0x0100
-    _PROCESS_TERMINATE = 0x0001
-    _PROCESS_SUSPEND_RESUME = 0x0800
-    _CREATE_SUSPENDED = 0x4
 
-    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
-        _fields_ = [
-            ("PerProcessUserTimeLimit", ctypes.c_int64),
-            ("PerJobUserTimeLimit", ctypes.c_int64),
-            ("LimitFlags", ctypes.wintypes.DWORD),
-            ("MinimumWorkingSetSize", ctypes.c_size_t),
-            ("MaximumWorkingSetSize", ctypes.c_size_t),
-            ("ActiveProcessLimit", ctypes.wintypes.DWORD),
-            ("Affinity", ctypes.POINTER(ctypes.c_ulong)),
-            ("PriorityClass", ctypes.wintypes.DWORD),
-            ("SchedulingClass", ctypes.wintypes.DWORD),
-        ]
-
-    class _IO_COUNTERS(ctypes.Structure):
-        _fields_ = [
-            ("ReadOperationCount", ctypes.c_uint64),
-            ("WriteOperationCount", ctypes.c_uint64),
-            ("OtherOperationCount", ctypes.c_uint64),
-            ("ReadTransferCount", ctypes.c_uint64),
-            ("WriteTransferCount", ctypes.c_uint64),
-            ("OtherTransferCount", ctypes.c_uint64),
-        ]
-
-    class _ExtendedLimitInfo(ctypes.Structure):
-        _fields_ = [
-            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
-            ("IoInfo", _IO_COUNTERS),
-            ("ProcessMemoryLimit", ctypes.c_size_t),
-            ("JobMemoryLimit", ctypes.c_size_t),
-            ("PeakProcessMemoryUsed", ctypes.c_size_t),
-            ("PeakJobMemoryUsed", ctypes.c_size_t),
-        ]
+def _windows_handle_birth(handle: Any) -> str:
+    """Creation FILETIME of the process behind an open handle: the runtime's birth token."""
+    times = [ctypes.wintypes.FILETIME() for _ in range(4)]
+    return (f"win-filetime:{(times[0].dwHighDateTime << 32) | times[0].dwLowDateTime}"
+            if _kernel32.GetProcessTimes(handle, *(ctypes.byref(item) for item in times)) else "")
 
 
 def _windows_process_start_time(pid: int) -> str:
-    handle = _kernel32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
-    if not handle:
-        return ""
+    return _windows_query(pid, _windows_handle_birth)[1] or ""
+
+
+def _windows_process_state(pid: int) -> str:
+    """``running``/``exited``/``unreadable`` once opened; else ``denied``, ``no_such_pid`` or ``error``."""
+    def exit_code(handle: Any) -> Optional[int]:
+        code = ctypes.wintypes.DWORD()
+        return int(code.value) if _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) else None
+    error, code = _windows_query(pid, exit_code)
+    return (("denied" if error == 5 else "no_such_pid" if error == 87 else "error") if error
+            else "unreadable" if code is None else "running" if code == 259 else "exited")
+
+
+@contextlib.contextmanager
+def inheritable_self_handle():
+    """Windows restart handle and exact stdio, owned until Popen has inherited them.
+
+    With all three Popen stream arguments omitted, its STARTUPINFO stays intact.
+    Passing even one fd instead makes Popen replace absent streams with pipes.
+    Duplicate present handles so no shared handle's inheritability is changed.
+    """
+    import _winapi
+    import msvcrt
+
+    with contextlib.ExitStack() as resources:
+        handle = subprocess.Handle(_winapi.OpenProcess(0x101000, True, os.getpid()))  # SYNCHRONIZE | QUERY_LIMITED
+        resources.callback(handle.Close)
+        startupinfo = subprocess.STARTUPINFO(dwFlags=subprocess.STARTF_USESTDHANDLES,
+                                            lpAttributeList={"handle_list": [handle]})
+        current = _winapi.GetCurrentProcess()
+        for name, field in (("stdin", "hStdInput"), ("stdout", "hStdOutput"), ("stderr", "hStdError")):
+            try:
+                raw = msvcrt.get_osfhandle(getattr(sys, f"__{name}__").fileno())
+            except (AttributeError, OSError, ValueError):
+                raw = 0
+            duplicate = 0
+            if raw not in (0, -1, -2):
+                duplicate = subprocess.Handle(_winapi.DuplicateHandle(
+                    current, raw, current, 0, True, _winapi.DUPLICATE_SAME_ACCESS))
+                resources.callback(duplicate.Close)
+                startupinfo.lpAttributeList["handle_list"].append(duplicate)
+            setattr(startupinfo, field, duplicate)
+        yield handle, {"startupinfo": startupinfo, "close_fds": True}
+
+
+def await_restart_binding(handle: int) -> None:
+    """Wait for a cold-bootstrap helper to finish its binding attempt, then close the pipe.
+
+    Only its read end was inherited. EOF also releases us if that helper died;
+    it says nothing about success, which the restart transaction must prove.
+    """
+    import _winapi
+
     try:
-        created, exited, kernel, user = (ctypes.wintypes.FILETIME() for _ in range(4))
-        if not _kernel32.GetProcessTimes(
-            handle, ctypes.byref(created), ctypes.byref(exited), ctypes.byref(kernel), ctypes.byref(user),
-        ):
-            return ""
-        return f"win-filetime:{(created.dwHighDateTime << 32) | created.dwLowDateTime}"
+        try:
+            _winapi.ReadFile(handle, 1)
+        except BrokenPipeError:
+            pass
     finally:
-        _kernel32.CloseHandle(handle)
+        _winapi.CloseHandle(handle)
+
+
+def await_process_handle(handle: int) -> dict:
+    """Windows: block until an inherited process handle signals, then close it; that process's identity and exit."""
+    import _winapi
+    if not (pid := _kernel32.GetProcessId(handle)):  # an older generation passes the number on without the handle
+        raise OSError(f"Restart parent handle {handle} names no process here; it is neither awaited nor closed")
+    try:
+        if (result := _winapi.WaitForSingleObject(handle, _winapi.INFINITE)) != _winapi.WAIT_OBJECT_0:
+            raise OSError(f"Restart parent handle did not signal (wait result {result})")
+        return {"pid": int(pid), "birth": _windows_handle_birth(handle),
+                "exit_code": int(_winapi.GetExitCodeProcess(handle))}
+    finally:
+        _winapi.CloseHandle(handle)
 
 
 def _windows_breakaway_flags() -> int:

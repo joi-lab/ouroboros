@@ -5,13 +5,16 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
     <title>Ouroboros</title>
     <script src="/static/theme.js"></script>
+    <!-- The macOS desktop window may run this page under its transparent title bar (launcher_window_chrome.py);
+         after theme.js, so the shell reads the painted palette with it. style.css reserves what it measures. -->
+    <meta name="ouroboros-window-chrome" content="integrated">
     <link rel="stylesheet" href="/static/ui.css">
     <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
     <link rel="stylesheet" href="/static/style.css">
     <link rel="stylesheet" href="/static/settings.css">
     <link rel="stylesheet" href="/static/model_roles.css">
-    <link rel="stylesheet" href="/static/reviewer_slots.css">
     <link rel="stylesheet" href="/static/model_wait.css">
+    <link rel="stylesheet" href="/static/room_work.css">
     <link rel="icon" href="/static/favicon.png" type="image/png">
     <script src="/static/chart.umd.min.js"></script>
     <script src="/static/purify.min.js"></script>

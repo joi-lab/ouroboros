@@ -462,7 +462,7 @@ def test_ordinary_stop_channel_retirement_does_not_panic_owned_daemon(tmp_path, 
     from supervisor import worker_pool_lifecycle, workers
 
     monkeypatch.setattr(worker_process, "worker_main", _ordinary_close_entry)
-    monkeypatch.setattr(worker_pool_lifecycle, "_record_worker_pids", lambda: None)
+    monkeypatch.setattr(worker_pool_lifecycle, "_record_worker_processes", lambda: None)
     ctx = multiprocessing.get_context("spawn")
     incoming, outgoing = ctx.Queue(), ctx.Queue()
     proc = worker_process.spawn_worker_process(ctx, 0, incoming, outgoing, tmp_path, tmp_path)

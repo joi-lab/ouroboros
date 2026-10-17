@@ -359,9 +359,22 @@ def test_successful_upload_without_a_url_is_incomplete(tmp_path):
     ("import time; time.sleep(60)", ("-n", "2", "--dist", "loadscope", "--max-worker-restart=0",
                                      "--timeout=2", "--timeout-method=thread")),
 ], ids=["exit", "ci-timeout"])
-def test_dead_xdist_worker_is_a_named_crash_and_not_an_unknown_session(tmp_path, body, args):
+def test_dead_xdist_worker_is_a_named_crash_and_not_an_unknown_session(tmp_path, monkeypatch, body, args):
+    monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "2")
     result, public, _ = _producer(tmp_path, f"""
         def test_dies():
+            import json, time
+            from pathlib import Path
+            deadline = time.monotonic() + 10
+            while True:
+                try:
+                    rows = [json.loads(line) for line in Path({str(tmp_path / 'public/events.jsonl')!r}).read_text(encoding='utf-8').splitlines()]
+                except (OSError, ValueError):
+                    rows = []
+                if any(row.get('phase') == 'teardown' and row.get('nodeid', '').endswith('::test_survives') for row in rows):
+                    break
+                assert time.monotonic() < deadline
+                time.sleep(.01)
             {body}
         class TestOtherScope:
             def test_survives(self, request):
@@ -382,8 +395,8 @@ def test_dead_xdist_worker_is_a_named_crash_and_not_an_unknown_session(tmp_path,
     # The controller re-emits worker events; a complete session never reads them back.
     journal = _events(public)
     assert sorted(_started(journal)) == [survivor, "test_specimen.py::test_dies"]
-    assert {"event": "finish", "nodeid": survivor} in journal
-    assert {"event": "finish", "nodeid": "test_specimen.py::test_dies"} not in journal
+    assert survivor in [row["nodeid"] for row in journal if row["event"] == "finish"]
+    assert "test_specimen.py::test_dies" not in [row["nodeid"] for row in journal if row["event"] == "finish"]
     assert "in flight" not in summary
     assert _annotate(tmp_path, public) == [
         "::error title=Failed test::test_specimen.py::test_dies (crash, WorkerCrash)"]
@@ -420,7 +433,10 @@ def test_killed_session_names_the_test_in_flight_and_earlier_failures(tmp_path):
     assert not (public / "results.json").exists()
     assert SECRET not in _public_text(public)
     blocked = "test_specimen.py::test_blocks[blocked-***]"
-    assert _started(_events(public))[-1] == blocked
+    journal = _events(public)
+    assert _started(journal)[-1] == blocked
+    assert all(row["duration_seconds"] >= 0 for row in journal if row["event"] == "report")
+    assert all(row["elapsed_seconds"] >= 0 for row in journal)
     summary, result = _summary(tmp_path, public, producer="failure")
     assert "Case outcomes: **unknown**. No passing result is inferred." in summary
     assert "ended before its final export" in summary and "diagnostics_incomplete" in summary
@@ -434,7 +450,8 @@ def test_killed_session_names_the_test_in_flight_and_earlier_failures(tmp_path):
         f"::error title=Test in flight when the session was killed::{blocked}"]
 
 
-def test_killed_xdist_session_names_every_test_in_flight(tmp_path):
+def test_killed_xdist_session_names_every_test_in_flight(tmp_path, monkeypatch):
+    monkeypatch.setenv("OURO_TEST_WORKER_BUDGET", "2")
     public = _kill_when(tmp_path, _blocking(tmp_path, """
         def test_blocks_a():
             block()
@@ -481,7 +498,13 @@ def test_journal_holds_only_redacted_identity_enums_and_exception_types(tmp_path
     rows = _events(public)
     assert [row["event"] for row in rows] == ["start", "report", "report", "report", "finish"] * 2
     assert {tuple(row) for row in rows} == {
-        ("event", "nodeid"), ("event", "nodeid", "phase", "outcome", "error_type")}
+        ("event", "nodeid", "elapsed_seconds"),
+        ("event", "nodeid", "elapsed_seconds", "phase", "outcome", "error_type", "duration_seconds", "is_subtest")}
+    assert all(row["is_subtest"] is False for row in rows if row["event"] == "report")
+    elapsed = [row["elapsed_seconds"] for row in rows]
+    assert elapsed == sorted(elapsed) and elapsed[0] >= 0
+    assert [row["duration_seconds"] for row in rows if row["event"] == "report"] == [
+        row["duration_seconds"] for row in _results(public)["reports"]]
     assert [(row["phase"], row["error_type"]) for row in rows
             if row.get("outcome") == "failed"] == [("call", "AssertionError")]
 

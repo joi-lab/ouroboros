@@ -68,6 +68,37 @@ def test_escalate_refuses_a_bound_that_cannot_hold_and_names_the_repair(tmp_path
     assert not getattr(ctx, "_owner_wait_max_minutes", None) and ctx.event_queue.empty()
 
 
+@pytest.mark.parametrize("ceiling,budget,limit", [
+    ("21600", None, 360), ("21600", 0, 360), ("21600", 50000, 360), ("21600", 1800, 30), (None, 1800, 30)])
+def test_escalate_caps_a_required_wait_by_the_task_execution_limit(tmp_path, monkeypatch, ceiling, budget, limit):
+    """#939: an owner wait counts as execution, so an explicit task budget narrower than the
+    global ceiling ends the task first. Absent or zero adds no bound: the ceiling decides."""
+    if ceiling is None:
+        monkeypatch.delenv("OUROBOROS_TASK_ABS_CEILING_SEC", raising=False)
+    else:
+        monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", ceiling)
+    registry, ctx = _registry(tmp_path)
+    ctx.task_metadata = {} if budget is None else {"execution_timeout_sec": budget}
+    ask = {"question": "Continue?", "options": ["Yes", "No"], "wait_for_answer": True}
+    refused = registry.execute_result("escalate", {**ask, "max_wait_minutes": limit + 1})
+    assert refused.code == "TOOL_ARG_ERROR" and f"at most {limit} (the task's execution time limit)" in refused.text
+    assert ctx.event_queue.empty()
+    accepted = registry.execute_result("escalate", {**ask, "max_wait_minutes": limit})
+    assert accepted.status == "ok" and f"waits up to {limit} minutes" in accepted.text
+
+
+@pytest.mark.parametrize("budget", [0.5, 30, 59.999])
+def test_escalate_subminute_budget_refuses_a_whole_minute_but_keeps_unbounded_wait(tmp_path, monkeypatch, budget):
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "unlimited")
+    registry, ctx = _registry(tmp_path)
+    ctx.task_metadata = {"execution_timeout_sec": budget}
+    ask = {"question": "Continue?", "options": ["Yes", "No"], "wait_for_answer": True}
+    refused = registry.execute_result("escalate", {**ask, "max_wait_minutes": 1})
+    assert refused.code == "TOOL_ARG_ERROR" and "shorter than one minute" in refused.text
+    assert ctx.event_queue.empty()
+    assert registry.execute_result("escalate", ask).status == "ok"
+
+
 def test_escalate_genuine_argument_mistake_is_one_typed_refusal(tmp_path):
     registry, ctx = _registry(tmp_path)
     result = registry.execute_result("escalate", {

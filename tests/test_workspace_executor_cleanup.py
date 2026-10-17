@@ -43,6 +43,16 @@ def _write_docker_records(state_dir, *, foreground_pidfile="/tmp/ouroboros-exec-
         ),
         encoding="utf-8",
     )
+    from ouroboros.owned_shutdown import import_inherited_records
+
+    import_inherited_records(state_dir.parents[1])
+
+
+def _index_raw(path):
+    """Name a hand-written record in the ownership set, bypassing the import's validation."""
+    from ouroboros.owned_shutdown import record_executor_process
+
+    assert record_executor_process(path, json.loads(path.read_text(encoding="utf-8")))
 
 
 def _install_live_docker_service(workspace_executor, tmp_path):
@@ -84,14 +94,14 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
         docker_run_calls.append([str(part) for part in cmd])
         # The live-service observer uses its normal ten-second bound; stop,
         # durable-record proof and marker retirement use five seconds.
-        live_probe = str(cmd[-1]) == "kill -0 67890 2>/dev/null && echo running || echo exited"
+        live_probe = str(cmd[-1]) == workspace_executor._docker_proc_observer_shell("67890", scope="group")
         assert kwargs["timeout"] == (10 if live_probe else 5)
         if str(cmd[-1]).startswith("rm -f -- "):
             retained = json.loads((state_dir / "foreground-docker.json").read_text())
             assert retained["backend_completed"] is True
         if "printf completed" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="completed", stderr="")
-        if "kill -0" in str(cmd[-1]):
+        if "_ouroboros_proc_observe" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="exited\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
@@ -112,9 +122,9 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
         workspace_executor._docker_exec_pidfile_stop_shell("/tmp/ouroboros-exec-test.pid"),
         "rm -f -- /tmp/ouroboros-exec-test.pid",
         workspace_executor._docker_service_stop_shell("67890"),
-        "kill -0 67890 2>/dev/null && echo running || echo exited",
+        workspace_executor._docker_proc_observer_shell("67890", scope="group"),
         workspace_executor._docker_service_stop_shell("12345"),
-        "kill -0 12345 2>/dev/null && echo running || echo exited",
+        workspace_executor._docker_proc_observer_shell("12345", scope="group"),
     ]
     assert all(call[:2] == ["docker", "exec"] for call in docker_run_calls)
     assert any(item.get("executor_type") == "docker_exec" for item in killed_foreground)
@@ -166,6 +176,7 @@ def test_executor_cleanup_ignores_unowned_forged_process_records(tmp_path, monke
         ),
         encoding="utf-8",
     )
+    _index_raw(state_dir / "foreground-forged.json")
 
     monkeypatch.setattr(
         workspace_executor,
@@ -196,6 +207,7 @@ def test_executor_cleanup_ignores_owner_shaped_forged_host_pid_records(tmp_path,
         ),
         encoding="utf-8",
     )
+    _index_raw(state_dir / "foreground-forged.json")
 
     monkeypatch.setattr(
         workspace_executor,
@@ -260,6 +272,7 @@ def test_executor_cleanup_ignores_pidless_docker_service_records(tmp_path, monke
         ),
         encoding="utf-8",
     )
+    _index_raw(state_dir / "service-docker.json")
 
     monkeypatch.setattr(
         workspace_executor.subprocess,

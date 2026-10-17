@@ -13,7 +13,7 @@ import pytest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-@pytest.mark.parametrize("job", ["quick-test", "full-test"])
+@pytest.mark.parametrize("job", ["quick-test", "full-test-runs"])
 def test_each_ci_job_runs_the_blocking_size_ratchet_lane(job):
     ci = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     block = re.search(

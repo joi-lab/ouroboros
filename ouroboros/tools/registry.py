@@ -242,14 +242,9 @@ from ouroboros.tools.registry_core import (  # noqa: F401 — re-exported moved 
 # diff, git-ref tripwire) run AFTER the handler has already written the
 # receipt, so they would only annotate the returned text, not gate the durable receipt —
 # adding them would give false assurance while the pre-exec guards already do the gating.
-# Path-bearing file tools whose active_workspace/system_repo path arg is normalized
-# ONCE at dispatch (execute) so the handler AND every guard (protected-path,
-# protected-artifact, shrink) resolve the identical target — no desync bypass.
-# apply_patch/edit_batch are absent because they carry no top-level `path` arg
-# (their paths live inside the patch text / edits[] entries), so this seam has
-# nothing to rewrite. They are NOT exempt from the canonicalization itself: both
-# the dispatch guards below and their handlers run every payload path through
-# `canonical_repo_relative_path`, the same normalization this seam applies.
+# Dispatch path normalization for path-bearing file tools, apply_patch patch text
+# and edit_batch edits[] paths included, is owned by
+# `tool_resolution._PATH_NORMALIZED_TOOLS` / `_normalize_dispatch_path_args_result`.
 
 # Repo-lane write tools that take a top-level `root` arg. Every gate keyed to
 # "a write that lands in the repo working tree" must judge the whole set, not

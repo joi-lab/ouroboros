@@ -94,9 +94,12 @@ def test_budget_notification_is_silent_without_bounded_accounting(tmp_path, monk
     assert "budget_threshold" not in state
 
 
+# A root finish in Main: the audience of opt-in completion notifications.
+_OWNER_ROOT = {"summary_kind": "terminal_root_projection", "chat_id": 1}
+
+
 def _root(tid, phase, **fields):
-    return {"type": "task_summary", "task_id": tid, "outcome_final": True,
-            "summary_kind": "terminal_root_projection", "chat_id": 1, "outcome_phase": phase,
+    return {"type": "task_summary", "task_id": tid, "outcome_final": True, **_OWNER_ROOT, "outcome_phase": phase,
             "outcome_axes": {"lifecycle": {"status": "completed"}}, **fields}
 
 
@@ -106,11 +109,8 @@ def _write_rows(data, rows):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def test_non_clean_root_finish_reaches_the_owner_with_the_toggle_off(tmp_path, monkeypatch):
-    """The whole audience and phase contract in one table (owner Q8, astra A-F6):
-    exactly the warn/error/cancelled ROOTS in owner-facing chats push, in row order;
-    the clean root, a child, the hidden partition, an A2A room, a chat-less row and
-    a kind-less row send nothing; and every id is consumed."""
+def test_off_suppresses_every_phase_and_consumes_every_id(tmp_path, monkeypatch):
+    """OFF includes failures/cancellations; seen IDs prevent a backlog on enable."""
     nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
     monkeypatch.setattr(nt, "TelegramClient", _Rec)
     _write_rows(data, [
@@ -122,14 +122,33 @@ def test_non_clean_root_finish_reaches_the_owner_with_the_toggle_off(tmp_path, m
     ])
     state = {"notified_task_ids": []}
     asyncio.run(nt._check_tasks_notify(api, {}, 42, state, "en"))
-    assert [text for _chat, text in _Rec.sent] == [
-        "⚠️ Task warn1 done with warnings", "❌ Task err1 failed", "🚫 Task stop1 cancelled",
-    ]
+    assert _Rec.sent == []
     assert state["notified_task_ids"] == [
         "done1", "warn1", "err1", "stop1", "child1", "hidden1", "a2a1", "nochat1", "nokind1"]
+    asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
+    assert _Rec.sent == []
 
 
-def test_the_floor_and_the_toggle_are_one_producer_and_never_double(tmp_path, monkeypatch):
+def test_enabled_notices_never_widen_the_audience(tmp_path, monkeypatch):
+    """With task notifications on, a ROOT finish in an owner room is announced; a
+    child, the hidden partition, an A2A room and a chat-less or kind-less row still send
+    nothing (the toggle once pushed every finish, children included), and all are seen."""
+    nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
+    monkeypatch.setattr(nt, "TelegramClient", _Rec)
+    _write_rows(data, [
+        _root("done1", "done"), _root("warn1", "warn", chat_id=1000000),
+        _root("child1", "done", summary_kind="terminal_result_projection"),
+        _root("hidden1", "done", chat_id=0), _root("a2a1", "done", chat_id=-1001),
+        {k: v for k, v in _root("nochat1", "done").items() if k != "chat_id"},
+        {k: v for k, v in _root("nokind1", "done").items() if k != "summary_kind"},
+    ])
+    state = {"notified_task_ids": []}
+    asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
+    assert [text for _chat, text in _Rec.sent] == ["✅ Task done1 done", "⚠️ Task warn1 done with warnings"]
+    assert state["notified_task_ids"] == ["done1", "warn1", "child1", "hidden1", "a2a1", "nochat1", "nokind1"]
+
+
+def test_enabled_notices_are_one_producer_and_never_double(tmp_path, monkeypatch):
     nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
     monkeypatch.setattr(nt, "TelegramClient", _Rec)
     _write_rows(data, [_root("warn1", "warn")])
@@ -150,7 +169,7 @@ def test_task_line_carries_the_card_reason_sentence(tmp_path, monkeypatch):
         _root("adv1", "warn", reason_detail=TASK_CAUSE_PHRASES["plan_review_advisory"]),
         _root("plain1", "warn"),
     ])
-    asyncio.run(nt._check_tasks_notify(api, {}, 42, {"notified_task_ids": []}, "en"))
+    asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, {"notified_task_ids": []}, "en"))
     assert [text for _chat, text in _Rec.sent] == [
         f"⚠️ Task adv1 done with warnings\n{TASK_CAUSE_PHRASES['plan_review_advisory']}",
         "⚠️ Task plain1 done with warnings",
@@ -194,7 +213,7 @@ def test_notifier_never_edits_the_silent_mode_tracked_message():
 
 
 def test_the_notifier_loop_runs_the_tasks_lane_with_both_toggles_off(tmp_path, monkeypatch):
-    """The floor is not opt-in: a pinned chat alone runs the tasks check."""
+    """The disabled lane still observes IDs, but must not send anything."""
     nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
     monkeypatch.setattr(nt, "TelegramClient", _Rec)
     monkeypatch.setattr(nt, "_load_settings", lambda _api: {"TELEGRAM_CHAT_ID": "42"})
@@ -209,7 +228,8 @@ def test_the_notifier_loop_runs_the_tasks_lane_with_both_toggles_off(tmp_path, m
     monkeypatch.setattr(nt.asyncio, "sleep", sleep)
     with pytest.raises(RuntimeError):
         asyncio.run(nt._make_notifier(api)())
-    assert [text for _chat, text in _Rec.sent] == ["⚠️ Task warn1 done with warnings"]
+    assert _Rec.sent == []
+    assert nt._load_notif_state(api)["notified_task_ids"] == ["warn1"]
     assert sleeps == [30]
 
 
@@ -217,13 +237,13 @@ def test_tasks_notify_primes_then_fires(tmp_path, monkeypatch):
     nt = _load(); api, data = _api(tmp_path); _Rec.sent = []
     monkeypatch.setattr(nt, "TelegramClient", _Rec)
     chat = data / "logs" / "chat.jsonl"
-    chat.write_text(json.dumps({"type": "task_summary", "task_id": "old1", "rounds": 3,
+    chat.write_text(json.dumps({"type": "task_summary", **_OWNER_ROOT, "task_id": "old1", "rounds": 3,
                                 "outcome_axes": {"lifecycle": "completed"}}) + "\n", encoding="utf-8")
     settings = {"TELEGRAM_NOTIFY_TASKS": "on"}; state = {}
     asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))   # primes, no send
     assert _Rec.sent == [] and "old1" in state["notified_task_ids"]
     with open(chat, "a", encoding="utf-8") as f:
-        f.write(json.dumps({"type": "task_summary", "task_id": "new1", "rounds": 5,
+        f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, "task_id": "new1", "rounds": 5,
                             "outcome_axes": {"lifecycle": "completed"}}) + "\n")
     asyncio.run(nt._check_tasks_notify(api, settings, 42, state, "en"))
     assert len(_Rec.sent) == 1 and "new1" in _Rec.sent[0][1] and "5r" in _Rec.sent[0][1]
@@ -250,7 +270,7 @@ def test_tasks_notify_waits_for_latest_final_summary_for_each_task(tmp_path, mon
     monkeypatch.setattr(nt, "TelegramClient", _Rec)
     chat = data / "logs" / "chat.jsonl"
     working = {
-        "type": "task_summary", "task_id": "same1", "outcome_final": False,
+        "type": "task_summary", **_OWNER_ROOT, "task_id": "same1", "outcome_final": False,
         "outcome_phase": "working",
         "outcome_axes": {"lifecycle": {"status": "completed"},
                          "execution": {"status": "ok"}},
@@ -328,7 +348,8 @@ def test_task_notification_retries_before_advancing_ledger(tmp_path, monkeypatch
 
     monkeypatch.setattr(nt, "TelegramClient", Flaky)
     (data / "logs" / "chat.jsonl").write_text(
-        json.dumps({"type": "task_summary", "task_id": "retry1", "outcome_axes": {"lifecycle": "completed"}}) + "\n",
+        json.dumps({"type": "task_summary", **_OWNER_ROOT, "task_id": "retry1",
+                    "outcome_axes": {"lifecycle": "completed"}}) + "\n",
         encoding="utf-8",
     )
     settings = {"TELEGRAM_NOTIFY_TASKS": "on"}; state = {"notified_task_ids": []}
@@ -355,7 +376,7 @@ def test_tasks_notify_stops_batch_on_first_transient_failure(tmp_path, monkeypat
     monkeypatch.setattr(nt, "TelegramClient", AlwaysOffline)
     with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
         for tid in ("t1", "t2", "t3"):
-            f.write(json.dumps({"type": "task_summary", "task_id": tid,
+            f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, "task_id": tid,
                                 "outcome_axes": {"lifecycle": "completed"}}) + "\n")
     state = {"notified_task_ids": []}
     transient, delivered = asyncio.run(
@@ -387,7 +408,7 @@ def test_notifier_cycle_makes_one_send_attempt_when_transport_is_down(tmp_path, 
     monkeypatch.setattr(nt, "_load_runtime_state", runtime_state)
     with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
         for tid in ("t1", "t2", "t3"):
-            f.write(json.dumps({"type": "task_summary", "task_id": tid,
+            f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, "task_id": tid,
                                 "outcome_axes": {"lifecycle": "completed"}}) + "\n")
     tasks_checks = []
     real_tasks_check = nt._check_tasks_notify
@@ -682,7 +703,7 @@ def test_tasks_notify_reads_lifecycle_status_and_severity_icon(tmp_path, monkeyp
     ]
     with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps({"type": "task_summary", **row}) + "\n")
+            f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, **row}) + "\n")
     state = {"notified_task_ids": []}
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
 
@@ -724,7 +745,7 @@ def test_tasks_notify_consumes_the_host_status_phase_when_the_row_carries_one(
     ]
     with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps({"type": "task_summary", **row}) + "\n")
+            f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, **row}) + "\n")
     state = {"notified_task_ids": []}
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, state, "en"))
 
@@ -755,7 +776,7 @@ def test_tasks_notify_word_and_icon_follow_the_host_phase(tmp_path, monkeypatch)
     ]
     with open(data / "logs" / "chat.jsonl", "w", encoding="utf-8") as f:
         for row in rows:
-            f.write(json.dumps({"type": "task_summary", **row}) + "\n")
+            f.write(json.dumps({"type": "task_summary", **_OWNER_ROOT, **row}) + "\n")
     asyncio.run(nt._check_tasks_notify(api, {"TELEGRAM_NOTIFY_TASKS": "on"}, 42, {"notified_task_ids": []}, "en"))
     assert [text for _chat, text in _Rec.sent] == [
         "❌ Task fail1 failed · 3r",

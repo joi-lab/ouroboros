@@ -32,6 +32,7 @@ from devtools.benchmarks.osworld.cu_bridge_runtime import SKILL_NAME
 _ALLOWED_CORE_TOOLS = frozenset({
     "list_available_tools", "enable_tools",   # discover + enable the computer-use skill
     "view_image",                             # the vision channel (SEE screenshots)
+    "finish_task",                            # select the result after review feedback
     "compact_context", "set_tool_timeout",    # agent self-management (no host access)
 })
 

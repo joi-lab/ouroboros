@@ -1,5 +1,4 @@
 import json
-import os
 import pathlib
 import re
 from types import SimpleNamespace
@@ -12,6 +11,7 @@ from ouroboros.tools.project_journal import (
 from ouroboros.tools.recent_tasks import _handle_recent_tasks
 from ouroboros.tools.task_tree import _tree_read
 from ouroboros.utils import append_jsonl
+from tests._store_shared import seed_result, read_result
 
 
 def _snapshot(text: str) -> str:
@@ -262,17 +262,15 @@ def test_runtime_tree_digest_uses_same_canonical_root_as_tree_read(tmp_path):
 
 
 def _write_task(root, index: int, *, project_id: str = "mine") -> None:
-    path = root / "task_results" / f"task-{index:03d}.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
+    seed_result(root, f"task-{index:03d}", {
         "task_id": f"task-{index:03d}",
         "ts": f"2026-08-21T00:{index // 60:02d}:{index % 60:02d}Z",
+        "updated_at": f"2026-08-21T00:{index // 60:02d}:{index % 60:02d}Z",
         "status": "completed",
         "description": f"task {index}",
         "result": f"result {index}",
         "project_id": project_id,
-    }), encoding="utf-8")
-    os.utime(path, ns=(index + 1, index + 1))
+    })
 
 
 def test_recent_tasks_pages_364_and_finds_21st_without_known_id(tmp_path):
@@ -317,11 +315,9 @@ def test_recent_tasks_next_replays_result_and_trace_query_flags(tmp_path):
     canonical = tmp_path / "canonical"
     for index in range(3):
         _write_task(canonical, index)
-        path = canonical / "task_results" / f"task-{index:03d}.json"
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = read_result(canonical, f"task-{index:03d}")
         data["trace_summary"] = f"trace {index}"
-        path.write_text(json.dumps(data), encoding="utf-8")
-        os.utime(path, ns=(index + 1, index + 1))
+        seed_result(canonical, f"task-{index:03d}", data)
     ctx = SimpleNamespace(drive_root=tmp_path / "fork", budget_drive_root=str(canonical))
 
     first = json.loads(_handle_recent_tasks(

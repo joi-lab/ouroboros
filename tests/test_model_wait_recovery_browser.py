@@ -146,7 +146,7 @@ def test_current_attempt_snapshot_never_reopens_old_wait_after_reload(waiting_ui
     page.reload()
     # Activities own the header, not card creation. A retained old wait alone
     # must not mint a card for this attempt before its first real progress.
-    page.locator('#chat-status').filter(has_text="Working...").wait_for()
+    page.locator('#chat-status').filter(has_text="Working").wait_for()
     page.wait_for_function("() => document.querySelectorAll('.model-wait-row').length === 0")
     assert len(task["model_waits"]) == 2, "Old rows remain retained as history"
     capture(page, "retried-task-without-old-wait")

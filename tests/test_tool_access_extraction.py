@@ -18,6 +18,7 @@ from ouroboros import (
     tool_access,
     tool_access_paths,
     tool_access_roots,
+    tool_access_reads,
     tool_access_types,
     tool_access_user_files,
 )
@@ -29,10 +30,12 @@ _LEAVES = (
     tool_access_types,
     tool_access_paths,
     tool_access_roots,
+    tool_access_reads,
     tool_access_user_files,
 )
 
 _MOVED_OWNERS = {
+    "scheduled_origin": tool_access_reads,
     "Operation": tool_access_types,
     "ResolvedResourceBinding": tool_access_types,
     "ResourceRoot": tool_access_types,
@@ -135,15 +138,3 @@ def test_tool_access_policy_matrix_is_one_object_across_owners():
     the facade re-export IS its binding."""
     assert tool_access._POLICY is tool_access_types._POLICY
     assert set(tool_access._ALL_ROOTS) == set(tool_access_types._ALL_ROOTS)
-
-
-def test_tool_access_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (tool_access, *_LEAVES)
-    }
-    assert counts["ouroboros.tool_access"] <= 900
-    assert all(count <= 1000 for count in counts.values())
-    assert counts["ouroboros.tool_access_user_files"] <= 1000

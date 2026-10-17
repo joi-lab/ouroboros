@@ -8,7 +8,15 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
+import tempfile
 from pathlib import Path
+
+
+def default_temp_parent() -> Path:
+    """A short macOS root keeps nested multiprocessing sockets inside AF_UNIX's path limit.
+    Other platforms retain their normal temporary-directory selection."""
+    return Path("/tmp") if sys.platform == "darwin" else Path(tempfile.gettempdir())
 
 
 def settings_keys() -> set[str]:
@@ -36,6 +44,20 @@ def scrub_environment(source, *, keep=()) -> dict[str, str]:
     return {key: value for key, value in source.items()
             if key in keep or not (key.startswith(prefixes) or key.endswith(suffixes)
                                   or key in projected or key in {"NODE_OPTIONS", "VIRTUAL_ENV"})}
+
+
+# Launch descriptors: launchd/XPC session ids, PyInstaller bootloader state and the
+# shell's location/session bookkeeping. They change with every launch and configure
+# nothing a test may rely on, so the hermetic gate neither passes nor fingerprints
+# them (a durable test receipt must survive a Restart); every other key stays.
+LAUNCH_ONLY_PREFIXES = ("XPC_", "_PYI_")
+LAUNCH_ONLY_KEYS = frozenset({"PWD", "OLDPWD", "SHLVL", "_", "TERM_SESSION_ID", "SECURITYSESSIONID",
+                              "LaunchInstanceID", "LAUNCHINSTANCEID"})
+
+
+def without_launch_descriptors(env: dict) -> dict[str, str]:
+    return {key: value for key, value in env.items()
+            if key not in LAUNCH_ONLY_KEYS and not key.startswith(LAUNCH_ONLY_PREFIXES)}
 
 
 # A disposable tree whose processes were not PROVEN gone keeps this file at its

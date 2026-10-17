@@ -174,7 +174,10 @@ def test_terminal_publication_timing_and_answer_copy(direct_server_with_data, br
                 rows = page.locator('#chat-messages .project-answer')
                 assert rows.count() == 3
                 assert rows.locator('.message').all_inner_texts() == ['NEW_TASK_ANSWER', 'OLD_TASK_ANSWER', 'LEGACY_TASK_ANSWER']
-                notes = rows.locator('.msg-provenance').all_inner_texts()
+                # One compact limitation beside each non-clean final; the clean one stays unadorned.
+                assert [row.locator('.project-answer-limitation').all_inner_texts() for row in rows.all()] == [
+                    [], ['Failed'], ['Failed']]
+                notes = rows.locator('.msg-provenance:not(.project-answer-limitation)').all_inner_texts()
                 assert 'Task ended' in notes[0] and 'Sep 25, 2026' in notes[0]
                 assert 'Sep 24, 2026' in notes[1] and 'Notification added Sep 26, 2026' in notes[1]
                 assert notes[2].startswith('Task end time not recorded')

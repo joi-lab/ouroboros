@@ -1,5 +1,6 @@
 """Snapshot working bytes stay exact; binary/large preimages stay outside Git's ODB."""
 from hashlib import sha256
+import os
 from pathlib import Path
 import subprocess
 import zipfile
@@ -41,10 +42,10 @@ def document(path, text="Original document"):
         archive.writestr("word/document.xml", f'<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>')
 
 
-def snapshot(tmp_path, target):
+def snapshot(tmp_path, target, *, independent=False):
     return provision_execution_snapshot(
         target_root=target, task_id="input-test", snapshot_id="input-snapshot",
-        worktree_root=tmp_path / "snapshots", data_dir=tmp_path / "data",
+        worktree_root=tmp_path / "snapshots", data_dir=tmp_path / "data", independent=independent,
     )
 
 
@@ -175,12 +176,25 @@ def test_baseline_file_copy_failure_cleans_checkout_ref_and_record(tmp_path, mon
 
 
 @pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
-@pytest.mark.parametrize("policy", ["autocrlf", "attributes"])
-def test_git_checkout_preserves_working_bytes_and_normal_patch_semantics(tmp_path, newline, policy):
+@pytest.mark.parametrize("policy", ["autocrlf", "attributes", "info_attributes", "info_overrides_tree", "attributes_file"])
+@pytest.mark.parametrize("independent", [False, True], ids=["worktree", "clone"])
+def test_git_checkout_preserves_working_bytes_and_normal_patch_semantics(tmp_path, newline, policy, independent):
     target = target_tree(tmp_path)
     git(target, "config", "core.autocrlf", "true" if policy == "autocrlf" else "false")
     if policy == "attributes":
         (target / ".gitattributes").write_bytes(b"*.txt text eol=crlf\n")
+    elif policy == "info_attributes":  # repository-local: an independent clone does not inherit it
+        (target / ".git" / "info").mkdir(exist_ok=True)
+        (target / ".git" / "info" / "attributes").write_bytes(b"*.txt text\n")
+        git(target, "config", "core.eol", "crlf")
+    elif policy == "info_overrides_tree":  # info/attributes outranks the tree's own file
+        (target / ".gitattributes").write_bytes(b"*.txt -text\n")
+        (target / ".git" / "info").mkdir(exist_ok=True)
+        (target / ".git" / "info" / "attributes").write_bytes(b"*.txt text eol=crlf\n")
+    elif policy == "attributes_file":
+        (tmp_path / "attributes").write_bytes(b"*.txt text eol=crlf\n")
+        git(target, "config", "core.attributesFile", str(tmp_path / "attributes"))
+    source_config = (target / ".git" / "config").read_bytes()
     original = newline.join([b"original", b"working bytes", b""])
     for name in ("code.txt", "staged.txt", "untracked.txt"):
         (target / name).write_bytes(original)
@@ -192,11 +206,16 @@ def test_git_checkout_preserves_working_bytes_and_normal_patch_semantics(tmp_pat
     before_index = git(target, "ls-files", "--stage", "-z").stdout
     before_head = git(target, "rev-parse", "HEAD").stdout
 
-    handle = snapshot(tmp_path, target)
+    handle = snapshot(tmp_path, target, independent=independent)
     execution = Path(handle.path)
     for name in ("code.txt", "staged.txt", "untracked.txt"):
         assert (execution / name).read_bytes() == original
+        # The copy's own Git writes the source's checkout representation.
+        assert git(execution, "cat-file", "--filters", f"{handle.baseline_sha}:{name}").stdout == \
+            git(target, "cat-file", "--filters", f"{handle.baseline_sha}:{name}").stdout
     assert not (execution / "deleted.txt").exists()
+    assert git(execution, "status", "--porcelain=v1", "-z").stdout == b""
+    assert (target / ".git" / "config").read_bytes() == source_config
     assert git(target, "status", "--porcelain=v1", "-z").stdout == before_status
     assert git(target, "ls-files", "--stage", "-z").stdout == before_index
     assert git(target, "rev-parse", "HEAD").stdout == before_head
@@ -221,16 +240,78 @@ def test_git_checkout_preserves_working_bytes_and_normal_patch_semantics(tmp_pat
     assert git(target, "rev-parse", "HEAD").stdout == before_head
 
 
+@pytest.mark.parametrize("local", ["", "false"], ids=["global_only", "local_overrides_global"])
+def test_clone_adopts_only_the_comparison_its_global_scope_does_not_give(tmp_path, monkeypatch, local):
+    global_config = tmp_path / "global.gitconfig"
+    global_config.write_bytes(b"[core]\n\tautocrlf = true\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    target = target_tree(tmp_path)
+    if local:
+        git(target, "config", "core.autocrlf", local)
+    (target / "code.txt").write_bytes(b"working\nbytes\n")
+    (target / "untracked.txt").write_bytes(b"working\r\nbytes\r\n")
+    handle = snapshot(tmp_path, target, independent=True)
+    execution = Path(handle.path)
+    for name in ("code.txt", "untracked.txt"):
+        assert (execution / name).read_bytes() == (target / name).read_bytes()
+        assert git(execution, "cat-file", "--filters", f"{handle.baseline_sha}:{name}").stdout == \
+            git(target, "cat-file", "--filters", f"{handle.baseline_sha}:{name}").stdout
+    assert git(execution, "status", "--porcelain=v1", "-z").stdout == b""
+    # The operator's global value is inherited, never copied; a local override is.
+    assert git(execution, "config", "--local", "--get", "core.autocrlf", check=False).stdout.strip() == local.encode()
+    assert global_config.read_bytes() == b"[core]\n\tautocrlf = true\n"
+    manifest, rows = capture(tmp_path, handle)
+    assert manifest["status"] == "ready_no_changes" and rows == []
+
+
+@pytest.mark.parametrize("independent", [False, True], ids=["worktree", "clone"])
+def test_a_source_local_filter_driver_is_never_carried_into_the_clone(tmp_path, independent):
+    target = target_tree(tmp_path)
+    git(target, "config", "filter.digest.clean", "git hash-object --stdin")
+    (target / ".gitattributes").write_bytes(b"code.txt filter=digest\n")
+    if not independent:  # a linked worktree shares its source's driver
+        handle = snapshot(tmp_path, target)
+        assert git(handle.path, "status", "--porcelain=v1", "-z").stdout == b""
+        return
+    with pytest.raises(subprocess.CalledProcessError):
+        snapshot(tmp_path, target, independent=True)
+    assert find_execution_snapshot("input-snapshot", tmp_path / "data") is None
+    assert not git(target, "for-each-ref", "refs/ouroboros/delegated/").stdout
+    assert not list((tmp_path / "snapshots").glob("dlg_*"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="no executable bit for the source to distrust")
+@pytest.mark.parametrize("independent", [False, True], ids=["worktree", "clone"])
+def test_untrusted_executable_bit_stays_out_of_the_snapshot_diff(tmp_path, independent):
+    target = target_tree(tmp_path)
+    git(target, "config", "core.filemode", "false")
+    (target / "code.txt").chmod(0o755)  # not a change the source's Git can see
+    handle = snapshot(tmp_path, target, independent=independent)
+    execution = Path(handle.path)
+    assert (execution / "code.txt").stat().st_mode & 0o111
+    assert git(execution, "status", "--porcelain=v1", "-z").stdout == b""
+    manifest, rows = capture(tmp_path, handle)
+    assert manifest["status"] == "ready_no_changes" and rows == []
+    (execution / "code.txt").write_bytes(b"child edit\n")
+    manifest, rows = capture(tmp_path, handle)
+    assert manifest["tracked_changed"] == ["code.txt"]
+    assert b"mode" not in (tmp_path / "capture" / "workspace.patch").read_bytes()
+
+
 @pytest.mark.parametrize("failure", ["copy_error", "source_changed"])
-def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("independent", [False, True], ids=["worktree", "clone"])
+def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp_path, monkeypatch, failure, independent):
     from ouroboros import artifacts
 
     target = target_tree(tmp_path)
+    # Unchanged CRLF bytes compare clean under the source's conversion; new content never does.
+    git(target, "config", "core.autocrlf", "true")
+    (target / "code.txt").write_bytes(b"unstaged\r\n")
     before_index = git(target, "ls-files", "--stage", "-z").stdout
     before_head = git(target, "rev-parse", "HEAD").stdout
     before_bytes = (target / "code.txt").read_bytes()
     original = artifacts.copy_artifact_file
-    newer = b"concurrent owner edit\n"
+    newer = b"concurrent owner edit\r\n"
 
     def copy(source, destination, **kwargs):
         if Path(source) == target / "code.txt":
@@ -242,7 +323,7 @@ def test_regular_input_copy_failure_cleans_snapshot_without_rewriting_target(tmp
     monkeypatch.setattr(artifacts, "copy_artifact_file", copy)
     expected = OSError if failure == "copy_error" else subprocess.CalledProcessError
     with pytest.raises(expected):
-        snapshot(tmp_path, target)
+        snapshot(tmp_path, target, independent=independent)
     assert (target / "code.txt").read_bytes() == (newer if failure == "source_changed" else before_bytes)
     assert git(target, "ls-files", "--stage", "-z").stdout == before_index
     assert git(target, "rev-parse", "HEAD").stdout == before_head

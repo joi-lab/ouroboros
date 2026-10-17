@@ -268,20 +268,40 @@ def run_chat_viewport_smoke(
             }"""
         )
 
+    held_census = []
+
+    def hold_census(route):
+        held_census.append(route)
+
+    def release_census(page):
+        page.unroute("**/api/state", hold_census)
+        while held_census:
+            held_census.pop(0).fallback()
+
     def begin_noop_read(page):
         # Establish follow through the existing reader action for the no-op
         # precondition, even when a concurrent restore already hid the button.
-        # Physical button and wheel interactions are exercised separately below.
+        # ↓ lands only once history still settling is idle, so the reader's own
+        # wheel at the edge then supersedes a return still pending (DESIGN
+        # "Reading on ... supersedes a ↓") and keeps following. The page's own
+        # /api/state poll waits for the window: a census that disagrees with these
+        # cards (switched below between complete and incomplete) repaints them,
+        # and inside the follow zone that repaint follows. The frame under test
+        # is the window's only writer; the census answers after it.
+        page.route("**/api/state", hold_census)
         page.locator("#chat-scroll-bottom").dispatch_event("click")
-        page.evaluate(_SETTLE_TWO_FRAMES)
+        read_to_latest(page)
         state = jump_state(page)
         assert state["remaining"] <= 1 and state["dotHidden"], state
         return set_remaining(page, 40)["scrollTop"]
 
     def assert_noop_read(page, before):
-        state = jump_state(page)
-        assert abs(state["scrollTop"] - before) <= 1, state
-        assert abs(state["remaining"] - 40) <= 2 and state["dotHidden"], state
+        try:
+            state = jump_state(page)
+            assert abs(state["scrollTop"] - before) <= 1, state
+            assert abs(state["remaining"] - 40) <= 2 and state["dotHidden"], state
+        finally:
+            release_census(page)
 
     def assert_noop_frame(page, frame):
         evidence.checkpoint("noop_frame:prepare", planned_frame=frame)
@@ -989,7 +1009,9 @@ def run_chat_viewport_smoke(
                 assert not jump_state(page)["dotHidden"]
 
                 # Repeating the exact applied revision consumes the frame but
-                # changes no projection, so it must not manufacture activity.
+                # changes no projection, so it must not manufacture activity
+                # (the census poll waits, as in every no-op window).
+                page.route("**/api/state", hold_census)
                 button.click()
                 page.evaluate(_SETTLE_TWO_FRAMES)
                 set_remaining(page, 300)
@@ -1012,6 +1034,7 @@ def run_chat_viewport_smoke(
                 )
                 assert duplicate_after == duplicate_before
                 assert jump_state(page)["dotHidden"]
+                release_census(page)
 
                 # Remote provenance survives the GET: the reference can arrive
                 # at bottom, then the reader can move away before Reviews lands.

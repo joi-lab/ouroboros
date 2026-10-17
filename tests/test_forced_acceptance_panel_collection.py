@@ -79,6 +79,8 @@ def test_turn_without_a_panel_keeps_the_rails_bypass_reason(recorder):
     """The quiet direction: nothing ran, so the rail's own reason is the truth."""
     ctx, record = recorder
     trace = _trace(ctx)
+    from ouroboros.artifacts import store_task_artifact_bytes
+    store_task_artifact_bytes(ctx.drive_root, ctx.task_id, "report.txt", ANSWER.encode())
     record(trace)
     assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
     assert trace["acceptance_decision"]["reason"] == BYPASS

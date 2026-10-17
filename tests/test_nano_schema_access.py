@@ -27,8 +27,16 @@ def test_nano_child_can_select_only_its_existing_capabilities(tmp_path, monkeypa
     assert ("run_command" in names) is (profile == "acting_subagent")
     assert "commit_reviewed" not in names
     if mode == "nano":
+        from ouroboros.tool_policy import initial_tool_schemas
+        from ouroboros.tools.tool_discovery import bind_resident_schemas
+
+        resident = initial_tool_schemas(registry, context_mode=mode)
+        assert "read_file" not in {s["function"]["name"] for s in resident}
+        bind_resident_schemas(registry, resident)
         result = registry.execute_result("enable_tools", {"tools": "read_file,commit_reviewed"})
         assert result.status == "ok", result.text
+        assert "read_file" in {s["function"]["name"] for s in resident}
+        assert "commit_reviewed" not in {s["function"]["name"] for s in resident}
         assert registry.get_schema_by_name("commit_reviewed") is None
         assert set(registry.available_tools()) == names
     ctx.task_contract = {"disabled_tools": ["enable_tools"]}

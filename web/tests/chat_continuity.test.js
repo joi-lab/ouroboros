@@ -203,22 +203,22 @@ test('admitted managed work shows Working... without a live card', () => {
         activeDirectCount: 0,
         pendingSubmissionsCount: 0,
     });
-    assert.deepEqual(status, { kind: 'thinking', text: 'Working...', showDots: true });
+    assert.deepEqual(status, { kind: 'thinking', text: 'Working', tone: 'live', showDots: true, dots: 'moving' });
 });
 
 test('managed status priority: working > thinking > sending > queued > online', () => {
     assert.equal(computeDerivedChatStatus({
         activeManagedCount: 1, activeDirectCount: 1, pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Working...');
+    }).text, 'Working');
     assert.equal(computeDerivedChatStatus({
         activeDirectCount: 1, pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Thinking...');
+    }).text, 'Working');
     assert.equal(computeDerivedChatStatus({
         pendingSubmissionsCount: 1, queuedManagedCount: 1,
-    }).text, 'Sending...');
+    }).text, 'Sending');
     assert.equal(computeDerivedChatStatus({
         queuedManagedCount: 1,
-    }).text, 'Queued...');
+    }).text, 'Queued');
     assert.equal(computeDerivedChatStatus({}).text, 'Online');
 });
 

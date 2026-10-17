@@ -11,6 +11,7 @@
 
 import { apiFetch } from './api_client.js';
 import { escapeHtmlAttr, renderMarkdown } from './utils.js';
+import { hostNoticeDisplayText } from './host_notice_text.js';
 
 const writeDirectly = (mutate) => mutate();
 
@@ -20,7 +21,7 @@ const writeDirectly = (mutate) => mutate();
 export function summarizeSkillReviewMessage(text) {
     const raw = String(text || '');
     const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const headline = lines[0] || 'Skill review';
+    const headline = hostNoticeDisplayText(lines[0] || 'Skill review', 'skill_review');
     const hashLine = lines.find((line) => line.startsWith('content_hash=')) || '';
     const reviewersLine = lines.find((line) => line.startsWith('Reviewers:')) || '';
     const findingsLine = lines.find((line) => /^##\s+Findings/.test(line)) || '';
@@ -50,7 +51,7 @@ export function renderSkillReviewDisclosure(text, ref = null, deps = {}) {
                     <span class="skill-review-toggle-label">Show review</span>
                 </span>
             </button>
-            <div class="skill-review-full" data-skill-review-full data-chat-markdown-enhanced="1" hidden>${jobRef ? '' : render(text)}</div>
+            <div class="skill-review-full" data-skill-review-full data-chat-markdown-enhanced="1" hidden>${jobRef ? '' : render(hostNoticeDisplayText(text, 'skill_review'))}</div>
         </div>
     `;
 }
@@ -88,7 +89,7 @@ function renderDetailState(full, entry, render, onDomWrite = writeDirectly) {
         if (entry.state === 'loading') {
             full.innerHTML = '<div class="skill-review-loading" role="status" aria-live="polite">Loading review details…</div>';
         } else if (entry.state === 'loaded') {
-            full.innerHTML = render(entry.markdown);
+            full.innerHTML = render(hostNoticeDisplayText(entry.markdown, 'skill_review'));
         } else if (entry.state === 'error') {
             full.innerHTML = `<div class="skill-review-error" role="status" aria-live="polite">Review details unavailable (${escapeHtmlAttr(entry.error)}). `
                 + (entry.retryable

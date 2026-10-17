@@ -194,7 +194,7 @@ def test_main_steers_the_resolver_through_the_mailbox_while_the_gate_is_closed(
     tx_repo, tmp_path, monkeypatch,
 ):
     import supervisor.queue as supervisor_queue
-    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.owner_mailbox import drain_owner_entries
     from supervisor.steering import _handle_steer_task
 
     tx = _write_tx("assisted_resolution")
@@ -219,7 +219,7 @@ def test_main_steers_the_resolver_through_the_mailbox_while_the_gate_is_closed(
         "client_message_id": "steer-owner-1",
     }, handler_ctx)
 
-    assert drain_owner_messages(tmp_path, RESOLVER_ID) == [
+    assert [e["text"] for e in drain_owner_entries(tmp_path, RESOLVER_ID)] == [
         "Keep our local config.py changes; take upstream for loop.py.",
     ]
 

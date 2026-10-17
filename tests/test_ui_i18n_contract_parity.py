@@ -21,8 +21,9 @@ def _py_fields(cls) -> set[str]:
 
 def test_every_interface_language_envelope_has_a_field_identical_browser_twin():
     text = TWIN.read_text(encoding="utf-8")
-    names = [name for name in contracts.__all__ if name.startswith("UiI18n")]
-    assert names, "the twin pair lost its envelopes"
+    names = list(contracts.__all__)  # the HTTP envelopes and the two WS frames
+    assert {"UiI18nResponse", "UiLanguageChangedOutbound", "UiI18nUpdatedOutbound"} <= set(names), \
+        "the twin pair lost its envelopes"
     for name in names:
         cls = getattr(contracts, name)
         assert re.search(rf"@typedef \{{Object\}} {name}\b", text), f"ui_i18n_types.js lacks {name}"

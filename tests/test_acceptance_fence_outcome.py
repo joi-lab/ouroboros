@@ -57,7 +57,7 @@ def test_one_lost_ack_and_resend_puts_the_fence_up(monkeypatch, tmp_path, short_
     queue_mod, _pending = _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
     supervisor = _Supervisor(events, tmp_path, lose_acks=1)
-    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events))
+    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events, running=monkeypatch))
     try:
         fence_ok, token = _begin_task_acceptance_fence(ctx, "root-1")
     finally:
@@ -91,7 +91,7 @@ def test_healthy_supervisor_leaves_no_unavailable_row(monkeypatch, tmp_path, sho
     _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
     supervisor = _Supervisor(events, tmp_path)
-    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events))
+    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events, running=monkeypatch))
     try:
         assert _begin_task_acceptance_fence(ctx, "root-1")[0]
         assert _begin_task_acceptance_fence(ctx, "root-1")[0]  # refresh through inspect
@@ -112,7 +112,7 @@ def test_refused_begin_is_typed_refused_with_its_reason(monkeypatch, tmp_path, s
     queue_mod.transition_acceptance_fence(action="end", token="a" * 32, outcome="terminal")
     events: stdqueue.Queue = stdqueue.Queue()
     supervisor = _Supervisor(events, tmp_path)
-    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events))
+    ctx = _loop_ctx(tmp_path, _pooled_agent(tmp_path, events, running=monkeypatch))
     try:
         outcome, token = _begin_task_acceptance_fence(ctx, "root-1")
     finally:
@@ -260,7 +260,7 @@ def test_lost_generation_mismatch_ack_cannot_produce_a_blind_seal(monkeypatch, t
 
     queue_mod, _pending = _isolated_queue(monkeypatch, tmp_path)
     events: stdqueue.Queue = stdqueue.Queue()
-    agent = _pooled_agent(tmp_path, events)
+    agent = _pooled_agent(tmp_path, events, running=monkeypatch)
     ctx = _loop_ctx(tmp_path, agent)
     supervisor = _Supervisor(events, tmp_path)
     try:

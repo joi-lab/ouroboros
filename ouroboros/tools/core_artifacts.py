@@ -81,7 +81,7 @@ def _send_photo(ctx: ToolContext, file_path: str = "", image_base64: str = "",
         "mime": mime,
         "caption": caption or "",
     })
-    text = "OK: photo sent to owner chat." if mode == "live" else "OK: photo queued for delivery to owner."
+    text = "OK: photo accepted for delivery to owner chat." if mode == "live" else "OK: photo queued for delivery to owner."
     return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text))
 
 
@@ -129,7 +129,7 @@ def _send_video(ctx: ToolContext, file_path: str = "", caption: str = "") -> str
         "mime": mime,
         "caption": caption or "",
     })
-    text = "OK: video sent to owner chat." if mode == "live" else "OK: video queued for delivery to owner."
+    text = "OK: video accepted for delivery to owner chat." if mode == "live" else "OK: video queued for delivery to owner."
     return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text))
 
 
@@ -151,6 +151,9 @@ def _send_file(ctx: ToolContext, file_path: str = "", caption: str = "") -> str:
         return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR", text="⚠️ Provide a file_path."))
 
     fp = pathlib.Path(file_path).expanduser().resolve()
+    if not fp.exists():
+        from ouroboros.evidence_packs import materialize_path
+        materialize_path(fp)  # a packed checkpoint handle is written back beside its name first
     if not fp.exists() or not fp.is_file():
         return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR", text=f"⚠️ File not found: {file_path}"))
     mime = _detect_document_mime(str(fp))
@@ -185,7 +188,9 @@ def _send_file(ctx: ToolContext, file_path: str = "", caption: str = "") -> str:
         # older caller's artifact context is unavailable. No uncaptured URL or
         # reference is published, and source-read failures still refuse delivery.
         try:
-            with fp.open("rb") as source:
+            from ouroboros.store import open_for_read
+
+            with open_for_read(fp) as source:
                 raw = source.read(_MAX_DOCUMENT_FILE_BYTES + 1)
             if len(raw) > _MAX_DOCUMENT_FILE_BYTES:
                 raise OSError(f"large file requires artifact capture: {exc}")
@@ -208,7 +213,7 @@ def _send_file(ctx: ToolContext, file_path: str = "", caption: str = "") -> str:
         "download_url_compat": compat_url,
         "file_ref": file_ref,
     })
-    text = (f"OK: file '{fp.name}' sent to owner chat." if mode == "live"
+    text = (f"OK: file '{fp.name}' accepted for delivery to owner chat." if mode == "live"
             else f"OK: file '{fp.name}' queued for delivery to owner.")
     return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text))
 
@@ -308,7 +313,7 @@ class QuizValidationError(ValueError):
 
 def validate_quiz_payload(
     question: Any, options: Any, stake: Any, assumption: Any,
-    *, wait_for_answer: bool = False, max_wait_minutes: Any = None,
+    *, wait_for_answer: bool = False, max_wait_minutes: Any = None, task: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Return one cleaned quiz payload, or refuse the entire card.
 
@@ -316,9 +321,9 @@ def validate_quiz_payload(
     callers — the LinksOutbound pattern). Optional questions name an
     assumption; required waiting has no implied default answer.
 
-    ``max_wait_minutes`` bounds a required wait only, and never past the task's
-    absolute wall-clock ceiling: beyond it the ceiling would end the task
-    first, so a larger bound would be a promise the runtime cannot keep.
+    ``max_wait_minutes`` bounds a required wait only, and never past ``task``'s
+    execution time limit (a wait counts as execution): beyond it that limit would
+    end the task first, so a larger bound would be a promise the runtime cannot keep.
 
     The authored text (question, option details, stake, assumption) is kept
     whole: the card may be the only explanation its reader gets, so there is no
@@ -374,7 +379,7 @@ def validate_quiz_payload(
             "state the assumption you continue under until the owner answers "
             "(what you do meanwhile, for example your recommended option).",
         )
-    bound = _validate_wait_bound(max_wait_minutes, wait_for_answer=wait_for_answer)
+    bound = _validate_wait_bound(max_wait_minutes, wait_for_answer=wait_for_answer, task=task)
     return {
         "question": q_text,
         "options": cleaned,
@@ -415,9 +420,23 @@ ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
         "calls. Waiting questions in one batch share one wait, ending on the first incoming "
         "message, not necessarily an owner answer. A plain-text clarification ends this "
         "turn; a waited question keeps it alive. How many decisions to raise and when "
-        "remains your judgment."
+        "remains your judgment. Unanswered questions remain available from Main after the "
+        "task ends. To explicitly retire a question, use action=close, quiz_id and a "
+        "non-empty reason; question_task_id may identify a recorded Continue or retry predecessor, "
+        "or another task that has already finished. Before you finish, close each of your own "
+        "unanswered questions whose answer would no longer change anything, saying why; leave the "
+        "rest open. Closing is your decision with an explanation, never the human's approval. "
+        "Materials may name existing task artifacts needed for the decision."
     ),
     "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["ask", "close"], "default": "ask"},
+        "quiz_id": {"type": "string", "description": "Existing question to close; used only with action=close."},
+        "question_task_id": {"type": "string", "description": "Question author for action=close; defaults to this task. Your own, a recorded Continue/retry predecessor's, or an already finished task's question may be closed; another live task's may not."},
+        "reason": {"type": "string", "description": "Required explanation shown beside an explicitly closed question. Silence or task completion is not approval."},
+        "materials": {"type": "array", "items": {"type": "object", "properties": {
+            "task_id": {"type": "string", "description": "Artifact's owning task; defaults to this task. Your task, descendants and recorded Continue/retry predecessors are supported."},
+            "name": {"type": "string", "description": "Exact registered artifact name from the task result inventory; never a filesystem path."},
+        }, "required": ["name"], "additionalProperties": False}, "description": "Existing artifacts needed to answer this question. Selected bytes are retained before publication; no automatic report attachment."},
         "question": {"type": "string", "description": (
             "The self-contained explanation of one decision, in the reader's language. "
             "Markdown renders in chat. No quiz-specific character limit.")},
@@ -446,12 +465,12 @@ ESCALATE_TOOL_SCHEMA: Dict[str, Any] = {
             "Optional positive whole-minute bound for wait_for_answer, within the task's "
             "existing lifetime limit. On expiry, resume with a system notice; the card stays "
             "answerable. Silence is not an answer.")},
-    }, "required": ["question"]},
+    }},
 }
 
 
-def _validate_wait_bound(max_wait_minutes: Any, *, wait_for_answer: bool) -> Optional[int]:
-    """The optional wait bound in whole minutes, capped by the task ceiling."""
+def _validate_wait_bound(max_wait_minutes: Any, *, wait_for_answer: bool, task: Optional[dict] = None) -> Optional[int]:
+    """The optional wait bound in whole minutes, capped by the task's execution time limit."""
     if max_wait_minutes is None or not wait_for_answer:
         # On an optional question a bound only spells out the documented default (no wait):
         # it takes the omitted path, and the asker's receipt says so.
@@ -462,17 +481,24 @@ def _validate_wait_bound(max_wait_minutes: Any, *, wait_for_answer: bool) -> Opt
             "QUIZ_WAIT_BOUND_INVALID",
             "max_wait_minutes must be a positive integer; omit it for an unbounded wait.",
         )
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import resolve_task_execution_timeout_sec
 
-    ceiling_sec = get_task_abs_ceiling_sec()
+    # The bound the supervisor enforces: an explicit task budget narrows the global ceiling.
+    ceiling_sec = resolve_task_execution_timeout_sec(task if isinstance(task, dict) else {})
     if ceiling_sec is None:  # no task lifetime: any positive bound is within it
         return int(max_wait_minutes)
-    ceiling_minutes = max(1, int(ceiling_sec) // 60)
+    ceiling_minutes = int(ceiling_sec) // 60
+    if ceiling_minutes == 0:
+        raise QuizValidationError(
+            "QUIZ_WAIT_BOUND_INVALID",
+            "The task's execution time limit is shorter than one minute; "
+            "omit max_wait_minutes (the execution limit still applies).",
+        )
     if max_wait_minutes > ceiling_minutes:
         raise QuizValidationError(
             "QUIZ_WAIT_BOUND_INVALID",
             f"max_wait_minutes must be at most {ceiling_minutes} "
-            "(the task's absolute wall-clock ceiling); omit it for an unbounded wait.",
+            "(the task's execution time limit); omit it for an unbounded wait.",
         )
     return int(max_wait_minutes)
 
@@ -489,14 +515,9 @@ def _send_links(
     try:
         actions = validate_link_actions(links)
     except LinkActionsValidationError as exc:
-        # The marker names the CAUSE in the refusal the model reads: SEND_LINKS_URL_BLOCKED a
-        # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
-        # code map (no _ARG_ERROR suffix rule exists), so the adapter types them from their
-        # SHAPE: the _BLOCKED head becomes LEGACY_BLOCKED and the _ERROR head
-        # LEGACY_TOOL_ERROR. Different buckets, but these TWO are both recorded as a
-        # refusal rather than a successful call, which is why the marker is here. It says
-        # nothing about this tool's other codes: SEND_LINKS_TOO_MANY is a LEGACY_WARNING
-        # whose status stays ok.
+        # Validation rejects the whole batch before delivery. The adapter keeps
+        # URL policy denials distinct from bad arguments, including TOO_MANY;
+        # no links were sent on any of these branches.
         from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
         return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(
@@ -509,7 +530,7 @@ def _send_links(
         "actions": actions,
     })
     if mode == "live":
-        return "OK: link buttons sent to owner chat."
+        return "OK: link buttons accepted for delivery to owner chat."
     return "OK: link buttons queued for delivery to owner."
 
 
@@ -571,12 +592,17 @@ def _quiz_host_facts(ctx: ToolContext, canonical_root: pathlib.Path, task_id: st
 
 def _escalate(
     ctx: ToolContext,
-    question: str,
+    question: str = "",
     options: list | None = None,
     stake: str = "",
     assumption: str = "",
     wait_for_answer: bool = False,
     max_wait_minutes: int | None = None,
+    action: str = "ask",
+    quiz_id: str = "",
+    reason: str = "",
+    question_task_id: str = "",
+    materials: list | None = None,
 ) -> str:
     """One escalation verb for the whole tree (owner decision 31 hierarchy).
 
@@ -588,16 +614,20 @@ def _escalate(
     with ``forward_to_worker`` or raises higher by calling ``escalate``
     itself, forwarding the payload verbatim. The owner only ever sees what no
     ancestor was willing to answer. Expiry stays structural (no host deadline):
-    the task-done seam closes an unanswered card, but a late answer to it is
+    the task-done seam expires the active wait but preserves the unanswered card; a late answer is
     still accepted and reaches the chat as an ordinary owner message (В17a=A).
     A consciousness wake-up is an ordinary root turn here: it asks its owner
     through the same card and may wait for the answer like any other root.
     """
     meta = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
+    if action == "close":
+        return _close_owner_question(ctx, quiz_id, reason, question_task_id)
+    if action not in ("", "ask"):
+        return argument_refusal(ctx, "QUIZ_ACTION_INVALID", ["action must be ask or close."], effect="The quiz was not sent.")
     try:
         payload = validate_quiz_payload(question, options, stake, assumption,
                                         wait_for_answer=wait_for_answer,
-                                        max_wait_minutes=max_wait_minutes)
+                                        max_wait_minutes=max_wait_minutes, task=meta)
     except QuizValidationError as exc:
         # Typed, and it says what did NOT happen: a refusal that only restates the rule is retried unchanged.
         return argument_refusal(ctx, exc.code, [str(exc)], effect="The quiz was not sent.")
@@ -626,6 +656,12 @@ def _escalate(
         # through to the owner card path.
         return ("⚠️ ESCALATE_UNAVAILABLE: delegated context without a parent "
                 "task id — record the open question in your result instead.")
+
+    canonical_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+    try:
+        material_refs = _question_materials(ctx, canonical_root, task_id, materials)
+    except (ValueError, OSError) as exc:
+        return argument_refusal(ctx, "QUIZ_MATERIAL_INVALID", [str(exc)], effect="The quiz was not sent.")
 
     if parent_task_id:
         # Upward hop: descendant -> nearest LIVE ancestor (the mirror of
@@ -685,6 +721,8 @@ def _escalate(
         ]
         if payload["stake"]:
             lines.append(f"At stake: {payload['stake']}")
+        for material in material_refs:
+            lines.append(f"Decision material: task_id={material['task_id']}, name={material['name']} ({material['label']})")
         lines.append(f"I continue meanwhile under the assumption: {payload['assumption']}")
         lines.append(
             f"Answer with forward_to_worker(task_id={task_id}, message=...), or "
@@ -708,7 +746,6 @@ def _escalate(
     from ouroboros.owner_quiz import record_asked
 
     quiz_id = uuid.uuid4().hex
-    canonical_root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     # The card's own chat, stored with the block: a late answer arriving after
     # this task is gone is delivered there, exactly where the card was shown.
     try:
@@ -726,8 +763,13 @@ def _escalate(
         wait_for_answer=wait_for_answer, chat_id=card_chat_id,
         max_wait_minutes=payload.get("max_wait_minutes"),
         host_facts=host_facts,
+        materials=material_refs,
     )
     if asked.get("refused"):
+        if asked["refused"] == "owner_questions_unavailable":
+            return argument_refusal(ctx, "QUIZ_MEMBERSHIP_UNAVAILABLE",
+                ["The current-question address could not be registered; retry when storage is available."],
+                effect="The question was not accepted or sent; no wait was selected.")
         if wait_for_answer:
             return ("⚠️ ESCALATE_UNAVAILABLE: the task already has the maximum number "
                     "of open owner questions. No default answer or wait was selected.")
@@ -747,6 +789,7 @@ def _escalate(
         "state": "open",
         "task_id": task_id,
         "host_facts": host_facts,
+        **({"materials": material_refs} if material_refs else {}),
         **({"wait_for_answer": True} if wait_for_answer else {}),
     })
     delivered = "accepted for delivery" if mode == "live" else "queued for delivery"
@@ -775,3 +818,89 @@ def _escalate(
             f"{payload['assumption']}. The answer (if any) arrives as an owner "
             "quiz answer in a later round; the card stays answerable after this "
             f"task ends — a later answer reaches this chat as an ordinary owner message.{ignored_bound}")
+
+
+def _close_owner_question(ctx: ToolContext, quiz_id: str, reason: str, question_task_id: str) -> str:
+    """Explicit model closure through the existing canonical quiz and delivery seam."""
+    from ouroboros.owner_quiz import record_closed
+    from ouroboros.tools.owner_delivery import deliver_owner_event
+
+    task_id = str(getattr(ctx, "task_id", "") or "")
+    meta = getattr(ctx, "task_metadata", {}) or {}
+    if not task_id or meta.get("parent_task_id") or meta.get("delegation_role") not in (None, "", "root"):
+        return argument_refusal(ctx, "QUIZ_CLOSE_UNAVAILABLE", ["Only an active root may close an owner question."], effect="The question remains unchanged.")
+    root = pathlib.Path(str(meta.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+    source_task = str(question_task_id or task_id)
+    outcome = record_closed(root, source_task, quiz_id=quiz_id, reason=reason, actor_task_id=task_id)
+    if not outcome.get("ok"):
+        return argument_refusal(ctx, "QUIZ_CLOSE_REFUSED", [str(outcome.get("error"))], effect="The question remains unchanged.")
+    block = outcome["block"]
+    if source_task == task_id and getattr(ctx, "_owner_wait_requested", "") == str(quiz_id):
+        # A model may ask and explicitly close within the same tool batch;
+        # its next boundary must not sleep on a question it just retired.
+        ctx._owner_wait_requested = ""
+        ctx._owner_wait_deadline_at, ctx._owner_wait_max_minutes = "", 0
+    # Retries preserve the first explanation and still heal an unwritten close row.
+    mode = deliver_owner_event(ctx, {
+        "type": "send_quiz_state", "task_id": source_task, "quiz_id": str(quiz_id),
+        "state": "closed", "closed_reason": block["closed_reason"],
+        "chat_id": block.get("publication_chat_id", block.get("chat_id", 0)),
+    })
+    return f"OK: quiz {quiz_id} explicitly closed; explanation {('accepted' if mode == 'live' else 'queued')} for delivery. No owner answer or approval was recorded."
+
+
+def _question_materials(ctx: ToolContext, root: pathlib.Path, task_id: str, materials: Any) -> list:
+    """Retain explicitly named existing artifacts under this question author's custody."""
+    if materials in (None, []):
+        return []
+    from types import SimpleNamespace
+    from urllib.parse import quote
+
+    from ouroboros.artifacts import copy_file_to_task_artifacts, registered_task_artifact
+    from ouroboros.owner_quiz import question_task_owned_by
+    from ouroboros.task_custody import task_artifact_stores
+    from ouroboros.task_results import load_task_result, validate_task_id
+
+    if not isinstance(materials, list):
+        raise ValueError("materials must be a list of existing {task_id, name} artifact references")
+    selected = []
+    for ref in materials:
+        if not isinstance(ref, dict) or set(ref) - {"task_id", "name"}:
+            raise ValueError("materials accepts only task_id and name, never an arbitrary path")
+        source_id = validate_task_id(str(ref.get("task_id") or task_id))
+        name = str(ref.get("name") or "")
+        if not name or name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError("material name must be an exact registered artifact filename")
+        row = load_task_result(root, source_id) or {}
+        permitted = question_task_owned_by(root, source_id, task_id)
+        seen, ancestor = set(), row
+        while not permitted and ancestor:
+            parent = str(ancestor.get("parent_task_id") or "")
+            if not parent or parent in seen:
+                break
+            seen.add(parent)
+            permitted = question_task_owned_by(root, parent, task_id)
+            ancestor = load_task_result(root, parent) or {}
+        if not permitted:
+            raise ValueError("material task is outside your own, descendant or recorded Continue/retry task line")
+        records = [item for item in row.get("artifacts", []) if isinstance(item, dict) and item.get("name") == name]
+        for drive in dict.fromkeys([root, pathlib.Path(ctx.drive_root)] if source_id == task_id else [root]):
+            registered = registered_task_artifact(drive, source_id, name)
+            if registered:
+                records.insert(0, registered)
+        stores = task_artifact_stores(root, source_id)
+        if source_id == task_id:
+            stores += task_artifact_stores(pathlib.Path(ctx.drive_root), source_id)
+        record = next((item for item in records if item.get("path")
+                       and pathlib.Path(str(item["path"])).name == name and any(
+            pathlib.Path(str(item["path"])).resolve().parent == store for store in stores)), None)
+        if not record or record.get("status") not in (None, "", "ready") or record.get("errors"):
+            raise ValueError(f"material {source_id}/{name} is not an available registered task artifact")
+        retained = copy_file_to_task_artifacts(SimpleNamespace(drive_root=root, task_id=task_id),
+                                              record["path"], immutable=True, expected={key: record[key] for key in ("size", "sha256", "immutable") if key in record})
+        if not retained:
+            raise ValueError(f"material {source_id}/{name} could not be retained")
+        selected.append({"task_id": task_id, "name": retained["name"], "label": name,
+                         "size": retained["size"], "sha256": retained["sha256"],
+                         "download_url": f"/api/tasks/{quote(task_id, safe='')}/artifacts/{quote(retained['name'], safe='')}"})
+    return selected

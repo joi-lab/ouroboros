@@ -241,14 +241,14 @@ def test_budget_exhaustion_projects_deferred_child_before_forced_return(
 def test_blocking_open_plan_round_rail_preserves_useful_candidate(tmp_path, monkeypatch):
     from ouroboros.task_results import (
         STATUS_RUNNING,
-        record_plan_review_attempt,
         write_task_result,
     )
+    from tests import _legacy_plan_shared as legacy
 
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
     registry._ctx.task_metadata["force_plan"] = True
     write_task_result(tmp_path, "parent1", STATUS_RUNNING, result="running")
-    record_plan_review_attempt(tmp_path, "parent1", fingerprint="a" * 64)
+    legacy.seed_plan_review_state(tmp_path, "parent1", legacy.v2_state(current="a" * 64))
     loop._replace_delivery_candidate(
         registry,
         limit_ctx,
@@ -718,16 +718,19 @@ def test_provider_unavailable_prefers_current_candidate_over_incomplete_forced_r
     assert returned_trace["forced_finalization"]["source"] == "retained_candidate"
 
 
-def test_provider_unavailable_without_model_answer_stamps_host_salvage(
+def test_provider_unavailable_without_model_answer_stamps_host_notice(
     tmp_path, monkeypatch,
 ):
+    """Nothing salvaged: the text is the host's own notice, so it is ``host_notice``
+    (its words are the row), never a ``host_salvage`` "preserved output" receipt."""
     loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
 
     text, usage, _returned_trace = loop._handle_provider_unavailable(limit_ctx)
 
     assert "provider returned no usable response" in text
-    assert usage["terminal_origin"] == "host_salvage"
+    assert usage["terminal_origin"] == "host_notice"
+    assert text == usage["terminal_provider_notice"]
 
 
 def test_deadline_exhausted_forced_finalization_keeps_local_reason(tmp_path, monkeypatch):
@@ -851,13 +854,11 @@ def test_forced_finalization_stops_services_before_model_and_binds_evidence(
             "artifact_outputs": "report.html is missing: " + ("x" * 9000),
         }]
 
+    captured = []
+
     def forced_model(_llm, messages, *_args, **_kwargs):
         order.append("model")
-        rendered = str(messages)
-        assert "SERVICE_FINALIZATION_EVIDENCE" in rendered
-        assert "artifact_output_failed" in rendered
-        assert "report.html is missing" in rendered
-        assert "OMISSION NOTE: truncated at 8000 chars" in rendered
+        captured.append(str(messages))
         return {"role": "assistant", "content": "Answer disclosing the missing report."}, 0.0
 
     monkeypatch.setattr(services_mod, "stop_task_services", stop_services)
@@ -871,6 +872,11 @@ def test_forced_finalization_stops_services_before_model_and_binds_evidence(
     )
 
     assert order == ["services", "model"]
+    assert "SERVICE_FINALIZATION_EVIDENCE" in captured[0]
+    assert "artifact_output_failed" in captured[0]
+    assert "report.html is missing: " + ("x" * 9000) in captured[0]
+    assert text == "Answer disclosing the missing report."
+    assert returned_trace["forced_finalization"]["source"] == "model"
     assert text == registry._ctx._delivery_candidate.full_text
     assert returned_trace["verification_events"][0]["kind"] == "services_stopped"
     assert len(returned_trace["verification_events"][0]["services"][0]["artifact_outputs"]) > 8000
@@ -977,9 +983,11 @@ def test_production_budget_wrapup_propagates_budget_exceeded(tmp_path, monkeypat
     import ouroboros.usage_accounting as accounting
     from ouroboros import task_pacing
 
-    loop, _registry, ctx, trace = _forced_test_context(
+    loop, registry, ctx, trace = _forced_test_context(
         tmp_path, usage={"cost": 5.0},
     )
+    # The paid wrap-up at a reached ceiling is an explicit experiment profile's authored rail.
+    registry._ctx.task_contract = {**registry._ctx.task_contract, "budget_profile": {"cost_hard_stop_pct": 50}}
 
     def reject_dispatch(*_args, **_kwargs):
         raise accounting.BudgetExceeded(
@@ -1003,9 +1011,11 @@ def test_wrapup_is_forced_while_real_ledger_admission_still_fits(tmp_path, monke
     from ouroboros import task_pacing
     import ouroboros.usage_accounting as accounting
 
-    loop, _registry, ctx, _trace = _forced_test_context(
+    loop, registry, ctx, _trace = _forced_test_context(
         tmp_path, usage={"cost": 1.0, "_context_prompt_estimate": 1000},
     )
+    # The last-fit rail is an explicit experiment profile's authored rail (#1128).
+    registry._ctx.task_contract = {**registry._ctx.task_contract, "budget_profile": {"cost_hard_stop_pct": 50}}
     scope = accounting.UsageScope(
         drive_root=tmp_path, task_id="parent1", root_task_id="parent1",
         global_limit_usd=1000.0, root_limit_usd=100.0,
@@ -1275,7 +1285,7 @@ def test_forced_owner_refresh_does_not_resend_unknown_provider_outcome(tmp_path,
 
 
 def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeypatch):
-    from tests.test_loop_acceptance_gate import _seed_acceptance_root
+    from tests.test_loop_acceptance_gate import _nominate_acceptance, _seed_acceptance_root
     _seed_acceptance_root(tmp_path, "parent1", SimpleNamespace())
     import hashlib
 
@@ -1333,6 +1343,7 @@ def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeyp
     trace = {"tool_calls": [], "reasoning_notes": []}
     messages = [{"role": "system", "content": ""}, {"role": "user", "content": "goal"}]
     answer = "Answer based on fact v1."
+    _nominate_acceptance(trace, task_id="parent1", subject=answer)
 
     another_round = loop._run_task_acceptance_review_once(
         tools=registry,
@@ -1360,15 +1371,18 @@ def test_child_result_change_during_host_panel_supersedes_pass(tmp_path, monkeyp
     assert "TASK ACCEPTANCE REFRESH" in str(messages[-1]["content"])
 
 
+@pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
 def test_child_result_change_after_host_panel_requires_replacement_and_fresh_panel(
-    tmp_path, monkeypatch,
+    tmp_path, monkeypatch, enforcement,
 ):
     import ouroboros.loop as loop
     import ouroboros.review_substrate as review_substrate
     from ouroboros.task_results import write_task_result
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
 
     _write_child(tmp_path)
     _loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    _nominate_acceptance(trace, task_id="parent1", subject="Answer based on child result v1.")
     registry._ctx.is_direct_chat = False
     registry._ctx._task_acceptance_reviewed = False
     clean = review_substrate.ReviewRunResult(
@@ -1428,15 +1442,21 @@ def test_child_result_change_after_host_panel_requires_replacement_and_fresh_pan
 
     monkeypatch.setattr(loop, "_project_child_result_dispositions", project_then_finish_child)
 
-    first = loop._no_tool_final_answer(
-        "Answer based on child result v1.",
-        ctx,
-        trace,
-        registry,
-        queue.Queue(),
-        set(),
-        lambda _text: None,
-    )
+    def answer_after_reading(text, **kwargs):
+        """G1 (#1737/#1741): a settled PASS reaches its author before the decision."""
+        from ouroboros.acceptance_settlement import expose_acceptance_feedback
+
+        assert loop._no_tool_final_answer(text, ctx, trace, registry, queue.Queue(), set(),
+                                          lambda _text: None, **kwargs) is None
+        assert ctx.messages[-1]["review_feedback"] and not registry._ctx._task_acceptance_reviewed
+        expose_acceptance_feedback(trace, ctx.messages, "parent1")
+        if kwargs.get("explicit_candidate"):
+            _select_completion(registry, ctx, trace, answer=text)
+        return loop._no_tool_final_answer(text, ctx, trace, registry, queue.Queue(), set(),
+                                          lambda _text: None, **kwargs)
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    first = answer_after_reading("Answer based on child result v1.")
 
     assert first is None
     assert panel_calls["count"] == 1
@@ -1449,15 +1469,29 @@ def test_child_result_change_after_host_panel_requires_replacement_and_fresh_pan
 
     answer = "Replacement answer incorporating late child result v2."
     _select_completion(registry, ctx, trace, answer=answer)
-    second = loop._no_tool_final_answer(answer, ctx, trace, registry, queue.Queue(), set(),
-                                        lambda _text: None, explicit_candidate=True)
+    if enforcement == "advisory":
+        # The exposed PASS already informed this explicit finish: no new feedback round.
+        second = loop._no_tool_final_answer(answer, ctx, trace, registry, queue.Queue(), set(),
+                                            lambda _text: None, explicit_candidate=True)
+    else:
+        second = answer_after_reading(answer, explicit_candidate=True)
 
     assert second is not None
     text, _usage, returned_trace = second
     assert text == "Replacement answer incorporating late child result v2."
-    assert panel_calls["count"] == 2
     assert registry._ctx._task_acceptance_reviewed is True
     binding = returned_trace["delivery_candidate"]["acceptance_binding"]
+    decision = returned_trace["acceptance_decision"]
+    if enforcement == "advisory":
+        # The informed explicit finish over exposed feedback ends without another panel;
+        # the PASS stays the earlier panel's signal and never approves the new material.
+        assert panel_calls["count"] == 1
+        assert (decision["status"], decision["reason"]) == ("finalized_unaccepted", "author_finish")
+        assert decision["author_disposition"]["reviewer_signal"] == "PASS"
+        assert binding["authoritative"] is False
+        return
+    assert panel_calls["count"] == 2
+    assert decision["status"] == "accepted"
     assert binding["authoritative"] is True
     assert binding["acceptance_status"] == "pass"
 
@@ -2074,8 +2108,11 @@ def test_post_tool_evidence_change_arms_after_children_dispositioned(tmp_path):
 
 
 def test_real_round_limit_still_finishes_after_child_holds_with_its_own_cause(tmp_path, monkeypatch):
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
+
     _write_child(tmp_path, status="running")
     loop, registry, ctx, trace = _forced_test_context(tmp_path)
+    _nominate_acceptance(trace, task_id="parent1", subject="Useful partial answer.")
     calls = []
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (calls.append(1) or {"role": "assistant", "content": "Useful partial answer."}, 0.0))
     for _ in range(3):
@@ -2206,7 +2243,10 @@ def test_claimed_child_dispositions_reads_the_blackboard(tmp_path):
 
 
 def test_round_limit_stamps_typed_acceptance_bypass(tmp_path, monkeypatch):
-    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
+
+    loop, _registry, limit_ctx, nominated = _forced_test_context(tmp_path)
+    _nominate_acceptance(nominated, task_id="parent1", subject="Nominated draft.")
     monkeypatch.setattr(
         loop,
         "call_llm_with_retry",
@@ -2218,7 +2258,7 @@ def test_round_limit_stamps_typed_acceptance_bypass(tmp_path, monkeypatch):
 
     _text, _usage, trace = loop._handle_round_limit(limit_ctx)
 
-    # Declared deliverable with no acceptance decision -> the panel was OWED.
+    # A nominated result with no acceptance decision -> the panel was OWED.
     assert trace["review_decision"] == {
         "eligibility": "eligible",
         "trigger": "bypassed_round_limit",
@@ -2232,8 +2272,10 @@ def test_budget_fence_no_spend_path_stamps_typed_acceptance_bypass(tmp_path, mon
     """The physical budget fence (`_handle_budget_exceeded`) re-raises around the
     LLM seam, so the stamp must ride the common recorder, not `_forced_final_answer`."""
     import ouroboros.usage_accounting as accounting
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
 
     loop, registry, limit_ctx, trace = _forced_test_context(tmp_path)
+    _nominate_acceptance(trace, task_id="parent1", subject="Best answer retained before the budget rail.")
     loop._replace_delivery_candidate(
         registry, limit_ctx, trace,
         "Best answer retained before the budget rail.", control="candidate",

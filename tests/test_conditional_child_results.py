@@ -11,6 +11,7 @@ from ouroboros.task_results import write_task_result
 from ouroboros.task_status import load_effective_task_result
 from ouroboros.tools import control_task_results as results
 from ouroboros.tools.join_ledger import _child_result_sha256
+from tests._store_shared import result_signature
 
 BODY = "Complete child analysis.\n" * 1200
 TRACE = "Exact trace summary.\n" * 400
@@ -54,7 +55,7 @@ def test_condition_is_explicit_and_full_read_survives_a_new_context(tmp_path, su
         return handler(ctx, "child1", **kwargs)
 
     ctx = _ctx(tmp_path)
-    before = (tmp_path / "task_results" / "child1.json").read_bytes()
+    before = result_signature(tmp_path, "child1")
     first = read(ctx)
     unchanged = read(ctx, True)
     assert BODY in (json.loads(first)["tasks"]["child1"]["result"] if surface == "batch" else first)
@@ -68,7 +69,7 @@ def test_condition_is_explicit_and_full_read_survives_a_new_context(tmp_path, su
         return json.loads(text)["tasks"] if surface == "batch" else text
     assert result_view(read(ctx)) == result_view(first)
     assert result_view(read(_ctx(tmp_path))) == result_view(first)
-    assert (tmp_path / "task_results" / "child1.json").read_bytes() == before
+    assert result_signature(tmp_path, "child1") == before
     assert not (tmp_path / "state" / "task_trees").exists()
 
 

@@ -22,6 +22,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.tools.review import get_tools
 from ouroboros.utils import append_jsonl
+from tests._usage_store_testing import ledger_rows
 
 
 @pytest.fixture(autouse=True)
@@ -54,7 +55,10 @@ def _fixture(tmp_path, *, split=False, retry=False, child=False, cap="finite", d
     task = {"id": tid, "chat_id": 0, "task_contract": contract, "task_attempt": 1,
             "_skip_post_task_synthesis": True,
             "drive_root": str(worker), "budget_drive_root": str(root), **lineage}
-    trace = {"tool_calls": [], "reasoning_notes": []}
+    # This is a nominated root review skipped at launch, not eligibility inferred
+    # from the task's expected_output. The historical debt retains that request.
+    trace = {"tool_calls": [], "reasoning_notes": [],
+             "acceptance_evidence_calls": [{"status": "deferred_to_host_acceptance", "authoritative": False}]}
     _observe_host_acceptance_request(registry, trace, tid, "auto")
     _skip_task_acceptance_for_launch_reason(ctx, trace, launch_reason="acceptance_skipped_budget",
         snapshot=SimpleNamespace(spendable_sec=0, remaining_sec=0, reserve_sec=0),
@@ -155,19 +159,30 @@ def test_launch_skip_pins_retained_sources_and_code_bytes_through_copyback_gc(tm
     assert prepared["source_ref"]["sha256"] == debt["source_ref"]["sha256"]
 
 
-def test_forced_round_rail_connects_to_final_result_capture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("nominated", [True, False])
+def test_forced_round_rail_connects_to_final_result_capture(tmp_path, monkeypatch, nominated):
     from tests.test_delivery_forced_finalization import _forced_test_context
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
     loop, registry, limit, trace = _forced_test_context(tmp_path)
     # External model transport only; the forced rail, seed, final persistence,
     # and source reader are production consumers.
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (
         {"role": "assistant", "content": "Forced final answer"}, 0.0))
+    # Only a typed nomination makes a root answer owe acceptance; the expected output alone does not.
+    if nominated:
+        _nominate_acceptance(trace, task_id="parent1", subject="Forced final answer")
     text, usage, trace = loop._handle_round_limit(limit)
-    assert trace["acceptance_history_seed"]["cause"] == "acceptance_bypassed_round_limit"
+    if not nominated:
+        assert text == "Forced final answer" and "acceptance_history_seed" not in trace
+    else:
+        assert trace["acceptance_history_seed"]["cause"] == "acceptance_bypassed_round_limit"
     task = {"id": "parent1", "chat_id": 7, "root_task_id": "parent1", "delegation_role": "root"}
     _store_task_result(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), task, text, usage, trace,
                       final_delivery={"delivery_id": "forced-delivery", "chat_id": 7, "text": text})
     row = load_task_result(tmp_path, "parent1")
+    if not nominated:
+        assert "acceptance_debt" not in row, "an answer nobody nominated owes no acceptance"
+        return
     assert read_acceptance_history(tmp_path, "parent1", row["acceptance_debt"])["answer"] == text
 
 
@@ -532,6 +547,7 @@ def test_restricted_actor_cannot_reuse_real_owner_source(tmp_path, actor):
 def test_huge_history_returns_compact_refs_and_real_bounded_reader_recovers_all_bytes(tmp_path):
     from ouroboros.acceptance_history import historical_source_reference
     from ouroboros.tools.core_file_tools import _read_file
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
     from ouroboros.tools.control_task_results import _get_task_result
 
     f = _fixture(tmp_path, split=True)
@@ -570,7 +586,7 @@ def test_huge_history_returns_compact_refs_and_real_bounded_reader_recovers_all_
             rendered = _read_file(ctx, **{**arguments, "start_line": start, "max_lines": 40})
             extent = ctx.last_read_view
             assert extent and extent["body_chars"] < 20_000
-            chunks.append(rendered[extent["body_start"]:extent["body_start"] + extent["body_chars"]])
+            chunks.append(delivered_source_prefix(extent, rendered, len(rendered)))
             if extent["end_line"] == extent["total_lines"]:
                 break
             start = extent["end_line"] + 1
@@ -602,6 +618,8 @@ def test_real_budget_pause_cap_amendment_preserves_all_controls_and_ledger(tmp_p
     settle_attempt(spent, cost_usd=2, cost_final=True)
     hold = reserve_attempt(AttemptRequest(model="synthetic", provider="test", drive_root=f.root,
         task_id=f.accounting, root_task_id=f.accounting, reservation_usd=2, global_limit_usd=100, root_limit_usd=4))
+    mark_dispatched(hold)
+    settle_attempt(hold, cost_usd=2, cost_final=True)  # known spend reaches the $4 cap (#1487)
     with pytest.raises(BudgetExceeded) as exhausted:
         reserve_attempt(AttemptRequest(model="synthetic", provider="test", drive_root=f.root,
             task_id=f.accounting, root_task_id=f.accounting, reservation_usd=0.1, global_limit_usd=100, root_limit_usd=4))
@@ -626,7 +644,7 @@ def test_real_budget_pause_cap_amendment_preserves_all_controls_and_ledger(tmp_p
         old_snapshot = snapshot.read_bytes()
         old_queue = copy.deepcopy((workers.PENDING, workers.RUNNING, queue.BUDGET_ROOT_FENCES))
         old_row = load_task_result(f.root, f.accounting)
-        old_ledger = (f.root / "state" / "usage_attempts.jsonl").read_bytes()
+        old_ledger = ledger_rows(f.root)
         ctx = _caller(f)
         out = _request(f, ctx, _source(ctx), new_original_root_cap_usd=9)
         assert out["cap_amendment"]["new_cap_usd"] == 9 and not out["dispatched"], out
@@ -637,8 +655,8 @@ def test_real_budget_pause_cap_amendment_preserves_all_controls_and_ledger(tmp_p
             k: v for k, v in old_row.items() if k != "updated_at"}
         assert (workers.PENDING, workers.RUNNING, queue.BUDGET_ROOT_FENCES) == old_queue
         assert snapshot.read_bytes() == old_snapshot
-        assert (f.root / "state" / "usage_attempts.jsonl").read_bytes() == old_ledger
+        assert ledger_rows(f.root) == old_ledger
         assert budget_pause.dispatch_fenced(f.accounting) and worker.busy_task_id is None
-        assert hold.attempt_id in old_ledger.decode()
+        assert hold.attempt_id in {row["attempt_id"] for row in old_ledger}
     finally:
         budget_pause.end_dispatch_fence(f.accounting)

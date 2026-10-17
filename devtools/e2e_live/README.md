@@ -24,7 +24,7 @@ and requires K passes for EACH selected scenario.
 
 | Scenario | Work and required evidence | Rationale / limits |
 |---|---|---|
-| SM1 | Change the shared brand accent consistently with DESIGN.md §3 in `web/ui.css`, exercise the app and setup wizard, then land a reviewed release through `preflight_review` → `commit_reviewed`. The full profile uses advanced runtime and blocking enforcement, with no landing skip flags. Acceptance retains the S2 checks: the commit exists and includes the changed shared palette with nonempty accent/focus roles, VERSION strictly increases, the landed carriers pass `commit_admission.release_metadata_preflight`, the worktree is clean, a real advisory ledger row and `scope_review_complete` exist, usage is positive, and the browser reads the new accent and matching accent/focus roles on both `/` and `/onboarding` after restart. | One shared file does not prove both documents loaded it: the browser oracle detects a missing wizard link or divergent page override. The named accent roles and alpha ladder remain part of the palette. SM1's lane-local release/review/restart contract is separate from a version-neutral contributor PR; changing its source oracle must not remove those obligations. `vision_evidence_present` records browser/vision tool rows for reviewers to judge, not a host assertion that the image was inspected. `committed_companions` records paths beyond the palette, release carriers, DESIGN and comment-only CSS as facts, not an automatic scope failure: reviewers may identify another legitimate accent consumer. The clean-tree check discloses and tolerates only transient `.ouroboros/` scratch. |
+| SM1 | Change the shared brand accent consistently with DESIGN.md §3 in `web/ui.css`, exercise the app and setup wizard, then land a reviewed release through `preflight_review` → `commit_reviewed`. The full profile uses advanced runtime and blocking enforcement, with no landing skip flags. Acceptance retains the S2 checks: the commit exists and includes the changed shared palette with nonempty accent/focus roles, VERSION strictly increases, the landed carriers pass `commit_admission.release_metadata_preflight`, the worktree is clean, a real advisory ledger row and the commit gate's review-ledger record of the wave (seats dispatched, both questions answered) exist, usage is positive, and the browser reads the new accent and matching accent/focus roles on both `/` and `/onboarding` after restart. | One shared file does not prove both documents loaded it: the browser oracle detects a missing wizard link or divergent page override. The named accent roles and alpha ladder remain part of the palette. SM1's lane-local release/review/restart contract is separate from a version-neutral contributor PR; changing its source oracle must not remove those obligations. `vision_evidence_present` records browser/vision tool rows for reviewers to judge, not a host assertion that the image was inspected. `committed_companions` records paths beyond the palette, release carriers, DESIGN and comment-only CSS as facts, not an automatic scope failure: reviewers may identify another legitimate accent consumer. The clean-tree check discloses and tolerates only transient `.ouroboros/` scratch. |
 | SW1 | The Swarm button arms `force_plan` on the ordinary chat send. Require the managed root and plan review, at least two completed children with causal parent/root/depth lineage, a `swarm_fanout` receipt covering them, absorbed-child finalization, the with-children cost rollup without retired aliases, positive usage and the `/proc` environment-based orphan check. | UI admission, child execution and root accounting are separate proofs. An API fallback can continue diagnostics when the browser is unavailable, but cannot pass `ui_swarm_path_exercised`. Children spend under their root's fence. |
 | SK1 | The model authors `SKILL.md` + `plugin.py` and calls `skill_preflight`; the runner reviews, grants exactly the manifest's one privileged permission (`inject_chat`), enables, dispatches, disables and deletes. Require persisted findings plus HTTP 200 with `executable_review` in BOTH the review response and `/api/extensions`; retain separate `author_*` / `dispatch_*` terminals. Dispatch needs the generation-bearing durable row, typed `status=ok`, exact echo and one host-attributed owner-chat relay per successful call. | The product's executable-review gate decides eligibility under the applied enforcement; SK1 sets no enforcement override. Clean state, non-PASS items, status and blocking reason remain facts, because requiring all-PASS would measure author quality instead of the lifecycle. A generation digest alone also appears on failed dispatches. The fixture exercises its declared permission rather than requesting an unused grant. |
 
@@ -56,10 +56,19 @@ the manifest comes from the applied settings file, not argv. Credit admission
 uses the minimum of key-limit remaining and account credits, refusing below
 `--min-credit-usd` (default the run cap).
 
-Paid runs use `scenarios.STAND_PANEL_SETTINGS`: Gemini 3.8 Flash / GPT-5.6
-Luna / DeepSeek v4 Pro triad, DeepSeek v4 Pro scope, Claude Sonnet 5 advisory;
-reviewers at low effort, task/evolution at medium. `--production-panel` selects
-the tree's defaults instead; neither choice changes installed product defaults.
+Paid runs use `scenarios.STAND_PANEL_SETTINGS`: the review pool as catalog rows
+marked Reviewer (`scenarios.STAND_REVIEW_PANEL`) — Gemini 3.8 Flash, GPT-5.6 Luna
+and DeepSeek v4 Pro packing the brief, DeepSeek v4 Pro reading the work itself —
+beside an unmarked Claude Sonnet 5 row an author may name for a preflight; every
+row at low effort, task/evolution at medium. The retired lane and review-effort
+keys are never written: the isolated settings builder drops them, so a panel
+under them would vanish and the lane would run the factory rows. `--production-panel`
+selects the tree's defaults instead (no catalog: the factory reviewer rows);
+neither choice changes installed product defaults.
+A scenario's overrides are applied over that template, and the lane reviews with
+the document they produce: SW1 composes its catalog as the scout beside the
+template's reviewers (the stand panel's marked rows, the factory rows under
+`--production-panel`, the stub lane's keyless rows), so every lane has a pool.
 The default `full` profile retains each scenario's enforcement; `wiring` sets
 advisory enforcement and must be reported as such.
 
@@ -89,7 +98,8 @@ global remaining) and the per-task cap minus its planning margin. A lane's
 global remaining is its own budget; root reservations do not disable this
 earlier stop. SW1's UI root and the evolution root also follow this path.
 
-Read settled spend and unknown-cost counts from `state/usage_attempts.jsonl`;
+Read settled spend and unknown-cost counts through `run_live_lanes.lane_spend`
+from `state/usage.sqlite`, with journal fallback for an older seed;
 `llm_usage` omits review/synthesis spend and cannot be the stand's money source.
 Admit only while `spent + reserved(in flight) + reservation ≤ cap`. If only
 in-flight reservations prevent admission, wait for settlement and recheck;
@@ -163,7 +173,7 @@ is explicitly unavailable, never passed.
 After the lane server stops, on every outcome, `traces.py` copies its
 journals into `lanes/<id>_a<n>/traces/` with the data-root layout kept:
 `logs/*.jsonl`, `logs/*.log` with the rotated `server.log.<n>` backups, `task_results/*.json`,
-`state/{advisory_review.json,usage_attempts.jsonl,queue_snapshot.json,evolution_campaign.json}`
+`state/{advisory_review.json,usage.sqlite,usage_attempts.jsonl,queue_snapshot.json,evolution_campaign.json}`
 and the observability call manifests `observability/calls/*/*.json`, for
 the lane root and every `state/headless_tasks/<id>/data` fork. Never
 `settings.json`, `memory/`, the gzip payload blobs or credential stores.

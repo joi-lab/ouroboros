@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.system_e2e.harness import ScriptedStubModel, MOCK_SLUG, keyless_settings
+from tests._usage_store_testing import ledger_rows
 
 FIRST = ("FIRST_POSITION: specimen A supports explanation alpha.\n\n"
          "Sources: DECLARED_QUESTION, DECLARED_FACTS, TOOL_DECLARED_OBSERVATION; "
@@ -201,12 +202,11 @@ def _run(episode):
 
 
 def _seals(episode, model):
-    from ouroboros import model_send_seal, usage_accounting as ua
+    from ouroboros import model_send_seal
     from ouroboros.request_wire_contract import physical_candidate_bytes
 
     rows = {}
-    for line in (episode.drive / ua.LEDGER_REL).read_text(encoding="utf-8").splitlines():
-        row = json.loads(line)
+    for row in ledger_rows(episode.drive):
         if row.get("candidate_manifest_ref"):
             rows[row["attempt_id"]] = row
     assert len(rows) == len(model.received)

@@ -86,9 +86,7 @@ rows for additional FAIL findings on the same item):
 | forgotten_touchpoints | | |
 | cross_surface_consistency | | |
 | regression_surface | | |
-| prompt_doc_sync | | |
 | architecture_fit | | |
-| cross_module_bugs | | |
 | implicit_contracts | | |
 
 <details>

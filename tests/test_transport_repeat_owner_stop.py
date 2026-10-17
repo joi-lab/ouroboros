@@ -1,4 +1,4 @@
-"""A cooperative stop interrupts only the unsent paid transport-repeat grant."""
+"""Cooperative Stop preserves physical custody during paced unknown recovery."""
 
 import threading
 import time
@@ -33,13 +33,15 @@ def test_stop_arriving_in_real_backoff_keeps_only_actual_physical_attempts(
     monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     monkeypatch.delenv("USE_LOCAL_FALLBACK", raising=False)
     monkeypatch.setattr(loop, "_run_cross_model_fallback_chain", _no_chain)
+    monkeypatch.setattr(loop_transport, "upstream_transport_reachable",
+                        lambda *_a, **_kw: {"kind": "upstream_http", "status_code": 200})
     llm = _LedgerLLM(canonical, *([lambda: httpx.ReadError("controlled socket death")] * 3))
     kwargs = _loop_kwargs(execution, llm, [])
     kwargs["drive_logs"] = execution / "logs"
     ctx = kwargs["tools"]._ctx
     ctx.task_id, ctx.task_attempt, ctx.budget_drive_root = "t-death", 1, canonical
     ctx.is_direct_chat = not owner_grace
-    if not owner_grace:  # inline Presence, the one direct caller that keeps the paid-repeat rail
+    if not owner_grace:
         kwargs["task_type"] = ctx.current_task_type = "presence"
     ctx.task_metadata = {"root_task_id": "t-death"}
     first_empty_check = threading.Event()
@@ -71,22 +73,25 @@ def test_stop_arriving_in_real_backoff_keeps_only_actual_physical_attempts(
     assert llm.calls == after_attempt
     rows = _ledger(canonical)
     assert len({row["attempt_id"] for row in rows}) == after_attempt
-    assert [row["state"] for row in rows] == ["reserved", "dispatched", "unresolved"] * after_attempt
+    assert [(row["state"], row["revision"]) for row in rows] == [("unresolved", 4)] * after_attempt
+    assert all(row["physical_failure"] for row in rows)
     assert accounting.usage_projection(canonical)["unresolved_upper_bound_usd"] == float(after_attempt)
-    assert usage.get(loop_llm_call.TRANSPORT_DEATHS_KEY, {}).get("count", 0) == after_attempt - 1
+    assert loop_llm_call.TRANSPORT_DEATHS_KEY not in usage
     assert usage["_last_llm_retry_same_request"] is False
     assert usage["_last_llm_error_kind"] == "provider_outcome_unknown"
-    assert trace["forced_finalization"]["source"] == "provider_outcome_unknown_no_resend"
-    assert ("owner requested Wrap up" if owner_grace else "owner requested Stop") in usage["terminal_provider_notice"]
-    assert "no terminal provider outcome" in usage["terminal_provider_notice"]
-    assert [row["reason_code"] for row in _events(execution / "logs", "llm_not_dispatched")] == ([] if owner_grace else ["finalize_control_pending"])
+    assert trace["forced_finalization"]["source"] == (
+        "provider_outcome_unknown_no_resend" if owner_grace else "owner_stopped_direct_turn")
+    if owner_grace:
+        assert "owner requested Wrap up" in usage["terminal_provider_notice"]
+        assert "no terminal provider outcome" in usage["terminal_provider_notice"]
+    assert _events(execution / "logs", "llm_not_dispatched") == []
     assert not _events(execution / "logs", "llm_retry_deadline_exhausted")
     if owner_grace:
         # Managed unknown waits use the ordinary round-top owner drain; no paid
         # repeat was granted, and the current finalize intent is consumed there.
         assert cancel_intents.active_intent(canonical, "t-death").get("control_drained_at")
     else:
-        assert mid not in ctx._loop_mailbox_seen_ids
+        assert mid in ctx._loop_mailbox_seen_ids
         assert mid not in owner_mailbox.acknowledged_task_message_ids(execution, "t-death", attempt_key=1)
         assert getattr(ctx, "_skip_post_task_synthesis", False)  # same Stop-now contract after loop exit
         from ouroboros import agent_task_pipeline

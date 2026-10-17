@@ -10,9 +10,9 @@ import {
     chatStatusCounts,
     createStateSnapshotSequencer,
     isForegroundLiveCard,
-    routingAnnotationText,
     unkeyedFrameEndsTurn,
 } from '../modules/chat_activity.js';
+import { routingAnnotationText } from '../modules/routing_receipt.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
@@ -24,10 +24,9 @@ test('review-only owner anchors do not advertise foreground task activity', () =
     }), false);
 });
 
-test('unkeyed terminal incidents do not clear unrelated live turns', () => {
+test('only a legacy unkeyed model final clears unscoped state; a System row settles its own submission', () => {
     // The cleanup guard also requires positive terminal evidence. Keep this
-    // source contract resilient to the guard's explicit conjunction while
-    // still checking the carve-out below it (the typed kinds that end nothing).
+    // source contract resilient to the guard's explicit conjunction.
     const cleanupStart = chatSource.indexOf('if (!finalizing && (!explicitTaskId || typedTerminal))');
     const finalCleanup = chatSource.slice(
         cleanupStart,
@@ -35,24 +34,21 @@ test('unkeyed terminal incidents do not clear unrelated live turns', () => {
     );
     assert.match(
         finalCleanup,
-        /} else if \(unkeyedFrameEndsTurn\(msg\)\) \{[^}]*?activeDirectActivities\.clear\(\);[^}]*?pendingSubmissions\.clear\(\);\s*}\s*}/,
+        /} else if \(unkeyedFrameEndsTurn\(msg\)\) \{[^}]*?activeDirectActivities\.clear\(\);[^}]*?pendingSubmissions\.clear\(\);\s*} else pendingSubmissions\.delete\(String\(msg\.client_message_id \|\| ''\)\);\s*}/,
     );
-    // Ordinary unkeyed finals retain their existing global cleanup semantics.
-    assert.match(finalCleanup, /activeDirectActivities\.clear\(\);/);
-    assert.match(finalCleanup, /pendingSubmissions\.clear\(\);/);
 });
 
-test('a note or skill notice arriving mid-turn keeps Thinking/Sending; an ordinary unkeyed final still ends it', () => {
+test('System voice concludes no Main turn; an unkeyed model final still ends it (#1403)', () => {
     // What the live handler does with the unscoped turn for each frame (the branch pinned above).
     const turn = { isConnected: true, hasActiveLiveCard: false, activeDirectCount: 1, pendingSubmissionsCount: 1 };
     const after = (frame) => computeDerivedChatStatus(unkeyedFrameEndsTurn(frame)
         ? { ...turn, activeDirectCount: 0, pendingSubmissionsCount: 0 } : turn).text;
-    for (const kind of ['reminder', 'skill_notice', 'terminal_incident']) {
-        assert.equal(after({ role: 'system', system_type: kind, task_id: '', content: 'Call mother' }), 'Thinking...', kind);
+    for (const kind of ['reminder', 'skill_notice', 'terminal_incident', 'budget_notice', 'startup_notice',
+        'presence_recovery_required', 'command_reply', '']) {
+        assert.equal(after({ role: 'system', system_type: kind, task_id: '', content: 'Call mother' }), 'Working', kind);
     }
     assert.equal(after({ role: 'assistant', task_id: '', content: 'Done.' }), 'Online');
-    assert.equal(after({ role: 'system', system_type: 'startup_notice', task_id: '' }), 'Online');
-    // The kind decides, never the words: a reply that quotes a reminder still ends the turn.
+    // The voice decides, never the words: a reply that quotes a reminder still ends the turn.
     assert.equal(after({ role: 'assistant', task_id: '', content: 'Reminder · Ouroboros · written Oct 3 14:05' }), 'Online');
 });
 
@@ -144,8 +140,10 @@ test('computeDerivedChatStatus: offline state when ws is disconnected', () => {
     });
     assert.deepEqual(status, {
         kind: 'offline',
-        text: 'Reconnecting...',
+        text: 'Reconnecting…',
+        tone: 'offline',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -158,12 +156,14 @@ test('computeDerivedChatStatus: working state when active live card is present',
     });
     assert.deepEqual(status, {
         kind: 'thinking',
-        text: 'Working...',
+        text: 'Working',
+        tone: 'live',
         showDots: false,
+        dots: 'moving',
     });
 });
 
-test('computeDerivedChatStatus: thinking state with dots when direct activities are active', () => {
+test('computeDerivedChatStatus: neutral work when only direct activity counts are known', () => {
     const status = computeDerivedChatStatus({
         isConnected: true,
         hasActiveLiveCard: false,
@@ -172,9 +172,27 @@ test('computeDerivedChatStatus: thinking state with dots when direct activities 
     });
     assert.deepEqual(status, {
         kind: 'thinking',
-        text: 'Thinking...',
+        text: 'Working',
+        tone: 'live',
         showDots: true,
+        dots: 'moving',
     });
+});
+
+test('direct neutral and explicit legacy phases reuse the installed translation memory', async () => {
+    const { applyPayload, currentPayload, CODE_PREFIX } = await import('../modules/i18n.js');
+    const prior = currentPayload();
+    try {
+        applyPayload({ language: 'ru', english: false, entries: {
+            [CODE_PREFIX + 'task.chip.working']: { text: 'Работает' },
+            [CODE_PREFIX + 'task.chip.thinking']: { text: 'Думает' },
+        } });
+        for (const [phase, expected] of [['working', 'Работает'], ['thinking', 'Думает']]) {
+            const counts = chatStatusCounts(new Map([['call', { kind: 'direct_chat', phase }]]), []);
+            assert.equal(computeDerivedChatStatus(counts).text, expected);
+        }
+        assert.equal(computeDerivedChatStatus({ activeDirectCount: 2 }).text, 'Работает');
+    } finally { applyPayload(prior); }
 });
 
 test('computeDerivedChatStatus: sending state with dots when local submissions are pending', () => {
@@ -186,8 +204,10 @@ test('computeDerivedChatStatus: sending state with dots when local submissions a
     });
     assert.deepEqual(status, {
         kind: 'thinking',
-        text: 'Sending...',
+        text: 'Sending',
+        tone: 'live',
         showDots: true,
+        dots: 'moving',
     });
 });
 
@@ -201,7 +221,9 @@ test('computeDerivedChatStatus: idle server status remains Online', () => {
     assert.deepEqual(status, {
         kind: 'online',
         text: 'Online',
+        tone: 'online',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -215,7 +237,9 @@ test('computeDerivedChatStatus: online idle state by default', () => {
     assert.deepEqual(status, {
         kind: 'online',
         text: 'Online',
+        tone: 'online',
         showDots: false,
+        dots: 'one',
     });
 });
 
@@ -307,30 +331,30 @@ test('computeHydratedDirectActivities: a concluded turn is never resurrected by 
     assert.ok(updated.has('act-live'));
 });
 
-test('computeDerivedChatStatus: priority order is preserved (offline > live card > direct thinking > sending > online)', () => {
+test('computeDerivedChatStatus: priority order is preserved (offline > live card > direct work > sending > online)', () => {
     // 1. Disconnected beats everything
     assert.equal(computeDerivedChatStatus({
         isConnected: false,
         hasActiveLiveCard: true,
         activeDirectCount: 5,
         pendingSubmissionsCount: 3,
-    }).text, 'Reconnecting...');
+    }).text, 'Reconnecting…');
 
-    // 2. Active live card beats direct thinking & sending & attention
+    // 2. Active live card beats direct work & sending & attention
     assert.equal(computeDerivedChatStatus({
         isConnected: true,
         hasActiveLiveCard: true,
         activeDirectCount: 5,
         pendingSubmissionsCount: 3,
-    }).text, 'Working...');
+    }).text, 'Working');
 
-    // 3. Direct thinking beats local pending submissions & attention
+    // 3. Direct work beats local pending submissions & attention
     assert.equal(computeDerivedChatStatus({
         isConnected: true,
         hasActiveLiveCard: false,
         activeDirectCount: 2,
         pendingSubmissionsCount: 3,
-    }).text, 'Thinking...');
+    }).text, 'Working');
 
     // 4. Local pending submissions beat idle
     assert.equal(computeDerivedChatStatus({
@@ -338,7 +362,7 @@ test('computeDerivedChatStatus: priority order is preserved (offline > live card
         hasActiveLiveCard: false,
         activeDirectCount: 0,
         pendingSubmissionsCount: 1,
-    }).text, 'Sending...');
+    }).text, 'Sending');
 
     // 5. No server activity means Online
     assert.equal(computeDerivedChatStatus({
@@ -362,17 +386,17 @@ test('computeDerivedChatStatus: paused work is not Working or Queued (#322)', ()
     // Restart hold (Batch4), so the header states the pause, not a cause.
     assert.deepEqual(
         computeDerivedChatStatus({ pausedManagedCount: 2 }),
-        { kind: 'online', text: 'Paused', showDots: false },
+        { kind: 'online', text: 'Paused', tone: 'held', showDots: false, dots: 'one' },
     );
     // Runnable queued work outranks the paused disclosure.
     assert.equal(
         computeDerivedChatStatus({ pausedManagedCount: 1, queuedManagedCount: 1 }).text,
-        'Queued...',
+        'Queued',
     );
     // Active work outranks both.
     assert.equal(
         computeDerivedChatStatus({ pausedManagedCount: 1, activeManagedCount: 1 }).text,
-        'Working...',
+        'Working',
     );
 });
 
@@ -408,6 +432,6 @@ test(`Batch4: a paused or pausing ${kind} card does not drive working header sta
     // Resumed: the census says working again and the released card drives Working.
     const resumed = chatStatusCounts(new Map([['p', { kind, phase: 'working' }]]),
         [{ root, groupId: 'p', direct: kind === 'direct_chat', finished: false, parkedPhase: '' }]);
-    assert.equal(computeDerivedChatStatus(resumed).text, kind === 'direct_chat' ? 'Thinking...' : 'Working...');
+    assert.equal(computeDerivedChatStatus(resumed).text, kind === 'direct_chat' ? 'Working' : 'Working');
 });
 }

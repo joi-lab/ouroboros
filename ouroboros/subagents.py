@@ -1,27 +1,22 @@
 """Subagent lane, cap, and metadata helpers.
 
-THE OWNER-FACING AXES ARE THREE, AND EVERYTHING ELSE IS DERIVED.
+A parent declares the WORK: ``write_surface`` (what the child may DO) and the
+Available-subagents row (WHO runs it, ``subagent_id``); it may also ask for the
+child's reasoning ``effort``. Model, route and TOOL profile are consequences of
+the row plus the owner's settings and what is live at the moment the child
+starts. The CREDENTIAL profile is NOT derived here at all (see the
+DelegationRoute pin and the rotation note below): it is Claudexor's choice, and
+the applied one comes back on the engine receipt.
 
-A parent declares the WORK: ``write_surface`` (what the child may DO),
-``model_lane`` (how good the answer must be) and ``executor`` (where it runs).
-Model, effort, route and TOOL profile are consequences of those three plus the
-owner's settings and what is live at the moment the child starts — never a second
-thing the parent can ask for. The CREDENTIAL profile is NOT derived here at all
-(see the DelegationRoute pin and the rotation note below): it is Claudexor's
-choice, and the applied one comes back on the engine receipt.
-
-``effort`` used to be a fourth public parameter and broke that twice. It was a
-second knob for the question ``model_lane`` already answers, so ``model_lane:
-light`` with ``effort: max`` was a request nobody could resolve (it pinned the
-cheapest model to the strongest reasoning and no rule reconciled them). And a
-harness route carries its OWN effort, so a parent asking ``low`` against a route
-pinned to ``xhigh`` had no rule for who wins. It is removed rather than ranked
-against the lane (BIBLE P2: remove the class). The owner still controls effort
-exactly as before, through ``config.resolve_effort(task_type)``. The ONE
-caller-facing strength axis lives elsewhere: a plan review order may declare
-its reviewer panel's effort as the default rung of each row's ladder
-(``plan_task.reviewer_effort`` → ``plan_review_runtime.plan_review_slots``);
-that is a review panel, not a subagent.
+Effort follows ONE rule (``settings_scales.choose_effort``): a level encoded in
+the row's model name, else the owner's pin (the row's ``effort``), else the
+parent's request clamped into the owner's effort range (Cyber Pro: unclamped,
+and a request beats a pin), else this room's primary clamped into its helper bounds. The decision is
+taken at dispatch, recorded as ``{requested, applied, source}`` on the child
+record (``SubagentDispatch.effort_fact``) and disclosed to the child, the parent
+and the chat; for a session row it is the delegated LEAF's level, while the
+nanny's own rounds inherit the parent's. A plan review order
+(``plan_task.reviewer_effort``) is the same rule over the reviewer rows.
 """
 
 from __future__ import annotations
@@ -47,8 +42,8 @@ log = logging.getLogger(__name__)
 # v6.87.7, where they named a TOPOLOGY — "fan out across the configured reviewer
 # slots" — smuggled in through a strength parameter. Nothing in the product ever
 # asked for them: every review surface (commit, plan, acceptance, skill) reads its
-# slots straight from config through get_review_models/get_scope_review_models and
-# runs them on the review substrate, never through schedule_subagent. They are
+# seats from the review pool (reviewer_slot_config.review_pool_slots) and runs
+# them on the review substrate, never through schedule_subagent. They are
 # removed rather than kept as aliases (BIBLE P2: remove the class). Durable records
 # that still carry the old values stay readable — build_subagent_envelope already
 # coerces an unknown stored lane instead of raising.
@@ -130,28 +125,35 @@ class DelegatedRunShape:
     mode: str
     isolation: str = ""
     delegated: bool = False
+    # Technical rights without write authority (#1609): the run executes in a
+    # private checking copy whose results are evidence, never a candidate patch.
+    investigation: bool = False
 
 
 def delegated_run_shape(acting: bool, access: str = "workspace_write") -> DelegatedRunShape:
-    """The run shape for an acting (mutating) child, or for a read-only one.
+    """The run shape a child's captured technical access entitles it to.
 
-    A MUTATING child runs ``live`` in the host's private execution snapshot;
-    captured changes still require explicit integration. The selected immutable
-    session supplies its captured access; old snapshots keep workspace_write.
-    This changes the harness's OS powers, not the task's assignment or write target.
-    In place is also the ONE shape where Claudexor would otherwise hand the
-    harness the operator's real ``$HOME`` — which holds the daemon control token — so
-    ``delegated`` travels with it, inseparably, in the same record.
+    TECHNICAL access alone decides the shape. A ``workspace_write``/``full`` run
+    executes ``live`` in a private host copy; ``acting`` decides only what that
+    copy is FOR: an acting child's captured changes await explicit integration,
+    while a non-acting one (research, an external reviewer) is an evidence-only
+    ``investigation`` whose copy is never applied and creates no apply duty.
+    The selected immutable session supplies its captured access; old snapshots
+    keep workspace_write. This changes the harness's OS powers, not the task's
+    assignment or write target. In place is also the ONE shape where Claudexor
+    would otherwise hand the harness the operator's real ``$HOME`` — which holds
+    the daemon control token — so ``delegated`` travels with it, inseparably.
 
-    A READ-ONLY child has nothing to write back, so it runs in Claudexor's default
-    envelope, which is scoped already and needs no marker: that is one transport with
-    one derived difference, not a second pipeline.
+    An explicitly READ-ONLY run has nothing to write back, so it runs in
+    Claudexor's default envelope, which is scoped already and needs no marker:
+    one transport with one derived difference, not a second pipeline.
     """
-    if acting and access != "readonly":
-        if access not in SESSION_ACCESS_PROFILES:
-            raise ValueError("Delegated session access must be workspace_write or full")
-        return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True)
-    return DelegatedRunShape(access="readonly", mode="ask")
+    if access == "readonly":
+        return DelegatedRunShape(access="readonly", mode="ask")
+    if access not in SESSION_ACCESS_PROFILES:
+        raise ValueError("Delegated session access must be readonly, workspace_write or full")
+    return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True,
+                             investigation=not acting)
 
 
 def delegated_execution_workspace_root(
@@ -379,7 +381,7 @@ def probe_subagent_executor(
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
-    run_shape = shape if shape is not None else delegated_run_shape(False)
+    run_shape = shape if shape is not None else delegated_run_shape(False, "readonly")
     gateway = None
     try:
         gateway = ensure_owned_gateway()
@@ -420,7 +422,8 @@ def dispatch_executor_resolution(task: Mapping[str, Any]) -> SubagentExecutorRes
 
     constraint = normalize_task_constraint(task.get("task_constraint"))
     surface = str(getattr(constraint, "surface", "") or "")
-    shape = delegated_run_shape(predicted_subagent_profile(write_surface=surface) == "acting_subagent")
+    acting = predicted_subagent_profile(write_surface=surface) == "acting_subagent"
+    shape = delegated_run_shape(acting, "workspace_write" if acting else "readonly")
     return probe_subagent_executor(requested, shape=shape)
 
 
@@ -819,6 +822,9 @@ def lane_delta_phrase(delta: Mapping[str, Any]) -> str:
 SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
     "requested_model_lane",
     "parent_model_lane",
+    # The parent's effort request (``schedule_subagent(effort=…)``; "" = none): dispatch
+    # decides the level inside the owner's range and records the fact beside it.
+    "requested_effort",
     # An ADMISSION fact carried as intent (F9): the lane an applicable
     # non-advisory `require_lane` delegation constraint verified this child
     # against at schedule time. The dispatch consults it to suppress the
@@ -828,15 +834,24 @@ SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
     "requested_executor",
 )
 
+
+def subagent_intent_fields(source: Mapping[str, Any]) -> Dict[str, Any]:
+    """Carry declared intent through task projections without deciding or defaulting it.
+
+    Producers own normalization; admission owns ``required_model_lane``. Missing
+    fields remain missing, and dispatch writes its decisions under separate keys.
+    """
+    return {key: source[key] for key in SUBAGENT_INTENT_FIELDS if key in source}
+
+
 # Fields a stored subagent record may still carry from a schema that no longer
 # exists. They are IGNORED at dispatch and the reason is written onto the record;
 # a load never fails over one (BIBLE P1: no silent loss, and no crash either).
 LEGACY_SUBAGENT_FIELDS: Dict[str, str] = {
     "reasoning_effort": (
-        "effort is not a subagent axis: it is derived from the owner's configured "
-        "effort for this task type, because a public effort was a second knob for "
-        "the question model_lane already answers (a plan review order declares its "
-        "panel's strength through plan_task.reviewer_effort instead)"
+        "a stored reasoning_effort written before the dispatch record existed is not a "
+        "request: the dispatch decides the effort inside the owner's range (a parent's "
+        "request rides requested_effort) and writes the level it decided here"
     ),
 }
 
@@ -854,6 +869,11 @@ SUBAGENT_RESOLUTION_FIELDS: tuple[str, ...] = (
     "model",
     "use_local_model",
     "reasoning_effort",
+    # The effort decision (``choose_effort``): the level applied, the parent's request and
+    # who decided — the child's own level, or the delegated LEAF's for a session row.
+    "effort_level",
+    "effort_requested",
+    "effort_source",
     "effective_executor",
     "executor_route",
     "tool_profile",
@@ -890,6 +910,9 @@ class SubagentDispatch:
     executor_resolution: SubagentExecutorResolution | None = None
     legacy_ignored: Dict[str, str] = field(default_factory=dict)
     availability: Dict[str, Any] = field(default_factory=dict)
+    # ``settings_scales.effort_fact``: {requested, applied, source}. For a session row the
+    # LEAF's decision (the nanny's own loop runs ``effort``, the parent's level).
+    effort_fact: Dict[str, str] = field(default_factory=dict)
 
     @property
     def blocked(self) -> bool:
@@ -908,11 +931,15 @@ class SubagentDispatch:
         keys off the task, so an added axis is one edit here instead of a field-by-
         field mapping repeated in four modules that drift apart one release later.
         """
+        fact = self.effort_fact or {"requested": "", "applied": self.effort, "source": "auto"}
         fields = {
             "effective_model_lane": self.lane.effective_lane,
             "model": self.lane.model,
             "use_local_model": self.lane.use_local_model,
             "reasoning_effort": self.effort,
+            "effort_level": str(fact.get("applied") or ""),
+            "effort_requested": str(fact.get("requested") or ""),
+            "effort_source": str(fact.get("source") or ""),
             "effective_executor": self.executor,
             "executor_route": self.route,
             "tool_profile": self.profile,
@@ -991,9 +1018,12 @@ def resolve_subagent_dispatch(
         requested_executor == "auto" and executor_reason == "harness_not_configured"
     ):
         executor_reason = ""
-    from ouroboros.config import resolve_effort
+    from ouroboros.runtime_mode_policy import effort_range_binds
+    from ouroboros.settings_scales import choose_effort, effort_fact
 
-    derived_effort = resolve_effort(task_type or str(task.get("type") or "task"))
+    # A row-less child: request or primary, clamped into this room's helper bounds.
+    derived_effort, effort_source = choose_effort(
+        task.get("requested_effort"), binds=effort_range_binds(task.get("metadata")))
 
     reasons: List[str] = []
     if lane.reduced:
@@ -1043,6 +1073,7 @@ def resolve_subagent_dispatch(
         delta=delta,
         executor_resolution=executor_resolution,
         legacy_ignored=legacy_ignored,
+        effort_fact=effort_fact(task.get("requested_effort"), derived_effort, effort_source),
     )
 
 
@@ -1113,8 +1144,8 @@ def build_subagent_envelope(
             if str(effective_lane or "").strip() else ""
         ),
         "model": str(model or ""),
-        # DERIVED at dispatch (`resolve_subagent_dispatch`), not requested: no parent
-        # can ask for an effort. Empty means the child has not been dispatched.
+        # DECIDED at dispatch (`resolve_subagent_dispatch`) inside the owner's range; the
+        # parent's request rides `requested_effort`. Empty means the child has not been dispatched.
         "reasoning_effort": str(reasoning_effort or ""),
         "executor": str(executor or ""),
         # `executor` is the REQUEST (empty means "not requested"); this is who
@@ -1186,6 +1217,14 @@ def actual_substrate(evidence: Mapping[str, Any] | None) -> str:
     if _count("delegated_runs_started"):
         return SUBSTRATE_HARNESS_ATTEMPTED
     return SUBSTRATE_NATIVE_ONLY
+
+
+def effort_result_fields(task: Mapping[str, Any]) -> Dict[str, str]:
+    """The dispatch's effort decision (``record_fields``) as the task carries it, for every
+    task-result write — running, completion, exception: the parent's projections and the
+    terminal chat frame read it from the result, not from the worker's memory."""
+    return {key: task[key] for key in ("effort_level", "effort_requested", "effort_source")
+            if isinstance(task.get(key), str)}
 
 
 def substrate_result_fields(envelope: Mapping[str, Any]) -> Dict[str, Any]:

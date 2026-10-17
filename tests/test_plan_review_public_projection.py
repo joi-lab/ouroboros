@@ -9,7 +9,9 @@ import pytest
 
 from ouroboros.gateway.tasks import api_task_get
 from ouroboros.outcomes import public_task_result
+from ouroboros.store_import import ensure_current_store
 from ouroboros.utils import atomic_write_json, read_json_dict
+from tests._store_shared import read_result, result_signature
 
 
 def _legacy(kind: str) -> dict:
@@ -77,6 +79,8 @@ def test_task_detail_projects_legacy_state_without_rewriting_disk(tmp_path):
     path.parent.mkdir(parents=True)
     stored = {"_schema_version": 1, "task_id": task_id, "status": "running", "plan_review_state": _legacy("open")}
     atomic_write_json(path, stored)
+    ensure_current_store(tmp_path)
+    signature = result_signature(tmp_path, task_id)
     request = SimpleNamespace(
         path_params={"task_id": task_id},
         app=SimpleNamespace(state=SimpleNamespace(drive_root=tmp_path)),
@@ -84,3 +88,5 @@ def test_task_detail_projects_legacy_state_without_rewriting_disk(tmp_path):
     payload = json.loads(asyncio.run(api_task_get(request)).body.decode("utf-8"))
     assert payload["plan_review_state"]["legacy_v1_projection"]["outcome"] == "REVIEW_REQUIRED"
     assert read_json_dict(path) == stored
+    assert read_result(tmp_path, task_id) == stored
+    assert result_signature(tmp_path, task_id) == signature

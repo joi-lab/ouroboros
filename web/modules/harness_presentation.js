@@ -8,7 +8,7 @@
 // This module presents identity only. It does not decide route availability,
 // status, requested/effective/executed truth, or review authority.
 
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, escapeHtmlText } from './utils.js';
 
 export const HARNESS_MARKS = Object.freeze({
     codex: Object.freeze({
@@ -101,11 +101,20 @@ export function joinMetaParts(parts) {
     return parts.filter(Boolean).join(META_PART_SEPARATOR);
 }
 
-/** Card identity consumes projected facts; it does not infer execution from marks. */
+/** Card identity consumes projected facts; it does not infer execution from marks.
+ *  The chip's detail sentence is also text on the line, shown only while the card
+ *  is expanded through its own summary control (pointer, keyboard or touch), never
+ *  a hover-only title. Its separator rides inside the hidden wrapper, so a
+ *  collapsed line keeps no dangling ` · `, and a copy of the open line keeps it.
+ *  Text-mode escaping keeps the markup equal to its serialization, which the meta
+ *  line's no-op check compares, so a quote never forces a rebuild. */
 export function executorIdentityMarkup(chip, { agentModel = '' } = {}) {
+    const detail = chip?.title
+        ? `<span class="chat-live-executor-detail">${META_PART_SEPARATOR}<span class="chat-live-meta-text">${escapeHtmlText(chip.title)}</span></span>`
+        : '';
     const identity = chip
         ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(chip.title || '')}">`
-            + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>'
+            + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>' + detail
         : '';
     const facts = [
         agentModel ? `${chip ? 'Coordinator' : 'Agent model'}: ${agentModel}` : '',

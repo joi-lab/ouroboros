@@ -9,11 +9,26 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
     // Every room opens following its newest message (owner decision 2026-10-05).
     let intent = null;
     // dragging: 'held'/'released' feed scrollbar, or 'owed' to a downward gesture's animation.
-    let approximate = false, dragging = '', claimed = null, scrolls = 0;
+    let approximate = false, dragging = '', claimed = null, scrolls = 0, arriving = null, relayout = false;
+    // WebKit also ends each step of an animated page scroll: the owed scrolls
+    // end only once a frame passes without another, and only this gesture's:
+    // a newer one's may not have begun to arrive. A resize that waited on them
+    // lays out then; its own wait looks again while they still arrive.
+    const owedEnd = (wait = false) => {
+        const token = generation, seen = scrolls;
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            if (dragging === 'owed' && token === generation && scrolls === seen) dragging = '';
+            if (!relayout) return;
+            if (dragging !== 'owed') { relayout = false; if (alive()) state.reflow(); }
+            else if (wait) owedEnd(true);
+        }));
+    };
     const state = {
         top: 0,
         stick: true,
         get generation() { return generation; },
+        // The unread opening still owed (`claim(true)`): its claim's generation, else null.
+        get arriving() { return arriving === generation ? arriving : null; },
         get pending() { return Boolean(intent); },
         get target() { return intent; },
         get approximate() { return approximate; },
@@ -22,7 +37,12 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             width = feed.clientWidth; viewportAnchor = anchors.capture();
         },
         reflow() {
-            if (dragging === 'released' || dragging === 'owed') dragging = ''; // a resize is no part of either
+            // The animation a downward gesture still owes scrolls to is the reader's:
+            // a resize neither writes under it (a write stops it short) nor ends it,
+            // so its own last scroll still decides following. The resize lays out
+            // once those scrolls end, no part of the gesture.
+            if (dragging === 'owed') { if (!relayout) { relayout = true; owedEnd(true); } return; }
+            if (dragging === 'released') dragging = ''; // a resize is no part of a released drag
             if (intent) { state.position(); return; }
             if (!visible()) return;
             if (state.stick) feed.scrollTop = feed.scrollHeight;
@@ -38,7 +58,7 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
                 // it leaves the feed.
                 if (dragging) state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
                 state.top = feed.scrollTop;
-                state.remember();
+                state.remember(relayout); // a resize waiting on these scrolls keeps where they end
             }
             updateButton();
         },
@@ -80,9 +100,10 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
         },
         /** An explicit navigation (↓) that awaits history before it moves: the
          * reader's own later gesture supersedes it, even one a bounded box absorbs. */
-        claim() {
+        claim(arrive = false) {
             state.cancel();
             const token = claimed = generation;
+            arriving = arrive ? token : null;
             return () => token === generation;
         },
         bindGestures(navigate) {
@@ -142,9 +163,10 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
                 const follow = state.stick, absorb = () => { state.stick = follow && direction > 0 && state.nearBottom(); };
                 if (nested) {
                     // Box scrolling also ends an earlier feed gesture's queued frame and
-                    // the scrolls it still owes, though not a scrollbar drag still held.
+                    // the scrolls it still owes, though not a scrollbar drag still held,
+                    // and an unread opening still owed after its claim reached the present.
                     gestures++; if (dragging !== 'held') dragging = '';
-                    if (intent || approximate || claimed === generation) state.cancel();
+                    if (intent || approximate || claimed === generation || arriving === generation) state.cancel();
                     absorb();
                     return;
                 }
@@ -171,14 +193,7 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             feed.addEventListener('scroll', noteBoxScroll, { passive: true, capture: true });
             const settle = () => {
                 if (dragging === 'released') dragging = '';
-                if (dragging !== 'owed') return;
-                // WebKit also ends each step of an animated page scroll: the owed
-                // scrolls end only once a frame passes without another, and only
-                // this gesture's: a newer one's may not have begun to arrive.
-                const token = generation, seen = scrolls;
-                requestAnimationFrame(() => requestAnimationFrame(() => {
-                    if (dragging === 'owed' && token === generation && scrolls === seen) dragging = '';
-                }));
+                if (dragging === 'owed') owedEnd();
             };
             feed.addEventListener('scrollend', settle, { passive: true });
             const pointer = ['pointerdown', 'pointerup', 'pointercancel'];
@@ -196,6 +211,21 @@ export function createChatReadingPosition({ visible, alive, ready, feed, anchors
             dragging = '';
             if (!intent) intent = { scrollTop: state.top, stick: state.stick, historyAnchor: anchors.serialize() };
             state.position();
+        },
+        /** An unread room opened (`claim(true)`) lands once on its newest message, `measure()`
+         * px from the bottom, unless the reader moved first; `token` is that opening's
+         * own claim, so a superseded one spends nothing. Nothing to move (on screen
+         * there, unknown, never reached) leaves the claim's own navigation in charge. */
+        land(measure, token) {
+            if (arriving !== generation || token !== generation) return;
+            arriving = null;
+            if (!visible()) return;
+            feed.scrollTop = feed.scrollHeight;
+            const offset = measure();
+            if (!offset) return;
+            state.cancel();
+            feed.scrollTop += offset;
+            state.top = feed.scrollTop; state.stick = false; state.remember(true); updateButton();
         },
         followAfterLayout() {
             const token = generation;

@@ -12,6 +12,8 @@ from ouroboros.delegate_supervision import (
     supervised_wait,
 )
 from ouroboros.task_results import STATUS_COMPLETED, STATUS_RUNNING, write_task_result
+from tests._shared import write_queue_document
+from tests._store_shared import unreadable_result
 
 
 def _ctx(tmp_path):
@@ -129,7 +131,7 @@ def test_meaningful_wake_carries_live_tree_planning_facts_and_replays_exactly(
     from ouroboros.deadline_utils import utc_now
     from ouroboros.review_substrate import review_binding_hash
     from ouroboros.task_results import claim_task_acceptance_review_cycle
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "3")
     contract = build_task_contract({
@@ -149,7 +151,7 @@ def test_meaningful_wake_carries_live_tree_planning_facts_and_replays_exactly(
     _child(tmp_path, "grandchild", parent_task_id="child")
     now = utc_now()
     (tmp_path / "state").mkdir(exist_ok=True)
-    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {
+    write_queue_document(tmp_path / "state" / "queue_snapshot.json", {
         "ts": utc_now_iso(),
         "pending": [],
         "running": [
@@ -323,10 +325,10 @@ def test_oversized_coordination_wake_is_valid_bounded_json_with_exact_source(tmp
 
 
 def test_live_descendant_fact_rejects_stale_queue_and_ignores_unrelated_corruption(
-    tmp_path,
+    tmp_path, monkeypatch,
 ):
     from ouroboros.delegate_supervision import coordination_live_context
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
     ctx = _ctx(tmp_path)
     _child(tmp_path)
@@ -340,15 +342,14 @@ def test_live_descendant_fact_rejects_stale_queue_and_ignores_unrelated_corrupti
             "root_task_id": "root", "delegation_role": "subagent",
         }}],
     }
-    atomic_write_json(state / "queue_snapshot.json", snapshot)
+    write_queue_document(state / "queue_snapshot.json", snapshot)
     stale = coordination_live_context(ctx)["active_descendants"]
     assert stale["state"] == "unknown"
     assert stale["count"] is None
 
-    unrelated = tmp_path / "task_results" / "unrelated-history.json"
-    unrelated.write_text("{broken", encoding="utf-8")
+    unreadable_result(monkeypatch, "unrelated-history")
     snapshot["ts"] = utc_now_iso()
-    atomic_write_json(state / "queue_snapshot.json", snapshot)
+    write_queue_document(state / "queue_snapshot.json", snapshot)
     current = coordination_live_context(ctx)["active_descendants"]
     assert current == {
         "state": "known",
@@ -361,13 +362,13 @@ def test_live_descendant_fact_rejects_stale_queue_and_ignores_unrelated_corrupti
 
 def test_live_descendant_fact_terminal_result_wins_over_stale_running_row(tmp_path):
     from ouroboros.delegate_supervision import coordination_live_context
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
     ctx = _ctx(tmp_path)
     _child(tmp_path, status=STATUS_COMPLETED)
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
-    atomic_write_json(state / "queue_snapshot.json", {
+    write_queue_document(state / "queue_snapshot.json", {
         "ts": utc_now_iso(),
         "pending": [],
         "running": [{"id": "child", "task": {
@@ -385,17 +386,16 @@ def test_live_descendant_fact_terminal_result_wins_over_stale_running_row(tmp_pa
     }
 
 
-def test_live_descendant_fact_is_unknown_for_corrupt_exact_queued_result(tmp_path):
+def test_live_descendant_fact_is_unknown_for_an_unreadable_exact_queued_result(tmp_path, monkeypatch):
     from ouroboros.delegate_supervision import coordination_live_context
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
     ctx = _ctx(tmp_path)
-    results = tmp_path / "task_results"
-    results.mkdir(exist_ok=True)
-    (results / "child.json").write_text("{", encoding="utf-8")
+    _child(tmp_path)
+    unreadable_result(monkeypatch, "child")
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
-    atomic_write_json(state / "queue_snapshot.json", {
+    write_queue_document(state / "queue_snapshot.json", {
         "ts": utc_now_iso(), "pending": [],
         "running": [{"id": "child", "task": {
             "id": "child", "parent_task_id": "parent",
@@ -404,20 +404,19 @@ def test_live_descendant_fact_is_unknown_for_corrupt_exact_queued_result(tmp_pat
     })
     fact = coordination_live_context(ctx)["active_descendants"]
     assert fact["state"] == "unknown" and fact["count"] is None
-    assert fact["reason"] == "ValueError"
+    assert fact["reason"] == "StoreError"
 
 
-def test_live_descendant_fact_ignores_corrupt_unrelated_active_root(tmp_path):
+def test_live_descendant_fact_ignores_an_unreadable_unrelated_active_root(tmp_path, monkeypatch):
     from ouroboros.delegate_supervision import coordination_live_context
-    from ouroboros.utils import atomic_write_json, utc_now_iso
+    from ouroboros.utils import utc_now_iso
 
     ctx = _ctx(tmp_path)
     _child(tmp_path)
-    results = tmp_path / "task_results"
-    (results / "unrelated-active.json").write_text("{", encoding="utf-8")
+    unreadable_result(monkeypatch, "unrelated-active")
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
-    atomic_write_json(state / "queue_snapshot.json", {
+    write_queue_document(state / "queue_snapshot.json", {
         "ts": utc_now_iso(), "pending": [],
         "running": [
             {"id": "child", "task": {

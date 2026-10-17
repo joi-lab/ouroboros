@@ -29,7 +29,9 @@ TASK = "t-mixed"
 
 def _mixed_population(drive):
     """One task owning: its own leaf, a live reviewer, a settled reviewer, and a
-    review invocation that never bound a run."""
+    review invocation that never bound a run. Reviewer rows carry the read-only
+    Ask shape their producer (``review_execution``) records."""
+    seat = {"access": "readonly", "mode": "ask"}
     dc._CUSTODY.clear()
     dc.record_started(drive, dc.RunCustody(
         run_id="run-leaf", task_id=TASK, route_id="codex", model="leaf-model",
@@ -37,10 +39,10 @@ def _mixed_population(drive):
     dc.record_started(drive, dc.RunCustody(
         run_id="run-review", task_id=TASK, route_id="codex", model="review-model",
         source="review_substrate", category="task_acceptance_review",
-        review_slot_id="triad_286lhb", ledger_root=str(drive)))
+        review_slot_id="triad_286lhb", ledger_root=str(drive)), shape=seat)
     dc.record_started(drive, dc.RunCustody(
         run_id="run-review-done", task_id=TASK, route_id="codex",
-        source="review_substrate:task_acceptance", ledger_root=str(drive)))
+        source="review_substrate:task_acceptance", ledger_root=str(drive)), shape=seat)
     assert dc.emit(drive, dc.SETTLED, {
         "run_id": "run-review-done", "task_id": TASK, "route": "codex",
         "model": "review-model", "state": "failed", "source": "review_substrate",
@@ -48,14 +50,14 @@ def _mixed_population(drive):
         "cost_final": True, "spend_disclosed": True})
     assert dc.record_start_requested(
         drive, run_id="", task_id=TASK, invocation_id="inv-review",
-        idempotency_key="inv-review", request={"prompt": "review packet"},
+        idempotency_key="inv-review", request={"prompt": "review packet", **seat},
         route="codex", source="review_substrate.extraction")
     dc._CUSTODY.clear()
 
 
 @pytest.mark.parametrize("consumer", [
     "terminal_audit", "execution_evidence", "unknown_hold",
-    "orphan_sweep", "pending_invocation", "owner_cancellation",
+    "orphan_sweep", "pending_invocation", "owner_cancellation", "continue_writer_check",
 ])
 def test_only_the_tasks_own_delegation_is_its_delegation(
     tmp_path, monkeypatch, consumer,
@@ -111,17 +113,32 @@ def test_only_the_tasks_own_delegation_is_its_delegation(
         assert delegate_hold._single_live_run(ctx) == "run-leaf"
         return
 
+    if consumer == "continue_writer_check":
+        # #1572: the owner's Continue reads the panel's rows as independent reviews
+        # without candidate-apply possibility; every other census keeps them.
+        from ouroboros.task_results import write_task_result
+        from supervisor.continuation_admission import CONTINUE_PURPOSE, conflicting_writers
+        from tests._budget_pause_exact_helpers import _install_queue
+
+        queue, _state, _workers = _install_queue(tmp_path, monkeypatch)
+        write_task_result(tmp_path, TASK, "cancelled", root_task_id=TASK, chat_id=0, result="interrupted")
+        delegated = lambda rows: sorted(row.get("run_id") or row.get("invocation_id")
+                                        for row in rows if row["kind"] == "delegated_run")
+        assert delegated(conflicting_writers(queue, TASK)) == ["inv-review", "run-leaf", "run-review"]
+        assert delegated(conflicting_writers(queue, TASK, purpose=CONTINUE_PURPOSE)) == ["run-leaf"]
+        dc._CUSTODY.clear()
+        return
+
     if consumer == "pending_invocation":
         class _NeverStarts(_LiveRunStub):
             def start_run(self, request, *, idempotency_key=""):
                 pytest.fail("a review panel rejoins its own invocation")
 
         outcomes = dc.reconcile_orphaned_runs(
-            tmp_path, set(), gateway_factory=_NeverStarts)
-        assert [row for row in outcomes if row.get("invocation_id")] == [{
-            "invocation_id": "inv-review", "task_id": TASK,
-            "action": "invocation_retained",
-            "reason": "review_panel_owns_invocation"}]
+            tmp_path, set(), gateway_factory=_NeverStarts, replay_pending=lambda: True)
+        # The periodic sweep leaves the panel's invocation to its panel: no outcome, still pending.
+        assert [row for row in outcomes if row.get("invocation_id")] == []
+        assert "inv-review" in {record["invocation_id"] for record in dc.pending_invocations(tmp_path)}
         dc._CUSTODY.clear()
         return
 

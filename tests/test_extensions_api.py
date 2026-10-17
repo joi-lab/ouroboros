@@ -172,6 +172,10 @@ def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monk
     srv.app.app.state.repo_dir = tmp_path / "repo"  # type: ignore[attr-defined]
     settings = {"OUROBOROS_SKILLS_REPO_PATH": str(old_repo), "OUROBOROS_RUNTIME_MODE": "advanced"}
     _patch_lifespan_for_drive_root_test(monkeypatch, srv, settings)
+    # The POST persists through the gateway's owner writer (``config.SETTINGS_PATH``), not
+    # through the ``server.save_settings`` name patched above: keep the document it writes
+    # in this test's tree instead of the worker-shared pytest data root.
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive_root / "settings.json")
     monkeypatch.setattr("ouroboros.config.get_skills_repo_path", lambda: str(old_repo))
     calls: list[tuple[pathlib.Path, str | None]] = []
     monkeypatch.setattr(
@@ -1622,7 +1626,11 @@ def test_api_skill_grants_rejects_blocking_blocker_review(tmp_path, monkeypatch)
         )
         resp = client.post("/api/skills/grant_blocked/grants", json={"items": ["OPENROUTER_API_KEY"]})
         assert resp.status_code == 409
-        assert "fresh executable review" in resp.json()["error"]
+        error = resp.json()["error"]
+        # Blocking enforcement admits no author acceptance: the reviewer verdict is the only authority.
+        assert error == ("key and permission grants need the review gate to permit the current bytes: "
+                         "a current executable reviewer verdict")
+        assert resp.json()["review_gate"]["blocking_reason"] == "blocker_findings_under_blocking_enforcement"
     finally:
         _stop_patches(patches)
 

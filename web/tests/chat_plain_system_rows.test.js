@@ -104,6 +104,18 @@ class ElementStub {
         const parent = this.parentNode;
         if (parent) parent.insertBefore(node, parent.children[parent.children.indexOf(this) + 1] || null);
     }
+    insertAdjacentElement(position, node) {
+        switch (position.toLowerCase()) {
+        case 'beforebegin': return this.parentNode?.insertBefore(node, this) || null;
+        case 'afterbegin': return this.insertBefore(node, this.children[0] || null);
+        case 'beforeend': return this.appendChild(node);
+        case 'afterend':
+            if (!this.parentNode) return null;
+            this.after(node);
+            return node;
+        default: throw new Error(`Unsupported insertion position: ${position}`);
+        }
+    }
     insertBefore(node, before) {
         if (node?.isDocumentFragment) {
             for (const child of [...node.children]) this.insertBefore(child, before);
@@ -212,7 +224,7 @@ function restoreDom(prior) {
     Object.assign(globalThis, prior);
 }
 
-function makeInstance(mount) {
+function makeInstance(mount, options = {}) {
     const handlers = new Map();
     const ws = {
         on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
@@ -234,6 +246,7 @@ function makeInstance(mount) {
         idPrefix: 'chat',
         mountEl: mount,
         asPanel: true,
+        ...options,
     });
     return { instance, handlers };
 }
@@ -265,6 +278,34 @@ const referenceShape = (node) => ({
     spoken: node?.getAttribute?.('aria-label'),
 });
 const LAUNCH_REFERENCE = { intent: 'open-project', pill: true, parts: ['', 'Launch', '↗'], spoken: 'Open project Launch' };
+
+for (const systemType of ['project_handoff', 'project_started']) {
+    for (const missing of ['task_id', 'project_id']) {
+        test(`an incomplete ${systemType} without ${missing} keeps plain text and Copy`, () => {
+            const { prior, mount } = installHistoryDom();
+            let instance;
+            try {
+                const made = makeInstance(mount, { chatId: 1, asPanel: false });
+                instance = made.instance;
+                const row = { chat_id: 1, role: 'system', system_type: systemType,
+                    task_id: 'legacy-task', project_id: 'launch', project_name: 'Launch',
+                    content: 'Retained entry **as written**', ts: '2026-10-08T13:58:00Z' };
+                delete row[missing];
+                made.handlers.get('chat')(row);
+                const bubble = findBubble('system');
+                assert.ok(bubble);
+                assert.equal(bubble.classList.contains('project-handoff'), false);
+                assert.match(bubble.innerHTML, /Retained entry \*\*as written\*\*/);
+                const copy = bubble.querySelector('.chat-message-copy');
+                assert.ok(copy, 'declining compact rendering does not remove plain-message Copy');
+                assert.equal(copy.listeners.get('click').length, 1);
+            } finally {
+                instance?.destroy();
+                restoreDom(prior);
+            }
+        });
+    }
+}
 
 test('plain project row renders escaped text with the Project reference and no markdown machinery', async () => {
     const { prior, mount } = installDom();
@@ -306,6 +347,34 @@ const MIRROR_ROW = {
     completion_answer: '**Done: PR #7 merged.**\n\nSecond paragraph.',
 };
 
+test('a nonclean final keeps one factual limitation, Project reference, and one logical delivery across retries', () => {
+    const { prior, mount } = installDom();
+    let instance;
+    try {
+        const made = makeInstance(mount);
+        instance = made.instance;
+        const row = { ...MIRROR_ROW, task_id: 'partial-task', delivery_id: 'completion:partial-task',
+            completion_reason: 'Partial result · Windows validation was not completed.' };
+        made.handlers.get('chat')(row);
+        made.handlers.get('chat')({ ...row, ts: '2026-09-01T00:00:00Z' });
+        const messages = document.byId.get('chat-messages');
+        const finals = messages.children.filter(node => node.dataset.deliveryId === row.delivery_id);
+        assert.equal(finals.length, 1, 'physical retry timestamps do not create another outcome');
+        const final = finals[0];
+        assert.equal(final.dataset.ts, String(Date.parse(row.ts)), 'the outcome keeps its original time');
+        const limitation = final.querySelector('.project-answer-limitation');
+        assert.equal(limitation.textContent, row.completion_reason);
+        assert.equal(limitation.title, row.completion_reason);
+        const actions = final.querySelector('.system-message-actions');
+        assert.equal(actions.children.length, 1);
+        assert.equal(actions.children[0].dataset.intent, 'open-project');
+        assert.match(final.innerHTML, /Done: PR #7 merged/);
+        made.handlers.get('chat')({ ...PLAIN_ROW, task_id: 'stopped-task', completion_reason: 'Stopped.' });
+        assert.equal(findBubble('system').querySelector('.project-answer-limitation'), null,
+            'the System fallback already carries its outcome and adds no duplicate limitation');
+    } finally { instance?.destroy(); restoreDom(prior); }
+});
+
 test('a completion row carrying the answer renders as an ordinary Ouroboros message with the Project chip', async () => {
     const { prior, mount } = installDom();
     let instance;
@@ -325,8 +394,8 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
-        // One control, and the SAME one the System row carries: the voice of a row never
-        // chooses how the UI points at its Project.
+        // The SAME reference the System row carries: the voice of a row never chooses how the
+        // UI points at its Project. The mirror has no second route into the result.
         assert.equal(actions.children.length, 1);
         const chip = actions.children[0];
         assert.deepEqual(referenceShape(chip), LAUNCH_REFERENCE);
@@ -402,9 +471,11 @@ test('the fold is CSS over the complete answer: clamp always, fade only when fol
     const rules = block.slice(0, block.indexOf('design-system:migrated-end'));
     assert.match(rules, /\.chat-bubble\.project-answer > \.message \{ max-height: var\(--project-answer-fold\); overflow: hidden; \}/);
     assert.match(rules, /\.chat-bubble\.project-answer\.is-folded > \.message \{[^}]*mask-image/);
+    // The Project is the route to the complete answer; the mirror never expands in place.
+    assert.doesNotMatch(rules, /\.project-answer\.is-expanded/);
     assert.doesNotMatch(rules, /user-select|font-size: \d|#[0-9a-fA-F]{3,6}\b/);
     // chat.js stays a caller: the decoration lives in its own module.
-    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName,/);
+    assert.match(chatSource, /decorateProjectRow\(bubble, \{ \.\.\.meta, \.\.\.opts, role,/);
 });
 
 test('plain system row renders identically live and after history reload', async () => {
@@ -573,7 +644,7 @@ for (const noticeRow of ORIGIN_ADDRESSED_NOTICE_ROWS) {
                 made.handlers.get('chat')(noticeRow);
                 const bubble = findBubble('system');
                 assert.ok(bubble, 'the notice row rendered a system bubble');
-                assert.match(bubble.innerHTML, /📋 System/);
+                assert.match(bubble.innerHTML, /<div class="sender">System<\/div>/);
                 assert.match(bubble.innerHTML, expectedText);
                 assert.doesNotMatch(bubble.innerHTML, /<br>|<h1|<h2|md-h1|md-h2|<strong/);
                 assert.equal(bubble.getAttribute('data-chat-markdown-enhanced'), '');
@@ -640,7 +711,7 @@ test('a refused steer leaves the running target card open', () => {
         made.handlers.get('chat')(notice);
         assert.equal(card.dataset.finished, '0', 'a refused message is no terminal task fact');
         assert.equal(liveCards().length, 1);
-        assert.match(findBubble('system').innerHTML, /📋 System/);
+        assert.match(findBubble('system').innerHTML, /<div class="sender">System<\/div>/);
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -655,23 +726,27 @@ test('render arm order and enhancement guard are pinned in source', () => {
         chatSource.indexOf('const timeFmt =', chatSource.indexOf("const rendered = role === 'user'")),
     );
     assert.match(ternary, /renderSkillReviewDisclosure\(text, opts\.skillReview \|\| null\)/);
-    assert.match(ternary, /role === 'system' && systemType !== 'skill_review' && markdown !== true\n\s+\? escapeHtml\(text\)/);
-    assert.match(chatSource, /: renderChatMarkdown\(text\);/);
+    assert.match(ternary, /role === 'system' && markdown !== true\n\s+\? escapeHtml\(painted\)/);
+    assert.match(chatSource, /: renderChatMarkdown\(painted\);/);
+    // `painted` is render-only (host_notice_text.js); Copy keeps the pre-cleanup `shown`.
+    assert.match(chatSource, /const painted = hostRowDisplayText\(\{ text: stored, role, system_type: systemType, narration: opts\.narration \}, text\);/);
+    assert.match(chatSource, /chatMedia\.attachCopyControl\(bubble, String\(shown\)\)/);
     // The enhancement pass skips exactly the plain-system case.
     assert.match(
         chatSource,
-        /const richMarkdown = role !== 'user' && systemType !== 'skill_review' && \(role !== 'system' \|\| markdown === true\);/,
+        /const richMarkdown = role !== 'user' && !skillReview && \(role !== 'system' \|\| markdown === true\);/,
     );
 });
 
 test('chat bubble heading ladder is scoped in style.css', () => {
     // Only a full rich answer (`.message.ui-rich-content`) follows the reading
-    // ladder (DESIGN.md §1, §5); compact Markdown in a bubble (a Skill Review
+    // ladder (DESIGN.md §1, §5), sharing its rules with a delivered document in
+    // the reader (DESIGN "Document reading"); compact Markdown in a bubble (a Skill Review
     // report) keeps every heading a body-size semibold label; the global md-h1
     // page-size rule stays for non-chat surfaces, and the live-card timeline
     // carries its own inline clamp.
     assert.match(styleSource, /\.chat-bubble \.message \.md-h1,\n\.chat-bubble \.message \.md-h2,\n\.chat-bubble \.message \.md-h3 \{\n\s+font-size: var\(--type-body\);\n\s+font-weight: 600;\n\}/);
-    assert.match(styleSource, /\n\.chat-bubble \.message:where\(\.ui-rich-content\) :is\(\.md-h1, \.md-h2\) \{ font-size: var\(--md-heading-major\); \}\n\.chat-bubble \.message:where\(\.ui-rich-content\) \.md-h3 \{ font-size: var\(--md-heading-minor\); \}\n/);
+    assert.match(styleSource, /\n\.chat-bubble \.message:where\(\.ui-rich-content\) :is\(\.md-h1, \.md-h2\),\n\.document-reader-markdown :is\(\.md-h1, \.md-h2\) \{ font-size: var\(--md-heading-major\); \}\n\.chat-bubble \.message:where\(\.ui-rich-content\) \.md-h3,\n\.document-reader-markdown \.md-h3 \{ font-size: var\(--md-heading-minor\); \}\n/);
     // The timeline label follows its row's size: collapsed rows are meta size,
     // an expanded row is body size (DESIGN.md §5, "summary outranks details").
     // Unambiguous block scan (indent, then a non-space start): the `(\s+[^\n]+\n)*`
@@ -776,8 +851,10 @@ test('the legacy-memory notice reads in the install language; other plain system
         assert.match(render(notice), /Memory: what Ouroboros remembered before this update/);
         sent.length = 0;
         await flushMisses();
-        // The bubble's own chrome (time, copy) reports its codes too; the notice is one text key.
-        const reported = sent.flatMap((payload) => payload.items).filter((item) => !item.key.startsWith('code:'));
+        // The bubble's own chrome (time, copy) reports its codes too, and the composer's effort
+        // button reports its fmt template at mount; the notice is one text key.
+        const reported = sent.flatMap((payload) => payload.items)
+            .filter((item) => !item.key.startsWith('code:') && !/\{\w+\}/.test(item.key));
         assert.deepEqual(reported.map((item) => item.key), [LEGACY_NOTICE]);
         assert.equal(reported[0].context.role, 'host-text');
     } finally {

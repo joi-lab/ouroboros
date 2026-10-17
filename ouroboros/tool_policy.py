@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Protocol, Sequence
 
 from ouroboros.tool_capabilities import CORE_TOOL_NAMES, META_TOOL_NAMES
+from ouroboros.contracts.task_contract import canonical_tool_name
 
 
 NANO_SCHEMA_META_NAMES = META_TOOL_NAMES | frozenset({"compact_context"})
@@ -62,8 +63,11 @@ def select_tool_schemas(
     unavailable_reasons: Mapping[str, str] | None = None,
 ) -> ToolSchemaSelection:
     """Pure selection from one permitted snapshot, retaining its canonical order."""
-    requested = _schema_names(schema_names)
     available = {schema["function"]["name"] for schema in canonical_schemas}
+    requested = _schema_names(
+        canonical_tool_name(name) if canonical_tool_name(name) in available else name
+        for name in _schema_names(schema_names)
+    )
     selected = set(requested) | NANO_SCHEMA_META_NAMES
     schemas = tuple(deepcopy(schema) for schema in canonical_schemas
                     if context_mode != "nano" or schema["function"]["name"] in selected)

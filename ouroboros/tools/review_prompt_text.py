@@ -61,6 +61,13 @@ Before marking any finding CRITICAL you MUST:
    or instructions a user/reviewer must rely on to use the changed feature correctly.
    Examples that should normally stay advisory: README test counts, descriptive
    "N fixes" summaries, or marketing-style numeric claims.
+8. Name who or what triggers the problem on a supported install — a user flow,
+   a crash or restart, a concurrent writer Ouroboros itself runs, a platform it
+   ships on. A fault that needs someone who already holds the power (the owner
+   or Ouroboros editing, planting or restoring files under its own data root) is
+   **advisory**, and disclosure is a valid fix. A remedy that adds a check,
+   re-read, proof or refusal states what it costs on the path it sits on at
+   today's history size, or what work it refuses.
 
 When in doubt: use "advisory". Reserve "critical" for clear, concrete,
 repo-local, reachable defects.
@@ -71,6 +78,22 @@ REVIEW_PREAMBLE = (
     "You are a pre-commit reviewer for Ouroboros, a self-modifying AI agent.\n"
     "Its Constitution is BIBLE.md. Its engineering handbook is DEVELOPMENT.md.\n"
 )
+
+
+# The core layer: the subject is a repository that is NOT Ouroboros's body, so
+# the preamble names neither the constitution nor the handbook — the universal
+# checklist is the whole rule set and the subject's own documents are evidence.
+REVIEW_PREAMBLE_CORE = (
+    "You are a pre-commit reviewer for a change that Ouroboros, an AI agent, is\n"
+    "landing in a repository that is not its own body. Judge the change by the\n"
+    "universal checklist below and by what the subject repository itself promises\n"
+    "in its documents and tests; no other project's rules apply to it.\n"
+)
+
+
+def review_preamble(layer: str = "body") -> str:
+    """The reviewer preamble for a checklist layer (`review_body_fact.layer_for`)."""
+    return REVIEW_PREAMBLE if layer == "body" else REVIEW_PREAMBLE_CORE
 
 
 REVIEW_THOROUGHNESS_BLOCK = """\
@@ -92,16 +115,22 @@ REVIEW_SEVERITY_THRESHOLDS = """\
 
 
 REPO_ANTI_PATTERN_LOCK_GUARD = """\
-Before returning, do a deliberate SECOND pass focused on a materially
-DIFFERENT concern class. This is a semantic breadth check, not a numeric
-finding quota: zero or one FAIL is valid, and you must never manufacture a
-finding merely to increase the count. For example:
-if your FAIL is `code_quality`, re-examine `tests_affected` and
-`self_consistency`; if `cross_platform`, re-examine `security_issues` and
-`architecture_doc`; if `version_bump`, re-examine `changelog_and_badge`
-and `self_consistency`. Update PASS entries in-place if your second pass
-uncovers new FAILs — return only one JSON array, not two.
+Before returning, challenge the behavior promised by this change and by your
+proposed fixes with a realistic supported counterexample or event sequence.
+Check what the facts establish and whether they justify the resulting decision
+for the actor and resource involved. Use existing evidence where sufficient.
+This check adds no required output or review stage; the checklist's existing
+evidence requirements still apply.
 """
+
+
+# Both layers use the same behavioral countercheck; keep the exported core name.
+REPO_ANTI_PATTERN_LOCK_GUARD_CORE = REPO_ANTI_PATTERN_LOCK_GUARD
+
+
+def anti_pattern_lock_guard(layer: str = "body") -> str:
+    """The shared behavioral countercheck for either checklist layer."""
+    return REPO_ANTI_PATTERN_LOCK_GUARD if layer == "body" else REPO_ANTI_PATTERN_LOCK_GUARD_CORE
 
 
 _ANTI_THRASHING_RULE_VERDICT = (
@@ -131,7 +160,10 @@ _CONVERGENCE_RULE_TEXT = (
 _HISTORY_VERIFICATION_ONLY_RULE = (
     "Use prior review history and obligation records for verification only. "
     "Do NOT manufacture a new FAIL from historical text alone. Any new FAIL must be "
-    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt."
+    "grounded in the CURRENT diff or CURRENT repository artifacts shown in this prompt. "
+    "An author's rejection is not reviewer agreement, and a verdict on an earlier subject "
+    "does not approve this revision. To revisit a rejected alternative, address its earlier "
+    "rationale and explain the new evidence or changed requirement."
 )
 
 
@@ -146,10 +178,15 @@ def format_review_history_entry(entry: object, *, default_severity: str = "advis
         tags += [f"model={entry['model']}"] if entry.get("model") else []
         tags += [f"obligation={entry['obligation_id']}"] if entry.get("obligation_id") else []
         label = str(entry.get("item") or entry.get("reason") or "?")
-        reason = single_line(entry.get("reason", ""))
+        reason = str(entry.get("reason") or "")
         tag_prefix = " ".join(f"[{tag}]" for tag in tags)
-        return f"[{severity}] {tag_prefix} {label}: {reason}".strip()
-    return single_line(entry)
+        rendered = f"[{severity}] {tag_prefix} {label}: {reason}".strip()
+        details = {key: value for key, value in entry.items()
+                   if key not in {"severity", "tag", "model", "obligation_id", "item", "reason"}}
+        if details:
+            rendered += "\n" + format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json")
+        return rendered
+    return str(entry or "")
 
 
 def build_review_history_section(
@@ -178,6 +215,12 @@ def build_review_history_section(
                 f"{prefix}{format_review_history_entry(finding, default_severity=default)}"
                 for finding in findings
             )
+        # Preserve the recorded subject, raw answers, author rationale and
+        # verdicts as data. A findings-only rendering loses the resolved dispute.
+        details = {key: value for key, value in entry.items()
+                   if key not in {"attempt", "commit_message", "critical", "advisory"}}
+        if details:
+            lines.append(format_prompt_code_block(json.dumps(details, ensure_ascii=False, indent=2, default=str), "json"))
         lines.append("")
 
     obligations_block = build_obligations_block(open_obligations)
@@ -188,6 +231,27 @@ def build_review_history_section(
         convergence_fires=bool(history and len(history) >= 2),
     ))
     return "\n".join(lines)
+
+
+def author_questions_block(questions, *, note: str = "") -> str:
+    """The author's own questions to the panel, numbered as asked — the ONE rendering
+    every surface uses (``review_change``'s wave, the public brief builder, the
+    system review's task), so a brief rebuilt outside the gate reads as the brief
+    the seat was sent. The questions are passed verbatim (``review_change``'s
+    contract); blank entries are dropped. ``note`` qualifies the heading (the system
+    review asks them after its own questionnaire). ``""`` without questions."""
+    asked = [str(question) for question in (questions or ()) if str(question or "").strip()]
+    if not asked:
+        return ""
+    heading = f"Author questions (answer each as asked{', ' + note if note else ''}):"
+    return heading + "".join(f"\n{number}. {question}" for number, question in enumerate(asked, 1))
+
+
+def goal_with_author_questions(goal: str, questions) -> str:
+    """The goal text a wave hands its seats: the author's goal, then the questions
+    block; the goal alone when nothing was asked."""
+    block = author_questions_block(questions)
+    return f"{goal}\n\n{block}".lstrip("\n") if block else str(goal or "")
 
 
 def build_obligations_block(open_obligations: list | None) -> str:
@@ -205,7 +269,7 @@ def build_obligations_block(open_obligations: list | None) -> str:
             "obligation_id": getattr(ob, "obligation_id", "?"),
             "item": getattr(ob, "item", "?"),
             "severity": getattr(ob, "severity", ""),
-            "reason_excerpt": format_obligation_excerpt(getattr(ob, "reason", "")),
+            "reason": redact_prompt_secrets(str(getattr(ob, "reason", "")))[0],
         }
         for ob in open_obligations
     ]

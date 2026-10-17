@@ -2,10 +2,10 @@
 """Validate a contributor scope-checklist receipt against the runtime contract.
 
 CONTRIBUTING.md's main review path asks the separate review agent to output a
-JSON array covering all eight Intent/Scope checklist items. This validator is
-a thin CLI over the SAME contract the runtime scope review enforces
-(`ouroboros.tools.scope_review_contract.normalize_scope_items`) — coverage,
-duplicate/contradictory rows, severities, and justified PASS reasons — so a
+JSON array covering every item of the Coupling questions checklist. This
+validator is a thin CLI over the SAME contract the runtime coupling review
+enforces (`ouroboros.tools.scope_review_contract.normalize_scope_items`) —
+coverage, duplicate/contradictory rows, severities, and a reason on every row — so a
 receipt that passes here matches what the project's own reviewers must
 produce. It validates SHAPE, not truth: the maintainer still reads the
 evidence.

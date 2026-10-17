@@ -16,15 +16,19 @@ import logging
 import json
 import pathlib
 from typing import Any
+from ouroboros.observability import stamp_finalization_enqueue
 from ouroboros.utils import utc_now_iso
+from supervisor.log_addressing import task_event_queue
 
 log = logging.getLogger(__name__)
 
 
 # Log types the worker sink does NOT forward: each already reaches the dashboard
 # live via a dedicated EVENT_Q sibling/handler, so forwarding the worker's
-# append_jsonl copy too would double-broadcast (and task_checkpoint would also be
-# re-persisted to events.jsonl by _handle_log_event, a double file write).
+# append_jsonl copy too would double-broadcast. A task_checkpoint producer
+# appends its own durable rows and then emits the one live frame explicitly
+# (loop_messages._emit_checkpoint_event), so its append copy is exactly the
+# frame that must not go out twice.
 
 
 WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
@@ -32,7 +36,7 @@ WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
     "tool_call", "tool_call_started", "tool_call_timeout",
     "llm_round", "task_checkpoint", "task_done", "llm_usage",
     "provider_incomplete_response", "llm_empty_response", "provider_body_error",
-    "review_cycles_exhausted", "plan_review_advisory_open",
+    "review_cycles_exhausted",
 })
 
 
@@ -71,9 +75,48 @@ def _bind_worker_repo_root(repo_dir: str, drive_root: str = "") -> None:
         _git_ops.DRIVE_ROOT = _pl.Path(drive_root)
 
 
+def write_bytecode_to_prefix_only(drive_root: str) -> None:
+    """Let this worker cache its bytecode, only into a prefix inside its data dir.
+
+    The launcher points the prefix at ``data/state/pycache``, and with a prefix Python
+    writes bytecode only there, never beside a source and so never into a signed bundle
+    (WA6, the reason the launcher sets ``PYTHONDONTWRITEBYTECODE``); the next worker then
+    loads its import graph instead of recompiling it on every boot. No prefix, or one
+    outside the data dir (a developer's, a test harness's), changes nothing, and the
+    inherited environment still keeps every other child this process starts from writing.
+    """
+    import sys
+
+    if not sys.pycache_prefix:
+        return
+    try:
+        inside = pathlib.Path(sys.pycache_prefix).resolve().is_relative_to(pathlib.Path(drive_root).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return
+    if inside:
+        sys.dont_write_bytecode = False
+
+
 def _prepare_worker_task_runtime() -> None:
     """Load the managed-update authorization path before a live merge can conflict."""
     import supervisor.update_merge  # noqa: F401
+
+
+def local_work_settled() -> bool:
+    """The idle probe's one answer: no tool future, review or paid sender of this process is owed.
+
+    Handoffs register the new owner before the old one settles: a tool that starts a review
+    registers it (``review_operation._LIVE``) during its own execution, and a review's
+    inspection calls are tool futures registered before the review can close. Tools a review
+    started cannot start reviews (their allowlist is read-only), so producers, reviews, then
+    producers again sees every chain: reviews-then-producers misses a tool that hands off to a
+    review between the two reads, producers-then-reviews misses a review that hands off to an
+    inspection tool between them (tests/test_worker_local_quiescence.py pins both).
+    """
+    from ouroboros.review_operation import local_reviews_settled
+    from ouroboros.tool_custody import local_producers_settled
+
+    return local_producers_settled() and local_reviews_settled() and local_producers_settled()
 
 
 def _adopt_published_extensions(pool_drive_root: str) -> None:
@@ -135,6 +178,10 @@ def request_worker_stop(proc):
     This Process still owns its native Popen. It is NOT an attached PID/watch:
     Process.kill retains multiprocessing's native exited-child checks, including
     on Darwin, and works before the child installs or can service its lifeline.
+
+    Panic budget: local child owners get 250 ms (``request_worker_owned_stops``),
+    the lifeline bounds its callback at 500 ms, and this backstop requests the
+    native kill at 750 ms whatever the lifeline did.
     """
     import threading
 
@@ -266,6 +313,12 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # fork-safety guard (no _scproxy/SCDynamicStoreCopyProxies on the child side
     # of fork) and a clean default for spawned workers too.
     _os.environ["OUROBOROS_IN_WORKER"] = "1"
+    write_bytecode_to_prefix_only(drive_root)  # before the agent's import graph
+    # Pin the executing source before this process loads the agent, and so before
+    # worker_ready lets an assisted update land another generation (preflight_receipts).
+    from ouroboros.preflight_receipts import capture_executing_source_baseline
+
+    capture_executing_source_baseline()
     # Before ANY import that resolves the update-tx marker through git_ops (see
     # _bind_worker_repo_root): a spawned child would otherwise gate on the hardcoded default repo.
     _bind_worker_repo_root(repo_dir, drive_root)
@@ -320,11 +373,16 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     # exactly-once rationale per group).
     try:
         from ouroboros.utils import emit_log_event, set_log_sink
+        from supervisor.log_addressing import stamp_recorded_row
 
         def _worker_log_sink(obj: Any) -> None:
             if isinstance(obj, dict) and str(obj.get("type") or "") in WORKER_LOG_SINK_SUPPRESSED_TYPES:
                 return
-            emit_log_event(out_q, obj, log_label="worker log")
+            # A row this worker appended names only its task: stamp that task's
+            # chat and lineage by value (the task's own endpoint, by task id), so
+            # the frame still routes when the supervisor handles it after task_done.
+            emit_log_event(out_q, stamp_recorded_row(dict(obj)) if isinstance(obj, dict) else obj,
+                           log_label="worker log")
 
         set_log_sink(_worker_log_sink)
     except Exception:
@@ -388,38 +446,79 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     except Exception as _e:
         _log_worker_crash(wid, _drive, "make_agent", _e, _tb.format_exc())
         return
+    # The birth is measured first, in its own try: a failing checkout read must
+    # neither leave it unbound for the idle probe nor suppress readiness. An empty
+    # birth is honest; the parent then matches this child by its own Process pid.
+    birth = ""
+    try:
+        from ouroboros.platform_layer import process_start_time
+
+        birth = str(process_start_time(_os.getpid()) or "")
+    except Exception:
+        log.warning("Worker %s could not measure its own process birth", wid, exc_info=True)
     try:
         _prepare_worker_task_runtime()
         from ouroboros.utils import append_jsonl as _append_jsonl
         from ouroboros.utils import get_git_info as _get_git_info
         from ouroboros.utils import utc_now_iso as _utc_now_iso
 
-        _branch, _sha = _get_git_info(_pathlib.Path(repo_dir))
+        _branch, _sha = _get_git_info(_pathlib.Path(repo_dir))  # best-effort, diagnostic only
         _append_jsonl(_drive / "logs" / "events.jsonl", {
             "ts": _utc_now_iso(), "type": "worker_ready", "worker_id": wid,
-            "pid": _os.getpid(), "git_branch": _branch, "git_sha": _sha,
+            "pid": _os.getpid(), "process_birth": birth, "git_branch": _branch, "git_sha": _sha,
         })
     except Exception as _e:
         _log_worker_crash(wid, _drive, "worker_ready", _e, _tb.format_exc())
+    import queue as _queue
+    from ouroboros.budget_pause import _HOLD_POLL_SEC
+
+    probe = None  # an idle-retirement token, answered only once no local producer is owed
     while True:
         try:
-            task = in_q.get()
+            try:
+                # Only an outstanding probe is rechecked, at the hold cadence: never an idle timer.
+                task = in_q.get(timeout=_HOLD_POLL_SEC) if probe else in_q.get()
+            except _queue.Empty:
+                task = probe
             if task is None or task.get("type") == "shutdown":
                 break
+            if task.get("type") == "worker_quiescence":
+                try:
+                    probe = None if local_work_settled() else task  # the handoff invariant lives there
+                except Exception:
+                    probe = task  # unknown defers; the bounded recheck retries, never a crash
+                    log.warning("Idle probe could not prove local quiescence", exc_info=True)
+                if probe is None:
+                    out_q.put({"type": "worker_quiescent", "worker_id": wid, "pid": _os.getpid(),
+                               "process_birth": birth, "token": str(task.get("token") or "")})
+                continue
+            probe = None
             task_drive_root = str(task.get("drive_root") or drive_root)
             if extensions_owned:
                 _adopt_published_extensions(drive_root)
+            runner = agent
             if task_drive_root != str(drive_root):
-                task_agent = make_agent(
+                runner = make_agent(
                     repo_dir=repo_dir,
                     drive_root=task_drive_root,
                     event_queue=out_q,
                     budget_drive_root=str(task.get("budget_drive_root") or drive_root),
                 )
-                task_agent.owner_wait_callback = agent.owner_wait_callback
-                events = task_agent.handle_task(task)
-            else:
-                events = agent.handle_task(task)
+                runner.owner_wait_callback = agent.owner_wait_callback
+            # The task's own endpoint (the direct lane's TurnEventQueue shape): every
+            # telemetry frame this task emits — live, or from a callback that
+            # outlives it — carries its chat and lineage by value, so the
+            # supervisor can handle it after task_done without a RUNNING row.
+            task_queue = task_event_queue(out_q, task)
+            pool_queue = getattr(runner, "_event_queue", None)
+            runner._event_queue = task_queue
+            try:
+                events = runner.handle_task(task)
+            except Exception as task_error:
+                _record_task_exception(runner, task, task_error, drive_root)
+                raise
+            finally:
+                runner._event_queue = pool_queue
             for e in events:
                 e2 = dict(e)
                 e2["worker_id"] = wid
@@ -440,10 +539,42 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
                         # File publication must not enter the model's crash-retry rail.
                         log.exception("Terminal file preparation failed for %s", task.get("id"))
                     e2["_files_prepared_attempt"] = int(task.get("_attempt") or 1)
-                out_q.put(e2)
+                task_queue.put(stamp_finalization_enqueue(e2))
         except Exception as _e:
             _log_worker_crash(wid, _drive, "handle_task", _e, _tb.format_exc())
             return
+
+
+def _record_task_exception(runner: Any, task: dict, exc: Exception, pool_drive_root: Any) -> None:
+    """An exception from ``handle_task`` is that task's own terminal (owner decision 1A, 11.10.2026).
+
+    Written through the env of the agent that ran the task, so a forked task's
+    terminal lands on its own drive where copy-back reads it, and never over a
+    row that is already terminal. Called inside the ``except`` so the recorded
+    traceback is the real one. It never raises: a terminal that could not be
+    written leaves today's crash policy (one retry) in charge.
+
+    A live exact pause of this attempt (``budget_pause.death_returns_to_pause``)
+    is left to the recovery that parks the same id again (#1196, F4), and so is
+    pause evidence that cannot be read. Its row lives in the budget root, which
+    is the pool drive unless the task names its own, never a forked task's drive.
+    """
+    try:
+        from ouroboros.budget_pause import budget_pause_row, death_returns_to_pause
+
+        pause = budget_pause_row(task.get("budget_drive_root") or pool_drive_root, str(task.get("id") or ""))
+        if death_returns_to_pause(pause, int(task.get("_attempt") or 1)):
+            return
+    except Exception:
+        log.warning("Pause evidence of task %s is unreadable; recovery decides its exception",
+                    task.get("id"), exc_info=True)
+        return
+    try:
+        from ouroboros.agent import _task_exception_terminal
+
+        _task_exception_terminal(runner.env, task, exc, runner.env.drive_path("logs"), keep_terminal=True)
+    except Exception:
+        log.warning("Exception terminal of task %s was not recorded", task.get("id"), exc_info=True)
 
 
 def _log_worker_crash(wid: int, drive_root: pathlib.Path, phase: str, exc: Exception, tb: str) -> None:

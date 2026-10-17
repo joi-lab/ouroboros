@@ -92,7 +92,7 @@ test('compact Chat removes internal write/status metadata while preserving execu
     assert.equal(view.body, event.result);
     assert.equal(view.fullBody, `[RESULT]\n${event.result}`);
     assert.equal(view.model, event.model);
-    assert.equal(view.executorChip.label, 'Cursor · 1 ok');
+    assert.equal(view.executorChip.label, 'Cursor');
     assert.ok(summarizeLogEvent(event).meta.includes('write=workspace'));
     assert.equal(prettyLogEvent(event), JSON.stringify(event, null, 2));
     assert.equal(JSON.stringify(event), before);

@@ -21,8 +21,9 @@ room text and the floor fact the task trace keeps).
 of the preferred mode with the shortest view of my memory cannot fit the window minus the
 reply reserve on the route's calibrated estimate (estimator tokens scaled by the route's measured
 ratio): all of my memory is already addresses and the request still cannot be sent.
-``mode_views`` renders every mode of one plan and picks that starting mode (a new route
-re-renders it from the same snapshot). Rendering stays ``memory_view``'s; nothing here reads
+``mode_views`` renders every mode of one plan and picks that starting mode (a new route that
+cannot hold a shown view narrows it from the same snapshot and the level it shows, ``kept``,
+never unfolding an address). Rendering stays ``memory_view``'s; nothing here reads
 the chronicle, publishes a record or calls a model.
 """
 from __future__ import annotations
@@ -38,9 +39,10 @@ from ouroboros import memory_view_legacy as legacy
 from ouroboros.utils import estimate_tokens
 
 # The ladder, old before new and people last: host fact lines of this room's tasks
-# (F1), other live rooms without notes (F1b), retold records, the whole first block too, as one line per room
-# (F3), my oldest pages and parts (F5), this room's retold page (F4), my longest replies
-# (F2), then people's words: other rooms' (F6, only when the view shows them) and this room's (F7).
+# (F1), other live rooms without notes (F1b), retold records, whole or not, as one line per room
+# (F3), my oldest pages, parts and accounts (F5; a record an account tells stays its address line), this
+# room's retold page (F4), my longest replies (F2), then people's words: other rooms' (F6, only when the
+# view shows them) and this room's (F7).
 LADDER = ("F1", "F1b", "F3", "F5", "F4", "F2", "F6", "F7")
 # The only steps an owner-selected Low or Nano target takes: facts, headers,
 # pointers and old retold memory; my replies and people's words answer to the window alone.
@@ -52,7 +54,7 @@ MODES = ("max", "low", "nano")  # the starting-mode order the window may lower t
 _COLLAPSING = ("F1", "F1b")  # many elements, one line: the first element carries it
 _SHOWN = (("F2", "{} of my replies"), ("F7", "{} lines of people in this room"),
           ("F6", "{} lines of people in other rooms"), ("F4", "{} records of this room's page"),
-          ("F5", "{} pages or parts of my story"), ("F3", "the retold records of {} rooms (one line per room)"),
+          ("F5", "{} pages, parts or accounts of my story"), ("F3", "the retold records of {} rooms (one line per room)"),
           ("F1", "{} task fact lines"), ("F1b", "{} other open rooms"))
 # One name set per closing ``floor_note`` can print (``memory_read_path``, with or without the
 # chronicle_write sentence): the shortest view takes the longest.
@@ -88,7 +90,7 @@ def floor_elements(snapshot: mv.MemoryViewSnapshot) -> List[Tuple[str, str, str,
         "F3": [(room_id, "\n".join(map(legacy.retold_record, group)), legacy.room_pointer(group))
                for room_id, group in legacy.pointer_rooms(snapshot.story).items()],
         "F5": [(entry["id"], "\n".join(mv._page_lines(entry)), mv._page_pointer(entry))
-               for entry in snapshot.story if entry.get("kind") != "legacy"],
+               for entry in snapshot.story if entry.get("kind") != "legacy" and not entry.get("told_by")],
         "F4": [(item["id"], mv._retold(item), mv._retold(item, True))
                for item in [*room.get("legacy", ()), *room.get("under_parts", ())]],
         "F2": [(item["address"], item["line"], mv._row_pointer(item, "my reply")) for item in mine],
@@ -123,26 +125,48 @@ def floor_allowances(*, window_tokens: Optional[int], output_reserve_tokens: Opt
     return {"margin": window["with_margin_tokens"], "physical": window["without_margin_tokens"], "budget": budget}
 
 
-def fit_memory_view(snapshot: mv.MemoryViewSnapshot, allowances: Mapping[str, Optional[int]]) -> mv.FloorLevel:
+def fit_memory_view(snapshot: mv.MemoryViewSnapshot, allowances: Mapping[str, Optional[int]], *,
+                    kept: mv.FloorLevel = mv.FULL_VIEW, saving: int = 0) -> mv.FloorLevel:
     """One pass down the ladder: an element becomes an address while the view exceeds its step's boundary.
 
     My replies and people's words answer to ``physical``, every other step to ``margin`` and, in
     ``MODE_TARGET_STEPS``, also to ``budget``. Each element saves its known difference;
-    the view is measured once, in full, and never rendered again to choose.
+    the view is measured once, in full, and never rendered again to choose. ``kept`` (a level a
+    shown view already has) stays addressed and the walk goes on from it; ``saving`` is what the
+    walk must save beyond it (an actual size refusal's deficit). Every step stays a prefix of its
+    elements, so a floor fact's counts name the level (``kept_level``).
     """
-    current = view_tokens(mv.render_story(snapshot)) + view_tokens(mv.render_room(snapshot))
-    taken: Dict[str, List[str]] = {}
-    by_budget = 0
-    for step, ident, whole, short in degradable_elements(snapshot):
+    elements = degradable_elements(snapshot)
+    old = {(step, ident) for step, ids in kept.addressed for ident in ids}
+    current = view_tokens(mv.render_story(snapshot)) + view_tokens(mv.render_room(snapshot)) - sum(
+        whole - short for step, ident, whole, short in elements if (step, ident) in old)
+    taken: Dict[str, List[str]] = {step: list(ids) for step, ids in kept.addressed}
+    by_budget, saved = kept.by_budget, 0
+    for step, ident, whole, short in elements:
+        if (step, ident) in old:
+            continue
         window = allowances.get("physical" if step in WINDOW_ONLY_STEPS else "margin")
         budget = allowances.get("budget") if step in MODE_TARGET_STEPS else None
-        over_window = window is not None and current > window
+        over_window = (window is not None and current > window) or (saving > 0 and saved < saving)
         if not over_window and not (budget is not None and current > budget):
             continue
         current -= whole - short
+        saved += whole - short
         taken.setdefault(step, []).append(ident)
         by_budget += not over_window
     return mv.FloorLevel(tuple((step, tuple(taken[step])) for step in LADDER if step in taken), by_budget=by_budget)
+
+
+def kept_level(snapshot: mv.MemoryViewSnapshot, facts: Mapping[str, Any]) -> mv.FloorLevel:
+    """The level a projection's floor fact names: each step's first ``count`` elements, in ladder order."""
+    floor = (facts or {}).get("floor") or {}
+    counts = dict(floor.get("steps") or {})
+    ids: Dict[str, List[str]] = {}
+    for step, ident, _whole, _short in floor_elements(snapshot):
+        if len(ids.setdefault(step, [])) < int(counts.get(step) or 0):
+            ids[step].append(ident)
+    return mv.FloorLevel(tuple((step, tuple(ids[step])) for step in LADDER if ids.get(step)),
+                         by_budget=int(floor.get("by_budget") or 0))
 
 
 def memory_read_path(tool_names: Optional[Iterable[str]]) -> str:
@@ -164,12 +188,18 @@ def memory_read_path(tool_names: Optional[Iterable[str]]) -> str:
 
 
 def floor_note(level: mv.FloorLevel, *, window_tokens: Optional[int], mode: str, target_tokens: Optional[int] = None,
-               lowered_from: Optional[str] = None, tool_names: Optional[Iterable[str]] = None) -> str:
+               lowered_from: Optional[str] = None, tool_names: Optional[Iterable[str]] = None,
+               budget_mode: Optional[str] = None) -> str:
     """``### Physical floor``: a fact and a possibility for the mind, exactly when a step past F1/F1b ran
-    or the window lowered the task's starting mode; never an instruction or a threshold. In Nano it
+    or the window lowered the task's mode; never an instruction or a threshold. In Nano it
     closes with how this request reaches ``memory_read`` (``tool_names``: the schemas it sends). The
     sealing possibility is named only when the request can call ``chronicle_write``: it sends it or
-    ``enable_tools`` (unknown schemas keep it); like the path line, a fact of the request, not a role."""
+    ``enable_tools`` (unknown schemas keep it); like the path line, a fact of the request, not a role.
+    Cuts are retained history, not a claim that the current mode cannot hold the full memory. The
+    window names the cut's frame; a fitting route keeps this note's bytes, and the round's facts
+    name the acting window. The mode names this view and the mode the task runs in, lowered at its
+    start or on a later route; ``budget_mode`` (default ``mode``) names the owner's target that took
+    the budget cuts."""
     names = None if tool_names is None else tuple(tool_names)
     counts = dict(level.steps)
     asked = set(counts) - set(_COLLAPSING)
@@ -177,19 +207,20 @@ def floor_note(level: mv.FloorLevel, *, window_tokens: Optional[int], mode: str,
         return ""
     lines, name = ["### Physical floor"], mode.capitalize()
     if asked:
-        bounds = ([f"this window ({window_tokens} tokens, {name})"] if sum(counts.values()) > level.by_budget else []) + (
-            [f"the {name} mode budget ({target_tokens} tokens)"] if level.by_budget else [])
+        bounds = ([f"the window ({window_tokens} tokens)"]
+                  if sum(counts.values()) > level.by_budget else []) + (
+            [f"the {(budget_mode or mode).capitalize()} mode budget ({target_tokens} tokens)"] if level.by_budget else [])
         subject = " and ".join(bounds)
         shown = ", ".join(text.format(counts[step]) for step, text in _SHOWN if counts.get(step))
         sealing = (" Sealing a closed part of the open conversation as a page (chronicle_write kind=page) or folding "
                    "old pages (kind=part) brings it back in my own words."
                    if names is None or _SEALING_TOOLS & set(names) else "")
-        lines.append(f"{subject[0].upper()}{subject[1:]} {'do' if len(bounds) > 1 else 'does'} not hold all of my "
-                     f"memory verbatim. Shown above only by address: {shown}. Nothing is lost: memory_read reads "
+        lines.append(f"This {name} view retains memory cuts for {subject}. "
+                     f"Shown above only by address: {shown}. Nothing is lost: memory_read reads "
                      f"each.{sealing}")
     if lowered_from:
-        lines.append(f"This window ({window_tokens} tokens) cannot hold {lowered_from.capitalize()} with even the "
-                     f"shortest view of my memory; this task started in {name}.")
+        lines.append(f"The window this view was cut for ({window_tokens} tokens) cannot hold "
+                     f"{lowered_from.capitalize()} with even the shortest view of my memory; this task runs in {name}.")
     path = memory_read_path(names) if mode == "nano" else ""
     return "\n".join(lines + [path] if path else lines)
 
@@ -220,22 +251,30 @@ def view_facts(snapshot: mv.MemoryViewSnapshot, level: mv.FloorLevel, *, window_
 
 def render_view_for_mode(snapshot: mv.MemoryViewSnapshot, *, mode: str, owner_mode: str, window_tokens: Optional[int],
                          known_window: bool, output_reserve: Optional[int], ratio: float, non_memory_tokens: int,
-                         lowered_from: Optional[str] = None,
-                         tool_names: Optional[Iterable[str]] = None) -> Tuple[str, str, Dict[str, Any]]:
+                         lowered_from: Optional[str] = None, tool_names: Optional[Iterable[str]] = None,
+                         kept: Optional[mv.FloorLevel] = None, saving: int = 0) -> Tuple[str, str, Dict[str, Any]]:
     """``(story text, room text, facts)`` of one mode's projection, the floor decided once.
 
     The window counts only when known and fresh (``known_window``). An owner target binds
     only the mode the owner selected: task-local Low and a mode the window lowered have
     none. The reply reserve is the mode's (Nano keeps its own headroom). ``tool_names`` are
     the schemas this mode's request sends, which the floor note reads (``memory_read_path``).
+    ``kept`` narrows a view already shown: from its level, against the window minus the reply
+    reserve alone -- no working margin, no target -- so nothing it addressed comes back.
+    What ``kept.by_budget`` counts the owner's mode target took (only it carries one), so the note
+    and the fact name that budget in whatever mode the view is narrowed, hop after hop.
     """
     target, reserve = context_budget.context_mode_limits(mode, owner_mode, output_reserve)
+    if kept is not None and kept.by_budget:
+        target = context_budget.context_mode_limits(owner_mode, owner_mode, output_reserve)[0]
     window = int(window_tokens) if known_window and window_tokens else None
     allowances = floor_allowances(window_tokens=window, output_reserve_tokens=reserve, non_memory_tokens=non_memory_tokens,
-                                  target_tokens=target, calibration_ratio=ratio)
-    level = fit_memory_view(snapshot, allowances)
+                                  target_tokens=None if kept is not None else target, calibration_ratio=ratio)
+    if kept is not None:
+        allowances = {**allowances, "margin": allowances["physical"]}
+    level = fit_memory_view(snapshot, allowances, kept=kept or mv.FULL_VIEW, saving=saving)
     note = floor_note(level, window_tokens=window, mode=mode, target_tokens=target, lowered_from=lowered_from,
-                      tool_names=tool_names)
+                      tool_names=tool_names, budget_mode=owner_mode)
     return (mv.render_story(snapshot, level), mv.render_room(snapshot, level, floor_note=note),
             view_facts(snapshot, level, window_tokens=window, mode=mode, allowances=allowances, target_tokens=target,
                        lowered_from=lowered_from))
@@ -296,28 +335,44 @@ def physical_mode(preferred: str, fixed_tokens_by_mode: Mapping[str, int], minim
 def mode_views(snapshot: mv.MemoryViewSnapshot, *, preferred: str, fixed_tokens_by_mode: Mapping[str, int],
                window_tokens: Optional[int], known_window: bool, output_reserve: Optional[int], ratio: float,
                start: Optional[str] = None, tool_names: Optional[Mapping[str, Iterable[str]]] = None,
+               allow_mode_lowering: bool = True, kept: Optional[Mapping[str, mv.FloorLevel]] = None,
+               saving: Optional[Mapping[str, int]] = None, select: Optional[str] = None,
                ) -> Tuple[Dict[str, Tuple[str, str, Dict[str, Any]]], str]:
     """Every mode's ``(story text, room text, view receipt)`` and the mode the task starts in.
 
     The starting mode is ``physical_mode`` of the owner's ``preferred`` one, or ``start`` (the
     mode a task already runs in, on a new route) when that is lower: a route switch never raises
-    a mode, and only the owner's mode carries a target. The projection of a mode this window
+    a mode, and only the owner's mode carries a target. A caller that keeps current Max books
+    until actual refusal sets ``allow_mode_lowering=False``: memory views still fit their
+    ordinary allowances, but estimated pressure cannot select another mode or report a switch.
+    The projection of a mode this window
     chose names the change in its ``### Physical floor`` (and its fact, ``mode_switch``), never
     in the runtime facts, which are captured before any mode is chosen. ``tool_names`` maps a
     mode to the schemas its request sends (``None``: not known, so its floor claims no path).
+    ``kept`` maps a mode to the level its shown view has, and narrows from it
+    (``render_view_for_mode``); ``saving`` maps a mode to what it must save beyond that level.
+    A lower mode this window selects, or ``select`` (the mode an actual refusal chose), narrows from the
+    level of the mode the task shows (``start``, else ``preferred``), never from its own unsent one:
+    nothing shown unfolds.
     """
     window = int(window_tokens) if known_window and window_tokens else None
-    physical = physical_mode(preferred, fixed_tokens_by_mode, minimal_view_tokens(snapshot, window_tokens=window),
-                             window_tokens=window, known_window=known_window, calibration_ratio=ratio,
-                             reserve_by_mode={mode: context_budget.context_mode_limits(mode, preferred, output_reserve)[1]
-                                              for mode in MODES})
-    begin = start if start in MODES and MODES.index(start) > MODES.index(physical) else physical
+    physical = (physical_mode(preferred, fixed_tokens_by_mode, minimal_view_tokens(snapshot, window_tokens=window),
+                              window_tokens=window, known_window=known_window, calibration_ratio=ratio,
+                              reserve_by_mode={mode: context_budget.context_mode_limits(mode, preferred, output_reserve)[1]
+                                               for mode in MODES})
+                if allow_mode_lowering else preferred)
+    begin = (select if select in MODES
+             else start if start in MODES and MODES.index(start) > MODES.index(physical) else physical)
+    shown = start if start in MODES else preferred
+    carried = kept is not None and begin != shown  # the shown level moves to the selected mode
     views = {}
     for mode in MODES:
         story, room, facts = render_view_for_mode(
             snapshot, mode=mode, owner_mode=preferred, window_tokens=window, known_window=known_window,
             output_reserve=output_reserve, ratio=ratio, non_memory_tokens=fixed_tokens_by_mode[mode],
             lowered_from=preferred if mode == begin == physical != preferred else None,
-            tool_names=(tool_names or {}).get(mode))
+            tool_names=(tool_names or {}).get(mode),
+            kept=None if kept is None else kept.get(shown if carried and mode == begin else mode, mv.FULL_VIEW),
+            saving=(saving or {}).get(mode, 0))
         views[mode] = (story, room, view_receipt(snapshot, story, room, facts))
     return views, begin

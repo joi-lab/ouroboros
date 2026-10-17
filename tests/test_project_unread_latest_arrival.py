@@ -27,6 +27,7 @@ from ouroboros.projects_registry import create_project, get_project
 from ouroboros.utils import append_jsonl
 from supervisor import events_chat_delivery as delivery
 from supervisor import message_bus
+from tests._store_shared import result_exists
 
 CHILD = {"id": "kid-1", "delegation_role": "subagent", "parent_task_id": "root-1",
          "root_task_id": "root-1", "subagent_role": "researcher"}
@@ -397,7 +398,7 @@ def test_a_legacy_child_final_its_task_result_names_is_never_the_newest_message(
 
 @pytest.mark.parametrize("old_result", [False, True], ids=["missing-result", "pre-upgrade-result"])
 def test_a_legacy_child_final_uses_the_progress_lineage_the_client_reads(room, old_result):
-    """A pre-upgrade result may be quarantined; the page still knows the child's parent."""
+    """A pre-upgrade result file never enters the store; the page still knows the child's parent."""
     room.deliver("root answer", 5)
     lineage = {"delegation_role": "subagent", "parent_task_id": "root-1",
                "root_task_id": "root-1", "subagent_task_id": "kid-old"}
@@ -406,15 +407,17 @@ def test_a_legacy_child_final_uses_the_progress_lineage_the_client_reads(room, o
     append_jsonl(room.root / "logs" / "progress.jsonl", {
         "ts": ts(4), "chat_id": room.chat_id, "task_id": "root-1", "content": "Child scheduled",
         "subagent_event": "scheduled", **lineage})
-    if old_result:
+    if old_result:  # an unstamped file beside the store: the import quarantines it, the store never lists it
         path = room.root / "task_results" / "kid-old.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"id": "kid-old", "status": "completed", **lineage}), encoding="utf-8")
+        from ouroboros.store_import import ensure_current_store
+        ensure_current_store(room.root)  # the boot door's real import judges it; a page read never imports
     recent = room.read()
     assert any(row.get("subagent_task_id") == "kid-old" for row in recent["messages"])
     assert recent["window"]["latest_message"] == {"history_id": room.row_id("root answer"), "out_of_order": False}
     if old_result:
-        assert not path.exists(), "the unstamped result was quarantined, not used as current lineage"
+        assert not result_exists(room.root, "kid-old"), "the unstamped result is not current lineage"
     # The scheduling row's task_id names the parent, and a delivery from that
     # same child still stands alone. Neither may be mistaken for child speech.
     assert room.host.bridge.send_photo(room.chat_id, b"\x89PNG\r\n\x1a\n", caption="child photo", task_id="kid-old")[0]
@@ -448,8 +451,13 @@ def test_a_photo_a_child_delivers_is_shown_alone_and_is_the_newest_arrival(room)
 
 
 def test_a_question_a_child_asked_before_the_recent_selection_is_named_by_the_bounded_search(room, narrow_recent):
+    from ouroboros.owner_quiz import record_asked
+
     durable_child(room)
     room.deliver("root answer", 5)
+    # Publication consumes the accepted canonical ask, as the escalation tool does.
+    record_asked(room.root, "kid-1", quiz_id="q-kid", question="Ship it?", options=["Yes", "No"],
+                 assumption="I ship after review", chat_id=room.chat_id)
     assert room.host.bridge.send_quiz(room.chat_id, "q-kid", "Ship it?", ["Yes", "No"],
                                       assumption="I ship after review", task_id="kid-1")[0]
     child_words(room, 6)

@@ -45,15 +45,16 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
   with the typed `review_cycles_exhausted` reason instead of looping. Numbers from runs
   before that change are NOT comparable on this axis; set the key explicitly to restore
   the old protocol.
-- **Acceptance panels follow the configured triad rows (2026-09-02).** Task acceptance
-  no longer runs an API-only projection of the reviewer panel: every
-  `OUROBOROS_REVIEWER_SLOTS.triad` row runs on its own delivery (API packet,
-  configured-subagent native inspection episode, or agent session), with per-row
-  effort and credential pin. Runs here use the comma-list `OUROBOROS_REVIEW_MODELS`
-  (three API packet rows), so their acceptance axis is unchanged and comparable with
-  earlier runs; a run whose triad has a retrieving row is NOT comparable on the
+- **Acceptance panels follow the configured review pool (2026-09-02; pool since PR-3).**
+  Task acceptance no longer runs an API-only projection of the reviewer panel: every
+  review-pool row (the review-eligible rows of `OUROBOROS_SUBAGENTS`) runs on its own
+  delivery (API packet, native inspection episode, or agent session), with per-row
+  effort and credential pin. Runs here write three API packet seats on the solve model
+  into the roster (`--review-models` substitutes an explicit panel, one packet seat per
+  model), so their acceptance axis is unchanged and comparable with earlier
+  comma-list runs; a run whose pool has a retrieving row is NOT comparable on the
   acceptance axis (different evidence view, cost class and — for a session — an
-  unobserved read set). Declare the triad rows in the run manifest and never overlay
+  unobserved read set). Declare the pool rows in the run manifest and never overlay
   such a run with API-panel runs.
 - **Acceptance review is required.** GAIA Track A measures the full Ouroboros
   scaffold chosen for this sprint: `OUROBOROS_TASK_REVIEW_MODE=required`, empty
@@ -97,9 +98,9 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
 - **Agent-visible deadline (honesty: visible == real budget − reserve).** GAIA
   imposes no per-task wall-clock limit — the sample timeout is an OPERATOR budget.
   The solver passes `--timeout = GAIA_SAMPLE_TIMEOUT_SEC − reserve` (reserve = 10%,
-  capped at 240s) so Ouroboros's existing deadline-awareness (50/25/10% milestones
-  + a save-at-10% nudge, `loop.py`) activates and the agent converges to a saved
-  answer instead of being killed mid-thought. The visible deadline is STRICTLY
+  capped at 240s). Ouroboros exposes factual 50/25/10% crossings and the deadline
+  in its round facts; `loop_round_limits` requests local finalization near the
+  bound. These mechanisms do not guarantee a saved answer. The visible deadline is STRICTLY
   tighter than the outer hard-kill backstop (`subprocess.run(timeout=…)`), so the
   agent is never told a deadline it is killed before reaching. The deadline conveys
   only time, no answer content. Disclosed here because GAIA is scaffold-sensitive.
@@ -117,6 +118,12 @@ does not rewrite the scorer or normalize Ouroboros's core `final_answer`.
 - **Historical raw material.** `dragunov_traces/gaia_repro/` remains outside the
   repo as forensic input; useful settings and wrapper ideas are copied/adapted
   here rather than imported as live code.
+
+The Ouroboros adapter declares `final_answer_line`. Runtime retention selects its
+exact answer payload before result-review eligibility, and the packet uses that
+same source. Inspect consumes only the structured `final_answer` bytes; empty or
+missing selection stays empty instead of falling back to narrative `result`.
+Synthetic contract checks do not establish live scores or historical parity.
 
 ## Answer-leakage audit protocol (publishable web-on runs)
 

@@ -209,9 +209,11 @@ def test_settings_template_follows_sprint_scaffold_defaults():
     assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_LIGHT"]
     assert template["OUROBOROS_MODEL"] == template["OUROBOROS_MODEL_FALLBACKS"]
     actors = json.loads(template["OUROBOROS_SUBAGENTS"])
-    assert [row["route"]["target_id"] for row in actors["items"]] == [
-        template["OUROBOROS_MODEL"]
-    ]
+    # One actor row plus the packet review seats of the pool, all on the solve model.
+    assert {row["route"]["target_id"] for row in actors["items"]} == {template["OUROBOROS_MODEL"]}
+    assert [row for row in actors["items"] if not row.get("review_eligible")] == actors["items"][:1]
+    assert all(row["delivery"] == "packet" for row in actors["items"][1:])
+    assert "OUROBOROS_REVIEWER_SLOTS" not in template
     assert "OUROBOROS_MODEL_HEAVY" not in template
 
 
@@ -268,7 +270,7 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
 
     drifted = {"OUROBOROS_RUNTIME_MODE": "light", "OUROBOROS_SAFETY_MODE": "full",
                "OUROBOROS_MAX_WORKERS": 1, "OUROBOROS_MODEL": "openai/gpt-5.5",
-               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory",
+               "OUROBOROS_REVIEW_ENFORCEMENT": "advisory", "OUROBOROS_TASK_REVIEW_MODE": "auto",
                "OUROBOROS_SUBAGENTS": rsa.single_model_subagents_setting("openai/gpt-5.5")}
 
     def fake_http(url, timeout=5):
@@ -290,13 +292,14 @@ def test_preflight_verifies_server_scaffold_settings(tmp_path, monkeypatch):
     assert not result["ok"]
     assert "OUROBOROS_RUNTIME_MODE" in joined and "OUROBOROS_SAFETY_MODE" in joined
     assert "OUROBOROS_MAX_WORKERS" in joined and "OUROBOROS_MODEL" in joined
-    # Adversarial review r2 #6: the blocking review lane is part of the scaffold gate.
-    assert "OUROBOROS_REVIEW_ENFORCEMENT" in joined
+    # Adversarial review r2 #6: the blocking review lane is part of the scaffold gate,
+    # and so is the benchmark's declared result-review mode (#1731, O4).
+    assert "OUROBOROS_REVIEW_ENFORCEMENT" in joined and "OUROBOROS_TASK_REVIEW_MODE" in joined
 
     # matching server -> ok; mismatch + explicit ablation flag -> ok but recorded
     matching.update({"OUROBOROS_RUNTIME_MODE": "pro", "OUROBOROS_SAFETY_MODE": "light",
                      "OUROBOROS_MAX_WORKERS": 4,
-                     "OUROBOROS_REVIEW_ENFORCEMENT": "blocking"})
+                     "OUROBOROS_REVIEW_ENFORCEMENT": "blocking", "OUROBOROS_TASK_REVIEW_MODE": "required"})
 
     def fake_http_ok(url, timeout=5):
         if url.endswith("/api/state"):

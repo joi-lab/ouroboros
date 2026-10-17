@@ -7,6 +7,7 @@ import urllib.request
 import pytest
 
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
+from tests._store_shared import seed_result
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
@@ -33,9 +34,9 @@ def test_speechless_history_and_direct_resume(direct_server_with_data, engine):
             **calls[1], "task_id": "unrelated", "invocation_id": f"unrelated-{index}"}) + "\n", encoding="utf-8")
     results = root / "task_results"
     results.mkdir(exist_ok=True)
-    (results / f"{task_id}.json").write_text(json.dumps({"_schema_version": 1, "task_id": task_id,
+    seed_result(root, task_id, {"_schema_version": 1, "task_id": task_id,
         "status": "completed", "suggested_name": "Read source records", "_is_direct_chat": True,
-        "root_phase_checkpoint": {"post_task_synthesis": "paused"}}), encoding="utf-8")
+        "root_phase_checkpoint": {"post_task_synthesis": "paused"}})
     fixture["start_server"]()
     census = {"phase": "budget_pausing", "pause_cause": "owner"}
     with urllib.request.urlopen(fixture["url"] + "/api/state", timeout=10) as response:

@@ -16,9 +16,9 @@ from ouroboros.utils import truncate_review_artifact
 # Bounded structured findings on the public actor projection: the bound is the
 # ROW COUNT, never a second aggressive cut of the finding bodies — capping the
 # only owner-reachable copy of reviewer text is the class v6.70.0 removed. The
-# per-string bound mirrors plan review's MAX_FINDING_TEXT_CHARS (2000), not the
-# 200-char path-list default; the durable remainder stays addressable through
-# the actor's existing response_ref, so no full-set hash is needed.
+# per-string bound is 2000 characters (not the 200-char path-list default); the
+# durable remainder stays addressable through the actor's existing
+# response_ref, so no full-set hash is needed.
 MAX_PROJECTED_ACTOR_FINDINGS = 8
 PROJECTED_FINDING_TEXT_CHARS = 2000
 _PROJECTED_FINDING_KEYS = (

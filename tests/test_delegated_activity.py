@@ -551,7 +551,8 @@ def test_wait_streams_exact_ranges_drains_the_terminal_tail_and_replays_the_same
         assert all(row["narration"] is False for row in rows)
 
 
-def test_a_later_wait_on_an_ended_run_catches_up_what_no_frame_carried(tmp_path, monkeypatch):
+@pytest.mark.parametrize("restart_memo", [False, True])
+def test_a_later_wait_on_an_ended_run_catches_up_what_no_frame_carried(tmp_path, monkeypatch, restart_memo):
     from ouroboros.tools import delegate
     from tests._delegated_transport_shared import _nanny_ctx
 
@@ -582,12 +583,23 @@ def test_a_later_wait_on_an_ended_run_catches_up_what_no_frame_carried(tmp_path,
         first = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=60, since_seq=0, gateway=gateway))
         assert first["status"] == "terminal" and events.empty(), "no frame left, so nothing counts as shown"
         channel["open"] = True
+        if restart_memo:
+            from ouroboros.delegate_activity import reset_process_memo
+            reset_process_memo()
+        requests_before = list(daemon.requests)
         second = json.loads(delegate._delegate_wait(ctx, "run-1", wait_sec=60, gateway=gateway))
+        assert daemon.requests == requests_before, "retained output and activity never wait on remote I/O"
     assert second["status"] == "terminal"
     frames = [row for row in (events.get_nowait() for _ in range(events.qsize())) if row["type"] == "send_message"]
     activity, = [frame["progress_meta"]["delegated_activity"] for frame in frames]
-    assert (activity["after_seq"], activity["source"]["read_through"], activity["source"]["ended"]) == (0, 3, True)
+    assert (activity["after_seq"], activity["source"]["read_through"]) == (0, 3)
+    if restart_memo:
+        assert "ended" not in activity["source"], "the raw source did not retain the stream's end-frame receipt"
+    else:
+        assert activity["source"]["ended"] is True
     assert [p["text"] for p in activity["parts"]] == ["Working on it.", "Finished."]
+    assert json.loads(delegate._delegate_wait(ctx, "run-1", gateway=gateway))["status"] == "terminal"
+    assert events.empty(), "only the successful frame commits the local activity cursor"
     assert {method for method, _path, _cursor in daemon.requests[handshaken:]} == {"GET"}, \
         "catching up reads the ended run's journal: no new run, answer or control request"
 

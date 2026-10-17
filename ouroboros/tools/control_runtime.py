@@ -15,8 +15,7 @@ import logging
 import os
 from hashlib import sha256
 
-from ouroboros.config import apply_settings_to_env, load_settings, save_settings
-from ouroboros.tools.registry import ToolContext
+from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import append_jsonl, run_cmd, utc_now_iso, write_text
 
 log = logging.getLogger(__name__)
@@ -59,16 +58,66 @@ def _evolution_restart_block_reason(ctx: ToolContext) -> str:
     return "commit_reviewed must create a local reviewed commit before evolution restart"
 
 
-def _request_restart(ctx: ToolContext, reason: str) -> str:
+def _prepare_self_change(ctx: ToolContext, resume: str = "", in_place: bool = False) -> str:
+    """Prepare (or deliberately resume) this task's body candidate before authoring or testing."""
+    from ouroboros import body_candidate
+
+    if in_place:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.consciousness_authority import effective_runtime_mode
+
+        if effective_runtime_mode(get_runtime_mode(), getattr(ctx, "task_metadata", None)) != "cyber_pro":
+            return _publish_tool_result(ctx, ToolResult(
+                status="blocked", code="ACCESS_BLOCKED",
+                text="⚠️ IN_PLACE_REQUIRES_CYBER_PRO: outside Cyber Pro, self-authoring uses a candidate."))
+        if body_candidate.is_bound(ctx):
+            return _publish_tool_result(ctx, ToolResult(
+                status="blocked", code="ACCESS_BLOCKED",
+                text="⚠️ CANDIDATE_ALREADY_BOUND: this task already authors a candidate; in_place applies before it."))
+        body_candidate.choose_in_place(ctx)
+        return ("OK: by your explicit Cyber Pro decision this task writes the serving checkout directly. "
+                "Unfinished edits are live for every reader of that tree.")
+    try:
+        bound = body_candidate.prepare(ctx, resume=str(resume or "").strip())
+    except body_candidate.CandidateRefused as exc:
+        return _publish_tool_result(ctx, ToolResult(
+            status="blocked", code=exc.code, text=f"⚠️ {exc.code}: {exc.text}"))
+    return (
+        f"OK: body candidate {bound['candidate_id']} is {bound['state']} — path {bound['path']}, branch "
+        f"{bound['branch']}, base {str(bound['base_sha'])[:12]}. Body writes, default process cwd, child copies, "
+        "review and commit_reviewed now use it; processes started inside it get an isolated HOME/data/settings "
+        f"environment. The running body at {bound['repo_dir']} is unchanged until an exact reviewed commit is "
+        "adopted with request_restart(adopt_commit=...), or published through the Git/PR tools."
+        + (f" The earlier checkout of this task was gone; its commits remain on branch {bound['previous_branch']}."
+           if bound.get("previous_branch") else "")
+    )
+
+
+def _request_restart(ctx: ToolContext, reason: str, adopt_commit: str = "") -> str:
     block_reason = _evolution_restart_block_reason(ctx)
     if block_reason:
         return f"⚠️ RESTART_BLOCKED: in evolution mode, {block_reason}."
     is_evolution = str(ctx.current_task_type or "") == "evolution"
     restart_reason = str(reason or "").strip() or "agent_requested_restart"
+    from ouroboros import body_adoption, body_candidate
+
+    serving_dir = body_candidate.serving_repo_dir_for(ctx)
+    adoption_note, handoff = "", None
+    try:  # the restart marker names the SERVING checkout's expected state, never the candidate's
+        if is_evolution and body_candidate.is_bound(ctx) and not str(adopt_commit or "").strip():
+            adopt_commit = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir).strip()
+        if str(adopt_commit or "").strip():
+            handoff = body_adoption.authorize(ctx, adopt_commit, reason=restart_reason)
+            adoption_note = (f" It adopts candidate commit {handoff['cand'][:12]} onto {handoff['branch']} "
+                             "once this generation's readers have stopped.")
+    except body_adoption.AdoptionRefused as exc:
+        return f"⚠️ RESTART_BLOCKED: {exc.code}: {exc.text}"
+    if not adoption_note and body_candidate.is_bound(ctx):
+        adoption_note = " The candidate is NOT adopted by this restart; it stays retained."
     # Persist expected ref for post-restart verification.
     try:
-        sha = run_cmd(["git", "rev-parse", "HEAD"], cwd=ctx.repo_dir)
-        branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=ctx.repo_dir)
+        sha = handoff["cand"] if handoff else run_cmd(["git", "rev-parse", "HEAD"], cwd=serving_dir)
+        branch = run_cmd(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=serving_dir)
         evolution_claim = {}
         if is_evolution:
             metadata = getattr(ctx, "task_metadata", {})
@@ -84,8 +133,10 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
         # One marker schema with the supervisor's evolution restart (W4-F3).
         from supervisor.evolution_lifecycle import write_pending_restart_marker
 
+        from ouroboros.tool_access_paths import canonical_data_root
+
         write_pending_restart_marker(
-            ctx.drive_root, expected_sha=sha, expected_branch=branch,
+            canonical_data_root(ctx), expected_sha=sha, expected_branch=branch,
             reason=restart_reason, evolution_claim=evolution_claim,
         )
         if evolution_claim:
@@ -112,11 +163,44 @@ def _request_restart(ctx: ToolContext, reason: str) -> str:
     ctx.pending_restart_reason = restart_reason
     ctx.last_push_succeeded = False
     ctx.last_reviewed_commit_sha = ""
-    return f"Restart requested: {restart_reason}"
+    return f"Restart requested: {restart_reason}.{adoption_note}"
+
+
+def self_change_tool_entries() -> list:
+    """The two verbs of own-body self-change, in catalog order: prepare the candidate, restart (and adopt)."""
+    return [
+        ToolEntry("prepare_self_change", {
+            "name": "prepare_self_change",
+            "description": (
+                "Prepare this task's own-body candidate BEFORE running tests, scripts or commands that author or "
+                "exercise Ouroboros's code: a separate checkout at the running body's commit, so unfinished work "
+                "never reaches the files the live server imports. Body file writes and acting self_worktree "
+                "children prepare it automatically; processes do not, so call this first for process-first work. "
+                "Idempotent. resume deliberately continues ONE exact retained candidate (its id, owner task or "
+                "branch) whose previous owner has ended. in_place is Cyber Pro's explicit decision to edit the "
+                "serving checkout directly instead."),
+            "parameters": {"type": "object", "properties": {
+                "resume": {"type": "string", "description": "Exact retained candidate to continue; omit for this task's own."},
+                "in_place": {"type": "boolean", "description": "Cyber Pro only: author the serving checkout directly."},
+            }, "required": []},
+        }, _prepare_self_change),
+        ToolEntry("request_restart", {
+            "name": "request_restart",
+            "description": (
+                "Ask supervisor to restart runtime after a reviewed local commit or a non-evolution clean no-op; "
+                "evolution requires its exact active commit receipt. A restart alone adopts nothing: pass "
+                "adopt_commit (the exact reviewed commit of your body candidate) to adopt it locally at this "
+                "restart, after the running generation's readers have stopped."),
+            "parameters": {"type": "object", "properties": {
+                "reason": {"type": "string"},
+                "adopt_commit": {"type": "string", "description": "Exact reviewed candidate commit SHA to adopt at this restart; it needs a full green test run of that commit on record (commit it with full_tests=true)."},
+            }, "required": ["reason"]},
+        }, _request_restart),
+    ]
 
 
 def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
-    """Persist timeout while pinning owner-only runtime mode to the live env."""
+    """Persist the tool timeout, one field under the settings lock, and apply it at once."""
     try:
         timeout_sec = int(seconds)
     except (TypeError, ValueError):
@@ -124,11 +208,19 @@ def _set_tool_timeout(ctx: ToolContext, seconds: int) -> str:
     if timeout_sec < 1:
         return "⚠️ TOOL_ARG_ERROR (set_tool_timeout): seconds must be >= 1"
 
-    settings = load_settings()
-    settings["OUROBOROS_TOOL_TIMEOUT_SEC"] = timeout_sec
-    settings["OUROBOROS_RUNTIME_MODE"] = os.environ.get("OUROBOROS_RUNTIME_MODE", "advanced")
-    save_settings(settings)
-    apply_settings_to_env(settings)
+    # Only this field is written: the runtime mode and every other saved value stay as they are on
+    # disk (an owner's pending next-boot mode included), so the agent cannot change its Access or
+    # lower a ratcheted mode here, and the process environment takes the field alone.
+    from ouroboros.gateway.owner_settings import (
+        _owner_update_settings,
+        fields_on_saved_document,
+        settings_document_mutation,
+    )
+
+    key = "OUROBOROS_TOOL_TIMEOUT_SEC"
+    with settings_document_mutation():
+        _owner_update_settings(fields_on_saved_document({key: timeout_sec}))
+        os.environ[key] = str(timeout_sec)  # under the same lock as the commit
     return f"OK: OUROBOROS_TOOL_TIMEOUT_SEC set to {timeout_sec}s and applied immediately."
 
 
@@ -151,19 +243,33 @@ def _promote_to_stable(ctx: ToolContext, reason: str) -> str:
     return f"Promote to stable requested: {reason}"
 
 
-def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
-    # Availability follows the configured deep-review ROW (a native inspection
-    # episode or a delegated session), not the model key alone.
+def _request_deep_self_review(ctx: ToolContext, reason: str, reviewer: str = "") -> str:
+    # The executor is the one enabled catalog row the caller names (decision 3A),
+    # else the Main model; availability follows that row (a native inspection
+    # episode or a delegated session), not a model key alone.
     from ouroboros.deep_self_review import deep_review_route, deep_review_unavailable_text
     from ouroboros.consciousness_authority import consciousness_origin_metadata
-    unavailable, identity = deep_review_route()
+    reviewer = str(reviewer or "").strip()
+    if reviewer:
+        from ouroboros.tools.arg_feedback import argument_refusal
+        from ouroboros.tools.review_change import ReviewChangeArgumentError, system_review_row
+
+        try:
+            unavailable, identity = deep_review_route(system_review_row(reviewer))
+        except ReviewChangeArgumentError as exc:
+            return argument_refusal(ctx, "TOOL_ARG_ERROR (request_deep_self_review)", [str(exc)],
+                                    effect="No review was queued.")
+    else:
+        unavailable, identity = deep_review_route()
     if unavailable:
         return deep_review_unavailable_text(unavailable)
     # A consciousness turn names itself: the review root then goes through the ONE
     # admission door and its spend stays inside the consciousness allowance.
-    ctx.pending_events.append({"type": "deep_self_review_request", "reason": reason, "model": identity, "ts": utc_now_iso(),
+    ctx.pending_events.append({"type": "deep_self_review_request", "reason": reason, "reviewer": reviewer,
+                               "model": identity, "ts": utc_now_iso(),
                                **consciousness_origin_metadata(getattr(ctx, "task_metadata", None))})
-    return f"Deep self-review requested (reviewer: {identity}). It will be queued and executed asynchronously."
+    return (f"Deep self-review requested (reviewer: {reviewer or 'Main'}, runs on {identity}). "
+            "It will be queued and executed asynchronously.")
 
 
 @completed_local_read
@@ -287,7 +393,8 @@ def _main_notice_refusal(ctx: ToolContext, chat_id: object) -> str:
     return ""
 
 
-def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current") -> str:
+def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destination: str = "current",
+                       reply_to_relay: str | None = None) -> str:
     """Send a separate owner reply without completing the ongoing task.
 
     ``destination="main"`` addresses the owner's main chat from an owner-visible
@@ -326,6 +433,21 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         # via log_chat(record_type=...) exactly like media rows.
         system_type = "proactive_message"
 
+    relay = {}
+    reply_meta = {}
+    if reply_to_relay is not None:
+        from ouroboros.owner_relay import select_return
+        from ouroboros.chat_references import resolve_reply
+        from ouroboros.tool_access import canonical_data_root
+        relay, error = select_return(ctx, reply_to_relay)
+        error = error or owner_contact_refusal(ctx, chat_id)
+        if relay and relay["source"]["chat_id"] != chat_id:
+            error = error or _main_notice_refusal(ctx, chat_id)
+        if error:
+            return publish_no_effect(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=error, meta={"reason_code": "RELAY_RETURN_UNRESOLVED"}))
+        chat_id, system_type = relay["source"]["chat_id"], "relay_reply"
+        reply_meta = {"reply_to": resolve_reply(canonical_data_root(ctx), relay["source"]["address"]),
+                      "reply_to_relay": relay["relay_id"]}
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
     mode = deliver_owner_event(ctx, {
@@ -335,6 +457,7 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         "format": "markdown",
         "is_progress": False,
         "system_type": system_type,
+        "progress_meta": reply_meta,
         "ts": utc_now_iso(),
     })
     append_jsonl(ctx.drive_logs() / "events.jsonl", {
@@ -346,6 +469,10 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "", destinatio
         "transport_mode": mode,
         "text_preview": text[:200],
     })
+    if relay:
+        ctx._open_relays.pop(relay["relay_id"], None)
+        from ouroboros.owner_relay import persist_held_state
+        persist_held_state(ctx)
     if target == "main":
         return "OK: notice sent to the main chat." if mode == "live" else "OK: notice queued for delivery to the main chat."
     if mode == "live":
@@ -530,9 +657,9 @@ def _consciousness_status_facts(ctx: ToolContext) -> str:
                                       "source": "owner settings, not the state file"}
     facts["notes"] = [
         "stored_next_wake_at is the last time the clock persisted and fires only while enabled; the running "
-        "clock keeps it no sooner than MIN after boot, and an event can pull it earlier.",
-        "Not in this read (held in the supervisor's memory): a pending early-wake reason, the last wake "
-        "outcome and error, failure backoff, the allowance window and a live wake task."]
+        "clock keeps it no sooner than MIN after boot, and no event moves it.",
+        "Not in this read (held in the supervisor's memory): the last wake outcome and error, failure "
+        "backoff, the allowance window and a live wake task."]
     return json.dumps(facts, ensure_ascii=False, indent=2)
 
 
@@ -582,6 +709,11 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "", primary: 
     locality and account policy with the owner's live wait-card choice for that
     role; "wait" also keeps a refusal there on the primary's own wait instead of
     paid alternatives. Effort intent is untouched.
+
+    Effort follows the owner's range (``_effort_switch``): a Main focus — a chat turn,
+    an ordinary root — keeps the level it works at outside Cyber Pro and the reply says
+    where deeper thinking goes; a child, an evolution task or a consciousness wake moves
+    inside the range; a pinned or model-named focus keeps its level.
     """
     from ouroboros.config import EFFORT_SCALE
     from ouroboros.llm import LLMClient
@@ -631,26 +763,101 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "", primary: 
         ctx.route_wait_on_primary, ctx.active_role_override = False, None  # an explicit route ends a declared wait
         changes.append(f"model={model}{' (local)' if use_local else ''}")
 
+    effort_note = ""
     if requested_effort:
-        ctx.active_effort_override = requested_effort
-        changes.append(f"effort={requested_effort}")
+        applied, effort_note = _effort_switch(ctx, requested_effort)
+        if applied:
+            ctx.active_effort_override = applied
+            changes.append(f"effort={applied}")
 
     if not changes:
+        if effort_note:
+            return effort_note
         return (f"Current available models: {', '.join(available)}. Pass model and/or effort to switch, "
                 "or primary='return'/'wait' to go back to this turn's primary route.")
 
-    return f"OK: switching to {', '.join(changes)} on next round."
+    return f"OK: switching to {', '.join(changes)} on next round." + (f" {effort_note}" if effort_note else "")
+
+
+def _effort_switch(ctx: ToolContext, requested: str) -> tuple[str, str]:
+    """``(level to apply or "", one sentence)`` for ``switch_model(effort=…)`` under the
+    owner's effort range (``settings_scales.choose_effort``). The decision never rewrites
+    the dispatch record or a session leaf's effort fact: it is this focus's next round."""
+    from ouroboros.route_spec import RouteSpec, model_named_effort
+    from ouroboros.runtime_mode_policy import effort_range_binds
+    from ouroboros.settings_scales import choose_effort, effort_range, resolve_effort
+
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    child = str(metadata.get("delegation_role") or "").lower() == "subagent"
+    task_type = str(getattr(ctx, "current_task_type", "") or metadata.get("type") or "").lower()
+    strong_role = task_type == "evolution" or str(metadata.get("model_role") or "").lower() == "consciousness"
+    binds = effort_range_binds(metadata)
+    rng = effort_range()
+    holding = str(getattr(ctx, "active_effort", "") or "")
+    if child:
+        snapshot = metadata.get("configured_subagent") if isinstance(metadata.get("configured_subagent"), dict) else {}
+        route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
+        named = model_named_effort(RouteSpec(str(route.get("kind") or "api_model"), str(route.get("target_id") or "")))
+        pin = str(snapshot.get("effort") or "")
+        leaf = (" Your delegated run keeps the level it started at; this moves your own rounds."
+                if str(metadata.get("effective_executor") or metadata.get("requested_executor") or "") == "harness" else "")
+        level, source = choose_effort(requested, pin=pin, model_named=named, binds=binds, rng=rng)
+        if source == "model_name":
+            return "", f"effort={requested} not applied: your row's model name carries {level}, which holds in every mode.{leaf}"
+        if source == "pin":
+            return "", f"effort={requested} not applied: my human pinned your row at {level}; it holds outside Cyber Pro.{leaf}"
+        moved = f" (requested {requested}, moved into my human's range {rng['min']}..{rng['max']})" if level != requested else ""
+        return level, (moved + leaf).strip() if (moved or leaf) else ""
+    from ouroboros.agent_dispatch import main_model_named_effort
+
+    named = main_model_named_effort(metadata)
+    if named:
+        return "", f"effort={requested} not applied: the level in the model name ({named}) holds in every mode."
+    if strong_role:
+        level, source = choose_effort(requested, pin=str(metadata.get("reasoning_effort") or ""), binds=binds, rng=rng)
+        if source == "pin":
+            return "", f"effort={requested} not applied: my human pinned this task at {level}; it holds outside Cyber Pro."
+        moved = f" (requested {requested}, moved into my human's range {rng['min']}..{rng['max']})" if level != requested else ""
+        return level, moved.strip()
+    if not binds:
+        return requested, ""
+    pinned = str(metadata.get("reasoning_effort") or "")
+    holding = holding or pinned or resolve_effort("task")
+    where = (f"the level my human pinned for this task ({holding})" if pinned
+             else f"my human's recommended level ({holding})")
+    return "", (f"effort={requested} not applied: Main works at {where}; deeper thinking is "
+                "delegated — schedule_subagent(effort=…).")
 
 
 def _finish_task(ctx: ToolContext, action: str, answer: str | None = None,
                  answer_sha256: str | None = None, rationale: str = "",
-                 acceptance_subject: dict | None = None, pending_review: str | None = None) -> str:
-    """Stage a local author act; the loop owns answer selection and finalization."""
+                 acceptance_subject: dict | None = None, pending_review: str | None = None,
+                 silent: bool = False) -> str:
+    """Stage an author act; only a wake's own direct turn can choose silence."""
+    allow_empty = False
+    if silent:
+        if action != "finish":
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent requires action=finish"))
+        from ouroboros.consciousness_authority import CONSCIOUSNESS_CATEGORY, is_consciousness_origin
+        metadata = getattr(ctx, "task_metadata", None)
+        if not bool(getattr(ctx, "is_direct_chat", False)):
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn"))
+        if not (is_consciousness_origin(metadata)
+                and str((metadata or {}).get("usage_category") or "") == CONSCIOUSNESS_CATEGORY):
+            return publish_no_effect(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR",
+                text="ERROR: COMPLETION_ARGUMENT: silent is available only on a consciousness wake's own turn, "
+                     "not on the tasks it started or any other turn"))
+        allow_empty = True
+        if answer is None and not answer_sha256:
+            answer = ""  # silence needs no words; complete bytes given anyway stay an internal result
     return stage_completion_request(ctx, {
         "action": action, "answer": answer, "answer_sha256": answer_sha256,
         "rationale": rationale, "acceptance_subject": acceptance_subject,
-        "pending_review": pending_review,
-    })
+        "pending_review": pending_review, "wake_silent": bool(silent) or None,
+    }, allow_empty=allow_empty)
 
 
 def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "finish_task",
@@ -660,6 +867,14 @@ def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "
     from ouroboros.task_results import resolve_task_lineage
 
     action, answer, selector = request.get("action"), request.get("answer"), request.get("answer_sha256")
+    # Strict tool schemas make a model fill the field it did not choose with "": an empty
+    # selector beside an answer (or an empty answer beside a selector) names nothing.
+    if isinstance(selector, str) and not selector.strip() and answer is not None:
+        selector = None
+        request = {**request, "answer_sha256": None}
+    elif isinstance(answer, str) and not answer.strip() and isinstance(selector, str) and selector.strip():
+        answer = None
+        request = {**request, "answer": None}
     error = ""
     if action not in {"finish", "stop"}:
         error = "action must be finish or stop"
@@ -669,7 +884,7 @@ def stage_completion_request(ctx: ToolContext, request: dict, *, source: str = "
         error = "select exactly one of answer and answer_sha256"
     elif not reply_later and answer is not None and (not isinstance(answer, str) or (not allow_empty and not answer.strip())):
         error = "answer must be complete nonempty text"
-    elif selector is not None and (not isinstance(selector, str) or not selector):
+    elif selector is not None and (not isinstance(selector, str) or not selector.strip()):
         error = "answer_sha256 must name an offered answer"
     elif request.get("pending_review") not in {None, "wait", "finish"}:
         error = "pending_review must be wait or finish"

@@ -1,7 +1,7 @@
 """The sleep-wake policy for COLD model sleeps.
 
 A cold sleep is parked like an exact pause (``_budget_pause`` marker, reason
-``sleep``) and nothing wakes it but its OWN selected sources: this pass, run
+``sleep``). This pass, run
 from the ordinary assignment tick (no second scheduler), reads readiness from
 the canonical records (``model_sleep.wake_reason`` over the task's mailbox,
 the selected tasks' results, its custody rows and the chosen time) OUTSIDE the
@@ -41,6 +41,7 @@ def _sleepers(q: Any) -> List[Dict[str, Any]]:
 
 def _readiness(q: Any, task: Dict[str, Any], row: Dict[str, Any]) -> str:
     from ouroboros.model_sleep import wake_reason
+    from ouroboros.store import acquisition_budget
 
     root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
     ctx = SimpleNamespace(
@@ -48,7 +49,8 @@ def _readiness(q: Any, task: Dict[str, Any], row: Dict[str, Any]) -> str:
         drive_root=str(task.get("drive_root") or task.get("child_drive_root") or root),
         budget_drive_root=str(root), task_attempt=int(task.get("_attempt") or 1),
         _loop_mailbox_seen_ids=set(row.get("sleep_seen") or ()), task_metadata=task.get("metadata") or {})
-    return wake_reason(ctx, row["sleep"])
+    with acquisition_budget(0):  # the next assignment tick retries a contended read; this one never stalls
+        return wake_reason(ctx, row["sleep"])
 
 
 def _vetoed(q: Any, task: Dict[str, Any]) -> str:

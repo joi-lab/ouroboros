@@ -104,57 +104,15 @@ def _clip_preview(value: Any, limit: int = 100) -> str:
     return text[: max(0, limit - 18)].rstrip() + f" …[{len(text) - (limit - 18)} chars omitted]"
 
 
-def _trigger_line(
-    projects: Dict[str, str], reason: str, rows: List[Dict[str, Any]], *, now: float,
-) -> tuple[str, str]:
-    """Return ``(human line, task id pinned by the trigger)`` without inventing state."""
-    from ouroboros.task_status import SETTLED_STATUSES
-
+def _trigger_line(reason: str) -> str:
+    """The wake's cause line. The schedule alone starts a wake (#1603), so the
+    heartbeat is the cause; what happened since is in the observed events."""
     raw = str(reason or "").strip()
     if not raw:
-        return "", ""
-    if raw.startswith("project_digest:"):
-        parts = raw.split(":", 2)
-        project_id = parts[1].strip() if len(parts) > 1 else ""
-        trigger_task_id = parts[2].strip() if len(parts) > 2 else ""
-        matches = [
-            row for row in rows
-            if str(row.get("project_id") or "").strip() == project_id
-            and str(row.get("status") or "") in SETTLED_STATUSES
-            and not row.get("_is_direct_chat")
-            and str((row.get("metadata") or {}).get("initiator") or "") != "consciousness"
-        ]
-        if trigger_task_id:
-            exact = [row for row in matches if str(row.get("task_id") or "") == trigger_task_id]
-            if exact:
-                matches = exact
-        matches.sort(key=lambda row: str(row.get("updated_at") or row.get("ts") or ""), reverse=True)
-        if matches:
-            row = matches[0]
-            task_id = str(row.get("task_id") or "")
-            status = str(row.get("status") or "settled")
-            title = _clip_preview(row.get("description") or row.get("text") or row.get("result"), 120)
-            cost = row.get("accounted_upper_bound_usd", row.get("cost_usd"))
-            cost_text = f", ${float(cost):.2f}" if isinstance(cost, (int, float)) else ""
-            project = projects.get(project_id, project_id)
-            stamp = _parse_iso(row.get("updated_at") or row.get("ts"))
-            age_text = f", {_ago(now - stamp)}" if stamp is not None else ""
-            detail = f"; {title}" if title else ""
-            qualifier = "settled task" if trigger_task_id else "latest settled task"
-            return f"- wake cause: project {project} {qualifier} {task_id} ({status}){cost_text}{age_text}{detail}", task_id
-        return f"- wake cause: project {projects.get(project_id, project_id)} reported a settled task (details unavailable)", ""
-    if raw.startswith("task_finished:"):
-        parts = raw.split(":", 2)
-        task_id, status = (parts[1:] + ["", ""])[:2]
-        row = next((row for row in rows if str(row.get("task_id") or "") == task_id), None)
-        title = _clip_preview((row or {}).get("description") or (row or {}).get("text") or (row or {}).get("result"), 120)
-        detail = f"; {title}" if title else ""
-        return f"- wake cause: task {task_id} finished ({status or 'settled'}){detail}", task_id
-    if raw.startswith("orphans_healed:"):
-        return f"- wake cause: {raw.replace('_', ' ')}", ""
+        return ""
     if raw == "heartbeat":
-        return "- wake cause: scheduled heartbeat; no event reason is recorded for this wake", ""
-    return f"- wake cause: {raw or 'unknown event'}", ""
+        return "- wake cause: the scheduled wake time; events never move it, they are listed as observed"
+    return f"- wake cause: {raw}"
 
 
 def _card_line(task_id: str, quiz_id: str, block: Dict[str, Any], *, now: float, owner_wait: Any = None) -> str:
@@ -198,12 +156,24 @@ def _answered_card_line(task_id: str, quiz_id: str, block: Dict[str, Any], *, no
 
 
 
+def _closed_card_line(task_id, quiz_id, block, *, now):
+    stamp = _parse_iso(block.get("closed_at"))
+    when = _ago(now - stamp) if stamp is not None else "at an unknown time"
+    actor = str(block.get("closed_actor") or "unknown actor")
+    if actor == "model" and block.get("closed_by_task_id"):
+        actor += f" task {block['closed_by_task_id']}"
+    return (f"- owner card {quiz_id} on task {task_id}: closed {when} by {actor}, without an owner answer; "
+            f"reason: {block.get('closed_reason') or 'unavailable'}; "
+            f"question: {_clip_preview(block.get('question') or 'question text unavailable')}")
+
+
 class _ChatChain(JsonlChainSnapshot):
     """One captured pass over ``logs/chat.jsonl`` + its rotated archives (``jsonl_chain_handles``).
 
     Offsets count bytes across the chain; archives are never pruned, so an
     accepted boundary stays a valid position across rotations. Only complete
-    rows are returned: an unfinished live line belongs to the next wake.
+    rows are returned (``JsonlChainSnapshot.rows``): an unfinished live line
+    belongs to the next wake.
     """
 
     def first_line_sha256(self, index: int) -> str:
@@ -223,29 +193,6 @@ class _ChatChain(JsonlChainSnapshot):
                     if first:
                         return hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest()
         return ""
-
-    def rows(self, index: int, lower: int, gaps: set) -> Tuple[List[Tuple[int, Dict[str, Any]]], int]:
-        """``([(offset, row)], end of the last complete line)`` of one segment from ``lower``."""
-        base, end = self.segment(index)
-        start = max(base, lower)
-        if start >= end:
-            return [], start
-        data, rows, position = self._read(start, end), [], start
-        for raw in data.splitlines(keepends=True):
-            if not raw.endswith(b"\n"):
-                if self.entries[index][2]:
-                    break  # an unfinished live line: the next pass reads it whole
-                gaps.add("torn_archive_line")
-            position += len(raw)
-            try:
-                row = json.loads(raw)
-            except (ValueError, UnicodeDecodeError):
-                if raw.strip():
-                    gaps.add("malformed_jsonl")
-                continue
-            if isinstance(row, dict):
-                rows.append((position - len(raw), row))
-        return rows, position
 
 
 def _boundary_segment(chain: _ChatChain, boundary: Any) -> Optional[int]:
@@ -316,7 +263,7 @@ def _chat_window(drive_root: pathlib.Path, boundary: Any, since: float,
     return collected, {"lower": lower, "upper": upper, "basis": basis, "boundary": accepted}
 
 
-_SYSTEM_ROW_KINDS = {"task_summary": "task_terminal", "quiz_answer": "card_answer",
+_SYSTEM_ROW_KINDS = {"task_summary": "task_terminal", "quiz_answer": "card_answer", "quiz_closed": "card_state",
                      "acceptance_late_settlement": "late_review", "task_error": "task_error"}
 
 
@@ -331,6 +278,9 @@ def _row_kind(row: Dict[str, Any]) -> str:
     from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 
     kind, direction = str(row.get("type") or ""), str(row.get("direction") or "")
+    if (kind == "task_summary" and row.get("summary_kind") == "host_task_facts"
+            and isinstance(row.get("presence_recovery"), dict)):
+        return "presence_observation"
     if kind in _SYSTEM_ROW_KINDS:
         return _SYSTEM_ROW_KINDS[kind]
     if direction != "in" or is_a2a_chat_id(row.get("chat_id")):
@@ -355,6 +305,7 @@ _KIND_WORDS = {  # (one, many)
     "card_state": ("card closed unanswered", "cards closed unanswered"),
     "outstanding_card": ("outstanding card", "outstanding cards"),
     "memory_change": ("memory change", "memory changes"),
+    "presence_observation": ("retained Presence observation", "retained Presence observations"),
 }
 
 
@@ -380,11 +331,18 @@ def _event_line(kind: str, row: Dict[str, Any], results: Dict[str, Dict[str, Any
     if kind == "card_answer":
         block = row.get("quiz") if isinstance(row.get("quiz"), dict) else {}
         return _answered_card_line(task_id, str(block.get("quiz_id") or "?"), block, now=now)
+    if kind == "card_state":
+        block = row.get("quiz") if isinstance(row.get("quiz"), dict) else {}
+        return _closed_card_line(task_id, str(block.get("quiz_id") or "?"), block, now=now)
     if kind == "late_review":
         # A chat row whose canonical fact was not found: only what the row itself says.
         return f"- late review announced for task {task_id}, {when}: {_clip_preview(row.get('text'), 240)}"
     if kind == "task_error":
         return f"- task {task_id} runner failed, {when}: {_clip_preview(row.get('text'), 160)}"
+    if kind == "presence_observation":
+        from ouroboros.dialogue_provenance import render_row_text
+
+        return f"- retained Presence observation in {rooms.label(row)}, {when}: {render_row_text(row)}"
     result = results.get(task_id) or {}
     metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     status = str(row.get("status") or result.get("status") or "settled")
@@ -396,6 +354,15 @@ def _event_line(kind: str, row: Dict[str, Any], results: Dict[str, Dict[str, Any
     if kind == "direct_turn":
         return f"- {'wake' if is_consciousness_origin(metadata) else 'direct turn'} {task_id} {status}{where}, {when}"
     if is_presence_task(result):
+        if isinstance(metadata.get("presence_unknown_outcome"), dict):
+            from ouroboros.dialogue_provenance import render_row_text
+            from ouroboros.presence_recovery import retained_turn_facts
+
+            presence = metadata.get("presence") or {}
+            retained = {"task_id": task_id, "type": "task_summary", "text": "",
+                        "presence_recovery": retained_turn_facts(result, task_id),
+                        "source_event": presence.get("event"), "source_text": presence.get("observed_text")}
+            return f"- Presence turn {task_id} {status}{where}, {when}; {render_row_text(retained)}"
         outcome = str(metadata.get("presence_outcome") or "unknown")
         work = str(metadata.get("presence_work_ref") or "")
         return (f"- Presence turn {task_id} {status}{where}, {when}; Presence outcome={outcome}; see get_task_result"
@@ -439,7 +406,7 @@ def _transition_facts(row: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     for quiz_id, block in quizzes.items():
         state = str(block.get("state") or "") if isinstance(block, dict) else ""
         if state and state != "open":
-            stamp = _parse_iso(block.get("answered_at") or block.get("reconciled_at") or "")
+            stamp = _parse_iso(block.get("closed_at") or block.get("answered_at") or block.get("reconciled_at") or "")
             facts[f"card:{task_id}:{quiz_id}:{state}"] = {
                 "kind": "card_answer" if state == "answered" else "card_state", "task_id": task_id,
                 "quiz_id": str(quiz_id), "block": block, "stamp": stamp, "proven": stamp is not None}
@@ -520,6 +487,8 @@ def _transition_line(fact: Dict[str, Any], results: Dict[str, Dict[str, Any]], r
         from ouroboros.project_dialogue import owner_wait_projection, question_status
 
         block = fact["block"]
+        if block.get("state") == "closed":
+            return kind, _closed_card_line(task_id, fact["quiz_id"], block, now=now)
         label = question_status(str(block.get("state") or ""), owner_wait_projection(
             fact["quiz_id"], (results.get(task_id) or {}).get("owner_wait"), block), False)
         when = f", closed {ago}" if stamp is not None else ""
@@ -721,6 +690,7 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
         key = next((key for key, fact in facts.items() if (
             kind == "task_terminal" and fact["kind"] == "task_terminal")
             or (kind == "card_answer" and key == f"card:{row.get('task_id')}:{quiz.get('quiz_id')}:answered")
+            or (kind == "card_state" and key == f"card:{row.get('task_id')}:{quiz.get('quiz_id')}:closed")
             or (kind == "late_review" and fact["kind"] == "late_review" and retry and retry == str(
                 ((fact["fact"].get("late_settlement") or {}).get("reviewed_subject") or {}).get("retry_key") or ""))),
             None)
@@ -758,7 +728,7 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
                     STATE_OPEN, STATE_EXPIRED_TERMINAL):
                 cards.append((str(block.get("asked_at") or ""), _card_line(
                     task_id, str(quiz_id), block, now=now, owner_wait=row.get("owner_wait"))))
-    trigger, _trigger_task = _trigger_line(projects, reason, rows, now=now)
+    trigger = _trigger_line(reason)
     chat_boundary = window.get("boundary") or {key: accepted[key] for key in _CHAT_BOUNDARY_KEYS if key in accepted}
     state_to_accept = {**chat_boundary, **({"transitions": state} if isinstance(state, dict) else {}),
                        **({"memory": memory_boundary} if memory_boundary is not None else {})}

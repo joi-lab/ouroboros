@@ -45,7 +45,7 @@ def _workflow(name):
     return loaded, loaded.get("on", loaded.get(True))
 
 
-def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes():
+def test_one_complete_browser_lane_serves_manual_runs_and_release_tags():
     shared, triggers = _workflow("ui-browser.yml")
     assert list(triggers) == ["workflow_call"], "the shared lane runs only when called"
     assert "secrets." not in str(shared["jobs"])
@@ -65,25 +65,25 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert "github.event_name == 'pull_request'" in caller["if"]
     assert "github.event_name == 'workflow_dispatch'" in caller["if"]
     assert "startsWith(github.ref, 'refs/tags/v')" in caller["if"]
-    # A push reaches the lane through its own workflow, never through ci.yml's
-    # push trigger.
+    # Dormant PR predicates do not admit PR events; only manual/tag triggers remain.
     assert "push" not in caller["if"] and "schedule" not in caller["if"]
     assert "schedule" not in ci_triggers  # owner, 2026-10-05: no nightly run nobody reads
 
-    assert list(push_triggers) == ["push", "workflow_dispatch"]
+    assert list(push_triggers) == ["workflow_dispatch"]
     assert push_triggers["workflow_dispatch"]["inputs"]["diagnostic"]["options"] == [
         "full", "viewport", "inflight"]
-    assert push_triggers["push"] == {"branches": ["ouroboros"]}
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
     # Both callers hand the lane nothing: it has no input to select a part of it with.
     assert "with" not in caller and "with" not in push["jobs"]["ui-smoke"]
     assert triggers["workflow_call"] is None
 
 
-def test_a_later_docs_only_push_cannot_supersede_an_untested_code_push():
-    """Push A changes code, push B (A..B) only docs. B's lane skips browsers for B's own
-    range, so A's lane must finish: a concurrency group would cancel it (in progress) or
-    replace it (pending), leaving B green over code no browser ever ran."""
+def test_requested_browser_runs_cannot_replace_each_other():
+    """A later requested run must not cancel or replace an earlier qualification.
+
+    The reusable scope selector retains its code/docs distinction independently
+    of the caller's trigger policy; manual runs request the complete lane.
+    """
     push, _ = _workflow("ui-browser-push.yml")
     groups = [push.get("concurrency")] + [job.get("concurrency") for job in push["jobs"].values()]
     assert groups == [None] * len(groups), groups

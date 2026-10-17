@@ -51,11 +51,10 @@ def test_one_resume_restores_post_task_and_dead_acceptance_preparation(late, tmp
 
     # The first paid late stage (scratchpad consolidation since the dialogue writer is retired).
     monkeypatch.setattr(pipeline, '_run_scratchpad_consolidation', late_stage)
-    monkeypatch.setattr(pipeline, '_run_reflection', lambda *_a, **_k: None)
     try:
         with usage_scope(UsageScope(drive_root=f.root, task_id=f.tid, root_task_id=f.tid,
                                     root_limit_usd=4.0, category='post_task')):
-            _, initial_threads = _spawned(lambda: pipeline._run_post_task_processing_async(env, task, {}, {}, {}, f.root / 'logs', blocking=False))
+            _, initial_threads = _spawned(lambda: pipeline._run_post_task_processing_async(env, task, {}, {}, f.root / 'logs', blocking=False))
         _join(initial_threads)
         before = load_task_result(f.root, f.tid)
         assert before['root_phase_checkpoint']['post_task_synthesis'] == 'paused'

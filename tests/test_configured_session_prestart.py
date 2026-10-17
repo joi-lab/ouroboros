@@ -14,6 +14,7 @@ from ouroboros.delegate_shared import _fail, delegate_result
 from ouroboros.tools.tool_result import ToolResult
 
 from tests.test_available_subagents_runtime import _session_row, _settings, _snapshot
+from tests._store_shared import read_result
 
 
 @pytest.mark.parametrize(("reason", "extra"), [
@@ -220,7 +221,6 @@ def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round
     # End-to-end pin (fable triad finding): the pre-start refusal seam is glue
     # between two halves — this drives _handle_task_scoped and asserts the
     # model is NEVER called and the durable record is the typed $0 terminal.
-    import json as _json
 
     from ouroboros import agent as agent_module
     import ouroboros.subagent_runtime as runtime
@@ -252,7 +252,7 @@ def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round
     agent._handle_task_scoped(dict(pinned))
 
     assert calls == [], "a definite pre-start refusal must never reach the model"
-    record = _json.loads((drive / "task_results" / "pinned-refused.json").read_text(encoding="utf-8"))
+    record = read_result(drive, "pinned-refused")
     assert float(record.get("cost_usd") or 0.0) == 0.0
     assert "NOT run on metered API tokens" in str(record.get("result") or "")
 

@@ -46,7 +46,8 @@ def test_symlink_is_rejected(tmp_path: Path) -> None:
     assert platform_support.path_is_link_or_reparse(link)
 
 
-def test_windows_liveness_probe_never_calls_os_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("pid", [1, 4242])
+def test_windows_liveness_probe_never_calls_os_kill(monkeypatch: pytest.MonkeyPatch, pid: int) -> None:
     calls: list[tuple[int, int, int]] = []
 
     class Kernel:
@@ -82,5 +83,32 @@ def test_windows_liveness_probe_never_calls_os_kill(monkeypatch: pytest.MonkeyPa
         raising=False,
     )
     monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("os.kill is destructive on Windows"))
-    assert platform_support.process_alive(4242)
-    assert calls and calls[0][2] == 4242
+    assert platform_support.process_alive(pid)
+    assert calls and calls[0][2] == pid
+
+
+@pytest.mark.parametrize(
+    "pid,outcome,alive",
+    [(1, None, True), (4242, ProcessLookupError, False), (4242, PermissionError, True)],
+)
+def test_posix_liveness_probes_positive_pids_including_pid1(
+    monkeypatch: pytest.MonkeyPatch, pid: int, outcome: type[BaseException] | None, alive: bool
+) -> None:
+    """A bare container server is PID 1: it must reach the real probe."""
+    calls: list[tuple[int, int]] = []
+
+    def fake_kill(target: int, sig: int) -> None:
+        calls.append((target, sig))
+        if outcome is not None:
+            raise outcome()
+
+    monkeypatch.setattr(platform_support, "IS_WINDOWS", False)
+    monkeypatch.setattr(os, "kill", fake_kill)
+    assert platform_support.process_alive(pid) is alive
+    assert calls == [(pid, 0)]
+
+
+@pytest.mark.parametrize("pid", [0, -1, -4242])
+def test_invalid_pids_are_dead_without_any_system_probe(monkeypatch: pytest.MonkeyPatch, pid: int) -> None:
+    monkeypatch.setattr(os, "kill", lambda *_args: pytest.fail("invalid PID reached os.kill"))
+    assert platform_support.process_alive(pid) is False

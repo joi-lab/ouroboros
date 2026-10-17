@@ -1,11 +1,11 @@
 """What stays honest after the old dialogue writer is retired.
 
-The shared knowledge-maintenance prompt still tells Light to author summaries; a
-nominated note with a summary still becomes resident in the index; Health keeps its
-own-memory lines for identity and scratchpad and no longer reports the retired
-writer's state, whatever the frozen ``dialogue_meta.json`` holds (its pending
-nominations are imported as marks); and the frozen cursor is still read strictly, so
-an unreadable file is never taken for an empty one.
+An authored note with a summary still becomes resident in the index (Light no
+longer nominates notes at all); Health keeps its own-memory lines for identity and
+scratchpad and no longer reports the retired writer's state, whatever the frozen
+``dialogue_meta.json`` holds (its pending nominations are imported as marks); and the
+frozen cursor is still read strictly, so an unreadable file is never taken for an
+empty one.
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import consolidator as c
 from ouroboros import context_health
 from ouroboros.memory_nomination_receipts import DialogueMetaUnreadable, parse_meta
 from ouroboros.tools.registry import ToolContext
@@ -27,20 +26,13 @@ def _health_env(tmp_path):
                            repo_path=lambda p: tmp_path / p, drive_path=lambda p: tmp_path / p)
 
 
-def test_light_is_told_to_author_summaries_and_keep_explicit_requests_explicit():
-    # Light never sees the knowledge_write schema, so the maintenance prompt is its only carrier.
-    assert "YAML summary" in c.KNOWLEDGE_MAINTENANCE_PROMPT
-    assert "resident in the index" in c.KNOWLEDGE_MAINTENANCE_PROMPT
-    assert "explicit standing request stays explicit" in c.KNOWLEDGE_MAINTENANCE_PROMPT
-
-
-def test_a_nominated_note_with_a_summary_becomes_resident_in_the_index(tmp_path):
+def test_an_authored_note_with_a_summary_becomes_resident_in_the_index(tmp_path):
     from ouroboros.knowledge import inventory_knowledge, render_knowledge_index, resolve_knowledge_address
+    from ouroboros.tools.knowledge import _knowledge_write
+
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, budget_drive_root=str(tmp_path), task_id="t")
-    entry = {"topic": "people/alex", "scope": "global", "expected_revision": None,
-             "content": "---\ntype: understanding\nsummary: Alex asks for brevity; an interpretation to test.\n---\nEvidence."}
-    outcomes = c._write_knowledge_entries(tmp_path / "memory" / "knowledge", [entry], context=ctx)
-    assert outcomes and outcomes[0]["ok"]
+    content = "---\ntype: understanding\nsummary: Alex asks for brevity; an interpretation to test.\n---\nEvidence."
+    assert _knowledge_write(ctx, "people/alex", content, scope="global").startswith("✅")
     rendered = render_knowledge_index(inventory_knowledge(resolve_knowledge_address(tmp_path, "overview", "global")))
     assert "Alex asks for brevity" in rendered
 

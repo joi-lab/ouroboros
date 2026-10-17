@@ -206,22 +206,20 @@ def test_legacy_summary_without_positive_row_facts_cannot_claim_exactness():
     assert build_cost_presentation({'accounted_usd': 0, 'cost_final': True}, scope=COST_SCOPE_OWN) is None
 
 
-# Production ledger/compaction fixtures, executed only by the parent's isolated suite.
-from tests import fixtures_usage_compaction as compaction_fixtures
+# Production money fixtures, executed only by the parent's isolated suite.
+from tests import fixtures_usage_store as compaction_fixtures
 
-data_root_any_tier = compaction_fixtures.data_root_any_tier
 data_root = compaction_fixtures.data_root
 
 
-def test_real_compaction_preserves_all_presentation_facts(data_root):
+def test_an_imported_compacted_journal_preserves_all_presentation_facts(data_root):
     from ouroboros import usage_accounting as usage
 
     compaction_fixtures._seed_mixed_ledger(data_root)
     compaction_fixtures._settle(data_root, cost=0, cost_final=True, task_id='zero')
     compaction_fixtures._settle(data_root, cost=0, cost_final=False, task_id='estimated-zero')
     before = usage.usage_breakdown(data_root, root_task_id='root')
-    receipt = compaction_fixtures._compact(data_root)
-    assert receipt is not None
+    compaction_fixtures.fold_into_archive(data_root, compaction_fixtures.foldable_attempt_ids(data_root))
     assert any(row['kind'] == 'usage_baseline_group' for row in compaction_fixtures._ledger_rows(data_root))
     after = usage.usage_breakdown(data_root, root_task_id='root')
     for field in ['priced_rows', 'tracked_nonfinal_rows', 'accounting_open_rows', 'unknown_unmetered',
@@ -289,16 +287,20 @@ def test_producer_to_wire_consumers_keep_tree_scope_and_late_unknown_price(data_
         const rows = JSON.parse(fs.readFileSync(0, 'utf8'));
         const projections = rows.map((row, i) => taskCostProjection(cardMetaKeys(row), `2026-09-20T00:0${i}:00Z`));
         const sticky = mergeStickyCostMeta(projections[0], projections[3]);
-        console.log(JSON.stringify({meta: rows.map(taskCostMeta), sticky: sticky.meta,
-            late: mergeStickyCostMeta(sticky, projections[4]).meta}));
+        console.log(JSON.stringify({meta: rows.map(taskCostMeta), sticky: sticky.meta, why: sticky.detail || '',
+            late: mergeStickyCostMeta(sticky, projections[4]).meta,
+            lateWhy: mergeStickyCostMeta(sticky, projections[4]).detail || ''}));
     """
     result = subprocess.run(['node', '--input-type=module', '-e', script],
                             cwd=Path(__file__).parents[1], input=json.dumps([terminal, heartbeat, history, own, late]),
                             capture_output=True, text=True, check=True)
     browser = json.loads(result.stdout)
-    assert browser['meta'] == [['Tracked: up to $2.00', 'some steps have no price']] * 3 + [['$0.00'], ['$0.35']]
-    assert browser['sticky'] == ['Tracked: up to $2.00', 'some steps have no price']
-    assert browser['late'] == ['$0.35']
+    # Owner 2026-10-12 (option B): the amount keeps its honest "Tracked:" word; the reason is
+    # the card's detail, carried with the amount it explains and gone once prices are known.
+    assert browser['meta'] == [['Tracked: up to $2.00']] * 3 + [['$0.00'], ['$0.35']]
+    assert browser['sticky'] == ['Tracked: up to $2.00']
+    assert browser['why'] == 'Cost: some steps have no price, so Tracked counts only the priced steps.'
+    assert browser['late'] == ['$0.35'] and browser['lateWhy'] == ""
 
 
 def test_first_terminal_root_frame_preserves_money_on_tree_failure(monkeypatch):

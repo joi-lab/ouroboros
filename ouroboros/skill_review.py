@@ -87,9 +87,7 @@ from ouroboros.skill_review_prompt import (  # noqa: F401 — split facade re-ex
     _SKILL_REVIEW_ITEMS,
     _build_review_prompt,
     _build_review_prompt_for_attempt,
-    _emit_skill_advisory_warning,
     _load_governance_artifact,
-    _run_skill_advisory_pre_review,
 )
 from ouroboros.skill_review_output import (  # noqa: F401 — split facade re-exports
     _aggregate_status,
@@ -143,6 +141,8 @@ class SkillReviewOutcome:
     review_contract_fingerprint: str = ""
     rebuttal_sha256: str = ""
     replayed_from_ts: str = ""
+    # Foreground call outcome, not the skill's pending status or recorded history.
+    dispatch_refusal_code: str = ""
 
 
 def _apply_auto_grant_outcome(outcome: SkillReviewOutcome, skill: Any, auto_grant: Any) -> None:
@@ -167,6 +167,7 @@ from ouroboros.skill_review_cycles import (  # noqa: E402
     plugin_api_admission_refusal_outcome as _admission_refusal_outcome,
     record_accepted_rebuttal as _record_accepted_rebuttal,  # noqa: F401 — re-export
     review_wave_budget_block as _review_wave_budget_block,
+    skill_wave_purchased as _wave_purchased,
 )
 
 
@@ -227,8 +228,8 @@ def _run_deterministic_preflight(
         "model": "deterministic_preflight",
     }]
     # A deterministic preflight failure is a structural fact, not an LLM verdict,
-    # so it is persisted as PENDING (non-executable under EVERY enforcement mode,
-    # in every readiness/execution caller) rather than BLOCKERS (which advisory
+    # so it is persisted as PENDING (non-executable outside Cyber Pro, in every
+    # readiness/execution caller) rather than BLOCKERS (which advisory
     # enforcement would let an operator override). The skill_preflight FAIL finding
     # still records exactly why, just like the other PENDING review-time failures.
     outcome = SkillReviewOutcome(
@@ -237,7 +238,7 @@ def _run_deterministic_preflight(
         findings=findings,
         reviewer_models=["deterministic_preflight"],
         content_hash=content_hash,
-        error="deterministic skill_preflight failed before LLM review; skill is not executable",
+        error="deterministic skill_preflight failed before LLM review; the review stays PENDING",
         raw_result=preflight_raw,
     )
     if persist:
@@ -269,7 +270,7 @@ def _run_deterministic_preflight(
         # Record what the skill requests (transparency in the review block) but
         # NEVER auto-grant a skill that FAILED the deterministic preflight gate
         # (invalid manifest, sensitive-shaped file, binary payload, path escape).
-        # The PENDING status already makes it non-executable everywhere; recording
+        # The PENDING status already makes it non-executable outside Cyber Pro; recording
         # the requested keys/permissions just keeps the review block honest about
         # what the skill wanted.
         from ouroboros.skill_loader import (
@@ -409,6 +410,8 @@ def _skill_cycles_gate(
     *,
     persist: bool = True,
     file_packs: Optional[List[str]] = None,
+    resume_only: bool = False,
+    previous: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional["SkillReviewOutcome"], str, str, str]:
     """Select exact late reconciliation or free substantive replay before paid
     admission. The shared cap counts per root task, or per manual content hash.
@@ -430,7 +433,9 @@ def _skill_cycles_gate(
     group_id = str(getattr(ctx, "_skill_review_group_id", "") or "") or f"manual:{skill.name}"
     if file_packs is not None and select_skill_review_resume(ctx, skill, drive_root,
             skill_review_wave_binding(ctx, skill, drive_root, content_hash, contract_fp,
-                                      rebuttal_sha, file_packs)):
+                                      rebuttal_sha, file_packs), previous):
+        return None, ctx._skill_review_resume["binding"]["review_contract_fingerprint"], rebuttal_sha, review_profile
+    if resume_only:  # failed current preflight or settings may still collect the paid wave
         return None, contract_fp, rebuttal_sha, review_profile
     replayed = free_replay_outcome(
         skill, drive_root=drive_root, group_id=group_id, content_hash=content_hash,
@@ -469,7 +474,7 @@ def _stamp_paid_facts(
     write-ahead dispatch marker recorded before the first transport call
     (plan-review precedent), so a crash cannot launder the spend and an
     assembly-refused $0 wave never counts."""
-    outcome.paid = bool(stamp is not None and getattr(stamp, "fired", False))
+    outcome.paid = _wave_purchased(stamp)
     outcome.review_contract_fingerprint = contract_fp
     outcome.rebuttal_sha256 = rebuttal_sha
     if stamp is not None:
@@ -535,6 +540,40 @@ def _skill_quorum_failure_outcome(
     return outcome
 
 
+def _skill_payload_packs(skill: Any, binding: ResolvedResourceBinding, content_hash: str, *, split: bool,
+                         packet_seats: List[str]) -> tuple[List[str], Any, Optional[SkillReviewOutcome]]:
+    """``(packs, skill, refusal)``: the hashed payload's review packs in one layout (``split``: packet-budget
+    chunks) with the skill re-bound to the same manifest and bytes, or the typed pending refusal."""
+    from ouroboros.skill_loader import SkillPayloadUnreadable
+    code = ""  # only the live over-budget refusal is a typed no-dispatch refusal (SkillReviewOutcome)
+    try:
+        packs = _build_skill_file_packs(skill.skill_dir, manifest_entry=skill.manifest.entry,
+                                        manifest_scripts=skill.manifest.scripts,
+                                        expected_content_hash=content_hash, split=split)
+        rebound = load_bound_skill(binding)
+        if rebound is None or rebound.load_error:
+            raise _SkillFileUnreadable("(payload snapshot)", RuntimeError("skill manifest changed after hashing"))
+        if compute_content_hash(rebound.skill_dir, manifest_entry=rebound.manifest.entry,
+                                manifest_scripts=rebound.manifest.scripts) != content_hash:
+            raise _SkillFileUnreadable("(payload snapshot)", RuntimeError("skill payload changed after hashing"))
+        return packs, rebound, None
+    except _SkillFileOverBudget as exc:
+        code = "LEGACY_BLOCKED"
+        error = (f"Skill file {exc.relpath!r} alone is ~{exc.tokens} tokens, over the {exc.budget}-token "
+                 f"packet budget: packet seat(s) {', '.join(packet_seats) or '(unresolved panel)'} cannot "
+                 "receive it untruncated in any chunk, so no reviewer was dispatched and review stays "
+                 "pending (it never truncates the executable surface). Shrink or split that one file.")
+    except _SkillBinaryPayload as exc:
+        error = (f"Skill file {exc.relpath!r} ({exc.size_bytes} bytes) is a loadable executable "
+                 f"({exc.kind or 'native magic bytes'}); review hard-blocks native code the subprocess could load "
+                 "via ctypes/import without reviewer inspection. Remove it or store it outside the hashed surface.")
+    except (_SkillFileUnreadable, SkillPayloadUnreadable) as exc:
+        error = (f"Skill file {exc.relpath!r} is unreadable ({type(exc.err).__name__}: {exc.err}). Review refuses "
+                 "to fail open — fix the file permissions or remove the file before re-running skill_review.")
+    return [], skill, SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
+                                         error=error, dispatch_refusal_code=code)
+
+
 def review_skill(
     ctx: Any,
     skill_name: str,
@@ -575,59 +614,24 @@ def review_skill(
                 "permissions or remove the unreadable file and re-run."
             ),
         )
+    slot_err = reviewer_slot_config_error()
     try:
-        file_packs = _build_skill_file_packs(
-            skill.skill_dir,
-            manifest_entry=skill.manifest.entry,
-            manifest_scripts=skill.manifest.scripts,
-            expected_content_hash=content_hash,
-        )
-        rebound = load_bound_skill(binding)
-        if rebound is None or rebound.load_error:
-            raise _SkillFileUnreadable("(payload snapshot)", RuntimeError(
-                "skill manifest changed after hashing"))
-        skill = rebound
-        if compute_content_hash(
-            skill.skill_dir, manifest_entry=skill.manifest.entry,
-            manifest_scripts=skill.manifest.scripts) != content_hash:
-            raise _SkillFileUnreadable("(payload snapshot)", RuntimeError(
-                "skill payload changed after hashing"))
-    except _SkillFileOverBudget as exc:
-        return SkillReviewOutcome(
-            skill_name=skill.name,
-            status=STATUS_PENDING,
-            content_hash=content_hash,
-            error=(
-                f"Skill file {exc.relpath!r} alone is ~{exc.tokens} tokens, over the "
-                f"{exc.budget}-token reviewer budget. Review refuses to truncate the "
-                "executable surface — shrink or split that one file so it fits a "
-                "single review pass."
-            ),
-        )
-    except _SkillBinaryPayload as exc:
-        return SkillReviewOutcome(
-            skill_name=skill.name,
-            status=STATUS_PENDING,
-            content_hash=content_hash,
-            error=(
-                f"Skill file {exc.relpath!r} ({exc.size_bytes} bytes) is a loadable "
-                f"executable ({exc.kind or 'native magic bytes'}); review hard-blocks "
-                "native code the subprocess could load via ctypes/import without "
-                "reviewer inspection. Remove it or store it outside the hashed surface."
-            ),
-        )
-    except (_SkillFileUnreadable, SkillPayloadUnreadable) as exc:
-        return SkillReviewOutcome(
-            skill_name=skill.name,
-            status=STATUS_PENDING,
-            content_hash=content_hash,
-            error=(
-                f"Skill file {exc.relpath!r} is unreadable "
-                f"({type(exc.err).__name__}: {exc.err}). Review refuses "
-                "to fail open — fix the file permissions or remove the "
-                "file before re-running skill_review."
-            ),
-        )
+        delivery = {} if slot_err else commit_triad_delivery()
+    except ValueError as exc:
+        slot_err, delivery = str(exc), {}
+    models = list(delivery.get("models") or [])
+    from ouroboros.skill_review_cycles import preceding_review_row
+    from ouroboros.skill_review_passes import panel_delivery_classes
+    packet_seats, packet_api_models, native_models = panel_delivery_classes(delivery)
+    split = bool(packet_seats) or not models
+    # A paid wave of these bytes is collected in the layout it was bought in, whatever today's pool says.
+    previous = preceding_review_row(ctx, drive_root, skill.name)
+    recorded = ((previous or {}).get("review_wave") or {}).get("binding") or {}
+    layout = len(recorded.get("chunks") or ()) > 1 if recorded.get("content_hash") == content_hash else split
+    file_packs, skill, refused = _skill_payload_packs(skill, binding, content_hash, split=layout,
+                                                      packet_seats=packet_seats)
+    if refused is not None:
+        return refused
     manifest_dump = json.dumps({
         "name": skill.manifest.name, "description": skill.manifest.description,
         "version": skill.manifest.version, "type": skill.manifest.type,
@@ -649,28 +653,25 @@ def review_skill(
         return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING,
                                   content_hash=content_hash, error=str(exc))
     if current_hash != content_hash:
-        return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING,
-            content_hash=content_hash,
+        return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
             error="Skill payload changed during deterministic preflight; review did not dispatch.")
-    if preflight_outcome is not None:
-        return preflight_outcome
-    if slot_err := reviewer_slot_config_error():  # #116: refuse loudly, never the silent default panel
-        return SkillReviewOutcome(
-            skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
-            error=f"invalid reviewer-slot configuration blocks skill review: {slot_err}")
-    try:
-        delivery = commit_triad_delivery()
-    except ValueError as exc:
-        return SkillReviewOutcome(
-            skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
-            error=f"invalid reviewer-slot configuration blocks skill review: {exc}")
-    models = list(delivery["models"])
     early_outcome, contract_fp, rebuttal_sha, review_profile = _skill_cycles_gate(
         ctx, skill, drive_root, models, delivery, review_rebuttal, content_hash, persist=persist,
-        file_packs=file_packs,
-    )
-    if early_outcome is not None:
-        return early_outcome
+        file_packs=file_packs, resume_only=preflight_outcome is not None or bool(slot_err), previous=previous)
+    if early_outcome is not None or (preflight_outcome is not None and not getattr(ctx, "_skill_review_resume", None)):
+        return early_outcome or preflight_outcome
+    if slot_err and not getattr(ctx, "_skill_review_resume", None):
+        return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING, content_hash=content_hash,
+            error=f"invalid review pool configuration blocks skill review: {slot_err}")
+    if layout != split and not getattr(ctx, "_skill_review_resume", None):
+        # That wave did not resume: a new one is laid out for today's pool and bound to its own packs.
+        file_packs, skill, refused = _skill_payload_packs(skill, binding, content_hash, split=split,
+                                                          packet_seats=packet_seats)
+        if refused is not None:
+            return refused
+        from ouroboros.skill_review_cycles import skill_review_wave_binding
+        ctx._skill_review_wave_binding = skill_review_wave_binding(
+            ctx, skill, drive_root, content_hash, contract_fp, rebuttal_sha, file_packs)
     admission_outcome = _admission_gate(ctx, skill, drive_root, content_hash, persist)
     if admission_outcome is not None:
         return admission_outcome
@@ -684,20 +685,17 @@ def review_skill(
     # Budget admission for the WHOLE review wave (v6.69.0): a wave that cannot
     # fit the remaining root budget is declined up front (typed event, $0 spent,
     # skill honestly pending) instead of dying mid-wave. Fail-open on unknowns.
-    from ouroboros.review_execution import ReviewRouteKind
-    api_models = [
-        model for model, route in zip(models, delivery["routes"])
-        if route is ReviewRouteKind.API_CHAT
-    ]
     budget_block = (
-        _review_wave_budget_block(ctx, skill.name, file_packs, api_models)
-        if api_models and not getattr(ctx, "_skill_review_resume", None) else None
+        # A native seat reads the whole payload once; a packet seat is priced per pack.
+        _review_wave_budget_block(ctx, skill.name, file_packs, packet_api_models,
+                                  **({"whole_models": native_models} if native_models else {}))
+        if (packet_api_models or native_models) and not getattr(ctx, "_skill_review_resume", None) else None
     )
     if budget_block is not None:
         return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING,
                                   reviewer_models=models, content_hash=content_hash,
                                   error=budget_block)
-    from ouroboros.skill_review_passes import run_skill_review_passes
+    from ouroboros.skill_review_passes import retained_beside_preflight, run_skill_review_passes
 
     # F3 write-ahead seam: the durable dispatch marker lands immediately
     # before the panel's first transport call (assembly failures inside the
@@ -765,6 +763,7 @@ def review_skill(
             error=f"review service error: {result_json['error']}",
         ))
 
+    models = list(result_json["recorded_models"]) if getattr(ctx, "_skill_review_resume", None) else models
     parsed_review = parse_model_review_results(result_json, required_items=_SKILL_REVIEW_ITEMS)
     emit_review_model_error_events(ctx, parsed_review, source="skill_review", skill_name=skill.name)
     findings, responded_models = parsed_review.findings, parsed_review.responsive_models
@@ -775,7 +774,7 @@ def review_skill(
         # is honored but the lost diversity is recorded loudly AND durably (Bible
         # P3) — in the outcome + review history below, not just this log line.
         log.warning("Skill review (trust gate) ran with a single reviewer (single_reviewer_no_diversity).")
-    if len(responded_models) < required_quorum:
+    if len(responded_models) < required_quorum or result_json.get("collection_pending"):
         return _paid_facts(_skill_quorum_failure_outcome(
             skill,
             findings=findings,
@@ -791,7 +790,7 @@ def review_skill(
             lifecycle_owns_history=bool(getattr(ctx, "_skill_review_lifecycle_guard", False)),
             # F3(a): the internal history append must carry the paid facts —
             # a dispatched quorum failure spent reviewer money.
-            paid=bool(getattr(stamp, "fired", False)),
+            paid=_wave_purchased(stamp),
             review_contract_fingerprint=contract_fp,
             rebuttal_sha256=rebuttal_sha,
             wave_id=str(getattr(stamp, "wave_id", "") or ""),
@@ -819,6 +818,7 @@ def review_skill(
         convergence_hint=_convergence_hint(history, findings, current_status=status),
         review_profile=review_profile,
     ))
+    retained_beside_preflight(outcome, preflight_outcome)
 
     if persist:
         return _persist_reviewed_outcome(

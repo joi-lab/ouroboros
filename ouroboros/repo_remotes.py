@@ -15,6 +15,11 @@ from typing import Any, Dict, List, Optional
 OFFICIAL_REPO = "razzant/ouroboros"
 PERSONAL_REMOTE_NAME = "origin"
 OFFICIAL_REMOTE_NAME = "managed"
+# Former official homes, now archived mirrors of OFFICIAL_REPO. Builds made
+# before v6.8.0 store one of them as their configured update source: it is the
+# project's own retired address, not a fork or mirror an owner chose.
+LEGACY_OFFICIAL_REPOS = frozenset({"joi-lab/ouroboros-desktop", "joi-lab/ouroboros"})
+_GITHUB_URL_PREFIXES = ("https://github.com/", "http://github.com/", "ssh://git@github.com/", "git@github.com:")
 
 
 @dataclass
@@ -37,6 +42,21 @@ def normalize_repo_slug(value: str) -> str:
     owner = re.sub(r"[^A-Za-z0-9_.-]", "", parts[0])
     repo = re.sub(r"[^A-Za-z0-9_.-]", "", parts[1])
     return f"{owner}/{repo}" if owner and repo else ""
+
+
+def is_legacy_official_repo(value: str) -> bool:
+    """True when ``value`` is a GitHub URL of exactly one former official home (no extra path)."""
+    text = str(value or "").strip().lower()
+    for prefix in _GITHUB_URL_PREFIXES:
+        if text.startswith(prefix):
+            path = text[len(prefix):].rstrip("/")
+            return path.removesuffix(".git").rstrip("/") in LEGACY_OFFICIAL_REPOS
+    return False
+
+
+def follow_former_official_home(url: str) -> str:
+    """The source an install follows: a former official home is the official repository."""
+    return f"https://github.com/{OFFICIAL_REPO}" if is_legacy_official_repo(url) else str(url or "")
 
 
 def _git_output(repo_dir: pathlib.Path, args: list[str]) -> tuple[int, str, str]:

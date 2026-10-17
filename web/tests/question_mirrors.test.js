@@ -50,9 +50,9 @@ test('a realistic burst: every unanswered question is the full Project form, an 
         const cards = fx.cards();
         assert.deepEqual(cards.map((card) => card.dataset.quizId), ['q-resumed', 'q-optional', 'q-finished', 'q-replaced', 'q-waiting']);
         assert.deepEqual(cards.map((card) => text(card, 'chat-quiz-status-text')), [
-            'Unanswered · the task continued; an answer is still accepted',
-            'Unanswered · an answer is still accepted',
-            'Unanswered · the task finished; a late answer is accepted as your message',
+            'Unanswered · task continued',
+            'Unanswered',
+            'Unanswered · task finished',
             'Replaced by a newer question',
             'Waiting for your answer',
         ]);
@@ -92,8 +92,10 @@ test('the mirror is the Project form node for node; its one addition is the Proj
         const [ownHead, ...ownBody] = own.children;
         assert.deepEqual(body.map(shape), ownBody.map(shape));
         assert.deepEqual(head.children.map((node) => node.className),
-            ['chat-quiz-chip', 'chat-live-project-card-btn chat-quiz-project', 'chat-quiz-status']);
-        assert.deepEqual(ownHead.children.map((node) => node.className), ['chat-quiz-chip', 'chat-quiz-status']);
+            ['chat-quiz-chip', 'chat-live-project-card-btn chat-quiz-project', 'chat-quiz-head-end']);
+        assert.deepEqual(ownHead.children.map((node) => node.className), ['chat-quiz-chip', 'chat-quiz-head-end']);
+        // The head ends with the status and the card's one quiet Close, the same on both surfaces.
+        assert.deepEqual(head.children[2].children.map((node) => node.className), ['chat-quiz-status', 'chat-quiz-close']);
         assert.deepEqual(shape(head.children[2]), shape(ownHead.children[1]));
         assert.equal(own.classList.contains('project-question-card'), false);
         const chip = head.children[1];
@@ -165,7 +167,8 @@ test('own words answer from Main; a failed attempt stays answerable and a lost r
         { ok: false, status: 500, json: async () => ({}) },
         { ok: false, status: 409, json: async () => ({ state: 'answered', answered_index: 1, comment: 'Winner.' }) },
     ];
-    const fx = mainFixture({ fetchImpl: async (_url, init) => replies.shift()
+    const fx = mainFixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': { ...ROW, state: 'open' } } }),
+        fetchImpl: async (_url, init) => replies.shift()
         || { ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', comment: JSON.parse(init.body).comment }) } });
     try {
         fx.add(WAITING);
@@ -173,10 +176,10 @@ test('own words answer from Main; a failed attempt stays answerable and a lost r
         const [raced, own] = fx.cards();
         options(raced)[0].click();
         await turn();
-        assert.deepEqual([raced.dataset.state, fx.toasts[0].text], ['open', 'Could not record the answer (500).']);
+        assert.deepEqual([raced.dataset.state, fx.toasts[0].text], ['open', 'Answer not confirmed. Your original answer is kept.']);
         mock.timers.tick(SETTLE_MS);
         assert.equal(fx.column.children.length, 2, 'a refused attempt starts no countdown');
-        options(raced)[0].click();
+        raced.querySelector('.chat-quiz-retry').click();
         await turn();
         assert.deepEqual([raced.dataset.state, text(raced, 'chat-quiz-answer'), fx.toasts[1].text],
             ['answered', "Owner's answer: Winner.", 'Already answered.']);
@@ -412,6 +415,85 @@ test('failed, missing and foreign canonical reads keep a safe Project recovery p
     }
 }));
 
+test('a Main card that settles asks the waiting pill to recount, and its lifecycle stays readable', () => withTimers(async () => {
+    let recounts = 0;
+    const fx = mainFixture({ onQuestionsChanged: () => { recounts += 1; } });
+    try {
+        fx.add({ ...WAITING });
+        assert.deepEqual(fx.decision.observedQuestion('t-1', 'qz-1'), { state: 'open', question_delivery: undefined });
+        const before = recounts;
+        fx.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'open', owner_wait_state: 'resumed' });
+        assert.equal(recounts, before, 'a change that keeps it answerable is no recount');
+        fx.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'answered', answered_index: 1 });
+        assert.ok(recounts > before, 'settling is');
+        assert.equal(fx.decision.observedQuestion('t-1', 'qz-1').state, 'answered');
+        assert.equal(fx.decision.observedQuestion('t-1', 'other'), null);
+    } finally { fx.decision.destroy(); fx.restore(); }
+}));
+
+test('only a receipt for the same delivery keeps a pending answer\'s copy out of Main', () => {
+    const fx = mainFixture();
+    const unknown = { ...ROW, quiz_state: 'answered', answered_index: 1,
+        question_delivery: { kind: 'answer', state: 'owed', reason_code: 'late_answer_delivery_unknown' } };
+    try {
+        // A long-lived tab remembers the question's publication receipt from before the answer.
+        fx.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'open',
+            question_delivery: { kind: 'publication', state: 'delivered' } });
+        fx.add(unknown);
+        const [card] = fx.cards();
+        assert.ok(card, 'the pending answer mounts at the first try');
+        assert.equal(card.querySelector('.chat-quiz-dismiss')?.textContent, 'Remove from pending');
+        fx.decision.destroy(); fx.restore();
+        const other = mainFixture();
+        try {
+            other.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'answered', answered_index: 1,
+                question_delivery: { kind: 'answer', state: 'delivered' } });
+            other.add(unknown);
+            assert.equal(other.cards().length, 0, 'its own delivered receipt does keep it out');
+        } finally { other.decision.destroy(); other.restore(); }
+    } finally { fx.decision.destroy(); fx.restore(); }
+});
+
+// Main's waiting pill mounts a question beyond the loaded history from its own census rows: one the
+// current census named is live at once; one kept from an older read (a gap, a failed read, a
+// reconnect) is withheld until its own canonical read, so a stale "unanswered" never takes input.
+test('a pointer from an older read mounts withheld until its canonical read; a current census row is live at once', async () => {
+    const reads = [];
+    const fx = mainFixture({ fetchDetail: (...args) => new Promise(resolve => reads.push([args, resolve])) });
+    try {
+        fx.decision.appendQuestionPointer({ ...WAITING, quiz_id: 'kept' }, { stale: true });
+        const kept = fx.cards()[0];
+        assert.equal(kept.dataset.state, 'unknown');
+        assert.equal(text(kept, 'chat-quiz-status-text'), 'Status unavailable');
+        assert.ok(options(kept).every(button => button.disabled));
+        assert.equal(kept.querySelector('.chat-quiz-close')?.disabled ?? true, true, 'nor can it be closed');
+        await turn();
+        assert.equal(reads.length, 1, 'it reads its canonical question at once');
+        reads[0][1]({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+            kept: { quiz_id: 'kept', state: 'open', question: 'Canonical source', options: ['A', 'B'] } } });
+        await turn();
+        const confirmed = fx.cards()[0];
+        assert.equal(confirmed.dataset.state, 'open');
+        assert.ok(options(confirmed).every(button => !button.disabled), 'the confirmed form takes answers');
+        assert.equal(text(confirmed, 'chat-quiz-question'), 'Canonical source');
+        // Memory that evicted something would make an unconfirmed pointer read too; a row of the
+        // current census needs no read.
+        for (let i = 0; i < 2001; i += 1)
+            fx.decision.applyQuizStateFrame({}, { task_id: 'noise', quiz_id: `n-${i}`, state: 'open' });
+        fx.decision.appendQuestionPointer({ ...WAITING, quiz_id: 'current', ts: ASKED[1] }, { canonical: true });
+        const current = fx.cards().find(card => card.dataset.quizId === 'current');
+        assert.equal(current.dataset.state, 'open');
+        assert.ok(options(current).every(button => !button.disabled));
+        await turn();
+        assert.equal(reads.length, 1, 'no read for the current census row');
+        fx.decision.appendQuestionPointer({ ...WAITING, quiz_id: 'plain', ts: ASKED[1] });
+        assert.equal(fx.cards().find(card => card.dataset.quizId === 'plain').dataset.state, 'unknown',
+            'without either word, eviction alone still withholds');
+        await turn();
+        assert.equal(reads.length, 2);
+    } finally { fx.decision.destroy(); fx.restore(); }
+});
+
 test('an answered pointer settles a pending safe copy for five seconds', () => withTimers(async () => {
     const pending = [];
     const fx = mainFixture({ fetchDetail: () => new Promise(resolve => pending.push(resolve)) });
@@ -592,7 +674,7 @@ test('a fresh single-wait census ends older waits in place without settling or r
         assert.equal(text(older, 'chat-quiz-status-text'), 'Waiting for your answer', 'a pre-arrival read cannot end a newer wait');
         fx.decision.appendActivityQuestion({ ...WAITING, quiz_id: 'q2', ts: ASKED[1] });
         assert.deepEqual([older, newer, foreign].map((card) => text(card, 'chat-quiz-status-text')), [
-            'Unanswered · the task continued; an answer is still accepted', 'Waiting for your answer', 'Waiting for your answer']);
+            'Unanswered · task continued', 'Waiting for your answer', 'Waiting for your answer']);
         assert.match(text(older, 'chat-quiz-assumption'), /^The wait ended without an answer/);
         assert.deepEqual([older.dataset.state, Boolean(older.querySelector('.chat-quiz-comment'))], ['open', true]);
         // Neither a missing stamp nor a sub-millisecond tie is an order.
@@ -602,7 +684,7 @@ test('a fresh single-wait census ends older waits in place without settling or r
         assert.deepEqual(fx.cards().slice(3, 5).map((card) => text(card, 'chat-quiz-status-text')),
             ['Waiting for your answer', 'Waiting for your answer']);
         fx.add(WAITING);
-        assert.equal(text(older, 'chat-quiz-status-text'), 'Unanswered · the task continued; an answer is still accepted',
+        assert.equal(text(older, 'chat-quiz-status-text'), 'Unanswered · task continued',
             'stale history cannot restore the closed wait');
         mock.timers.tick(SETTLE_MS * 2);
         assert.equal(fx.removed.length, 0, 'an unanswered question is never removed');
@@ -730,7 +812,7 @@ test('an optional canonical ask inherits no resumed fact from another quiz wait'
         const detail = await fx.decision.readQuestion('t-1', 'opt', 'p1');
         assert.equal(detail.owner_wait_state, undefined);
         const card = fx.decision.buildQuizCard(detail);
-        assert.equal(text(card, 'chat-quiz-status-text'), 'Unanswered · an answer is still accepted');
+        assert.equal(text(card, 'chat-quiz-status-text'), 'Unanswered');
         assert.ok(options(card).every(button => !button.disabled));
     } finally { fx.decision.destroy(); fx.restore(); }
 });

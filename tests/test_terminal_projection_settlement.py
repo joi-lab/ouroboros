@@ -6,8 +6,8 @@ right away. So Main heard about a run that had not finished finalizing, and a
 crash between the two effects lost whichever half had not happened yet.
 
 The obligation is now a durable row (``canonical_terminal_projection_ready``)
-persisted before the effects and cleared only when Main is durably OWED or
-positively INELIGIBLE. One continuation runs both halves outside the result
+persisted before the effects and cleared only when Main is confirmed delivered
+or positively INELIGIBLE. One continuation runs both halves outside the result
 lock, ``task_done`` and the post-task callback share it, and existing startup
 and off-loop maintenance passes retry it without cognition or a new timer/store.
 
@@ -30,6 +30,7 @@ from ouroboros.post_task_checkpoint import (
 )
 from ouroboros.project_dialogue import append_terminal_task_projection
 from ouroboros.task_results import STATUS_COMPLETED, load_task_result, write_task_result
+from tests._store_shared import seed_result
 
 DONE = {"chat_id": 1, "status": "completed", "outcome_axes": {"execution": {"status": "ok"}}}
 
@@ -55,11 +56,19 @@ def project_root(tmp_path, monkeypatch):
     bind_task_to_project(tmp_path, "root-1", project["id"], project["chat_id"],
                          origin={"absent": "system"})
     queued: list[dict] = []
-    monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery",
-                        lambda _root, event, **_kw: queued.append(dict(event)) or True)
+    def send(root, event, **_kw):
+        from supervisor.terminal_delivery import register_delivery
+        queued.append(dict(event))
+        register_delivery(root, event["delivery_id"], emitted={**event, "chat_id": 1})
+        return True
+
+    monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery", send)
+    from supervisor.event_observation import ObservedEventQueue
+    bus = ObservedEventQueue()
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda *, create=True: bus)
     task = {"id": "root-1", "project_id": project["id"], "title": "Ship release",
             "chat_id": project["chat_id"], "root_task_id": "root-1"}
-    return SimpleNamespace(root=tmp_path, project=project, task=task, queued=queued)
+    return SimpleNamespace(root=tmp_path, project=project, task=task, queued=queued, send=send, bus=bus)
 
 
 def _store(root, task_id="root-1", *, project_id="launch", phase=None, **over):
@@ -171,12 +180,15 @@ class TestPartialWritesAndRetry:
         record = load_task_result(project_root.root, "root-1")
         assert record["canonical_terminal_projection_ready"]["summary_id"] == "task-terminal:root-1"
 
-        # The next pass heals: one Project row, one delivery id, obligation closed.
+        # A later due pass heals; cache failure consumes backoff, not tick-rate retries.
+        ready = record["canonical_terminal_projection_ready"]
+        ready["main_delivery"]["last_attempt_at"] = "2000-01-01T00:00:00Z"
+        write_task_result(project_root.root, "root-1", "completed", canonical_terminal_projection_ready=ready)
         monkeypatch.undo()
         monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery",
-                            lambda _root, event, **_kw: project_root.queued.append(dict(event)) or True)
+                            project_root.send)
         assert settle_terminal_projection(
-            project_root.root, "root-1", task=project_root.task) == SETTLEMENT_SETTLED
+            project_root.root, "root-1", task=project_root.task, event_queue=project_root.bus) == SETTLEMENT_SETTLED
         assert len(_project_rows(project_root.root, "root-1")) == 1
         assert load_task_result(project_root.root, "root-1")["canonical_terminal_projection_ready"] is None
 
@@ -203,18 +215,18 @@ class TestPartialWritesAndRetry:
         # A stale summary id belongs to a different terminal and clears nothing.
         expected = load_task_result(project_root.root, "root-1")
         stale = {**expected, "canonical_terminal_projection_ready": {"summary_id": "task-terminal:other"}}
-        _clear_terminal_projection_obligation(project_root.root, "root-1", stale, "owed")
+        _clear_terminal_projection_obligation(project_root.root, "root-1", stale, "ineligible")
         assert load_task_result(
             project_root.root, "root-1")["canonical_terminal_projection_ready"] is not None
         # A post-task pass that re-opened also blocks the clear.
         _store(project_root.root, phase="running")
-        _clear_terminal_projection_obligation(project_root.root, "root-1", expected, "owed")
+        _clear_terminal_projection_obligation(project_root.root, "root-1", expected, "ineligible")
         assert load_task_result(
             project_root.root, "root-1")["canonical_terminal_projection_ready"] is not None
         # Matching marker and settled phase: the obligation closes.
         _store(project_root.root, phase="completed")
         expected = load_task_result(project_root.root, "root-1")
-        _clear_terminal_projection_obligation(project_root.root, "root-1", expected, "owed")
+        _clear_terminal_projection_obligation(project_root.root, "root-1", expected, "ineligible")
         assert load_task_result(
             project_root.root, "root-1")["canonical_terminal_projection_ready"] is None
 
@@ -268,20 +280,20 @@ class TestPartialWritesAndRetry:
         assert len(_project_rows(project_root.root, "root-1")) == 1
         assert load_task_result(project_root.root, "root-1")["canonical_terminal_projection"]["written_at"] == published_at
 
-    def test_queue_failure_after_registration_retires_readiness_to_durable_disposition(self, project_root, monkeypatch):
+    def test_queue_failure_keeps_canonical_debt_and_retry_schedule(self, project_root, monkeypatch):
         from supervisor.terminal_delivery import pending_deliveries
         from ouroboros.terminal_projection import reconcile_terminal_projections
 
         _store(project_root.root)
         monkeypatch.setattr("supervisor.terminal_delivery.enqueue_terminal_delivery",
                             lambda *_a, **_kw: (_ for _ in ()).throw(OSError("queue unavailable")))
-        assert settle_terminal_projection(project_root.root, "root-1", task=project_root.task) == SETTLEMENT_SETTLED
+        assert settle_terminal_projection(project_root.root, "root-1", task=project_root.task) == SETTLEMENT_DEFERRED
         assert [r["delivery_id"] for r in pending_deliveries(project_root.root)] == ["project-completion:root-1"]
         current = load_task_result(project_root.root, "root-1")
-        assert current["canonical_terminal_projection"]["main_disposition"] == "owed"
-        assert current["canonical_terminal_projection_ready"] is None
-        # Even once the bounded registry has forgotten it, historical scanning
-        # must never register another mirror for this terminal result.
+        saved = current["canonical_terminal_projection_ready"]["main_delivery"]
+        assert saved["attempts"] == 1
+        assert saved["event"]["chat_id"] == 1
+        # A missing cache entry does not reset timing or cause a tick-rate send.
         (project_root.root / "state" / "terminal_deliveries.json").write_text('{"delivered": [], "pending": {}}')
         assert reconcile_terminal_projections(project_root.root) == 0
 
@@ -352,7 +364,6 @@ class TestRestartRecovery:
             append_terminal_task_projection(project_root.root, "root-1", project_root.task, stored, DONE)
         # Historical terminals, retired publication obligations and children
         # share the startup scan but owe no Project/Main publication work.
-        folder = project_root.root / "task_results"
         for index in range(64):
             tid = f"history-{index}"
             row = {"task_id": tid, "status": "completed"}
@@ -362,7 +373,7 @@ class TestRestartRecovery:
             elif index % 3 == 2:
                 row.update(parent_task_id="root-1", root_task_id="root-1",
                            canonical_terminal_projection_origin="terminal_transition")
-            (folder / f"{tid}.json").write_text(json.dumps(stamp_task_result_schema(row)), encoding="utf-8")
+            seed_result(project_root.root, tid, stamp_task_result_schema(row))
         calls = []
         for name in ("capture_unread_mail", "capture_owner_mail"):
             original = getattr(task_custody, name)
@@ -490,6 +501,9 @@ def test_periodic_maintenance_retries_terminal_only_without_synthesis(project_ro
     monkeypatch.setattr('supervisor.terminal_delivery.register_pending_delivery', lambda *_a, **_kw: False)
     assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_DEFERRED
     assert not project_root.queued
+    ready = load_task_result(project_root.root, 'root-1')['canonical_terminal_projection_ready']
+    ready['main_delivery']['last_attempt_at'] = '2000-01-01T00:00:00Z'
+    write_task_result(project_root.root, 'root-1', 'completed', canonical_terminal_projection_ready=ready)
     monkeypatch.setattr('supervisor.terminal_delivery.register_pending_delivery', real_register)
     monkeypatch.setattr(maintenance, 'DATA_DIR', project_root.root)
     stop_checks = iter([False, True])
@@ -497,7 +511,7 @@ def test_periodic_maintenance_retries_terminal_only_without_synthesis(project_ro
     assert maintenance._CUSTODY_SWEEP_LOCK.acquire(blocking=False)
     maintenance._run_periodic_custody_sweep()
     assert len(project_root.queued) == len(_project_rows(project_root.root, 'root-1')) == 1
-    assert load_task_result(project_root.root, 'root-1')['canonical_terminal_projection']['main_disposition'] == 'owed'
+    assert load_task_result(project_root.root, 'root-1')['canonical_terminal_projection']['main_disposition'] == 'delivered'
 
 
 def test_main_uses_current_canonical_result_after_project_append(project_root, monkeypatch):
@@ -517,15 +531,16 @@ def test_main_uses_current_canonical_result_after_project_append(project_root, m
     assert project_root.queued[0]['progress_meta']['completion_answer'] == 'fresh canonical answer'
 
 
-def test_main_disposition_is_durable_before_live_queue(project_root, monkeypatch):
+def test_main_address_and_retry_claim_are_durable_before_live_queue(project_root, monkeypatch):
     _store(project_root.root)
 
-    def queue(root, event):
+    def queue(root, event, **_kw):
         stored = load_task_result(root, 'root-1')
-        assert stored['canonical_terminal_projection_ready'] is None
-        assert stored['canonical_terminal_projection']['main_disposition'] == 'owed'
-        project_root.queued.append(event)
-        return True
+        ready = stored['canonical_terminal_projection_ready']
+        assert ready['main_delivery']['event'] == event
+        assert ready['main_delivery']['attempts'] == 1
+        assert ready['main_delivery']['event']['chat_id'] == 1
+        return project_root.send(root, event)
 
     monkeypatch.setattr('supervisor.terminal_delivery.enqueue_terminal_delivery', queue)
     assert settle_terminal_projection(project_root.root, 'root-1', task=project_root.task) == SETTLEMENT_SETTLED

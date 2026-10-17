@@ -1,57 +1,52 @@
 """Complete chosen assignments and operative plans at their actual consumer seams."""
 
-from copy import deepcopy
 import json
+from types import SimpleNamespace
 
 import pytest
 
-from ouroboros.tools import plan_packet, plan_spec
+from ouroboros import plan_record
+from ouroboros.tools import plan_packet
+
+_PREFIX = "яё𐍈🚀\n" * 500
 
 
-@pytest.mark.parametrize("field", ["goal", "in_scope", "non_goals", "invariants",
-                                   "affected_paths", "affected_resources", "evidence",
-                                   "acceptance_claims", "decisions", "deferred"])
-def test_operative_tail_changes_normalized_identity_and_current_packet(field):
-    prefix = "яё𐍈🚀\n" * 500
-    raw = {"goal": "Full plan", field: prefix + "TAIL_A"}
-    if field != "goal":
-        # Also cross the former 40-item list cap; the decisive item is last.
-        raw[field] = [f"first {i}" for i in range(40)] + [prefix + "TAIL_A"]
-    before, errors = plan_spec.normalize_spec(raw)
-    assert not errors
-    changed = deepcopy(raw)
-    if field == "goal":
-        changed[field] = prefix + "TAIL_B"
+def _revision_fields(field: str, tail: str) -> dict:
+    """A plan whose decisive text sits at the END of a long field; list fields carry 40
+    ordinary items before the decisive one (the retired spec capped lists at 40)."""
+    fields = {
+        "goal": "Full plan", "plan": "Chosen plan",
+        "done_when": [{"id": f"c{i}", "claim": f"first {i}"} for i in range(40)]
+        + [{"id": "decisive", "claim": "the decisive claim", "support": "check it"}],
+        "affected_paths": [f"src/first_{i}.py" for i in range(40)] + ["src/decisive.py"],
+    }
+    if field in ("goal", "plan"):
+        fields[field] = _PREFIX + tail
+    elif field == "affected_paths":
+        fields["affected_paths"][-1] = _PREFIX + tail
     else:
-        changed[field][-1] = prefix + "TAIL_B"
-    after, errors = plan_spec.normalize_spec(changed)
-    assert not errors
-    assert plan_spec.spec_hash(before) != plan_spec.spec_hash(after)
-    assert plan_spec.spec_delta(before, after)["changed"]
+        fields["done_when"][-1][field.split(".", 1)[1]] = _PREFIX + tail
+    return fields
+
+
+def _participant_content(revision: dict) -> str:
+    return plan_packet.build_participant_content(
+        objective="Parent goal", owner_words="", dialogue_section="", revision=revision, delta=None, cross_talk="",
+        own_objections=[], message="", evidence_section=plan_packet.render_evidence({}), first_time=True)
+
+
+@pytest.mark.parametrize("field", ["goal", "plan", "done_when.claim", "done_when.support", "affected_paths"])
+def test_operative_tail_changes_revision_identity_and_current_delivery(field):
+    before = plan_record.compose_revision(None, **_revision_fields(field, "TAIL_A"))
+    after = plan_record.compose_revision(None, **_revision_fields(field, "TAIL_B"))
+    assert len(after["done_when"]) == 41 and len(after["affected_paths"]) == 41  # nothing past an item cap is lost
+    assert before["content_sha256"] != after["content_sha256"]
+    delta = plan_record.revision_delta({**before, "n": 1}, {**after, "n": 2})
+    assert any(delta[key] for key in ("goal_changed", "plan_changed", "done_when_reworded", "affected_paths_added"))
     serialized = json.dumps(after, ensure_ascii=False)
     assert "TAIL_B" in serialized and "TAIL_A" not in serialized
-    packet = plan_packet.build_plan_review_user_content(
-        objective="Parent goal", goal=after["goal"], plan_prose="Chosen plan",
-        spec=after, manifest={}, prior_cycles=[], dispositions=[],
-        spec_delta=None, root_exploration_log=None,
-    )
-    assert "TAIL_B" in packet and "OMISSION NOTE" not in packet
-
-
-@pytest.mark.parametrize("collection,key", [("decisions", "choice"), ("decisions", "why"),
-                                           ("decisions", "rejected"), ("deferred", "what"),
-                                           ("deferred", "why_safe_to_defer")])
-def test_nested_operative_tails_survive(collection, key):
-    tail = "строка\n" * 200 + "DECISIVE_NESTED_TAIL"
-    item = {"choice": "choice"} if collection == "decisions" else {"what": "later"}
-    item[key] = [f"rejected {i}" for i in range(8)] + [tail] if key == "rejected" else tail
-    raw = {"goal": "Full plan", collection: [item]}
-    spec, errors = plan_spec.normalize_spec(raw)
-    assert not errors
-    assert spec[collection][0][key] == item[key]
-    changed = deepcopy(raw)
-    changed[collection][0][key] = item[key] + ["next"] if key == "rejected" else tail + "next"
-    assert plan_spec.spec_hash(spec) != plan_spec.spec_hash(plan_spec.normalize_spec(changed)[0])
+    packet = _participant_content({**after, "n": 2, "body": False})
+    assert "TAIL_B" in packet and "TAIL_A" not in packet and "OMISSION NOTE" not in packet
 
 
 def test_large_direct_request_keeps_chosen_prompt_and_host_instruction_roles(tmp_path, monkeypatch):
@@ -71,7 +66,7 @@ def test_large_direct_request_keeps_chosen_prompt_and_host_instruction_roles(tmp
     assert request["prompt"] == prompt
     instructions = request["instructions"]
     assert instructions.count(objective) == 1 and instructions.count(expected) == 1
-    marker = "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+    marker = "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
     # The contract JSON is followed by the owner's words that caused the work, so decode just the JSON.
     host, _end = json.JSONDecoder().raw_decode(instructions.split(marker, 1)[1])
     assert host["objective"] == objective and host["expected_output"] == expected
@@ -79,14 +74,18 @@ def test_large_direct_request_keeps_chosen_prompt_and_host_instruction_roles(tmp
     assert "CHOSEN_ASSIGNMENT_TAIL" not in instructions
 
 
-def test_current_packet_keeps_full_parent_objective_and_plan_prose():
+def test_current_delivery_keeps_full_parent_objective_and_plan_prose():
+    from ouroboros.tools import plan_ask
+
     objective = " \n" + "О" * 8_001 + "OBJECTIVE_TAIL\n "
     prose = " \n" + "П" * 40_001 + "PROSE_TAIL\n "
-    spec, errors = plan_spec.normalize_spec({"goal": "g"})
-    assert not errors
-    packet = plan_packet.build_plan_review_user_content(
-        objective=objective, goal="g", plan_prose=prose, spec=spec, manifest={},
-        prior_cycles=[], dispositions=[], spec_delta=None, root_exploration_log=None,
-    )
-    assert objective in packet and prose in packet
+    revision = plan_record.compose_revision(None, goal="g", plan=prose, done_when=[], affected_paths=[])
+    assert revision["plan"] == prose  # the revision keeps the chosen prose byte for byte
+    # What a participant receives, assembled by the organ from the task contract and the revision.
+    packet = plan_ask.participant_content(
+        SimpleNamespace(task_contract={"objective": objective}, task_metadata={}), plan_record.empty_record(),
+        {**revision, "n": 1, "body": False}, plan_ask.Participant(SimpleNamespace(slot_id="s1"), owner_marked=True),
+        message="", manifest={}, dialogue_section="")
+    # The rendering trims only the prose's outer whitespace; every character of the text stays.
+    assert objective in packet and prose.strip() in packet
     assert "OMISSION NOTE" not in packet

@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 import ouroboros.skill_loader as skill_loader
 from ouroboros.marketplace import ouroboroshub
 from ouroboros.marketplace.provenance import (
@@ -182,14 +184,29 @@ def test_sweep_fails_closed_when_payload_probe_fails(tmp_path, monkeypatch):
     assert (state / "review.json").exists()  # kept: cannot prove payload-gone
 
 
-def test_hub_uninstall_paths_write_the_tombstone():
-    import inspect
-
+@pytest.mark.parametrize("marketplace", ["clawhub", "ouroboroshub"])
+def test_hub_uninstall_paths_write_the_tombstone(tmp_path, monkeypatch, marketplace):
     import ouroboros.marketplace.install as install
-    import ouroboros.marketplace.ouroboroshub as hub
 
-    assert "write_uninstall_tombstone" in inspect.getsource(install.uninstall_skill)
-    assert "write_uninstall_tombstone" in inspect.getsource(hub.uninstall)
+    root = tmp_path / "skills" / marketplace
+    payload = root / "demo"
+    payload.mkdir(parents=True)
+    (payload / "SKILL.md").write_text(_MANIFEST, encoding="utf-8")
+    (payload / f".{marketplace}.json").write_text("{}", encoding="utf-8")
+    state = _seed_state(tmp_path, "demo")
+    grants = (state / "grants.json").read_bytes()
+
+    if marketplace == "clawhub":
+        result = install.uninstall_skill(tmp_path, sanitized_name="demo")
+    else:
+        monkeypatch.setattr(ouroboroshub, "get_ouroboroshub_skills_dir", lambda: root)
+        result = ouroboroshub.uninstall("demo")
+
+    assert result.ok, result
+    assert not payload.exists()
+    marker = json.loads((state / UNINSTALL_TOMBSTONE_FILENAME).read_text(encoding="utf-8"))
+    assert marker["source"] == marketplace and marker["uninstalled_at"]
+    assert (state / "grants.json").read_bytes() == grants
 
 
 def test_tombstone_filename_is_forgery_guarded():
@@ -202,9 +219,20 @@ def test_tombstone_filename_is_forgery_guarded():
     assert "uninstalled" in SKILL_OWNER_STATE_STEMS
 
 
-def test_startup_prune_sweeps_run_the_tombstone_sweep():
-    import inspect
-
+def test_startup_prune_sweeps_run_the_tombstone_sweep(tmp_path, monkeypatch):
     import ouroboros.server_maintenance as sm
 
-    assert "sweep_uninstalled_skill_state" in inspect.getsource(sm._startup_prune_sweeps)
+    state = _seed_state(tmp_path, "dead")
+    grants = (state / "grants.json").read_bytes()
+    write_uninstall_tombstone(tmp_path, "dead", source="clawhub")
+    monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(sm, "_STARTUP_PRUNES_OWED", [True])
+    monkeypatch.setattr(sm, "_STARTUP_TREES_OWED", [False])
+    monkeypatch.setattr(sm, "_STARTUP_SOURCE_PRUNES_OWED", [False])
+    monkeypatch.setattr(sm, "_startup_worktree_prune", lambda: None)
+    monkeypatch.setattr(sm, "_prune_delegated_snapshots", lambda: None)
+
+    sm._run_deferred_startup_prunes()
+
+    assert sorted(path.name for path in state.iterdir()) == ["grants.json", UNINSTALL_TOMBSTONE_FILENAME]
+    assert (state / "grants.json").read_bytes() == grants

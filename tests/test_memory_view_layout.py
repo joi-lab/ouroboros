@@ -1,11 +1,11 @@
 """Where the memory view sits in a request, and what each block's bytes depend on.
 
-A built request is one system message of three text blocks and the task: governance and the
-books (A, marked), identity with my story (B, marked), then knowledge, my rooms and the runtime
+A built request holds common governance (A', marked), the optional handbook (D, marked),
+identity with my story (B, marked), then knowledge, my rooms and the runtime
 facts (C, unmarked). B depends only on the chronicle, identity, WORLD, the deep review and the
 catalog: the same bytes for Main, a Project's root and a wake. Knowledge edits change only C;
-a new page changes B and never A. Anthropic keeps four breakpoints (tools, A, B, the task seal);
-Codex and direct OpenAI keep A and B as two system items and C as one notice (their cache is
+a new page changes B and never A' or D. Anthropic keeps the message seal and gives schemas
+only a free slot. Codex and direct OpenAI keep all stable items and C as one notice (their cache is
 read only inside the leading system group, by prefix: measured 2026-10-03); the view fact of
 the first send reaches the cap info, the task context, one event and the trace.
 Fixture: ``tests._memory_inventory_shared`` (three rooms besides Main, legacy memory).
@@ -31,14 +31,15 @@ def _messages(env, memory, task, **kwargs):
     return build_llm_messages(env=env, memory=memory, task={"type": "task", "text": "hi", **task}, **kwargs)
 
 
-def test_the_request_is_three_blocks_with_my_story_in_b_and_knowledge_in_c(tmp_path):
+def test_the_request_keeps_my_story_before_the_changing_tail_and_the_book_separate(tmp_path):
     env, memory, _rooms = world(tmp_path)
     messages, _cap = _messages(env, memory, MAIN)
     content = messages[0]["content"]
-    assert len(content) == 3 and messages[1]["role"] == "user"
-    assert [("cache_control" in block) for block in content] == [True, True, False]
-    a, b, c = (block["text"] for block in content)
-    assert "## My story" in b and "## My story" not in a + c
+    assert messages[1]["role"] == "user"
+    assert all("cache_control" in block for block in content[:-1]) and "cache_control" not in content[-1]
+    a, d, b, c = (block["text"] for block in content)
+    assert d.startswith("## DEVELOPMENT.md\n") and "## DEVELOPMENT.md\n" not in a
+    assert "## My story" in b and "## My story" not in a + d + c
     for heading in ("## Shared understanding", "## Knowledge base", "## Live rooms", "## This room (Main)"):
         assert heading in c and heading not in a + b, heading
     for gone in ("## Dialogue History", "## Recent chat", "## Project owner origins", "## Legacy Dialogue Summary"):
@@ -46,13 +47,115 @@ def test_the_request_is_three_blocks_with_my_story_in_b_and_knowledge_in_c(tmp_p
 
 
 def test_b_is_byte_identical_for_main_another_room_and_a_wake(tmp_path):
+    """One story for every integrating focus; a wake's room is Main, byte for byte the Main turn's, and its
+    live rooms carry the words of people there (the Main turn's carry one line per room)."""
     env, memory, rooms = world(tmp_path)
     views = {name: blocks(env, memory, task) for name, task in (
         ("main", MAIN), ("alpha", {"id": "bound", "chat_id": 1}), ("beta", {"id": "tb", "chat_id": rooms["beta"]}),
         ("wake", WAKE))}
     assert len({view[1] for view in views.values()}) == 1  # B: one story, whatever the room or role
-    assert len({view[0] for view in views.values()}) == 1  # A: governance and books
+    assert len({view[0] for view in views.values()}) == 1  # A': common governance
     assert len({view[2] for view in views.values()}) == 4  # C: each one's own rooms
+    main_c, wake_c = views["main"][2], views["wake"][2]
+    assert section(wake_c, "## This room (Main)") == section(main_c, "## This room (Main)")
+    assert "## This room (Main)" not in views["alpha"][2]
+    for words in ("alpha again", "beta again"):  # people's words of the other live rooms, verbatim, to the wake alone
+        assert words in section(wake_c, "## Live rooms") and words not in main_c, words
+
+
+def test_full_roles_share_the_first_block_and_only_eligible_tasks_get_the_handbook(tmp_path):
+    """A real workspace binding must not invalidate the common governance prefix."""
+    env, memory, _rooms = world(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    tasks = {
+        "main": ({**MAIN, "_is_direct_chat": True}, True),
+        "wake": (WAKE, True),
+        "system-root": ({"id": "root", "workspace": "none"}, True),
+        "workspace-root": ({"id": "bound", "workspace_root": str(project)}, False),
+        **{source: ({"id": source, "metadata": {"source": source}}, False)
+           for source in ("api_task", "cli", "scheduled_task")},
+        "presence": ({"id": "presence", "type": "presence", "source": "presence", "_presence_turn": True,
+                      "context_requires_development": False, "chat_id": 777}, False),
+    }
+    contents = {name: _messages(env, memory, task)[0][0]["content"] for name, (task, _book) in tasks.items()}
+    assert all(content[0] == contents["main"][0] for content in contents.values())
+    for name, content in contents.items():
+        book = tasks[name][1]
+        assert "docs/DEVELOPMENT.md" in content[0]["text"], name
+        handbook = [block for block in content if block["text"].startswith("## DEVELOPMENT.md\n")]
+        assert len(handbook) == int(book), name
+        if book:
+            assert content[1] == handbook[0] and "cache_control" in handbook[0], name
+
+
+@pytest.mark.parametrize("mode,child", [("low", False), ("nano", False), ("max", True), ("low", True), ("nano", True)])
+def test_compact_modes_and_children_keep_both_book_maps_without_a_separate_handbook(tmp_path, monkeypatch, mode, child):
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", mode)
+    env, memory, _rooms = world(tmp_path)
+    task = {**MAIN, **({"delegation_role": "subagent", "parent_task_id": "bound",
+                       "configured_subagent": {"id": "h", "route": {"kind": "api_model"}}} if child else {})}
+    prefixes = []
+    for flag in (False, True):
+        messages, _cap = _messages(env, memory, {**task, "context_requires_self_body_docs": flag})
+        content = messages[0]["content"]
+        prefixes.append(content[0])
+        assert "## ARCHITECTURE.md (navigation map)" in content[0]["text"]
+        assert "## DEVELOPMENT.md (navigation map)" in content[0]["text"]
+        assert not any(block["text"].startswith("## DEVELOPMENT.md\n") for block in content)
+    assert prefixes[0] == prefixes[1]
+
+
+@pytest.mark.parametrize("book", [False, True])
+def test_route_reprojection_keeps_the_captured_handbook_and_counts_it_in_the_floor(tmp_path, monkeypatch, book):
+    """D is reconstructed from the capture, never from a block index or changed files."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from ouroboros import context, context_fit
+
+    env, memory, _rooms = world(tmp_path)
+    entry = env.repo_path("docs/DEVELOPMENT.md")
+    entry.write_text("# Development\n\nEngineering handbook.\n\n## Chapters\n\n- [Rules](development/rules.md)\n", encoding="utf-8")
+    chapter = env.repo_path("docs/development/rules.md")
+    chapter.parent.mkdir()
+    chapter.write_text("# Rules\n\nChange rules.\n\n## Detail\n\n" + "handbook body " * 2000, encoding="utf-8")
+    task = {"type": "task", "text": "hi", **MAIN, "workspace_root": "" if book else str(tmp_path / "project")}
+    core = context._capture_context_core(env, memory, task, None, None)
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_a, **_kw: 1.0)
+    route = lambda *_a, **_kw: ({"model": "m", "provider": "p"}, SimpleNamespace(  # noqa: E731
+        route_fp="r", status="asserted", stale=False, window_tokens=1_000_000))
+
+    def build(capture):
+        return context._build_context_fit_plan(env, capture, task, preferred_mode="max", route_resolver=route)
+
+    plan = build(core)
+    without = build(replace(core, docs_need_development=False))
+    for mode in ("max", "low", "nano"):
+        facts = plan.projection(mode).memory_facts["floor"]
+        delta = without.projection(mode).memory_facts["floor"]["physical_allowance_tokens"] - facts["physical_allowance_tokens"]
+        assert (delta > 5000) if book and mode == "max" else delta == 0
+    chapter.write_text("# Rules\n\nChanged after capture.\n", encoding="utf-8")
+    rebuilt = plan.reproject_for_route(window_tokens=2_000_000, known_window=True, ratio=1.0,
+                                      output_reserve=plan.output_reserve_tokens, tool_schemas=None)
+    # A window the Max request cannot hold narrows Max's memory: D is still the captured one, counted the same.
+    tight = plan.projection("max").estimated_tokens + plan.output_reserve_tokens - 1
+    narrowed = plan.reproject_for_route(window_tokens=tight, known_window=True, ratio=1.0,
+                                       output_reserve=plan.output_reserve_tokens, tool_schemas=None)
+    for mode in ("max", "low", "nano"):
+        before, after = plan.messages_for(mode)[0], rebuilt.messages_for(mode)[0]
+        assert after["content"] == before["content"]  # a larger window keeps every shown view
+        assert rebuilt.projection(mode).memory_facts == plan.projection(mode).memory_facts
+        texts = [block["text"] for block in after["content"]]
+        assert sum(text.startswith("## DEVELOPMENT.md\n") for text in texts) == int(book and mode == "max")
+        if book and mode == "max":
+            assert texts[1] == "## DEVELOPMENT.md\n\n" + core.development_md
+        assert all("Changed after capture" not in text for text in texts)
+    texts = [block["text"] for block in narrowed.messages_for("max")[0]["content"]]
+    assert narrowed.projection("max").system_content_json != plan.projection("max").system_content_json
+    assert sum(text.startswith("## DEVELOPMENT.md\n") for text in texts) == int(book)
+    assert all("Changed after capture" not in text for text in texts)
+    assert (narrowed.projection("max").memory_facts["floor"]["physical_allowance_tokens"]
+            - plan.projection("max").memory_facts["floor"]["physical_allowance_tokens"]) == tight - 1_000_000
 
 
 def test_a_knowledge_edit_changes_only_c_and_a_new_page_changes_b_but_never_a(tmp_path):
@@ -77,40 +180,46 @@ def test_a_knowledge_edit_changes_only_c_and_a_new_page_changes_b_but_never_a(tm
     assert a3 == a0 and b3 != b2 and "identity, revised" in b3
 
 
-def _anthropic_payload(messages, tools):
-    """The direct-Anthropic shape the finalizer reads: tools, then system blocks, then messages."""
+@pytest.mark.parametrize("book", [False, True])
+@pytest.mark.parametrize("long", [False, True])
+@pytest.mark.parametrize("provider", ["anthropic", "openrouter"])
+@pytest.mark.parametrize("mode", ["max", "low", "nano"])
+def test_anthropic_preserves_the_message_seal_and_gives_schemas_only_a_free_slot(tmp_path, monkeypatch, book, long, provider, mode):
+    """Exercise the actual wire builders, including a nested direct-Anthropic tool result."""
     from ouroboros.context_fit import seal_task_transcript
-
-    transcript = copy.deepcopy(messages)
-    seal_task_transcript(transcript)
-    return {"tools": copy.deepcopy(tools), "system": transcript[0]["content"],
-            "messages": [{"role": "user", "content": transcript[1]["content"]}]}
-
-
-@pytest.mark.parametrize("third_marked", [False, True])
-def test_anthropic_keeps_four_breakpoints_with_the_task_seal(tmp_path, third_marked):
-    """Three explicit markers (A, B, the task seal) and the automatic one on the schemas: exactly
-    the Anthropic limit. A marker put back on block C would make five, and the seal would be dropped."""
     from ouroboros.llm import LLMClient
+    from tests.test_review_prompt_caching import _deep_markers, _openrouter_target, _send_direct_anthropic, _tools
 
+    monkeypatch.setenv("OUROBOROS_CONTEXT_MODE", mode)
     env, memory, _rooms = world(tmp_path)
-    messages, _cap = _messages(env, memory, MAIN)
-    tools = [{"name": "memory_read", "description": "read", "input_schema": {"type": "object", "properties": {}}}]
-    payload = _anthropic_payload(messages, tools)
-    if third_marked:
-        payload["system"][2]["cache_control"] = {"type": "ephemeral"}
+    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": str(tmp_path / "project") if not book else ""})
+    seal_task_transcript(messages)
+    if long:
+        for i in range(6):
+            messages.extend([
+                {"role": "assistant", "content": "", "tool_calls": [{"id": f"call_{i}", "type": "function",
+                    "function": {"name": "zeta_tool", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": f"call_{i}", "content": f"result {i}"},
+            ])
+        seal_task_transcript(messages, min_prefix_tokens=0)
+    canonical, tools = copy.deepcopy(messages), _tools()
     client = LLMClient(api_key="unused")
-    client._normalize_payload_cache_ttl({"provider": "anthropic"}, payload)
-    note = client._cache_breakpoint_tls.pending
-    kept = LLMClient._payload_cache_breakpoints(payload)
-    seal = [block for block in payload["messages"][0]["content"] if isinstance(block, dict)]
-    assert len(kept) == 4 and "cache_control" in payload["tools"][-1]
-    if third_marked:
-        assert note == {"declared": 5, "kept": 4, "dropped": 1}
-        assert not any("cache_control" in block for block in seal)  # the moving seal lost: the regression
+    if provider == "anthropic":
+        payload, usage = _send_direct_anthropic(monkeypatch, messages, tools)
+        assert usage.get("prompt_cache_breakpoints_reduced") is None
     else:
-        assert note is None
-        assert any("cache_control" in block for block in seal)
+        target = _openrouter_target("anthropic/claude-fable-5")
+        payload = client._build_remote_kwargs(target, messages, "high", 512, "auto", None, tools, skip_capability_fetch=True)
+        client._normalize_payload_cache_ttl(target, payload)
+        assert client._cache_breakpoint_tls.pending is None
+    kept = LLMClient._payload_cache_breakpoints(payload)
+    assert len(kept) == len(_deep_markers(payload)) == 4
+    has_book = book and mode == "max"
+    assert ("cache_control" in payload["tools"][-1]) == (not has_book)
+    assert kept[-1]["text"] == ("result 0" if long else messages[1]["content"][-1]["text"])
+    assert any(block.get("text", "").startswith("## DEVELOPMENT.md\n") for block in kept) == has_book
+    assert all(block["cache_control"] == {"type": "ephemeral", "ttl": "1h"} for block in kept)
+    assert messages == canonical and tools == _tools()
 
 
 def test_local_compaction_keeps_my_story_and_this_room_and_never_splits_a_reply(tmp_path):
@@ -124,6 +233,27 @@ def test_local_compaction_keeps_my_story_and_this_room_and_never_splits_a_reply(
     assert section(c, "## This room (Main)") in kept_c  # the label in parentheses still matches "This room"
     assert "  ## with a heading" in kept_c and "## with a heading\n\n[Compacted" not in kept_c
     assert "[Compacted for local-model context" in section(kept_c, "## Live rooms")  # not a kept title
+
+
+@pytest.mark.parametrize("book", [False, True])
+def test_local_compaction_keeps_identity_and_my_story_whichever_block_holds_them(tmp_path, monkeypatch, book):
+    """The handbook moves B off the second block; a local model still gets my identity, story and room."""
+    from ouroboros import llm_local
+    from ouroboros.llm import LLMClient
+
+    env, memory, _rooms = world(tmp_path)
+    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": "" if book else str(tmp_path / "project")})
+    a, *middle, c = (block["text"] for block in messages[0]["content"])
+    b = middle[-1]
+    assert [text.startswith("## DEVELOPMENT.md\n") for text in middle] == ([True, False] if book else [False])
+    sizes = iter([10**9, 0])  # the request is over the local window; its compacted form fits
+    monkeypatch.setattr(llm_local, "_estimate_message_chars", lambda _messages: next(sizes))
+    kept_a, *kept_middle, kept_c = (block["text"] for block in
+                                    LLMClient()._prepare_messages_for_local_context(messages, 8192, 512)[0]["content"])
+    assert section(b, "## Identity") in kept_middle[-1] and section(b, "## My story") in kept_middle[-1]
+    assert section(c, "## This room (Main)") in kept_c and section(a, "## BIBLE.md") in kept_a
+    if book:  # the handbook compacts as a book, like the governance block before it
+        assert kept_middle[0].startswith("## DEVELOPMENT.md\n\n[Compacted for local-model context")
 
 
 def test_the_view_fact_reaches_the_cap_info_the_task_context_and_one_event(tmp_path):
@@ -242,8 +372,10 @@ def test_a_nano_floor_names_only_the_path_its_own_request_sends(tmp_path, monkey
     window = (10_000_000 - roomy.projection("nano").memory_facts["floor"]["physical_allowance_tokens"]
               + minimal_view_tokens(snapshot_from_json(core.memory_view_json), window_tokens=10_000_000) + 50)
     built = plan(window)
-    assert built.initial_mode == "nano"
-    floor = section(built.messages_for("nano")[0]["content"][2]["text"], "### Physical floor")
+    # Prediction keeps owner-Max books. The Nano projection is available only
+    # after an actual refusal; its tool/memory routing still must agree.
+    assert built.initial_mode == ("max" if owner == "max" else "nano")
+    floor = section(built.messages_for("nano")[0]["content"][-1]["text"], "### Physical floor")
     sent = select_tool_schemas(schemas, context_mode="nano").chosen
     assert "memory_read" not in sent and ("enable_tools" in floor) == ("enable_tools" in sent), (sent, floor)
     # Sealing is offered only to a request that can call chronicle_write (sent, or loaded by enable_tools).
@@ -290,21 +422,24 @@ def _codex_wire(messages):
     return payload["messages"], target
 
 
-def test_codex_keeps_identity_and_my_story_in_the_leading_system_group(tmp_path):
-    """L2: system(A), system(B), one notice(C), the task. A knowledge edit changes only the
-    notice; a new page changes B's item and never A's; round 2 extends round 1 byte for byte."""
+@pytest.mark.parametrize("book", [False, True])
+def test_codex_keeps_identity_and_my_story_in_the_leading_system_group(tmp_path, book):
+    """A', optional D and B remain system items; only C becomes a notice."""
     from ouroboros.llm_messages import HOST_CONTEXT_NOTICE_BEFORE_TASK
     from tests.test_memory_view_story import _page
 
     env, memory, _rooms = world(tmp_path)
-    messages, _cap = _messages(env, memory, MAIN)
+    task = {**MAIN, "workspace_root": "" if book else str(tmp_path / "project")}
+    messages, _cap = _messages(env, memory, task)
     wire, target = _codex_wire(messages)
-    assert [message["role"] for message in wire] == ["system", "system", "user", "user"]
+    stable, c = messages[0]["content"][:-1], messages[0]["content"][-1]["text"]
+    boundary = len(stable)
+    assert [message["role"] for message in wire] == ["system"] * boundary + ["user", "user"]
     assert target["wire_layout"] == {"system_prefix_split": True, "moved_blocks": 1}
-    a, b, c = (block["text"] for block in messages[0]["content"])
-    assert wire[0]["content"] == [{"type": "text", "text": a}] and wire[1]["content"] == [{"type": "text", "text": b}]
-    assert "## My story" in wire[1]["content"][0]["text"]
-    notice = wire[2]["content"]
+    assert [item["content"] for item in wire[:boundary]] == [[{"type": "text", "text": block["text"]}] for block in stable]
+    assert "## My story" in wire[boundary - 1]["content"][0]["text"]
+    assert any(item["content"][0]["text"].startswith("## DEVELOPMENT.md\n") for item in wire[:boundary]) == book
+    notice = wire[boundary]["content"]
     assert HOST_CONTEXT_NOTICE_BEFORE_TASK in notice and notice.endswith(c)
     assert "## My story" not in notice and "## Shared understanding" in notice
 
@@ -314,47 +449,60 @@ def test_codex_keeps_identity_and_my_story_in_the_leading_system_group(tmp_path)
 
     (memory.drive_root / "memory" / "knowledge" / "overview.md").write_text(
         "# Overview\n\nWhat is true now: the cache keeps my story.\n", encoding="utf-8")
-    edited, _target = _codex_wire(_messages(env, memory, MAIN)[0])
-    assert edited[:2] == wire[:2] and edited[2] != wire[2]
+    edited, _target = _codex_wire(_messages(env, memory, task)[0])
+    assert edited[:boundary] == wire[:boundary] and edited[boundary] != wire[boundary]
 
     _page(memory.drive_root, "1", 11, 12, text="A page appended to my story.")
-    paged, _target = _codex_wire(_messages(env, memory, MAIN)[0])
-    assert paged[0] == wire[0] and paged[1] != wire[1]
-    assert "A page appended to my story." in paged[1]["content"][0]["text"]
+    paged, _target = _codex_wire(_messages(env, memory, task)[0])
+    assert paged[:boundary - 1] == wire[:boundary - 1] and paged[boundary - 1] != wire[boundary - 1]
+    assert "A page appended to my story." in paged[boundary - 1]["content"][0]["text"]
 
 
-def test_direct_openai_and_openrouter_keep_the_two_system_items_and_one_notice(tmp_path, monkeypatch):
+@pytest.mark.parametrize("book", [False, True])
+def test_direct_openai_and_openrouter_keep_all_stable_items_and_one_notice(tmp_path, monkeypatch, book):
     from ouroboros.llm import LLMClient
     from ouroboros.llm_messages import HOST_CONTEXT_NOTICE_BEFORE_TASK
 
     monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True, raising=False)
     monkeypatch.setattr("ouroboros.pricing._fetch_live_rows", lambda *_a, **_kw: {})
     env, memory, _rooms = world(tmp_path)
-    messages, _cap = _messages(env, memory, MAIN)
-    a, b, c = (block["text"] for block in messages[0]["content"])
+    messages, _cap = _messages(env, memory, {**MAIN, "workspace_root": "" if book else str(tmp_path / "project")})
+    stable, c = messages[0]["content"][:-1], messages[0]["content"][-1]["text"]
+    tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {}}}}]
     client = LLMClient(api_key="unused")
     for model, key in (("openai::gpt-6-sol", "OPENAI_API_KEY"), ("openai/gpt-6-sol", "OPENROUTER_API_KEY")):
         monkeypatch.setenv(key, "unused")
         target = client._resolve_remote_target(model)
-        wire = client._build_remote_kwargs(target, copy.deepcopy(messages), "high", 512, "auto", None, None,
-                                           skip_capability_fetch=True)["messages"]
-        assert [message["role"] for message in wire] == ["system", "system", "user", "user"], model
-        assert [block["text"] for block in wire[0]["content"]] == [a] and [block["text"] for block in wire[1]["content"]] == [b]
-        assert HOST_CONTEXT_NOTICE_BEFORE_TASK in wire[2]["content"] and wire[2]["content"].endswith(c)
+        payload = client._build_remote_kwargs(target, copy.deepcopy(messages), "high", 512, "auto", None, tools,
+                                             skip_capability_fetch=True)
+        client._normalize_payload_cache_ttl(target, payload)
+        wire, boundary = payload["messages"], len(stable)
+        assert [message["role"] for message in wire] == ["system"] * boundary + ["user", "user"], model
+        assert [message["content"][0]["text"] for message in wire[:boundary]] == [block["text"] for block in stable]
+        assert all(("cache_control" in message["content"][0]) == (key == "OPENROUTER_API_KEY") for message in wire[:boundary])
+        assert all("cache_control" not in tool for tool in payload["tools"])
+        assert HOST_CONTEXT_NOTICE_BEFORE_TASK in wire[boundary]["content"] and wire[boundary]["content"].endswith(c)
         assert target["wire_layout"] == {"system_prefix_split": True, "moved_blocks": 1}
 
 
-def test_the_task_input_pointer_follows_the_calibrated_nano_request_and_the_floor_counts_resident_schemas(tmp_path, monkeypatch):
-    """A11. The pointer trigger compares the CALIBRATED Nano request, schemas it sends included, plus the
-    reply floor with the target: a fitting calibrated input gets no pointer, and a schema-heavy request that
-    only the schemas push over the target gets one. On a route switch the floor's fixed part counts the
-    schemas a running task actually sends (an enable_tools addition), not a fresh Nano selection that drops them."""
+def test_the_task_input_pointer_is_a_physical_rescue_and_the_floor_counts_resident_schemas(tmp_path, monkeypatch):
+    """A11, #1527 (owner 2026-10-13, A). The owner's words reach Nano as text whatever the 85K target: the
+    pointer replaces them only when a known fresh window cannot hold the calibrated Nano request (schemas it
+    sends and its reply floor included) and the pointer request does fit it. An unknown window, a pointer that
+    does not fit either, or a failed source write keep the words. The pointer's reader reaches the end of the
+    exact input. On a route switch the resident list (an enable_tools addition) counts in the fit and the floor."""
+    import math
     from types import SimpleNamespace
 
-    from ouroboros import context, context_fit
+    from ouroboros import artifacts, context, context_fit
+    from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS, OWNER_NANO_TARGET_TOKENS
+    from ouroboros.tool_policy import select_tool_schemas
+    from ouroboros.tools.core import _read_file
+    from ouroboros.tools.registry import ToolContext
 
     env, memory, _rooms = world(tmp_path)
-    task = {"type": "task", "text": "x" * 240_000, **MAIN}  # ~60K raw tokens: under the target alone, over it with the schemas
+    final = "FINAL CONSTRAINT: keep the old API alive."
+    task = {"type": "task", "text": "x" * 240_000 + "\n" + final, **MAIN}  # ~60K raw tokens of owner words
     core = context._capture_context_core(env, memory, task, None, None)
     big = [{"type": "function", "function": {"name": f"tool_{i}", "description": "d" * 4_000,
                                              "parameters": {"type": "object", "properties": {}}}} for i in range(30)]
@@ -363,27 +511,57 @@ def test_the_task_input_pointer_follows_the_calibrated_nano_request_and_the_floo
     heavy_meta = [{"type": "function", "function": {"name": "enable_tools", "description": "d" * 120_000,  # ~30K tokens Nano DOES send
                                                     "parameters": {"type": "object", "properties": {}}}}, meta[1]]
 
-    def plan(tools, ratio):
+    def plan(tools, ratio, window=1_000_000, *, status="asserted", stale=False):
         monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_a, **_kw: ratio)
         return context._build_context_fit_plan(env, core, task, preferred_mode="nano", tool_schemas=tools,
                                                route_resolver=lambda *_a, **_kw: ({"model": "m", "provider": "p"}, SimpleNamespace(
-                                                   route_fp="r", status="asserted", stale=False, window_tokens=1_000_000)))
+                                                   route_fp="r", status=status, stale=stale, window_tokens=window)))
+
+    def total(built, tools, ratio):  # the calibrated Nano request: schemas it sends and its reply floor
+        sent = context_fit.tool_schema_tokens(list(select_tool_schemas(tools, context_mode="nano").schemas))
+        return math.ceil((built.nano_projection.estimated_tokens + sent) * ratio) + NANO_MIN_HEADROOM_TOKENS
 
     pointer = lambda built: built.nano_projection.user_content_json is not None  # noqa: E731
-    assert not pointer(plan(meta, 1.0))  # 60K + floor < 85K
-    assert not pointer(plan(meta + big, 1.0))  # schemas the Nano request does not send do not count
-    assert pointer(plan(heavy_meta, 1.0))  # the 30K of schemas the Nano request sends push it over
-    assert not pointer(plan(heavy_meta, 0.8))  # calibrated: (60K + 30K) x 0.8 + floor fits the target
-    assert pointer(plan(meta, 1.5))  # calibrated the other way: a dense tokenizer makes the same input a pointer
+    # Over the target, inside a known window: the words stay text, whatever schemas or density push it there.
+    assert total(plan(heavy_meta, 1.0), heavy_meta, 1.0) > OWNER_NANO_TARGET_TOKENS
+    for tools, ratio in ((meta, 1.0), (meta + big, 1.0), (heavy_meta, 1.0), (heavy_meta, 0.8), (meta, 1.5)):
+        assert not pointer(plan(tools, ratio)), (len(tools), ratio)
+    full = total(plan(heavy_meta, 1.0), heavy_meta, 1.0)
+    # A known window that cannot hold the words, and holds the pointer request: the exact source replaces them.
+    window = full - 30_000
+    rescued = plan(heavy_meta, 1.0, window)
+    assert pointer(rescued) and total(rescued, heavy_meta, 1.0) <= window
+    shown = json.loads(rescued.nano_projection.user_content_json)
+    assert shown.startswith("[Exact task input source]") and final not in shown
+    assert rescued.max_projection.user_content_json is None and rescued.low_projection.user_content_json is None
+    locator = json.loads(shown.split("\n", 2)[2])
+    stored = artifacts.read_actor_source_bytes(env.drive_root, task["id"], locator).decode("utf-8")
+    assert stored == core.user_content_json  # the exact original input, never a summary
+    reader = ToolContext(repo_dir=tmp_path, drive_root=env.drive_root, task_id=task["id"])
+    at = stored.rindex(final)
+    page = _read_file(reader, locator["path"], root="artifact_store", start_line=1, max_lines=1,
+                      start_char=at, max_chars=len(final))
+    assert page.endswith(final) and at > 240_000  # the reader reaches the input's last constraint
+    # Neither a window that cannot hold the pointer request, nor an unknown or stale window, hides the words.
+    assert not pointer(plan(heavy_meta, 1.0, total(rescued, heavy_meta, 1.0) - 1))
+    assert not pointer(plan(heavy_meta, 1.0, window, status="failed"))
+    assert not pointer(plan(heavy_meta, 1.0, window, stale=True))
+    monkeypatch.setattr(artifacts, "store_actor_source_bytes", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk")))
+    assert not pointer(plan(heavy_meta, 1.0, window))  # no exact source: the words stay
+    monkeypatch.undo()
 
-    # The floor on a route switch: the resident list (a big schema enable_tools added) narrows Nano's room.
+    # The fit on a route switch counts the resident list: the same window keeps the bare view and narrows the loaded one.
     built = plan(meta, 1.0)
-    bare = built.reproject_for_route(window_tokens=1_000_000, known_window=True, ratio=1.0, output_reserve=65_536,
-                                     tool_schemas=meta, start_mode="nano")
-    loaded = built.reproject_for_route(window_tokens=1_000_000, known_window=True, ratio=1.0, output_reserve=65_536,
-                                       tool_schemas=meta + big, start_mode="nano")
-    room = lambda plan_: plan_.nano_projection.memory_facts["floor"]["allowance_tokens"]  # noqa: E731
-    assert room(bare) - room(loaded) >= 30_000
+    resident = lambda tools: built.nano_projection.estimated_tokens + context_fit.tool_schema_tokens(tools) + NANO_MIN_HEADROOM_TOKENS  # noqa: E731
+    middle = resident(meta) + 15_000
+    assert resident(meta + big) > middle
+    on = lambda tools, **kw: built.reproject_for_route(window_tokens=kw.pop("window", middle), known_window=True,  # noqa: E731
+                                                       ratio=1.0, output_reserve=65_536, tool_schemas=tools, start_mode="nano", **kw)
+    assert on(meta).nano_projection.system_content_json == built.nano_projection.system_content_json
+    assert on(meta + big).nano_projection.system_content_json != built.nano_projection.system_content_json
+    # A narrowing floor counts the same resident schemas in its fixed part.
+    room = lambda plan_: plan_.nano_projection.memory_facts["floor"]["physical_allowance_tokens"]  # noqa: E731
+    assert room(on(meta, window=1_000_000, refused_tokens=1)) - room(on(meta + big, window=1_000_000, refused_tokens=1)) >= 30_000
     # The first request keeps the owner-mode selection: a full list is not what Nano sends there.
     assert (built.nano_projection.memory_facts["floor"]["physical_allowance_tokens"]
             == plan(meta + big, 1.0).nano_projection.memory_facts["floor"]["physical_allowance_tokens"])

@@ -1,0 +1,53 @@
+# Refresh the archived joi-lab repositories after every stable release.
+#
+# joi-lab/ouroboros (a fork of this repository) and joi-lab/ouroboros-desktop
+# were the official homes before 2026-05-31. They stay archived, but old links,
+# clones, the first Colab badge and desktop apps installed before v6.8.0 still
+# reach them. Stable promotion advances main only after the release is
+# published, so each push to main runs scripts/sync_legacy_mirrors.py: it checks
+# that the commit carries the published v<VERSION> tag, unarchives the mirrors
+# for a minute, fast-forwards their update branches, refreshes main and the
+# "moved" release, and archives them again; the last step re-archives them even
+# when the refresh failed or was cancelled (owner decisions 2026-10-11 №1=B,
+# №2=A). The token acts as ouroboros-agent, an admin of both mirrors; it needs
+# the workflow scope because the stable tree carries .github/workflows.
+
+name: Refresh Legacy Mirrors
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: legacy-mirrors
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    # A manual run from another branch must never publish unreleased code.
+    if: github.repository == 'razzant/ouroboros' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refresh archived joi-lab mirrors
+        timeout-minutes: 24
+        env:
+          MIRROR_TOKEN: ${{ secrets.JOILAB_FORK_MIRROR_PAT }}
+        run: python3 scripts/sync_legacy_mirrors.py --source-ref "$GITHUB_SHA"
+
+      - name: Archive the mirrors again
+        if: always()
+        timeout-minutes: 4
+        env:
+          MIRROR_TOKEN: ${{ secrets.JOILAB_FORK_MIRROR_PAT }}
+        run: python3 scripts/sync_legacy_mirrors.py --archive-only

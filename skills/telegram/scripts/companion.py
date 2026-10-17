@@ -28,6 +28,7 @@ from cloudflare_tunnel import (
 )
 from sidecar import SidecarSeams, TelegramProxySidecar
 from platform_support import (
+    IS_WINDOWS,
     PlatformSupportError,
     acquire_file_lock,
     path_is_link_or_reparse,
@@ -63,6 +64,8 @@ _CONFIG_NAME = "runtime_config.json"
 _STATUS_NAME = "status.json"
 _CONFIG_SCHEMA = 2
 _INITIAL_PARENT_PID = os.getppid()
+# The host's ouroboros.process_custody.PARENT_PID_ENV: the spawner's own PID.
+_PARENT_PID_ENV = "OUROBOROS_PARENT_PID"
 _RETRY_BASE_SEC = (1.0, 2.0, 4.0, 8.0, 15.0, 30.0, 60.0)
 _STABLE_READY_RESET_SEC = 300.0
 _CORE_HEALTH_INTERVAL_SEC = 30.0
@@ -104,6 +107,25 @@ def release_singleton(fd: int | None) -> None:
 
 def _pid_alive(pid: int) -> bool:
     return process_alive(pid)
+
+
+def _server_parent_pid() -> int:
+    """The spawning server's PID, or 0 once this companion is already orphaned.
+
+    A bare container server is PID 1, but PID 1 also adopts orphans. A host
+    that names itself settles it on POSIX: the parent captured at import and
+    the current one must both be that PID, so neither init nor a subreaper
+    passes for the server. A legacy host names nobody and PID 1 stays
+    refused; Windows never reparents a child.
+    """
+    parent = _INITIAL_PARENT_PID
+    try:
+        named = int(os.environ.get(_PARENT_PID_ENV) or 0)
+    except ValueError:
+        named = 0
+    if named and not IS_WINDOWS:
+        return parent if named == parent == os.getppid() else 0
+    return parent if parent > 1 else 0
 
 
 def require_running(stop_event: asyncio.Event) -> None:
@@ -1197,8 +1219,8 @@ async def run() -> int:
         )
         if not token:
             raise CompanionError("TELEGRAM_BOT_TOKEN is missing or not granted.")
-        parent_pid = _INITIAL_PARENT_PID
-        if not _pid_alive(parent_pid):
+        parent_pid = _server_parent_pid()
+        if not parent_pid or not _pid_alive(parent_pid):
             raise CompanionError("Ouroboros server parent is unavailable.")
         lifeline_cancel, lifeline_thread = start_parent_lifeline(
             parent_pid,

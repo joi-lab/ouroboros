@@ -22,6 +22,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros.owner_quiz import quiz_states, record_asked
 from ouroboros.projects_registry import create_project, get_project
 from ouroboros.utils import append_jsonl
 from supervisor import events_chat_delivery as delivery
@@ -162,6 +163,8 @@ def test_media_links_and_questions_are_conversation_messages(room):
     assert room.bridge.send_document(room.chat_id, b"csv", filename="r.csv", task_id="root-1")[0]
     assert room.bridge.send_links(room.chat_id, [{"label": "Docs", "url": "https://example.com"}],
                                   title="Links", task_id="root-1")[0]
+    record_asked(room.root, "root-1", quiz_id="q1", question="Merge now?", options=["Yes", "No"],
+                 stake="release timing", assumption="continuing with the merge", chat_id=room.chat_id)
     assert room.bridge.send_quiz(room.chat_id, quiz_id="q1", question="Merge now?",
                                  options=[{"label": "Yes"}, {"label": "No"}], stake="release timing",
                                  assumption="continuing with the merge", task_id="root-1") == (True, "ok")
@@ -195,6 +198,8 @@ def test_every_counted_message_is_stored_before_its_revision_advances(room, monk
     assert room.bridge.send_document(room.chat_id, b"csv", filename="r.csv", task_id="root-1")[0]
     assert room.bridge.send_links(room.chat_id, [{"label": "Docs", "url": "https://example.com"}],
                                   title="Links", task_id="root-1")[0]
+    record_asked(room.root, "root-1", quiz_id="q1", question="Merge now?", options=["Yes", "No"],
+                 stake="release timing", assumption="continuing with the merge", chat_id=room.chat_id)
     assert room.bridge.send_quiz(room.chat_id, quiz_id="q1", question="Merge now?",
                                  options=[{"label": "Yes"}, {"label": "No"}], stake="release timing",
                                  assumption="continuing with the merge", task_id="root-1") == (True, "ok")
@@ -202,12 +207,19 @@ def test_every_counted_message_is_stored_before_its_revision_advances(room, monk
 
 
 @pytest.mark.parametrize("kind", ["text", "photo", "video", "document", "links", "quiz"])
-def test_failed_canonical_append_keeps_live_delivery_without_a_phantom_revision(room, monkeypatch, kind):
-    """Unread describes stored conversation; a failed log must not mint a revision for an old row."""
+def test_failed_canonical_append_never_mints_a_phantom_revision(room, monkeypatch, kind):
+    """Unread describes stored conversation, including strict quiz publication.
+
+    Ordinary unbound sends retain best-effort live delivery; a question remains
+    owed until its canonical row is durable, before any live exposure.
+    """
     assert room.deliver("root-1", "stored answer") == 1
     chat_log = room.root / "logs" / "chat.jsonl"
     initial = chat_log.read_bytes()
     append = message_bus.append_jsonl
+    if kind == "quiz":
+        record_asked(room.root, "root-1", quiz_id="write-q", question="Continue?", options=["Yes", "No"],
+                     stake="next step", assumption="continue", chat_id=room.chat_id)
     send = {
         "text": lambda: message_bus.send_with_budget(room.chat_id, "new reply", task_id="root-1"),
         "photo": lambda: room.bridge.send_photo(room.chat_id, b"png", caption="new photo"),
@@ -221,12 +233,23 @@ def test_failed_canonical_append_keeps_live_delivery_without_a_phantom_revision(
     monkeypatch.setattr(message_bus, "append_jsonl", lambda path, *args, **kwargs:
                         False if path == chat_log else append(path, *args, **kwargs))
     before_frames = len(room.frames)
-    result = send()
-    assert (result is None if kind == "text" else result == (True, "ok")), result
-    assert len(room.frames) > before_frames, "existing best-effort live delivery stays available"
+    if kind == "quiz":
+        with pytest.raises(RuntimeError, match="canonical message acceptance could not be persisted"):
+            send()
+        assert len(room.frames) == before_frames, "no quiz or Main pointer precedes its canonical row"
+        block = quiz_states(room.root, "root-1")["write-q"]
+        assert block["publication_chat_id"] == room.chat_id
+        assert block["delivery"]["state"] == "owed" and not block.get("published_at")
+    else:
+        result = send()
+        assert (result is None if kind == "text" else result == (True, "ok")), result
+        assert len(room.frames) > before_frames, "existing best-effort live delivery stays available"
     assert chat_log.read_bytes() == initial
     assert room.revision() == 1, "the missing canonical row cannot be acknowledged as a new revision"
     monkeypatch.setattr(message_bus, "append_jsonl", append)
     send()
     assert len(chat_log.read_text(encoding="utf-8").splitlines()) == 2
     assert room.revision() == 2, "a later successful write still advances exactly once"
+    if kind == "quiz":
+        assert quiz_states(room.root, "root-1")["write-q"]["delivery"]["state"] == "delivered"
+        assert len(room.frames) > before_frames

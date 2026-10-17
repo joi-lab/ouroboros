@@ -23,6 +23,7 @@
 // line (promote/human false). Consecutive silent rows of one run read as one row.
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml, renderMarkdown } from './utils.js';
 import { taskSourceDownloadUrl } from './api_client.js';
+import { tr } from './i18n.js';
 
 const RECENT_TECHNICAL = 24;
 // A silent stretch row lists every folded observation's source; past this many the
@@ -313,7 +314,7 @@ export function delegatedActivityBodyHtml(view, { expanded = false } = {}) {
         if (shown.part.kind === 'message') {
             html.push(`<div class="chat-delegated-message">${actor(shown)}${text(shown)}${notes(shown)}</div>`);
         } else if (shown.part.kind === 'problem') {
-            html.push(`<div class="chat-delegated-problem">⚠ ${escapeHtml([actorLabel(shown.part.actor), shown.part.label].filter(Boolean).join(' · '))}: ${escapeHtml(shown.text)}${notes(shown)}</div>`);
+            html.push(`<div class="chat-delegated-problem">${escapeHtml(tr('task.delegated.problem', 'Problem'))}: ${escapeHtml([actorLabel(shown.part.actor), shown.part.label].filter(Boolean).join(' · '))}: ${escapeHtml(shown.text)}${notes(shown)}</div>`);
         }
     }
     const thinking = view.parts.filter((shown) => shown.part.kind === 'thinking');

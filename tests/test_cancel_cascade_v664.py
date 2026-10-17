@@ -19,6 +19,14 @@ def _isolate_queue(monkeypatch, tmp_path, tasks):
     return queue, pending
 
 
+def _request(drive, task_id, *, cascade=False):
+    """Every cancel ingress records the durable intent first (invariant 14); a cascade
+    records it on the root with the cascade scope."""
+    from ouroboros.cancel_intents import SCOPE_CASCADE, request_cancel
+
+    request_cancel(drive, task_id, scope=SCOPE_CASCADE if cascade else "", allow_settled_target=True)
+
+
 def test_root_cancel_snapshots_and_cancels_whole_live_subtree(tmp_path, monkeypatch):
     from ouroboros.task_results import STATUS_CANCELLED, load_task_result
 
@@ -47,7 +55,8 @@ def test_root_cancel_snapshots_and_cancels_whole_live_subtree(tmp_path, monkeypa
     order: list[str] = []
     monkeypatch.setattr(queue, "_emit_cancel_task_done", lambda _task, task_id, **_kw: order.append(task_id))
 
-    assert queue.cancel_task_by_id("root", cascade=True) is True
+    _request(tmp_path, "root", cascade=True)
+    assert queue.cancel_task_by_id("root") is True
 
     assert order == ["grandchild", "child", "root"]
     assert [task["id"] for task in pending] == ["other"]
@@ -71,11 +80,13 @@ def test_midtree_cancel_uses_combined_pending_lineage(tmp_path, monkeypatch):
         ],
     )
 
-    assert queue.cancel_task_by_id("child", cascade=True) is True
+    _request(tmp_path, "child", cascade=True)
+    assert queue.cancel_task_by_id("child") is True
     assert [task["id"] for task in pending] == ["root"]
 
 
-def test_default_cancel_preserves_live_children(tmp_path, monkeypatch):
+def test_single_cancel_preserves_live_children(tmp_path, monkeypatch):
+    """A single-scope intent drives one custody; the subtree is a cascade's business."""
     queue, pending = _isolate_queue(
         monkeypatch,
         tmp_path,
@@ -85,7 +96,8 @@ def test_default_cancel_preserves_live_children(tmp_path, monkeypatch):
         ],
     )
 
-    assert queue.cancel_task_by_id("root") is True
+    _request(tmp_path, "root")
+    assert queue.drive_cancel_intent_scope("root") == queue.CANCEL_CANCELLED
     assert [task["id"] for task in pending] == ["child"]
 
 
@@ -116,7 +128,7 @@ def test_cascade_resweeps_descendants_admitted_after_the_first_snapshot(monkeypa
     monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _fake_single(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
-    assert cancel_task_by_id("root", cascade=True) is True
+    assert cancel_task_by_id("root") is True
     assert "late-child" in cancelled, cancelled
     assert cancelled.count("root") == 1, cancelled
 
@@ -144,7 +156,7 @@ def test_cancelled_root_fences_late_descendant_admission(monkeypatch):
     monkeypatch.setattr(q, "cancel_task_custody", _custody)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
-    assert cancel_task_by_id("root", cascade=True) is True
+    assert cancel_task_by_id("root") is True
     # A schedule event that drained AFTER the whole sweep loop is refused.
     admitted = q.enqueue_task({"id": "late", "parent_task_id": "root", "root_task_id": "root"})
     assert admitted.get("_admission_blocked") == "root_cancelled"
@@ -181,7 +193,7 @@ def test_mid_tree_cancel_fences_a_grandchild_scheduled_by_a_live_descendant(monk
     monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _remove_from_live(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
-    assert cancel_task_by_id("mid", cascade=True) is True
+    assert cancel_task_by_id("mid") is True
     assert "deep" not in q.RUNNING  # the cancelled subtree really is gone
 
     admitted = q.enqueue_task(
@@ -223,7 +235,7 @@ def test_a_500_child_cascade_never_evicts_its_own_fence(monkeypatch):
     monkeypatch.setattr(q, "cancel_task_custody", lambda tid, **_kw: q.CANCEL_CANCELLED if _remove(tid) else q.CANCEL_FAILED)
     monkeypatch.setattr(q, "append_jsonl", lambda *a, **k: None)
 
-    assert cancel_task_by_id("root", cascade=True) is True
+    assert cancel_task_by_id("root") is True
     assert "root" in tl.CANCELLED_ROOT_FENCES
     assert "c499" in tl.CANCELLED_ROOT_FENCES
     # A schedule event draining after the final sweep is still refused.
@@ -274,7 +286,8 @@ def test_completion_wins_over_a_cascade_that_is_already_tearing_down(monkeypatch
 
     write_task_result(tmp_path, "root", "completed", result="Finished on its own.")
 
-    queue.cancel_task_by_id("root", cascade=True)
+    _request(tmp_path, "root", cascade=True)
+    queue.cancel_task_by_id("root")
 
     assert load_task_result(tmp_path, "root")["status"] == "completed"
     assert load_task_result(tmp_path, "child")["status"] == "cancelled"
@@ -329,7 +342,8 @@ def test_a_child_that_refuses_to_die_fails_the_whole_cascade(monkeypatch, tmp_pa
 
     monkeypatch.setattr(q, "cancel_task_custody", _custody)
 
-    assert tl.cancel_task_by_id("root", cascade=True) is False
+    _request(tmp_path, "root", cascade=True)
+    assert tl.cancel_task_by_id("root") is False
     assert any(str(t.get("id")) == "child" for t in q.PENDING), "the child really is still live"
 
 
@@ -346,6 +360,7 @@ def test_a_stubborn_process_is_refused_not_reported_cancelled(monkeypatch, tmp_p
     monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", lambda *a, **k: None)
     emitted: list[str] = []
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: emitted.append("emit"))
+    _request(tmp_path, "stuck")
 
     assert q.cancel_task_custody("stuck") == q.CANCEL_FAILED
     assert "stuck" in q.RUNNING, "custody is restored so the tree stays honest"
@@ -362,6 +377,7 @@ def test_persistence_failure_restores_custody_and_publishes_nothing(monkeypatch,
     _isolate_queue(monkeypatch, tmp_path, [{"id": "root", "chat_id": 0, "root_task_id": "root"}])
     emitted: list[str] = []
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: emitted.append("emit"))
+    _request(tmp_path, "root")
 
     def _boom(*a, **k):
         raise OSError("disk full")
@@ -403,6 +419,8 @@ def test_concurrent_cascades_on_overlapping_trees_both_settle(monkeypatch, tmp_p
         {"id": "leaf", "chat_id": 0, "root_task_id": "root", "parent_task_id": "mid"},
     ])
     monkeypatch.setattr(tl, "CANCELLED_ROOT_FENCES", {}, raising=False)
+    _request(tmp_path, "root", cascade=True)
+    _request(tmp_path, "mid", cascade=True)
 
     def _custody(tid, **_kw):
         # Mirrors the real contract: custody is the ONE settle owner, so the
@@ -425,8 +443,8 @@ def test_concurrent_cascades_on_overlapping_trees_both_settle(monkeypatch, tmp_p
 
     results: dict[str, bool] = {}
     threads = [
-        threading.Thread(target=lambda: results.__setitem__("root", tl.cancel_task_by_id("root", cascade=True))),
-        threading.Thread(target=lambda: results.__setitem__("mid", tl.cancel_task_by_id("mid", cascade=True))),
+        threading.Thread(target=lambda: results.__setitem__("root", tl.cancel_task_by_id("root"))),
+        threading.Thread(target=lambda: results.__setitem__("mid", tl.cancel_task_by_id("mid"))),
     ]
     for t in threads:
         t.start()
@@ -457,6 +475,7 @@ def test_a_settled_task_with_a_live_worker_is_killed_and_keeps_its_result(monkey
     emitted: list[str] = []
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: emitted.append("emit"))
     write_task_result(tmp_path, "done-ish", "completed", result="Finished on its own.")
+    _request(tmp_path, "done-ish")
 
     assert q.cancel_task_custody("done-ish") == q.CANCEL_ALREADY_SETTLED
     assert not state["alive"], "the settled-but-live worker IS killed (GR6-1b)"
@@ -490,6 +509,7 @@ def test_cancelling_a_running_task_completes_the_whole_publish_phase(monkeypatch
     )
     emitted: list[str] = []
     monkeypatch.setattr(q, "_emit_cancel_task_done", lambda *a, **k: emitted.append("emit"))
+    _request(tmp_path, "live-one")
 
     assert q.cancel_task_custody("live-one") == q.CANCEL_CANCELLED
     assert not state["alive"], "the process is confirmed dead before publishing"
@@ -523,6 +543,7 @@ def test_custody_marks_the_slot_so_the_health_check_keeps_its_hands_off(monkeypa
     monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", _kill)
     respawned: list[int] = []
     monkeypatch.setattr(workers, "respawn_worker", lambda wid: respawned.append(wid), raising=False)
+    _request(tmp_path, "live-two")
 
     assert q.cancel_task_custody("live-two") == q.CANCEL_CANCELLED
     assert seen_reaping == [True], "the slot is marked BEFORE the lock is released"
@@ -543,6 +564,7 @@ def test_a_raising_kill_restores_custody_and_clears_the_slot_marker(monkeypatch,
         raise OSError("kill failed")
 
     monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", _boom)
+    _request(tmp_path, "boom-one")
 
     assert q.cancel_task_custody("boom-one") == q.CANCEL_FAILED
     assert "boom-one" in q.RUNNING, "the task is visible to the liveness check again"
@@ -619,6 +641,7 @@ def test_a_natural_result_written_before_the_kill_still_resolves_the_card(monkey
         state["alive"] = False
 
     monkeypatch.setattr("ouroboros.platform_layer.kill_pid_tree", _kill)
+    _request(tmp_path, "racer")
 
     assert q.cancel_task_custody("racer") == q.CANCEL_ALREADY_SETTLED
     assert load_task_result(tmp_path, "racer")["status"] == "completed"
@@ -654,6 +677,7 @@ def test_split_drive_completion_is_promoted_before_cancelled_write(monkeypatch, 
         lambda _task, task_id, **kw: emitted.append({"task_id": task_id, **kw}),
     )
 
+    _request(tmp_path, "split-racer")
     assert q.cancel_task_custody("split-racer") == q.CANCEL_ALREADY_SETTLED
     stored = load_task_result(tmp_path, "split-racer")
     assert stored["status"] == "completed"
@@ -686,6 +710,7 @@ def test_publication_failures_after_the_durable_write_never_undo_the_cancellatio
     monkeypatch.setattr(q, "_emit_cancel_task_done", _boom)
     monkeypatch.setattr(workers, "respawn_worker", _boom, raising=False)
     monkeypatch.setattr(q, "persist_queue_snapshot", _boom, raising=False)
+    _request(tmp_path, "post-boundary")
 
     assert q.cancel_task_custody("post-boundary") == q.CANCEL_CANCELLED
     assert load_task_result(tmp_path, "post-boundary")["status"] == "cancelled"
@@ -716,7 +741,7 @@ def test_a_cascade_settles_when_a_child_is_terminal_but_still_winding_down(monke
 
     monkeypatch.setattr(q, "cancel_task_custody", _custody)
 
-    assert tl.cancel_task_by_id("root", cascade=True) is True, (
+    assert tl.cancel_task_by_id("root") is True, (
         "a terminal-but-unreclaimed child is settled, not live"
     )
 
@@ -750,6 +775,8 @@ def test_overlapping_cascade_cannot_confirm_success_while_the_child_kill_is_in_f
         "child": {"task": {"id": "child", "root_task_id": "root", "parent_task_id": "root"}},
     }, raising=False)
 
+    _request(tmp_path, "root", cascade=True)
+    _request(tmp_path, "child")
     outcome = {}
     child_thread = threading.Thread(
         target=lambda: outcome.__setitem__("child", q.cancel_task_custody("child")),
@@ -757,7 +784,7 @@ def test_overlapping_cascade_cannot_confirm_success_while_the_child_kill_is_in_f
     child_thread.start()
     assert kill_started.wait(timeout=5)
     try:
-        assert tl.cancel_task_by_id("root", cascade=True) is False, (
+        assert tl.cancel_task_by_id("root") is False, (
             "no success while the child's kill is in flight"
         )
         assert tl.task_subtree_is_live("root") is True, "the in-flight child stays visible"
@@ -765,7 +792,7 @@ def test_overlapping_cascade_cannot_confirm_success_while_the_child_kill_is_in_f
         release_kill.set()
         child_thread.join(timeout=10)
     assert outcome.get("child") == q.CANCEL_CANCELLED
-    assert tl.cancel_task_by_id("root", cascade=True) is True, "settled after confirmed death"
+    assert tl.cancel_task_by_id("root") is True, "settled after confirmed death"
 
 
 def test_a_natural_task_done_in_the_kill_window_keeps_one_owner(monkeypatch, tmp_path):

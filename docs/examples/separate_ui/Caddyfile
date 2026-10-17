@@ -1,0 +1,26 @@
+# One browser origin over a separately hosted Ouroboros interface and its core.
+# The core keeps its prefixes (/api, /auth, /onboarding, /ws: `core_paths` in
+# GET /api/contract); every other path goes to the interface host. README.md
+# lists the variables and what the core needs.
+
+{$OUROBOROS_SITE} {
+	tls {$OUROBOROS_TLS_CERT} {$OUROBOROS_TLS_KEY}
+
+	# Each access-log line names the upstream that answered it.
+	log
+	log_append upstream {http.reverse_proxy.upstream.hostport}
+
+	@core path /api /api/* /auth /auth/* /onboarding /onboarding/* /ws /ws/*
+	handle @core {
+		reverse_proxy {$OUROBOROS_CORE_UPSTREAM:127.0.0.1:8765} {
+			# The core trusts this header from a loopback proxy and asks for its
+			# password only when the visitor is not loopback. Overwrite it with the
+			# peer Caddy saw, so no visitor can claim to be loopback.
+			header_up X-Forwarded-For {client_ip}
+		}
+	}
+
+	handle {
+		reverse_proxy {$OUROBOROS_INTERFACE_UPSTREAM:127.0.0.1:8080}
+	}
+}

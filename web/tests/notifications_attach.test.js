@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 import {
     DEFAULT_NOTIFY_PREFS,
     NOTIFY_PREFS_KEY,
+    createNotificationActivation,
     createNotifier,
 } from '../modules/notifications.js';
 
@@ -93,6 +94,51 @@ test('an external owner transport notifies; another Project room does not leak',
     fx.send('chat', { role: 'system', system_type: 'task_summary', task_id: 'other',
                       chat_id: 777, project_thread: true });
     assert.equal(fx.built.length, 1);
+});
+
+test('banner activation preserves the producer Main route for real Telegram transport and legacy Main', async () => {
+    for (const event of ['chat', 'quiz', 'log', 'legacy']) {
+        const fx = fixture(), opened = [];
+        const activation = createNotificationActivation({
+            resolveProject: async () => assert.fail('Main transport must not query the Project registry'),
+            openProject: () => assert.fail('Main transport must not open a Project'),
+            openMain: () => opened.push('Main'), unavailable: () => assert.fail('known Main destination'),
+        });
+        const targets = [];
+        fx.notifier.configure({ onActivate: target => { targets.push(target); return activation(target); } });
+        const transport = { kind: 'telegram', conversation_id: '994321', sender_label: 'Owner' };
+        const address = { chat_id: 994321, transport };
+        if (event === 'log') fx.send('log', { ...address, data: { type: 'task_done', task_id: 'tg', status: 'completed' } });
+        else if (event === 'quiz') fx.send('quiz', { ...address, task_id: 'tg', quiz: { quiz_id: 'choice', state: 'open', wait_for_answer: true } });
+        else fx.send('chat', { ...(event === 'legacy' ? {} : address), role: 'system', system_type: 'task_summary', task_id: 'tg' });
+        fx.built[0].onclick();
+        await Promise.resolve();
+        assert.deepEqual(opened, ['Main']);
+        assert.equal(targets[0].isMain, true);
+        assert.equal(targets[0].chatId, event === 'legacy' ? undefined : 994321);
+        fx.notifier.destroy();
+    }
+});
+
+test('the same numeric address routed as a Project resolves its full registry entry or remains unavailable', async () => {
+    for (const missing of [false, true]) {
+        const fx = fixture({ projects: [994321] }), opened = [], lookups = [];
+        const project = { id: 'project-full-registry', chat_id: 994321, lifecycle: 'active' };
+        fx.notifier.configure({ onActivate: createNotificationActivation({
+            resolveProject: async id => { lookups.push(id); return missing ? null : project; },
+            openProject: (row, options) => opened.push({ row, options }),
+            openMain: () => assert.fail('missing Project must not fall back to Main'),
+            unavailable: () => opened.push('unavailable'),
+        }) });
+        fx.send('log', { chat_id: 994321, project_thread: true,
+            data: { type: 'task_done', task_id: 'project-task', status: 'completed' } });
+        fx.built[0].onclick();
+        await Promise.resolve(); await Promise.resolve();
+        assert.deepEqual(lookups, [994321]);
+        assert.deepEqual(opened, missing ? ['unavailable'] : [{ row: project,
+            options: { openOnly: true, taskId: 'project-task', quizId: '' } }]);
+        fx.notifier.destroy();
+    }
 });
 
 test('a throw inside the notifier cannot break message rendering', () => {

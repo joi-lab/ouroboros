@@ -74,7 +74,7 @@ def _bootstrap_repo(repo: Path, *, files: dict[str, str] | None = None) -> str:
     for rel, text in (files or {"small.py": "x = 1\n"}).items():
         path = repo / rel
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(text, encoding="utf-8")
+        path.write_bytes(text.encode("utf-8"))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "base")
     return _git(repo, "rev-parse", "HEAD")
@@ -865,6 +865,39 @@ def test_ref_inventory_reads_unsubstituted_git_blob_bytes(tmp_path: Path) -> Non
 
     module = next(item for item in inventory.modules if item.path == "formatted.py")
     assert module._source_text == source
+
+
+@pytest.mark.parametrize("count", [0, 1024])
+def test_git_source_snapshot_uses_file_input_and_preserves_all_blobs(tmp_path, monkeypatch, count):
+    import stat
+    from ouroboros import review
+
+    repo = tmp_path / "repo"
+    source = "value = '$Format:%H$'\n"
+    files = {f"mod_{i:04d}.py": source for i in range(count)}
+    head = _bootstrap_repo(repo, files={"seed.py": source} if count else {"README.md": "No gated sources.\n"})
+    if count:
+        oid = _git(repo, "rev-parse", "HEAD:seed.py")
+        entries = b"".join(f"100644 blob {oid}\t{path}\0".encode() for path in files)
+        head = subprocess.check_output(["git", "mktree", "-z"], cwd=repo, input=entries).decode().strip()
+    real_run = subprocess.run
+    observed = []
+
+    def run(args, **kwargs):
+        if args[:3] == ["git", "cat-file", "--batch"]:
+            stream = kwargs.get("stdin")
+            assert stream is not None and stat.S_ISREG(os.fstat(stream.fileno()).st_mode)
+            assert "input" not in kwargs and kwargs["capture_output"] and kwargs["check"]
+            assert stream.tell() == 0
+            observed.append(stream)
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(review.subprocess, "run", run)
+    with review._git_source_snapshot(repo, head) as (snapshot, paths):
+        assert set(paths) == set(files)
+        for path, expected in files.items():
+            assert (snapshot / path).read_bytes() == expected.encode()
+    assert len(observed) == 1 and observed[0].closed
 
 
 def test_bootstrap_accepts_the_current_tree_as_its_own_authority(tmp_path: Path) -> None:

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from ouroboros.headless import retry_child_task_refs
+from tests._tool_result_delivery_shared import measured_fit
+
 import gzip
 import json
 import pathlib
@@ -231,6 +233,7 @@ def test_real_truncated_tool_source_envelope_remains_actor_readable_after_gc(tmp
         trace,
         emit_progress=lambda _message, *, incident=None: None,
         tools=SimpleNamespace(_ctx=ctx),
+        fit_candidate=measured_fit(window=16_000, reserve=4_000),
     )
     produced_ref = _source_ref_from_visible_result(messages[0]["content"])
     request = persist_call(
@@ -273,11 +276,20 @@ def test_real_truncated_tool_source_envelope_remains_actor_readable_after_gc(tmp
     read_args = dict(promoted_ref["read"]["arguments"])
     read_args["start_char"] = 95_000
     canonical_ctx = ToolContext(repo_dir=repo, drive_root=parent, task_id=task_id)
-    assert exact_tail in _read_file(canonical_ctx, **read_args)
+    from ouroboros.tools.core_file_tools import delivered_source_prefix
+    displayed = _read_file(canonical_ctx, **read_args)
+    assert exact_tail in delivered_source_prefix(canonical_ctx.last_read_view, displayed, len(displayed))
 
 
 @pytest.mark.parametrize("mismatch", ["tool", "root", "path"])
-def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, mismatch):
+def test_task_source_read_envelope_plays_no_part_in_retention(tmp_path, mismatch):
+    """``read`` is presentation its producer wrote; identity is owner + path + size + sha256.
+
+    The system's own producers write envelopes that differ from the ref
+    (``chat_chain.retain_memory_source`` names ``runtime_data``) or none at all
+    (compact focus/capsule handles), so the envelope neither hides verified bytes
+    nor is rewritten: the carrier keeps its own reference and the bytes are kept.
+    """
     from ouroboros.artifacts import store_actor_source_bytes
 
     task_id = f"phase3c-source-contract-{mismatch}"
@@ -312,15 +324,16 @@ def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, misma
     copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
-    gap = copied["review_evidence"]["exact_source_ref"]
-    assert gap["availability"] == "unavailable"
-    assert gap["reason"] == "invalid_ref"
-    assert not (
-        parent / "task_results" / "artifacts" / task_id / pathlib.Path(ref["path"])
-    ).exists()
+    assert copied["review_evidence"]["exact_source_ref"] == malformed
+    assert copied["child_ref_promotion"]["status"] == "complete"
+    assert copied["child_ref_promotion"]["unavailable_refs"] == []
     assert prune_headless_task_drives(
         parent, retention_days=0, now=_future_now(), live=lambda _task: False
     )["pruned"]
+    assert not child.exists()
+    assert (
+        parent / "task_results" / "artifacts" / task_id / pathlib.Path(ref["path"])
+    ).read_bytes() == b"exact source"
 
 
 def test_copyback_promotes_service_full_log_refs_in_durable_evidence_and_tool_payload(tmp_path):
@@ -845,7 +858,7 @@ def test_periodic_maintenance_invokes_pending_ref_promotion_sweep(
 
     for thread in threads:
         thread.join(5)
-    assert [thread.name for thread in threads] == ["terminal-maintenance", "reconcile-maintenance"]
+    assert [thread.name for thread in threads if thread.name not in {"cold-custody", "schedule-admission"}] == ["cancel_intent_sweep", "terminal_delivery_replay", "question_delivery_replay", "pause_notice_replay", "abandoned_usage_reconciliation", "post_task_synthesis_recovery", "reconcile-maintenance"]
     assert calls == [(tmp_path, "reconcile-maintenance")]
     assert server_maintenance._RECONCILE_SWEEP_LOCK.acquire(timeout=2)
     server_maintenance._RECONCILE_SWEEP_LOCK.release()

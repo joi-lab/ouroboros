@@ -19,6 +19,10 @@ def test_setup_contract_exposes_cyber_pro_as_fourth_access_level():
     cyber = modes[-1]
     assert cyber["label"] == "Cyber Pro"
     assert "Blocking" in cyber["copy"] and "Advisory" in cyber["copy"]
+    # The choice is kept, but review findings do not block actions in Cyber Pro (#1736);
+    # Panic and the owner's other controls still do, so the copy never says nothing blocks.
+    assert "review findings do not block actions in Cyber Pro" in cyber["copy"]
+    assert "nothing blocks" not in cyber["copy"] and "owner-controlled" not in cyber["copy"]
 
 
 def test_policy_projection_distinguishes_restart_and_next_task(monkeypatch):

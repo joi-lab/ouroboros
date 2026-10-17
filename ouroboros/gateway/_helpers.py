@@ -4,7 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import pathlib
+import time
+from datetime import datetime, timezone
 from typing import Any
 
 import anyio
@@ -144,6 +147,15 @@ def json_error(message: str, status: int = 500, **extra: Any) -> JSONResponse:
     return JSONResponse(payload, status_code=status)
 
 
+def migrating_error(drive_root: Any) -> JSONResponse | None:
+    """The write doors' 503 while the boot import owns the store (P1), else ``None``."""
+    from ouroboros.store import migrating
+
+    if not migrating(drive_root):
+        return None
+    return json_error("the task store is importing; retry shortly", 503, reason_code="migrating")
+
+
 def json_exception(exc: BaseException, status: int | None = None, *, context: str = "") -> JSONResponse:
     """Answer an exception as JSON. Without an explicit status it is an unexpected
     failure, recorded here once with its stack (#1138); a caller that chooses a status
@@ -191,8 +203,48 @@ def stage_initial_task_attachments(
     }, status_code=422)
 
 
+def _normalize_deadline_at(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("deadline_at must be an ISO-8601 datetime") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("deadline_at must include a timezone offset or Z")
+    return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def task_time_limits(body: dict, raw_metadata: dict) -> dict:
+    """Keep the submit-anchored calendar limit separate from the execution duration.
+
+    ``deadline_at`` wins; otherwise legacy ``timeout_sec``/``timeout`` becomes a calendar
+    deadline counted from submission (queue included). ``execution_timeout_sec`` never
+    creates a deadline: it is the pause-excluded execution budget, absent/0 = no limit.
+    """
+    deadline = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
+    try:
+        timeout = float(body.get("timeout_sec") or body.get("timeout") or 0)
+    except (TypeError, ValueError):
+        timeout = 0.0
+    if not deadline and timeout > 0:
+        deadline = datetime.fromtimestamp(time.time() + timeout, timezone.utc).isoformat().replace("+00:00", "Z")
+    limits: dict = {"deadline_at": deadline}
+    if "execution_timeout_sec" in body:
+        raw = body["execution_timeout_sec"]
+        try:
+            execution = float(raw) if not isinstance(raw, bool) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            execution = math.nan
+        if not math.isfinite(execution) or execution < 0:
+            raise ValueError("execution_timeout_sec must be a finite non-negative number (0 adds no limit)")
+        limits["execution_timeout_sec"] = execution
+    return limits
+
+
 __all__ = (
-    "coerce_bool", "coerce_int", "iter_jsonl_objects", "json_error", "json_exception",
+    "coerce_bool", "coerce_int", "iter_jsonl_objects", "json_error", "json_exception", "task_time_limits",
     "read_rotated_jsonl_entries", "request_json_or", "request_drive_root", "request_repo_dir",
     "stage_initial_task_attachments", "run_sync_to_completion", "settle_to_completion",
 )

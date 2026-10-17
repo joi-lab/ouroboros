@@ -28,9 +28,7 @@ def test_health_snapshot(tmp_path):
     plugin = _load_plugin()
     api, data = _api_with_data(tmp_path)
     (data / "state" / "queue_snapshot.json").write_text(
-        json.dumps({"running_count": 2, "pending_count": 3, "running": [], "pending": []}), encoding="utf-8")
-    (data / "state" / "worker_pids.json").write_text(
-        json.dumps({"workers": [{"pid": 1}, {"pid": 2}, {"pid": 3}]}), encoding="utf-8")
+        json.dumps({"running_count": 2, "pending_count": 3, "running": [], "pending": [], "worker_total": 3}), encoding="utf-8")
     txt = plugin._collect_health(api, "en")
     assert "RUNNING 2" in txt and "PENDING 3" in txt
     assert "Workers: 3" in txt

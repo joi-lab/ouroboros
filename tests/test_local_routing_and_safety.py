@@ -274,7 +274,7 @@ def test_real_system_prompt_keeps_its_floor_rules_under_local_compaction():
     assert "in Cyber Pro internal checks inform my judgment without veto" in normalized
     assert "including over my own configuration" in normalized
     assert "I preserve independent facts" in normalized
-    assert "Panic stops everything" in normalized
+    assert "Panic acts immediately; nothing I produce may delay it" in normalized
     assert "## BIBLE.md\n\nBIBLE TEXT" in compacted
     # Everything below the preamble was compacted, not silently kept or lost.
     assert "## Delegation\n\n[Compacted for local-model context" in compacted

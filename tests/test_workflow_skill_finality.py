@@ -110,6 +110,90 @@ def test_main_receives_terminal_reference_then_finishes_without_second_panel(sub
     assert "SKILL_EXEC_BLOCKED" in skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
 
 
+def test_exec_schema_states_the_advisory_author_path_its_gate_permits(subject, monkeypatch):
+    """skill_exec's description is the gate it obeys: outside Cyber Pro a qualified
+    Advisory author acceptance runs the current bytes while the reviewer status is
+    still pending, and enablement, grants and dependencies stay separate conditions."""
+    ctx, directory, _ = subject
+    assert "error" not in _finish(subject, reference=_unavailable(subject))
+    loaded = load_skill(directory, ctx.drive_root)
+    gate = loaded.review.gate_for(loaded.content_hash)
+    assert (loaded.review.status, gate["executable_review"], gate["blocking_reason"]) == (
+        "pending", True, "author_accepted_advisory")
+    description = skill_exec._EXEC_SCHEMA["description"]
+    assert "fresh executable review verdict" not in description
+    assert "Advisory author acceptance" in description and "still be pending" in description
+    assert all(term in description for term in ("must be enabled", "grants", "dependencies", "Cyber Pro"))
+    save_enabled(ctx.drive_root, "demo", True)
+    result = json.loads(skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py"))
+    assert result["exit_code"] == 0
+    save_enabled(ctx.drive_root, "demo", False)
+    assert "is disabled" in skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
+
+
+def test_toggle_schema_states_the_gate_its_enable_owner_obeys(subject, monkeypatch):
+    """#1735: toggle_skill enables through the same author-aware gate as skill_exec, so its
+    text names both authorities; Blocking enforcement still refuses the same bytes."""
+    ctx, directory, _ = subject
+    assert "error" not in _finish(subject, reference=_unavailable(subject))
+    assert load_skill(directory, ctx.drive_root).review.status == "pending"
+    description = skill_exec._TOGGLE_SCHEMA["description"]
+    assert "fresh executable review" not in description
+    assert all(term in description for term in (
+        "Advisory author acceptance", "grants", "dependencies", "Cyber Pro"))
+    enabled = json.loads(skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True))
+    assert enabled["enabled"] is True and enabled["review_gate"]["blocking_reason"] == "author_accepted_advisory"
+    assert json.loads(skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=False))["enabled"] is False
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    refused = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
+    assert refused.startswith("⚠️ SKILL_TOGGLE_ERROR") and (
+        "cannot enable until the review gate permits the current bytes: a current executable reviewer verdict\"") in refused
+
+
+def test_refusals_name_the_authorities_their_gate_admits(subject, monkeypatch):
+    """#1735: a refused gate names what it still needs. Advisory admits a current reviewer verdict
+    or a qualified author acceptance of these bytes; Blocking admits the verdict only. skill_exec,
+    toggle_skill and the grant owner say the same thing their gate decided."""
+    from ouroboros.skill_lifecycle_actions import prepare_skill_grant
+
+    ctx, directory, _ = subject
+    # A review of these exact bytes that produced no executable verdict (not a stale one).
+    save_review_state(ctx.drive_root, "demo", SkillReviewState(status="pending", content_hash=compute_content_hash(directory)))
+    both = "a current executable reviewer verdict or a qualified Advisory author acceptance of these exact bytes"
+    for enforcement, needed in (("advisory", both), ("blocking", "a current executable reviewer verdict")):
+        monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+        save_enabled(ctx.drive_root, "demo", True)
+        ran = skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
+        assert ran.startswith("⚠️ SKILL_EXEC_BLOCKED") and f"Execution needs {needed}. " in ran, ran
+        save_enabled(ctx.drive_root, "demo", False)
+        toggled = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
+        assert f"cannot enable until the review gate permits the current bytes: {needed}\"" in toggled, toggled
+        granted = prepare_skill_grant(load_skill(directory, ctx.drive_root), ctx.drive_root, [])
+        assert granted["error"] == f"key and permission grants need the review gate to permit the current bytes: {needed}"
+        assert granted["review_gate"]["blocking_reason"] == "review_pending"
+        assert "fresh executable review" not in ran + toggled + granted["error"]
+
+
+def test_grant_prompt_does_not_ask_for_a_review_the_gate_already_permits(subject, monkeypatch):
+    """#1735: the grant prompt is reached only past the executable gate; under a qualified
+    Advisory author acceptance (reviewer still pending) it asks for the grant alone."""
+    ctx, directory, _ = subject
+    monkeypatch.setenv("OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS", "false")
+    manifest = directory / "SKILL.md"
+    manifest.write_text(manifest.read_text(encoding="utf-8").replace(
+        "scripts:\n", "permissions: [inject_chat]\nscripts:\n"), encoding="utf-8")
+    assert "error" not in _finish(subject, reference=_unavailable(subject))
+    loaded = load_skill(directory, ctx.drive_root)
+    gate = loaded.review.gate_for(loaded.content_hash)
+    assert (loaded.review.status, gate["blocking_reason"]) == ("pending", "author_accepted_advisory")
+    refused = skill_exec._handle_toggle_skill(ctx, skill="demo", enabled=True)
+    assert "requested key and permission grants" in refused, "the gate passed; grants are still required"
+    save_enabled(ctx.drive_root, "demo", True)
+    ran = skill_exec._handle_skill_exec(ctx, skill="demo", script="hello.py")
+    assert ran.startswith("⚠️ SKILL_EXEC_GRANT_REQUIRED") and "inject_chat" in ran
+    assert "fresh executable review" not in ran and "review gate already permits" in ran
+
+
 @pytest.mark.parametrize("case", ["running", "no_reference", "wrong_reference", "no_job", "no_terminal_time"])
 def test_pending_finish_needs_actual_terminal_source(subject, case):
     reference = None

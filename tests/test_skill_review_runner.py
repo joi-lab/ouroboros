@@ -3,6 +3,8 @@ from __future__ import annotations
 import pathlib
 from types import SimpleNamespace
 
+import pytest
+
 import ouroboros.skill_lifecycle_queue as lifecycle_queue
 from ouroboros.skill_loader import (
     SkillReviewState,
@@ -237,6 +239,23 @@ def test_review_result_message_allows_warnings_status(monkeypatch):
     assert _review_result_message(outcome).startswith(
         "Review executable with findings (warnings):"
     )
+
+
+@pytest.mark.parametrize("access", ["advanced", "cyber_pro"], indirect=True)
+@pytest.mark.parametrize("status", ["pending", "blockers"])
+def test_review_result_message_keeps_cyber_permission_apart_from_the_critic_outcome(monkeypatch, access, status):
+    """The chat summary never calls a pending or blocked review "executable" because Cyber Pro may run it."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    outcome = SkillReviewOutcome(skill_name="alpha", status=status,
+                                 findings=[{"item": "bug_hunting", "verdict": "FAIL", "reason": "unsafe path"}])
+    message = _review_result_message(outcome)
+    if access == "cyber_pro":
+        expected = {"pending": "Review pending (pending)", "blockers": "Review found blockers (blockers)"}[status]
+        assert message.startswith(expected) and "Review executable" not in message
+        assert message.endswith(" | Cyber Pro: execution is Ouroboros's decision, not a review result")
+    else:
+        assert message.startswith({"pending": "Review pending", "blockers": "Review blocked: blocker findings"}[status])
+        assert "Cyber Pro" not in message
 
 
 def test_review_result_message_includes_auto_granted_keys(monkeypatch):
@@ -987,10 +1006,10 @@ def test_cancel_and_timeout_each_write_one_idempotent_terminal_row(tmp_path):
     from ouroboros.utils import atomic_write_json
     atomic_write_json(review_job_state_path(drive_root, "beta"), beta_job)
     _mark_review_job_timeout(
-        drive_root, "beta", "hash-b", reason="TimeoutError: lifecycle deadline",
+        drive_root, "beta", "hash-b", reason="TimeoutError: lifecycle deadline", job_id="timeout-job",
     )
     _mark_review_job_timeout(
-        drive_root, "beta", "hash-b", reason="TimeoutError: lifecycle deadline",
+        drive_root, "beta", "hash-b", reason="TimeoutError: lifecycle deadline", job_id="timeout-job",
     )
 
     for skill, expected_status, expected_job in (
@@ -1037,6 +1056,180 @@ def test_success_without_typed_verdict_stays_pending_in_history(tmp_path):
     ]
     assert history[0]["status"] == "pending"
     assert history[0]["job_status"] == "succeeded"
+
+
+def _passing_review_fixture(tmp_path, monkeypatch):
+    """A reviewable skill whose post-pass dependency and extension steps are inert."""
+    _reset_queue()
+    drive_root = tmp_path / "drive"
+    repo_dir = tmp_path / "repo"
+    skills_root = tmp_path / "skills"
+    for path in (drive_root, repo_dir, skills_root):
+        path.mkdir()
+    skill_dir = _build_extension(skills_root, "alpha")
+    content_hash = compute_content_hash(skill_dir, manifest_entry="plugin.py")
+    monkeypatch.setattr("supervisor.message_bus.send_with_budget", lambda *a, **k: None)
+    monkeypatch.setattr("ouroboros.skill_review_runner._reconcile_deps_after_pass_review", lambda *_a, **_k: ("installed", ""))
+    monkeypatch.setattr(
+        "ouroboros.skill_review_runner._reconcile_extension_payload",
+        lambda *_a, **_k: reconcile_receipt("extension_loaded", "review_passed"),
+    )
+
+    def outcome(skill_name):
+        return SkillReviewOutcome(
+            skill_name=skill_name, status="pass", content_hash=content_hash,
+            reviewer_models=["fake/reviewer"],
+            findings=[{"item": "manifest_schema", "verdict": "PASS"}], error="",
+        )
+
+    return drive_root, repo_dir, skills_root, outcome
+
+
+def _review_records(drive_root):
+    import json
+
+    def rows(path):
+        return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
+
+    return (
+        rows(drive_root / "state" / "skills" / "alpha" / "review_history.jsonl"),
+        [row["type"] for row in rows(drive_root / "logs" / "events.jsonl") if row["type"].startswith("skill_review_")],
+        [row for row in rows(drive_root / "logs" / "chat.jsonl") if row.get("type") == "skill_review"],
+    )
+
+
+def test_leftover_pending_job_file_does_not_block_a_new_review(tmp_path, monkeypatch):
+    """PR #782: a job file left at a non-running word is no lock.
+
+    The start hook refuses only a *running* claim of another job, so a new
+    review takes the file over and is the only attempt recorded: the leftover
+    claim gains no interrupted/terminal history row, event or chat summary.
+    """
+    import json
+    import os
+
+    from ouroboros.skill_review_runner import review_job_state_path
+
+    drive_root, repo_dir, skills_root, outcome = _passing_review_fixture(tmp_path, monkeypatch)
+    job_path = review_job_state_path(drive_root, "alpha")
+    job_path.write_text(json.dumps({
+        "status": "pending", "skill": "alpha", "job_id": "skill-job-leftover",
+        "started_at": "2026-01-01T00:00:00+00:00",
+        # A live pid as well: the word, not the owner's liveness, decides.
+        "pid": os.getpid(),
+    }), encoding="utf-8")
+
+    payload = run_skill_review_lifecycle_blocking(
+        SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[]), "alpha",
+        source="skills", review_impl=lambda _ctx, name: outcome(name), repo_path=str(skills_root),
+    )
+
+    job = json.loads(job_path.read_text(encoding="utf-8"))
+    history, events, chat = _review_records(drive_root)
+    assert payload["status"] == "clean"
+    assert job["status"] == "completed"
+    assert job["review_status"] == "clean"
+    assert job["job_id"] != "skill-job-leftover"
+    assert job["review_predecessor_job_id"] == "skill-job-leftover"
+    assert [row["job_id"] for row in history] == [job["job_id"]]
+    assert [row["job_id"] for row in chat] == [job["job_id"]]
+    assert events == ["skill_review_started", "skill_review_completed"]
+
+
+@pytest.fixture
+def access(request):
+    from ouroboros import config
+
+    config.reset_runtime_mode_baseline_for_tests()
+    config.initialize_runtime_mode_baseline(request.param)
+    yield request.param
+    config.reset_runtime_mode_baseline_for_tests()
+
+
+@pytest.mark.parametrize("access", ["advanced", "cyber_pro"], indirect=True)
+@pytest.mark.parametrize("enforcement", ["advisory", "blocking"])
+@pytest.mark.parametrize("prior", ["missing", "clean", "author", "stale"])
+def test_duplicate_review_points_at_the_live_job_and_persists_nothing(tmp_path, monkeypatch, access, enforcement, prior):
+    """A second request for the same skill and bytes answers with the live job.
+
+    It is a pointer, not an attempt: the job file still belongs to the live
+    review and no pending row, event or chat summary is written for it. Its
+    executable fact is the current payload's, independent of this pending invocation.
+    """
+    import json
+    import threading
+
+    from ouroboros.skill_review_runner import review_job_state_path
+
+    drive_root, repo_dir, skills_root, outcome = _passing_review_fixture(tmp_path, monkeypatch)
+    started, release = threading.Event(), threading.Event()
+    first = {}
+
+    from ouroboros.skill_loader import SkillReviewState, save_review_state
+    from ouroboros.review_records import build_author_disposition
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    current_hash = outcome("alpha").content_hash
+    if prior != "missing":
+        author = build_author_disposition(
+            disposition="accepted", rationale="Current bytes were checked; retained critic evidence stands.",
+            subject_hash=current_hash, reviewer_signal="blockers", enforcement="advisory",
+        ) if prior == "author" else None
+        save_review_state(drive_root, "alpha", SkillReviewState(
+            status="blockers" if prior == "author" else "clean",
+            content_hash=current_hash if prior == "clean" else "older-payload",
+            author_disposition=author,
+        ))
+
+    def slow_review(_ctx, skill_name):
+        started.set()
+        assert release.wait(30)
+        return outcome(skill_name)
+
+    def run_first():
+        try:
+            first["payload"] = run_skill_review_lifecycle_blocking(
+                SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[]), "alpha",
+                source="skills", review_impl=slow_review, repo_path=str(skills_root),
+            )
+        except BaseException as exc:  # surfaced by the assertion below
+            first["error"] = exc
+
+    thread = threading.Thread(target=run_first)
+    thread.start()
+    try:
+        assert started.wait(30)
+        job_path = review_job_state_path(drive_root, "alpha")
+        live = json.loads(job_path.read_text(encoding="utf-8"))
+        duplicate = run_skill_review_lifecycle_blocking(
+            SimpleNamespace(drive_root=drive_root, repo_dir=repo_dir, messages=[]), "alpha",
+            source="skills", review_impl=slow_review, repo_path=str(skills_root),
+        )
+        during = json.loads(job_path.read_text(encoding="utf-8"))
+        records_during = _review_records(drive_root)
+    finally:
+        release.set()
+        thread.join(30)
+
+    assert "error" not in first and first["payload"]["status"] == "clean"
+    assert live["status"] == "running"
+    assert duplicate["status"] == "pending"
+    executable = access == "cyber_pro" or prior == "clean" or (prior == "author" and enforcement == "advisory")
+    assert duplicate["executable_review"] is duplicate["review_gate"]["executable_review"] is executable
+    if access != "cyber_pro" and prior == "author" and enforcement == "advisory":
+        assert duplicate["review_gate"]["blocking_reason"] == "author_accepted_advisory"
+    assert duplicate["job_id"] == live["job_id"]
+    assert duplicate["job_status"] == "running"
+    assert "review already running" in duplicate["error"]
+    assert {key: during[key] for key in ("job_id", "status", "review_round", "snapshot_attempt")} == {
+        key: live[key] for key in ("job_id", "status", "review_round", "snapshot_attempt")
+    }
+    assert records_during == ([], ["skill_review_started"], [])
+    history, events, chat = _review_records(drive_root)
+    assert [row["job_id"] for row in history] == [live["job_id"]]
+    assert [row["job_id"] for row in chat] == [live["job_id"]]
+    assert events == ["skill_review_started", "skill_review_completed"]
+    assert json.loads(job_path.read_text(encoding="utf-8"))["status"] == "completed"
 
 
 def test_skill_review_response_typedef_carries_qualified_reconcile_fields():

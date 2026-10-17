@@ -9,6 +9,7 @@ from ouroboros.task_results import load_task_result, write_task_result
 from supervisor import queue_schedules
 from supervisor import schedule_occurrence as occurrence
 from tests import test_schedule_occurrence as fixtures
+from tests._store_shared import delete_result, unreadable_result
 
 _row, _rows, q = fixtures._row, fixtures._rows, fixtures.q
 
@@ -83,9 +84,7 @@ def test_refusal_never_overrides_current_admission_or_unknown_source(q, monkeypa
     if case == "foreign":
         write_task_result(q.root, task_id, "scheduled", schedule_admission={"token": "foreign"})
     elif case == "unreadable":
-        path = q.root / f"task_results/{task_id}.json"
-        path.parent.mkdir(exist_ok=True)
-        path.write_text("{not-json")
+        unreadable_result(monkeypatch, task_id)
     elif case == "dispatch_row":
         with queue_schedules.schedule_transaction(q.root):
             data = queue_schedules.load_schedule_store(q.root)
@@ -118,7 +117,7 @@ def test_receipt_loss_after_dispatch_cannot_replay_old_refusal(q, monkeypatch): 
     [task] = q.pending
     assert occurrence.record_dispatch_possible(task)
     q.pending.clear()
-    (q.root / f'task_results/{held["task_id"]}.json').unlink()
+    delete_result(q.root, held["task_id"])
     for _ in range(2):
         q.queue.check_scheduled_tasks()
     assert not q.pending and "occurrence" not in _rows(q)["s1"]
@@ -133,7 +132,7 @@ def test_accepted_republish_refusal_does_not_claim_never_admitted(q, monkeypatch
     q.queue.check_scheduled_tasks()
     current = _rows(q)["s1"]["occurrence"]
     assert current["phase"] == "admitted" and "admission" not in current
-    (q.root / f'task_results/{held["task_id"]}.json').unlink()
+    delete_result(q.root, held["task_id"])
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     q.queue.check_scheduled_tasks()
     assert not q.pending and _rows(q)["s1"]["hold"]["reason"] == "occurrence_evidence_missing"
@@ -175,6 +174,7 @@ from ouroboros.tools.followup import _handle_schedule_followup
 from ouroboros.tools.registry import ToolContext
 from tests.test_schedule_transition_repair import _api
 from tests.test_worker_crash_retry import _make_worker
+from tests.worker_pool_support import affirm_ready
 base, stage, source, crash_point = pathlib.Path(sys.argv[1]), *sys.argv[2:]
 root, repo, folder = base / "data", base / "repo", base / "folder"
 root.mkdir(exist_ok=True); repo.mkdir(exist_ok=True)
@@ -224,7 +224,7 @@ else:
     assert len(workers.PENDING) == 1
     task = workers.PENDING[0]
     assert task["workspace_root"] == str(folder.resolve())
-    worker = _make_worker(alive=True, busy_task_id=None, exitcode=None)
+    worker = affirm_ready(_make_worker(alive=True, busy_task_id=None, exitcode=None))
     workers.WORKERS[0] = worker
     state.budget_remaining = lambda *_a, **_k: 10.0
     workers.assign_tasks()
@@ -275,9 +275,7 @@ def test_worker_delete_reads_receipt_from_its_canonical_table_root(q, tmp_path, 
             "schedule_id": "s1", "token": "same-token" if state_kind == "accepted" else "other",
             "dispatch": "none", "task": {"id": "same-task", "text": "frozen"}})
     elif state_kind == "unreadable":
-        path = canonical / "task_results" / "same-task.json"
-        path.parent.mkdir(parents=True)
-        path.write_text("{broken", encoding="utf-8")
+        unreadable_result(monkeypatch, "same-task", root=canonical)
     # This other queue root has a receipt too. Neither its presence nor its
     # absence can determine custody of the selected table's occurrence.
     if state_kind == "missing":

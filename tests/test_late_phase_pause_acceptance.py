@@ -48,7 +48,9 @@ def test_pause_during_sent_late_acceptance_collects_it_once_and_releases_when_no
         late, tmp_path, monkeypatch, registered):  # noqa: F811
     """Pause is accepted after delivery (with and without a RUNNING row); the already
     dispatched panel finishes and is collected once — never re-sent — and the delivered
-    answer stays exactly as it was. Nothing was left to defer, so the Pause releases itself."""
+    answer stays exactly as it was. Owner 2026-10-08 (full variant): with no writer left
+    the tree reads Paused while its launched reviewers finish separately; a live writer
+    keeps it Pausing. Nothing was left to defer, so the Pause releases itself."""
     from ouroboros.owner_pause import read_fence
     from supervisor.owner_pause_control import request_owner_pause
     from tests._budget_pause_exact_helpers import _install_queue
@@ -67,9 +69,14 @@ def test_pause_during_sent_late_acceptance_collects_it_once_and_releases_when_no
         if registered:
             workers.RUNNING[f.tid] = {"task": f.task, "attempt": 1, "worker_id": 0}
         pause = request_owner_pause(f.tid, request_id="late-acceptance-pause")
-        assert pause["ok"] and pause["state"] == "requested", pause
-        assert _census(f.root)[f.tid] == "budget_pausing"
-        assert _tick(q) == [] and read_fence(f.root, f.tid)["state"] == "requested"  # sent work still settling
+        expected = "requested" if registered else "paused"
+        assert pause["ok"] and pause["state"] == expected, pause
+        assert _census(f.root)[f.tid] == ("budget_pausing" if registered else "budget_paused")
+        _tick(q)
+        fence = read_fence(f.root, f.tid)
+        assert fence["state"] == expected  # a live writer keeps Pausing; reviewers alone never do
+        if not registered:
+            assert fence["finishing_reviews"], fence  # still finishing, shown separately
     finally:
         workers.RUNNING.clear()
         release.set()
@@ -178,6 +185,7 @@ def _end_preparer(proc, log):
     log.close()
 
 
+@pytest.mark.serial  # starts the real preparer process
 def test_paused_preparation_survives_dead_controller_and_resumes_same_debt_once(late, tmp_path, monkeypatch):  # noqa: F811
     from ouroboros.owner_pause import read_fence
     from tests._budget_pause_exact_helpers import _install_queue
@@ -220,6 +228,79 @@ def test_paused_preparation_survives_dead_controller_and_resumes_same_debt_once(
     review_operation.recover_orphaned_acceptance_operations(f.root)
     q.resume_budget_paused_task(f.tid)
     assert len(late.calls) == 3
+
+
+@pytest.mark.serial  # starts the real preparer process
+@pytest.mark.parametrize('read', ['admission', 'unstarted'])
+def test_resume_opening_the_fence_inside_a_restored_control_read_still_runs_the_debt_once(
+        late, tmp_path, monkeypatch, read):  # noqa: F811
+    """Resume restores the saved preparer BEFORE it opens the fence, so the preparer's
+    first admission read, or its operation control read, can see the closed Pause and
+    finish after the release. That Pause block is stale: it waits, it never refuses."""
+    from ouroboros import acceptance_late, owner_pause
+    from supervisor.owner_pause_control import request_owner_pause
+    from tests._budget_pause_exact_helpers import _install_queue
+
+    f = delivered(tmp_path, monkeypatch)
+    q, _, _ = _install_queue(f.root, monkeypatch)
+    proc, log, start = _preparing_process(f)
+    try:
+        assert request_owner_pause(f.tid, request_id='resume-inside-read')['ok']
+    finally:
+        _end_preparer(proc, log)
+    _tick(q)
+    assert owner_pause.read_fence(f.root, f.tid)['state'] == 'paused'
+    controls, release = acceptance_late.historical_operation_controls, owner_pause.set_fence_state
+    seen, opened, stale = threading.Event(), threading.Event(), []
+
+    def held_read(*args, **kwargs):
+        blocked = controls(*args, **kwargs)
+        if read in kwargs and threading.current_thread().name.startswith('review-prepare-') and not seen.is_set():
+            stale.append(blocked)  # read under the closed fence; it returns only after the release
+            seen.set()
+            opened.wait(10)
+        return blocked
+
+    def held_release(*args, **kwargs):
+        if kwargs.get('state') == owner_pause.FENCE_RELEASED:
+            assert seen.wait(10), 'the restored preparer never read its controls'
+        try:
+            return release(*args, **kwargs)
+        finally:
+            opened.set()
+
+    monkeypatch.setattr(acceptance_late, 'historical_operation_controls', held_read)
+    monkeypatch.setattr(owner_pause, 'set_fence_state', held_release)
+    assert q.resume_budget_paused_task(f.tid)['ok']
+    until(lambda: len(late.calls) == 3)
+    until(lambda: not review_operation._LIVE)
+    assert stale == [['root_budget_fence']]  # the held read did see the closed Pause
+    assert set(load_task_result(f.root, f.tid)['review_operations']) == {start['owner_id']}
+    assert len(late.calls) == 3
+
+
+def test_root_budget_fence_that_is_not_the_owner_pause_still_refuses_unsent_late_work(
+        late, tmp_path, monkeypatch):  # noqa: F811
+    """Only the owner's closed Pause makes unsent late work wait (D10); a root budget
+    fence read with that Pause open on both sides refuses at once and buys nothing."""
+    from ouroboros.acceptance_late import run_historical_acceptance
+    from supervisor.events_budget import _set_root_budget_pause_locked
+    from tests._budget_pause_exact_helpers import _install_queue
+
+    f = delivered(tmp_path, monkeypatch)
+    q, _, _ = _install_queue(f.root, monkeypatch)
+    try:
+        with q._queue_lock:
+            _set_root_budget_pause_locked(f.accounting, {'fence_id': 'root-money-fence'})
+            assert q.persist_queue_snapshot(reason='root_money_fence')
+        run_historical_acceptance(_caller(f), task_id=f.tid,
+            debt_id=load_task_result(f.root, f.tid)['acceptance_debt']['debt_id'], automatic=True)
+        until(lambda: not review_operation._LIVE)
+    finally:
+        q.BUDGET_ROOT_FENCES.pop(f.accounting, None)
+    pointer = next(iter(load_task_result(f.root, f.tid)['review_operations'].values()))
+    assert pointer['state'] == 'preparation_refused', pointer
+    assert pointer['preparation_outcome']['reason'] == 'root_budget_fence' and not late.calls
 
 
 @pytest.mark.parametrize('bound', ['global', 'root', 'deadline', 'restart', 'panic', 'cancel'])

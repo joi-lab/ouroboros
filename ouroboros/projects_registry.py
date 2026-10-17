@@ -1,15 +1,11 @@
-"""Durable owner Project registry in ``data/state/projects.json``.
-
-Rooms have an id, name, memory under ``data/projects/<id>/``, a positive chat id
-and an optional working folder. File-less rooms are valid; only the owner
-archives/deletes them, never age pruning. Tombstones preserve history/data and
-prevent rediscovery while the registry survives. Recovery from store markers
-creates fresh execution incarnations; lost folders/tombstones are not recovered
-(PERSISTENCE.md). This bookkeeping does not split Ouroboros's identity (BIBLE P1).
-"""
+"""Project registry (data/state/projects.json): id/name/memory/positive chat id, optional folder.
+Only owners archive/delete, never age pruning; tombstones preserve history/data and prevent
+rediscovery. Store-marker recovery creates fresh incarnations, not lost folders/tombstones
+(PERSISTENCE); rooms share one identity (BIBLE P1)."""
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 import pathlib
@@ -18,8 +14,10 @@ from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterator, List, Optional
 
 from ouroboros.contracts.chat_id_policy import project_chat_id
+from ouroboros.composer_cognition import ensure_project_cognition, main_cognition, project_cognition
 from ouroboros.contracts.schema_versions import with_schema_version
 from ouroboros.project_facts import sanitize_project_id
+from ouroboros.store import open_store
 from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso, strip_markdown
 
 log = logging.getLogger(__name__)
@@ -32,7 +30,8 @@ _BINDINGS_NAME = "project_task_bindings.json"
 # Additive schema: unstamped rows are version 0; reconstructed rows may lack
 # optional provenance fields, whose defaults must remain compatible.
 _REGISTRY_SCHEMA_VERSION = 2
-# v6.73.0: project_task_bindings.json gains source_text / origin_absent fields.
+# v6.73.0: project_task_bindings.json gains source_text / origin_absent fields; a copied origin with
+# attachments adds source_attachments / source_channel / source_text_placeholder (optional).
 _BINDINGS_SCHEMA_VERSION = 1
 _LOCK = threading.RLock()
 
@@ -41,23 +40,13 @@ PROJECT_ACTIVE = "active"
 PROJECT_DELETING = "deleting"
 PROJECT_TOMBSTONED = "tombstoned"
 PROJECT_LIFECYCLES = frozenset({PROJECT_ACTIVE, PROJECT_DELETING, PROJECT_TOMBSTONED})
-_DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
 
 
 @contextmanager
 def _file_write_lock(target_path: pathlib.Path, *, timeout_sec: float = 4.0) -> Iterator[None]:
-    """Cross-process exclusive lock for a registry/bindings read-modify-write.
-
-    The registry is written from BOTH the server process (project create/bind,
-    digest touch) AND worker processes (``project_journal`` touch_project), so a
-    process-local ``threading.Lock`` cannot prevent lost updates. Flock a sidecar
-    so the load→modify→atomic-write sequence is exclusive across processes; the
-    in-process ``_LOCK`` is nested inside for thread-level serialization too.
-    """
-    from ouroboros.platform_layer import (
-        acquire_exclusive_file_lock,
-        release_exclusive_file_lock,
-    )
+    """Server create/bind and worker journal share a sidecar flock for load→modify→atomic-write;
+    nested _LOCK serializes threads. A process-local lock alone permits lost updates."""
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target_path.with_name(target_path.name + ".lock")
@@ -226,6 +215,27 @@ def _validated_origin(origin: Any, resolved_chat: int) -> Dict[str, Any]:
     return {"source_ref": clean_ref, "source_text": text}
 
 
+def _origin_media(drive_root: Any, origin: Any) -> Dict[str, Any]:
+    """The attachment refs, ``source`` and placeholder mark the origin's canonical row recorded —
+    found by the ref's own ids and verified against the whole ref, never guessed from the text.
+    No row, another row or an unreadable chain records nothing; the text copy still stands."""
+    ref = origin.get("ref") if isinstance(origin, dict) else None
+    if not isinstance(ref, dict) or not isinstance(origin.get("text"), str):
+        return {}
+    from ouroboros.chat_uploads import stored_refs
+    from ouroboros.project_dialogue import entry_matches_source_ref
+    from supervisor.message_ingress import accepted_chat_message
+    try:
+        row = accepted_chat_message(drive_root, int(ref.get("chat_id") or 0), str(ref.get("client_message_id") or ""))
+    except (OSError, TypeError, ValueError):
+        log.debug("origin attachments unreadable for %r", ref, exc_info=True)
+        return {}
+    if not row or not row.get("attachments") or not entry_matches_source_ref(row, [ref]):
+        return {}
+    return {"source_attachments": stored_refs(row["attachments"]), "source_channel": str(row.get("source") or ""),
+            **({"source_text_placeholder": True} if row.get("text_placeholder") is True else {})}
+
+
 def bind_task_to_project(
     drive_root: Any,
     task_id: str,
@@ -234,6 +244,7 @@ def bind_task_to_project(
     *,
     origin: Dict[str, Any],
     admission_basis: Optional[dict] = None,
+    execution_readmission: bool = False,
 ) -> Dict[str, Any]:
     """Durably bind an existing task/live card to a project thread.
 
@@ -255,9 +266,8 @@ def bind_task_to_project(
         raise ValueError(f"unusable project id: {project_id!r}")
     if admission_basis is None and get_reserved_project(drive_root, pid) is None:
         create_project(drive_root, pid)
-    # Linearize admission with the lifecycle fence. Holding the registry lock
-    # through the short bindings append means begin_project_deletion either lands
-    # before this bind (which is refused) or after it (which cancellation sees).
+    media = _origin_media(drive_root, origin)  # a chat read: never under the registry's cross-process lock
+    # Registry lock linearizes binding with destination deletion.
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         project = next(
@@ -272,11 +282,14 @@ def bind_task_to_project(
         except (TypeError, ValueError):
             resolved_chat = project_chat_id(pid)
         origin_fields = _validated_origin(origin, resolved_chat)
+        if "source_text" in origin_fields:  # only a cross-thread origin keeps a copy, and so its media
+            origin_fields.update(media)
         row = {
             "task_id": tid,
             "project_id": pid,
             "project_chat_id": resolved_chat,
             "bound_at": utc_now_iso(),
+            **({"placement_admission": admission_basis} if execution_readmission else {}),
             **origin_fields,
         }
         with _file_write_lock(_bindings_path(drive_root)):
@@ -285,8 +298,6 @@ def bind_task_to_project(
             if isinstance(existing, dict):
                 existing_pid = str(existing.get("project_id") or "")
                 if existing_pid == pid:
-                    # One-way enrichment: fill a ref-less row when a valid ref
-                    # arrives; a stored valid ref is immutable (never replaced).
                     if not isinstance(existing.get("source_ref"), dict) and "source_ref" in origin_fields:
                         enriched = {
                             key: value for key, value in existing.items() if key != "origin_absent"
@@ -307,34 +318,15 @@ def bind_task_to_project(
 
 
 def project_task_bindings(drive_root: Any) -> Dict[str, Dict[str, Any]]:
-    """Copy of the immutable task-to-Project bindings for read models."""
-    return {
-        str(task_id): dict(row)
-        for task_id, row in _load_bindings(drive_root).get("bindings", {}).items()
-        if isinstance(row, dict)
-    }
+    """Copy of the immutable task-to-Project bindings for read models (the cached lens)."""
+    return {str(task_id): dict(row) for task_id, row in _bindings_lens(drive_root).items() if isinstance(row, dict)}
 
 
 def all_task_bindings(drive_root: Any) -> Dict[str, int]:
-    """Map task_id -> project chat_id for ALL post-hoc 'Turn into project' bindings.
-
-    Cognition/history isolation consults this so a bound task's rows (which keep
-    their ORIGINAL main chat_id) are still treated as project-owned. One bounded
-    read; no per-row lock (atomic writes guarantee complete reads)."""
-    out: Dict[str, int] = {}
-    try:
-        for tid, row in _load_bindings(drive_root).get("bindings", {}).items():
-            if not isinstance(row, dict):
-                continue
-            try:
-                cid = int(row.get("project_chat_id") or 0)
-            except (TypeError, ValueError):
-                continue
-            if cid:
-                out[str(tid)] = cid
-    except Exception:
-        log.debug("all_task_bindings failed", exc_info=True)
-    return out
+    """Map task_id -> project chat_id for ALL post-hoc 'Turn into project' bindings:
+    the explicit roots (cursor fingerprints, the census). One bounded read; no
+    per-row lock (atomic writes guarantee complete reads)."""
+    return {tid: int(row["chat_id"]) for tid, row in all_task_project_bindings(drive_root).items()}
 
 
 def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[str, Dict[str, Any]]:
@@ -344,8 +336,10 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
     (F4), not merely to suppress the stray convert button (P2). Strict snapshot
     readers propagate source failures so absence never impersonates completeness."""
     out: Dict[str, Dict[str, Any]] = {}
-    try:
-        for tid, row in _load_bindings(drive_root, strict=strict).get("bindings", {}).items():
+    try:  # a strict reader rereads the file; the others share the mtime-keyed lens
+        names = {row["id"]: row.get("name") or row["id"] for row in _load(drive_root)["projects"]}
+        bindings = _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+        for tid, row in bindings.items():
             if not isinstance(row, dict):
                 continue
             pid = str(row.get("project_id") or "").strip()
@@ -354,7 +348,7 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
             except (TypeError, ValueError):
                 cid = 0
             if pid and cid:
-                out[str(tid)] = {"project_id": pid, "chat_id": cid}
+                out[str(tid)] = {"project_id": pid, "chat_id": cid, "project_name": str(names.get(pid) or pid)}
     except Exception:
         if strict:
             raise
@@ -433,16 +427,11 @@ _ORIGIN_CLAIM_LOCK = threading.RLock()
 
 
 def origin_claim_lock() -> Any:
-    """The one lock every IMPLICIT project claim holds from its origin read through
-    its durable bind: the UI conversion, the promote handler and the in-task
-    ``ensure_project_scope`` handler. All three run in the SERVER process (the
-    gateway is in-process with the supervisor, and workers reach both through
-    events), so a process-local RLock serializes them; a model call that names the
-    project stays OUTSIDE it, because it may await for seconds.
+    """Serialize mind/button placement from the task binding read through commit.
 
-    Without it two cards of the SAME owner message, clicked in two tabs (or the
-    desktop shell and the mini app) inside one naming window, both read "no project
-    for this origin" and both create one."""
+    Naming stays outside the lock. Shared message origin is provenance only;
+    independent works never acquire each other's room through this serializer.
+    """
     return _ORIGIN_CLAIM_LOCK
 
 
@@ -470,46 +459,6 @@ def _live_task_ids() -> set:
         log.debug("_live_task_ids: direct activity read failed", exc_info=True)
     live.discard("")
     return live
-
-
-def live_origin_lanes() -> list:
-    """``(task_id, origin_message_ref)`` for every LIVE owner ROOT and in-flight
-    direct turn — the task ids one owner message's work can still be spread across.
-
-    Subagents are excluded: a delegated child is never bound itself, it inherits
-    its root's project by lineage. ONE scan with TWO readers that must agree — the
-    freshly created project's sibling claim (which binds them durably) and the
-    /api/state binding projection (which only closes their convert gate). While
-    each kept its own scan, a task the claim skipped could still be offered as a
-    second convertible unit for work that already has a project. Never raises: an
-    unreadable supervisor answers "no lanes", which degrades to today's
-    task-keyed behaviour rather than blocking the owner.
-    """
-    lanes: list = []
-    try:
-        from supervisor.queue import _queue_lock
-        from supervisor.workers import PENDING, RUNNING
-
-        with _queue_lock:
-            rows = [meta.get("task") for meta in list(RUNNING.values()) if isinstance(meta, dict)]
-            rows += list(PENDING or ())
-        for row in rows:
-            if not isinstance(row, dict) or str(row.get("delegation_role") or "") == "subagent":
-                continue
-            lanes.append((str(row.get("id") or ""), row.get("origin_message_ref")))
-    except Exception:
-        log.debug("live_origin_lanes: queue scan failed", exc_info=True)
-    try:
-        from supervisor.active_activity import get_direct_activity_registry
-
-        for entry in get_direct_activity_registry().actors():
-            lanes.append((
-                str(getattr(entry, "activity_id", "") or ""),
-                getattr(entry, "origin_message_ref", None),
-            ))
-    except Exception:
-        log.debug("live_origin_lanes: direct activity scan failed", exc_info=True)
-    return [(tid, ref) for tid, ref in lanes if tid]
 
 
 def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False,
@@ -639,35 +588,149 @@ def _bindings_lens(drive_root: Any) -> Dict[str, Any]:
     return bindings
 
 
+_TASK_LINEAGE: Dict[tuple, Dict[str, Any]] = {}
+_TASK_LINEAGE_LIMIT = 50_000  # a memory bound, not a policy: the facts are re-read on the next sight
+_ROOM_ANSWERS: Dict[str, tuple] = {}
+_LINEAGE_SELECT = ("SELECT t.task_id, t.parent_task_id, t.root_task_id, t.delegation_role, "
+                   "json_extract(b.body, '$.chat_id') FROM tasks t LEFT JOIN task_bodies b ON b.task_id = t.task_id "
+                   "WHERE t.task_id IN (SELECT value FROM json_each(?))")
+
+
+def _read_lineage(drive_root: Any, task_ids: Any) -> Optional[Dict[str, Dict[str, Any]]]:
+    """ONE indexed read of the lineage facts of ``task_ids`` (parent, root, role and the
+    admitted ``chat_id``), remembered per task id for the process (an existing task's
+    lineage never changes); an id the store does not hold is absent from the answer
+    (admission creates it later); ``None`` when the store cannot answer right now."""
+    try:
+        with open_store(drive_root, write=False) as txn:
+            records = txn.conn.execute(_LINEAGE_SELECT, (json.dumps(sorted(task_ids)),)).fetchall()
+    except Exception:
+        log.debug("task lineage read failed", exc_info=True)
+        return None
+    if len(_TASK_LINEAGE) >= _TASK_LINEAGE_LIMIT:
+        _TASK_LINEAGE.clear()
+    facts = {}
+    for record in records:
+        try:
+            chat = int(record[4]) if record[4] not in (None, "") else None
+        except (TypeError, ValueError):
+            chat = None
+        facts[str(record[0])] = {"parent_task_id": str(record[1] or ""), "root_task_id": str(record[2] or ""),
+                                 "delegation_role": str(record[3] or ""), "chat_id": chat}
+    for tid, row in facts.items():
+        _TASK_LINEAGE[(str(drive_root), tid)] = row
+    return facts
+
+
+class RoomResolver:
+    """One rule for live/history/cognition: nearest explicit binding on task→parent→…,
+    then root; else own admitted registered Project chat (never project_id), else 0
+    preserves the caller's address. Caller/store lineage is shared. Answers cache per
+    bindings snapshot: conversion invalidates, commit does not; unavailable ancestors
+    retry, absent ids read once per resolver. Strict publication uses fresh bindings
+    and propagates unreadable authority instead of pinning a guessed room."""
+
+    __slots__ = ("root", "bindings", "answers", "misses", "_projects", "strict")
+
+    def __init__(self, drive_root: Any, *, strict: bool = False) -> None:
+        self.root, self.strict = drive_root, strict
+        self.bindings = (_load_bindings(drive_root, strict=True)["bindings"] if strict
+                         else _bindings_lens(drive_root))  # one ``stat`` per resolver
+        key = str(_bindings_path(drive_root))
+        cached = None if strict else _ROOM_ANSWERS.get(key)
+        if cached is None or cached[0] is not self.bindings:
+            cached = (self.bindings, {})
+            if not strict:
+                _ROOM_ANSWERS[key] = cached
+        self.answers: Dict[str, int] = cached[1]
+        self.misses: set = set()
+        self._projects: Optional[frozenset] = None
+
+    def _facts(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """Cached or read facts; ``{}`` for a known miss; ``None`` when unavailable now."""
+        facts = _TASK_LINEAGE.get((str(self.root), task_id))
+        if facts is None and task_id not in self.misses:
+            read = _read_lineage(self.root, [task_id])
+            if read is None:
+                if self.strict:
+                    raise ValueError("project_source_unknown")
+                return None
+            facts = read.get(task_id)
+            if facts is None:
+                self.misses.add(task_id)
+        return facts or {}
+
+    def lineage(self, task_id: Any) -> Dict[str, Any]:
+        """The task's facts (``{}`` when unknown or unavailable now): what a reader anchors by."""
+        tid = str(task_id or "").strip()
+        return (self._facts(tid) if tid else None) or {}
+
+    def _bound(self, task_id: str) -> int:
+        row = project_binding_for_task(self.root, task_id, strict=self.strict, bindings_snapshot=self.bindings)
+        if self.strict and row:
+            project = get_reserved_project(self.root, row["project_id"], strict=True)
+            if not project or type(project.get("chat_id")) is not int:
+                raise ValueError("project_source_unknown")
+            return project["chat_id"]
+        try:
+            return int(row.get("project_chat_id") or 0) if isinstance(row, dict) else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def __call__(self, task_id: Any, parent_task_id: Any = "", root_task_id: Any = "") -> int:
+        tid = str(task_id or "").strip()
+        if not tid:
+            return 0
+        answer = self.answers.get(tid)
+        if answer is not None:
+            return answer
+        reads: List[Optional[Dict[str, Any]]] = []  # ``None``: an ancestor the store could not answer
+        chain: List[str] = []
+        cur, parent, chat = tid, str(parent_task_id or "").strip(), 0
+        while cur and cur not in chain:
+            chain.append(cur)
+            if chat := self._bound(cur):
+                break
+            if not parent:
+                reads.append(self._facts(cur))
+                parent = (reads[-1] or {}).get("parent_task_id", "")
+            cur, parent = parent, ""
+        own = {} if chat else self._facts(tid)
+        reads.append(own)
+        own = own or {}
+        if not chat:
+            root = str(root_task_id or "").strip() or own.get("root_task_id", "")
+            chat = self._bound(root) if root and root not in chain else 0
+            if not chat and own.get("chat_id"):
+                if self._projects is None:
+                    self._projects = (frozenset(reserved_project_chat_ids(self.root, strict=True)) if self.strict
+                                      else project_thread_chat_ids(self.root))
+                chat = own["chat_id"] if own["chat_id"] in self._projects else 0
+        if (chat or own) and None not in reads:  # an incomplete ancestry read is never memoized
+            self.answers[tid] = chat
+        return chat
+
+    def warm(self, task_ids: Any) -> None:
+        """Read the lineage of every unseen id and of its unseen ancestors, ONE transaction per
+        generation, before the rule walks them one id at a time (a page names dozens)."""
+        wanted = {str(tid) for tid in task_ids if tid}
+        while unseen := {tid for tid in wanted if (str(self.root), tid) not in _TASK_LINEAGE} - self.misses:
+            read = _read_lineage(self.root, unseen)
+            if read is None:
+                return
+            self.misses.update(unseen - read.keys())
+            wanted = {row[key] for row in read.values() for key in ("parent_task_id", "root_task_id") if row[key]}
+
+
 def project_chat_for_task_tree(
     drive_root: Any, task_id: Any, parent_task_id: Any = "", root_task_id: Any = ""
 ) -> int:
-    """Resolve the project chat for a task by its TASK TREE: the task's OWN binding
-    wins; else inherit from its parent; else its root. A subagent is never bound
-    itself, so this is how its live frames + history are recognized as belonging to
-    its root's project and route to the project thread instead of staying in the main
-    chat (the cyber-racing "subagents vanished from the project" gap). Membership is
-    DERIVED from lineage — no per-child binding store, one SSOT."""
-    # One cached bindings view for all three probes (runs per live log event).
+    """The room rule (``RoomResolver``) under its live-addressing name: 0 when none; never raises."""
     try:
-        bindings = _bindings_lens(drive_root)
+        return RoomResolver(drive_root)(task_id, parent_task_id, root_task_id)
     except Exception:
-        log.debug("project_chat_for_task_tree bindings read failed", exc_info=True)
+        log.debug("project_chat_for_task_tree failed", exc_info=True)
         return 0
-    for tid in (task_id, parent_task_id, root_task_id):
-        tid = str(tid or "").strip()
-        if not tid:
-            continue
-        row = bindings.get(tid)
-        if not isinstance(row, dict):
-            continue
-        try:
-            chat = int(row.get("project_chat_id") or 0)
-        except (TypeError, ValueError):
-            chat = 0
-        if chat:
-            return chat
-    return 0
 
 
 def list_reserved_projects(drive_root: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
@@ -765,28 +828,6 @@ def stamp_project_thread(drive_root: Any, payload: Dict[str, Any]) -> None:
         log.debug("Project thread lens failed", exc_info=True)
 
 
-def registered_project_chat_ids(drive_root: Any) -> set:
-    """One-minor compatibility alias for :func:`reserved_project_chat_ids`."""
-    key = str(pathlib.Path(drive_root).resolve(strict=False))
-    if key not in _DEPRECATED_CHAT_IDS_EVENTS:
-        _DEPRECATED_CHAT_IDS_EVENTS.add(key)
-        try:
-            from ouroboros.utils import append_jsonl
-
-            append_jsonl(
-                pathlib.Path(drive_root) / "logs" / "events.jsonl",
-                {
-                    "ts": utc_now_iso(),
-                    "type": "deprecated_project_chat_ids_alias_used",
-                    "alias": "registered_project_chat_ids",
-                    "replacement": "reserved_project_chat_ids",
-                },
-            )
-        except Exception:
-            log.debug("Failed to record Project chat-id alias use", exc_info=True)
-    return reserved_project_chat_ids(drive_root)
-
-
 def get_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     project = get_reserved_project(drive_root, project_id, strict=strict)
     return project if project and project.get("lifecycle") == PROJECT_ACTIVE else None
@@ -806,6 +847,18 @@ def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = Fal
 def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
     name = " ".join(str(value or "").split()) or str(fallback or "")
     return name if len(name) <= PROJECT_NAME_MAX else name[: PROJECT_NAME_MAX - 1].rstrip() + "…"
+
+
+def task_presentation_name(*sources: Any) -> str:
+    """Plain work title from structured task/result rows, without storage reads."""
+    sources = [row for row in sources if isinstance(row, dict)]
+    for field in ("title", "suggested_name", "objective", "description"):
+        for source in sources:
+            # Strip markdown before flattening the raw request into a plain label.
+            name = _bounded_presentation_name(strip_markdown(str(source.get(field) or "")))
+            if name:
+                return name
+    return "Task"
 
 
 def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = None,
@@ -853,17 +906,7 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
         pname = ""
     if pid and not pname:
         pname = "Project"
-    task_name = ""
-    for field in ("title", "suggested_name", "objective", "description"):
-        for source in sources:
-            # Strip markdown BEFORE the name is flattened: the task half is a raw
-            # request line, and ARCHITECTURE promises this label is plain text.
-            task_name = _bounded_presentation_name(strip_markdown(str(source.get(field) or "")))
-            if task_name:
-                break
-        if task_name:
-            break
-    task_name = task_name or "Task"
+    task_name = task_presentation_name(*sources)
     label = f"{pname} › {task_name}" if pname else task_name
     # One name, said once: a task whose own name IS the project name renders
     # "Launch › Launch", which reads as two different things. Exact equality
@@ -909,15 +952,13 @@ def create_project(
     origin: str = "owner",
     admission_basis: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Register or return an active room; its optional folder may stay empty.
-
-    Chat identity derives deterministically from the id. The returned, unpersisted
-    ``created`` flag is true only for THIS registration, so announcements can
-    distinguish a newly created room from an idempotent replay.
-    """
+    """Register an active room with deterministic chat id and an optional folder.
+    The unpersisted ``created`` flag distinguishes this registration from replay."""
     pid = sanitize_project_id(project_id)
     if not pid:
         raise ValueError(f"unusable project id: {project_id!r}")
+    cognition = main_cognition()
+    ensure_project_cognition(drive_root, baseline=cognition)
     with _file_write_lock(_registry_path(drive_root)), \
             project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         data = _load(drive_root, strict=True, project_id=pid)
@@ -934,6 +975,7 @@ def create_project(
             "name": _validated_name(name, pid),
             "chat_id": project_chat_id(pid),
             "working_dir": str(working_dir or "").strip(),
+            "cognition": cognition,
             "origin": str(origin or "owner"),
             "created_at": utc_now_iso(),
             "last_active_at": utc_now_iso(),
@@ -1146,6 +1188,8 @@ def reconcile_projects(drive_root: Any) -> int:
     """
     added = 0
     try:
+        ensure_project_cognition(drive_root)
+        cognition = main_cognition()
         if _registry_path(drive_root).is_file():
             _mark_registry_committed(drive_root)  # a registry saved before its witness existed
         projects_root = pathlib.Path(drive_root) / "projects"
@@ -1186,13 +1230,14 @@ def reconcile_projects(drive_root: Any) -> int:
                     if not store.is_dir():
                         continue
                     marker = _read_store_marker(store)
-                    if marker.get("id") != row.get("id") or marker.get("name") != row.get("name"):
+                    if any(marker.get(key) != row.get(key) for key in ("id", "name", "cognition")):
                         try:
                             atomic_write_json(store / _PROJECT_MARKER_NAME, {
                                 "id": row.get("id"),
                                 "name": row.get("name"),
                                 "origin": row.get("origin"),
                                 "created_at": row.get("created_at"),
+                                "cognition": row.get("cognition"),
                             })
                         except OSError:
                             # One unwritable store must not abort the whole reconcile:
@@ -1227,8 +1272,8 @@ def reconcile_projects(drive_root: Any) -> int:
                     # proj_*-named project passed through create_project and is
                     # already in ``known``, so it never reaches this guard.
                     row_name, row_origin, row_created = pid, "reconcile", ""
+                    marker = _read_store_marker(entry)
                     if pid.startswith("proj_") and pid not in bound:
-                        marker = _read_store_marker(entry)
                         if marker.get("id") != pid:
                             continue  # unbound, unmarked: a workspace facts store
                         # Recovery with the room's REAL identity: the pre-guard
@@ -1242,6 +1287,7 @@ def reconcile_projects(drive_root: Any) -> int:
                         "name": row_name,
                         "chat_id": project_chat_id(pid),
                         "working_dir": "",
+                        "cognition": project_cognition(marker, cognition),
                         "origin": row_origin,
                         "created_at": row_created or utc_now_iso(),
                         "last_active_at": utc_now_iso(),
@@ -1384,21 +1430,26 @@ def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any,
     return str((entry or {}).get("working_dir") or "")
 
 
-def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:
-    """Compact list for /api/state and the sidebar."""
+def projects_summary(drive_root: Any, *, limit: int = 50, chat_id: Any = None) -> List[Dict[str, Any]]:
+    """Sidebar list or strict addressed room, independent of sidebar caps/activity.
+    Missing/inactive yields no room; unreadable/ambiguous authority raises."""
     out: List[Dict[str, Any]] = []
+    cognition = main_cognition()
     bindings = _load_bindings(drive_root).get("bindings", {})
+    if chat_id is not None:
+        address = int(chat_id)
+        projects = [row for row in list_reserved_projects(drive_root, strict=True)
+                    if row.get("chat_id") == address and row.get("lifecycle") == PROJECT_ACTIVE]
+        if len(projects) > 1:
+            raise ValueError("Project chat identity is ambiguous")
+    else:
+        projects = list_sidebar_projects(drive_root)[: max(1, int(limit))]
 
     def _has_thread_activity(project: Dict[str, Any]) -> bool:
-        # Registry-facts derivation ONLY — the GET path never scans logs and
-        # never writes. Micro-delta vs the retired per-request log scan
-        # (disclosed): a project whose thread carries ONLY telemetry rows (no
-        # owner-visible canonical row, no binding) reads inactive until its
-        # first visible row — exactly the junk-row shape this filter exists
-        # to hide. Legacy projects whose activity predates the
-        # visible_revision counter are covered by the write-once
-        # `thread_activity_seen` flag seeded at boot reconcile
-        # (_backfill_thread_activity).
+        # Registry facts only: GET never scans logs or writes. Telemetry-only
+        # rooms (no visible canonical row or binding) remain inactive until a
+        # visible row arrives, hiding junk rooms. Boot reconcile's write-once
+        # thread_activity_seen covers activity predating visible_revision.
         pid = str(project.get("id") or "")
         # v6.59.0: a project the OWNER explicitly created in the UI is always shown —
         # the activity filter exists to hide junk reconcile rows, not a fresh project
@@ -1411,12 +1462,13 @@ def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]
             return True
         return bool(project.get("thread_activity_seen"))
 
-    for project in list_sidebar_projects(drive_root)[: max(1, int(limit))]:
+    for project in projects:
         out.append({
             "id": project.get("id"),
             "name": project.get("name"),
             "chat_id": project.get("chat_id"),
             "working_dir": project.get("working_dir") or "",
+            "cognition": project_cognition(project, cognition),
             "provenance": project.get("provenance") or "",
             "last_active_at": project.get("last_active_at") or "",
             "lifecycle": project.get("lifecycle") or PROJECT_ACTIVE,
@@ -1447,17 +1499,17 @@ __all__ = [
     "list_projects",
     "list_reserved_projects",
     "list_sidebar_projects",
-    "live_origin_lanes",
     "origin_claim_lock",
     "origin_key",
     "project_binding_for_task",
     "project_chat_for_task",
     "project_thread_note_for_task",
     "project_chat_for_task_tree",
+    "RoomResolver",
     "project_id_for_origin",
     "project_task_bindings",
     "task_presentation_snapshot",
-    "registered_project_chat_ids",
+    "task_presentation_name",
     "reserved_project_chat_ids",
     "projects_summary",
     "reconcile_projects",

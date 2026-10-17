@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from ouroboros import consolidator, context
+from ouroboros import context
 from ouroboros import knowledge as store
 from ouroboros.memory import Memory
 from ouroboros.tools import knowledge as tools
@@ -270,25 +270,24 @@ def test_unparseable_source_leaves_both_change_facts_unknown(tmp_path):
     assert appended.ok and (appended.delta["body_changed"], appended.delta["summary_changed"]) == (None, None)
 
 
-def test_backlog_summary_is_refused_rather_than_ignored(tmp_path):
-    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    item = "### ibl-1\n- summary: Trim the index preview.\n- category: memory\n"
-    for args in ({"mode": "edit", "summary": NEW}, {"mode": "overwrite", "content": item, "summary": NEW}):
-        assert tools._knowledge_write(ctx, tools.BACKLOG_TOPIC, **args).startswith("⚠️ TOOL_ARG_ERROR")
+def test_the_backlog_summary_is_an_ordinary_revision_checked_edit(tmp_path):
+    """The backlog has no merge writer of its own: its summary changes like any note's."""
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="summary-edit")
+    item = "- Trim the index preview.\n"
+    assert tools._knowledge_write(ctx, tools.BACKLOG_TOPIC, item, mode="overwrite", summary=NEW).startswith(
+        "⚠️ TOOL_ARG_ERROR")
     assert not (tmp_path / "memory").exists()
-
-
-def test_automatic_nomination_keeps_its_edits_form_and_gains_the_same_change_facts(tmp_path):
-    ctx, address, original = _setup(tmp_path)
-    reads = consolidator.KnowledgeReadContext(ctx)
-    reads.reads[(address.scope, address.topic)] = original.revision
-    edit = {"old_text": "Старый факт.", "new_text": "Новый факт.", "basis": "The episode moved it."}
-    outcome = consolidator._write_knowledge_entries(address.shelf, reads.bind_entries([
-        {"topic": "people/ada", "scope": "global", "edits": [edit], "summary": NEW}]), context=ctx)[0]
-    assert outcome["ok"]
-    row = _history(address)[-1]
-    assert (row["edits"], row["summary"]) == ([edit], NEW)
-    assert (row["delta"]["body_changed"], row["delta"]["summary_changed"]) == (True, True)
+    _receipt(tools._knowledge_write(ctx, tools.BACKLOG_TOPIC, item))
+    address = store.resolve_knowledge_address(tmp_path, tools.BACKLOG_TOPIC, "global")
+    created = store.read_knowledge_note(address)
+    stale = tools._knowledge_write(ctx, tools.BACKLOG_TOPIC, mode="edit", summary=NEW)
+    assert "revision_required" in stale and store.read_knowledge_note(address).raw == created.raw
+    receipt = _receipt(tools._knowledge_write(ctx, tools.BACKLOG_TOPIC, mode="edit", summary=NEW,
+                                              expected_revision=created.revision))
+    assert receipt["knowledge_delta"]["summary_changed"] is True and receipt["knowledge_delta"]["body_changed"] is False
+    current = store.read_knowledge_note(address)
+    assert current.summary == NEW and _body(current) == _body(created)
+    assert _history(address)[-1]["summary"] == NEW
 
 
 def test_schema_adds_summary_without_breaking_older_calls(tmp_path):
@@ -297,7 +296,7 @@ def test_schema_adds_summary_without_breaking_older_calls(tmp_path):
     assert schema["parameters"]["required"] == ["topic"]
     assert props["summary"]["type"] == "string" and "mode=edit only" in props["summary"]["description"]
     assert {"topic", "scope", "content", "mode", "old_str", "expected_revision"} < set(props)
-    assert props["mode"]["enum"] == ["overwrite", "append", "edit"]
+    assert props["mode"]["enum"] == ["overwrite", "append", "edit", "archive", "restore"]
     assert set(props) == set(inspect.signature(tools._knowledge_write).parameters) - {"ctx"}
     assert "body text never replaces it" in schema["description"]
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)

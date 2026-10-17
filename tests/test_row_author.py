@@ -7,7 +7,6 @@ test red.
 from __future__ import annotations
 
 import ast
-import json
 import pathlib
 
 import pytest
@@ -19,6 +18,7 @@ from ouroboros.dialogue_provenance import (
     row_class,
     task_lineage_lookup,
 )
+from tests._store_shared import seed_result
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 EPOCH = {"pos": 100, "ts": "2026-08-21T20:18:52", "address": {"kind": "chat_row"}}
@@ -119,25 +119,25 @@ def test_lineage_epoch_requires_the_row_position_and_only_then():
     assert row_author(_out(subagent_task_id="c1"), lineage_epoch=EPOCH)["kind"] == "child"
 
 
-def test_strict_task_result_lookup_reads_facts_and_never_moves_a_file(tmp_path):
+def test_strict_task_result_lookup_reads_facts_and_never_writes(tmp_path, monkeypatch):
     from ouroboros.task_result_schema import SCHEMA_VERSION_KEY, TASK_RESULT_SCHEMA_VERSION
-    from ouroboros.task_results import task_result_path
+    from tests._store_shared import result_signature, unreadable_result
 
     def store(task_id, **fields):
-        path = task_result_path(tmp_path, task_id)
-        path.write_text(json.dumps({SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id,
-                                    "status": "completed", **fields}), encoding="utf-8")
-        return path
+        seed_result(tmp_path, task_id, {SCHEMA_VERSION_KEY: TASK_RESULT_SCHEMA_VERSION, "task_id": task_id,
+                                    "status": "completed", **fields})
 
     store("root0001")
     store("kid00001", parent_task_id="root0001", root_task_id="root0001", delegation_role="subagent")
-    broken = task_result_path(tmp_path, "bad00001")
-    broken.write_text("{not json", encoding="utf-8")
+    store("bad00001")
+    before = result_signature(tmp_path, "bad00001")
+    switch = unreadable_result(monkeypatch, "bad00001")  # the store cannot answer for this row
     lookup = task_lineage_lookup(tmp_path)
     assert lookup("root0001")["is_root_task"] is True
     assert lookup("kid00001")["parent_task_id"] == "root0001"
     assert lookup("bad00001") is None and lookup("gone0001") is None and lookup("") is None
-    assert broken.read_text(encoding="utf-8") == "{not json"  # strict read: no quarantine move
+    switch["on"] = False
+    assert result_signature(tmp_path, "bad00001") == before  # strict read: the row was never touched
     signed = {tid: row_author(_out(task_id=tid), pos=1, lineage_epoch=EPOCH, lineage_lookup=lookup)["kind"]
               for tid in ("root0001", "kid00001", "bad00001", "gone0001")}
     assert signed == {"root0001": "ouroboros", "kid00001": "child", "bad00001": "unattributed",

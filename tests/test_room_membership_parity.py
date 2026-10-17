@@ -18,14 +18,14 @@ from tests import _memory_inventory_shared as shared
 
 def _canonical(root):
     from ouroboros.project_dialogue import room_membership, source_refs_for_project
-    from ouroboros.projects_registry import all_task_bindings, list_reserved_projects
+    from ouroboros.projects_registry import list_reserved_projects, RoomResolver
 
     projects = {int(project["chat_id"]) for project in list_reserved_projects(root)}
-    bindings = all_task_bindings(root)
+    rooms = RoomResolver(root)
 
     def member(room: int):
         refs = source_refs_for_project(root, room) if room in projects else []
-        return room_membership(room, projects, refs, bindings)
+        return room_membership(room, projects, refs, rooms)
 
     return member
 

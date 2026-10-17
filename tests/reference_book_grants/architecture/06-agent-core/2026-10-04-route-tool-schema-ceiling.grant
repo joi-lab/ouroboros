@@ -1,3 +1,0 @@
-327
-A provider's physical ceiling on tool schemas per request is held at the Main round seam: core, meta and
-actor-loaded schemas stay, the overflow is left out under a notice naming it and stays callable.

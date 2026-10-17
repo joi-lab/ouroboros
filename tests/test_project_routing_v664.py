@@ -4,6 +4,7 @@ import pathlib
 import types
 
 import pytest
+from tests._store_shared import unreadable_result
 
 
 class _ImmediateThread:
@@ -43,7 +44,7 @@ def _ctx(tmp_path, *, pending=None, running=None, direct=None):
     )
 
 
-def test_project_single_pending_root_gets_zero_call_mailbox_delivery(tmp_path, monkeypatch):
+def test_project_single_pending_root_starts_a_new_head(tmp_path, monkeypatch):
     import server
     from ouroboros.owner_mailbox import drain_owner_messages
     from ouroboros.project_dialogue import latest_chat_annotations
@@ -87,14 +88,9 @@ def test_project_single_pending_root_gets_zero_call_mailbox_delivery(tmp_path, m
     monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
     server._process_bridge_updates(Bridge(), 0, ctx)
 
-    assert drain_owner_messages(tmp_path, "pending-root") == ["continue with the failing test"]
-    assert "direct" not in calls
-    assert calls[-1][1]["status"] == "delivered"
-    assert calls[-1][1]["target"] == "pending-root"
-    annotation = latest_chat_annotations(tmp_path)["owner-1"]
-    assert annotation["action"] == "mailbox_delivery"
-    assert annotation["target"] == "pending-root"
-    assert annotation["status"] == "delivered"
+    assert drain_owner_messages(tmp_path, "pending-root") == []
+    assert "direct" in calls
+    assert "owner-1" not in latest_chat_annotations(tmp_path)
 
 
 def test_project_fast_route_stages_attachment_in_actor_child_drive(tmp_path):
@@ -131,7 +127,8 @@ def test_project_fast_route_stages_attachment_in_actor_child_drive(tmp_path):
     assert "child-drive-readable" in _read_file(
         tool_ctx, manifest[0]["relpath"], root="artifact_store",
     )
-    assert notices and "status=staged" in notices[-1]
+    # A landed delivery publishes no row: the receipt the caller records carries the stashed report.
+    assert notices == [] and "status=staged" in metadata["_attachment_report"]
 
 
 def test_project_swarm_bypasses_single_root_mailbox_for_new_managed_root(tmp_path, monkeypatch):
@@ -242,7 +239,7 @@ def test_project_zero_call_followup_advances_active_fence_then_falls_through_whe
         "delegation_role": "root",
         "drive_root": str(tmp_path),
     }]
-    ctx = _ctx(tmp_path, pending=pending)
+    ctx = _ctx(tmp_path, running={root_id: {"task": pending[0]}})
     monkeypatch.setattr(queue_mod, "ACCEPTANCE_FENCES", {
         root_id: {
             "token": "f" * 32,
@@ -406,7 +403,7 @@ def test_main_inline_decision_has_no_predecision_annotation(tmp_path, monkeypatc
     assert len(calls) == 1
     metadata = calls[0][3]["task_metadata"]
     assert metadata["main_routing_manifest"]["projects"][0]["project_id"] == "racer"
-    assert metadata["routing_contract"]["on_uncertain_or_invalid_target"] == "needs_manual_target"
+    assert "on_uncertain_or_invalid_target" not in metadata["routing_contract"]
     assert latest_chat_annotations(tmp_path) == {}
     # Typing is the only wait affordance. An inline answer emits no typed routing
     # action, so the canonical user row must never gain a transient annotation.
@@ -436,14 +433,9 @@ def test_main_manifest_manual_options_include_project_roots_and_new_project_task
     metadata = server._decision_turn_metadata(ctx, 987654, "external-1", {})
 
     assert metadata["routing_contract"]["source_lane"] == "main"
-    options = metadata["routing_contract"]["manual_options"]
-    assert any(row.get("task_id") == "project-root" for row in options)
-    assert any(
-        row.get("action") == "new_task_in_project"
-        and row.get("project_id") == "racer"
-        and row.get("label") == "New task in Racer"
-        for row in options
-    )
+    assert "manual_options" not in metadata["routing_contract"]
+    assert {"start_task", "move_to_project", "tell_task"} <= set(metadata["routing_contract"]["valid_actions"])
+    assert "route_to_project" not in metadata["routing_contract"]["valid_actions"]
 
 
 def test_project_room_manual_options_are_room_scoped(tmp_path):
@@ -458,11 +450,7 @@ def test_project_room_manual_options_are_room_scoped(tmp_path):
 
     assert metadata["routing_contract"]["source_lane"] == "project"
     assert "main_routing_manifest" not in metadata
-    assert metadata["routing_contract"]["manual_options"] == [{
-        "action": "new_task_in_project",
-        "project_id": "racer",
-        "label": "New task in Project",
-    }]
+    assert "manual_options" not in metadata["routing_contract"]
 
 
 def test_project_room_decision_turn_carries_last_task_result_ground_truth(tmp_path):
@@ -509,158 +497,92 @@ def test_project_room_decision_turn_carries_last_task_result_ground_truth(tmp_pa
     assert "result" not in last and "RAW TEXT" not in str(last)
 
 
-@pytest.mark.parametrize("shape", ["group_crosses_the_window", "group_in_the_self_heal_tail", "equal_ts", "empty_ts"])
-def test_project_last_task_result_tie_order_is_total(tmp_path, monkeypatch, shape):
-    """The tie order is TOTAL: an equal-mtime group that crosses the 64-entry
-    search window is read to its end, a group met in the self-heal tail obeys
-    the same rule, a present `ts` beats an absent one, and equal `ts` falls
-    back to the task id deterministically. The production order is (mtime,
-    file name), so the file NAMES are chosen to sort adversely — the older or
-    key-less row ahead of the newer one — and the listing order is irrelevant."""
-    import json
-    import os
-
+@pytest.mark.parametrize("shape", ["many_foreign_rows", "equal_ts", "empty_ts"])
+def test_project_last_task_result_tie_order_is_total(tmp_path, shape):
+    """The order is TOTAL and the store's own: the project's root rows newest first by the
+    durable ``ts``, a present ``ts`` beats an absent one, and equal ``ts`` falls back to the
+    task id deterministically — however many newer foreign rows exist, and whatever order the
+    ids sort in (the older or key-less row is named to sort ahead of the newer one)."""
     import server
-    from ouroboros import task_results as task_results_module
-    from ouroboros.projects_registry import create_project, update_project
-    from ouroboros.task_results import task_results_dir, write_task_result
+    from ouroboros.projects_registry import create_project, get_project, update_project
+    from ouroboros.task_results import write_task_result
+    from ouroboros.task_store import patch_document
 
     create_project(tmp_path, "racer", name="Racer")
-    if shape == "group_crosses_the_window":
-        # Sorted by name: a00..a62 (foreign), y_old at index 63, z_new at 64 —
-        # the newer row is the FIRST entry past the window.
-        foreign = [f"a{i:02d}" for i in range(63)]
-        for name in foreign:
+    if shape == "many_foreign_rows":
+        for name in (f"a{i:02d}" for i in range(64)):
             write_task_result(tmp_path, name, "completed", project_id="boat", objective="c", ts="2026-08-10T00:00:03Z")
         write_task_result(tmp_path, "y_old", "completed", project_id="racer", objective="a", ts="2026-08-10T00:00:01Z")
         write_task_result(tmp_path, "z_new", "completed", project_id="racer", objective="b", ts="2026-08-10T00:00:02Z")
-        listing = foreign + ["y_old", "z_new"]
-        expected = "z_new"
-    elif shape == "group_in_the_self_heal_tail":
-        # Sorted by name: a00..a63 (foreign) fill the window; both project rows
-        # are met only by the self-heal tail, the older one first.
-        foreign = [f"a{i:02d}" for i in range(64)]
-        for name in foreign:
-            write_task_result(tmp_path, name, "completed", project_id="boat", objective="c", ts="2026-08-10T00:00:03Z")
-        write_task_result(tmp_path, "y_old", "completed", project_id="racer", objective="a", ts="2026-08-10T00:00:01Z")
-        write_task_result(tmp_path, "z_new", "completed", project_id="racer", objective="b", ts="2026-08-10T00:00:02Z")
-        listing = foreign + ["y_old", "z_new"]
         expected = "z_new"
     elif shape == "equal_ts":
         write_task_result(tmp_path, "a", "completed", project_id="racer", objective="a", ts="2026-08-10T00:00:01Z")
         write_task_result(tmp_path, "b", "completed", project_id="racer", objective="b", ts="2026-08-10T00:00:01Z")
-        listing = ["a", "b"]
-        expected = "b"  # equal ts: the greater task id, whatever the listing order
+        expected = "b"  # equal ts: the greater task id
     else:
-        # Sorted by name the key-less row comes FIRST; the stamped row must win.
         write_task_result(tmp_path, "b_stamped", "completed", project_id="racer", objective="a", ts="2026-08-10T00:00:01Z")
         write_task_result(tmp_path, "a_keyless", "completed", project_id="racer", objective="b", ts="2026-08-10T00:00:02Z")
-        keyless = task_results_dir(tmp_path, create=False) / "a_keyless.json"
-        stripped = json.loads(keyless.read_text(encoding="utf-8"))
-        for key in ("ts", "updated_at"):  # the store always stamps both; a foreign/legacy row may lack them
-            stripped.pop(key, None)
-        keyless.write_text(json.dumps(stripped), encoding="utf-8")
-        listing = ["a_keyless", "b_stamped"]
+        # The writer always stamps both; a foreign/legacy row may lack them.
+        patch_document(tmp_path, "a_keyless", lambda row: {k: v for k, v in row.items() if k not in ("ts", "updated_at")})
         expected = "b_stamped"  # a present ts beats an absent one
-    real_dir = task_results_dir(tmp_path, create=False)
-    tick = 1_700_000_000 * 10**9
-    for path in real_dir.glob("*.json"):
-        os.utime(path, ns=(tick, tick))  # every result in ONE tie group
 
-    class _Listing:  # the real directory with a controlled listing order
-        def __init__(self, order):
-            self.paths = [real_dir / f"{name}.json" for name in order]
-
-        def glob(self, pattern):
-            return iter(self.paths)
-
-        def __truediv__(self, name):
-            return real_dir / name
-
-    from ouroboros.projects_registry import get_project
-
-    for order in (listing, list(reversed(listing))):
-        update_project(tmp_path, "racer", last_task_result_id="")  # the scan, not the pointer, is under test
-        monkeypatch.setattr(task_results_module, "task_results_dir", lambda root, create=True, order=order: _Listing(order))
-        assert server._latest_project_task_result(_ctx(tmp_path), "racer")["task_id"] == expected
-        # The selected row — never an arbitrary tied one — became the durable pointer.
-        assert get_project(tmp_path, "racer")["last_task_result_id"] == expected
+    update_project(tmp_path, "racer", last_task_result_id="")  # the scan, not the pointer, is under test
+    assert server._latest_project_task_result(_ctx(tmp_path), "racer")["task_id"] == expected
+    # The selected row — never an arbitrary tied one — became the durable pointer.
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == expected
 
 
 def test_project_last_task_result_uncertainty_never_persists_the_pointer(tmp_path, monkeypatch):
-    """A result file whose stat (or JSON) cannot be read might be the project's
-    NEWER result: the scan still answers best-effort for this call, but the
-    durable pointer is not written — a later lookup must see the file once it
-    is readable again instead of the frozen older row."""
+    """A row the store cannot answer for might be the project's NEWER result: the lookup is
+    refused as unknown (the caller logs and offers nothing) and the durable pointer is not
+    written — a later lookup must see the row once it is readable again instead of a frozen
+    older row."""
     import server
-    from ouroboros import task_results as task_results_module
     from ouroboros.projects_registry import create_project, get_project
-    from ouroboros.task_results import task_results_dir, write_task_result
+    from ouroboros.store import StoreError
+    from ouroboros.task_results import write_task_result
 
     create_project(tmp_path, "racer", name="Racer")
     write_task_result(tmp_path, "old1", "completed", project_id="racer", objective="a", ts="2026-08-10T00:00:01Z")
     write_task_result(tmp_path, "new1", "completed", project_id="racer", objective="b", ts="2026-08-10T00:00:02Z")
-    real_dir = task_results_dir(tmp_path, create=False)
-
-    class _Unstattable:  # readable JSON whose stat fails (a transient filesystem error)
-        def __init__(self, real):
-            self._real = real
-            self.name = real.name
-
-        def stat(self):
-            raise OSError("transient stat failure")
-
-        def __fspath__(self):
-            return str(self._real)
-
-        def __str__(self):
-            return str(self._real)
-
-    listing = [real_dir / "old1.json", _Unstattable(real_dir / "new1.json")]
-    monkeypatch.setattr(task_results_module, "task_results_dir",
-                        lambda root, create=True: types.SimpleNamespace(glob=lambda pattern: iter(listing),
-                                                                         __truediv__=lambda self, name: real_dir / name))
+    unreadable = unreadable_result(monkeypatch, "new1")
     ctx = _ctx(tmp_path)
-    assert server._latest_project_task_result(ctx, "racer")["task_id"] == "old1"  # best effort for THIS call
+    with pytest.raises(StoreError):
+        server._latest_project_task_result(ctx, "racer")
     assert not get_project(tmp_path, "racer").get("last_task_result_id")  # nothing frozen
-    monkeypatch.undo()
+    unreadable["on"] = False
     assert server._latest_project_task_result(ctx, "racer")["task_id"] == "new1"  # readable again: the truth wins
     assert get_project(tmp_path, "racer")["last_task_result_id"] == "new1"
 
 
 def test_project_last_task_result_lookup_is_bounded(tmp_path, monkeypatch):
-    """Finding 1: the one-row query parses newest-first by mtime and STOPS at
-    the first project match — never a full task_results replay per interaction
+    """Finding 1: the one-row query selects the project's root ids newest-first in the store
+    and STOPS at the first admissible row — never a full task-result replay per interaction
     (projection over replay)."""
-    import os
-
     import server
-    import ouroboros.utils as utils
+    from ouroboros import task_results as task_results_module
     from ouroboros.projects_registry import create_project
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
 
     create_project(tmp_path, "racer", name="Racer")
-    write_task_result(tmp_path, "oldracer1", "completed", project_id="racer", objective="v1")
-    write_task_result(tmp_path, "newracer1", "completed", project_id="racer", objective="v2")
-    write_task_result(tmp_path, "boat1", "completed", project_id="boat", objective="x")
-    # Deterministic mtime order regardless of filesystem timestamp granularity.
-    for name, mtime in (("oldracer1", 100), ("newracer1", 200), ("boat1", 300)):
-        os.utime(task_result_path(tmp_path, name, create=False), (mtime, mtime))
+    write_task_result(tmp_path, "oldracer1", "completed", project_id="racer", objective="v1", ts="2026-08-10T00:00:01Z")
+    write_task_result(tmp_path, "newracer1", "completed", project_id="racer", objective="v2", ts="2026-08-10T00:00:02Z")
+    write_task_result(tmp_path, "boat1", "completed", project_id="boat", objective="x", ts="2026-08-10T00:00:03Z")
 
     opened: list = []
-    real_read = utils.read_json_dict
+    real_read = task_results_module.read_document
 
-    def _counting_read(path):
-        opened.append(path.stem)
-        return real_read(path)
+    def _counting_read(root, task_id):
+        opened.append(str(task_id))
+        return real_read(root, task_id)
 
-    monkeypatch.setattr(utils, "read_json_dict", _counting_read)
+    monkeypatch.setattr(task_results_module, "read_document", _counting_read)  # load_task_result's body read
 
     row = server._latest_project_task_result(_ctx(tmp_path), "racer")
 
     assert str(row.get("task_id") or row.get("id")) == "newracer1"
-    # Newest-first, stop at the match: boat1 examined, oldracer1 NEVER opened.
-    assert opened == ["boat1", "newracer1"]
+    # The project's newest root only: boat1 is filtered in the store, oldracer1 NEVER opened.
+    assert opened == ["newracer1"]
 
 
 def test_main_manifest_carries_working_dir_and_workspace_facts(tmp_path):
@@ -693,22 +615,16 @@ def test_main_manifest_offers_owner_roots_not_swarm_children(tmp_path):
     roots and a result the owner had just read could not be continued from. Children
     are skipped and counted as their OWN omission; the final_results count keeps its
     cap-only meaning."""
-    import os
-
     import server
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
 
     for index in range(16):
-        tid = f"root{index:02d}"
-        write_task_result(tmp_path, tid, "completed", objective=f"owner work {index}",
+        write_task_result(tmp_path, f"root{index:02d}", "completed", objective=f"owner work {index}",
                           ts=f"2026-08-10T00:00:{index:02d}Z")
-        os.utime(task_result_path(tmp_path, tid, create=False), (100 + index, 100 + index))
     for index in range(2):
-        tid = f"child{index}"
-        write_task_result(tmp_path, tid, "completed", objective="helper work",
+        write_task_result(tmp_path, f"child{index}", "completed", objective="helper work",
                           parent_task_id="root15", root_task_id="root15",
                           delegation_role="subagent", ts=f"2026-08-11T00:00:{index:02d}Z")
-        os.utime(task_result_path(tmp_path, tid, create=False), (900 + index, 900 + index))
 
     manifest = server._main_routing_manifest(_ctx(tmp_path))
     offered = [row["task_id"] for row in manifest["final_results"]]
@@ -725,22 +641,16 @@ def test_omissions_count_children_ordered_after_the_cap(tmp_path):
     """The child count must not be a by-product of the capped loop: children older
     than the 16th root were skipped but counted nowhere, and the cap number silently
     absorbed them (A26 requires the two omissions to stay separate)."""
-    import os
-
     import server
-    from ouroboros.task_results import task_result_path, write_task_result
+    from ouroboros.task_results import write_task_result
 
     for index in range(17):
-        tid = f"root{index:02d}"
-        write_task_result(tmp_path, tid, "completed", objective=f"owner work {index}",
+        write_task_result(tmp_path, f"root{index:02d}", "completed", objective=f"owner work {index}",
                           ts=f"2026-08-20T00:00:{index:02d}Z")
-        os.utime(task_result_path(tmp_path, tid, create=False), (900 + index, 900 + index))
     for index in range(2):
-        tid = f"child{index}"
-        write_task_result(tmp_path, tid, "completed", objective="helper work",
+        write_task_result(tmp_path, f"child{index}", "completed", objective="helper work",
                           parent_task_id="root16", root_task_id="root16",
                           delegation_role="subagent", ts=f"2026-08-01T00:00:{index:02d}Z")
-        os.utime(task_result_path(tmp_path, tid, create=False), (100 + index, 100 + index))
 
     manifest = server._main_routing_manifest(_ctx(tmp_path))
 
@@ -749,65 +659,60 @@ def test_omissions_count_children_ordered_after_the_cap(tmp_path):
     assert manifest["omissions"]["final_results"] == 1  # exactly the root cut by the cap
 
 
-def test_project_room_direct_chat_root_is_admitted_as_a_predecessor(tmp_path):
-    """The second half of the traced refusal (I29): a project room's direct-chat
-    root left the per-project pointer empty, so the room's own decision turn had no
-    predecessor to offer. With the pointer stamped, the promote admits it."""
+def _recent_dialogue(tmp_path):
     import server
-    from ouroboros.projects_registry import create_project
-    from ouroboros.task_results import write_task_result
-    from ouroboros.tools.control_routing import _attach_predecessor_authority_from_metadata
-    from ouroboros.tools.project_journal import record_project_last_result
 
-    project = create_project(tmp_path, "racer", name="Racer")
-    write_task_result(tmp_path, "roomturn1", "completed", project_id="racer",
-                      objective="answer in the room", ts="2026-08-10T00:00:01Z")
-    record_project_last_result("racer", "roomturn1", tmp_path)
-
-    metadata = server._decision_turn_metadata(
-        _ctx(tmp_path), int(project["chat_id"]), "room-1", {"project_id": "racer"},
-    )
-    assert metadata["project_last_task_result"]["task_id"] == "roomturn1"
-
-    evt: dict = {}
-    refusal = _attach_predecessor_authority_from_metadata(
-        types.SimpleNamespace(task_metadata=metadata, drive_root=tmp_path,
-                              budget_drive_root=str(tmp_path)),
-        evt, "roomturn1",
-    )
-    assert refusal == ""
-    assert evt["predecessor_task_id"] == "roomturn1"
+    return server._main_routing_manifest(_ctx(tmp_path))["recent_canonical_dialogue"]
 
 
-def test_promoting_from_an_owner_root_still_succeeds_after_the_child_filter(tmp_path):
-    """CHECKLISTS item 21 positive path: the narrowing removes CHILDREN from the
-    predecessor window, and the owner's own root result stays fully promotable
-    through the same manifest -> authority route."""
-    import server
-    from ouroboros.projects_registry import create_project
-    from ouroboros.task_results import write_task_result
-    from ouroboros.tools.control_routing import _attach_predecessor_authority_from_metadata
+def test_main_window_shows_the_owners_quiz_choice_past_a_long_question(tmp_path):
+    """The window clipped each row's raw text at 500 chars, and a quiz answer's text is
+    the host frame that puts the whole question before the choice: past a long question
+    the owner's choice was always cut. The window now renders a row as memory does."""
+    from ouroboros.owner_quiz import quiz_answer_frame
+    from supervisor.message_bus import log_chat
 
-    create_project(tmp_path, "racer", name="Racer")  # keeps the Main manifest non-empty
-    write_task_result(tmp_path, "ownerroot1", "completed", objective="the owner's work",
-                      ts="2026-08-10T00:00:01Z")
-    write_task_result(tmp_path, "helper1", "completed", objective="helper work",
-                      parent_task_id="ownerroot1", root_task_id="ownerroot1",
-                      delegation_role="subagent", ts="2026-08-10T00:00:02Z")
+    block = {
+        "quiz_id": "q-tower", "question": "Which way for the tower? " + "context " * 80,
+        "options": ["Keep the tower and repaint it", "Rebuild from scratch"],
+        "asked_at": "2026-10-05T10:00:00Z", "answered_at": "2026-10-05T10:05:00Z",
+        "answered_index": 0, "comment": "keep it, the base is solid; " * 24, "state": "answered",
+    }
+    frame = quiz_answer_frame(block, 0, block["comment"])
+    assert frame.index("The owner chose option 1") > 500  # past the old clip
+    # The row exactly as the answer door writes it (gateway.task_decision).
+    log_chat("system", 1, 0, frame, ts=block["answered_at"], source="owner_quiz_answer",
+             task_id="root-q", client_message_id="quiz_answer:root-q:q-tower",
+             record_type="quiz_answer", quiz=dict(block), drive_root=tmp_path)
 
-    metadata = server._decision_turn_metadata(_ctx(tmp_path), 1, "msg-1", {})
-    offered = [row["task_id"] for row in metadata["main_routing_manifest"]["final_results"]]
-    assert offered == ["ownerroot1"]
+    [row] = _recent_dialogue(tmp_path)
 
-    evt: dict = {}
-    refusal = _attach_predecessor_authority_from_metadata(
-        types.SimpleNamespace(task_metadata=metadata, drive_root=tmp_path,
-                              budget_drive_root=str(tmp_path)),
-        evt, "ownerroot1",
-    )
-    assert refusal == ""
-    assert evt["predecessor_task_id"] == "ownerroot1"
-    assert evt["predecessor_authority_source"]["tool"] == "get_task_result"
+    assert len(block["comment"]) > 500
+    assert row["text"] == (
+        f'[answer q-tower] chose (1) Keep the tower and repaint it — "{block["comment"]}"')
+    assert (row["direction"], row["task_id"]) == ("system", "root-q")
+
+
+def test_main_window_keeps_people_whole_and_bounds_every_other_row(tmp_path):
+    """People's words ride whole, as memory keeps them; a child's long report keeps the
+    disclosed bound, its omission note inside the 500 chars; a row without text stays out."""
+    from supervisor.message_bus import log_chat
+
+    owner = "w" * 595 + " end."
+    lineage = {"subagent_task_id": "child-1", "delegation_role": "subagent",
+               "parent_task_id": "root-1", "root_task_id": "root-1"}
+    log_chat("in", 1, 1, owner, source="web", client_message_id="owner-600", drive_root=tmp_path)
+    log_chat("out", 1, 0, "R" * 2000, task_id="child-1", message_meta=lineage, drive_root=tmp_path)
+    log_chat("out", 1, 0, "", task_id="root-1", drive_root=tmp_path)
+    log_chat("system", 1, 0, "", task_id="root-1", record_type="task_summary", drive_root=tmp_path)
+
+    rows = _recent_dialogue(tmp_path)
+
+    assert [(row["direction"], row["task_id"]) for row in rows] == [("in", ""), ("out", "child-1")]
+    assert rows[0]["text"] == owner and len(owner) == 600
+    report = rows[1]["text"]
+    assert len(report) <= 500 and report.startswith("R" * 400)
+    assert report.endswith("OMISSION NOTE: truncated at 500 chars; original length 2000")
 
 
 def test_project_routing_facts_keep_host_scope_when_registry_recheck_is_unavailable(
@@ -828,7 +733,7 @@ def test_project_routing_facts_keep_host_scope_when_registry_recheck_is_unavaila
 
     assert metadata["routing_contract"]["source_lane"] == "project"
     assert metadata["routing_contract"]["valid_actions"] == [
-        "answer_inline", "steer_task", "promote_chat_to_task", "route_to_project", "needs_manual_target",
+        "answer_inline", "tell_task", "start_task", "move_to_project",
     ]
     assert "main_routing_manifest" not in metadata
 
@@ -948,7 +853,7 @@ def test_routing_ack_carries_event_time_human_label_without_replacing_target(mon
     bridge.send_routing_ack(
         7,
         client_message_id="m-labelled",
-        action="steer_task",
+        action="tell_task",
         target="opaque-task-id",
         target_label="Проект 🚀 › Исправить тесты",
         status="delivered",
@@ -1112,10 +1017,15 @@ def test_project_completion_enqueues_once_for_root_and_never_for_child_or_direct
         "system_type": "project_completion_summary",
         "delivery_id": "project-completion:root-project",
         "progress_meta": {
+            "outcome_axes": {"schema_version": 1, "lifecycle": {"status": "completed"},
+                "execution": {"status": "ok", "reason_code": ""}, "artifacts": {"status": "not_applicable"},
+                "objective": {"status": "not_evaluated", "source": "none"},
+                "review": {"status": "skipped", "trigger": "not_evaluated"}},
             "project_id": "launch",
             "project_name": "Launch 🚀",
             "target_label": "Launch 🚀 › Ship release",
             "status": "completed",
+            "completion_notice": {"neutral": False, "detail": "", "phase": "done", "salvage": ""},
             "terminal_time": {"v": 1, "occurred_at": None, "source": "unknown",
                               "attempt": dict.fromkeys(("task_attempt", "_attempt", "started_at",
                                                         "metadata_attempt", "metadata_task_attempt"))},
@@ -1190,7 +1100,7 @@ def test_project_completion_duplicate_outbox_events_deliver_one_main_row(tmp_pat
     )
     queued = []
     monkeypatch.setattr(
-        workers, "get_event_q", lambda: types.SimpleNamespace(put=queued.append),
+        workers, "get_event_q", lambda **_kw: types.SimpleNamespace(put=queued.append),
     )
     events._DELIVERED_MESSAGE_IDS.clear()
     task = {"id": "stable-root", "project_id": project["id"], "title": "Finish"}
@@ -1217,38 +1127,3 @@ def test_project_completion_duplicate_outbox_events_deliver_one_main_row(tmp_pat
     assert sent[0][0][0] == 1
     assert sent[0][1]["system_type"] == "project_completion_summary"
     assert sent[0][1]["progress_meta"]["target_label"] == "Stable Project › Finish"
-
-
-def test_manual_target_event_persists_concrete_options_in_latest_annotation(
-    tmp_path, monkeypatch,
-):
-    from ouroboros.project_dialogue import latest_chat_annotations
-    from supervisor import message_bus
-    from supervisor.events import _handle_routing_manual_target
-
-    ws_payloads = []
-    bridge = message_bus.LocalChatBridge()
-    bridge._broadcast_fn = ws_payloads.append
-    monkeypatch.setattr(message_bus, "publish_event", lambda *_a, **_k: None)
-    ctx = types.SimpleNamespace(DRIVE_ROOT=tmp_path, bridge=bridge)
-    event = {
-        "chat_id": 9,
-        "client_message_id": "owner-choice-1",
-        "requested_target": "ghost",
-        "options": [
-            {"action": "steer_task", "task_id": "task-1", "title": "Fix tests"},
-            {"action": "new_task_in_project", "project_id": "racer", "label": "New task in Project"},
-        ],
-    }
-
-    _handle_routing_manual_target(event, ctx)
-
-    payload = ws_payloads[-1]
-    assert payload["type"] == "message_annotation"
-    assert payload["status"] == "needs_manual_target"
-    assert payload["options"][0]["label"] == "Fix tests"
-    assert payload["options"][1] == event["options"][1]
-    assert payload["suppress_bubble"] is True
-    sidecar = latest_chat_annotations(tmp_path)["owner-choice-1"]
-    assert set(sidecar) >= {"client_message_id", "action", "target", "status"}
-    assert sidecar["options"] == payload["options"]

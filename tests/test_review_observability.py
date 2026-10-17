@@ -31,6 +31,13 @@ def _make_ctx(tmp_path: pathlib.Path) -> MagicMock:
     # materialises a literal ``MagicMock/mock.drive_root.__truediv__()...`` dir
     # in the repo CWD (then committed by a careless ``git add -A``).
     ctx.drive_root = str(tmp_path)
+    # Match ToolContext's absent canonical override; an auto-Mock here becomes
+    # a truthy path ahead of drive_root in the real review-error log writer.
+    ctx.budget_drive_root = ""
+    # A real ToolContext has no reconcile flag until the commit gate arms one
+    # (``tools/git.py``). Left unset, the auto-MagicMock is truthy and the commit
+    # review takes the reconcile-only path over a roster of mocks instead of the pool.
+    ctx._review_reconcile_only = False
     ctx.task_id = "test-task"
     ctx._review_history = []
     ctx._review_iteration_count = 0
@@ -77,6 +84,8 @@ def test_parse_failure_distinct_from_pass(tmp_path):
     # raw_text must be preserved in full — not truncated
     assert triad_raw[0]["raw_text"] == bad_json
     assert triad_raw[0]["parsed_items"] == []
+    [event] = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text().splitlines()]
+    assert (event["type"], event["model"], event["status"]) == ("review_model_error", "model-a", "parse_failure")
 
 
 def test_pass_verdict_distinct_from_parse_failure(tmp_path):
@@ -194,22 +203,18 @@ def test_all_three_models_ok_no_degraded(tmp_path):
 
 # ── Test 6: parse_failure on scope output ─────────────────────────────────────
 
-def test_scope_parse_failure_status():
-    """Unparseable scope LLM output must produce status='parse_failure' with raw_text preserved."""
-    from ouroboros.tools.scope_review import ScopeReviewResult
+def test_coupling_seat_parse_failure_status():
+    """Unparseable output of a seat asked the coupling question must produce
+    status='parse_failure' with raw_text preserved — never a PASS of Part 2."""
+    from ouroboros.triad_review import parse_seat_answers
 
     bad_raw = "Sorry, I cannot review this at this time."
-    result = ScopeReviewResult(
-        blocked=True,
-        block_message="⚠️ SCOPE_REVIEW_BLOCKED: Could not parse...",
-        status="parse_failure",
-        raw_text=bad_raw,
-        model_id="some-scope-model",
-        prompt_chars=10000,
-    )
-    assert result.status == "parse_failure"
-    assert result.raw_text == bad_raw
-    assert result.blocked is True
+    parsed = parse_seat_answers({"results": [{"model": "some-model", "slot_id": "s1", "text": bad_raw}]},
+                                {"s1": ("change", "coupling")})
+    record = parsed.actor_records[0].to_dict()
+    assert record["status"] == "parse_failure"
+    assert record["raw_text"] == bad_raw
+    assert record["parts"] == ["change", "coupling"] and parsed.findings == []
 
 
 # ── Test 7: save/load roundtrip ───────────────────────────────────────────────
@@ -301,22 +306,16 @@ def test_collect_review_findings_returns_4_tuple(tmp_path):
 
 # ── Test 9: ctx._last_triad_raw_results reset per attempt ────────────────────
 
-def test_scope_history_entry_preserves_status_for_parse_failure():
-    """_scope_history_entry must preserve status='parse_failure' so it is
+def test_coupling_history_entry_preserves_status_for_parse_failure():
+    """_coupling_history_entry must preserve status='parse_failure' so it is
     not misread as clean PASS on the retry path (empty findings != PASS)."""
-    from ouroboros.tools.parallel_review import _scope_history_entry
-    from ouroboros.tools.scope_review import ScopeReviewResult
+    from ouroboros.review_ledger import CouplingOutcome
+    from ouroboros.tools.parallel_review import _coupling_history_entry
 
     # A parse_failure result has no findings (they couldn't be parsed)
     # but must NOT be summarised as "(no findings)" — which would look like PASS
-    result = ScopeReviewResult(
-        blocked=True,
-        block_message="SCOPE_REVIEW_BLOCKED: parse failure",
-        critical_findings=[],
-        advisory_findings=[],
-        status="parse_failure",
-    )
-    entry = _scope_history_entry(result)
+    result = CouplingOutcome(blocked=True, status="parse_failure")
+    entry = _coupling_history_entry(result)
     assert entry["status"] == "parse_failure", "status must be preserved in history entry"
     assert entry["summary"] != "(no findings)", (
         "parse_failure with no findings must NOT summarise as '(no findings)' — "
@@ -325,36 +324,24 @@ def test_scope_history_entry_preserves_status_for_parse_failure():
     assert "parse_failure" in entry["summary"], "summary must expose the status signal"
 
 
-def test_scope_history_entry_budget_exceeded_summary():
+def test_coupling_history_entry_budget_exceeded_summary():
     """budget_exceeded status must appear in the summary even with no findings."""
-    from ouroboros.tools.parallel_review import _scope_history_entry
-    from ouroboros.tools.scope_review import ScopeReviewResult
+    from ouroboros.review_ledger import CouplingOutcome
+    from ouroboros.tools.parallel_review import _coupling_history_entry
 
-    result = ScopeReviewResult(
-        blocked=False,
-        block_message="",
-        critical_findings=[],
-        advisory_findings=[],
-        status="budget_exceeded",
-    )
-    entry = _scope_history_entry(result)
+    result = CouplingOutcome(blocked=False, status="budget_exceeded")
+    entry = _coupling_history_entry(result)
     assert entry["status"] == "budget_exceeded"
     assert "budget_exceeded" in entry["summary"]
 
 
-def test_scope_history_entry_clean_pass_keeps_no_findings_label():
+def test_coupling_history_entry_clean_pass_keeps_no_findings_label():
     """A genuine responded+no-findings result keeps '(no findings)' summary."""
-    from ouroboros.tools.parallel_review import _scope_history_entry
-    from ouroboros.tools.scope_review import ScopeReviewResult
+    from ouroboros.review_ledger import CouplingOutcome
+    from ouroboros.tools.parallel_review import _coupling_history_entry
 
-    result = ScopeReviewResult(
-        blocked=False,
-        block_message="",
-        critical_findings=[],
-        advisory_findings=[],
-        status="responded",
-    )
-    entry = _scope_history_entry(result)
+    result = CouplingOutcome(verdict="PASS", blocked=False, status="responded")
+    entry = _coupling_history_entry(result)
     assert entry["status"] == "responded"
     assert entry["summary"] == "(no findings)"
 
@@ -370,7 +357,7 @@ def test_scope_history_section_does_not_label_budget_exceeded_as_passed():
     ``PASSED`` because the renderer derived the label purely from
     ``blocked=False`` — indistinguishable from a genuine clean PASS.
     """
-    from ouroboros.tools.scope_review import _build_scope_history_section
+    from ouroboros.tools.review_brief_coupling import build_coupling_history_section
 
     history = [{
         "blocked": False,
@@ -379,7 +366,7 @@ def test_scope_history_section_does_not_label_budget_exceeded_as_passed():
         "critical_findings": [],
         "advisory_findings": [],
     }]
-    section = _build_scope_history_section(history)
+    section = build_coupling_history_section(history)
     # Extract just the "Round 1:" label line
     round1_line = next(
         (ln for ln in section.splitlines() if ln.startswith("Round 1:")),
@@ -397,7 +384,7 @@ def test_scope_history_section_does_not_label_budget_exceeded_as_passed():
 def test_scope_history_section_does_not_label_omitted_as_passed():
     """The rendered history section must NOT show ``PASSED`` for a
     ``status='omitted'`` sentinel entry."""
-    from ouroboros.tools.scope_review import _build_scope_history_section
+    from ouroboros.tools.review_brief_coupling import build_coupling_history_section
 
     history = [{
         "blocked": False,
@@ -406,7 +393,7 @@ def test_scope_history_section_does_not_label_omitted_as_passed():
         "critical_findings": [],
         "advisory_findings": [],
     }]
-    section = _build_scope_history_section(history)
+    section = build_coupling_history_section(history)
     round1_line = next(
         (ln for ln in section.splitlines() if ln.startswith("Round 1:")),
         "",
@@ -424,7 +411,7 @@ def test_scope_history_section_does_not_label_parse_failure_as_passed():
     ``blocked=True`` by _scope_history_entry for parse_failure results,
     the renderer must also guard against the degenerate case where
     upstream code produced blocked=False + status=parse_failure."""
-    from ouroboros.tools.scope_review import _build_scope_history_section
+    from ouroboros.tools.review_brief_coupling import build_coupling_history_section
 
     # Degenerate-but-guarded case: blocked=False + status=parse_failure
     history = [{
@@ -434,7 +421,7 @@ def test_scope_history_section_does_not_label_parse_failure_as_passed():
         "critical_findings": [],
         "advisory_findings": [],
     }]
-    section = _build_scope_history_section(history)
+    section = build_coupling_history_section(history)
     round1_line = next(
         (ln for ln in section.splitlines() if ln.startswith("Round 1:")),
         "",
@@ -450,7 +437,7 @@ def test_scope_history_section_labels_genuine_pass_as_passed():
     """A genuine ``responded`` + ``blocked=False`` + no findings entry MUST
     still render as ``PASSED`` so the reviewer can distinguish it from
     degraded states."""
-    from ouroboros.tools.scope_review import _build_scope_history_section
+    from ouroboros.tools.review_brief_coupling import build_coupling_history_section
 
     history = [{
         "blocked": False,
@@ -459,7 +446,7 @@ def test_scope_history_section_labels_genuine_pass_as_passed():
         "critical_findings": [],
         "advisory_findings": [],
     }]
-    section = _build_scope_history_section(history)
+    section = build_coupling_history_section(history)
     round1_line = next(
         (ln for ln in section.splitlines() if ln.startswith("Round 1:")),
         "",
@@ -472,7 +459,7 @@ def test_scope_history_section_labels_genuine_pass_as_passed():
 
 def test_scope_history_section_labels_blocked_as_blocked():
     """A ``blocked=True`` entry must render as ``BLOCKED`` regardless of status."""
-    from ouroboros.tools.scope_review import _build_scope_history_section
+    from ouroboros.tools.review_brief_coupling import build_coupling_history_section
 
     history = [{
         "blocked": True,
@@ -481,7 +468,7 @@ def test_scope_history_section_labels_blocked_as_blocked():
         "critical_findings": [{"item": "some_item"}],
         "advisory_findings": [],
     }]
-    section = _build_scope_history_section(history)
+    section = build_coupling_history_section(history)
     round1_line = next(
         (ln for ln in section.splitlines() if ln.startswith("Round 1:")),
         "",
@@ -499,23 +486,26 @@ def test_scope_history_section_labels_blocked_as_blocked():
 # coverage is redundant.
 
 
-def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path):
-    """ctx._last_triad_raw_results must be reset at start of each _run_unified_review call.
-
-    We verify by pre-seeding stale data then running a review that completes
-    with mocked LLM output (no findings). The stale data from the previous
-    attempt must be gone — replaced by fresh actor records from this run.
-    """
+def _run_unified_review_with_one_fresh_seat(tmp_path, monkeypatch, *, pool: bool):
+    """One ``_run_unified_review`` over a ctx that still carries a prior attempt's actor
+    record. ``pool=True`` puts one marked api seat (``fresh-model``) in the environment catalog
+    so the wave is dispatched to the mocked fan-out; ``pool=False`` leaves the catalog malformed,
+    so no seat can be built (an empty pool would run the Main seat)."""
     from ouroboros.tools import review as review_mod
+    from tests.review_pool_rosters import pool_roster, pool_seat, set_review_pool
 
+    if pool:
+        set_review_pool(monkeypatch, pool_roster(pool_seat("fresh-seat", "fresh-model")))
+        # The synthetic model has no remote capability catalog entry.
+        monkeypatch.setattr(review_mod, "reviewer_context_window", lambda *a, **kw: 1_000_000)
+    else:
+        set_review_pool(monkeypatch, "{broken")
     ctx = _make_ctx(tmp_path)
     # Pre-seed stale data simulating a prior attempt
     ctx._last_triad_raw_results = [
         {"model_id": "stale-model", "status": "responded", "raw_text": "stale data",
          "parsed_items": [], "tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0}
     ]
-
-    # Return a staged diff so function proceeds past the empty-diff guard
     pass_items = json.dumps([
         {"item": "bible_compliance", "verdict": "PASS", "severity": "critical", "reason": "OK"}
     ])
@@ -525,24 +515,77 @@ def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path):
              "tokens_in": 10, "tokens_out": 5, "cost_estimate": 0.001}
         ]
     })
-
+    fan_out = MagicMock(return_value=mock_review_output)
+    # Return a staged diff so function proceeds past the empty-diff guard
     with patch.object(review_mod, "run_cmd", return_value="some diff content"), \
          patch("ouroboros.tools.review_binary_context.capture_staged_diff",
                return_value="some diff content"), \
-         patch.object(review_mod, "_handle_multi_model_review", return_value=mock_review_output), \
+         patch.object(review_mod, "_handle_multi_model_review", fan_out), \
          patch.object(review_mod, "_load_checklist_section", return_value="## checklist"), \
          patch.object(review_mod, "_preflight_check", return_value=None), \
          patch.object(review_mod, "load_governance_doc", return_value=""), \
          patch("ouroboros.tools.review_helpers.build_touched_file_pack",
                return_value=("(files)", [])):
         review_mod._run_unified_review(ctx, "test commit")
+    return ctx, fan_out
 
+
+def test_last_triad_raw_results_reset_at_start_of_run_unified_review(tmp_path, monkeypatch):
+    """ctx._last_triad_raw_results must be reset at start of each _run_unified_review call.
+
+    We verify by pre-seeding stale data then running a review over a pool with one
+    seat that completes with mocked LLM output (no findings). The stale data from
+    the previous attempt must be gone — replaced by fresh actor records from this run.
+    (The pool is the environment catalog's marked rows; with no seat the wave is not
+    dispatched at all — the case below.)
+    """
+    ctx, fan_out = _run_unified_review_with_one_fresh_seat(tmp_path, monkeypatch, pool=True)
+
+    assert fan_out.called, "the one-seat pool must reach the fan-out"
+    assert fan_out.call_args.kwargs["models"] == ["fresh-model"], "the pool, not a recorded roster, was dispatched"
     # After the run, stale model_id must not appear
     model_ids = [r["model_id"] for r in ctx._last_triad_raw_results]
     assert "stale-model" not in model_ids, (
         "Stale triad_raw_results from prior attempt must be cleared at function entry"
     )
     assert "fresh-model" in model_ids, "Fresh actor record from this run must be present"
+
+
+def test_last_triad_raw_results_reset_precedes_the_invalid_pool_exit(tmp_path, monkeypatch):
+    """The reset is at function ENTRY, before the pool is even assembled: a malformed
+    catalog ends the run as the typed infrastructure block without a wave, and a prior
+    attempt's actor records must not survive into that record either."""
+    ctx, fan_out = _run_unified_review_with_one_fresh_seat(tmp_path, monkeypatch, pool=False)
+
+    assert not fan_out.called, "a malformed pool dispatches no wave"
+    assert ctx._last_review_block_reason == "infra_failure"
+    assert ctx._last_triad_raw_results == [], "stale actor records must not outlive the attempt that made them"
+
+
+def test_the_invalid_pool_exit_holds_for_a_real_tool_context(tmp_path, monkeypatch):
+    """The same exit over the product's own ``ToolContext``, which no test double can
+    make truthy by accident: no reconcile flag is armed, so a malformed catalog is the typed
+    infrastructure block and no wave, whatever a prior attempt left behind."""
+    from ouroboros.tools import review as review_mod
+    from ouroboros.tools.registry import ToolContext
+    from tests.review_pool_rosters import set_review_pool
+
+    set_review_pool(monkeypatch, "{broken")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="test-task")
+    ctx._last_triad_raw_results = [{"model_id": "stale-model", "status": "responded"}]
+    fan_out = MagicMock()
+    with patch.object(review_mod, "run_cmd", return_value="some diff content"), \
+         patch("ouroboros.tools.review_binary_context.capture_staged_diff", return_value="some diff content"), \
+         patch.object(review_mod, "_handle_multi_model_review", fan_out), \
+         patch.object(review_mod, "_load_checklist_section", return_value="## checklist"), \
+         patch.object(review_mod, "_preflight_check", return_value=None), \
+         patch.object(review_mod, "load_governance_doc", return_value=""), \
+         patch("ouroboros.tools.review_helpers.build_touched_file_pack", return_value=("(files)", [])):
+        review_mod._run_unified_review(ctx, "test commit")
+
+    assert not fan_out.called, "a malformed pool dispatches no wave"
+    assert ctx._last_review_block_reason == "infra_failure"
+    assert ctx._last_triad_raw_results == []
 
 
 # ── Test 10: parse_failure actors do NOT count toward quorum ──────────────────
@@ -663,29 +706,20 @@ def test_stale_actor_evidence_cleared_at_commit_start(tmp_path):
 
 
 
-def test_scope_empty_response_distinct_from_error(tmp_path):
-    """Empty LLM response must use status='empty_response', not status='error'.
+def test_empty_seat_response_distinct_from_error(tmp_path):
+    """An empty seat answer is a parse failure of the seat (status='parse_failure',
+    raw_text=''), distinct from a transport failure (status='error') — and never
+    a PASS of either part."""
+    from ouroboros.triad_review import parse_seat_answers
 
-    Before this fix, an empty model response was indistinguishable from a transport
-    failure (both used status='error'), weakening epistemic integrity.
-    """
-    from ouroboros.tools.scope_review import run_scope_review
-    from unittest.mock import patch
-
-    ctx = _make_ctx(tmp_path)
-    ctx._scope_review_history = {}
-    ctx._last_scope_raw_result = {}
-
-    with patch("ouroboros.tools.scope_review._call_scope_llm",
-               return_value=("", {"prompt_tokens": 100, "completion_tokens": 0, "cost": 0.001}, None)), \
-         patch("ouroboros.tools.scope_review._get_scope_model", return_value="test-model"):
-        result = run_scope_review(ctx, "test commit")
-
-    assert result.status == "empty_response", (
-        f"Empty LLM response must use status='empty_response', got {result.status!r}. "
-        "This is distinct from transport error (status='error')."
-    )
-    assert result.blocked is True, "Empty response must still block the commit"
+    parsed = parse_seat_answers({"results": [
+        {"model": "test-model", "slot_id": "s1", "text": ""},
+        {"model": "test-model", "slot_id": "s2", "verdict": "ERROR", "text": "Error: transport"},
+    ]}, {"s1": ("change", "coupling"), "s2": ("change", "coupling")})
+    empty, errored = (r.to_dict() for r in parsed.actor_records)
+    assert empty["status"] == "parse_failure" and empty["raw_text"] == ""
+    assert errored["status"] == "error" and "transport" in errored["raw_text"]
+    assert parsed.findings == [] and parsed.responsive_models == []
 
 
 # ── Test 11: scope_raw_result has parsed_items for shape parity ───────────────

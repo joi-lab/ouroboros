@@ -393,7 +393,14 @@ def test_route_rebind_preserves_nano_on_model_account_fallback(monkeypatch, tmp_
     assert mode == "nano"
     assert rebound.preferred_mode == rebound.initial_mode == "nano"
     assert rebound.nano_projection is not None
-    assert rebound.nano_projection.calibrated_tokens == estimated * 2
+    # This fixture's system_message also carries a private cache-split hint;
+    # count the visible role/content plus actual preserved tail, not that hint.
+    rows = rebound.messages_for("nano")
+    measured = context_fit.estimate_context_prompt_tokens([
+        {"role": "system", "content": rows[0]["content"]}, *rows[1:]])
+    assert rebound.nano_projection.estimated_tokens == measured
+    assert rebound.nano_projection.calibrated_tokens == measured * 2
+    assert measured != estimated  # rebind measures the actual current messages, not stale stored size
     assert rebound.window_tokens == window
     assert messages[0] == rebound.nano_projection.system_message()
     assert rebound.model == "claudexor::codex=fallback-model"
@@ -464,14 +471,14 @@ def test_route_switch_without_immutable_core_fails_loudly(tmp_path):
         )
 
 
-def test_p3_commit_and_scope_review_do_not_use_task_context_fit():
+def test_p3_commit_review_seats_do_not_use_task_context_fit():
     from ouroboros import review_substrate
-    from ouroboros.tools import review, scope_review
+    from ouroboros.tools import review, review_multi_model
 
     source = (
         inspect.getsource(review_substrate.ReviewCoordinator._run_slot)
         + inspect.getsource(review._run_unified_review)
-        + inspect.getsource(scope_review._call_scope_llm)
+        + inspect.getsource(review_multi_model._query_model)
     )
     assert "run_llm_loop" not in source
     assert "ContextFitPlan" not in source

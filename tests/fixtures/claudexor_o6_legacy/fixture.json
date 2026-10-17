@@ -1,0 +1,43 @@
+{
+  "baseline": "820e849cd15cca47758b700603e156ef29129fbf",
+  "fixture_time": "2026-09-14T00:00:00.000Z",
+  "epoch": "11111111-1111-4111-8111-111111111111",
+  "producer": "Frozen DurableJournal and CommandStore; no daemon or provider",
+  "producer_manifest_sha256": "e1d3affa1a8e713c2156663dbbc378d47eb8a639f8485755c07a15523350aa3f",
+  "producer_sources": [
+    {
+      "path": "packages/daemon/src/command-store.ts",
+      "git_blob": "56be6797d378ebc2071715a3284828898323de36",
+      "sha256": "74b83397c3a9d919931bc6a59e3ce6f8bdd1c68356b0436ebe2b0ed735957318"
+    },
+    {
+      "path": "packages/daemon/src/journal-fold-policy.ts",
+      "git_blob": "90549fa2ada464143daca1e823f371a1e129b6a0",
+      "sha256": "8eb2794ad5e69b290aca506288d9e7f0785266bfec17254b3c96ea62492d3547"
+    },
+    {
+      "path": "packages/journal/src/frame-codec.ts",
+      "git_blob": "1e5fa732930992b04784a9e1c616e1f6d9cd9f6b",
+      "sha256": "519c9a36340f0f29545b87997c2e8038364d1813052098d7ddea2cba9a0e552c"
+    },
+    {
+      "path": "packages/journal/src/index.ts",
+      "git_blob": "4c41db498ae68a58673ba9554cc724731bfccebf",
+      "sha256": "c1a97075d6ec72659803a4250c6a0844691a17193532f9832959fdace677e89b"
+    }
+  ],
+  "journal": {
+    "path": "journal/global-8001c2743965/journal.bin",
+    "sha256": "d7513d2ed1b6eaceb5b707a2bee5a2b3a5587f47b82d1c6988e0150ffdff67fd",
+    "size_bytes": 2075,
+    "records": 4
+  },
+  "expected": {
+    "jobId": "job-o6-legacy",
+    "runId": "run-o6-legacy",
+    "taskId": "task-o6-legacy",
+    "state": "succeeded"
+  },
+  "run_artifacts": [],
+  "coverage": "Native run-id lookup after import/restart; no old output-file or vendor-session claim"
+}

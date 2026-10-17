@@ -129,7 +129,10 @@ def test_headless_pending_cancel_still_emits_task_done(tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
 
-    assert queue.cancel_task_by_id(task["id"]) is True
+    from ouroboros.cancel_intents import request_cancel
+
+    request_cancel(tmp_path, task["id"])
+    assert queue.drive_cancel_intent_scope(task["id"]) == queue.CANCEL_CANCELLED
 
     terminal = [event for event in events if event.get("type") == "task_done"]
     assert len(terminal) == 1
@@ -151,7 +154,7 @@ def _patch_reaper(tmp_path, monkeypatch):
     monkeypatch.setattr(queue, "QUEUE_MAX_RETRIES", 1)
     monkeypatch.setattr(queue, "reconstruct_task_cost", lambda *_a, **_k: _available_cost_fields())
 
-    def _enqueue_task(task, front=False):
+    def _enqueue_task(task, front=False, timeout_retry=False):
         admitted = dict(task)
         pending.append(admitted)
         enqueued.append((admitted, front))
@@ -654,7 +657,6 @@ def test_assign_keeps_unsafe_pending_when_terminal_write_is_not_durable(tmp_path
 def test_corrupt_or_integrity_degraded_ledger_never_permits_budget_resume(
     tmp_path, monkeypatch, corruption, expected_error,
 ):
-    from ouroboros import usage_accounting as accounting
     from supervisor import queue, state, workers
 
     state.init(tmp_path, total_budget_limit=10.0)
@@ -675,17 +677,16 @@ def test_corrupt_or_integrity_degraded_ledger_never_permits_budget_resume(
     monkeypatch.setattr(workers, "WORKERS", {})
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
 
-    reservation = accounting.reserve_attempt(accounting.AttemptRequest(
-        model="test/model",
-        provider="test",
-        drive_root=tmp_path,
-        task_id="replay-risk",
-        root_task_id="replay-risk",
-        reservation_usd=0.01,
-        global_limit_usd=10.0,
-    ))
-    accounting.release_attempt(reservation, "test_setup")
-    ledger = tmp_path / accounting.LEDGER_REL
+    from tests._usage_store_testing import write_journal
+
+    # A journal the store has not imported yet (an install upgrading from a
+    # journal whose writer crashed): the import quarantines a torn final row
+    # (integrity degraded) and refuses damage before it (unavailable).
+    row = {"attempt_id": "a1", "kind": "attempt", "model": "test/model", "provider": "test",
+           "task_id": "replay-risk", "root_task_id": "replay-risk",
+           "reservation_upper_bound_usd": 0.01, "pricing_known": True}
+    ledger = write_journal(tmp_path, [{**row, "state": "reserved"},
+                                      {**row, "state": "released", "reason": "test_setup"}])
     if corruption == "quarantined_tail":
         with ledger.open("ab") as handle:
             handle.write(b'{"seq":')

@@ -247,17 +247,34 @@ def test_host_application_publishes_full_decision_before_finalization(tmp_path, 
                                  "evidence_refs": ["artifacts"]}]}
     result = ReviewRunResult(request={"surface": "task_acceptance"}, aggregate_signal="PASS",
                              actors=[{"signal": "PASS", "slot_id": "s1", "status": "ok", "parsed": parsed}], parsed_findings=[])
-    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", lambda context: result)
+    panels = []
+    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", lambda context: panels.append(context) or result)
     if apply_failure:
         def fail_apply(*args, **kwargs):
             raise RuntimeError("host application failed after receiving the panel")
         monkeypatch.setattr("ouroboros.loop_acceptance_review._apply_task_acceptance_result", fail_apply)
-    trace = {"tool_calls": []}
-    again = loop._run_task_acceptance_review_once(
-        tools=SimpleNamespace(_ctx=ctx), content="The requested file is ready.", task_id="applied", task_type="task",
-        llm_trace=trace, drive_root=tmp_path, messages=[], emit_progress=lambda *_a, **_k: None,
-    )
-    assert again is apply_failure
+    from ouroboros.acceptance_settlement import expose_acceptance_feedback
+    from tests.test_loop_acceptance_gate import _nominate_acceptance
+
+    # Required reviews the answer the author nominates (no expected-output or queue eligibility).
+    trace = _nominate_acceptance({"tool_calls": []}, task_id="applied", subject="The requested file is ready.")
+    messages = [{"role": "user", "content": "Make the requested file."}]
+
+    def decide():
+        return loop._run_task_acceptance_review_once(
+            tools=SimpleNamespace(_ctx=ctx), content="The requested file is ready.", task_id="applied",
+            task_type="task", llm_trace=trace, drive_root=tmp_path, messages=messages,
+            emit_progress=lambda *_a, **_k: None)
+
+    assert decide() is True, "the received panel result reaches its author before any decision"
+    assert len(panels) == 1 and messages[-1].get("review_feedback")
+    if apply_failure:  # the host failure is told to the author; nothing is accepted
+        assert messages[-1]["content"].startswith("Acceptance host processing failed: RuntimeError")
+    else:
+        assert "acceptance_decision" not in trace, "a PASS the author has not seen decides nothing"
+        expose_acceptance_feedback(trace, messages, "applied")  # the author's next request carried it
+        assert decide() is False and len(panels) == 1, "the same paid panel decides; none is bought again"
+        assert trace["review_decision"]["panel_reused"] is True
     assert trace["acceptance_decision"]["status"] == ("revision_requested" if apply_failure else "accepted")
     # Host failure is a separate task fact, not a fabricated second critic.
     # The received reviewer record still gets its own exact source publication.

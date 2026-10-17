@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import json
 import queue
+import threading
 
 import pytest
 
@@ -286,10 +287,22 @@ def test_full_loop_unknown_inspect_at_round_start_delivers_a_valid_finish_withou
 def test_full_loop_owner_message_during_the_call_is_refused_typed_and_delivered_next_round_without_a_park(full_loop, monkeypatch):
     """The mirror: a REAL owner message lands during Main's call. The valid control
     is refused ``owner_input_unread`` (no repair spent), the message is delivered
-    next round, and nothing parks between the REPAIR and the repair round."""
+    next round, and nothing parks between the REPAIR and the repair round. The
+    rewrite does not abandon the paid first panel (G1 #1737): its wait parks first
+    and its verdict reaches Main, then the rewrite's own panel parks."""
+    from ouroboros.acceptance_settlement import panel_awaiting_this_turn
+
     f = full_loop
     owner_text = "Also add a timeline section to the report."
     rewritten = ANSWER + " Timeline: two weeks."
+    awaited, real_park = [], f.ctx.owner_wait_callback
+
+    def park(ctx, checkpoint):
+        awaited.append((panel_awaiting_this_turn(ctx, ctx._execution_trace) or {}).get("binding_hash"))
+        real_park(ctx, checkpoint)
+        f.release = threading.Event()  # the next panel's reviewers read until the host parks for it
+
+    f.ctx.owner_wait_callback = park
 
     def main(_llm, messages, *_a, **_kw):
         f.model_inputs.append(copy.deepcopy(messages))
@@ -317,7 +330,12 @@ def test_full_loop_owner_message_during_the_call_is_refused_typed_and_delivered_
     result, _usage, trace = f.run()
     assert result == rewritten
     assert len(f.review_sends) == 2, ("the rewrite for the new premises got its own panel", f.progress)
-    assert [wait["reason"] for wait in f.waits] == ["review"], "only the second panel's own wait parks"
+    first, second = (run["binding_hash"] for run in trace["review_runs"])
+    assert [wait["reason"] for wait in f.waits] == ["review", "review"] and awaited == [first, second], \
+        "the first panel's own wait, then the rewrite's own panel"
+    assert any(source.get("settled") and source.get("binding_hash") == first
+               for messages in f.model_inputs for row in messages for source in row.get("review_feedback") or []), \
+        "the first panel's verdict reaches Main"
     assert trace["acceptance_decision"]["status"] == "accepted"
     refusals = [row for row in _ack_rows(f.ctx.drive_root) if row["ok"] is False]
     assert refusals and refusals[0]["cause"] == "owner_input_unread" and refusals[0]["pending_kinds"] == ["owner_text"]

@@ -75,7 +75,8 @@ class TestTheSourcePredicate:
         )
         assert trace["forced_finalization"]["source"] == "transport_unavailable_no_resend"
         assert loop_transport.UNKNOWN_ATTEMPT_COST_NOTE not in text
-        assert "Retry when connectivity returns" in text
+        assert text.startswith("⚠️ The request did not reach the provider; the task waited")
+        assert "Retry when connectivity" not in text and "consciousness" not in text
 
     def test_the_repeat_record_path_is_unchanged(self, tmp_path):
         accumulated = {
@@ -170,7 +171,7 @@ def test_stop_and_wrapup_text_are_byte_preserved(control, action):
     reason = REASON_OWNER_REQUESTED_FINALIZATION if action == 'Wrap up' else REASON_OWNER_STOPPED_DIRECT_TURN
     usage = {'_last_llm_error_kind': 'provider_outcome_unknown'}
     expected = (
-        f'⚠️ The owner requested {action} while the provider connection was unavailable.'
+        f'⚠️ The owner requested {action} while the provider had not returned a usable answer.'
         ' The wait ended after 5.0 min; No new summary request was sent. Any files written so far are preserved.'
         ' The dispatched request has no terminal provider outcome, so no '
         'retry or paid fallback was sent; either could duplicate live work.'

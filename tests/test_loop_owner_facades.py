@@ -51,12 +51,10 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
     ),
     "loop_nudges": (
         "_skill_names_touched_by_trace _skill_finalization_message _force_plan_decision "
-        "_force_plan_reminder _force_plan_disclosure _build_recent_tool_trace "
-        "_maybe_inject_self_check _maybe_inject_time_budget_milestone "
-        "_maybe_inject_cost_budget_milestone _maybe_inject_nanny_economics_reminder "
+        "_force_plan_reminder _force_plan_disclosure _maybe_inject_time_budget_milestone "
+        "_maybe_inject_cost_budget_milestone "
         "_inject_round_checkpoints _forced_delegation_note _nanny_finalization_message "
-        "_maybe_inject_finalization_nudges _answer_protocol_active "
-        "_contract_expected_output"
+        "_maybe_inject_finalization_nudges _answer_protocol_active"
     ),
     "loop_model_call": (
         "_adopt_fallback_route _snapshot_context_fit_usage _restore_context_fit_usage "
@@ -91,7 +89,8 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_project_child_result_dispositions _record_forced_finalization "
         "_forced_orphan_note _claimed_child_dispositions _undispositioned_children "
         "_maybe_enforce_child_absorption_gate "
-        "_enforce_swarm_actions _finalize_forced_services _drain_forced_owner_directives "
+        "_enforce_swarm_actions _finalize_forced_services _disclose_service_finalization "
+        "_drain_forced_owner_directives "
         "_call_forced_model_once _publish_model_forced_candidate "
         "_publish_stale_forced_candidate _forced_fallback_result "
         "_resolve_forced_delivery_control "

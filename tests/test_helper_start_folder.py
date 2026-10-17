@@ -17,6 +17,7 @@ from ouroboros.tools.registry import ToolContext, ToolRegistry
 from supervisor.events_subagent_admission import _resolve_subagent_constraint
 from supervisor.task_dispatch import build_scheduled_task_payload
 from tests._shared import configure_test_subagent
+from tests._store_shared import read_result
 
 
 @pytest.mark.parametrize("named", [True, False])
@@ -56,7 +57,7 @@ def test_schedule_preserves_parent_source_and_exact_child_folder(tmp_path, monke
     assert event["task_contract"]["workspace"]["root"] == str(expected)
     assert event["task_contract"]["disabled_tools"] == ["web_search"]
     assert event["parent_workspace"] == {"root": str(parent), "mode": "", "source": "project_room"}
-    saved = json.loads((data / "task_results" / f"{event['task_id']}.json").read_text(encoding="utf-8"))
+    saved = read_result(data, event['task_id'])
     assert saved["parent_workspace"] == event["parent_workspace"]
     task = build_scheduled_task_payload({**event, "tid": event["task_id"], "parent_id": "parent-task"})
     assert task["metadata"]["parent_workspace"] == event["parent_workspace"]

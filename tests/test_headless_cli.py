@@ -442,21 +442,19 @@ def test_terminal_bench_harbor_adapter_imports_without_harbor():
 
 def test_queue_restore_accepts_headless_chat_zero(tmp_path, monkeypatch):
     import supervisor.queue as queue
+    from tests._shared import write_queue_document
 
     monkeypatch.setattr(queue, "PENDING", [])
     monkeypatch.setattr(queue, "RUNNING", {})
     monkeypatch.setattr(queue, "QUEUE_SEQ_COUNTER_REF", {"value": 0})
     monkeypatch.setattr(queue, "DRIVE_ROOT", tmp_path)
-    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "queue_snapshot.json")
+    monkeypatch.setattr(queue, "QUEUE_SNAPSHOT_PATH", tmp_path / "state" / "queue_snapshot.json")
     monkeypatch.setattr(queue, "append_jsonl", lambda *args, **kwargs: None)
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
-    (tmp_path / "queue_snapshot.json").write_text(
-        json.dumps({
-            "ts": utc_now_iso(),
-            "pending": [{"task": {"id": "headless1", "type": "task", "chat_id": 0, "text": "x"}}],
-        }),
-        encoding="utf-8",
-    )
+    write_queue_document(queue.QUEUE_SNAPSHOT_PATH, {
+        "ts": utc_now_iso(),
+        "pending": [{"task": {"id": "headless1", "type": "task", "chat_id": 0, "text": "x"}}],
+    })
 
     assert queue.restore_pending_from_snapshot(max_age_sec=900) == 1
     assert queue.PENDING[0]["id"] == "headless1"

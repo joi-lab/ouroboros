@@ -13,7 +13,19 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ouroboros.platform_layer import IS_WINDOWS, assign_pid_to_job, close_job, create_kill_on_close_job, kill_process_on_port, kill_process_tree, merge_hidden_kwargs, request_process_tree_kill, subprocess_new_group_kwargs, terminate_job, terminate_process_tree
+from ouroboros.platform_layer import (
+    IS_WINDOWS,
+    assign_pid_to_job,
+    close_job,
+    create_kill_on_close_job,
+    kill_process_on_port,
+    kill_process_tree,
+    merge_hidden_kwargs,
+    request_process_tree_kill,
+    subprocess_new_group_kwargs,
+    terminate_job,
+    terminate_process_tree,
+)
 from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS
 from ouroboros.usage_accounting import record_unmetered_external_dispatch
 from ouroboros.utils import atomic_write_json, utc_now_iso
@@ -30,11 +42,10 @@ _COMPANION_BASE_ENV_KEYS = {"PATH", "SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT"
 
 
 def _companion_base_env() -> Dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if key.upper() in _COMPANION_BASE_ENV_KEYS
-    }
+    from ouroboros.process_scope import installation_scope_entries
+
+    return {**{key: value for key, value in os.environ.items() if key.upper() in _COMPANION_BASE_ENV_KEYS},
+            **installation_scope_entries()}
 
 
 def _drain_companion_pipe(pipe, cap: int, buf: bytearray, overflow_flag: Dict[str, bool], label: str) -> None:
@@ -145,9 +156,11 @@ class CompanionSupervisor:
             for port in descriptor.ports:
                 if not _port_is_available(port):
                     raise RuntimeError(f"port {port} is already in use")
+            from ouroboros.process_custody import lifeline_parent_env
+
             popen_kwargs: Dict[str, Any] = {
                 "cwd": str(descriptor.cwd),
-                "env": {**_companion_base_env(), **dict(descriptor.env)},
+                "env": {**_companion_base_env(), **dict(descriptor.env), **lifeline_parent_env()},
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.PIPE,
@@ -189,6 +202,7 @@ class CompanionSupervisor:
                             f"extension_companion:{descriptor.skill_name}:"
                             f"{descriptor.name}"
                         ),
+                        non_task_operation=True,  # a host companion: no task lineage to read
                     )
                 except Exception:
                     self._retire_failed_start(key, runtime, "cost disclosure failed")
@@ -478,17 +492,19 @@ def companion_spawn_env(
     computational.
     """
     from ouroboros.contracts.plugin_api import FORBIDDEN_SKILL_SETTINGS
-    from ouroboros.node_runtime import prepend_skill_node_emergency_path, skill_manifest_owns_path
     from ouroboros.extension_isolated_deps import _isolated_python_site_dirs
     from ouroboros.gateway.host_service import DEFAULT_HOST_SERVICE_HOST, host_service_port
+    from ouroboros.node_runtime import prepend_skill_node_emergency_path, skill_manifest_owns_path
+    from ouroboros.process_custody import PARENT_PID_ENV
     from ouroboros.tools.skill_exec import _scrub_env
+
     # Case-aware merge (delta finding D2-8): a manifest "Path" must REPLACE
     # the allowlisted "PATH" on Windows, never sit next to it — duplicate
     # case-variant env keys make CreateProcess-era spawns fail or pick an
     # undefined winner. Same contract as the executor-local service lane.
     from ouroboros.workspace_executor import overlay_env
 
-    reserved = set(FORBIDDEN_SKILL_SETTINGS) | {"HOST_SERVICE_TOKEN", "HOST_SERVICE_URL"}
+    reserved = set(FORBIDDEN_SKILL_SETTINGS) | {"HOST_SERVICE_TOKEN", "HOST_SERVICE_URL", PARENT_PID_ENV}
     env = overlay_env(
         _scrub_env(
             list(env_allow), state_dir, skill,

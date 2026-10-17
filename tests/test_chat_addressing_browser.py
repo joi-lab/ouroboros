@@ -39,7 +39,7 @@ _OBSERVE_CARDS = """() => {
 def _work_order(text):
     """The objective an actor was handed, read past the drafted-objective frame.
 
-    A promoted follow-up's first user row opens with the host's
+    A started follow-up's first user row opens with the host's
     ``[OBJECTIVE_AUTHOR]`` notice (a task, not the owner, drafted it); the
     fixture routes actors by the work order that follows, never by the frame.
     """
@@ -70,8 +70,8 @@ class ToolCallOnlyModel(ScriptedStubModel):
 
 
 @pytest.mark.parametrize("case,width", [
-    ("promote_only", 1440), ("promote_only", 390),
-    ("read_promote", 1440), ("failed_steer", 390),
+    ("start_only", 1440), ("start_only", 390),
+    ("read_start", 1440), ("failed_tell", 390),
 ])
 def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
     wait_clone, tmp_path, monkeypatch, case, width,
@@ -81,14 +81,13 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
 
     direct_marker = "NATIVE_ADDRESSING_" + uuid.uuid4().hex
     child_marker = "MANAGED_FOLLOWUP_" + uuid.uuid4().hex
-    promote = {"tool": "promote_chat_to_task", "arguments": {
+    start = {"tool": "start_task", "arguments": {
         "objective": child_marker, "workspace": "none", "title": "Admitted follow-up",
-        "predecessor_task_id": "",
     }}
     steps = {
-        "promote_only": [promote],
-        "read_promote": [{"tool": "read_file", "arguments": {"root": "system_repo", "path": "VERSION"}}, promote],
-        "failed_steer": [{"tool": "steer_task", "arguments": {"task_id": "missing-live-task", "message": "Please continue"}}],
+        "start_only": [start],
+        "read_start": [{"tool": "read_file", "arguments": {"root": "system_repo", "path": "VERSION"}}, start],
+        "failed_tell": [{"tool": "tell_task", "arguments": {"task_id": "missing-live-task", "note": "Please continue"}}],
     }[case]
     direct_calls = []
     child_calls = []
@@ -144,7 +143,7 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                     result = wait_durable_result(oracle, task_id, timeout=90)
                     assert len(direct_calls) >= len(steps) + 1
                     message_id = task["metadata"]["origin_message_ref"]["client_message_id"]
-                    if case != "failed_steer":
+                    if case != "failed_tell":
                         annotations = [row for row in oracle._jsonl("logs/chat_annotations.jsonl")
                                        if row.get("client_message_id") == message_id and row.get("status") == "scheduled"]
                         assert len(annotations) == 1
@@ -163,11 +162,13 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                         page.locator(f'.chat-live-card[data-task-id="{child_id}"]').wait_for(state="attached", timeout=30000)
                         assert page.locator(f'.chat-live-card[data-task-id="{child_id}"]').count() == 1
                     else:
-                        annotations = [row for row in oracle._jsonl("logs/chat_annotations.jsonl")
-                                       if row.get("client_message_id") == message_id]
+                        rows = oracle._jsonl("logs/chat_annotations.jsonl")
+                        # A tell that quotes none of his words is the turn's own note: it never speaks
+                        # for his message, and its refusal is the turn's own receipt.
+                        assert [row for row in rows if row.get("client_message_id") == message_id] == []
+                        annotations = [row for row in rows if row.get("target") == "missing-live-task"]
                         assert len(annotations) == 1
                         assert annotations[0]["action"] == "steer_task"
-                        assert annotations[0]["target"] == "missing-live-task"
                         assert annotations[0]["status"] == "needs_manual_target"
                         assert annotations[0]["reason"] == "target_unknown"
                     # Wait for the actual aggregate task_metrics frame from the
@@ -177,7 +178,7 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                     assert metrics and metrics[-1]["tool_calls"] == len(steps)
                     page.get_by_text("The addressing attempt is complete.", exact=True).wait_for(timeout=30000)
                     card = page.locator(f'.chat-live-card[data-task-id="{task_id}"]')
-                    if case == "promote_only":
+                    if case == "start_only":
                         assert card.count() == 0
                         assert task_id not in page.evaluate("() => window.__mountedCards")
                     else:
@@ -193,8 +194,8 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                     page.screenshot(path=str(evidence / "live.png"), full_page=True, animations="disabled")
                     page.reload(wait_until="domcontentloaded")
                     page.get_by_text("The addressing attempt is complete.", exact=True).wait_for(timeout=30000)
-                    assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]').count() == (0 if case == "promote_only" else 1)
-                    if case != "failed_steer":
+                    assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]').count() == (0 if case == "start_only" else 1)
+                    if case != "failed_tell":
                         assert page.locator('.msg-routing-annotation[data-annotation-status="scheduled"]').count() == 1
                     page.screenshot(path=str(evidence / "reloaded.png"), full_page=True, animations="disabled")
                     assert not errors, errors
@@ -202,11 +203,11 @@ def test_ordinary_addressing_card_tracks_real_work_through_metrics_and_reload(
                         "case": case, "task": task, "result": result,
                         "annotations": annotations,
                         "task_metrics": metrics,
-                        "child_metrics": child_metrics if case != "failed_steer" else [],
+                        "child_metrics": child_metrics if case != "failed_tell" else [],
                         "observed_direct_calls": len(direct_calls), "errors": errors,
                     }, ensure_ascii=False, indent=2), encoding="utf-8")
-                    if case == "failed_steer":
-                        # The integrated P5 producer types rejected steering as
+                    if case == "failed_tell":
+                        # The integrated P5 producer types a rejected tell as
                         # TOOL_REPORTED_FAILURE. Preserve this acceptance even
                         # when an older preparation base still reports zero.
                         assert metrics[-1]["tool_errors"] == 1

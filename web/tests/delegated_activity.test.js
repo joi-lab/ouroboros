@@ -76,7 +76,7 @@ test('messages lead, thinking sits behind one labelled disclosure, problems, cou
     const thinking = html.indexOf('<details class="chat-delegated-thinking"><summary>Thinking (2)</summary>');
     assert.ok(message !== -1 && problem > message && thinking > problem, html);
     assert.match(html, /<strong>Telegram<\/strong>/, 'the executor message uses the shared rich-text renderer');
-    assert.match(html, /⚠ claude · a01 · Bash: exit 1: 2 failed/);
+    assert.match(html, /<div class="chat-delegated-problem">Problem: claude · a01 · Bash: exit 1: 2 failed/, 'words and warn tone identify the problem without a glyph');
     assert.match(html, /4 technical events since seq 1 · Read ×2 · Bash ×2/);
     assert.ok(!html.includes('chat-delegated-events'), 'the ordered technical detail waits for the row Expand');
     const expanded = delegatedActivityBodyHtml(view, { expanded: true });
@@ -355,4 +355,14 @@ test('a failed exact read is a provisional window that folds once the exact even
         source: { kind: 'timeline_window', reason: 'stream_not_listed', rows: 1 }, parts: [{ kind: 'message', actor: '', text: 'same' }] };
     const legacy = { items: [{ activity: windowRow }, { activity: { ...windowRow } }] };
     assert.deepEqual(visible(legacy), [[['same'], 0], [['same'], 0]]);
+});
+
+test('the host problem label translates and escapes without rewriting executor evidence', async () => {
+    const { applyPayload, currentPayload, CODE_PREFIX } = await import('../modules/i18n.js');
+    const prior = currentPayload();
+    try {
+        applyPayload({ language: 'ru', english: false, entries: { [CODE_PREFIX + 'task.delegated.problem']: { text: '<Проблема>' } } });
+        const html = delegatedActivityBodyHtml(delegatedLineView({ activity: burst }));
+        assert.match(html, /chat-delegated-problem">&lt;Проблема&gt;: claude · a01 · Bash: exit 1: 2 failed/);
+    } finally { applyPayload(prior); }
 });

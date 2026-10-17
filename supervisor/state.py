@@ -598,7 +598,7 @@ EVOLUTION_BUDGET_RESERVE: float = 2.0  # Stop evolution when remaining < this
 
 
 def set_budget_limit(limit: float) -> None:
-    """Set total budget limit for budget_pct."""
+    """Set the total budget limit the budget readers use."""
     global TOTAL_BUDGET_LIMIT
     TOTAL_BUDGET_LIMIT = limit
 
@@ -644,10 +644,9 @@ def budget_remaining(
         projection = None
     try:
         if projection is None:
-            from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
+            from ouroboros.usage_accounting import usage_projection
             from ouroboros.usage_ledger import UsageLockUnavailable
 
-            ensure_legacy_imported(DRIVE_ROOT)
             with contextlib.suppress(*((UsageLockUnavailable,) if allow_stale else ())):
                 projection = usage_projection(DRIVE_ROOT, global_limit_usd=total, allow_stale=allow_stale)
             if projection is None or (
@@ -767,10 +766,9 @@ def _openrouter_ledger_settled(breakdown: Optional[Dict[str, Any]] = None) -> Op
     the tracked side of the drift comparison."""
     try:
         if breakdown is None:
-            from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+            from ouroboros.usage_accounting import usage_writer_snapshot
 
-            ensure_legacy_imported(DRIVE_ROOT)
-            breakdown = usage_breakdown(DRIVE_ROOT)
+            breakdown = usage_writer_snapshot(DRIVE_ROOT)
         bucket = dict(breakdown.get("by_provider") or {}).get("openrouter") or {}
         return float(bucket.get("settled_usd") or 0.0)
     except Exception:
@@ -956,22 +954,6 @@ def _apply_openrouter_ground_truth(st: Dict[str, Any], snapshot: Dict[str, Any],
             st["budget_drift_alert"] = False
 
 
-def budget_pct(st: Dict[str, Any]) -> float:
-    """Return ledger-derived budget percent used."""
-    total = float(TOTAL_BUDGET_LIMIT or 0.0)
-    if total <= 0:
-        return 0.0
-    try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
-
-        ensure_legacy_imported(DRIVE_ROOT)
-        projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
-        return (float(projection.get("accounted_usd") or 0.0) / total) * 100.0
-    except Exception:
-        log.exception("Budget ledger unavailable while calculating percent")
-        return 100.0
-
-
 def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     """Refresh the legacy state projection from the physical-attempt ledger.
 
@@ -982,6 +964,11 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     The persisted projection carries totals only; the per-root map is never written.
     The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what this
     function persists is rendered; the loop's llm_usage path writes once per turn, direct callers on call.
+
+    Writes are ordered by the ledger's ``(compaction_epoch, seq)`` marker, compared under STATE_LOCK:
+    a lower epoch, or a same-epoch lower seq, is stale and skipped; an equal or higher marker writes.
+    The projection stays untouched, returning False, on a quarantined ledger (``integrity_degraded``),
+    an unparseable fresh or saved marker, a lock timeout, or an unavailable ``state.json``.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
@@ -1016,7 +1003,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
 
     from ouroboros.usage_accounting import (
         UsageLedgerCorrupt,
-        ensure_legacy_imported,
+        UsageLockUnavailable,
         usage_projection,
         usage_writer_snapshot,
     )
@@ -1028,14 +1015,11 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     # A DISPLAY read (``allow_stale``: this runs on the supervisor loop once per turn with
     # ``llm_usage`` events): a lagging snapshot carries its own lower marker, so it never regresses money.
     try:
-        ensure_legacy_imported(DRIVE_ROOT)
         breakdown = usage_writer_snapshot(DRIVE_ROOT, allow_stale=True)
         total_limit = float(TOTAL_BUDGET_LIMIT or 0.0)
         projection_snapshot = breakdown.pop("_usage_projection", None)
         if total_limit > 0 and isinstance(projection_snapshot, dict):
             from ouroboros._usage_rows import _with_limit
-            # Totals only (issue #1002): per-root money is a ledger render nothing reads back from here.
-            projection_snapshot.pop("by_root", None)
             projection = _with_limit(projection_snapshot, total_limit)
         else:
             projection = (
@@ -1052,6 +1036,11 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
         # in place, report the refusal to the caller, and let the next event
         # retry: paid usage itself is already persisted in the ledger.
         log.warning("Skipping legacy budget projection: usage ledger is corrupt", exc_info=True)
+        return False
+    except UsageLockUnavailable:
+        # Contention, or a journal still awaiting the lifecycle import: unknown, never
+        # zero; the prior projection stays and the next event retries.
+        log.info("Skipping budget projection: the usage store is unavailable for a display read")
         return False
     ledger_high_water_marker = (
         None if breakdown.get("integrity_degraded") else _ledger_high_water_marker(breakdown)
@@ -1128,9 +1117,8 @@ def budget_breakdown(st: Dict[str, Any]) -> Dict[str, float]:
     """Aggregate accounted physical-attempt cost by category."""
     breakdown: Dict[str, float] = {}
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+        from ouroboros.usage_accounting import usage_breakdown
 
-        ensure_legacy_imported(DRIVE_ROOT)
         ledger = usage_breakdown(DRIVE_ROOT, allow_stale=True)
         for category, bucket in dict(ledger.get("by_category") or {}).items():
             breakdown[str(category)] = float(bucket.get("accounted_usd") or 0.0)
@@ -1147,9 +1135,8 @@ def model_breakdown(st: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
     """Aggregate physical calls/tokens/accounted cost by model."""
     breakdown: Dict[str, Dict[str, float]] = {}
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+        from ouroboros.usage_accounting import usage_breakdown
 
-        ensure_legacy_imported(DRIVE_ROOT)
         ledger = usage_breakdown(DRIVE_ROOT, allow_stale=True)
         buckets = dict(ledger.get("by_model") or {})
         unattributed = dict(ledger.get("unattributed") or {}).get("model") or {}
@@ -1170,27 +1157,21 @@ def model_breakdown(st: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
 
 
 def per_task_cost_summary(max_tasks: int = 10, tail_bytes: int = 512_000) -> List[Dict[str, Any]]:
-    """Return task cost summary from ledger-attributed physical attempts."""
-    del tail_bytes  # compatibility-only; the append-only ledger is replayed in full
-    tasks: Dict[str, Dict[str, Any]] = {}
+    """The costliest tasks by accounted spend: the indexed task summaries, never
+    a scan of attempts (``accounted_num`` orders; amounts come from the exact
+    decimal text)."""
+    del tail_bytes  # compatibility-only
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+        from ouroboros import usage_store
 
-        ensure_legacy_imported(DRIVE_ROOT)
-        ledger = usage_breakdown(DRIVE_ROOT)
-        for task_id, bucket in dict(ledger.get("by_task") or {}).items():
-            tasks[str(task_id)] = {
-                "task_id": str(task_id),
-                "cost": float(bucket.get("accounted_usd") or 0.0),
-                "rounds": int(bucket.get("physical_calls") or 0),
-                "model": "",
-            }
+        with usage_store.read(DRIVE_ROOT) as txn:
+            buckets = [(key, txn.bucket("task", key)) for key in txn.top_keys("task", max_tasks)]
     except Exception:
         log.error("Failed to calculate ledger per-task cost summary", exc_info=True)
         raise
-
-    sorted_tasks = sorted(tasks.values(), key=lambda x: x["cost"], reverse=True)
-    return sorted_tasks[:max_tasks]
+    tasks = [{"task_id": key, "cost": float(bucket.render_summary()["accounted_usd"]),
+              "rounds": int(bucket.physical), "model": ""} for key, bucket in buckets]
+    return sorted(tasks, key=lambda x: x["cost"], reverse=True)
 
 
 def reconstruct_task_cost(
@@ -1215,11 +1196,10 @@ def reconstruct_task_cost(
             from ouroboros.cost_projection import (
                 COST_SCOPE_OWN, build_cost_presentation, honest_accounted_amount,
             )
-            from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
+            from ouroboros.usage_accounting import usage_breakdown
 
             authority_root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
             if breakdown is None:
-                ensure_legacy_imported(authority_root)
                 bucket = usage_breakdown(authority_root, task_id=want)
             else:
                 from ouroboros._usage_rows import _breakdown_bucket, _with_integrity
@@ -1322,16 +1302,17 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list,
         lines.append("queue_warning: running>0 while busy=0")
     accounting_available = True
     try:
-        from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
+        from ouroboros.usage_accounting import usage_breakdown, usage_projection
 
-        ensure_legacy_imported(DRIVE_ROOT)
         ledger_breakdown = usage_breakdown(DRIVE_ROOT, allow_stale=True)  # /status renders on the loop
         ledger_projection = (
             usage_projection(DRIVE_ROOT, global_limit_usd=TOTAL_BUDGET_LIMIT, allow_stale=True)
             if TOTAL_BUDGET_LIMIT > 0
             else ledger_breakdown
         )
-        spent = float(ledger_projection.get("accounted_usd") or 0.0)
+        spent = float(ledger_projection.get("settled_usd") or 0.0)  # known: what the limit decides on
+        open_holds = float(ledger_projection.get("reserved_usd") or 0.0) + float(
+            ledger_projection.get("unresolved_upper_bound_usd") or 0.0)
         pct = (spent / TOTAL_BUDGET_LIMIT * 100.0) if TOTAL_BUDGET_LIMIT > 0 else 0.0
         budget_remaining_usd = (
             float(ledger_projection.get("remaining_known_usd") or 0.0)
@@ -1345,7 +1326,7 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list,
     except Exception:
         log.exception("Budget ledger unavailable while building status")
         accounting_available = False
-        spent = pct = budget_remaining_usd = None
+        spent = pct = budget_remaining_usd = open_holds = None
         spent_calls = prompt_tokens = completion_tokens = cached_tokens = None
     lines.append(f"budget_total: ${TOTAL_BUDGET_LIMIT:.0f}")
     if not accounting_available:
@@ -1362,6 +1343,9 @@ def status_text(workers_dict: Dict[int, Any], pending_list: list,
             lines.append(f"spent_usd: ${spent:.2f} ({pct:.1f}% of budget)")
         else:
             lines.append(f"spent_usd: ${spent:.2f}")
+        if open_holds > 0:
+            lines.append(f"open_holds_usd: ${open_holds:.2f} (reservations and unresolved upper bounds; "
+                         "not counted as spending)")
         lines.append(f"spent_calls: {spent_calls}")
         lines.append(
             f"prompt_tokens: {prompt_tokens}, completion_tokens: {completion_tokens}, "
@@ -1449,18 +1433,6 @@ def rotate_jsonl_log_if_needed(
         return
     if path.stat().st_size < max_bytes:
         return
-    ts = utc_now_iso().replace("-", "").replace(":", "").split(".")[0]
-    archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}.jsonl"
-    # Second-resolution names can collide when a fast writer forces two rotations
-    # within one second; os.replace onto an existing archive would destroy it. The
-    # "_<n>" suffix sorts lexicographically AFTER "<ts>.jsonl" ("_" > "."), so
-    # name-ordered readers keep the true chronological chain.
-    suffix = 0
-    while archive_path.exists():
-        suffix += 1
-        archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}_{suffix}.jsonl"
-    archive_path.parent.mkdir(parents=True, exist_ok=True)
-
     from ouroboros.utils import jsonl_append_lock_path
 
     lock_path = jsonl_append_lock_path(path)
@@ -1471,6 +1443,21 @@ def rotate_jsonl_log_if_needed(
     try:
         if not path.exists() or path.stat().st_size < max_bytes:
             return
+        # The archive's name is its rotation time, taken UNDER the append lock: every
+        # row already in the file was appended before this stamp, so a reader that
+        # bounds its archive scan by a time it recorded earlier (the terminal
+        # projection's readiness mint) can stop at the first older segment.
+        ts = utc_now_iso().replace("-", "").replace(":", "").split(".")[0]
+        archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}.jsonl"
+        # Second-resolution names can collide when a fast writer forces two rotations
+        # within one second; os.replace onto an existing archive would destroy it. The
+        # "_<n>" suffix sorts lexicographically AFTER "<ts>.jsonl" ("_" > "."), so
+        # name-ordered readers keep the true chronological chain.
+        suffix = 0
+        while archive_path.exists():
+            suffix += 1
+            archive_path = drive_root / "archive" / f"{archive_prefix}_{ts}_{suffix}.jsonl"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
         os.replace(path, archive_path)
         path.touch()
     finally:

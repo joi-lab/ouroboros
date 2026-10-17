@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import pytest
 from ouroboros import cancel_intents as ci
+from ouroboros import store_import
 from ouroboros.contracts.schema_versions import SCHEMA_VERSION_KEY
 from ouroboros.task_results import (
     STATUS_CANCEL_REQUESTED,
@@ -302,7 +303,9 @@ def test_boot_migration_admits_the_unstamped_latch_and_quarantines_the_rest(tmp_
     _write_pre_7_0_row(tmp_path, "latched", STATUS_CANCEL_REQUESTED, note="pre-7.0")
     _write_pre_7_0_row(tmp_path, "finished", STATUS_COMPLETED, result="pre-7.0")
 
-    assert ci.migrate_legacy_cancel_latches(tmp_path) == ["latched"]
+    # Boot's import admits the latch (stamped) and runs the migration itself; a later scan finds nothing new.
+    assert store_import.ensure_current_store(tmp_path)["results"] == 1
+    assert ci.migrate_legacy_cancel_latches(tmp_path) == []
 
     stored = load_task_result(tmp_path, "latched")
     assert stored["status"] == STATUS_CANCEL_REQUESTED and stored["note"] == "pre-7.0"
@@ -332,13 +335,17 @@ def test_boot_migrates_the_latch_before_any_quarantining_read():
     from ouroboros import server_maintenance
 
     recovery = inspect.getsource(server_maintenance._run_startup_task_recovery)
-    assert recovery.index("_migrate_startup_cancel_latches") < recovery.index(
-        "reconcile_orphaned_running_tasks"), recovery
-    assert "migrate_legacy_cancel_latches" not in inspect.getsource(
-        server_maintenance._startup_custody_sweep), (
-        "the migration must not ALSO run from the later custody sweep, whose "
-        "own reads would already have quarantined the latch"
-    )
+    assert "_migrate_startup_cancel_latches" not in recovery
+    # The import owner (store_switch: prepare_startup_state on its thread) starts first; the
+    # recovery and the supervisor each wait for its publication before their first read.
+    import server
+    lifespan = inspect.getsource(server.lifespan)
+    assert lifespan.index("store_switch.start") < lifespan.index("_run_startup_task_recovery")
+    assert lifespan.index("store_switch.start") < lifespan.index("_start_supervisor_if_needed")
+    assert recovery.index("require_published(drive_root)") < recovery.index("_startup_live_task_ids")
+    assert "startup:current_store" in inspect.getsource(server._run_supervisor)
+    assert "migrate_legacy_cancel_latches" not in inspect.getsource(server_maintenance._startup_custody_sweep)
+
 
 def test_the_admitted_latch_reaches_the_cancelled_terminal(tmp_path, monkeypatch):
     """The carve-out's whole point. Once admitted, the latch is an ORDINARY
@@ -362,8 +369,9 @@ def test_the_admitted_latch_reaches_the_cancelled_terminal(tmp_path, monkeypatch
     monkeypatch.setattr(task_lifecycle, "CANCELLED_ROOT_FENCES", {}, raising=False)
     monkeypatch.setattr(task_lifecycle, "_ACTIVE_CASCADE_FENCES", {}, raising=False)
 
-    assert ci.migrate_legacy_cancel_latches(tmp_path) == ["wedged"]
+    assert store_import.ensure_current_store(tmp_path)["results"] == 1  # the import migrates the latch
     intent = ci.active_intent(tmp_path, "wedged")
+    assert intent["source"] == "boot_migration"
 
     outcome = cancel_publication._finalize_cancel_intent_on_miss(q, "wedged", intent=intent)
 

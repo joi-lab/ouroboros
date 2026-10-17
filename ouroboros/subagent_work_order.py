@@ -23,7 +23,7 @@ def input_source_selection_receipt(task: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "input_sources": "declared",
         "included": [
-            "SYSTEM.md and BIBLE.md; existing reference-book projections",
+            "SYSTEM.md and BIBLE.md; reference-book projections; own-body DESIGN navigation or source-gap disclosure",
             "explicit assignment, question, evidence and normalized task authority",
             "runtime access, tools, workspace, clock, resource and budget facts",
             "the inherited delegation_budget.intent_note: parent-authored advice carried in the task contract, never authority",
@@ -65,11 +65,12 @@ def _text(value: Any) -> str:
 
 
 def assignment_instructions(ctx: Any) -> str:
-    """Host-authored complete normalized contract for every direct delegate start.
+    """Host-authored assignment with a predecessor brief for each direct start.
 
     The owner's words that caused the work follow the contract: a root's own
     corpus, a child's inherited words, or the host's absence marker; a declared
-    contract keeps its parent's selection and carries none.
+    contract keeps its parent's selection and carries none. Full predecessor
+    reports are read through the launching task, never claimed to be inline.
     """
 
     contract = getattr(ctx, "task_contract", None)
@@ -84,14 +85,22 @@ def assignment_instructions(ctx: Any) -> str:
     if not contract:
         return ""
     from ouroboros.contracts.task_contract import task_input_sources
+    from ouroboros.main_context_authority import project_helper_predecessor_authority
     from ouroboros.owner_words import owner_words_text
 
     # A declared run's receipt names the words among omitted inputs, for the sessions it starts too.
     declared = task_input_sources({"task_contract": contract}) == "declared"
+    if contract.get("predecessor_authority"):
+        contract["predecessor_authority"] = project_helper_predecessor_authority(
+            contract["predecessor_authority"], declared=declared)
     words = "" if declared else owner_words_text(ctx, audience="session")
     return (
-        "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+        "HOST TASK CONTRACT AUTHORITY (normalized JSON; predecessor is a brief):\n"
         + json.dumps(contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        + ("\n\nThe predecessor brief omits evidence; its source names get_task_result. "
+           "Ask the launching task (nanny or root) for the full report; it can reply through delegate_answer. "
+           "Without a question channel, return input_required for a new run with the answers."
+           if contract.get("predecessor_authority") else "")
         + (f"\n\n{words}" if words else "")
     )
 
@@ -310,6 +319,49 @@ def compile_external_work_order(task: Mapping[str, Any]) -> str:
     """Compile the complete chosen brief; transport limits belong to the recipient."""
 
     return _render_external_work_order(task)
+
+
+def session_design_navigation(ctx: Any, *, target_root: str, source_root: str) -> str:
+    """Pin body navigation in the prepared session request, beside its work order.
+
+    The canonical work order is reconstructed for source-range validation and
+    cannot depend on mutable files. Session instructions instead ride the durable
+    start request and its byte-identical retry. Identity comes from the selected
+    task source; bytes come from the prepared copy, never a foreign target's doc.
+    """
+    from pathlib import Path
+
+    from ouroboros.context_layout import design_navigation, task_design_source
+
+    metadata = getattr(ctx, "task_metadata", {})
+    task = dict(metadata) if isinstance(metadata, Mapping) else {}
+    task["task_contract"] = getattr(ctx, "task_contract", {})
+    selected = task_design_source(ctx, task)
+    if selected is None:
+        return ""
+    try:
+        folder = Path(target_root).resolve().relative_to(selected.resolve())
+    except ValueError:
+        from ouroboros.tools.tool_resolution import active_repo_dir_for
+        from ouroboros.workspace_copies import same_directory
+
+        if not same_directory(target_root, active_repo_dir_for(ctx)):
+            return ""  # e.g. a payload session launched by an own-body task
+        source = selected  # declared folderless body work reads system docs, not scratch
+    else:
+        source = Path(source_root).resolve()
+        for _part in folder.parts:
+            source = source.parent  # an investigation can start below the copied repo root
+    path = source / "docs/DESIGN.md"
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError):
+        raw, text = None, None
+    navigation = design_navigation(text, source=str(path))
+    digest = f"\nSource bytes SHA-256: {sha256(raw).hexdigest()}." if raw is not None else ""
+    return ("\n\nDESIGN NAVIGATION DELIVERY (host instructions, separate from canonical work order)\n"
+            + navigation + digest)
 
 
 def start_binding_fingerprints(ctx: Any, prompt: str) -> tuple[str, str]:

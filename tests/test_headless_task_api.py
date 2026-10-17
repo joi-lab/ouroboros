@@ -15,6 +15,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros import store_import
 from ouroboros.gateway.tasks import (
     _compose_task_text,
     _resolve_workspace_root,
@@ -28,6 +29,7 @@ from ouroboros.headless import (
 from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies on import)
     _managed_worker_pool_available,
 )
+from tests._store_shared import read_result, result_exists, result_signature, seed_result, unreadable_result
 
 
 def test_task_api_enqueue_workspace_creates_child_drive(tmp_path, monkeypatch):
@@ -100,9 +102,9 @@ def test_task_api_enqueue_workspace_creates_child_drive(tmp_path, monkeypatch):
     assert captured[0]["task_contract"]["resource_policy"]["protected_artifacts"][0]["paths"] == ["reference.bin"]
     child_drive = captured[0]["drive_root"]
     assert child_drive
-    assert (tmp_path / "data" / "task_results" / f"{payload['task_id']}.json").is_file()
+    assert result_exists(tmp_path / "data", payload['task_id'])
     assert "seed identity" in (data / "state" / "headless_tasks" / payload["task_id"] / "data" / "memory" / "identity.md").read_text(encoding="utf-8")
-    result = json.loads((data / "task_results" / f"{payload['task_id']}.json").read_text(encoding="utf-8"))
+    result = read_result(data, payload['task_id'])
     assert result["artifact_status"] == "pending"
     assert captured[0]["root_task_id"] == payload["task_id"]
     assert captured[0]["parent_task_id"] is None
@@ -348,10 +350,14 @@ def test_task_api_rejects_unsafe_task_id_and_system_workspace(tmp_path, monkeypa
 
 def test_task_api_identity_collision_check_is_strict_not_fail_soft(tmp_path, monkeypatch):
     """ABI-2 (Ф3.1 fix-round pin): the task_id-already-exists probe is an
-    AUTHORITY read. An INADMISSIBLE stored row (here: unstamped pre-7.0
-    history) must still occupy its identity — the request is refused with 409
-    — and the probe must NOT quarantine the row as a side effect: the bytes
-    stay in task_results/, nothing moves under quarantine/."""
+    AUTHORITY read. A stored row occupies its identity — the request is refused
+    with 409 — and the probe must NOT mutate storage as a side effect (row
+    signature unchanged). An INADMISSIBLE legacy file (unstamped pre-7.0 history,
+    a torn file) is judged by the real upgrade import, which quarantines it; its
+    identity stays occupied (409) and the probe moves nothing more. An UNREADABLE
+    row (the store refusing) occupies it the same way instead of reading as absent."""
+    from ouroboros.store_import import ensure_current_store
+
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     subprocess.run(["git", "init"], cwd=workspace, check=True, capture_output=True)
@@ -360,38 +366,40 @@ def test_task_api_identity_collision_check_is_strict_not_fail_soft(tmp_path, mon
     data = tmp_path / "data"
     results = data / "task_results"
     results.mkdir(parents=True)
-    legacy = results / "legacyid.json"
-    legacy.write_text(
-        json.dumps({"task_id": "legacyid", "status": "completed", "result": "pre-7.0"}),
-        encoding="utf-8",
-    )
-    original = legacy.read_bytes()
+    legacy = {"task_id": "legacyid", "status": "completed", "result": "pre-7.0"}
+    (results / "legacyid.json").write_text(json.dumps(legacy), encoding="utf-8")  # unstamped pre-7.0 history
+    (results / "tornid.json").write_text("{ not json", encoding="utf-8")
+    seed_result(data, "storedid", {"task_id": "storedid", "status": "completed"})
+    ensure_current_store(data)  # the real upgrade door: the two legacy files are quarantined, byte-unchanged
+    quarantined = sorted(path.name for path in (results / "quarantine").glob("*.json"))
+    assert quarantined == ["legacyid.json", "tornid.json"]
+    assert json.loads((results / "quarantine" / "legacyid.json").read_text(encoding="utf-8")) == legacy
+    original = result_signature(data, "storedid")
     monkeypatch.setattr("supervisor.queue.enqueue_task", lambda task: task)
     monkeypatch.setattr("supervisor.queue.persist_queue_snapshot", lambda reason="": True)
 
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root = data
     app.state.repo_dir = repo
-    response = TestClient(app).post(
-        "/api/tasks",
-        json={"description": "x", "task_id": "legacyid", "workspace_root": str(workspace)},
-    )
-
-    assert response.status_code == 409
-    assert "already exists" in response.json()["error"]
-    # The identity probe never mutates storage: no quarantine, bytes unchanged.
-    assert legacy.read_bytes() == original
-    assert not (results / "quarantine").exists()
-    # An unreadable (torn/malformed) row occupies its identity the same way.
-    torn = results / "tornid.json"
-    torn.write_text("{ not json", encoding="utf-8")
+    for task_id in ("storedid", "legacyid", "tornid"):
+        response = TestClient(app).post(
+            "/api/tasks",
+            json={"description": "x", "task_id": task_id, "workspace_root": str(workspace)},
+        )
+        assert response.status_code == 409, task_id
+        assert "already exists" in response.json()["error"]
+    # The identity probe never mutates storage: the row's signature and the quarantine are as the import left them.
+    assert result_signature(data, "storedid") == original
+    assert sorted(path.name for path in (results / "quarantine").glob("*.json")) == quarantined
+    assert not (results / "legacyid.json").exists() and not (results / "tornid.json").exists()
+    # An unreadable row (the store refuses its read) occupies its identity the same way.
+    unreadable_result(monkeypatch, "brokenid")
     torn_response = TestClient(app).post(
         "/api/tasks",
-        json={"description": "x", "task_id": "tornid", "workspace_root": str(workspace)},
+        json={"description": "x", "task_id": "brokenid", "workspace_root": str(workspace)},
     )
     assert torn_response.status_code == 409
-    assert torn.read_text(encoding="utf-8") == "{ not json"
-    assert not (results / "quarantine").exists()
+    assert sorted(path.name for path in (results / "quarantine").glob("*.json")) == quarantined
 
 
 def test_resolve_workspace_root_blocks_case_variant_control_plane(tmp_path):
@@ -502,7 +510,7 @@ def test_task_api_preserves_top_level_actor_id_after_metadata_sanitization(tmp_p
 
     assert response.status_code == 200
     assert captured[0]["actor_id"] == "operator-1"
-    result = json.loads((data / "task_results" / f"{response.json()['task_id']}.json").read_text(encoding="utf-8"))
+    result = read_result(data, response.json()['task_id'])
     assert result["metadata"]["actor_id"] == "operator-1"
     assert "forged-metadata" not in json.dumps(result)
 
@@ -624,19 +632,15 @@ def test_task_api_explicit_partial_attachments_reaches_caller_contract_and_actor
     assert task["attachments"] == manifest
     assert task["task_contract"]["attachment_manifest"] == manifest
     assert "reason=source_missing" in task["text"]
-    result = json.loads(
-        (data / "task_results" / "partial-attachments.json").read_text(encoding="utf-8")
-    )
+    result = read_result(data, "partial-attachments")
     assert result["attachment_manifest"] == manifest
 
 
 def test_late_api_identity_lookup_failure_preserves_exact_result(tmp_path):
     from ouroboros.gateway.tasks import _admission_rejection_response
 
-    result_path = tmp_path / "task_results" / "api-corrupt.json"
-    result_path.parent.mkdir()
-    original = b"{api-corrupt"
-    result_path.write_bytes(original)
+    seed_result(tmp_path, "api-corrupt", {"task_id": "api-corrupt", "status": "completed"})
+    original = result_signature(tmp_path, "api-corrupt")
     response = _admission_rejection_response(
         {"_admission_blocked": "task_id_lookup_failed"},
         drive_root=tmp_path, task_id="api-corrupt", project_id="",
@@ -644,7 +648,7 @@ def test_late_api_identity_lookup_failure_preserves_exact_result(tmp_path):
     )
     assert response is not None and response.status_code == 409
     assert json.loads(response.body)["admission"]["reason_code"] == "task_id_lookup_failed"
-    assert result_path.read_bytes() == original
+    assert result_signature(tmp_path, "api-corrupt") == original
 
 
 def test_task_api_rejects_negative_depth_before_reservation_or_queue(tmp_path, monkeypatch):
@@ -683,7 +687,7 @@ def test_task_api_rejects_negative_depth_before_reservation_or_queue(tmp_path, m
         assert response.status_code == 400
         assert response.json()["error"] == expected_error
         assert task_id not in queue_module.ADMISSION_RESERVATIONS
-        assert not (data / "task_results" / f"{task_id}.json").exists()
+        assert not result_exists(data, task_id)
     assert captured == []
 
 
@@ -715,6 +719,7 @@ def test_task_api_refuses_reserved_input_selection_before_any_admission_effect(t
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_: True)
     app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
     app.state.drive_root, app.state.repo_dir = data, repo
+    store_import.ensure_current_store(data)  # boot's import; the identity probe below reads the store
     before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
 
     response = TestClient(app).post("/api/tasks", json={

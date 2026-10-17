@@ -1,5 +1,7 @@
 """Converting a RUNNING direct Main turn into a project, end to end in a browser.
 
+One work, one card: the click moves the work and the SAME Main card becomes its portal.
+
 Owner decision 16.09: a direct conversation turn that does real work IS a full
 task card in Main, and it offers "Turn into project" WHILE IT RUNS — not only
 after it ends. The running half is what no unit test can certify: the click has
@@ -53,8 +55,7 @@ _MAIN_CARD_FACTS = """id => {
     const card = document.querySelector(`#page-chat .chat-live-card[data-task-id="${id}"]`);
     return {
         card: !!card,
-        converted: card?.dataset.projectCreated || '',
-        bound: card?.dataset.projectBound || '',
+        portal: card?.dataset.portal || '',
         pointer: !!card?.querySelector('.chat-live-bound-pointer'),
         convert_buttons: document.querySelectorAll('#page-chat [data-turn-into-project]').length,
     };
@@ -171,15 +172,14 @@ def test_running_direct_turn_converts_to_project_and_its_answer_follows(
                     assert payload["handoff_receipt"] == "durable", payload
                     assert payload["handoff_id"].startswith("project-handoff:"), payload
 
-                    # The Main card became the project chip, and stopped offering
-                    # a second conversion of the same work.
+                    # The SAME Main card became the work's portal (one work, one card): it keeps
+                    # its Stop, names its Project in its footer, and offers no second conversion.
                     converted = page.locator(
-                        f'.chat-live-card[data-task-id="{task_id}"][data-project-created="1"]')
+                        f'.chat-live-card[data-task-id="{task_id}"][data-portal="1"]')
                     converted.wait_for(timeout=30000)
                     page.wait_for_selector(
-                        f'.chat-live-card[data-task-id="{task_id}"].is-project', timeout=30000)
+                        f'.chat-live-card[data-task-id="{task_id}"] > .chat-live-bound-pointer', timeout=30000)
                     assert converted.get_attribute("data-project-id") == project["id"]
-                    assert converted.get_attribute("data-handoff-id") == payload["handoff_id"]
                     assert converted.get_attribute("data-receipt") is None, "a durable receipt is not marked as a gap"
                     assert converted.locator(".chat-live-project-name").inner_text().strip()
                     assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]'
@@ -228,25 +228,25 @@ def test_running_direct_turn_converts_to_project_and_its_answer_follows(
                     page.get_by_text(marker, exact=False).first.wait_for(timeout=30000)
                     # Zero convert buttons is also the state of a card whose
                     # binding has not landed yet. Wait for the fact the
-                    # assertion below requires: no card, or a card that names
-                    # its project.
+                    # assertion below requires: no card, or the work's portal.
                     reloaded = wait_until(
                         lambda: (lambda facts: facts if (
-                            not facts["card"] or facts["converted"] == "1" or facts["bound"] == "1"
+                            not facts["card"] or facts["portal"] == "1"
                         ) else None)(
                             page.evaluate(_MAIN_CARD_FACTS, task_id)),
                         30) or page.evaluate(_MAIN_CARD_FACTS, task_id)
                     assert reloaded["convert_buttons"] == 0, \
                         f"Main still offers to convert work that already has a project: {reloaded}"
-                    # A surviving card names its Project instead of offering
-                    # a second conversion; the durable receipt survives separately.
-                    assert not reloaded["card"] or reloaded["converted"] == "1" or reloaded["bound"] == "1", \
+                    # A surviving card is the work's portal naming its Project instead of
+                    # offering a second conversion; the durable receipt row is data, not an entry.
+                    assert not reloaded["card"] or (reloaded["portal"] == "1" and reloaded["pointer"]), \
                         f"a surviving Main card does not name its project: {reloaded}"
                     main_text = page.locator("#page-chat").inner_text()
                     page.locator('#page-chat .project-answer').filter(has_text='The converted turn finished its work.').wait_for(timeout=30000)
                     page.wait_for_selector('#page-chat .project-answer.is-folded', timeout=30000)
-                    page.wait_for_function("() => [...document.querySelectorAll('#page-chat .project-handoff:not([hidden]) .chat-live-phase')].some(n => n.textContent === 'Done')", timeout=30000)
-                    assert page.locator('#page-chat .project-handoff:not([hidden])').count() == 1
+                    page.wait_for_function("() => [...document.querySelectorAll('#page-chat .chat-live-card[data-portal]:not([hidden]) .chat-live-phase')].some(n => n.textContent === 'Done')", timeout=30000)
+                    assert page.locator('#page-chat .chat-live-card[data-portal="1"]:not([hidden])').count() == 1
+                    assert page.locator('#page-chat .project-handoff').count() == 0, "no second entry beside the card"
                     assert marker in main_text, "Main lost the owner message the turn started from"
                     main_history = page.evaluate(
                         "async () => (await (await fetch('/api/chat/history?chat_id=1')).json())")
